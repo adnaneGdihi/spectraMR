@@ -22,10 +22,13 @@ from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.training.builders import infrastructure_builder as ib_mod
 from spectramr.infrastructure.training.builders import loss_builder as lb_mod
 from spectramr.infrastructure.training.builders import model_builder as mb_mod
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _config():
-    return TrainingSettings.from_yaml("experiments/inprogress/dummy/dummy_gan.yaml")
+    return TrainingSettings.from_yaml(
+        str(require_repo_file("experiments/inprogress/dummy/dummy_gan.yaml"))
+    )
 
 
 def test_enabled_but_unregistered_metric_raises(monkeypatch):

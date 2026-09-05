@@ -351,8 +351,8 @@ check-deps-imports:
 FUZZ_RUNS ?= -1
 fuzz-audit-ladder:
 	@echo "=== fuzz-audit-ladder: atheris fuzzer for ConfigHealthChecker ==="
-	@if . .venv/bin/activate && python -c "import atheris" 2>/dev/null; then \
-		. .venv/bin/activate && \
+	@if $(VENV) python -c "import atheris" 2>/dev/null; then \
+		$(VENV) \
 		python tests/fuzz/audit_ladder_fuzz/atheris_runner.py \
 			-runs=$(FUZZ_RUNS) \
 			-artifact_prefix=fuzz-corpus/audit_ladder_crash_; \
@@ -366,8 +366,8 @@ fuzz-audit-ladder:
 # Usage: make test-mutation
 test-mutation:
 	@echo "=== test-mutation: mutmut for physics + health checker ==="
-	@if . .venv/bin/activate && python -c "import mutmut" 2>/dev/null; then \
-		. .venv/bin/activate && \
+	@if $(VENV) python -c "import mutmut" 2>/dev/null; then \
+		$(VENV) \
 		mutmut run \
 			--paths-to-mutate \
 				src/spectramr/infrastructure/physics/fft_ops.py,\

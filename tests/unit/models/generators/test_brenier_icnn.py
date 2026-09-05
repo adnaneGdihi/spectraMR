@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from spectramr.models.generators.brenier_icnn import BrenierICNN
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _net(**kw) -> BrenierICNN:
@@ -82,7 +83,7 @@ def test_synthetic_forward_probe_passes_for_both_arms() -> None:
         "b15_brenier_intensity_transfer",
     ):
         cfg = TrainingSettings.from_yaml(
-            f"experiments/inprogress/mrixfields2026/task1/{arm}.yaml"
+            str(require_repo_file(f"experiments/inprogress/mrixfields2026/task1/{arm}.yaml"))
         )
         report = synthetic_forward_probe(cfg)
         assert report.passed, f"{arm}: probe failed -> {getattr(report, 'message', report)}"

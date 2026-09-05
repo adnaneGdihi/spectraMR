@@ -35,6 +35,8 @@ import subprocess
 import pytest
 import yaml
 
+from tests.utils.repo_scripts import skip_if_public_export
+
 REPO = pathlib.Path(__file__).resolve().parents[3]
 SCOPE = "experiments/inprogress"
 
@@ -94,6 +96,7 @@ def _m4raw_arms() -> list[tuple[pathlib.Path, dict]]:
 def test_the_scan_finds_arms_at_all() -> None:
     """Anti-vacuity. Without this, a broken enumerator makes the pin below
     trivially green -- which is how a corpus guard rots into decoration."""
+    skip_if_public_export("experiments/ does not ship; no m4raw arm is present here")
     arms = _m4raw_arms()
     assert len(arms) >= 50, f"only {len(arms)} m4raw arms found under {SCOPE}"
 

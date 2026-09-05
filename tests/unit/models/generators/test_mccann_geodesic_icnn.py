@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from spectramr.models.generators.mccann_geodesic_icnn import McCannGeodesicICNN
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _net(**kw) -> McCannGeodesicICNN:
@@ -102,7 +103,7 @@ def test_synthetic_forward_probe_passes_for_both_arms() -> None:
 
     for arm in ("b39_mccann_path", "b39_ablate_convexity"):
         cfg = TrainingSettings.from_yaml(
-            f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"
+            str(require_repo_file(f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"))
         )
         report = synthetic_forward_probe(cfg)
         assert report.passed, f"{arm}: probe failed -> {getattr(report, 'message', report)}"

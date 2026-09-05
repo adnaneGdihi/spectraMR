@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from spectramr.models.generators.steerable_field_unet import SteerableFieldUNet
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _net(use_equivariance: bool = True, use_field_conditioning: bool = True) -> SteerableFieldUNet:
@@ -109,7 +110,7 @@ def test_synthetic_forward_probe_passes_for_both_arms() -> None:
 
     for arm in ("b14_steerable_equivariant_7t", "b14_ablate_equivariance"):
         cfg = TrainingSettings.from_yaml(
-            f"experiments/inprogress/mrixfields2026/task1/{arm}.yaml"
+            str(require_repo_file(f"experiments/inprogress/mrixfields2026/task1/{arm}.yaml"))
         )
         report = synthetic_forward_probe(cfg)
         assert report.passed, f"{arm}: probe failed -> {getattr(report, 'message', report)}"

@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 REPO = Path(__file__).resolve().parents[2]
 SIM2RANK = REPO / "scripts" / "sim2rank"
 
@@ -80,9 +82,7 @@ def _declared_flags(script: Path) -> set[str]:
         literals = [
             a.value
             for a in node.args
-            if isinstance(a, ast.Constant)
-            and isinstance(a.value, str)
-            and a.value.startswith("--")
+            if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.startswith("--")
         ]
         flags.update(literals)
         if _is_boolean_optional(node):
@@ -138,8 +138,20 @@ def _emitted_flags(block: str, variables: dict[str, str]) -> set[str]:
     return set(re.findall(r"(?<![\w-])(--[a-zA-Z][\w-]*)", expanded))
 
 
+def _read(name: str) -> str:
+    """A launcher's text, or an explained skip where sim2rank does not ship.
+
+    Not ``SIM2RANK / name`` directly: the whole subsystem is denied by the public
+    allowlist, so in the export these reads raised ``FileNotFoundError``. The
+    existence check inside :func:`_sbatch_targets` stays a plain ``.exists()`` --
+    there, absence means "this launcher calls a helper outside sim2rank/", which
+    is a real condition in BOTH trees and not a publication boundary.
+    """
+    return require_repo_file(f"scripts/sim2rank/{name}").read_text()
+
+
 def _sbatch_targets(name: str):
-    text = (SIM2RANK / name).read_text()
+    text = _read(name)
     variables = _flag_var_assignments(text)
     for target, block in _invocations(text):
         script = SIM2RANK / target
@@ -168,7 +180,7 @@ def test_at_least_one_invocation_was_actually_checked(name: str) -> None:
 
 
 def _brain_invocation(target: str) -> str:
-    text = (SIM2RANK / "run_fastmri_brain_pipeline.sbatch").read_text()
+    text = _read("run_fastmri_brain_pipeline.sbatch")
     blocks = [b for t, b in _invocations(text) if t == target]
     assert blocks, f"no {target} invocation in the brain launcher"
     return "\n".join(blocks)
@@ -193,7 +205,7 @@ def test_both_ranker_sweeps_receive_the_cohort_defining_flags(flag: str) -> None
 def test_leaderboard_sweep_declares_its_axis_bank() -> None:
     """#414: a run must say which degradation bank produced its leaderboard."""
     assert "--axis-bank" in _brain_invocation("sim2rank.py")
-    text = (SIM2RANK / "run_full_pipeline.sbatch").read_text()
+    text = _read("run_full_pipeline.sbatch")
     assert "--axis-bank" in text
 
 
@@ -213,12 +225,12 @@ def test_sweep_knobs_are_validated_against_their_advertised_set(
     argparse ever sees these values, so an unknown one has to fail in the
     preflight rather than after the expensive part.
     """
-    text = (SIM2RANK / name).read_text()
+    text = _read(name)
     for knob in knobs:
         assert f'{knob}="${{' in text, f"{name}: {knob} is not an overridable knob"
-        assert re.search(
-            rf'case "\$\{{{knob}\}}" in', text
-        ), f"{name}: {knob} is accepted but never validated against its choices"
+        assert re.search(rf'case "\$\{{{knob}\}}" in', text), (
+            f"{name}: {knob} is accepted but never validated against its choices"
+        )
 
 
 def test_the_seam_check_would_catch_an_unknown_flag() -> None:

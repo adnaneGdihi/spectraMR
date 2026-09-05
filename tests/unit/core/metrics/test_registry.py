@@ -22,6 +22,8 @@ they don't depend on (or pollute) production registrations.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -444,14 +446,17 @@ class TestWorkflowTagIntegrity:
         from spectramr.config.schemas.enums import Regime
         from spectramr.core.metrics.registry import MetricsRegistry
 
-        saved_metrics = dict(MetricsRegistry._metrics)
-        saved_aliases = dict(MetricsRegistry._aliases)
-        saved_tags = dict(MetricsRegistry._workflow_tags)
+        # snapshot()/restore() rather than three hand-picked dicts: this test
+        # used to save _metrics, _aliases and _workflow_tags and NOT _needs,
+        # _requires_context or _requires_reference, so the clear() below left
+        # those three empty for the rest of the process. Every later
+        # MetricsRegistry.needs() read then returned () -- a wrong value, not an
+        # error -- and the release suite could not be run under xdist because the
+        # failure set depended on which files shared a worker (#1846).
+        saved = MetricsRegistry.snapshot()
         try:
 
-            @MetricsRegistry.register(
-                "_tag_integrity_probe", workflows=frozenset({Regime.FLOW})
-            )
+            @MetricsRegistry.register("_tag_integrity_probe", workflows=frozenset({Regime.FLOW}))
             class _Probe:
                 higher_is_better = True
 
@@ -465,9 +470,7 @@ class TestWorkflowTagIntegrity:
                 "reporting coverage for metrics that no longer exist."
             )
         finally:
-            MetricsRegistry._metrics.update(saved_metrics)
-            MetricsRegistry._aliases.update(saved_aliases)
-            MetricsRegistry._workflow_tags.update(saved_tags)
+            MetricsRegistry.restore(saved)
 
     def test_a_bare_string_workflows_tag_is_rejected(self) -> None:
         """`workflows="mri_flow"` would SUBSTRING-match in the ledger.
@@ -529,9 +532,7 @@ class TestWorkflowsAccessor:
     def test_alias_resolves_to_the_canonical_tag(self) -> None:
         from spectramr.core.metrics.registry import MetricsRegistry
 
-        assert MetricsRegistry.workflows("CBFRMSE") == MetricsRegistry.workflows(
-            "cbf_rmse"
-        )
+        assert MetricsRegistry.workflows("CBFRMSE") == MetricsRegistry.workflows("cbf_rmse")
 
     def test_unknown_name_is_agnostic(self) -> None:
         """Unknown must read as "applies everywhere" — the loud direction.
@@ -628,3 +629,151 @@ class TestInheritedInitRejectsKwargs:
             assert inst.device_arg == "cpu"
         finally:
             MetricsRegistry._metrics.pop("_test_declares_device_metric", None)
+
+
+def _unlisted_tables(registry: type) -> set[str]:
+    """Registration tables ``registry`` declares that ``_TABLES`` does not name.
+
+    A free function taking the class, rather than a method, so the detector can
+    be pointed at a PLANTED violation as well as at the real registry. A check
+    that can only ever run against the real object is a check nobody has watched
+    fail, and the whole reason this file grew these tests is that an enumeration
+    which had never been watched fail was wrong (non-negotiable 15).
+    """
+    declared = set(getattr(registry, "_TABLES", ()))
+    live = {
+        name
+        for name, value in vars(registry).items()
+        if isinstance(value, dict) and name.startswith("_") and not name.startswith("__")
+    }
+    return live - declared
+
+
+class TestRegistrationTableOwnership:
+    """``_TABLES`` is the single owner of "what a registration table is".
+
+    ``clear()``, ``snapshot()`` and ``restore()`` were three independent
+    enumerations of the same set and one of them was wrong: the workflow-tag
+    isolation test saved three of the six tables ``clear()`` wipes, leaving
+    ``_needs``, ``_requires_context`` and ``_requires_reference`` empty for the
+    remainder of the process.
+
+    Nothing raised. ``needs()`` returns ``()`` for an unregistered name, so the
+    reads that followed came back *wrong* rather than *loud*, and which tests
+    saw it depended on ordering -- serial runs mostly escaped because
+    ``test_registry.py`` sorts after ``test_nr_*.py``, while under
+    ``pytest-xdist --dist loadfile`` it depended on which files shared a worker.
+    That is why the release lane was pinned to serial (#1846).
+    """
+
+    def test_no_declared_table_is_missing_from_tables(self) -> None:
+        """The ratchet: declare a seventh table and this goes red."""
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        assert _unlisted_tables(MetricsRegistry) == set(), (
+            "a registration table is not listed in _TABLES, so clear()/snapshot()"
+            "/restore() silently skip it -- the exact shape of #1846"
+        )
+
+    def test_the_detector_sees_a_planted_unlisted_table(self) -> None:
+        """Plant the violation, or the ratchet above is untested."""
+
+        class _Drifted:
+            _TABLES = ("_listed",)
+            _listed: ClassVar[dict] = {}
+            _forgotten: ClassVar[dict] = {}
+
+        assert _unlisted_tables(_Drifted) == {"_forgotten"}
+
+    def test_the_detector_ignores_non_table_class_attributes(self) -> None:
+        """``_instance``/``_initialized`` are not tables; a bool is not a dict."""
+
+        class _WithScalars:
+            _TABLES = ("_listed",)
+            _listed: ClassVar[dict] = {}
+            _instance = None
+            _initialized = False
+
+        assert _unlisted_tables(_WithScalars) == set()
+
+    def test_clear_empties_every_listed_table(self) -> None:
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        saved = MetricsRegistry.snapshot()
+        try:
+            for table in MetricsRegistry._TABLES:
+                getattr(MetricsRegistry, table)["_probe"] = ()
+            MetricsRegistry.clear()
+            for table in MetricsRegistry._TABLES:
+                assert getattr(MetricsRegistry, table) == {}, table
+        finally:
+            MetricsRegistry.restore(saved)
+
+    def test_snapshot_restore_round_trips_every_table(self) -> None:
+        """The test that would have caught #1846: it asserts over ALL tables.
+
+        The original saved the three tables the test it lived in was *about*.
+        Iterating ``_TABLES`` means a table cannot be forgotten by omission.
+        """
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        saved = MetricsRegistry.snapshot()
+        try:
+            for table in MetricsRegistry._TABLES:
+                getattr(MetricsRegistry, table)["_probe"] = ()
+            mid = MetricsRegistry.snapshot()
+            MetricsRegistry.clear()
+            MetricsRegistry.restore(mid)
+            for table in MetricsRegistry._TABLES:
+                assert "_probe" in getattr(MetricsRegistry, table), table
+        finally:
+            MetricsRegistry.restore(saved)
+
+    def test_restore_raises_when_the_snapshot_predates_a_table(self) -> None:
+        """Absent is a state to report: a partial snapshot must not half-restore."""
+        import pytest
+
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        incomplete = {k: v for k, v in MetricsRegistry.snapshot().items() if k != "_needs"}
+        with pytest.raises(KeyError, match="_needs"):
+            MetricsRegistry.restore(incomplete)
+
+    def test_restore_replaces_rather_than_merges(self) -> None:
+        """A registration made after the snapshot must not outlive the restore."""
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        saved = MetricsRegistry.snapshot()
+        try:
+            MetricsRegistry._needs["_probe_after_snapshot"] = ("mask",)
+            MetricsRegistry.restore(saved)
+            assert "_probe_after_snapshot" not in MetricsRegistry._needs
+        finally:
+            MetricsRegistry.restore(saved)
+
+    def test_a_declared_need_survives_a_clear_and_restore(self) -> None:
+        """The regression, through the real decorator rather than a raw dict.
+
+        Registering with ``needs=`` and reading it back via the public
+        ``needs()`` is the exact call the poisoned runs got ``()`` from.
+        """
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        saved = MetricsRegistry.snapshot()
+        try:
+
+            @MetricsRegistry.register("_needs_probe", needs=("sibling_contrasts",))
+            class _Probe:
+                higher_is_better = True
+
+                def __call__(self, prediction, target, **kwargs):
+                    return 0.0
+
+            assert MetricsRegistry.needs("_needs_probe") == ("sibling_contrasts",)
+            mid = MetricsRegistry.snapshot()
+            MetricsRegistry.clear()
+            assert MetricsRegistry.needs("_needs_probe") == ()
+            MetricsRegistry.restore(mid)
+            assert MetricsRegistry.needs("_needs_probe") == ("sibling_contrasts",)
+        finally:
+            MetricsRegistry.restore(saved)

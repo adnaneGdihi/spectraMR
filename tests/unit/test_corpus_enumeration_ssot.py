@@ -16,6 +16,7 @@ import sys
 import pytest
 
 from tests.utils.corpus import repo_root, tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 _COHORT = "experiments/inprogress/kspace_filling"
 
@@ -87,6 +88,7 @@ def test_repo_root_is_the_directory_holding_experiments_and_pyproject() -> None:
 
 def test_tracked_yamls_agrees_with_git_ls_files() -> None:
     """The helper must return exactly what git reports -- no more, no fewer."""
+    skip_if_public_export("experiments/ does not ship; git reports no arms because there are none")
     root = repo_root()
     expected = {
         root / line
@@ -111,6 +113,9 @@ def test_tracked_yamls_excludes_an_untracked_arm() -> None:
     two implementations -- which is precisely why the defect survived until a
     cluster run whose working tree happened to be dirty.
     """
+    skip_if_public_export(
+        "experiments/ does not ship; there is no cohort directory to plant the probe in"
+    )
     probe = repo_root() / _COHORT / "_corpus_ssot_probe.yaml"
     assert not probe.exists(), "stale probe from an interrupted run -- delete it"
     try:
@@ -128,6 +133,7 @@ def test_tracked_yamls_excludes_an_untracked_arm() -> None:
 
 def test_tracked_yamls_accepts_relative_paths_and_non_recursive_mode() -> None:
     """Both call shapes the repointed sites use."""
+    skip_if_public_export("experiments/ does not ship; both call shapes see an empty cohort")
     root = repo_root()
     assert tracked_yamls(_COHORT) == tracked_yamls(root / _COHORT)
 

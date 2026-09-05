@@ -16,6 +16,7 @@ import torch
 import yaml
 
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 # --- MRF schema -------------------------------------------------------------
 
@@ -146,6 +147,7 @@ def _audit(path: Path) -> str:
 
 
 def test_all_ten_ablation_yamls_audit_clean() -> None:
+    skip_if_public_export("experiments/ does not ship; the fmri/mrf ablations are absent")
     # The fmri_2026 cohort has 5 ablation YAMLs (idea_1..idea_5); the mrf_2026
     # cohort has 6 — idea_2 was split into both a "extra_wide_diffusion" and a
     # "high_sigma_diffusion" arm in commit 4886995bc so both extremes of the

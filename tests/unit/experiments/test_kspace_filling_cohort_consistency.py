@@ -32,6 +32,7 @@ import yaml
 from spectramr.config.schemas.loss import LossConfigSchema
 from spectramr.models.losses.weights import build_loss_weight_table
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 _COHORT = Path(__file__).resolve().parents[3] / "experiments" / "inprogress" / "kspace_filling"
 
@@ -400,6 +401,7 @@ def test_no_cohort_arm_is_hidden_from_git() -> None:
     than the specific rule, so any future ignore pattern that swallows a cohort
     directory fails here regardless of how it is spelled.
     """
+    skip_if_public_export("experiments/ does not ship; the cohort is absent, not hidden")
     import subprocess
 
     on_disk = {p.relative_to(_COHORT.parents[2]) for p in _COHORT.rglob("*.yaml")}

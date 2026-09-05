@@ -37,6 +37,7 @@ import pytest
 import yaml
 
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 _COHORT_DIR = (
     Path(__file__).resolve().parents[3]
@@ -81,6 +82,7 @@ _YAMLS = _cohort_yamls()
 
 
 def test_cohort_is_non_empty() -> None:
+    skip_if_public_export("experiments/ does not ship; the exp11 cohort is empty here")
     # Same floor rationale as test_exp11_variant_dc_consistency.py: floor below
     # the always-present tracked count so a fresh worktree is not a false red.
     assert len(_YAMLS) >= 25, f"expected the full exp11 cohort, found {len(_YAMLS)}"

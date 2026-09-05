@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 # ── Fixtures ─────────────────────────────────────────────────────────
 
@@ -209,6 +210,7 @@ class TestCampaignReferenceIntegrity:
 
     def test_the_scan_sees_every_campaign(self, project_root: Path) -> None:
         """Guard the two tests below against passing vacuously."""
+        skip_if_public_export("experiments/ does not ship; experiments/campaigns is absent here")
         campaigns = list(tracked_yamls(project_root / "experiments" / "campaigns"))
         assert len(campaigns) > len(TestCampaignSchemaValidation.CAMPAIGNS), (
             "the glob must cover more than the hand-maintained CAMPAIGNS list — "
@@ -225,6 +227,7 @@ class TestCampaignReferenceIntegrity:
         )
 
     def test_ratchet_has_no_stale_entries(self, project_root: Path) -> None:
+        skip_if_public_export("experiments/campaigns does not ship, so every known-dangling ref reads as fixed")
         fixed = KNOWN_DANGLING_CAMPAIGN_REFS - _dangling_campaign_refs(project_root)
         assert not fixed, (
             "these refs resolve now — drop them from "

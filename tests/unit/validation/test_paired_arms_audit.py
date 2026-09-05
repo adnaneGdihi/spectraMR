@@ -25,26 +25,36 @@ from spectramr.infrastructure.validation.paired_arms_audit import (
     audit_paired_arms,
     _DEFAULT_DIFF_PATHS,
 )
+from tests.utils.repo_scripts import require_repo_file
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-ARM_A = (
-    REPO_ROOT
-    / "experiments/inprogress/cold_diffusion/experiment_12_image_cold_diffusion_v2.yaml"
+_ARM_A_REL = (
+    "experiments/inprogress/cold_diffusion/experiment_12_image_cold_diffusion_v2.yaml"
 )
-ARM_B = (
-    REPO_ROOT
-    / "experiments/inprogress/cold_diffusion/experiment_12_physics_cold_diffusion_v2.yaml"
+_ARM_B_REL = (
+    "experiments/inprogress/cold_diffusion/experiment_12_physics_cold_diffusion_v2.yaml"
 )
+
+
+def _arm_a() -> Path:
+    return require_repo_file(_ARM_A_REL)
+
+
+def _arm_b() -> Path:
+    return require_repo_file(_ARM_B_REL)
 
 
 class TestCampaignHappyPath:
     """The real campaign YAMLs must pass the audit."""
 
     def test_arm_a_exists(self) -> None:
-        assert ARM_A.exists(), f"Arm A YAML missing at {ARM_A}"
+        # require_repo_file, not `.exists()`: the two answers must stay
+        # distinguishable. An arm the allowlist never selects is a publication
+        # boundary (skip); an arm that was deleted or MOVED is the defect this
+        # test exists for, and it must still fail loudly in every other tree.
+        assert _arm_a().is_file()
 
     def test_arm_b_exists(self) -> None:
-        assert ARM_B.exists(), f"Arm B YAML missing at {ARM_B}"
+        assert _arm_b().is_file()
 
     @pytest.mark.xfail(
         strict=True,
@@ -58,7 +68,7 @@ class TestCampaignHappyPath:
         ),
     )
     def test_paired_arms_audit_passes(self) -> None:
-        result = audit_paired_arms(ARM_A, ARM_B)
+        result = audit_paired_arms(_arm_a(), _arm_b())
         assert (
             result.passed
         ), f"Paired-arms audit failed unexpectedly:\n{result.render()}"
@@ -83,8 +93,8 @@ def _forge_pair(tmp_path: Path, mutate) -> tuple[Path, Path]:
     ``metadata.name``/``output_dir`` differences are already allow-listed, so a
     self-pair audits clean and the injected diff is the only signal.
     """
-    a = yaml.safe_load(ARM_A.read_text())
-    b = yaml.safe_load(ARM_A.read_text())
+    a = yaml.safe_load(_arm_a().read_text())
+    b = yaml.safe_load(_arm_a().read_text())
     mutate(b)
     a_path, b_path = tmp_path / "forged_a.yaml", tmp_path / "forged_b.yaml"
     a_path.write_text(yaml.safe_dump(a))
@@ -209,8 +219,8 @@ class TestGroupValidation:
     """Arms must declare the same metadata.group."""
 
     def test_mismatched_groups_raise(self, tmp_path: Path) -> None:
-        a = yaml.safe_load(ARM_A.read_text())
-        b = yaml.safe_load(ARM_B.read_text())
+        a = yaml.safe_load(_arm_a().read_text())
+        b = yaml.safe_load(_arm_b().read_text())
         b["metadata"]["group"] = "wrong_group"
         a_path = tmp_path / "forged_a.yaml"
         b_path = tmp_path / "forged_b.yaml"
@@ -222,7 +232,7 @@ class TestGroupValidation:
     def test_missing_arm_raises(self, tmp_path: Path) -> None:
         nonexistent = tmp_path / "does_not_exist.yaml"
         with pytest.raises(FileNotFoundError):
-            audit_paired_arms(nonexistent, ARM_B)
+            audit_paired_arms(nonexistent, _arm_b())
 
 
 class TestStagedRenamePathsAreNormalised:

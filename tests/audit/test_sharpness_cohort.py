@@ -28,11 +28,20 @@ import torch
 
 from spectramr.config.settings import TrainingSettings
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import require_repo_file
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_COHORT = _REPO_ROOT / "experiments" / "inprogress" / "kspace_filling" / "sharpness"
-_BASELINE = _COHORT / "experiment_11_sharp_baseline.yaml"
-_VARIANT = _COHORT / "experiment_11_sharp_hfen.yaml"
+_COHORT_REL = "experiments/inprogress/kspace_filling/sharpness"
+_BASELINE_REL = f"{_COHORT_REL}/experiment_11_sharp_baseline.yaml"
+_VARIANT_REL = f"{_COHORT_REL}/experiment_11_sharp_hfen.yaml"
+
+
+def _baseline_path() -> Path:
+    return require_repo_file(_BASELINE_REL)
+
+
+def _variant_path() -> Path:
+    return require_repo_file(_VARIANT_REL)
 
 # Selection is held IDENTICAL across the pair, so it is not a second variable.
 _SELECTION_METRIC = "val_hfen_mean"
@@ -45,16 +54,19 @@ def _entries(settings: TrainingSettings, section: str) -> list[dict[str, Any]]:
 
 @pytest.fixture(scope="module")
 def baseline() -> TrainingSettings:
-    return TrainingSettings.from_yaml(str(_BASELINE))
+    return TrainingSettings.from_yaml(str(_baseline_path()))
 
 
 @pytest.fixture(scope="module")
 def variant() -> TrainingSettings:
-    return TrainingSettings.from_yaml(str(_VARIANT))
+    return TrainingSettings.from_yaml(str(_variant_path()))
 
 
 def test_both_arms_exist() -> None:
-    assert _BASELINE.is_file() and _VARIANT.is_file()
+    # require_repo_file, not `.is_file()`: an arm the allowlist never selects is
+    # a publication boundary (skip), while an arm that was deleted or MOVED is
+    # the ablation breaking, and must stay loud in every tree but the export.
+    assert _baseline_path().is_file() and _variant_path().is_file()
 
 
 def test_hfen_is_the_only_loss_delta(
@@ -119,7 +131,7 @@ def test_hfen_loss_fires_and_is_differentiable() -> None:
     """
     from spectramr.models.losses.registry import LossRegistry
 
-    settings = TrainingSettings.from_yaml(str(_VARIANT))
+    settings = TrainingSettings.from_yaml(str(_variant_path()))
     entry = _entries(settings, "image_losses")[0]
     loss_fn = LossRegistry.create(entry["name"], **entry["kwargs"])
 
@@ -154,7 +166,7 @@ def test_hfen_does_not_double_bridge() -> None:
     """
     from spectramr.models.losses.registry import LossRegistry
 
-    settings = TrainingSettings.from_yaml(str(_VARIANT))
+    settings = TrainingSettings.from_yaml(str(_variant_path()))
     assert str(
         getattr(settings.losses.policy.output_domain, "value", settings.losses.policy.output_domain)
     ) == ("kspace")
@@ -173,7 +185,7 @@ def test_declared_kwargs_survive_the_schema() -> None:
     silently dropped — which is exactly how ``sobolev_order`` became a dead knob across
     53 arms (issue #615). This pins the surface that actually works.
     """
-    settings = TrainingSettings.from_yaml(str(_VARIANT))
+    settings = TrainingSettings.from_yaml(str(_variant_path()))
     kwargs = _entries(settings, "image_losses")[0]["kwargs"]
     assert kwargs == {
         "kernel_size": 15,

@@ -101,6 +101,27 @@ class MetricsRegistry:
     # assert an EVAL_ONLY regime is backed by real, registered metrics.
     _workflow_tags: ClassVar[dict[str, dict[str, Any]]] = {}
 
+    # Every mutable registration table, named ONCE. ``clear()``, ``snapshot()``
+    # and ``restore()`` all iterate this tuple instead of each spelling the set
+    # out, because they WERE three independent enumerations and one of them was
+    # wrong. The isolation helper in ``test_registry.py`` saved three of the six
+    # tables ``clear()`` wipes, so ``_needs`` stayed EMPTY for the rest of the
+    # process and every later ``needs()`` read returned ``()`` -- a wrong value
+    # rather than an error, because ``needs()`` cannot distinguish "declares
+    # nothing" from "never registered". Under ``pytest-xdist`` that made the
+    # FAILURE SET depend on which files shared a worker, which is why the
+    # release lane could not be parallelised (#1846). Add a table here and all
+    # three helpers cover it at once (non-negotiable 17); the ratchet in
+    # ``test_registry.py`` fails if a table is declared and not listed.
+    _TABLES: ClassVar[tuple[str, ...]] = (
+        "_metrics",
+        "_aliases",
+        "_needs",
+        "_requires_context",
+        "_requires_reference",
+        "_workflow_tags",
+    )
+
     def __new__(cls) -> MetricsRegistry:
         """__new__.
 
@@ -453,12 +474,52 @@ class MetricsRegistry:
         this table is the anti-facade check, so a stale entry here is a facade in
         the guard itself.
         """
-        cls._metrics.clear()
-        cls._aliases.clear()
-        cls._needs.clear()
-        cls._requires_context.clear()
-        cls._requires_reference.clear()
-        cls._workflow_tags.clear()
+        for table in cls._TABLES:
+            getattr(cls, table).clear()
+
+    @classmethod
+    def snapshot(cls) -> dict[str, dict[str, Any]]:
+        """A copy of every registration table, to hand back to :meth:`restore`.
+
+        The counterpart to :meth:`clear` for any test that needs a registry it
+        can scribble on. Hand-rolling the save/restore is what went wrong: the
+        obvious spelling saves the tables the test happens to be *about*, and
+        the ones it is not about are the ones that stay broken -- silently, in
+        the same process, for every test that runs afterwards.
+
+        Copies each table one level deep, which is what the tables hold: name ->
+        class, name -> tuple, name -> bool. ``_workflow_tags`` maps to a dict,
+        so a mutation *inside* one tag entry would survive a restore; nothing
+        mutates a tag in place, and a deep copy here would silently deep-copy
+        the registered metric CLASSES, which is worse.
+        """
+        return {table: dict(getattr(cls, table)) for table in cls._TABLES}
+
+    @classmethod
+    def restore(cls, snapshot: dict[str, dict[str, Any]]) -> None:
+        """Put every registration table back exactly as ``snapshot`` found it.
+
+        REPLACES rather than merges. Updating in place leaves behind whatever
+        the test registered after taking the snapshot, so a probe metric
+        outlives the test that defined it and the next reader sees a registry
+        that never existed.
+
+        A snapshot missing a table **raises**: it means the snapshot predates a
+        table being added, and restoring the rest would put the registry into a
+        state that is half old and half empty -- exactly the failure this whole
+        mechanism exists to remove. Absent is a state to report, not to infer.
+        """
+        missing = [table for table in cls._TABLES if table not in snapshot]
+        if missing:
+            raise KeyError(
+                f"snapshot is missing {missing}; it does not cover the registry's "
+                f"current tables {list(cls._TABLES)}. Take it with "
+                "MetricsRegistry.snapshot() rather than by hand."
+            )
+        for table in cls._TABLES:
+            live = getattr(cls, table)
+            live.clear()
+            live.update(snapshot[table])
 
 
 # Convenience functions for cleaner API

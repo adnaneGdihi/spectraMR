@@ -24,11 +24,10 @@ the tests + docs (intended) or fails CI (unintended).
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
+from tests.utils.repo_scripts import require_repo_file
 
 # Entry points that expose ``--device`` and must default to ``"auto"``.
 _CLI_ENTRY_POINTS = (
@@ -40,7 +39,15 @@ _CLI_ENTRY_POINTS = (
 
 
 def _read(relpath: str) -> str:
-    return (REPO / relpath).read_text()
+    """Read a subject that ships only in the private tree.
+
+    ``scripts/sim2rank/`` is denied by the public allowlist (65 files, 36.8k LOC
+    of research tooling), so in the export every one of these reads raised
+    ``FileNotFoundError``. The guard is per-test rather than module-level: the
+    device-resolver test below has no ``scripts/`` subject and must keep running
+    in both trees.
+    """
+    return require_repo_file(relpath).read_text()
 
 
 @pytest.mark.parametrize("relpath", _CLI_ENTRY_POINTS)
@@ -71,12 +78,12 @@ def test_cli_resolves_device_via_shared_helper() -> None:
     than the bare ``torch.device(args.device)`` (which can't honour ``auto``)."""
     for relpath in _CLI_ENTRY_POINTS:
         text = _read(relpath)
-        assert (
-            "_resolve_device(args.device)" in text
-        ), f"{relpath} must resolve --device via _resolve_device(args.device)."
-        assert (
-            "torch.device(args.device)" not in text
-        ), f"{relpath} still uses torch.device(args.device); 'auto' won't resolve."
+        assert "_resolve_device(args.device)" in text, (
+            f"{relpath} must resolve --device via _resolve_device(args.device)."
+        )
+        assert "torch.device(args.device)" not in text, (
+            f"{relpath} still uses torch.device(args.device); 'auto' won't resolve."
+        )
 
 
 def test_resolve_device_prefers_cuda_and_refuses_to_guess_cpu() -> None:
@@ -106,8 +113,7 @@ def test_slurm_submit_requests_gpu() -> None:
     """``submit_sim2rank.sbatch`` must request a GPU (``--gres=gpu``)."""
     text = _read("scripts/sim2rank/submit_sim2rank.sbatch")
     assert any(
-        ln.strip().startswith("#SBATCH") and "--gres=gpu" in ln
-        for ln in text.splitlines()
+        ln.strip().startswith("#SBATCH") and "--gres=gpu" in ln for ln in text.splitlines()
     ), "submit_sim2rank.sbatch must request a GPU (CUDA-canonical as of 2026-05-25)."
 
 
@@ -135,20 +141,17 @@ def test_meta_eval_sbatch_invokes_cli_with_device_cuda() -> None:
     active_lines = [ln for ln in raw.splitlines() if not ln.lstrip().startswith("#")]
     active = "\n".join(active_lines)
     assert re.search(r"--device\s+cuda(\s|\\|$)", active), (
-        "mata_eval.sbatch must invoke `python -m spectramr.cli meta-evaluate "
-        "--device cuda ...`."
+        "mata_eval.sbatch must invoke `python -m spectramr.cli meta-evaluate --device cuda ...`."
     )
-    assert not re.search(
-        r"--device\s+cpu", active
-    ), "mata_eval.sbatch must not pass `--device cpu` — CUDA is canonical."
+    assert not re.search(r"--device\s+cpu", active), (
+        "mata_eval.sbatch must not pass `--device cpu` — CUDA is canonical."
+    )
 
 
 def test_readme_documents_cuda_canonical() -> None:
     """The README must call out CUDA as the canonical execution backend."""
     text = _read("scripts/sim2rank/README.md")
-    assert "CUDA is the canonical execution backend" in text or (
-        "CUDA is canonical" in text
-    ), (
+    assert "CUDA is the canonical execution backend" in text or ("CUDA is canonical" in text), (
         "README must document that CUDA is the canonical sim2rank execution "
         "backend (native-data path runs ESPIRiT + complex k-space + Inception, "
         "all GPU-bound)."
@@ -167,7 +170,7 @@ def _synthetic_sweep():
     import importlib.util
     import sys
 
-    path = Path(__file__).resolve().parents[2] / "scripts" / "sim2rank" / "sim2rank.py"
+    path = require_repo_file("scripts/sim2rank/sim2rank.py")
     spec = importlib.util.spec_from_file_location("_s2r_for_test", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
@@ -249,12 +252,10 @@ def test_synthetic_branch_leaves_no_variable_unbound() -> None:
     """
     import ast
 
-    path = Path(__file__).resolve().parents[2] / "scripts" / "sim2rank" / "sim2rank.py"
+    path = require_repo_file("scripts/sim2rank/sim2rank.py")
     tree = ast.parse(path.read_text())
     fn = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "run_sim2rank"
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "run_sim2rank"
     )
 
     branch = next(
@@ -263,8 +264,7 @@ def test_synthetic_branch_leaves_no_variable_unbound() -> None:
             for n in fn.body
             if isinstance(n, ast.If)
             and any(
-                isinstance(d, ast.Attribute) and d.attr == "synthetic"
-                for d in ast.walk(n.test)
+                isinstance(d, ast.Attribute) and d.attr == "synthetic" for d in ast.walk(n.test)
             )
         ),
         None,

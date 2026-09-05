@@ -14,16 +14,16 @@ run a CLI verb, and there is no per-experiment Python to write.
 
 .. note::
 
-   **This is the v0.1.0 public documentation set, and it is a subset.** These
-   pages were written against the internal research tree, where an experiment
-   corpus of several hundred configurations and a directory of internal tooling
-   sit beside the framework. Neither is published. Pages here therefore sometimes
-   *name* an internal script or an experiment arm as the provenance of a measured
-   number. Naming a source is fine; telling you to **run** a file this repository
-   does not contain is not, and any such block that survives here is a
-   documentation defect worth an issue rather than an instruction worth following.
-   :doc:`known_limitations` records what this tree does not do, and it is worth
-   reading before the tutorials rather than after.
+   **This is the public documentation set, and it is a subset.** It documents
+   version |release|. These pages were written against the internal research
+   tree, where an experiment corpus of several hundred configurations and a
+   directory of internal tooling sit beside the framework. Neither is published.
+   Pages here therefore sometimes *name* an internal script or an experiment arm
+   as the provenance of a measured number. Naming a source is fine; telling you
+   to **run** a file this repository does not contain is not, and any such block
+   that survives here is a documentation defect worth an issue rather than an
+   instruction worth following. :doc:`known_limitations` records what this tree
+   does not do, and it is worth reading before the tutorials rather than after.
 
 Start here
 ==========

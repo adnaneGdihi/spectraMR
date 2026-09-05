@@ -28,13 +28,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS_DIR = REPO_ROOT / "scripts" / "coverage"
 
 
 def _load(module_name: str, file_name: str):
-    """Import a script by file path (no need to put scripts/ on sys.path)."""
-    path = SCRIPTS_DIR / file_name
+    """Import a script by file path (no need to put scripts/ on sys.path).
+
+    Guarded: scripts/coverage/ ships only in part, so in the export this load
+    raised FileNotFoundError. Per-call rather than module-level -- the classes
+    covering the scripts that DO ship keep running there.
+    """
+    path = require_repo_file(f"scripts/coverage/{file_name}")
     spec = importlib.util.spec_from_file_location(module_name, str(path))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -82,12 +88,8 @@ class TestMissingTestFiles:
         tests = tmp_path / "tests" / "unit" / "core"
         tests.mkdir(parents=True)
         # alpha + beta are mentioned by name; gamma is mentioned nowhere.
-        (tests / "test_alpha.py").write_text(
-            "from core.alpha import f\ndef test_a(): pass\n"
-        )
-        (tests / "test_beta_shapes.py").write_text(
-            "from core.beta import g\ndef test_b(): pass\n"
-        )
+        (tests / "test_alpha.py").write_text("from core.alpha import f\ndef test_a(): pass\n")
+        (tests / "test_beta_shapes.py").write_text("from core.beta import g\ndef test_b(): pass\n")
 
         mod = _load("missing_test_files_test", "missing_test_files.py")
         monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
@@ -202,9 +204,7 @@ class TestShapeCoverageReport:
             "def test_loss_registry():\n    name = 'beta_loss'\n"
         )
         # Names gamma_metric, but is NOT a shapes file — must not count as coverage.
-        (tests / "test_unrelated.py").write_text(
-            "def test_x():\n    name = 'gamma_metric'\n"
-        )
+        (tests / "test_unrelated.py").write_text("def test_x():\n    name = 'gamma_metric'\n")
 
         mod = _load("shape_coverage_report_test", "shape_coverage_report.py")
         monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
@@ -233,9 +233,7 @@ class TestShapeCoverageReport:
         assert covered
         assert hit is not None and "loss_registry_shapes" in hit.name
 
-    def test_mention_in_a_non_shapes_file_is_not_coverage(
-        self, fake_tests_tree
-    ) -> None:
+    def test_mention_in_a_non_shapes_file_is_not_coverage(self, fake_tests_tree) -> None:
         """``gamma_metric`` appears only in ``test_unrelated.py``.
 
         The corpus glob is what makes the number mean "has a SHAPE-contract test"

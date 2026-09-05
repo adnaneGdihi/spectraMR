@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 # Make the package importable so autoapi / autodoc can walk it.
@@ -12,8 +13,37 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "spectraMR"
 author = "Adnane Gdihi"
 copyright = "2026, Adnane Gdihi"
-release = "0.1.0"
-version = "0.1"
+
+
+def _declared_version() -> str:
+    """Read ``__version__`` out of the package, without importing it.
+
+    ``src/spectramr/__init__.py`` is the single writer for the version --
+    ``scripts/release/bump_version.py`` writes it there, to ``CHANGELOG.md`` and
+    to ``CITATION.cff``, and ``scripts/release/build_dist.py`` reconciles those
+    against the git tag. A literal here would be a FIFTH declaration that no
+    comparator reads, and it drifted exactly that way: it still said ``0.1.0``
+    after ``v0.1.1`` was cut, and Read the Docs rendered ``0.1.0`` onto every
+    published page. The conda recipe under ``conda/`` reads the same file with
+    ``load_file_regex`` for the same reason.
+
+    Parsed as text rather than imported: ``import spectramr`` pulls in torch and
+    the whole dependency graph, which a docs build should not need merely to
+    learn its own version number. Raises rather than defaulting -- a version
+    silently falling back to a placeholder is worse than a failed build.
+    """
+    init = os.path.join(os.path.dirname(__file__), "..", "src", "spectramr", "__init__.py")
+    with open(init, encoding="utf-8") as handle:
+        text = handle.read()
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    if match is None:
+        raise RuntimeError(f"no __version__ found in {init}")
+    return match.group(1)
+
+
+release = _declared_version()
+# The short X.Y form Sphinx shows in the sidebar, derived from the same string.
+version = ".".join(release.split(".")[:2])
 
 extensions = [
     "myst_parser",
@@ -46,13 +76,27 @@ _try_extension("sphinx_copybutton")
 # autoapi, delete every `docs/api/*.rst`, drop `sphinx.ext.autodoc` above,
 # and uncomment the autoapi block in `archive/autoapi_config.py`.
 
-# Heavy native deps are mocked so the build works on a CPU-only Read the
-# Docs runner without GPU wheels. But mocking `torch` breaks type-hint
-# evaluation in any module that uses `str | torch.device` syntax (PEP 604
-# unions require real types, not MagicMock). So we mock ONLY the packages
-# that aren't actually installed in the current environment — the local
-# `.venv` and the cluster get the real packages; RtD's bare CPU runner
-# falls back to mocks.
+# Heavy native deps are mocked so the build works on a CPU-only Read the Docs
+# runner without GPU wheels. Mock ONLY what is genuinely absent: the local
+# `.venv` and the cluster carry the real packages, and RTD gets the CPU torch
+# wheel from `.readthedocs.yaml`'s `pre_install` step.
+#
+# Mocking is not free, and the cost has a narrow shape worth stating exactly,
+# because the obvious statement of it is wrong. Sphinx's mock
+# (`sphinx.ext.autodoc._dynamic._mock._MockObject`) raises `TypeError:
+# unsupported operand type(s) for |` for a PEP 604 union with a mock on EITHER
+# side -- `str | torch.device`, `torch.Tensor | None`, `None | torch.Tensor`.
+# Nothing else raises: `@torch.no_grad()`, a bare `x: torch.Tensor` and a
+# `Tensor["N K"]` subscript all pass through as mocks (probed 2026-09-05).
+#
+# So `from __future__ import annotations` protects most sites -- it makes a
+# signature annotation a string that is never evaluated -- and it is why a
+# mocked torch costs far less than the union count suggests. It does NOT
+# protect a module-level alias (`Device = str | torch.device`,
+# `spectramr/core/types.py:24`), a default value, or a pydantic field, which
+# pydantic resolves at class construction. Across `src/spectramr`: 857 of 2091
+# modules lack the future import, and 212 modules / 655 sites sit in a shape
+# that raises under the mock.
 _HEAVY_DEPS = [
     "torch",
     "torchio",
@@ -253,16 +297,23 @@ nitpicky = False
 suppress_warnings = [
     "ref.python",
     "docutils",
-    # Many submodules of this repo import `torch.utils.tensorboard` at the
-    # top level. When `tensorboard` is mocked (because it's not installed in
-    # the RtD CPU runner), `torch.utils.tensorboard.__init__` does
-    # `Version(tensorboard.__version__)` — that fails because the mock's
-    # `__version__` is a MagicMock, not a string. The result: autodoc
-    # cannot import the submodule and emits a warning. The build still
-    # produces correct docs for every module that DOES import cleanly; the
-    # mocked-cascade subset just lacks its auto-generated content. We
-    # suppress the warning class until either (a) tensorboard moves into
-    # the docs extra or (b) the affected import sites are wrapped in
-    # `try / except ImportError` guards.
+    # STALE AS OF PR #1858, AND KEPT ONLY TO DATE THE CLAIM. The original
+    # reason: many submodules import `torch.utils.tensorboard` at the top
+    # level, and when `tensorboard` is mocked `torch.utils.tensorboard.__init__`
+    # does `Version(tensorboard.__version__)`, which fails because the mock's
+    # `__version__` is a MagicMock rather than a string — autodoc then cannot
+    # import the submodule and emits a warning.
+    #
+    # That premise no longer holds. RTD installs the project (`python.install`
+    # in .readthedocs.yaml), so tensorboard arrives as a real transitive
+    # dependency and nothing is mocked there. Measured 2026-09-05 on the public
+    # tree at b83ecb18a with this entry REMOVED: `build succeeded`, zero sphinx
+    # warnings. The suppression is therefore inert today and can only hide a
+    # future breakage — an unimportable module costs a silently missing API
+    # section instead of a warning `fail_on_warning: true` would catch, which
+    # is exactly how a torch-less build loses 77 of 105 signatures without
+    # turning red. Removal is tracked in issue #1860 and is deliberately
+    # sequenced AFTER the first green RTD build, so a new failure mode is not
+    # enabled by the same change that first lets RTD reach sphinx at all.
     "autodoc.import_object",
 ]

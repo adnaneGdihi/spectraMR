@@ -14,6 +14,7 @@ from torch.optim import SGD, Adam, AdamW, Optimizer, RMSprop
 
 from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.builders import OptimizationBuilder
+from tests.utils.repo_scripts import require_repo_file
 
 
 class DummyModel(nn.Module):
@@ -56,7 +57,7 @@ def config_reconstruction():
     reconstruction training_mode).
     """
     return TrainingSettings.from_yaml(
-        "experiments/inprogress/hilbert_mamba/exp_hm_01_ct_mamba.yaml"
+        str(require_repo_file("experiments/inprogress/hilbert_mamba/exp_hm_01_ct_mamba.yaml"))
     )
 
 
@@ -70,7 +71,7 @@ def config_gan():
     minimal v6.x GAN exemplar.
     """
     return TrainingSettings.from_yaml(
-        "experiments/inprogress/dummy/dummy_gan.yaml"
+        str(require_repo_file("experiments/inprogress/dummy/dummy_gan.yaml"))
     )
 
 
@@ -265,9 +266,7 @@ class TestOptimizationBuilderBuilderInterface:
         result = builder.validate()
         assert result is builder  # Returns self for chaining
 
-    def test_validate_fails_without_optimizers(
-        self, config_reconstruction, dummy_models
-    ):
+    def test_validate_fails_without_optimizers(self, config_reconstruction, dummy_models):
         """Test that validation fails if no optimizers created."""
         builder = OptimizationBuilder(config_reconstruction, models=dummy_models)
         # Don't call build_optimizers()
@@ -361,9 +360,7 @@ class TestBuildSchedulersRaisesOnUnknown:
 
     def test_build_schedulers_known_type_creates(self, dummy_model):
         """A known scheduler type is created and stored (alias 'cosine' normalized)."""
-        builder = self._make_builder_with_optimizer(
-            {"type": "cosine", "kwargs": {}}, dummy_model
-        )
+        builder = self._make_builder_with_optimizer({"type": "cosine", "kwargs": {}}, dummy_model)
         result = builder.build_schedulers()
         assert result is builder
         assert "opt_g" in builder._schedulers

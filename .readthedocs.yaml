@@ -1,14 +1,18 @@
 # Read the Docs build for https://spectramr.readthedocs.io
 #
-# `fail_on_warning: true` is deliberate and it passes. Measured 2026-09-04 against
-# a fresh clone of the PUBLIC tree -- which is what RTD builds -- with the mock set
-# RTD's thin environment produces (every heavy dep a `pip install .[docs]` does NOT
-# provide forced into `autodoc_mock_imports`): `sphinx-build -W` exited 0 with zero
-# sphinx warnings and 84 pages. Do not measure this in the private checkout: it
-# carries docs/api/ (174 generated rst files, not in public_allowlist.txt and never
-# shipped), whose re-documented members raise 527 unsuppressable "duplicate object
-# description" warnings. Sphinx emits those with no `type=`, so `suppress_warnings`
-# in docs/conf.py cannot reach them -- they read as a blocker and are not one here.
+# `fail_on_warning: true` is deliberate. Measured 2026-09-04 against a fresh clone
+# of the PUBLIC tree -- which is what RTD builds -- with the mock set RTD's thin
+# environment produces (every heavy dep a `pip install .[docs]` does NOT provide
+# forced into `autodoc_mock_imports`): `sphinx-build -W` exited 0 with zero sphinx
+# warnings and 84 pages. That is a LOCAL measurement: as of 2026-09-05 the sphinx
+# phase had never once executed on RTD itself -- every build died in `pre_install`
+# at ~22 s (see below) -- so it is evidence, not proof. Read the first green build
+# via the v2 API and confirm `length` is in the ~190 s range before trusting it.
+# Do not measure this in the private checkout: it carries docs/api/ (174 generated
+# rst files, not in public_allowlist.txt and never shipped), whose re-documented
+# members raise 527 unsuppressable "duplicate object description" warnings. Sphinx
+# emits those with no `type=`, so `suppress_warnings` in docs/conf.py cannot reach
+# them -- they read as a blocker and are not one here.
 version: 2
 
 build:
@@ -16,13 +20,65 @@ build:
   tools:
     python: "3.12"
   jobs:
+    # `pip install --upgrade pip` MUST stay the first command here, and it is load
+    # bearing rather than hygiene. `build.jobs.pre_install` runs immediately after
+    # `python -mvirtualenv` and BEFORE RTD's own `pip install --upgrade pip`, so
+    # the torch line below would otherwise execute under the version virtualenv
+    # seeds: `pip==23.1`. That pip compares a wheel's metadata `Name:` against the
+    # index's project name WITHOUT PEP 503 normalization, so it discarded its own
+    # valid `typing_extensions-4.16.0-py3-none-any.whl` -- the file's metadata says
+    # `typing_extensions`, the index says `typing-extensions` -- fell back to the
+    # sdist, and could not resolve the sdist's PEP 517 build dep `flit_core`
+    # because `--index-url` REPLACES PyPI rather than adding to it. Every version
+    # failed this way (latest, stable, and the Dependabot PR builds), each at ~22 s:
+    #   https://readthedocs.org/api/v2/build/34402614/   (latest)
+    #   https://readthedocs.org/api/v2/build/34403022/   (stable)
+    # Reproduced byte-identically in a local `pip==23.1` venv, and that same venv
+    # installs cleanly once pip is upgraded -- torch-2.14.0+cpu, torchvision
+    # -0.29.0+cpu, typing_extensions-4.16.0 from the wheel, no sdist build.
+    #
+    # Do NOT "fix" this by adding `--extra-index-url https://pypi.org/simple`: that
+    # re-exposes PyPI's CUDA torch to the resolver, and the reason the CPU wheel
+    # would still win (a PEP 440 local version sorts above the same public one) is
+    # a subtlety this file should not be betting the build on.
+    #
     # Install the CPU torch wheel BEFORE the project, or `pip install .[docs]`
     # resolves `torch>=2.8` from PyPI and drags in the whole nvidia-*-cu13 stack,
     # cuda-toolkit and triton -- 5.1 GB measured, none of it used to render a page,
-    # and enough to exhaust the build's time and disk budget. docs/conf.py mocks
-    # what it cannot import, so the docs do not need a GPU build; they do need
-    # torch importable, because autodoc imports the package.
+    # and enough to exhaust the build's time and disk budget. This step does not
+    # decide WHETHER torch is installed -- `torch>=2.8` and `torchvision>=0.23` are
+    # hard `[project.dependencies]`, so installing the project installs them either
+    # way -- only WHICH torch.
+    #
+    # The docs do NOT need torch to build, and the project install is kept for what
+    # it renders rather than for whether it exits 0. Measured 2026-09-05 against the
+    # public tree at b83ecb18a, in a venv holding nothing but the `[docs]` extra --
+    # no torch, and no numpy or pydantic either, since those are project deps too:
+    # sphinx printed `build succeeded` over the same 37 pages, and the ONLY warning
+    # in the whole log was the package's own NOT-FOR-CLINICAL-USE `UserWarning`, not
+    # a sphinx one. What is lost is content: 77 of the 105 rendered `spectramr.*`
+    # signatures vanish, and SEVEN of the nine public pages carrying an autodoc
+    # directive lose their entire API section -- `metrics_reference` 21 -> 0,
+    # `modules/loader` 18 -> 0, `losses_reference` 14 -> 0, `strategies_reference`
+    # 9 -> 0, `modules/unet` 8 -> 0, `reference/workflow_profiles` 5 -> 0,
+    # `modules/bloch` 2 -> 0. Only `run_provenance_and_logging` (22) and
+    # `accelerated_run_contract` (6) survive, being torch-free.
+    #
+    # COUNT RENDERED SIGNATURES (`class="sig sig-object py"` in the built HTML),
+    # never index anchors. `losses_reference` and `strategies_reference` mark every
+    # directive `:no-index:`, which suppresses the `id="spectramr.<...>"` attribute
+    # while still rendering the signature -- so an anchor grep cannot see 16 of the
+    # 105, and this comment first shipped the loss as "61 of 89" because both halves
+    # were measured the same blind way and their difference looked clean.
+    #
+    # The loss is SILENT: docs/conf.py suppresses `autodoc.import_object`, so a module
+    # autodoc cannot import costs a missing section, never a warning. Dropping the
+    # install therefore trades a working page set for a green build with holes in
+    # it -- which is the failure mode `fail_on_warning: true` above exists to catch
+    # and cannot see. The mechanism by which a mocked torch loses a module is
+    # narrow and documented at the `_HEAVY_DEPS` block in docs/conf.py.
     pre_install:
+      - pip install --upgrade pip
       - pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 sphinx:

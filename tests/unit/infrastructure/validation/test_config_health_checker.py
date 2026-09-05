@@ -28,6 +28,7 @@ from spectramr.infrastructure.validation.config_health_checker import (
 )
 from tests.utils.config_block_stub import block_stub
 from tests.utils.data_config_stub import DataConfigStub
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _make_config(
@@ -1651,7 +1652,7 @@ def _subvoxel_cfg(in_channels: int = 24, n_frames: int = 8, marker_channels: boo
 
     from spectramr.config.settings import TrainingSettings
 
-    src = pathlib.Path("experiments/inprogress/vf/exp_vf_01_subvoxel_superres_v2.yaml")
+    src = require_repo_file("experiments/inprogress/vf/exp_vf_01_subvoxel_superres_v2.yaml")
     raw = yaml.safe_load(src.read_text())
     raw["model"]["in_channels"] = in_channels
     macq = raw["physics"]["multi_acquisition"]

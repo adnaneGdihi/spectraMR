@@ -90,9 +90,25 @@ conftest.py
 # LOC), a research programme rather than framework surface, and CLAUDE.md records
 # it as under heavy active development. Its in-package half DOES ship
 # (spectramr.core.metrics.meta_evaluation), so denying these costs real coverage:
-# 15 of the 63 shipped tests importing that subpackage. 48 survive, so it is a
+# 16 of the 65 test FILES importing that subpackage. 49 survive, so it is a
 # partial loss, not an untested subsystem -- measured, not assumed. Shipping the
-# 36.8k LOC to recover 15 tests is the worse trade.
+# 36.8k LOC to recover 16 files is the worse trade.
+#
+# Re-measured 2026-09-05 (AST import scan of the private tree, checked against a
+# fresh --strict export): 16/65/49. It read 15/63/48 when this block was written
+# and drifted on corpus growth alone -- two new files, one denied, one surviving
+# -- with no allowlist edit involved, so RE-MEASURE this line, never quote it:
+#   python - <<'EOF'
+#   import ast, pathlib
+#   T="spectramr.core.metrics.meta_evaluation"
+#   hit=lambda m,names: m==T or m.startswith(T+".") or (
+#       m=="spectramr.core.metrics" and any(a.name=="meta_evaluation" for a in names))
+#   f=[p for p in pathlib.Path("tests").rglob("*.py")
+#      if any((isinstance(n,ast.ImportFrom) and hit(n.module or "", n.names))
+#             or (isinstance(n,ast.Import) and any(a.name.startswith(T) for a in n.names))
+#             for n in ast.walk(ast.parse(p.read_text())))]
+#   print(len(f))   # then count how many exist in the export tree
+#   EOF
 !tests/contracts/test_metric_registry.py
 !tests/unit/core/metrics/test_metric_directions.py
 !tests/unit/core/metrics/test_metric_registry_health.py
@@ -467,10 +483,12 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 # can no longer see its corpus leaves the public lane rather than passing vacuously.
 !tests/unit/ci/test_check_acceleration_ladder_realisable.py
 !tests/unit/ci/test_check_getattr_names_a_real_field.py
+!tests/unit/ci/test_run_required_locally.py                 # scripts/ci/run_required_locally.py; 0 / 14
 !tests/unit/ci/test_rerun_wrapper.py
 !tests/unit/ci/test_smoke_wrapper_hygiene.py
 !tests/unit/scripts/test_check_experiment_configs_load.py
 !tests/unit/scripts/test_check_model_kwargs_are_read.py
+!tests/unit/scripts/test_check_ulf_operator_is_wired.py     # scripts/ci/check_ulf_operator_is_wired.py; 0 / 16
 !tests/unit/scripts/test_smoke_wrapper.py
 
 # scripts/sim2rank/ -- third and final group; same decision as the two above.
@@ -480,6 +498,7 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 !tests/unit/test_sim2rank_manifest_integration.py
 !tests/unit/test_sim2rank_mode_guard.py
 !tests/unit/test_sim2rank_per_axis_all_generations.py
+!tests/unit/test_sim2rank_seed_flag.py                      # 0 / 8
 !tests/unit/test_sim2rank_segment_folder.py
 
 # Validation-image / mosaic tooling (scripts/*.py, scripts/ci/audit_validation_images.py).
@@ -487,6 +506,12 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 # measurement, not taste: all five themselves read experiments/, TODO/ or
 # tests_experiments/, so shipping them relocates this same problem rather than
 # solving it.
+# `tests/unit/tools/test_audit_validation_images.py` was denied here from the
+# start; `tests/unit/scripts/test_audit_validation_images.py` -- a SECOND test
+# file for the SAME script -- was not. Both load
+# scripts/ci/audit_validation_images.py by path. The census that built this block
+# grouped by the test's own directory, so the pair was never seen as a pair.
+!tests/unit/scripts/test_audit_validation_images.py         # 0 / 2 (+1 cohort-absent skip)
 !tests/unit/scripts/test_validation_mosaic_audit.py
 !tests/unit/tools/test_audit_validation_images.py
 !tests/unit/tools/test_generate_validation_mosaic.py
@@ -564,6 +589,63 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 # Both are correct on this branch; neither has a subject in the distribution.
 !tests/unit/tools/test_production_plan_batch_partition.py    # collection error -> Interrupted
 !tests/unit/scripts/test_rename_package_identifier.py        # 0 / 14
+
+# ---- deny block 4: measured by failure-set diff, not by census -------------
+# The three blocks above scan for a SHAPE (an inline path chain, a module-level
+# alias, an AST import) and then measure what they found. This one inverts it:
+# run the suite in both trees at ONE sha and diff the failure sets, so a file is
+# reached by its behaviour rather than by a pattern someone thought to look for.
+# That is what caught the pair below that the directory-grouped census split, and
+# the four whose subject is named only inside a fixture.
+#
+# Why a diff and not a count: `dev` is standing-red, so "N failed in the export"
+# proves nothing about the boundary. Method -- export_public_tree.py --sha
+# 1795484c0 --strict into a fresh dir, `git worktree --detach` the same sha for
+# the control, one `pytest --junitxml` session each, same .venv, same machine.
+#
+# `git init` in the export is load-bearing: tests/utils/corpus.py::repo_root()
+# emits a visible skip when no .git sits above it, so a plain exported directory
+# SKIPS the corpus tests while the real public repo -- a checkout -- FAILS them.
+# Measuring in a non-git export understates this by the whole corpus.
+#
+# Measured (2026-09-05, 64 candidate files): 975 export testcases against 4292
+# private, 915 in common. 272 fail ONLY in the export; 17 fail in both (standing
+# `dev` debt, out of scope here); 4 fail only in private. The 60 cases unique to
+# the export are all SKIPS, so nothing hid in the gap.
+#
+# Those 272 split by the bar this file already uses twice: 20 files / 134
+# failures are 100% failing and denied below; 35 files / 138 failures keep
+# passing tests and get per-test guards instead (#1589). Every skip counted
+# against a denied file below is pytest's "got empty parameter set" -- the
+# @parametrize-over-an-empty-corpus shape, which is absence of coverage, not
+# coverage. No denied file has a single passing test in the export.
+#
+# experiments/{inprogress,campaigns}/ -- 14 files whose subject is one arm, or a
+# cohort, read by path. Nothing survives the corpus being absent.
+!tests/audit/test_inprogress_knee_cohort_invariants.py       # 0 / 2
+!tests/audit/test_kspace_filling_config_honesty.py           # 0 / 1
+!tests/unit/builders/test_optimization_builder_ttur_2026_06.py  # 0 / 3
+!tests/unit/config/test_exp11_kspace_filling_loss_weights.py  # 0 / 1
+!tests/unit/config/test_f11_singleton_yaml_fixes.py          # 0 / 4
+!tests/unit/config/test_f16_generator_build_yaml_fixes.py    # 0 / 8
+!tests/unit/config/test_mrixfields_validation_batch_cap_2026_07_19.py  # 0 / 3
+!tests/unit/config/test_vf_arms_fully_load.py                # 0 / 1
+!tests/unit/experiments/test_contrast_field_agnostic_arms_resolve.py   # 0 / 6
+!tests/unit/experiments/test_direct_ulf_to_hf_sr.py          # 0 / 6
+!tests/unit/experiments/test_mrixfields_arms_audit.py        # 0 / 2
+!tests/unit/experiments/test_raster_control_single_knob.py   # 0 / 5
+!tests/unit/reporting/test_mrixfields_reporting_coverage.py  # 0 / 1
+!tests/unit/test_vf_digital_twin_wiring.py                   # 0 / 49 -- the largest single file
+#
+# scripts/eda/ -- the dataset-EDA runner, a cluster-side exploratory tool.
+!tests/unit/data/eda/test_cli.py                             # scripts/eda/dataset_eda_runner.py; 0 / 1
+#
+# scripts/container/ -- Dockerfile + spectramr.def, neither of which ships. Its
+# two other tests already "pass" as `if not path.exists(): pytest.skip` -- the
+# absence-keyed shape this file rejects, since it cannot tell the publication
+# boundary from someone deleting the Dockerfile. Denying the file removes the
+# blind guard with it rather than leaving it in the public tree as a green.
+!tests/unit/scripts/test_container_entrypoint.py             # 0 / 1 (+2 absence-skips)
 
 # ---- CI workflows ----------------------------------------------------------
 # Workstream F's condition is met: the two Claude workflows are denied below, so
