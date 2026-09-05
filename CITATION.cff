@@ -11,7 +11,7 @@ authors:
 # `date-released` is stamped when the tag is actually cut: it asserted 2026-08-01
 # while no tag, GitHub release or PyPI distribution existed, and a citation is the
 # one file whose whole job is to be verifiable.
-version: 0.1.2.dev1
+version: 0.1.3.dev1
 date-released: "2026-09-04"
 license: Apache-2.0
 # `doi` is the CONCEPT DOI -- the parent record that always redirects to the newest

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-05
+
+### Fixed
+- **The Read the Docs build, which had failed on every version since 0.1.0.** Every
+  build died in `pre_install` at ~22 s -- `latest`, `stable` and the Dependabot PR
+  builds alike -- so the sphinx phase had never once executed there. `build.jobs`
+  runs before Read the Docs upgrades pip, so the CPU-torch line executed under the
+  `pip==23.1` that virtualenv seeds; that pip compares a wheel's metadata `Name:`
+  against the index's project name without PEP 503 normalisation, discarded its own
+  valid `typing_extensions` wheel, fell back to the sdist, and could not resolve the
+  sdist's `flit_core` build dependency because `--index-url` replaces PyPI rather
+  than adding to it. `pip install --upgrade pip` now runs first in `pre_install`.
+- **The published documentation announced the wrong version.** `docs/conf.py` set
+  `release` from a literal `"0.1.0"` -- a fifth version declaration that
+  `build_dist.py` does not reconcile against the other four -- so every rendered page
+  still said `0.1.0` after `v0.1.1` was cut. `conf.py` now parses `__version__` out of
+  `src/spectramr/__init__.py`, the single writer, as text rather than by importing the
+  package, and raises rather than falling back to a placeholder.
+- **`MetricsRegistry` could answer with a wrong value instead of an error.** `clear()`,
+  `snapshot()` and `restore()` were three independent enumerations of the mutable
+  registration tables, and one of them was incomplete: the test-isolation helper
+  restored three of the six tables `clear()` wipes, so `_needs` stayed empty for the
+  rest of the process and every later `needs()` returned `()` -- which the caller
+  cannot tell apart from "declares nothing". Under `pytest-xdist` that made the
+  failure set depend on which test files shared a worker. All three helpers now
+  iterate one declared tuple, and a test in `test_registry.py` fails if a table is
+  added without listing it.
+
+### Changed
+- The export no longer ships 20 test files that could only fail here, because they
+  exercise internal scripts and experiment cohorts this repository does not carry.
+  `tests/utils/repo_scripts.py` gains `require_repo_file` and `skip_if_public_export`,
+  so a test needing a file the export omits skips with a reason instead of erroring.
+  The published tree goes from 4790 files to 4771.
+- `make fuzz` and `make mutate` use the `$(VENV)` prefix the rest of the Makefile
+  already uses, rather than spelling `. .venv/bin/activate` twice per target.
+- Dependencies: `monai` 1.5.2 -> 1.6.0, `pillow` 12.2.0 -> 12.3.0, `setuptools`
+  81.0.0 -> 83.0.0.
+
+
 ## [0.1.1] - 2026-09-04
 
 ### Added
@@ -124,6 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      return 404, so the 200s here mean something. The `[0.1.0]` heading date above
      and `date-released` in CITATION.cff are two further declarations of the same
      day, and nothing reconciles the three; change them together. -->
-[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.2
 [0.1.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.1
 [0.1.0]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.0
