@@ -31,6 +31,7 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.builders.directors.data_pipeline_director import (
     DataPipelineDirector,
 )
+from tests.utils.repo_scripts import require_repo_file
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "tests" / "debug" / "inspect_val_loader.py"
@@ -63,7 +64,11 @@ def test_import_does_not_run_the_inspection(script: types.ModuleType) -> None:
 def test_default_config_exists(script: types.ModuleType) -> None:
     """The #1280 path defect: a default arm that no longer exists on disk."""
     default = script.DEFAULT_CONFIG
-    assert default.is_file(), (
+    # require_repo_file, not `.is_file()`: this script ships in the public export
+    # while `experiments/` does not, so there the arm's absence is the publication
+    # boundary and not #1280. In every other tree a default that does not resolve
+    # is still exactly the defect this test was written for, and still fails loud.
+    assert require_repo_file(str(default.relative_to(REPO))).is_file(), (
         f"DEFAULT_CONFIG points at a file that does not exist: {default}. "
         "The experiments tree was reorganised; repoint it at a live arm."
     )

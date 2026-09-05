@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import yaml
 from tests.utils.optional_backends import requires_cuda_for_mamba
+from tests.utils.repo_scripts import require_repo_file
 
 
 # --- Real Mamba in BiMamba4DBlock / MRFMambaBlock4D -------------------------
@@ -206,8 +207,10 @@ def test_mrf_dictless_matcher_round_trip() -> None:
 def test_campaign_manifests_parse() -> None:
     root = Path(__file__).resolve().parents[3]
     for cohort in ("fmri_2026_cohort", "mrf_2026_cohort"):
-        path = root / f"experiments/campaigns/{cohort}.yaml"
-        assert path.is_file(), f"missing manifest {path}"
+        # require_repo_file, not `.is_file()`: a manifest the allowlist never
+        # selects is the publication boundary; a manifest that was DELETED is the
+        # defect, and stays loud in every tree that is not the export.
+        path = require_repo_file(f"experiments/campaigns/{cohort}.yaml")
         parsed = yaml.safe_load(path.read_text())
         assert parsed["name"] == cohort
         assert len(parsed["experiments"]) == 10
@@ -220,8 +223,9 @@ def test_campaign_manifests_parse() -> None:
 
 
 def test_reporting_block_lists_new_plotters() -> None:
-    root = Path(__file__).resolve().parents[3]
-    yaml_path = root / "experiments/inprogress/fmri_2026/idea_1_spatiotemporal_adaptive_sfc.yaml"
+    yaml_path = require_repo_file(
+        "experiments/inprogress/fmri_2026/idea_1_spatiotemporal_adaptive_sfc.yaml"
+    )
     cfg = yaml.safe_load(yaml_path.read_text())
     figs = cfg.get("reporting", {}).get("figures") or []
     assert "fig_c1_beltrami_field" in figs

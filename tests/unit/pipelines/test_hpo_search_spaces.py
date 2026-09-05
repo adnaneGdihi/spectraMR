@@ -36,6 +36,7 @@ from spectramr.pipelines.hpo_search_spaces import (
     load_presets,
     make_search_space_template,
 )
+from tests.utils.repo_scripts import require_repo_file
 
 # ---------------------------------------------------------------------------
 # Distribution
@@ -56,9 +57,7 @@ class TestDistribution:
             Distribution(kind="uniform", low=1.0, high=1.0)
 
     def test_loguniform_requires_positive_low(self):
-        with pytest.raises(
-            ValueError, match="loguniform distributions require low > 0"
-        ):
+        with pytest.raises(ValueError, match="loguniform distributions require low > 0"):
             Distribution(kind="loguniform", low=0.0, high=1.0)
 
     def test_unknown_kind_rejected(self):
@@ -320,9 +319,7 @@ class TestApplyDottedOverride:
                 ],
             },
         }
-        apply_dotted_override(
-            cfg, "losses.kspace_losses[name=log_spectral].weight", 0.3
-        )
+        apply_dotted_override(cfg, "losses.kspace_losses[name=log_spectral].weight", 0.3)
         kspace = cfg["losses"]["kspace_losses"]
         assert kspace[0]["weight"] == 1.0  # unchanged
         assert kspace[1]["weight"] == 0.3  # the one we targeted
@@ -342,12 +339,8 @@ class TestApplyDottedOverride:
         """End-to-end: load the kan_dual_domain preset, mock-sample one trial,
         and apply every sampled override to a real headline YAML — every
         single override must succeed without raising."""
-        headline = (
-            Path(__file__).resolve().parents[3]
-            / "experiments"
-            / "inprogress"
-            / "kspace_filling"
-            / "experiment_11_kan_dual_domain.yaml"
+        headline = require_repo_file(
+            "experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml"
         )
         with open(headline) as fh:
             cfg = yaml.safe_load(fh)
@@ -377,9 +370,7 @@ class TestApplyDottedOverride:
         assert landed == overrides[lr_path]
 
     @pytest.mark.parametrize("preset_name", sorted(PRESETS))
-    def test_every_preset_applies_cleanly_to_headline_yaml(
-        self, preset_name: str
-    ) -> None:
+    def test_every_preset_applies_cleanly_to_headline_yaml(self, preset_name: str) -> None:
         """Every built-in preset's list selectors must resolve against a real arm.
 
         Plain dotted keys auto-create missing dicts, so a ``model_kwargs`` path
@@ -390,12 +381,8 @@ class TestApplyDottedOverride:
         so any HPO run using ``kan_dual_domain`` or ``loss_weights_only`` died on
         trial 1 with "no list item with name=...".
         """
-        headline = (
-            Path(__file__).resolve().parents[3]
-            / "experiments"
-            / "inprogress"
-            / "kspace_filling"
-            / "experiment_11_kan_dual_domain.yaml"
+        headline = require_repo_file(
+            "experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml"
         )
         with open(headline) as fh:
             cfg = yaml.safe_load(fh)
@@ -416,8 +403,7 @@ class TestApplyDottedOverride:
         # loss presets, this invariant would still pass while testing nothing.
         if preset_name in ("kan_dual_domain", "loss_weights_only"):
             assert selectors == 4, (
-                f"{preset_name} should carry 4 list-selector loss paths; "
-                f"found {selectors}"
+                f"{preset_name} should carry 4 list-selector loss paths; found {selectors}"
             )
 
 

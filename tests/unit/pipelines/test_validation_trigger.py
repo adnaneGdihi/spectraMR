@@ -9,6 +9,8 @@ Ensures that:
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 
 class TestValidationTriggerLogic:
     """Unit tests for the validation trigger condition in _execute_training_loop.
@@ -289,11 +291,9 @@ class TestExperiment11Config:
         "declares the retired flat spelling" rather than the far more confusing
         "on_epoch missing from schedule".
         """
-        from pathlib import Path
-
         import yaml
 
-        config = yaml.safe_load(Path(self.ARM).read_text())
+        config = yaml.safe_load(require_repo_file(self.ARM).read_text())
         validation = config.get("validation", {})
         retired = [k for k in ("eval_on_epoch", "eval_interval") if k in validation]
         assert not retired, (

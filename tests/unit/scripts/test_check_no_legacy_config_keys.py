@@ -20,8 +20,26 @@ from pathlib import Path
 import pytest
 
 from spectramr.config.schemas.renames import RenameRecord
+from tests.utils.repo_scripts import require_repo_file
 
 _CI = Path(__file__).resolve().parents[3] / "scripts" / "ci"
+
+#: The gate ships; this does not. `_version_status` reaches it per scanned file
+#: through `_version_migrator()`, which execs it by path, so the failure surfaces
+#: as FileNotFoundError from inside a shipped script rather than at import.
+_VERSION_MIGRATOR = "scripts/migrations/migrate_config_version_to_v1.py"
+
+
+@pytest.fixture
+def version_migrator() -> None:
+    """Require the migrator the gate classifies versions with.
+
+    Marked on the tests that actually reach it, not on `_with_table`: a scan that
+    never classifies a version (TestScope's v5 config is skipped before the
+    classifier runs) has no migrator dependency and must keep running in the
+    export.
+    """
+    require_repo_file(_VERSION_MIGRATOR)
 
 
 def _load(name: str):
@@ -68,6 +86,7 @@ losses:
 """
 
 
+@pytest.mark.usefixtures("version_migrator")
 class TestBlockAwareness:
     def test_flags_the_key_only_under_its_declared_block(self, gate, tmp_path, capsys):
         (tmp_path / "arm.yaml").write_text(_ARM)
@@ -137,17 +156,13 @@ class TestScope:
         assert "scanned 0 loadable config(s)" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("version_migrator")
 class TestRefusalsAreReportedSeparately:
-    def test_a_disagreement_is_not_offered_as_auto_fixable(
-        self, gate, tmp_path, capsys
-    ):
+    def test_a_disagreement_is_not_offered_as_auto_fixable(self, gate, tmp_path, capsys):
         """Both spellings with different values needs a human, so printing the
         fixer command against it would send the author in a circle."""
         (tmp_path / "arm.yaml").write_text(
-            "config_version: '1.0'\n"
-            "workflow:\n"
-            "  name: mri_structural\n"
-            "  regime: mri_quantitative\n"
+            "config_version: '1.0'\nworkflow:\n  name: mri_structural\n  regime: mri_quantitative\n"
         )
         _with_table(
             gate,
@@ -166,6 +181,7 @@ class TestRefusalsAreReportedSeparately:
         assert "the fixer can rewrite" not in out
 
 
+@pytest.mark.usefixtures("version_migrator")
 class TestTheCheckIsTheFixer:
     def test_gate_reports_exactly_what_the_fixer_would_change(self, gate, tmp_path):
         """The whole point of delegating: run both and compare."""
@@ -185,6 +201,7 @@ class TestTheCheckIsTheFixer:
         assert gate.main([str(tmp_path)]) == 1
 
 
+@pytest.mark.usefixtures("version_migrator")
 class TestLegacyVersionCountdown:
     """The gate also counts LEGACY SCHEMA VERSIONS, next to the staged keys.
 
@@ -219,9 +236,7 @@ class TestLegacyVersionCountdown:
     def test_canonical_is_not_counted_as_legacy(self, gate) -> None:
         from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
 
-        status, _ = gate._version_status(
-            f"config_version: '{CANONICAL_CONFIG_VERSION}'\n"
-        )
+        status, _ = gate._version_status(f"config_version: '{CANONICAL_CONFIG_VERSION}'\n")
         assert status == "canonical"
 
     def test_the_migrator_module_is_loaded_once(self, gate) -> None:
@@ -248,6 +263,7 @@ class TestPerRecordCountdown:
     countdown the line-scanner cannot see.
     """
 
+    @pytest.mark.usefixtures("version_migrator")
     def test_per_record_counts_are_reported(self, gate, tmp_path, capsys) -> None:
         rec = RenameRecord(
             legacy="losses.output_domain",
@@ -266,9 +282,8 @@ class TestPerRecordCountdown:
             "the countdown must name the record, not just report a total"
         )
 
-    def test_a_drained_record_is_listed_as_promotable(
-        self, gate, tmp_path, capsys
-    ) -> None:
+    @pytest.mark.usefixtures("version_migrator")
+    def test_a_drained_record_is_listed_as_promotable(self, gate, tmp_path, capsys) -> None:
         """Zero staged AND zero unreachable is the promotion condition."""
         rec = RenameRecord(
             legacy="losses.output_domain",
@@ -286,9 +301,7 @@ class TestPerRecordCountdown:
         assert "promotable" in out.lower()
         assert "losses.output_domain" in out
 
-    def test_the_corpus_is_enumerated_from_git_not_an_on_disk_glob(
-        self, gate
-    ) -> None:
+    def test_the_corpus_is_enumerated_from_git_not_an_on_disk_glob(self, gate) -> None:
         """An on-disk glob has a different subject on every machine.
 
         Cluster job 8004252 reported failures against two arms that exist in no
@@ -303,14 +316,10 @@ class TestPerRecordCountdown:
         import inspect
 
         src = inspect.getsource(gate.main)
-        assert "rglob" not in src, (
-            "main() must not enumerate the corpus with an on-disk glob"
-        )
+        assert "rglob" not in src, "main() must not enumerate the corpus with an on-disk glob"
         assert hasattr(gate, "_iter_corpus_yamls")
 
-    def test_git_enumeration_excludes_an_untracked_file(
-        self, gate, tmp_path
-    ) -> None:
+    def test_git_enumeration_excludes_an_untracked_file(self, gate, tmp_path) -> None:
         import subprocess
 
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
@@ -325,9 +334,7 @@ class TestPerRecordCountdown:
             "a generated-but-never-added arm must not enter the countdown"
         )
 
-    def test_a_non_git_root_announces_that_it_globbed_instead(
-        self, gate, tmp_path, capsys
-    ) -> None:
+    def test_a_non_git_root_announces_that_it_globbed_instead(self, gate, tmp_path, capsys) -> None:
         """Returning [] outside a checkout would report "scanned 0" as though
         the corpus were clean. Globbing is right there -- but it must SAY so,
         because the numbers then describe a different subject."""
@@ -348,9 +355,7 @@ class TestTheFixersDependenciesAreTheGates:
     which the gate's own docstring forbids -- was the only route left.
     """
 
-    def test_a_missing_fixer_dependency_names_the_gate_and_the_fix(
-        self, gate, monkeypatch
-    ) -> None:
+    def test_a_missing_fixer_dependency_names_the_gate_and_the_fix(self, gate, monkeypatch) -> None:
         """The traceback pointed at the fixer; the reader invoked the gate."""
         import importlib.util
 

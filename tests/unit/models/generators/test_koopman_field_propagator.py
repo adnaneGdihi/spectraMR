@@ -7,6 +7,7 @@ import torch
 
 from spectramr.infrastructure.physics.koopman_operator import koopman_continuous_propagate
 from spectramr.models.generators.koopman_field_propagator import KoopmanFieldPropagator
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _net(**kw) -> KoopmanFieldPropagator:
@@ -132,7 +133,7 @@ def test_synthetic_forward_probe_passes_for_both_arms() -> None:
 
     for arm in ("b310_koopman", "b310_ablate_nonlinear"):
         cfg = TrainingSettings.from_yaml(
-            f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"
+            str(require_repo_file(f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"))
         )
         report = synthetic_forward_probe(cfg)
         assert report.passed, f"{arm}: probe failed -> {getattr(report, 'message', report)}"

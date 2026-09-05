@@ -23,22 +23,24 @@ from pathlib import Path
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 REPO = Path(__file__).resolve().parents[3]
-SBATCH = REPO / "scripts" / "ci" / "run_all_tests.sbatch"
+_SBATCH_REL = "scripts/ci/run_all_tests.sbatch"
 
 PHASE_VARS = ["UNIT_EXIT", "INTEGRATION_EXIT", "SPECIALIZED_EXIT"]
 
 
 @pytest.fixture(scope="module")
 def script() -> str:
-    if not SBATCH.is_file():
-        pytest.skip(f"{SBATCH} not present")
-    return SBATCH.read_text()
+    return require_repo_file(_SBATCH_REL).read_text()
 
 
 def test_script_is_valid_bash() -> None:
     """A syntax error here is invisible until the job is queued on the cluster."""
-    result = subprocess.run(["bash", "-n", str(SBATCH)], capture_output=True, text=True)
+    result = subprocess.run(
+        ["bash", "-n", str(require_repo_file(_SBATCH_REL))], capture_output=True, text=True
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -52,9 +54,7 @@ def test_it_is_a_bash_script_not_sh(script: str) -> None:
 
 
 @pytest.mark.parametrize("var", PHASE_VARS)
-def test_phase_exit_code_is_not_captured_from_the_pipeline_status(
-    var: str, script: str
-) -> None:
+def test_phase_exit_code_is_not_captured_from_the_pipeline_status(var: str, script: str) -> None:
     """``VAR=$?`` after a ``tee`` is the #639 defect exactly."""
     assert f"{var}=$?" not in script, (
         f"{var} captures `tee`'s status, not pytest's; use ${{PIPESTATUS[0]}} "
@@ -68,22 +68,16 @@ def test_phase_exit_code_comes_from_pipestatus(var: str, script: str) -> None:
 
 
 @pytest.mark.parametrize("var", PHASE_VARS)
-def test_nothing_executes_between_the_pipeline_and_the_capture(
-    var: str, script: str
-) -> None:
+def test_nothing_executes_between_the_pipeline_and_the_capture(var: str, script: str) -> None:
     """PIPESTATUS is reset by the next command, so the read must be adjacent.
 
     Blank lines and comments are not commands and are allowed; anything else
     silently reinstates the bug while leaving the grep above satisfied.
     """
     lines = script.splitlines()
-    idx = next(
-        i for i, ln in enumerate(lines) if ln.strip() == f"{var}=${{PIPESTATUS[0]}}"
-    )
+    idx = next(i for i, ln in enumerate(lines) if ln.strip() == f"{var}=${{PIPESTATUS[0]}}")
     preceding = [
-        ln
-        for ln in reversed(lines[:idx])
-        if ln.strip() and not ln.strip().startswith("#")
+        ln for ln in reversed(lines[:idx]) if ln.strip() and not ln.strip().startswith("#")
     ]
     assert preceding, f"no command precedes {var}"
     assert preceding[0].strip().startswith("2>&1 | tee "), (
@@ -119,9 +113,7 @@ def test_the_old_idiom_really_did_swallow_the_failure() -> None:
 
 
 def test_the_new_idiom_surfaces_the_failure() -> None:
-    assert (
-        _run_bash("(exit 7) 2>&1 | tee /dev/null\nE=${PIPESTATUS[0]}\necho $E") == "7"
-    )
+    assert _run_bash("(exit 7) 2>&1 | tee /dev/null\nE=${PIPESTATUS[0]}\necho $E") == "7"
 
 
 def test_comments_between_pipeline_and_capture_are_harmless() -> None:
@@ -138,8 +130,5 @@ def test_a_command_between_pipeline_and_capture_destroys_it() -> None:
 
 def test_the_set_plus_e_wrapper_still_reports_the_real_code() -> None:
     """Phase 3's exact shape: non-blocking, but the code is still recoverable."""
-    body = (
-        "set -e\nset +e\n(exit 9) 2>&1 | tee /dev/null\n"
-        "E=${PIPESTATUS[0]}\nset -e\necho $E"
-    )
+    body = "set -e\nset +e\n(exit 9) 2>&1 | tee /dev/null\nE=${PIPESTATUS[0]}\nset -e\necho $E"
     assert _run_bash(body) == "9"

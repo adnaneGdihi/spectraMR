@@ -12,19 +12,17 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from spectramr.infrastructure.validation.config_health_checker import ConfigHealthChecker
 from tests.utils.config_block_stub import block_stub
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _cfg(model_type):
-    return SimpleNamespace(
-        model=SimpleNamespace(model_type=model_type, model_kwargs={})
-    )
+    return SimpleNamespace(model=SimpleNamespace(model_type=model_type, model_kwargs={}))
 
 
 @pytest.fixture(scope="module")
@@ -38,9 +36,7 @@ def registry():
 
 def test_check_reports_an_undeclared_model(registry):
     model_registry, get_caps = registry
-    undeclared = next(
-        (n for n in model_registry if get_caps(n) is None), None
-    )
+    undeclared = next((n for n in model_registry if get_caps(n) is None), None)
     assert undeclared is not None, "expected at least one unannotated model"
     r = ConfigHealthChecker().check_model_contract_declared(_cfg(undeclared))
     # Report-only: never gates (passed=True, info), but surfaces the gap.
@@ -70,9 +66,7 @@ def test_check_passes_a_fully_declared_model(registry):
 
 
 def test_check_skips_unknown_model():
-    r = ConfigHealthChecker().check_model_contract_declared(
-        _cfg("definitely_not_a_real_model_xyz")
-    )
+    r = ConfigHealthChecker().check_model_contract_declared(_cfg("definitely_not_a_real_model_xyz"))
     assert r.passed is True
     assert "not in registry" in r.message
 
@@ -90,12 +84,7 @@ def test_check_handles_missing_model_section():
 
 @pytest.fixture(scope="module")
 def cc():
-    path = (
-        Path(__file__).resolve().parents[4]
-        / "scripts"
-        / "audit"
-        / "contract_coverage.py"
-    )
+    path = require_repo_file("scripts/audit/contract_coverage.py")
     spec = importlib.util.spec_from_file_location("contract_coverage", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)

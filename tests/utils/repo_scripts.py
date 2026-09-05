@@ -1,4 +1,4 @@
-"""Resolve a ``scripts/`` file from a test that must run in BOTH trees.
+"""Resolve a repo-relative path from a test that must run in BOTH trees.
 
 ``scripts/`` is not an importable package, so a test for one of its files loads
 it by path. That is fine in the private checkout and a **session-killer** in the
@@ -42,6 +42,15 @@ one leaves several hundred others still unselected and the answer still "private
 Every function here is pure and total in its ``root``, so the tests drive them
 with synthetic trees rather than with whatever tree the suite happens to run in
 -- the only way to exercise the export branch from the private checkout.
+
+``scripts/`` was the first subject, not the only one: the export also drops
+``experiments/`` wholesale, and a test that reads one arm by path fails there for
+the same reason and with the same two wrong answers. So the resolver is
+:func:`require_repo_file` and takes any repo-relative path -- the tree-identity
+question it asks about ``scripts/`` is evidence about the *tree*, not about the
+subject. A test that asserts over a whole corpus has no single path to name;
+:func:`skip_if_public_export` is that case, and it is keyed on the same derived
+verdict rather than on the corpus being empty.
 """
 
 from __future__ import annotations
@@ -121,11 +130,15 @@ def _export_verdict() -> bool:
     return is_public_export()
 
 
-def require_script(rel_path: str, root: Path | None = None) -> Path:
+def require_repo_file(rel_path: str, root: Path | None = None) -> Path:
     """The absolute path to ``rel_path``, or an explained skip / a loud failure.
 
-    Call at module scope: the skip is ``allow_module_level`` so the export stops
-    at "1 skipped" instead of "errors during collection".
+    ``rel_path`` is any repo-relative path -- ``scripts/ci/gate.py`` or
+    ``experiments/inprogress/<cohort>/<arm>.yaml``. Safe at module scope: the
+    skip is ``allow_module_level`` so the export stops at "1 skipped" instead of
+    "errors during collection". Inside a test body it is an ordinary skip, which
+    is what a *partial* file needs -- the tests whose subject still ships keep
+    running.
     """
     live = root is None
     base = REPO_ROOT if live else root
@@ -154,12 +167,12 @@ def require_script(rel_path: str, root: Path | None = None) -> Path:
 
 
 def load_script_module(rel_path: str, module_name: str, root: Path | None = None) -> ModuleType:
-    """Import a ``scripts/`` file by path, guarded by :func:`require_script`.
+    """Import a ``scripts/`` file by path, guarded by :func:`require_repo_file`.
 
     Registered in ``sys.modules`` before execution so a script defining classes
     that get pickled, or doing a self-import, resolves to this same module.
     """
-    script = require_script(rel_path, root)
+    script = require_repo_file(rel_path, root)
     spec = importlib.util.spec_from_file_location(module_name, script)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise ImportError(f"cannot build an import spec for {script}")
@@ -167,3 +180,22 @@ def load_script_module(rel_path: str, module_name: str, root: Path | None = None
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def skip_if_public_export(reason: str, root: Path | None = None) -> None:
+    """Skip when this tree is the published export; do nothing otherwise.
+
+    The counterpart to :func:`require_repo_file` for a test that asserts over a
+    whole *corpus* rather than reading one path -- "at least 30 arms declare a
+    workflow", "every cohort member agrees on the sampler". The export drops
+    ``experiments/`` wholesale, so there is no single missing file to name, and
+    the assertion fails on the empty set instead of raising ``FileNotFoundError``.
+
+    Keying the skip on emptiness instead -- ``if not arms: skip`` -- is the shape
+    that silently swallows a genuine drain of the cohort in the private tree,
+    which is the *only* thing these tripwires exist to catch. So ask which tree,
+    never whether the corpus is there.
+    """
+    exported = _export_verdict() if root is None else is_public_export(root)
+    if exported:
+        pytest.skip(f"public export: {reason}")

@@ -33,16 +33,13 @@ the load-bearing keys are present. No heavy model forward passes.
 
 from __future__ import annotations
 
-import pathlib
-
 import yaml
 
-
-_REPO = pathlib.Path(__file__).resolve().parents[3]
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _load(path: str) -> dict:
-    return yaml.safe_load((_REPO / path).read_text())
+    return yaml.safe_load(require_repo_file(path).read_text())
 
 
 # ---------------------------------------------------------------------------

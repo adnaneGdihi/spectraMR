@@ -1,7 +1,7 @@
 """Planted violations for :mod:`tests.utils.repo_scripts`.
 
 Non-negotiable 15: a gate is only a gate for the violation shape it has been
-watched failing on. This helper decides whether a missing ``scripts/`` file is a
+watched failing on. This helper decides whether a missing repo file is a
 publication boundary (skip) or a defect (fail), and **both** of its wrong answers
 are silent -- skipping in a private checkout hides a deletion, failing in the
 export re-breaks collection for the whole suite. So each branch of the table in
@@ -26,8 +26,9 @@ from tests.utils.repo_scripts import (
     REPO_ROOT,
     is_public_export,
     load_script_module,
-    require_script,
+    require_repo_file,
     selects,
+    skip_if_public_export,
     unselected_scripts,
 )
 
@@ -104,39 +105,60 @@ def test_bytecode_does_not_make_a_tree_private(tmp_path: Path) -> None:
 def test_live_tree_is_not_an_export() -> None:
     """Non-vacuity, in the tree the suite is running in.
 
-    If this ever returns True in the private checkout, every ``require_script``
+    If this ever returns True in the private checkout, every ``require_repo_file``
     call site turns into an unconditional skip and the suite goes quietly green.
     """
     assert is_public_export(REPO_ROOT) is False
     assert len(unselected_scripts(REPO_ROOT)) > 100
 
 
-# --- require_script(): both wrong answers are planted -----------------------
+# --- require_repo_file(): both wrong answers are planted --------------------
 
 
 def test_present_script_is_returned(tmp_path: Path) -> None:
     root = _tree(tmp_path)
-    assert require_script("scripts/ci/shipped.py", root) == root / "scripts/ci/shipped.py"
+    assert require_repo_file("scripts/ci/shipped.py", root) == root / "scripts/ci/shipped.py"
 
 
 def test_absent_in_export_skips_and_names_the_reason(tmp_path: Path) -> None:
     root = _tree(tmp_path)
     with pytest.raises(pytest.skip.Exception, match="does not ship in the public export"):
-        require_script("scripts/ci/absent.py", root)
+        require_repo_file("scripts/ci/absent.py", root)
 
 
 def test_absent_in_a_private_tree_fails_rather_than_skipping(tmp_path: Path) -> None:
     """The masking plant: a deletion must NOT be mistaken for a boundary."""
     root = _tree(tmp_path, "scripts/ci/private_only.py")
     with pytest.raises(pytest.fail.Exception, match="NOT the public export"):
-        require_script("scripts/ci/absent.py", root)
+        require_repo_file("scripts/ci/absent.py", root)
+
+
+def test_a_non_scripts_subject_reaches_the_same_verdicts(tmp_path: Path) -> None:
+    """The generalisation, planted: ``experiments/`` is why this stopped being
+    ``require_script``. The tree-identity evidence lives under ``scripts/``, so a
+    subject outside it must not change the answer -- present returns, and absent
+    still splits export (skip) from private tree (fail)."""
+    arm = "experiments/inprogress/dummy/dummy_gan.yaml"
+
+    export = _tree(tmp_path / "exp")
+    (export / arm).parent.mkdir(parents=True)
+    (export / arm).write_text("config_version: '1.0'\n", encoding="utf-8")
+    assert require_repo_file(arm, export) == export / arm
+
+    export_without = _tree(tmp_path / "exp2")
+    with pytest.raises(pytest.skip.Exception, match="does not ship in the public export"):
+        require_repo_file(arm, export_without)
+
+    private = _tree(tmp_path / "priv", "scripts/ci/private_only.py")
+    with pytest.raises(pytest.fail.Exception, match="NOT the public export"):
+        require_repo_file(arm, private)
 
 
 def test_absent_with_no_allowlist_fails(tmp_path: Path) -> None:
     root = _tree(tmp_path)
     (root / ALLOWLIST_REL).unlink()
     with pytest.raises(pytest.fail.Exception, match="NOT the public export"):
-        require_script("scripts/ci/absent.py", root)
+        require_repo_file("scripts/ci/absent.py", root)
 
 
 # --- load_script_module() ---------------------------------------------------
@@ -156,3 +178,28 @@ def test_load_script_module_inherits_the_skip(tmp_path: Path) -> None:
     root = _tree(tmp_path)
     with pytest.raises(pytest.skip.Exception):
         load_script_module("scripts/ci/absent.py", "absent_under_test", root)
+
+
+# --- skip_if_public_export(): the corpus counterpart ------------------------
+
+
+def test_corpus_guard_skips_in_the_export(tmp_path: Path) -> None:
+    root = _tree(tmp_path)
+    with pytest.raises(pytest.skip.Exception, match="public export: cohort absent"):
+        skip_if_public_export("cohort absent", root)
+
+
+def test_corpus_guard_is_inert_in_a_private_tree(tmp_path: Path) -> None:
+    """The masking plant, and the reason this is not ``if not arms: skip``.
+
+    A drained cohort in the private checkout must still reach the assertion. A
+    guard keyed on the corpus being empty cannot tell that case from the export
+    and would turn every cohort tripwire into a permanent green.
+    """
+    root = _tree(tmp_path, "scripts/ci/private_only.py")
+    skip_if_public_export("cohort absent", root)  # returns; raises nothing
+
+
+def test_corpus_guard_is_inert_in_the_live_tree() -> None:
+    """Non-vacuity where it counts: this suite's own tree is not an export."""
+    skip_if_public_export("cohort absent", REPO_ROOT)

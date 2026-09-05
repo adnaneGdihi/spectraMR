@@ -51,18 +51,24 @@ from pathlib import Path
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 REPO = Path(__file__).resolve().parents[3]
-SBATCH = REPO / "scripts" / "training" / "train_distributed.sbatch"
+_SBATCH_REL = "scripts/training/train_distributed.sbatch"
 
 #: Every launcher that derives a rank count from the environment and hands it to
 #: ``torchrun --nproc_per_node``. All three carried the same ``:-1`` guess; the
 #: two ablation submitters get the shape guards below rather than a second
 #: extraction harness, because they use the identical construct and the raise
 #: behaviour is proven once, behaviourally, against the main launcher.
+#: Repo-relative, not ``Path``: each is resolved through ``require_repo_file`` at
+#: use, so the two ablation submitters -- which the public allowlist denies --
+#: skip with a reason in the export instead of failing, while a launcher that
+#: MOVED still fails loudly in every other tree.
 RANK_DERIVING_SCRIPTS = [
-    SBATCH,
-    REPO / "scripts" / "training" / "submit_exp11_fpk_ablation.sbatch",
-    REPO / "scripts" / "training" / "submit_exp11_ema_warmup_ablation.sbatch",
+    _SBATCH_REL,
+    "scripts/training/submit_exp11_fpk_ablation.sbatch",
+    "scripts/training/submit_exp11_ema_warmup_ablation.sbatch",
 ]
 
 _BEGIN = "# --- gpu-count-derivation"
@@ -85,9 +91,7 @@ _BASE_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 @pytest.fixture(scope="module")
 def script() -> str:
-    if not SBATCH.is_file():
-        pytest.skip(f"{SBATCH} not present")
-    return SBATCH.read_text()
+    return require_repo_file(_SBATCH_REL).read_text()
 
 
 @pytest.fixture(scope="module")
@@ -109,17 +113,17 @@ def block(script: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: p.stem)
-def test_script_is_valid_bash(path: Path) -> None:
+@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: Path(p).stem)
+def test_script_is_valid_bash(path: str) -> None:
     """A syntax error here is invisible until the job is queued on the cluster."""
-    if not path.is_file():
-        pytest.skip(f"{path} not present")
-    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    result = subprocess.run(
+        ["bash", "-n", str(require_repo_file(path))], capture_output=True, text=True
+    )
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: p.stem)
-def test_no_launcher_defaults_its_rank_count_to_one(path: Path) -> None:
+@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: Path(p).stem)
+def test_no_launcher_defaults_its_rank_count_to_one(path: str) -> None:
     """``${SLURM_GPUS*:-1}`` is the sibling spelling of the same guess.
 
     The main launcher's version ended in ``|| echo 1``; the two ablation
@@ -127,9 +131,7 @@ def test_no_launcher_defaults_its_rank_count_to_one(path: Path) -> None:
     syntax, identical consequence -- one rank on a multi-GPU allocation, with a
     successful-looking run to show for it.
     """
-    if not path.is_file():
-        pytest.skip(f"{path} not present")
-    code = _executable_lines(path.read_text())
+    code = _executable_lines(require_repo_file(path).read_text())
     offenders = re.findall(r"\$\{SLURM_GPUS[A-Z_]*:-1\}", code)
     assert not offenders, (
         f"{path.name} defaults its rank count to 1 ({offenders}); a job whose "
@@ -137,8 +139,8 @@ def test_no_launcher_defaults_its_rank_count_to_one(path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: p.stem)
-def test_every_launcher_refuses_rather_than_guesses(path: Path) -> None:
+@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: Path(p).stem)
+def test_every_launcher_refuses_rather_than_guesses(path: str) -> None:
     """Removing the ``:-1`` is only half a fix if what replaced it carries on.
 
     The fatal path must sit BETWEEN the derivation and the ``torchrun`` that
@@ -147,9 +149,7 @@ def test_every_launcher_refuses_rather_than_guesses(path: Path) -> None:
     (a missing-CONFIG guard) before this fix, so that assertion passed on the
     buggy versions. Anchoring it to the interval is what makes it a test.
     """
-    if not path.is_file():
-        pytest.skip(f"{path} not present")
-    lines = _executable_lines(path.read_text()).splitlines()
+    lines = _executable_lines(require_repo_file(path).read_text()).splitlines()
 
     derived = next(
         (i for i, ln in enumerate(lines) if re.match(r"\s*(NPROC|GPUS_PER_NODE)=", ln)),
@@ -358,5 +358,8 @@ def test_the_old_idiom_really_did_resolve_to_one(env: dict[str, str]) -> None:
 def test_the_repo_still_has_the_launcher_where_the_docs_say() -> None:
     """The header of this file cites the path; a move would strand every skip
     above as a silent green."""
-    assert SBATCH.is_file(), f"{SBATCH} moved; update this test's REPO-relative path"
-    assert os.access(SBATCH, os.R_OK)
+    # require_repo_file, not `SBATCH.is_file()`: both answers must stay
+    # distinguishable. A launcher the allowlist denies is a publication boundary
+    # (skip); a launcher that MOVED is the defect this test exists for, and it
+    # must still fail loudly in any tree that is not the export.
+    assert os.access(require_repo_file(_SBATCH_REL), os.R_OK)

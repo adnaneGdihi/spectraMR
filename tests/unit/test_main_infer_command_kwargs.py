@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 
 from spectramr.pipelines.infer import run_inference_pipeline
+from tests.utils.repo_scripts import require_repo_file
 
 
 def test_infer_command_only_uses_supported_kwargs() -> None:
@@ -112,7 +113,7 @@ def test_infer_command_resolves_seed_and_determinism_from_config(
 
     import spectramr.main as main_mod
 
-    with open("experiments/inprogress/dummy/dummy_gan.yaml", encoding="utf-8") as fh:
+    with open(require_repo_file("experiments/inprogress/dummy/dummy_gan.yaml"), encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
     raw.setdefault("training", {})["deterministic"] = False
     # `seed` is a fact about the RUN. Both `training.seed` and the top-level `seed` were

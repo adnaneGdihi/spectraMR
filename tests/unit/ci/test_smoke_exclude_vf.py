@@ -16,16 +16,27 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-WRAPPER = REPO_ROOT / "scripts" / "ci" / "smoke_test_vf_configs.sh"
+from tests.utils.repo_scripts import require_repo_file
+
+_WRAPPER_REL = "scripts/ci/smoke_test_vf_configs.sh"
+
+
+def _wrapper() -> Path:
+    """The wrapper, or an explained skip: ``scripts/ci/`` ships only in part.
+
+    Resolved per-test, not as a module constant: the filter-expression test below
+    exercises the grep itself and is independent of the wrapper file, so it must
+    keep running in the export.
+    """
+    return require_repo_file(_WRAPPER_REL)
 
 
 def test_wrapper_is_valid_bash() -> None:
-    assert subprocess.run(["bash", "-n", str(WRAPPER)]).returncode == 0
+    assert subprocess.run(["bash", "-n", str(_wrapper())]).returncode == 0
 
 
 def test_exclude_vf_flag_and_alias_present() -> None:
-    text = WRAPPER.read_text()
+    text = _wrapper().read_text()
     assert "--exclude-vf|--no-vf)" in text, "flag + alias must be parsed"
     assert "EXCLUDE_VF=true" in text
     assert 'grep -v "/inprogress/vf/"' in text, (

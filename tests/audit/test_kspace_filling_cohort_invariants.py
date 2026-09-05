@@ -155,6 +155,7 @@ import yaml
 from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.physics.dc_settings import DC_SSOT_KEYS
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import require_repo_file, skip_if_public_export
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COHORT_ROOT = _REPO_ROOT / "experiments" / "inprogress" / "kspace_filling"
@@ -273,6 +274,7 @@ def _skip_if_cross_contrast(arm_path: Path) -> None:
 
 def test_arms_discovered() -> None:
     """Guard against an empty parametrization silently passing every invariant."""
+    skip_if_public_export("experiments/ does not ship; the kspace_filling cohort is empty here")
     assert (
         len(_ARMS) >= 30
     ), f"expected the full kspace_filling cohort, found {len(_ARMS)}"
@@ -550,6 +552,7 @@ def test_i2_curriculum_uniform_within_each_sub_cohort() -> None:
     other. Cross-contrast arms are exempt for the usual reason (they are not in
     any head-to-head).
     """
+    skip_if_public_export("experiments/ does not ship; there are no arms to group")
     groups: dict[str, dict[tuple[Any, Any], list[str]]] = {}
     for arm in _ARMS:
         if arm.name in _CROSS_CONTRAST_ARMS:
@@ -637,20 +640,34 @@ def test_i3_ladder_uniform_within_each_sub_cohort() -> None:
 # would otherwise score green.
 # --------------------------------------------------------------------------
 
-_PLANT_BASE = _COHORT_ROOT / "attention_shootout" / "experiment_11_attention_channel.yaml"
+_PLANT_BASE_REL = (
+    "experiments/inprogress/kspace_filling/attention_shootout/"
+    "experiment_11_attention_channel.yaml"
+)
+
+
+def _plant_base() -> Path:
+    """The arm every NN15 plant below mutates.
+
+    Resolved through ``require_repo_file`` rather than held as a constant: the
+    plants are the detector's own proof that it goes red, and in the public
+    export their subject does not ship. A skip says that; a FileNotFoundError
+    from ``read_text`` says the plant is broken.
+    """
+    return require_repo_file(_PLANT_BASE_REL)
 
 
 def _planted(tmp_path: Path, **dotted: Any) -> TrainingSettings:
-    """Load ``_PLANT_BASE`` with ``dotted`` keys overridden, proving each landed."""
-    raw = yaml.safe_load(_PLANT_BASE.read_text())
+    """Load ``_plant_base()`` with ``dotted`` keys overridden, proving each landed."""
+    raw = yaml.safe_load(_plant_base().read_text())
     for path, value in dotted.items():
         node = raw
         *parents, leaf = path.split("__")
         for p in parents:
             node = node[p]
-        assert leaf in node, f"plant target {path!r} absent from {_PLANT_BASE.name}"
+        assert leaf in node, f"plant target {path!r} absent from {_plant_base().name}"
         node[leaf] = value
-    out = tmp_path / _PLANT_BASE.name
+    out = tmp_path / _plant_base().name
     out.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
     settings = TrainingSettings.from_yaml(str(out))
     for path, value in dotted.items():
@@ -671,14 +688,14 @@ def test_plant_curriculum_ladder_opening_past_the_budget_is_red(tmp_path: Path) 
     """
     s = _planted(tmp_path, training__curriculum_ramp_rate=0.0001)  # opens at 270000
     with pytest.raises(AssertionError, match="#17"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_unpinned_ramp_rate_is_red(tmp_path: Path) -> None:
     """Dropping half the pair must turn test_i red, not fall back to full range."""
     s = _planted(tmp_path, training__curriculum_ramp_rate=None)
     with pytest.raises(AssertionError, match="#17"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_truncating_patience_is_red(tmp_path: Path) -> None:
@@ -713,14 +730,14 @@ def test_plant_ladder_shorter_than_timesteps_is_red(tmp_path: Path) -> None:
     """
     s = _planted(tmp_path, undersampling__acceleration_range=[1.0, 2.0, 8.0, 32.0])
     with pytest.raises(AssertionError, match="#20"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_base_disagreeing_with_the_head_is_red(tmp_path: Path) -> None:
     """base_acceleration that is not the first rung must turn test_i red."""
     s = _planted(tmp_path, undersampling__base_acceleration=2.0)
     with pytest.raises(AssertionError, match="#17"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_untrained_identity_head_is_red(tmp_path: Path) -> None:
@@ -732,7 +749,7 @@ def test_plant_untrained_identity_head_is_red(tmp_path: Path) -> None:
     """
     s = _planted(tmp_path, undersampling__train_identity_rung=False)
     with pytest.raises(AssertionError, match="#16"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_identity_rung_without_its_gradient_path_is_red(tmp_path: Path) -> None:
@@ -743,7 +760,7 @@ def test_plant_identity_rung_without_its_gradient_path_is_red(tmp_path: Path) ->
     """
     s = _planted(tmp_path, losses__reconstruction__lambda_pre_dc_kspace=0.0)
     with pytest.raises(AssertionError, match="#16"):
-        test_i_acceleration_spread_matches_base(s, _PLANT_BASE)
+        test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
 def test_plant_divergent_ladders_within_a_sub_cohort_are_red() -> None:
@@ -831,6 +848,7 @@ def kan_settings(request: pytest.FixtureRequest) -> TrainingSettings:
 
 
 def test_kan_ablations_discovered() -> None:
+    skip_if_public_export("experiments/ does not ship; the KAN ablation directory is absent here")
     assert len(_KAN_ARMS) == 11, f"expected 11 KAN ablations, found {len(_KAN_ARMS)}"
 
 
@@ -1143,6 +1161,7 @@ def test_the_cross_contrast_exemption_is_not_a_blanket_pass() -> None:
 
 def test_every_exempted_arm_exists() -> None:
     """Anti-rot: an exemption for a deleted or renamed arm guards nothing."""
+    skip_if_public_export("experiments/ does not ship, so every exemption reads as naming a deleted arm")
     present = {p.name for p in tracked_yamls(_COHORT_ROOT)}
     missing = sorted((set(_CROSS_CONTRAST_ARMS) | set(_INERT_LADDER_ARMS)) - present)
     assert not missing, f"exemption names an arm that no longer exists: {missing}"

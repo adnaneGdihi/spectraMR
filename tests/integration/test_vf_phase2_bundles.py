@@ -16,6 +16,8 @@ import importlib
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 torch = pytest.importorskip("torch")
 
 pytestmark = pytest.mark.integration
@@ -77,5 +79,5 @@ def test_yaml_loads(mode):
     """Each new arm's YAML loads through the frozen settings model."""
     from spectramr.config.settings import TrainingSettings
 
-    settings = TrainingSettings.from_yaml(_NEW_YAMLS[mode])
+    settings = TrainingSettings.from_yaml(str(require_repo_file(_NEW_YAMLS[mode])))
     assert settings.training.training_mode == mode

@@ -44,6 +44,7 @@ from spectramr.config.schemas.loss import LossConfigSchema
 from spectramr.models.losses._legacy_weights import FOLDING_STRATEGIES
 from spectramr.models.losses.weights import build_loss_weight_table, canonical_loss_name
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 REPO = Path(__file__).resolve().parents[2]
 LIVE_TREES = ("experiments/inprogress", "experiments/active")
@@ -306,6 +307,7 @@ def test_every_superseded_entry_is_real_and_cites_its_commit() -> None:
     still carries it (otherwise nothing is being exempted and the row is dead), and
     the reason names the commit that made the change.
     """
+    skip_if_public_export("experiments/ does not ship, so every superseded entry reads as a deleted arm")
     import re
 
     for rel, why in SUPERSEDED.items():
@@ -326,6 +328,7 @@ def test_every_superseded_entry_is_real_and_cites_its_commit() -> None:
 
 def test_the_corpus_is_actually_covered() -> None:
     """Guard against the parametrization silently collapsing to zero arms."""
+    skip_if_public_export("experiments/ does not ship; the live corpus is empty here")
     assert len(ARMS) > 500, f"expected the live corpus, found {len(ARMS)} arms"
 
 
@@ -413,6 +416,7 @@ def test_warmup_gate_shape_is_pinned() -> None:
     This asserts the gate's shape: a gated term is 0.0 before ``warmup_iterations`` and its
     full weight after; an ungated term is unaffected by ``iteration``.
     """
+    skip_if_public_export("experiments/ does not ship; there are no arms whose weights to check")
     checked = 0
     for arm in ARMS:
         doc = pyyaml.safe_load(arm.read_text())

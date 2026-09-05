@@ -45,6 +45,7 @@ import pytest
 from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.physics.data_consistency import VALID_DC_METHODS
 from tests.utils.corpus import tracked_yamls
+from tests.utils.repo_scripts import skip_if_public_export
 
 # Imported, never transcribed. This was a hand-copied mirror, on the premise that
 # the generator's set "lives inside ``__init__`` and is not importable" -- true
@@ -82,6 +83,7 @@ _YAMLS = _cohort_yamls()
 
 
 def test_cohort_is_non_empty() -> None:
+    skip_if_public_export("experiments/ does not ship; the exp11 cohort is empty here")
     # Guards against a glob that silently matches nothing (which would make every
     # parametrized assertion vacuously pass). The exact count varies by checkout:
     # the gitignored ``ablations_kan_dual_domain/`` dir (.gitignore '**/*_kan_*/')

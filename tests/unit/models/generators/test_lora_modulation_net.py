@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from spectramr.models.generators.lora_modulation_net import LoRAModulationNet
+from tests.utils.repo_scripts import require_repo_file
 
 
 def _net(**kw) -> LoRAModulationNet:
@@ -124,7 +125,7 @@ def test_synthetic_forward_probe_passes_for_all_arms() -> None:
 
     for arm in ("b36_lora_modulation", "b36_ablate_rank0", "b36_ablate_param_matched"):
         cfg = TrainingSettings.from_yaml(
-            f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"
+            str(require_repo_file(f"experiments/inprogress/mrixfields2026/task3/{arm}.yaml"))
         )
         report = synthetic_forward_probe(cfg)
         assert report.passed, f"{arm}: probe failed -> {getattr(report, 'message', report)}"
