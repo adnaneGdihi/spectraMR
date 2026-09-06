@@ -119,7 +119,7 @@ zero if the model, losses, and gradients are wired correctly. A sanity check tha
    spectramr train -c exp.yaml --resume auto
 
 ``--override / -O`` uses **dotted nested paths** because the config is nested
-(``config.optimization.learning_rate``, never ``config.lr``); each ``-O`` is one
+(``optimization.optimizer.learning_rate``, never ``lr``); each ``-O`` is one
 key. Overrides are re-validated against the schema, so an illegal value still
 fails loudly.
 

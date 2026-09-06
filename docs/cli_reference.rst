@@ -58,7 +58,7 @@ re-invoke a second parser.
    re-validation could not catch the loss).
 
    **Determinism/seed wiring (2026-07-01).** ``infer``, ``infer-dataset``, and
-   ``experiment`` now resolve ``training.seed`` and ``training.deterministic``
+   ``experiment`` now resolve ``run.seed`` and ``training.deterministic``
    from the ``--config`` YAML (``experiment`` after applying overrides),
    mirroring ``train``. Previously they hardcoded
    ``initialize_accelerator(device, 42)`` — both knobs were silent no-ops on

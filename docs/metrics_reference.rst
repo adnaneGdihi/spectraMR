@@ -987,7 +987,7 @@ The two are complementary — run both.
 
 **Caveats (state these when citing the numbers):**
 
-* **Slice-Dice, not volume-Dice.** With ``data.slice_2d: true`` the validation loop
+* **Slice-Dice, not volume-Dice.** With ``data.sampling.enable_slice_2d: true`` the validation loop
   passes one axial slice at a time, so the reported figure is a mean of *per-slice*
   Dice; small slices carry the same weight as large ones. Evaluate a representative
   slice set — the val loader is **unshuffled**, so a small

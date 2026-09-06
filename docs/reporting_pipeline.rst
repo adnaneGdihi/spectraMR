@@ -163,7 +163,7 @@ generated ``\definecolor`` lines, and TikZ artifacts are recorded in
 Report-case contract
 ---------------------
 
-Qualitative figures need image data. When ``logging.save_report_cases`` is true, the
+Qualitative figures need image data. When ``logging.report_cases.enabled`` is true, the
 validation loop records best/median/worst cases (by the primary metric) to
 ``<run_dir>/report_cases/`` (``case_*.npz`` + ``cases_index.json``). ``generate_report``
 auto-discovers them — no manual wiring needed.
@@ -337,7 +337,7 @@ default ``spectramr report`` "plot all" pass. Across a whole cohort, drive it
 with ``spectramr report --exp-dir <cohort-root> --recursive``, which walks every
 experiment directory beneath the root::
 
-    spectramr report --exp-dir <cohort-root> --recursive --metrics ssim,psnr,lpips
+    spectramr report --exp-dir <cohort-root> --recursive
 
 The driver never calls ``savefig`` — saving happens inside the registered plotter
 via :func:`~spectramr.infrastructure.reporting.style.save_figure`, so the C1
@@ -587,7 +587,7 @@ produced by a registered plotter under ``plotters/`` (plus the plotly ``interact
 layer), styled through ``style.py``, and orchestrated by :func:`pipeline.generate_report`.
 The only sanctioned exceptions are the sim2rank meta-evaluation figures under
 ``core/metrics/meta_evaluation/`` and dataset EDA under ``data/eda/`` — reached by the
-separate ``spectramr meta`` / EDA paths, never by ``spectramr report``. A ratchet test,
+separate ``spectramr meta-evaluate`` / EDA paths, never by ``spectramr report``. A ratchet test,
 ``tests/unit/infrastructure/reporting/test_plotting_ssot_guard.py``, fails on any new
 ``savefig`` / ``write_html`` / ``write_image`` / ``plt.show`` added outside
 ``infrastructure/reporting/`` (with a frozen baseline of pre-existing emitters).

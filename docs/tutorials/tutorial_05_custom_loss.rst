@@ -245,31 +245,42 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
 
 .. code-block:: yaml
 
-   experiment_name: tutorial_05_freq_weighted_loss
-   config_version: "6.0"
-   device: cuda
-   seed: 42
+   config_version: "1.0"
 
    data:
-     data_root: databases/fastmri/datasets/knee_singlecoil_train/
      dataset_type: fastmri_knee
-     batch_size: 8
-     num_workers: 4
-     in_channels: 1
-     out_channels: 1
-     coil_processing_mode: rss
+     in_channels: 2   # rss produces real+imag
+     out_channels: 2
 
+     loader:
+       batch_size: 8
+       num_workers: 4
+     coils:
+       processing_mode: rss
+     source:
+       root: databases/fastmri/datasets/knee_singlecoil_train/
+
+   # k-space in, image-domain U-Net out: bridge explicitly (NN#9, no silent rescue).
+   adapters:
+     pre_model:
+       - name: ifft_kspace_to_image
+       - name: complex_to_real_imag_interleave
+
+   undersampling:
+     acceleration_type: cartesian_vd
+     base_acceleration: 4.0
+     center_fraction: 0.08
    model:
      model_type: standard_unet
-     in_channels: 1
-     out_channels: 1
+     in_channels: 4   # rss(2ch) -> ifft -> real/imag interleave = 4
+     out_channels: 4
 
    training:
      training_mode: reconstruction
+     output_dir: experiments/results/tutorial_05_freq_weighted_loss
      max_iterations: 30000
 
    losses:
-     output_domain: image
      image_losses:
        # Combine with L1 for stability
        - name: l1
@@ -288,16 +299,24 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
          weight: 1.0
          enabled: true
 
+     policy:
+       output_domain: image
    optimization:
-     learning_rate: 1e-4
-     optimizer_type: adamw
-     weight_decay: 1e-4
-     lr_scheduler: cosine
-     warmup_iterations: 1000
-     use_amp: true
-     amp_dtype: bfloat16
-     gradient_clip_val: 1.0
+     lr_scheduler_strategy: cosine
+     warmup_steps: 1000
+     gradient:
+       clip:
+         enabled: true
+         method: norm
+         value: 1.0
 
+     optimizer:
+       type: adamw
+       learning_rate: 1e-4
+       weight_decay: 1e-4
+     precision:
+       enabled: true
+       dtype: bfloat16
    checkpoint:
      checkpoint_dir: checkpoints/tutorial_05
      save_interval: 5000
@@ -307,9 +326,9 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
 
    validation:
      enabled: true
-     eval_interval: 2000
-     save_images: true
 
+     schedule:
+       interval_steps: 2000
    physics:
      data_consistency:
        enabled: true
@@ -320,6 +339,17 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
      compute_ssim: true
      compute_hfen: true     # High-frequency error norm (matches our loss goal)
      compute_lpips: false   # Skip for speed
+   run:
+     seed: 42
+     device: cuda
+
+   logging:
+     identity:
+       experiment: tutorial_05_freq_weighted_loss
+     images:
+       save_validation: true
+     intervals:
+       log: 50
 
 
 Step 5 — Launch Training
@@ -328,13 +358,10 @@ Step 5 — Launch Training
 .. code-block:: bash
 
    # Dry run first — validates config without GPU
-   python src/main.py train \
-       --config experiments/training/tutorial_05_freq_weighted.yaml \
-       --dry_run
+   spectramr train --config experiments/training/tutorial_05_freq_weighted.yaml --dry-run
 
    # Full training
-   python src/main.py train \
-       --config experiments/training/tutorial_05_freq_weighted.yaml
+   spectramr train --config experiments/training/tutorial_05_freq_weighted.yaml
 
    # Monitor with TensorBoard
    tensorboard --logdir logs/tutorial_05_freq_weighted_loss/

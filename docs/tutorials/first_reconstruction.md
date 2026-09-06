@@ -93,7 +93,7 @@ Wrote 48 train + 16 val phantoms to databases/tutorial_phantom/
 Save this as `experiments/inprogress/tutorials/first_reconstruction.yaml`:
 
 ```yaml
-config_version: '6.0'
+config_version: '1.0'
 
 metadata:
   name: tutorial_first_reconstruction
@@ -104,9 +104,9 @@ metadata:
     paradigm: reconstruction
     type: tutorial
     novelty: tutorial_first_reconstruction
-  version: '6.0'
+  version: '1.0'
 
-acceleration:
+undersampling:
   base_acceleration: 4
   center_fraction: 0.08
 
@@ -121,28 +121,41 @@ checkpoint:
 
 data:
   dataset_type: npy_slice
-  data_root: ${SPECTRAMR_DATA_ROOT}/tutorial_phantom
-  coil_processing_mode: rss
-  patch_size: [64, 64, 1]
-  batch_size: 8
-  num_workers: 0
+  # Synthesise the aliased input from the fully-sampled phantom:
+  # fft2c -> Cartesian mask (undersampling: above) -> ifft2c. This is the
+  # y = M F x forward model; without it the undersampling block applies to
+  # nothing and the arm silently trains at 1x.
+  image_undersampling: true
 
+  loader:
+    batch_size: 8
+    num_workers: 0
+  coils:
+    # Identity for image-domain input; keeps the phantom at 1 channel.
+    processing_mode: rss_image
+  sampling:
+    patch_size: [64, 64, 1]
+  source:
+    root: ${SPECTRAMR_DATA_ROOT}/tutorial_phantom
 logging:
-  experiment_name: tutorial_first_reconstruction
-  level: info
 
+  identity:
+    experiment: tutorial_first_reconstruction
+  sinks:
+    level: info
 loss_logging:
   enabled: true
   csv_path: experiments/results/tutorial_first_reconstruction/losses.csv
 
 losses:
-  output_domain: image
   image_losses:
     - {name: l1,   weight: 1.0, enabled: true}
     - {name: ssim, weight: 0.2, enabled: true}
   kspace_losses: []
   complex_losses: []
 
+  policy:
+    output_domain: image
 metrics:
   best_metric_name: val_psnr
   best_metric_mode: max
@@ -159,24 +172,28 @@ model:
     features: [16, 32, 64]   # tiny — runs on CPU
 
 optimization:
-  optimizer_type: adamw
-  learning_rate: 1.0e-3
-  weight_decay: 1.0e-5
 
+  optimizer:
+    type: adamw
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-5
 training:
   training_mode: reconstruction
   strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
   epochs: 20
   device: cpu                # change to 'cuda' if you have one
-  seed: 42
   output_dir: experiments/results/tutorial_first_reconstruction
 
 validation:
   enabled: true
-  metrics: [psnr, ssim]
-  eval_interval: 100
 
+  schedule:
+    interval_steps: 100
+  scoring:
+    compute: [psnr, ssim]
 physics: {}
+run:
+  seed: 42
 ```
 
 Two things to notice:

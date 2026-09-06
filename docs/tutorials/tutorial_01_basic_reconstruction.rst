@@ -42,13 +42,13 @@ Configuration File
 .. code-block:: yaml
 
    # Tutorial 01: Basic U-Net Reconstruction
-   config_version: '6.0'
+   config_version: '1.0'
 
    metadata:
      name: "Tutorial 01 - Basic U-Net Reconstruction"
      description: "Baseline U-Net for 4× accelerated MRI reconstruction"
      tags: ["tutorial", "reconstruction", "unet", "baseline"]
-     version: '6.0'
+     version: '1.0'
 
    model:
      model_type: standard_unet
@@ -65,22 +65,24 @@ Configuration File
      output_domain: image
      strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
      num_epochs: 50
-     enable_mixed_precision: true  # FP16 for faster training
      device: cuda
-     seed: 42
+     output_dir: experiments/results/tutorial_01_basic_unet
 
    data:
      dataset_type: kspace
-     data_root: databases/fastmri/datasets
      datasets:
        - name: fastmri_train
          path: databases/fastmri/datasets/multicoil_train
-     index_path: data/manifests/fastmri_brain_multicoil_train.json
-     validation_index_path: data/manifests/fastmri_brain_multicoil_val.json
-     batch_size: 4
-     num_workers: 4  # CPU workers for data loading
-     normalize_kspace: false
 
+     loader:
+       batch_size: 4
+       num_workers: 4  # CPU workers for data loading
+     processing:
+       enable_kspace_normalization: false
+     source:
+       root: databases/fastmri/datasets
+       index_path: data/manifests/fastmri_brain_multicoil_train.json
+       validation_index_path: data/manifests/fastmri_brain_multicoil_val.json
    physics:
      compressed_sensing:
        enabled: true
@@ -90,19 +92,21 @@ Configuration File
        enable_kspace_recon: false
        enforce_hermitian_symmetry: true
 
-   acceleration:
+   undersampling:
      base_acceleration: 4.0  # 4× undersampling
      center_fraction: 0.08  # 8% center fully sampled (calibration)
      acceleration_type: cartesian_vd
 
    optimization:
-     optimizer_type: adam
-     learning_rate: 0.0001
-     weight_decay: 0.0
      lr_scheduler_strategy: cosine
+     precision:
+       enabled: true  # AMP (FP16) -- the live switch
 
+     optimizer:
+       type: adam
+       learning_rate: 0.0001
+       weight_decay: 0.0
    losses:
-     output_domain: image
      image_losses:
        - name: l1
          weight: 1.0
@@ -113,11 +117,22 @@ Configuration File
      kspace_losses: []
      complex_losses: []
 
+     policy:
+       output_domain: image
    logging:
-     log_interval: 50
-     save_interval: 5
      enable_wandb: false  # Set true to use Weights & Biases
-     enable_tensorboard: true
+     intervals:
+       log: 50
+       save: 5
+     tracking:
+       enable_tensorboard: true
+   run:
+     seed: 42
+
+   adapters:
+     pre_model:
+       - name: ifft_kspace_to_image
+       - name: complex_to_real_imag_interleave
 
 **Key Configuration Choices:**
 
@@ -166,9 +181,12 @@ Start training:
 
 .. code-block:: bash
 
-   python src/main.py train \
-       --config experiments/tutorials/tutorial_01_basic_unet.yaml \
-       --output-dir experiments/tutorials/tutorial_01_basic_unet
+   spectramr train --config experiments/tutorials/tutorial_01_basic_unet.yaml
+
+The run directory is not a command-line flag — it comes from
+``training.output_dir`` in the YAML above
+(``experiments/results/tutorial_01_basic_unet``). Override it for a one-off run
+with ``-O training.output_dir=...`` if you need to.
 
 **Expected Output (first few epochs):**
 
@@ -193,7 +211,7 @@ Monitoring Training
 .. code-block:: bash
 
    # In a separate terminal
-   tensorboard --logdir experiments/tutorials/tutorial_01_basic_unet/logs
+   tensorboard --logdir experiments/results/tutorial_01_basic_unet/logs
 
    # Open browser to: http://localhost:6006
 
@@ -202,7 +220,7 @@ Monitoring Training
 .. code-block:: bash
 
    # Watch training progress
-   tail -f experiments/tutorials/tutorial_01_basic_unet/logs/train.log
+   tail -f experiments/results/tutorial_01_basic_unet/logs/train.log
 
 ==================
 Step 4: Run Inference
@@ -212,17 +230,20 @@ Test the trained model on validation data:
 
 .. code-block:: bash
 
-   python src/main.py infer \
-       --config experiments/tutorials/tutorial_01_basic_unet.yaml \
-       --checkpoint experiments/tutorials/tutorial_01_basic_unet/checkpoints/best.pt \
-       --output-dir experiments/tutorials/tutorial_01_basic_unet/inference \
-       --num-samples 20  # Reconstruct 20 slices
+   spectramr infer \
+       --checkpoint experiments/results/tutorial_01_basic_unet/checkpoints/best.pt \
+       --input databases/fastmri/datasets/multicoil_val \
+       --output experiments/results/tutorial_01_basic_unet/inference
+
+``--config`` is optional here: the run directory beside the checkpoint holds
+``resolved_config.json``, which wins unless you pass ``--from-yaml``. Every
+input under ``--input`` is reconstructed — there is no per-run sample cap.
 
 **Output Structure:**
 
 .. code-block:: text
 
-   experiments/tutorials/tutorial_01_basic_unet/inference/
+   experiments/results/tutorial_01_basic_unet/inference/
    ├── predictions/
    │   ├── slice_0000.npy  # Reconstructed image
    │   ├── slice_0001.npy
@@ -248,7 +269,7 @@ Compute Metrics
    import numpy as np
 
    # Load metrics
-   with open('experiments/tutorials/tutorial_01_basic_unet/inference/metrics.json') as f:
+   with open('experiments/results/tutorial_01_basic_unet/inference/metrics.json') as f:
        metrics = json.load(f)
 
    print(f"Average PSNR: {metrics['psnr_mean']:.2f} ± {metrics['psnr_std']:.2f} dB")
@@ -273,9 +294,9 @@ Visualize Reconstructions
 
    def visualize_reconstruction(slice_idx=0):
        # Load data
-       pred = np.load(f'experiments/tutorials/tutorial_01_basic_unet/inference/predictions/slice_{slice_idx:04d}.npy')
-       gt = np.load(f'experiments/tutorials/tutorial_01_basic_unet/inference/ground_truth/slice_{slice_idx:04d}.npy')
-       zf = np.load(f'experiments/tutorials/tutorial_01_basic_unet/inference/undersampled/slice_{slice_idx:04d}.npy')
+       pred = np.load(f'experiments/results/tutorial_01_basic_unet/inference/predictions/slice_{slice_idx:04d}.npy')
+       gt = np.load(f'experiments/results/tutorial_01_basic_unet/inference/ground_truth/slice_{slice_idx:04d}.npy')
+       zf = np.load(f'experiments/results/tutorial_01_basic_unet/inference/undersampled/slice_{slice_idx:04d}.npy')
 
        # Create visualization
        fig, axes = plt.subplots(1, 4, figsize=(16, 4))

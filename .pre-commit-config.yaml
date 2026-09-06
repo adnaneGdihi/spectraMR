@@ -46,7 +46,10 @@ repos:
       - id: codespell
         # `astroid` is pylint's AST library (a real distribution name in
         # uv.lock), not a misspelling of "asteroid".
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid"]
+        # `unparseable` is the word scripts/ci/migrate_config_keys.py prints in
+        # its own summary line (":576"), so docs quoting that output must spell
+        # it the way the tool does, not the way the dictionary prefers.
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint

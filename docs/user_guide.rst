@@ -77,13 +77,13 @@ Top-Level Structure
 
 .. code-block:: yaml
 
-   config_version: '6.0'
+   config_version: '1.0'
 
    metadata:            # Metadata (name, tags, description)
      name: <str>
      tags: <dict>
      description: <str>
-     version: '6.0'
+     version: '1.0'
 
    model:               # Architecture definition
      model_type: <str>
@@ -506,8 +506,8 @@ Checkpointing
 
 .. code-block:: bash
 
-   python -m spectramr.cli train \\
-       --config experiments/active/experiment_30_mamba_mri_reconstruction.yaml \\
+   python -m spectramr.cli train \
+       --config experiments/active/experiment_30_mamba_mri_reconstruction.yaml \
        --resume experiments/active/experiment_30_mamba_mri_reconstruction/checkpoints/latest.pt
 
 Logging and Monitoring
@@ -567,11 +567,11 @@ Running Inference
 
 .. code-block:: bash
 
-   python -m spectramr.cli infer \\
-       --config experiments/active/experiment_30_mamba_mri_reconstruction.yaml \\
-       --checkpoint experiments/active/experiment_30_mamba_mri_reconstruction/checkpoints/best.pt \\
-       --input-dir databases/fastmri/datasets/multicoil_brain_val \\
-       --output-dir output/experiment_30_inference \\
+   python -m spectramr.cli infer \
+       --config experiments/active/experiment_30_mamba_mri_reconstruction.yaml \
+       --checkpoint experiments/active/experiment_30_mamba_mri_reconstruction/checkpoints/best.pt \
+       --input-dir databases/fastmri/datasets/multicoil_brain_val \
+       --output-dir output/experiment_30_inference \
        --batch-size 8
 
 **Output Structure:**
@@ -634,10 +634,15 @@ Using Optuna
 
 .. code-block:: bash
 
-   python src/train.py hpo \\
-       --config experiments/hpo/hpo_config.yaml \\
-       --trials 50 \\
-       --jobs 4  # Parallel trials on 4 GPUs
+   spectramr hpo \
+       --config experiments/hpo/hpo_config.yaml \
+       --model-type standard_unet \
+       --n-trials 50
+
+``--model-type`` is required and repeatable — one Optuna study per type.
+There is no ``--jobs``: run trials in parallel by pointing several
+``spectramr hpo`` processes at one shared study with
+``--storage sqlite:///experiments/hpo/study.db``.
 
 **Multi-Objective Optimization:**
 
@@ -965,12 +970,17 @@ Adding a new one requires 5 steps and zero changes to orchestration code.
        # ... existing modes ...
        MY_CUSTOM = "my_custom"
 
-**Step 4 — Create experiment config:**
+**Step 4 — Create experiment config.** The excerpt below shows only the blocks
+this step adds; a loadable file also needs ``model:``, ``data:``, ``optimization:``
+and ``logging:`` (see :doc:`config_schema_reference`).
 
 .. code-block:: yaml
 
-   experiment_name: my_custom_experiment
-   config_version: "6.0"
+   config_version: "1.0"
+
+   logging:
+     identity:
+       experiment: my_custom_experiment
 
    training:
      training_mode: my_custom   # ← dispatches to MyCustomStrategy
@@ -982,10 +992,11 @@ Adding a new one requires 5 steps and zero changes to orchestration code.
      out_channels: 1
 
    losses:
-     output_domain: image
      image_losses:
        - name: l1
          weight: 10.0
+     policy:
+       output_domain: image
 
 **Step 5 — Run:**
 
@@ -1063,12 +1074,16 @@ Multi-Site Training (Continual Learning)
 For training across multiple scanners/sites without catastrophic forgetting,
 use the ``continual_learning`` strategy with EWC (Elastic Weight Consolidation).
 
-**YAML config:**
+**YAML config.** An excerpt — only the continual-learning blocks are shown;
+a loadable file also needs ``data:``, ``optimization:`` and ``logging:``.
 
 .. code-block:: yaml
 
-   experiment_name: multi_site_ewc
-   config_version: "6.0"
+   config_version: "1.0"
+
+   logging:
+     identity:
+       experiment: multi_site_ewc
 
    training:
      training_mode: reconstruction
@@ -1217,4 +1232,3 @@ Multi-Node Training
        --master_addr=node0.cluster.local \
        --master_port=29500 \
        spectramr train --config my.yaml
-

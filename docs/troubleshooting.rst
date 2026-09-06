@@ -69,27 +69,45 @@ Add to your YAML:
 
 .. code-block:: yaml
 
-   config_version: "6.0"
+   config_version: "1.0"
 
 ``AttributeError: 'TrainingSettings' object has no attribute 'lr'``
 --------------------------------------------------------------------
 
-Flat aliases were removed in v5.0. Use nested access:
+Flat aliases were removed. Use the nested path — and note that
+``optimization.learning_rate`` is **also** retired: the optimizer block was
+decomposed and the field moved one level deeper, so the obvious first guess
+raises the same ``AttributeError`` you are trying to fix.
 
 .. code-block:: python
 
-   # ❌
+   # ❌ flat alias — never existed on the schema
    config.lr
    config.lambda_l1
 
-   # ✅
+   # ❌ one-level spelling — retired when the optimizer block was decomposed
    config.optimization.learning_rate
+   # AttributeError: 'OptimizationConfigSchema' object has no attribute 'learning_rate'
+
+   # ✅
+   config.optimization.optimizer.learning_rate
    config.losses.image_losses[0].weight
+
+When you are unsure where a field lives now, resolve it through
+``spectramr/config/schemas/renames.py`` rather than guessing: it names the
+canonical location for every retired spelling, and says whether the old one
+still folds silently or raises.
 
 ``extra fields not permitted``
 -------------------------------
 
-Pydantic ``extra='forbid'`` is enabled on all schemas. Remove unknown
+``TrainingSettings`` itself sets ``extra='forbid'``, and so do 263 of the 353
+config schema classes — an unknown key at those levels raises. It is **not**
+universal, though: 23 classes set ``extra='allow'`` (``AdapterStepSchema``, for
+one, because an adapter's kwargs are arbitrary by design) and 67 leave it
+unset, which means Pydantic's default of ``ignore``. A typo inside one of those
+sub-blocks is dropped in silence rather than reported, so a config that loads
+is not proof that every key in it was read. Remove unknown
 fields or check for typos. Common culprits: ``enable_ema`` (→ ``ema.enabled``),
 ``lambda_l1`` (→ ``losses.image_losses[].weight``).
 
@@ -291,9 +309,11 @@ Mixed precision: ``precision.dtype`` selects the autocast dtype
 
 .. note::
 
-   The older flat spellings ``optimization.use_amp`` / ``optimization.amp_dtype``
-   are ``RENAMES`` entries that **fold** onto ``precision.enabled`` /
-   ``precision.dtype``. A YAML declaration in either spelling is live, which has
+   The two older flat spellings differ, and the difference matters.
+   ``optimization.use_amp`` is a ``RENAMES`` entry with posture ``fold``: it
+   still loads and still lands on ``precision.enabled``. ``optimization.amp_dtype``
+   has posture ``raise`` — declaring it is now a hard load error naming
+   ``precision.dtype``. So a ``use_amp`` declaration is live, which has
    a practical consequence worth spelling out: **grepping for the canonical key
    under-reports AMP usage.** A sweep for
    ``optimization.precision.enabled: true`` across
@@ -638,11 +658,11 @@ validation starts.
 
 **Root cause**: a full-resolution 256×256 patch linearizes to a 65,536-token
 sequence; the SSM selective-scan tensor for a single forward is ~9.75 GiB, so
-``validation.val_batch_size: 2`` tries to allocate ~19.5 GiB (= 2×) on top of the
+``validation.loader.batch_size: 2`` tries to allocate ~19.5 GiB (= 2×) on top of the
 model. Validation, not training, is the trigger because training already fit at
 batch 1.
 
-**Fix**: ``val_batch_size: 1`` across all ten arms is the guaranteed lever (a
+**Fix**: ``validation.loader.batch_size: 1`` across all ten arms is the guaranteed lever (a
 single forward fits, as the training step proved); the val OOM was a latent
 failure for every full-resolution arm once the checkpointing crash above is
 cleared. ``optimization.use_amp: true`` + ``amp_dtype: bfloat16`` is also

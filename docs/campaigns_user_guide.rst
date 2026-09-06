@@ -365,29 +365,29 @@ The CLI surface is :program:`python -m spectramr.cli campaign <action>`:
    source .venv/bin/activate
 
    # 1. Validate without submitting (recommended first step).
-   python -m spectramr.cli campaign submit \\
-       experiments/campaigns/geomamba_ulf_super_resolution.yaml \\
+   python -m spectramr.cli campaign submit \
+       experiments/campaigns/geomamba_ulf_super_resolution.yaml \
        --dry-run
 
    # 2. Submit every arm in parallel.
-   python -m spectramr.cli campaign submit \\
+   python -m spectramr.cli campaign submit \
        experiments/campaigns/geomamba_ulf_super_resolution.yaml
 
    # 3. Poll SLURM and update the per-arm status table.
-   python -m spectramr.cli campaign status \\
+   python -m spectramr.cli campaign status \
        experiments/results/campaigns/geomamba_ulf_super_resolution
 
    # 4. Watch every 60 s until everything is in a terminal state,
    #    then auto-evaluate.
-   python -m spectramr.cli campaign watch \\
+   python -m spectramr.cli campaign watch \
        experiments/results/campaigns/geomamba_ulf_super_resolution
 
    # 5. Manually trigger evaluation (idempotent).
-   python -m spectramr.cli campaign evaluate \\
+   python -m spectramr.cli campaign evaluate \
        experiments/results/campaigns/geomamba_ulf_super_resolution
 
    # 6. Cancel every active SLURM job for the campaign.
-   python -m spectramr.cli campaign cancel \\
+   python -m spectramr.cli campaign cancel \
        experiments/results/campaigns/geomamba_ulf_super_resolution
 
 The state file ``campaign_state.json`` lives at the campaign root
@@ -405,20 +405,20 @@ a subset without rewriting the manifest:
 .. code-block:: bash
 
    # Re-submit only one arm by name:
-   python -m spectramr.cli campaign submit campaign.yaml \\
+   python -m spectramr.cli campaign submit campaign.yaml \
        --only baseline_swinir
 
    # Comma-separated list:
-   python -m spectramr.cli campaign submit campaign.yaml \\
+   python -m spectramr.cli campaign submit campaign.yaml \
        --only geomamba_ulf_v0,geomamba_ulf_v0_multicontrast
 
    # Restrict by tag (all ablation arms with tag.arch=geo_mamba):
-   python -m spectramr.cli campaign submit campaign.yaml \\
-       --include role=ablation \\
+   python -m spectramr.cli campaign submit campaign.yaml \
+       --include role=ablation \
        --include tag.arch=geo_mamba
 
    # Drop the most expensive arm:
-   python -m spectramr.cli campaign submit campaign.yaml \\
+   python -m spectramr.cli campaign submit campaign.yaml \
        --exclude name=baseline_latent_diffusion_3d
 
 The selector grammar is ``key=value`` with three recognised keys:
@@ -512,9 +512,9 @@ Re-run a single ablation after fixing a bug
 
 .. code-block:: bash
 
-   python -m spectramr.cli campaign submit \\
-       experiments/campaigns/geomamba_ulf_super_resolution.yaml \\
-       --only abl_no_metric_sfc \\
+   python -m spectramr.cli campaign submit \
+       experiments/campaigns/geomamba_ulf_super_resolution.yaml \
+       --only abl_no_metric_sfc \
        --resume
 
 Skip the most expensive baselines while iterating
@@ -522,9 +522,9 @@ Skip the most expensive baselines while iterating
 
 .. code-block:: bash
 
-   python -m spectramr.cli campaign submit \\
-       experiments/campaigns/geomamba_ulf_super_resolution.yaml \\
-       --exclude name=baseline_latent_diffusion_3d \\
+   python -m spectramr.cli campaign submit \
+       experiments/campaigns/geomamba_ulf_super_resolution.yaml \
+       --exclude name=baseline_latent_diffusion_3d \
        --exclude name=baseline_swin_unetr_3d
 
 Re-run only the partial-promotion arms of a sequential P3 campaign
@@ -532,9 +532,9 @@ Re-run only the partial-promotion arms of a sequential P3 campaign
 
 .. code-block:: bash
 
-   python -m spectramr.cli campaign submit \\
-       experiments/campaigns/geomamba_ulf_p3_promotion.yaml \\
-       --include role=variant \\
+   python -m spectramr.cli campaign submit \
+       experiments/campaigns/geomamba_ulf_p3_promotion.yaml \
+       --include role=variant \
        --exclude name=geomamba_ulf_v1_p3
 
 Sweep one knob without writing per-trial YAMLs

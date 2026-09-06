@@ -745,7 +745,7 @@ Overridable with ``make <target> VAR=value``.
      - Makefile: config passed to ``make train`` / ``make predict``.
        Read by ``Makefile``
    * - ``PYTHON``
-     - ``$(if $(wildcard .venv/bin/pytho...``
+     - ``$(if $(wildcard .venv/bin/python),.venv/bin/python,python3)``
      - Makefile: interpreter, auto-detected as ``.venv/bin/python`` when present.
        Read by ``scripts/ci/cluster_verify.sh``
    * - ``FUZZ_RUNS``
@@ -1526,12 +1526,12 @@ because there are **two** registries and they are not connected:
 
 * ``env.names()`` has exactly one consumer in the tree —
   :file:`scripts/release/print_env.py`.
-* ``spectramr diagnostics`` does **not** use it. It iterates ``_ENV_KNOBS``
+* ``spectramr doctor`` does **not** use it. It iterates ``_ENV_KNOBS``
   (:file:`src/spectramr/cli/diagnostics.py`), a hand-maintained tuple that is a
   separate partial list.
 
 So registering a variable in :file:`core/env.py` does *not* make it appear in
-``spectramr diagnostics``; the twelve added here do not. Reconciling ``_ENV_KNOBS``
+``spectramr doctor``; the twelve added here do not. Reconciling ``_ENV_KNOBS``
 against ``names()`` is a further piece of work, deliberately not done here.
 
 .. note::
@@ -1599,4 +1599,3 @@ is the part that is easy to get wrong:
 #. Otherwise, a name assigned a literal anywhere in the shell corpus is script-local.
 
 Skipping rule 1 hides 4 advertised sim2rank knobs; skipping rule 2 hides 29 more.
-

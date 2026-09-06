@@ -35,11 +35,11 @@ with the actual measurements.
 .. code-block:: yaml
 
    # experiments/tutorials/tutorial_04a_physics_dc.yaml
-   config_version: '6.0'
+   config_version: '1.0'
 
    metadata:
      name: "Tutorial 04a - Physics Data Consistency"
-     version: '6.0'
+     version: '1.0'
 
    model:
      model_type: standard_unet
@@ -48,9 +48,35 @@ with the actual measurements.
 
    training:
      training_mode: reconstruction
+     output_dir: experiments/results/tutorial_04a_physics_dc
      strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
      epochs: 50
-     seed: 42
+
+   data:
+     dataset_type: kspace
+     volume_format: h5
+     loader:
+       batch_size: 4
+     source:
+       root: databases/fastmri/datasets
+       index_path: data/manifests/fastmri_brain_multicoil_train.json
+
+   # k-space data into an image-domain U-Net: bridge explicitly (NN#9, no silent rescue).
+   adapters:
+     pre_model:
+       - name: ifft_kspace_to_image
+       - name: complex_to_real_imag_interleave
+
+   optimization:
+     optimizer:
+       type: adam
+       learning_rate: 0.0001
+
+   logging:
+     identity:
+       experiment: tutorial_04a_physics_dc
+     intervals:
+       log: 50
 
    physics:
      data_consistency:
@@ -61,12 +87,11 @@ with the actual measurements.
        enable_kspace_recon: true
        enforce_hermitian_symmetry: true
 
-   acceleration:
+   undersampling:
      base_acceleration: 4.0
      center_fraction: 0.08
 
    losses:
-     output_domain: image
      image_losses:
        - name: l1
          weight: 1.0
@@ -74,10 +99,14 @@ with the actual measurements.
        - name: ssim
          weight: 1.0
          enabled: true
-     kspace_losses:
-       - name: data_consistency
-         weight: 1.0
-         enabled: true
+     # NOTE: hard DC is enforced by the physics: block above (it replaces measured
+     # k-space after the forward pass). The registered `data_consistency` LOSS is the
+     # *soft* alternative — declaring both gives one invariant two owners.
+     kspace_losses: []
+     policy:
+       output_domain: image
+   run:
+     seed: 42
 
 **Expected Result:** +0.5–1.0 dB PSNR compared to Tutorial 01 baseline,
 and significantly reduced aliasing artefacts near the k-space centre.
@@ -172,26 +201,46 @@ Configuration for Cycle-Bloch:
 .. code-block:: yaml
 
    # experiments/tutorials/tutorial_04b_cycle_bloch.yaml
-   config_version: '6.0'
+   config_version: '1.0'
 
    metadata:
      name: "Tutorial 04b - Cycle-Bloch ULF-to-HF"
-     version: '6.0'
+     version: '1.0'
 
    model:
      model_type: standard_unet
      in_channels: 1        # ULF magnitude input
      out_channels: 1
+     # The discriminator is a component OF the model, not a top-level block.
+     discriminator_component:
+       name: patch_gan
+       kwargs:
+         n_layers: 3
+         ndf: 64
 
-   discriminator:
-     discriminator_type: patch_gan
-     in_channels: 1
+   data:
+     dataset_type: kspace
+     volume_format: h5
+     loader:
+       batch_size: 2
+     coils:
+       processing_mode: rss
+     domain:
+       target_channels: 1
+     source:
+       root: databases/m4raw/data
+       index_path: data/manifests/m4raw_train.json
+
+   adapters:
+     pre_model:
+       - name: ifft_kspace_to_image
+       - name: magnitude_from_complex
 
    training:
      training_mode: cycle_bloch
+     output_dir: experiments/results/tutorial_04b_cycle_bloch
      strategy_class: spectramr.infrastructure.training.strategies.cycle_bloch_strategy.CycleBlochStrategy
      epochs: 100
-     seed: 42
 
    physics:
      bloch:
@@ -200,22 +249,36 @@ Configuration for Cycle-Bloch:
        ulf_te: 14.0     # ms – echo time for ULF sequence
 
    losses:
-     output_domain: image
      image_losses:
        - name: l1
          weight: 1.0
          enabled: true
      gan:
+       enable_adversarial: true   # required whenever a discriminator is declared
+       lambda_adv: 1.0
+       gan_loss_type: lsgan
+       disc_updates: 1
        lambda_cycle_bloch: 10.0   # Bloch cycle loss weight
        lambda_cycle_adv: 1.0      # GAN adversarial weight
      kspace_losses: []
      complex_losses: []
 
+     policy:
+       output_domain: image
    optimization:
-     optimizer_type: adam
-     learning_rate: 0.0002
-     optimizer_kwargs:
-       betas: [0.5, 0.999]
+     optimizer:
+       type: adam
+       learning_rate: 0.0002
+       kwargs:
+         betas: [0.5, 0.999]
+   run:
+     seed: 42
+
+   logging:
+     identity:
+       experiment: tutorial_04b_cycle_bloch
+     intervals:
+       log: 50
 
 **Loss Terms (auto-logged to TensorBoard):**
 
@@ -273,14 +336,10 @@ Step 5: Run & Verify
 .. code-block:: bash
 
    # Data consistency reconstruction
-   python src/main.py train \
-       --config experiments/tutorials/tutorial_04a_physics_dc.yaml \
-       --output-dir experiments/tutorials/tutorial_04a
+   spectramr train --config experiments/tutorials/tutorial_04a_physics_dc.yaml
 
    # Cycle-Bloch ULF↔HF synthesis
-   python src/main.py train \
-       --config experiments/tutorials/tutorial_04b_cycle_bloch.yaml \
-       --output-dir experiments/tutorials/tutorial_04b
+   spectramr train --config experiments/tutorials/tutorial_04b_cycle_bloch.yaml
 
 After training, compare results:
 

@@ -10,7 +10,7 @@ perceptually richer images than a supervised U-Net alone.
 **What You'll Learn:**
 
 - Configuring a GAN training strategy
-- Balancing adversarial, pixel, and perceptual losses using the v6.0 ``losses:`` schema
+- Balancing adversarial, pixel, and perceptual losses using the ``losses:`` schema
 - Reading discriminator-specific training metrics
 - Common GAN instability fixes
 
@@ -57,13 +57,13 @@ Then edit the file:
 .. code-block:: yaml
 
    # Tutorial 02: GAN Super-Resolution
-   config_version: '6.0'
+   config_version: '1.0'
 
    metadata:
      name: "Tutorial 02 - GAN Super-Resolution"
      description: "4× accelerated MRI super-resolution with adversarial training"
      tags: ["tutorial", "gan", "super-resolution"]
-     version: '6.0'
+     version: '1.0'
 
    model:
      model_type: standard_unet
@@ -71,36 +71,37 @@ Then edit the file:
      out_channels: 1
      model_kwargs:
        features: [64, 128, 256, 512]
-
-   discriminator:
-     discriminator_type: patch_gan
-     in_channels: 1
-     model_kwargs:
-       ndf: 64
-       n_layers: 3
+     discriminator_component:
+       name: patch_gan
+       kwargs:
+         in_channels: 1
+         ndf: 64
+         n_layers: 3
 
    training:
+     output_dir: experiments/results/tutorial_02_gan_sr
      training_mode: gan
      strategy_class: spectramr.infrastructure.training.strategies.gan.GANTrainingStrategy
      epochs: 100
-     seed: 42
 
    data:
      dataset_type: image
-     data_root: databases/fastmri/datasets
-     batch_size: 4
-     num_workers: 4
 
+     loader:
+       batch_size: 4
+       num_workers: 4
+     source:
+       root: databases/fastmri/datasets
    optimization:
-     optimizer_type: adam
-     learning_rate: 0.0002
-     weight_decay: 0.0
-     optimizer_kwargs:
-       betas: [0.5, 0.999]   # Standard GAN betas
      lr_scheduler_strategy: none
 
+     optimizer:
+       type: adam
+       learning_rate: 0.0002
+       weight_decay: 0.0
+       kwargs:
+         betas: [0.5, 0.999]   # Standard GAN betas
    losses:
-     output_domain: image
      image_losses:
        - name: l1
          weight: 10.0         # Strong pixel anchor prevents mode collapse
@@ -108,21 +109,29 @@ Then edit the file:
        - name: perceptual
          weight: 1.0
          enabled: true
-       - name: adversarial
-         weight: 1.0
-         enabled: true
-         kwargs:
-           loss_type: lsgan   # LSGAN more stable than vanilla BCE
      kspace_losses: []
      complex_losses: []
+     gan:
+       enable_adversarial: true
+       lambda_adv: 1.0
+       gan_loss_type: lsgan   # LSGAN more stable than vanilla BCE
+       disc_updates: 1
 
+     policy:
+       output_domain: image
    validation:
-     eval_interval: 500
-     metrics: [psnr, ssim, lpips]
 
+     schedule:
+       interval_steps: 500
+     scoring:
+       compute: [psnr, ssim, lpips]
    logging:
-     log_interval: 50
-     enable_tensorboard: true
+     intervals:
+       log: 50
+     tracking:
+       enable_tensorboard: true
+   run:
+     seed: 42
 
 **Key Choices Explained:**
 
@@ -136,9 +145,7 @@ Step 2: Train
 
 .. code-block:: bash
 
-   python src/main.py train \
-       --config experiments/tutorials/tutorial_02_gan_sr.yaml \
-       --output-dir experiments/tutorials/tutorial_02_gan_sr
+   spectramr train --config experiments/tutorials/tutorial_02_gan_sr.yaml
 
 **Expected Training Output:**
 
@@ -219,7 +226,7 @@ Step 5: Compare to Supervised Baseline
    with open('experiments/tutorials/tutorial_01_basic_unet/inference/metrics.json') as f:
        unet_metrics = json.load(f)
 
-   with open('experiments/tutorials/tutorial_02_gan_sr/inference/metrics.json') as f:
+   with open('experiments/results/tutorial_02_gan_sr/inference/metrics.json') as f:
        gan_metrics = json.load(f)
 
    print("Model       | PSNR (dB) | SSIM  | LPIPS")

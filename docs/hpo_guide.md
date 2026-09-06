@@ -36,7 +36,9 @@ Pick the *least invasive* mechanism that fits your needs.
 5 named presets ship with the repo:
 
 ```bash
-python -m spectramr.cli hpo --list-presets
+# --config and --model-type are required even though this flag reads neither;
+# any loadable path and any registered model_type will do.
+python -m spectramr.cli hpo --config <yaml> -m <model> --list-presets
 ```
 
 | Preset | Dimension | What it tunes |
@@ -67,11 +69,12 @@ Conflicts (same dotted path defined in multiple presets) raise an error by defau
 For arbitrary search spaces, write your own YAML:
 
 ```bash
-# Generate a starter template
-python -m spectramr.cli hpo --print-template > my_space.yaml
+# Generate a starter template. --config/--model-type are required here too,
+# and unread here too.
+python -m spectramr.cli hpo --config <yaml> -m <model> --print-template > my_space.yaml
 
-# List every dotted-path field TrainingSettings exposes (1176 of them)
-python -m spectramr.cli hpo --list-schema-paths
+# List every dotted-path field TrainingSettings exposes
+python -m spectramr.cli hpo --config <yaml> -m <model> --list-schema-paths
 
 # Run with your spec
 python -m spectramr.cli hpo --config <yaml> -m <model> --search-space my_space.yaml
@@ -80,13 +83,14 @@ python -m spectramr.cli hpo --config <yaml> -m <model> --search-space my_space.y
 YAML format:
 
 ```yaml
-# Each top-level key is a dotted-path config field
-optimization.learning_rate:
+# Each top-level key is a dotted-path config field. Use the CANONICAL nested
+# spelling -- see the pitfall about retired spellings below.
+optimization.optimizer.learning_rate:
   dist: loguniform        # or uniform, int_uniform, int_loguniform, categorical
   low: 1.0e-5
   high: 2.0e-4
 
-optimization.weight_decay:
+optimization.optimizer.weight_decay:
   dist: loguniform
   low: 1.0e-7
   high: 1.0e-3
@@ -221,10 +225,20 @@ Default pruner is Hyperband with intermediate reports at iters 4K / 8K / 16K / 3
 ```bash
 python -m spectramr.cli hpo --config <yaml> -m <model> \
     --search-preset kan_dual_domain \
-    --pruner median           # or successive_halving, threshold, none
+    --pruner median           # or successive_halving
 ```
 
-`--pruner none` disables pruning entirely (every trial trains to completion). Useful for short `--max-iter` runs (≤5K) where pruning would kill trials before they've stabilized.
+> **`--pruner none` does not disable pruning, and `--pruner threshold` does not run.**
+> The CLI's `choices=` list and the factory that consumes the string are two
+> unsynced vocabularies.
+> `none` is translated to `nop`, the pruner factory has no `nop` branch, and the
+> fall-through returns **MedianPruner** — so trials you expected to run to
+> completion get pruned instead. `threshold` raises
+> `TypeError: Either lower or upper must be specified.` before the first trial,
+> because nothing plumbs its bounds. The pruners that behave as documented are
+> `hyperband`, `median` and `successive_halving`. Likewise `--sampler nsga2` is
+> matched as `nsgaii` in the factory and silently degrades to TPE unless
+> `--multi-objective --cost-weight >0` is also set.
 
 ## Output layout
 
@@ -253,7 +267,11 @@ The output directory defaults to `<base.training.output_dir>/hpo` so HPO trial a
 
 * **Conflict between presets.** `--search-preset a --search-preset b` raises if `a` and `b` define the same path. This is intentional — silent precedence rules are usually a bug. If you genuinely want one to override the other, pass `--preset-merge-policy override` (later wins) or `keep` (first wins).
 
-* **Pruning at iter 4K when `--max-iter 5000`.** The Hyperband milestones don't auto-rescale to your `--max-iter`. For short runs, either disable pruning (`--pruner none`) or pick a budget where pruning makes sense (`--max-iter 30000+`).
+* **Pruning at iter 4K when `--max-iter 5000`.** The Hyperband milestones don't auto-rescale to your `--max-iter`. Pick a budget where pruning makes sense (`--max-iter 30000+`) — you cannot currently opt out, because `--pruner none` silently becomes MedianPruner.
+
+* **`train --override` cannot express a `[name=...]` selector.** The selector syntax works in a *search space*, which resolves paths through `apply_dotted_override`. `train --override` uses a different resolver that splits on the first `=` — which lands inside the selector — and then discards the result while logging `Overrides applied (1)`. Applying a winning loss weight by hand means editing the YAML, or just running the `best_config.yaml` that HPO already wrote.
+
+* **A retired spelling in a search space raises on trial 1.** `optimization.learning_rate` and `optimization.weight_decay` are `fold` records: a YAML that declares *only* the old spelling still loads. A search space is different, because it *adds* a key to a config that already has one. If the arm declares `optimization.optimizer.learning_rate` and the search space names `optimization.learning_rate`, both are present with different values and the fold's conflict guard raises `optimization.learning_rate=... and optimization.optimizer.learning_rate=... disagree`. Verified against `experiment_11_kan_dual_domain.yaml`, which declares the nested spelling — so both of these must be written the canonical way. Resolve any path you are unsure of through `config/schemas/renames.py` before putting it in a search space, and note that the fold is *silent when the values happen to coincide*, which makes a spot check with a round number useless as a test.
 
 * **Wavelet-attention configs cannot use the `kan_dual_domain` preset directly.** The preset defines paths inside `model.model_kwargs.kan_dual_domain_kwargs` which the wavelet attention type ignores. For wavelet HPO, write a custom YAML targeting the wavelet-specific paths (e.g., `num_levels`, `score_fn`).
 
@@ -278,7 +296,7 @@ space = load_presets(["optimizer_basic", "loss_weights_only"])
 
 # (c) Programmatic — use tuple specs for terseness or dict specs for readability
 space = SearchSpace.from_dict({
-    "optimization.learning_rate": ("loguniform", 1e-5, 2e-4),
+    "optimization.optimizer.learning_rate": ("loguniform", 1e-5, 2e-4),
     "model.model_kwargs.kan_dual_domain_kwargs.kan_grid_size": ("categorical", 4, 5, 6, 8),
     "losses.kspace_losses[name=log_spectral].weight": ("loguniform", 0.01, 1.0),
 })

@@ -34,12 +34,35 @@ Software
 --------
 
 - **Operating System**: Linux (Ubuntu 20.04+), macOS, or Windows with WSL2
-- **Python**: 3.9, 3.10, 3.11, or 3.12
-- **CUDA**: 11.8 or 12.1+ (for GPU acceleration)
+- **Python**: 3.12 or newer (``requires-python = ">=3.12"``)
+- **CUDA**: 12.6 (for GPU acceleration). The project pins the
+  ``pytorch-cu126`` wheel index deliberately: cu126 is the last lane that
+  still ships ``sm_70``, which the V100 above needs. A cu129 (or newer)
+  wheel fails every kernel launch on a V100 with
+  ``cudaErrorNoKernelImageForDevice``.
 - **Git**: For cloning the repository
 
 Installation
 ============
+
+There are two routes. Install from PyPI if you only want to *run* the framework;
+clone if you want the experiment corpus, the tutorials' companion files, or to
+modify the source.
+
+From PyPI
+---------
+
+.. code-block:: bash
+
+   pip install spectraMR              # core
+   pip install "spectraMR[mri]"       # + TorchIO / MONAI / NiBabel / torchkbnufft
+   pip install "spectraMR[all]"       # everything that resolves in one shot
+
+This installs the ``spectramr`` console script, which is what every command in
+these pages uses. It does **not** bring the ``experiments/`` tree with it, so the
+tutorials below have you write their configuration files yourself.
+
+The remaining steps are the clone route.
 
 Step 1: Clone the Repository
 -----------------------------
@@ -57,7 +80,7 @@ Using **conda** (recommended):
 .. code-block:: bash
 
    # Create environment
-   conda create -n spectramr python=3.11
+   conda create -n spectramr python=3.12
    conda activate spectramr
 
 Using **venv**:
@@ -65,7 +88,7 @@ Using **venv**:
 .. code-block:: bash
 
    # Create environment
-   python3.11 -m venv .venv
+   python3.12 -m venv .venv
    source .venv/bin/activate  # On Windows: .venv\\Scripts\\activate
 
 Step 3: Install Dependencies
@@ -130,7 +153,7 @@ Step 4: Verify Installation
 
 Expected output::
 
-   PyTorch: 2.1.0+cu118
+   PyTorch: 2.8.0+cu126
    CUDA Available: True
    spectraMR installed successfully!
 
@@ -180,8 +203,8 @@ Option 1: FastMRI Dataset (Recommended for Beginners)
       mkdir -p data/manifests
 
       # Run preprocessing to generate index
-      python scripts/data/regenerate_cluster_manifests.py \\
-          --data-base databases \\
+      python scripts/data/regenerate_cluster_manifests.py \
+          --data-base databases \
           --datasets fastmri_brain
 
 Option 2: M4Raw Dataset
@@ -195,8 +218,8 @@ M4Raw is another excellent dataset for rapid prototyping.
    # databases/m4raw/ -- see https://doi.org/10.5281/zenodo.8056074
    #
    # Then build the manifests:
-   python scripts/data/regenerate_cluster_manifests.py \\
-       --data-base databases \\
+   python scripts/data/regenerate_cluster_manifests.py \
+       --data-base databases \
        --datasets m4raw
 
 Option 3: Using Sample Data (Quick Start)
@@ -224,9 +247,7 @@ Step 1: Understand the Configuration
 Experiments are defined using YAML configuration files. Let's examine a simple configuration:
 
 .. code-block:: yaml
-   :caption: experiments/configs/quickstart_basic_reconstruction.yaml
-
-   config_version: '6.0'
+   config_version: '1.0'
    model:
      model_type: standard_unet
      in_channels: 2
@@ -240,24 +261,40 @@ Experiments are defined using YAML configuration files. Let's examine a simple c
      max_iterations: 10000
      epochs: 10
      device: cuda
+     output_dir: experiments/results/quickstart_basic_reconstruction
 
    data:
      dataset_type: kspace
-     data_root: databases/fastmri/datasets
      datasets:
        - name: fastmri_train
          path: databases/fastmri/datasets/multicoil_train
-     index_path: data/manifests/fastmri_brain_multicoil_train.json
-     batch_size: 4
 
-   acceleration:
+     loader:
+       batch_size: 4
+     source:
+       root: databases/fastmri/datasets
+       index_path: data/manifests/fastmri_brain_multicoil_train.json
+   adapters:
+     pre_model:
+       - name: ifft_kspace_to_image          # kspace -> complex_image
+       - name: complex_to_real_imag_interleave  # complex_image -> image (2 channels)
+
+   undersampling:
      base_acceleration: 4
      center_fraction: 0.08
      acceleration_type: cartesian_vd
 
    optimization:
-     optimizer_type: adam
-     learning_rate: 0.0001
+     optimizer:
+       type: adam
+       learning_rate: 0.0001
+
+   logging:
+     identity:
+       experiment: quickstart_basic_reconstruction
+     intervals:
+       log: 50
+       save: 5
 
 **Key Parameters:**
 
@@ -334,10 +371,10 @@ Once training completes, run inference on test data:
 
 .. code-block:: bash
 
-   python -m spectramr.cli infer \\
-       --config experiments/templates/comprehensive_config_template.yaml \\
-       --checkpoint experiments/results/comprehensive_experiment_template/checkpoints/best.pt \\
-       --input databases/fastmri/datasets/multicoil_brain_val \\
+   python -m spectramr.cli infer \
+       --config experiments/templates/comprehensive_config_template.yaml \
+       --checkpoint experiments/results/comprehensive_experiment_template/checkpoints/best.pt \
+       --input databases/fastmri/datasets/multicoil_brain_val \
        --output output/inference_results
 
 Step 5: Evaluate Results
@@ -432,8 +469,8 @@ Generate the dataset index:
 
 .. code-block:: bash
 
-   python scripts/data/regenerate_cluster_manifests.py \\
-       --data-base databases \\
+   python scripts/data/regenerate_cluster_manifests.py \
+       --data-base databases \
        --datasets fastmri_brain
 
 Issue: Slow Training

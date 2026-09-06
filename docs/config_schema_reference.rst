@@ -1,7 +1,7 @@
 .. _config_schema_reference:
 
 =================================================
-Configuration Schema Reference — v6.0
+Configuration Schema Reference — v1.0
 =================================================
 
 .. sectionauthor:: spectraMR Research
@@ -10,6 +10,34 @@ Every training run is driven by a single YAML file loaded once via
 ``TrainingSettings.from_yaml(path)`` and validated immediately. After
 loading the object is **frozen** (Pydantic ``frozen=True``) — no
 downstream code may mutate it.
+
+.. note::
+
+   **Why ``1.0`` comes after ``6.x``.** The number restarts at ``1.0``
+   deliberately. The 5.x/6.x lineage numbered a schema that no longer exists —
+   the 15-phase block decomposition rebuilt the layout underneath those names,
+   and nothing ever branched on the version anyway: it is validated, bound onto
+   ``run.config_version``, and read by no consumer. A version that gates nothing
+   but keeps incrementing is a changelog pretending to be a contract. ``1.0``
+   names the schema as it now is, once.
+
+   ``6.0`` and ``6.1`` were briefly *accepted at the door and folded* to ``1.0``
+   so the corpus could migrate gradually. That fold was removed on 2026-08-08:
+   ``LEGACY_CONFIG_VERSIONS`` is now an empty frozenset and a legacy declaration
+   **raises**. If you are holding an older file, migrate the *keys* first, then
+   set the version:
+
+   .. code-block:: bash
+
+      python scripts/ci/migrate_config_keys.py <file> --apply --all-versions
+      # then edit the file: config_version: '1.0'
+
+   ``--all-versions`` is not optional here: without it the key migrator skips
+   any file the loader rejects — which is every file that still declares a
+   legacy version — and reports "no retired keys found" while exiting 0.
+
+   Do the two in that order. The key migration is what makes the file loadable;
+   the version line on its own only changes which error you get.
 
 .. contents:: Table of Contents
    :depth: 2
@@ -21,7 +49,7 @@ Top-Level Structure
 
 .. code-block:: yaml
 
-   config_version: "6.0"        # required — validated on load; accepted: "6.0", "6.1"
+   config_version: '1.0'        # required — validated on load; the ONLY accepted value
    device: cuda                 # cuda | cpu | mps | auto
    seed: 42
    model_domain: kspace         # OPTIONAL convenience knob — image | kspace | (omit)
@@ -62,7 +90,7 @@ Top-Level Structure
      signal_domain: image       #   SignalDomain (optional) — which domain the arm CONSUMES
      spatial_rank: 2            #   int (optional) — 2 = slices, 3 = volumes
 
-   # ---- v6.1 additive blocks (strict superset of v6.0) ----
+   # ---- additive blocks ----
    acquisition:    { ... }      # AcquisitionConfigSchema (PILOT codesign, BALD)
    certification:  { ... }      # CertificationConfigSchema (conformal / CHD / PRC / PAC-Bayes)
    audit:          { ... }      # AuditConfigSchema (Tier-3 KSD defensibility)
@@ -163,10 +191,10 @@ diverged by 404 documented paths.
 
 .. note::
 
-   **Schema currency for ``experiments/inprogress/``.** ``6.1`` is the latest
+   **Schema currency for ``experiments/inprogress/``.** ``1.0`` is the only
    accepted version, and the corpus is migrating to it *plus* a ``workflow:``
    block, opportunistically: any ``inprogress/`` YAML opened during a task is
-   brought to ``config_version: '6.1'`` with a declared regime × task before that
+   brought to ``config_version: '1.0'`` with a declared regime × task before that
    task ends. Note the audit's deliberate asymmetry — an **absent** ``workflow:``
    is advisory, a **wrong** one is a hard error (a ``STUB``-maturity regime, or a
    task the regime does not support), so never guess: bump the version alone and
@@ -195,15 +223,21 @@ Python access:
 
    cfg = TrainingSettings.from_yaml("experiments/training/my.yaml")
 
-   # ✅ CORRECT: nested access
+   # ✅ CORRECT: nested access, at the depth the schema actually has
    cfg.training.training_mode
-   cfg.optimization.learning_rate
-   cfg.data.batch_size
+   cfg.optimization.optimizer.learning_rate
+   cfg.data.loader.batch_size
    cfg.losses.image_losses          # list[LossComponentConfig]
 
-   # ❌ FORBIDDEN: flat aliases removed in v5.0+
+   # ❌ FORBIDDEN: flat aliases, never on the schema
    cfg.lr                           # AttributeError
    cfg.lambda_l1                    # AttributeError
+
+   # ❌ ALSO WRONG: a `fold` rename is a YAML/override courtesy, not an attribute.
+   # These two spellings are accepted in a YAML file and by ``-O``, and are
+   # relocated during validation -- but nothing binds them on the object.
+   cfg.optimization.learning_rate   # AttributeError
+   cfg.data.batch_size              # AttributeError
 
 
 ---
@@ -1480,16 +1514,15 @@ Dry-run before allocating GPU:
 
 .. code-block:: bash
 
-   python src/main.py train \
-       --config experiments/training/my.yaml \
-       --dry_run
+   spectramr train --config experiments/training/my.yaml --dry-run
 
 The ``ConfigHealthChecker`` validates:
 
 1. ``model.in_channels`` matches ``data.coil_processing_mode``
-2. ``losses.output_domain`` matches populated loss lists
-3. ``config_version`` present and in ``ACCEPTED_CONFIG_VERSIONS`` (``'6.0'`` /
-   ``'6.1'``; ``inprogress/`` arms migrate to ``'6.1'`` — see the schema-currency
+2. ``losses.policy.output_domain`` matches populated loss lists
+3. ``config_version`` present and in ``ACCEPTED_CONFIG_VERSIONS`` — which is
+   exactly ``{'1.0'}``; ``LEGACY_CONFIG_VERSIONS`` emptied on 2026-08-08, so
+   "accepted" and "current" now name the same thing (see the schema-currency
    note above)
 4. All manifest paths exist on disk
 5. ``physics.data_consistency.enabled`` in reconstruction modes
@@ -1498,8 +1531,7 @@ The ``ConfigHealthChecker`` validates:
 
 .. code-block:: bash
 
-   python src/main.py train \
-       --config my.yaml \
+   spectramr train --config my.yaml \
        --override "optimization.learning_rate=5e-5" \
        --override "data.batch_size=16"
 
@@ -1578,7 +1610,7 @@ include_concomitant}`` — is declared **once**, as
 ``spectramr.config.schemas.training.pmps.AcquisitionParam`` is an alias of it, kept so
 ``fixed_protocols`` and the module's ``__all__`` are unchanged for callers.
 
-It was not always one. ``pmps.py`` re-declared the class with the same eight fields,
+It was not always one. ``pmps.py`` redeclared the class with the same eight fields,
 the same types and the same defaults — except ``contrast_type``:
 
 =========================  ===================================================

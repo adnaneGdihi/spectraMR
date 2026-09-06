@@ -214,7 +214,7 @@ The console / log file also gets a scannable banner at startup::
     run_id     : exp_gan-20260611_201500-61cf45551c5e
     git        : 61cf45551c5e @ dev (DIRTY)
     host       : node07 (pid 4242, <user>)
-    torch      : 2.11.0+cu129 · 2x A100(40.0GB)
+    torch      : 2.8.0+cu126 · 2x A100(40.0GB)
     gpu        : 2 visible / 4 on node · 2 allocated · driver 550.54.15 · CUDA_VISIBLE_DEVICES=0,1
     node       : 8/128 cores · 64.0/1007.5 GB RAM · AMD EPYC 7763 64-Core Processor
     python     : 3.12.12
