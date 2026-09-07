@@ -12,14 +12,9 @@ spectraMR's generators are organized by reconstruction paradigm. All follow the
 
 .. note::
 
-   **This page does not state a count, deliberately.** It used to claim "273
-   generator classes across 115 files"; the registry holds **586** models and
-   ``models/generators/`` holds **224** files, so both halves were wrong and
-   nothing recomputed them. A frozen count in a hand-written page drifts silently
-   and is worse than no count -- a reader who trusts it under-estimates the
-   framework by a factor of two.
-
-   The registry is the only answer that cannot go stale. Ask it:
+   **This page states no model count, deliberately.** A frozen count in a
+   hand-written page drifts silently, and is worse than no count. The registry is
+   the only answer that cannot go stale. Ask it:
 
    .. code-block:: python
 
@@ -320,7 +315,7 @@ Sparse VAE
 VAE with sparsity-inducing prior on the latent space for disentangled
 representations.
 
-Masked Autoencoder (MAE) 
+Masked Autoencoder (MAE)
 -------------------------
 
 **Registry:** ``mae_mri`` — **File:** ``mae_generator.py``
@@ -808,7 +803,7 @@ on a style vector; a ``MappingNetwork`` (shared MLP with per-domain heads) that 
 latent code ``z`` + domain label ``y`` to a style vector; and a ``StyleEncoder`` (shared
 convolutional trunk with per-domain heads) that extracts a style vector from a reference
 image. Style genuinely drives the AdaIN affine transforms — the generator output is
-verified to differ under two independent styles (anti-facade, pitfall #16). The companion
+verified to differ under two independent styles. The companion
 discriminator (``stargan_v2_discriminator``, ``models/discriminators/stargan_v2_discriminator.py``)
 shares the same domain-selection contract: ``forward(x, y) -> [B]`` logits gathered
 from per-domain output heads of a shared convolutional trunk (Task 9).
@@ -1018,26 +1013,22 @@ Quick Reference Table
      - Epistemic uncertainty mapping (NIG)
 
 
-Audit-2026-05-14 round-2 fixes (model-side)
-===========================================
-
-WavKAN norm-kwarg leak (F8 / E13)
----------------------------------
+WavKAN norm-kwarg filtering
+===========================
 
 :py:class:`spectramr.models.layers.kan.kan_convs.wav_kan.WavKANConvNDLayer`
-accepts ``**norm_kwargs`` and historically forwarded the entire blob
-unfiltered to ``norm_class(output_dim, **norm_kwargs)``. The caller
+accepts ``**norm_kwargs``, which must not be forwarded unfiltered to
+``norm_class(output_dim, **norm_kwargs)``. The caller
 chain ``RefinedKANUNet → DoubleConvWithKAN → WavKANConv2DLayer``
 forwards the full YAML ``model_kwargs`` dict, which can include
 KAN-specific options (``grid_size``, ``spline_order``, ``scale_noise``,
 ``scale_base``, ``grid_update_freq``, ``grid_range``,
 ``grid_update_decay``, ``base_filters``, ``features``,
-``bottleneck_only``). Those landed on ``BatchNorm2d.__init__`` and
-raised ``TypeError: got an unexpected keyword argument 'grid_size'``
-for every KAN-based experiment in the 2026-05-14 smoke run.
+``bottleneck_only``). Unfiltered, those land on ``BatchNorm2d.__init__`` and
+raise ``TypeError: got an unexpected keyword argument 'grid_size'``.
 
-The fix introspects ``norm_class`` with ``inspect.signature`` and
-keeps only kwargs that the norm constructor's signature accepts.
+The layer therefore introspects ``norm_class`` with ``inspect.signature`` and
+keeps only kwargs the norm constructor's signature accepts.
 Mirrors the filter pattern already present in
 :py:mod:`spectramr.models.layers.kan.kan_convs.fast_kan_conv`. Pinned by
 :py:mod:`tests.unit.models.blocks.test_wav_kan_norm_kwarg_filter` (14
@@ -1138,8 +1129,7 @@ Data Layer: Image Volume Utilities
 * ``group_slices_by_prefix`` — groups slices into volumes by filename prefix.
 * ``find_common_png_stems`` — intersection of PNG stems across directories.
 
-These helpers centralise the repeated logic that was previously duplicated
-across TRELLIS dataset variants.
+These helpers centralise the logic shared across TRELLIS dataset variants.
 
 
 Infrastructure: Reporting Tables
@@ -1201,4 +1191,3 @@ References
 
 15. Kirkpatrick, J., et al. "Overcoming Catastrophic Forgetting in Neural
     Networks." PNAS, 2017. (Continual Learning, EWC)
-

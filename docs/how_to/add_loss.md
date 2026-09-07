@@ -84,7 +84,7 @@ from . import (
 )
 ```
 
-The repo's "pitfall 9" rule (no silent fallbacks) is exactly this
+The no-silent-fallbacks rule is exactly this
 case: a `@register_loss` decorator that nothing imports is silently dead.
 
 A cold-subprocess regression test in
@@ -184,4 +184,4 @@ The adapter chain runs before each loss is computed. See
 
 - [Add a model](add_model.md) — the registration pattern is similar.
 - [Add a paradigm](add_paradigm.md) — how to use multiple losses in one training loop.
-- [Registries reference](../reference/registries.md) — list every registered loss in the repo.
+- [Losses reference](../losses_reference.rst) — the registered loss catalogue.

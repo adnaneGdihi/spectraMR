@@ -808,3 +808,133 @@ class TestSliceLevelRecords:
             DataConfigSchema(dataset_type="kspace", slice_level_records=False).slice_level_records
             is False
         )
+
+
+class TestR2RTargetMode:
+    """``target_mode: 'r2r'`` and the two nonlinearities that silently break it.
+
+    R2R's guarantee is second-moment: ``Cov(y + a z, y - z/a) = 0``, which makes
+    the L1/L2 minimiser the CLEAN image even though no clean image is ever shown.
+    That identity survives LINEAR maps (``Cov(A a, A b) = A Cov(a, b) A^H``) and
+    dies under a nonlinearity -- SILENTLY, because the loss still falls. So both
+    nonlinear stages in this pipeline raise here rather than degrade (NN#3).
+    """
+
+    def test_r2r_is_in_the_target_mode_vocabulary(self):
+        assert DataConfigSchema(target_mode="r2r", val_target_mode="phase_aligned_mean").target_mode == "r2r"
+
+    def test_r2r_alpha_defaults_to_one(self):
+        """alpha=1 splits the noise evenly: 2*Sigma into each half."""
+        assert DataConfigSchema(target_mode="r2r", val_target_mode="phase_aligned_mean").r2r_alpha == 1.0
+
+    def test_r2r_alpha_is_accepted_under_r2r(self):
+        assert DataConfigSchema(target_mode="r2r", r2r_alpha=0.5, val_target_mode="phase_aligned_mean").r2r_alpha == 0.5
+
+    @pytest.mark.parametrize("bad_alpha", [0.0, -1.0])
+    def test_non_positive_alpha_is_refused(self, bad_alpha):
+        """alpha appears as ``1/alpha`` in the target, so 0 is not a limit."""
+        with pytest.raises(ValidationError):
+            DataConfigSchema(target_mode="r2r", r2r_alpha=bad_alpha, val_target_mode="phase_aligned_mean")
+
+    @pytest.mark.parametrize("other_mode", ["complex_mean", "phase_aligned_mean", "rep_pair"])
+    def test_alpha_declared_under_another_mode_is_refused(self, other_mode):
+        """An unread knob is a defect, not a harmless extra (NN#8)."""
+        with pytest.raises(ValidationError, match="r2r_alpha"):
+            DataConfigSchema(target_mode=other_mode, r2r_alpha=2.0)
+
+    def test_alpha_declared_with_no_mode_at_all_is_refused(self):
+        with pytest.raises(ValidationError, match="r2r_alpha"):
+            DataConfigSchema(r2r_alpha=2.0)
+
+    def test_r2r_without_a_validation_reference_is_refused(self):
+        """An r2r validation target is a fresh random image every epoch.
+
+        PSNR against it measures the noise draw, and ``track_best_metric`` would
+        checkpoint whichever epoch drew kindest. The knob is not optional under
+        r2r, so the schema names it rather than defaulting (NN#3).
+        """
+        with pytest.raises(ValidationError, match="val_target_mode"):
+            DataConfigSchema(target_mode="r2r")
+
+    def test_r2r_with_leave_one_out_is_accepted(self):
+        """Pins a DELETED guard: this combination used to raise, and must not.
+
+        ``nex_target_exclude_input`` is ONE knob shared by both splits. Under
+        r2r the training split never averages -- but the VALIDATION split runs
+        ``val_target_mode`` (a real averaging mode), and leave-one-out there is
+        what keeps the input repetition out of its own reference. Refusing the
+        pair made the whole cohort's arm A unconstructible.
+        """
+        cfg = DataConfigSchema(
+            target_mode="r2r", val_target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+        )
+        assert cfg.nex_target_exclude_input is True
+        assert cfg.val_target_mode == "phase_aligned_mean"
+
+    def test_val_target_mode_defaults_to_none(self):
+        """None means "serve the training mode to both splits"."""
+        assert DataConfigSchema().val_target_mode is None
+
+    def test_val_target_mode_cannot_be_r2r(self):
+        """Excluded at the TYPE level: a redrawn target is not a metric reference."""
+        with pytest.raises(ValidationError):
+            DataConfigSchema(target_mode="r2r", val_target_mode="r2r")
+
+    @pytest.mark.parametrize(
+        "train_mode", ["complex_mean", "phase_aligned_mean", "rep_pair"]
+    )
+    def test_val_target_mode_is_readable_under_every_training_mode(self, train_mode):
+        """It is not an r2r-only knob.
+
+        Holding ONE val reference fixed across a cohort is what makes the arms
+        comparable, so every arm declares it -- not just the r2r one.
+        """
+        extra = {"nex_target_exclude_input": True} if train_mode == "rep_pair" else {}
+        cfg = DataConfigSchema(
+            target_mode=train_mode, val_target_mode="phase_aligned_mean", **extra
+        )
+        assert cfg.val_target_mode == "phase_aligned_mean"
+        assert cfg.target_mode == train_mode
+
+    @pytest.mark.parametrize("mode", ["rss", "magnitude", "svd"])
+    def test_nonlinear_coil_combine_is_refused_under_r2r(self, mode):
+        """``|.|`` maps the Gaussian residual to Rician: E[target] != x.
+
+        This is the guard that matters most in practice -- ``dataset_type: m4raw``
+        injects ``coils.processing_mode: svd`` through a preset, so an r2r arm
+        that does not say ``none`` explicitly gets a nonlinear combine it never
+        asked for.
+        """
+        with pytest.raises(ValidationError, match="processing_mode"):
+            DataConfigSchema(target_mode="r2r", coils={"processing_mode": mode}, val_target_mode="phase_aligned_mean")
+
+    def test_linear_coil_path_is_accepted_under_r2r(self):
+        cfg = DataConfigSchema(target_mode="r2r", coils={"processing_mode": "none"}, val_target_mode="phase_aligned_mean")
+        assert cfg.coils.processing_mode == "none"
+
+    def test_log_scaling_is_refused_under_r2r(self):
+        """``log1p`` on magnitude breaks decorrelation the same way a modulus does."""
+        with pytest.raises(ValidationError, match="enable_log_scaling"):
+            DataConfigSchema(
+                target_mode="r2r",
+                coils={"processing_mode": "none"},
+                processing={"enable_log_scaling": True},
+                val_target_mode="phase_aligned_mean",
+            )
+
+    @pytest.mark.parametrize("mode", ["complex_mean", "phase_aligned_mean", "rep_pair"])
+    def test_the_linearity_guards_do_not_fire_for_other_modes(self, mode):
+        """The guards are r2r-scoped: every other arm keeps its nonlinear stages.
+
+        Without this, the change would be a corpus-wide break dressed as a new
+        feature -- most M4Raw arms DO use a magnitude coil combine.
+        """
+        extra = {"nex_target_exclude_input": True} if mode == "rep_pair" else {}
+        cfg = DataConfigSchema(
+            target_mode=mode,
+            coils={"processing_mode": "rss"},
+            processing={"enable_log_scaling": True},
+            **extra,
+        )
+        assert cfg.target_mode == mode

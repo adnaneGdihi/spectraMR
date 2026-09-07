@@ -1,8 +1,8 @@
 .. _losses_reference:
 
-======================================
+=======================================
 Loss Functions — Mathematical Reference
-======================================
+=======================================
 
 .. sectionauthor:: spectraMR Research
 
@@ -25,18 +25,15 @@ the ``LossRegistry`` singleton. All implement
       LossRegistry.list_available()          # the canonical names
       len(LossRegistry.list_available())
 
-   Tracked as issue #1643 -- these pages should be generated from the
-   registries, the way ``docs/config_key_reference.rst`` already is.
-
 .. contents:: Table of Contents
    :depth: 2
    :local:
 
-Strict-duplicate registration (post-2026-05-09 audit)
-=====================================================
+Strict-duplicate registration
+=============================
 
-Per CLAUDE.md rule #9 (silent fallbacks forbidden), ``LossRegistry``
-refuses to silently overwrite a registration:
+Because silent fallbacks are forbidden, ``LossRegistry`` refuses to silently
+overwrite a registration:
 
 * Re-registering the **same** class under the **same** name is idempotent
   (test reloads / repeated imports stay green).
@@ -50,10 +47,7 @@ the import that triggers it, so the audit ladder
 rather than letting the registry silently flip between two classes
 depending on import order.
 
-Recent collisions resolved by this guard: ``hfen`` (physics_losses vs
-hfen_loss), ``lncc`` (cross_contrast vs registration), ``huber``
-(diffusion vs smooth_l1). See ``TODO/audit/00_implementation_tracker.md``
-and the regression tests under
+The regression tests are under
 ``tests/unit/models/test_registry_strict_duplicates.py``.
 
 Usage
@@ -78,10 +72,10 @@ Usage
          weight: 1.0
          enabled: true
 
-Declarative-list loss contract (post-2026-05-11 fix)
-====================================================
+Declarative-list loss contract
+==============================
 
-The v6.0 declarative loss form (``losses.image_losses``,
+The declarative loss form (``losses.image_losses``,
 ``losses.kspace_losses``, ``losses.complex_losses``) is the canonical
 way to wire losses into a reconstruction experiment. The LossBuilder
 turns each list entry into a callable and pushes it into
@@ -98,30 +92,8 @@ total:
 2. **Dynamic loop** that iterates ``losses_dict`` and adds anything not
    already in ``components``.
 
-These paths used to collide: the dynamic loop carried an unconditional
-skip-list (``["l1", "l2", "mse", "gradient_penalty", "r1",
-"r1_regularization"]``) intended to prevent double-counting when the
-explicit block had already fired. The skip ran even when the explicit
-block did **not** fire — for example a YAML whose only loss was
-``image_losses: [{name: mse}]`` would get:
-
-* ``lambda_l2 = 0.0`` (schema default) → explicit L2 path skipped.
-* ``lambda_l1 = 10.0`` but ``"l1" ∈ SPATIAL_LOSSES`` and
-  ``iteration < warmup_iterations=1000`` → explicit L1 path warmed
-  to 0 for the first 1000 iters.
-* Dynamic ``mse`` entry from LossBuilder dropped by the skip-list.
-
-Result: ``components = {}`` →
-``_stack_components`` returns ``torch.tensor(0.0, requires_grad=True)``
-— a leaf tensor with no upstream graph. ``backward()`` on it produces
-no gradients, the optimizer's update is a no-op, and the run "passes"
-with ``final_loss: 0.0`` while the model never trains. That was the
-silent-fallback signature behind the
-``exp_02_fourier_neural_operator`` / ``exp_04_neural_ode`` /
-``exp_07_contrastive_disentanglement`` mosaic-aliased outputs from the
-2026-05-10 smoke run.
-
-After the fix the dynamic-loop skip is conditional: ``mse`` / ``l1``
+The two paths must not double-count, and must not cancel each other
+out. The dynamic-loop skip is therefore conditional: ``mse`` / ``l1``
 / ``l2`` are only dropped from the loop when the **canonical key**
 (``l2`` for ``mse``, otherwise the loss name itself) is already in
 ``components``. ``gradient_penalty`` / ``r1`` / ``r1_regularization``
@@ -132,7 +104,7 @@ Pinned by
 :py:func:`tests.unit.test_loss_computers.TestUnifiedReconstructionLossComputer.test_declarative_mse_only_yaml_still_computes_loss_pre_warmup`.
 
 Per-entry constructor arguments: ``kwargs:``, never ``config:``
---------------------------------------------------------------
+---------------------------------------------------------------
 
 A list entry passes constructor arguments through ``kwargs:``:
 
@@ -171,17 +143,15 @@ which checks the field names, that a rename would raise against the real
 constructor signature, and that no committed arm under ``experiments/``
 declares ``config:`` on a loss entry.
 
-``pre_model`` adapter wiring for m4raw cross-contrast (post-2026-05-11 fix)
-==========================================================================
+``pre_model`` adapter wiring for m4raw cross-contrast
+=====================================================
 
-The v6.0 adapter chains
+The adapter chains
 (:py:mod:`spectramr.infrastructure.builders.leaf.adapter_builders`) have five
 hooks: ``pre_model``, ``post_model``, ``pre_loss_pred``,
 ``pre_loss_target``, ``pre_metric``. The audit
-(:py:mod:`spectramr.infrastructure.validation`) validates every declared
-chain, but until this fix no training strategy actually *applied*
-``pre_model`` at forward time — so a YAML opt-in produced no runtime
-effect and the audit's "pass" was a lie.
+(:py:mod:`spectramr.infrastructure.validation`) validates every declared chain,
+and the training strategy applies it at forward time.
 
 The m4raw dataset's cross-contrast pipeline (lines 818–852 of
 ``src/spectramr/data/datasets/m4raw_dataset.py``) emits a 4-channel tensor even
@@ -195,65 +165,51 @@ strict DomainMismatch check at lines 633–663 (and a downstream
 ``Conv2d`` channel-mismatch crash) catches the discrepancy at runtime
 with the same opaque error every time.
 
-The fix has three parts:
+Declare the adapter to close the gap:
 
-1. ``rss_coils_to_magnitude`` registers ``pre_model`` in its
-   ``insertion_points`` tuple
-   (:py:mod:`spectramr.data.adapters.channels`).
-2. :py:meth:`BaseTrainingStrategy.train_step` now applies the
-   ``pre_model`` chain to **both** ``input_batch_prepared`` and
-   ``target_batch`` immediately after the complex→real guard and
-   before the DomainMismatch check. Idempotent adapters
-   (``rss_coils_to_magnitude`` is identity on 1-ch input) make re-
-   application in the loss path safe.
-3. The 16 affected YAMLs under
-   ``experiments/inprogress/{multi_contrast,promoted}/*.yaml`` declare
-   ``adapters.pre_model: [{name: rss_coils_to_magnitude}]`` so the
-   chain actually fires.
+.. code-block:: yaml
+
+   adapters:
+     pre_model:
+       - name: rss_coils_to_magnitude
+
+``rss_coils_to_magnitude`` registers ``pre_model`` in its ``insertion_points``
+tuple (:py:mod:`spectramr.data.adapters.channels`), and
+:py:meth:`BaseTrainingStrategy.train_step` applies the chain to **both**
+``input_batch_prepared`` and ``target_batch`` immediately after the
+complex→real guard and before the DomainMismatch check. The adapter is
+idempotent (identity on 1-ch input), so re-application in the loss path is
+safe.
 
 Pinned by
 :py:mod:`tests.unit.data.test_adapters_pre_model_rss` (4 tests:
 insertion-point registration, builder acceptance, 4-ch → 1-ch
 collapse, 1-ch idempotency).
 
-``pre_loss_pred`` hook extension (audit-2026-05-14 E18)
--------------------------------------------------------
+``pre_loss_pred`` hook
+----------------------
 
-Several YAMLs under ``experiments/inprogress/`` declare the
-``rss_coils_to_magnitude`` adapter at the ``pre_loss_pred`` hook (model
-output side, before per-loss comparison). Before the round-2 fix
-``insertion_points`` listed only ``pre_model``, ``pre_loss_target`` and
-``pre_metric`` — those YAMLs failed loud with
-``Pipeline failed: Adapter 'rss_coils_to_magnitude' is not allowed at
-hook 'pre_loss_pred'`` (15+ smoke arms).
-
-The RSS reduction is a side-effect-free squashing of an
-arbitrary-channel real tensor to a 1-channel magnitude image — equally
-valid at the prediction-side hook. The fix adds ``pre_loss_pred`` to
-the registered insertion points (see
-:py:mod:`spectramr.data.adapters.channels`). Pinned by the additional three
+``rss_coils_to_magnitude`` is also allowed at ``pre_loss_pred`` (model output
+side, before per-loss comparison). The RSS reduction is a side-effect-free
+squashing of an arbitrary-channel real tensor to a 1-channel magnitude image, so
+it is equally valid there. An adapter declared at a hook it does not advertise
+fails loud: ``Adapter '<name>' is not allowed at hook '<hook>'``. Pinned by three
 ``test_adapters_pre_model_rss`` cases (``test_rss_coils_to_magnitude_advertises_pre_loss_pred``,
 ``test_adapter_chain_builder_accepts_pre_loss_pred_chain``,
 ``test_rss_coils_to_magnitude_lists_all_four_hooks``).
 
-Dict-output unwrap in unified loss computers (audit-2026-05-14 F2a)
-===================================================================
+Dict-output unwrap in unified loss computers
+============================================
 
 Several generators (latent / cold diffusion, multi-head VAEs) return a
-``dict`` like ``{"pred": tensor, "aux": ...}`` from ``forward``. Before
-the round-2 fix, those dicts landed in
-:py:func:`spectramr.models.losses.computers.unified_diffusion_reconstruction._complex_safe_mse`
-and ``._complex_safe_l1``, which called ``.shape`` / ``.device`` on the
-dict and raised ``AttributeError: 'dict' object has no attribute
-'shape'`` — the W6 / W3 warning class (28+ occurrences in the
-2026-05-14 smoke log).
-
-The fix introduces ``_unwrap_tensor_arg(name, value)`` which probes a
+``dict`` like ``{"pred": tensor, "aux": ...}`` from ``forward``. The loss
+computers unwrap it rather than calling ``.shape`` / ``.device`` on the dict:
+``_unwrap_tensor_arg(name, value)`` probes a
 fixed list of common prediction keys (``pred`` / ``prediction`` /
 ``image`` / ``output`` / ``x`` / ``x0`` / ``sample`` /
 ``reconstruction`` / ``denoised``, etc.) and falls back to the first
 tensor-valued entry. Dict-of-non-tensors raises a typed ``TypeError``
-(CLAUDE.md #9 fail-loud). Tuples and lists unwrap to their first
+rather than failing silently. Tuples and lists unwrap to their first
 element.
 
 Pinned by :py:mod:`tests.unit.losses.test_unified_diffusion_unwrap` (24
@@ -261,18 +217,17 @@ tests: passthrough, every probed key, fallback to first tensor, dict
 of non-tensors raises, tuple/list unwrap, ``_complex_safe_mse`` and
 ``_complex_safe_l1`` end-to-end with dict inputs).
 
-K-space RSS phase-strip pitfall (audit-2026-05-14 F5)
-=====================================================
+K-space RSS phase-strip pitfall
+===============================
 
 The legacy :py:meth:`spectramr.data.transforms.kspace_coil_transforms.CoilCombineTransform._rss_combine`
 chains IFFT → RSS-magnitude → FFT-back-to-k-space. The third step
 ``fft2c(|x|)`` is phase-stripping: the returned k-space is
 Hermitian-symmetric, and any downstream IFFT-then-magnitude produces a
-*centro-symmetric* image — the "doubled brain" signature flagged in 10
-of 89 smoke mosaics on 2026-05-14.
+*centro-symmetric* image — a "doubled brain" reconstruction.
 
-The round-2 fix adds ``method="rss_image"`` which stops at step 2 and
-returns the real magnitude image directly. The TorchIO transform
+Use ``method="rss_image"`` instead: it stops at step 2 and returns the real
+magnitude image directly. The TorchIO transform
 builder (:py:mod:`spectramr.data.builders.torchio_transform_builder`) routes
 ``coil_processing_mode: rss_image`` to this new branch at both
 training and eval sites.
@@ -362,32 +317,24 @@ de-faced ``kspace_inr`` stub.
 Image-Space Losses
 ==================
 
-.. note::
+The registered losses group into six categories.
 
-   This section used to embed rendered per-loss error maps computed on a real M4Raw
-   FLAIR slice at 4x Cartesian undersampling. Those images are **not published**:
-   ``docs/figures/`` has never been tracked -- a blanket ``*.png`` rule in
-   ``.gitignore`` covers the whole path -- so every directive resolved to nothing
-   and rendered as a broken image. The category headings below are kept, because
-   they enumerate what is actually registered. Regenerate the plots locally
-   against your own data if you want them.
-
-**Pixel & Structural Losses** — L1, L2, Smooth-L1 (Huber), Charbonnier, Log-Cosh, SSIM, MS-SSIM:
+**Pixel and structural** — L1, L2, Smooth-L1 (Huber), Charbonnier, Log-Cosh, SSIM, MS-SSIM.
 
 
-**Complex & K-Space Losses** — Complex L1/MSE, Spectral, Sobolev, Focal Frequency, Log-Spectral, Data Consistency:
+**Complex and k-space** — Complex L1/MSE, Spectral, Sobolev, Focal Frequency, Log-Spectral, Data Consistency.
 
 
-**Perceptual & Edge Losses** — VGG (conv1–conv4), Sobel, HFEN, Gradient Magnitude, Structure:
+**Perceptual and edge** — VGG (conv1–conv4), Sobel, HFEN, Gradient Magnitude, Structure.
 
 
-**Regularisation & VQ Losses** — Total Variation, KL Divergence, VQ Commitment, Deep Supervision at 4 scales:
+**Regularisation and VQ** — Total Variation, KL Divergence, VQ Commitment, Deep Supervision at 4 scales.
 
 
-**Diffusion, Uncertainty & SNR-Preserving Losses** — Diffusion MSE at 4 timesteps, Heteroscedastic, R1 Penalty, SNR-Preserving:
+**Diffusion, uncertainty and SNR-preserving** — Diffusion MSE at 4 timesteps, Heteroscedastic, R1 Penalty, SNR-Preserving.
 
 
-**Physics & Domain Losses** — Data Consistency at R=2/4/8/16, Energy Conservation, Rician, Cycle Consistency, Histogram:
+**Physics and domain** — Data Consistency at R=2/4/8/16, Energy Conservation, Rician, Cycle Consistency, Histogram.
 
 
 **GAN Loss Functions** — Vanilla, LSGAN, Hinge, WGAN discriminator objectives:
@@ -1002,7 +949,7 @@ Several critical regularization terms are computed inline by their respective tr
 
 When these keys are enabled in the YAML configuration, they are safely skipped by the ``LossBuilder`` to prevent instantiation crashes, and are instead parsed and applied natively by the underlying strategy logic:
 
-* **GAN & Adversarial Regularization**: 
+* **GAN & Adversarial Regularization**:
   - **r1** (``R1RegularizationLoss``): R1 gradient penalty for GAN training.
   - **patch_nce**: Patch-based Noise Contrastive Estimation for unpaired translation.
 * **Vector Quantization & Latent**:
@@ -1116,13 +1063,11 @@ into pred through the birth/death voxels of each matched feature. Requires the
 construction without them, and the ``geomamba_ulf`` strategy re-raises rather
 than silently degrading to L1.
 
-**Diagonal-projection terms (July 2026).** The W2 matching pads each diagram
-with the diagonal projections of the other, so a pred feature the target lacks
-is matched to the diagonal. The differentiable loss previously **dropped** those
-diagonal-matched pred points (and short-circuited to 0 whenever the *target*
-diagram was empty), so hallucinated / spurious topology received no gradient and
-the loss was blind to it (facade — pitfall #16). Each diagonal-matched pred
-feature :math:`(b, d)` now contributes its :math:`L_\infty` distance to the
+**Diagonal-projection terms.** The W2 matching pads each diagram with the
+diagonal projections of the other, so a pred feature the target lacks is matched
+to the diagonal. This is what gives hallucinated / spurious topology a gradient:
+each diagonal-matched pred feature :math:`(b, d)` contributes its
+:math:`L_\infty` distance to the
 diagonal, :math:`\left(\tfrac{d-b}{2}\right)^p`, differentiable through both pred
 voxels — pushing the spurious feature's persistence toward zero. The loss still
 vanishes at ``pred == target`` (each feature matches its identical partner) and
@@ -1134,7 +1079,7 @@ Evidential Regularization Loss (NIG)
 
 **Registry name:** ``evidential`` — **Class:** ``EvidentialLoss``
 
-Replaces deterministic point estimates with Normal-Inverse-Gamma (NIG) 
+Replaces deterministic point estimates with Normal-Inverse-Gamma (NIG)
 distributions for aleatoric and epistemic uncertainty quantification (Pillar 9).
 The generator predicts four parameters :math:`\gamma, \nu, \alpha, \beta`, and the loss maximizes model evidence:
 
@@ -1533,18 +1478,13 @@ raises at import.**
 .. admonition:: Why an unknown value must raise
    :class: warning
 
-   ``domain=`` used to be a free string looked up in a dict, so an unrecognised
-   value fell out as ``None`` — *unannotated*. That made a typo
-   (``domain="imagee"``) indistinguishable from a deliberate non-signal domain:
-   both silently skipped every check they were meant to face. Four losses sat in
-   that hole (``hamiltonian_energy_conservation``,
-   ``gradient_hardware_compliance``, ``bloch_consistency``,
-   ``bloch_signal_synthesis_consistency``), reaching the *correct* outcome by
-   accident.
+   ``domain=`` is a closed vocabulary, not a free string. Were it looked up in a
+   dict, an unrecognised value would fall out as ``None`` — *unannotated* — and a
+   typo (``domain="imagee"``) would be indistinguishable from a deliberate
+   non-signal domain: both silently skipping every check they were meant to face.
 
-   They now carry ``domain_agnostic=True`` explicitly. Behaviour is unchanged —
-   they passed the block check before and pass it now — but the pass is stated,
-   and survives any future tightening of the ``None`` branch. Adding a value to
+   A loss that genuinely faces no domain check declares ``domain_agnostic=True``,
+   so the pass is stated rather than inferred. Adding a value to
    ``REGISTRABLE_DOMAINS`` means deciding which column above it belongs in.
 
 Domain-Aware Loss Routing
@@ -1865,10 +1805,9 @@ Kernelised Stein Discrepancy Loss
 (domain ``image``; aliases ``ksd``, ``kernelized_stein_discrepancy``,
 ``stein_federated_consistency``).
 
-Closes the ``stein_federated`` strategy façade: that strategy advertises
+Backs the ``stein_federated`` strategy, which advertises
 kernelised-Stein-discrepancy (KSD) mathematics for federated posterior
-aggregation but previously routed to vanilla reconstruction losses. This loss
-actually penalises the KSD between the (aggregated) prediction's sample
+aggregation. This loss penalises the KSD between the (aggregated) prediction's sample
 distribution and the target distribution.
 
 KSD measures how far a sample set :math:`\{x_i\}` is from a target distribution
@@ -1909,8 +1848,8 @@ Front-Door Criterion Loss (Pearl Causal Adjustment)
 **Domain:** ``image``
 
 Concretises the ``frontdoor_federated`` / ``frontdoor_scanner`` strategy keys,
-which previously advertised Pearl front-door causal-adjustment mathematics but
-routed to a vanilla reconstruction objective. When scanner identity :math:`S`
+which advertise Pearl front-door causal-adjustment mathematics. When scanner
+identity :math:`S`
 confounds anatomy :math:`A` and image :math:`I` but is unmeasured at inference
 (a new site / vendor), back-door adjustment fails; the front-door criterion
 [Pearl 2009, Th. 3.3.4] still identifies :math:`P(I\mid\mathrm{do}(A))` through
@@ -1952,8 +1891,7 @@ Stochastic-Resetting Consistency Loss
 
 Concretises the ``resetting_diffusion`` strategy key, which advertises
 stochastic-resetting diffusion mathematics (Evans & Majumdar 2011; Evans,
-Majumdar & Schehr 2020) but previously routed to a generic diffusion strategy
-with vanilla losses. Stochastic resetting intermittently resets the reverse-SDE
+Majumdar & Schehr 2020). Stochastic resetting intermittently resets the reverse-SDE
 sample toward a data-consistent anchor :math:`\mathcal{R}(\hat y)`; this
 strictly accelerates first-passage to the data manifold whenever the
 coefficient of variation of the unreset passage-time distribution exceeds 1,
@@ -2044,8 +1982,8 @@ guarantee. This loss is that lever. For the atom matrix :math:`W\in\mathbb{R}^{m
 
 which is 0 iff the atoms are mutually orthogonal and rises with coherence. It is a
 **parameter** penalty (not a ``(pred, target)`` loss): invoked without a frame /
-atom tensor it **raises** so it cannot silently no-op in a YAML ``losses`` block
-(CLAUDE.md #16). It is wired through
+atom tensor it **raises** so it cannot silently no-op in a YAML ``losses``
+block. It is wired through
 :class:`~spectramr.infrastructure.training.strategies.sparse_frame_strategy.SparseFrameStrategy`
 (``training_mode: sparse_frame``), which trains a
 :class:`~spectramr.models.generators.tight_frame_learner.TightFrameLearner` (a learnable
@@ -2067,7 +2005,7 @@ Dispersion-latent Bloch autoencoder terms (DL-BAE, bundle M4)
 =============================================================
 
 ``multifield_data_consistency`` (domain: ``image``)
---------------------------------------------------
+---------------------------------------------------
 
 .. math::
 
@@ -2089,7 +2027,7 @@ noisier than 7 T.
    :no-index:
 
 ``dispersion_monotonicity`` (domain: ``physics``)
-------------------------------------------------
+-------------------------------------------------
 
 .. math::
 

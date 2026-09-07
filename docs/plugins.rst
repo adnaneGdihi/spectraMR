@@ -53,7 +53,7 @@ fail loudly, while installed third-party plugins fail soft.
       spectramr train --config experiment.yaml
 
    An unimportable token **raises** at startup (a user-declared knob must not
-   silently no-op — pitfall #15). The resolved list is stamped into the run's
+   silently no-op). The resolved list is stamped into the run's
    ``provenance.json``.
 
 3. **``config.plugins`` block** — declare the import paths inside the config:
@@ -77,7 +77,7 @@ Name collisions are an error
 ----------------------------
 
 A plugin that re-registers a name an in-tree component already owns is a hard
-error, not a silent override (spec §6.1, pitfall #9). The in-tree registry is
+error, not a silent override. The in-tree registry is
 populated **first**, so the duplicate ``@register_*`` raises when the plugin is
 imported:
 

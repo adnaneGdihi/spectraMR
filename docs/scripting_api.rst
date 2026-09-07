@@ -1,5 +1,5 @@
 Scripting API (``spectramr.api``)
-===============================
+=================================
 
 spectraMR supports four ways to launch work. Three are *declarative* — you write a
 YAML config and the framework builds and runs everything:
@@ -38,22 +38,23 @@ the whole torch import chain). Both share one export table, so they resolve to t
 
 Currently exported:
 
-================================  ============================================
-Name                              Purpose
-================================  ============================================
-``fit`` / ``Trainer``             Train a hand-built model in-process, reusing
-                                  the standard loop.
-``register_model``                Decorator — register a model class by name.
-``register_loss``                 Decorator — register a loss by name.
-``register_metric``               Decorator — register a metric by name.
-``settings_from_dict``            Build a validated, frozen ``TrainingSettings``
-                                  from an in-memory dict (no YAML file).
-``TrainingSettings``              The frozen config SSOT.
-``make_model`` / ``make_optimizer``
-``make_dataset`` / ``make_dataloader``
-                                  Build a single component from a config
-                                  (in-memory **or** a YAML path).
-================================  ============================================
+======================================  ==========================================
+Name                                    Purpose
+======================================  ==========================================
+``fit`` / ``Trainer``                   Train a hand-built model in-process,
+                                        reusing the standard loop.
+``register_model``                      Decorator — register a model class by name.
+``register_loss``                       Decorator — register a loss by name.
+``register_metric``                     Decorator — register a metric by name.
+``settings_from_dict``                  Build a validated, frozen
+                                        ``TrainingSettings`` from an in-memory
+                                        dict (no YAML file).
+``TrainingSettings``                    The frozen config SSOT.
+``make_model`` / ``make_optimizer``     Build a model or optimizer from a config
+                                        (in-memory **or** a YAML path).
+``make_dataset`` / ``make_dataloader``  Build a dataset or dataloader from a
+                                        config (in-memory **or** a YAML path).
+======================================  ==========================================
 
 Training in-process: ``fit`` / ``Trainer``
 ------------------------------------------
@@ -142,7 +143,7 @@ partial ``config=`` dict (completed with the reconstruction defaults) or a full
       fit(model, train_loader, config={"training": {"output_dir": "/tmp/my_run"}})
 
 Evaluating and predicting: ``Trainer.evaluate`` / ``Trainer.predict``
---------------------------------------------------------------------
+---------------------------------------------------------------------
 
 ``Trainer.evaluate`` runs ONE validation pass over a loader and returns the
 aggregated metric dict — **no training, no optimizer steps**. It builds the same
@@ -170,7 +171,7 @@ model object:
 .. code-block:: python
 
    trainer.predict(
-       config_path="experiments/active/my_arm.yaml",
+       config_path="experiments/<paradigm>/<your-arm>.yaml",
        checkpoint_path="runs/my_arm/checkpoints/best.pt",
        input_path="data/test/",
        output_path="runs/my_arm/predictions/",
@@ -234,7 +235,7 @@ The ``make_*`` helpers accept either an in-memory ``config=`` **or** a
 ``config_path=`` to a YAML file (the original form); passing neither raises.
 
 Data helpers: ``make_dataset`` / ``make_dataloader``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Both build through the canonical ``DataPipelineDirector``, so a scripted loader
 is the same object training gets.
@@ -248,21 +249,21 @@ is the same object training gets.
    meta["shuffle"]          # read off the constructed loader, not inferred
 
 ``split`` accepts ``"train"``, ``"val"`` (or ``"validation"``) and ``"test"``.
-**Anything else raises.** It previously fell through to the *training* loader,
-so a typo returned training data while the metadata echoed the bogus name back.
+**Anything else raises** rather than falling through to the *training* loader,
+so a typo can never return training data under a bogus split name.
 
 .. warning::
 
-   There is **no held-out test set yet** (issue #665 — ``data.test_split`` is
-   declared by 467 arms and read by nothing). ``split="test"`` therefore returns
-   the *validation* loader, and the metadata records that as
+   There is **no held-out test set**: ``data.test_split`` is accepted by the
+   schema and read by nothing. ``split="test"`` therefore returns the
+   *validation* loader, and the metadata records that as
    ``split_resolved: "val"``. Do not report a number from it as a test-set
-   result until that issue lands.
+   result.
 
 Batch size is **not** a parameter of these helpers — set
-``data.loader.batch_size`` in the config. ``make_dataloader`` used to accept a
-``batch_size=`` it silently ignored, and an override would not be harmless: the
-director exposes only a validation-side batch-size knob, the validation
+``data.loader.batch_size`` in the config. A helper-level ``batch_size=`` would
+not be harmless: the director exposes only a validation-side batch-size knob,
+the validation
 *stride* is derived from it (so it changes which records the validation set
 contains, not merely their grouping), and ``dataset_type: cine`` has a
 batch-size guard it would route around.

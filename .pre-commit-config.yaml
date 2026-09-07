@@ -46,7 +46,15 @@ repos:
       - id: codespell
         # `astroid` is pylint's AST library (a real distribution name in
         # uv.lock), not a misspelling of "asteroid".
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid"]
+        # `unparseable` is the word scripts/ci/migrate_config_keys.py prints in
+        # its own summary line (":576"), so docs quoting that output must spell
+        # it the way the tool does, not the way the dictionary prefers.
+        # `tre` is the registered alias for `target_registration_error`
+        # (`core/metrics/report_step_metrics.py:283`), a metric name the docs
+        # must spell as the registry does -- same reason as `te` above.
+        # `nce` is Noise-Contrastive Estimation: it appears only as a LaTeX
+        # subscript in the InfoNCE loss formulas on losses_reference.rst.
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint

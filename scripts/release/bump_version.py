@@ -6,8 +6,11 @@ Four files state the version independently -- ``src/spectramr/__init__.py``,
 something that cannot import the package. ``build_dist.py`` is the sole
 **comparator** of that set (non-negotiable 17) and fails the build on any
 disagreement. This is the sole **writer** for the same set, and it imports
-``build_dist``'s readers rather than restating them: a writer with its own idea
-of where the version lives is exactly the second owner that rule forbids.
+``build_dist``'s readers *and its comparator* rather than restating them: a
+writer with its own idea of where the version lives is exactly the second owner
+that rule forbids. ``show`` did restate it once, as ``len(set(values)) != 1``,
+which cannot express a dev build -- so it reported ``DISAGREEMENT`` on every
+tree this file's own ``nightly`` mode had just written correctly.
 
 Modes, and why they are separate:
 
@@ -44,7 +47,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from build_dist import changelog_version, citation_version, declared_version
+from build_dist import (
+    changelog_version,
+    citation_version,
+    declared_version,
+    version_disagreements,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 INIT = "src/spectramr/__init__.py"
@@ -157,10 +165,14 @@ def rewrite_changelog(text: str, new: Version, today: str) -> str:
 
 
 def sources(root: Path) -> dict[str, str | None]:
-    """What each file says the version is, read by ``build_dist``'s own readers."""
+    """Each file that states the version *as a version*, via ``build_dist``'s readers.
+
+    ``CHANGELOG.md`` is deliberately not here. It states the version as a dated
+    heading, which a dev build deliberately has none of, so it cannot join a
+    string comparison -- ``build_dist.changelog_disagreement`` judges it instead.
+    """
     return {
         INIT: declared_version((root / INIT).read_text()),
-        CHANGELOG: changelog_version((root / CHANGELOG).read_text()),
         CITATION: citation_version((root / CITATION).read_text()),
     }
 
@@ -196,14 +208,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"UNREADABLE: {', '.join(unreadable)}", file=sys.stderr)
         return 2
 
+    changelog_text = (args.root / CHANGELOG).read_text()
+
     if args.mode == "show":
         for path, value in have.items():
             print(f"  {value:<16} {path}")
-        distinct = set(have.values())
-        if len(distinct) != 1:
-            print(f"DISAGREEMENT: {sorted(distinct)}", file=sys.stderr)
+        newest = changelog_version(changelog_text)
+        print(f"  {newest or '-':<16} {CHANGELOG}   (newest released heading)")
+        problems = version_disagreements(
+            have[INIT], {k: v for k, v in have.items() if k != INIT}, changelog_text
+        )
+        if problems:
+            print("DISAGREEMENT:", file=sys.stderr)
+            for why in problems:
+                print(f"  {why}", file=sys.stderr)
             return 1
-        print(f"\nversion: {distinct.pop()}")
+        print(f"\nversion: {have[INIT]}")
         return 0
 
     current = parse(have[INIT])

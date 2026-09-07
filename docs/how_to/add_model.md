@@ -158,4 +158,4 @@ kwargs.
 ## Next steps
 
 - [Add a paradigm](add_paradigm.md) — pair the new model with a custom training loop.
-- [Registries reference](../reference/registries.md) — the full eight-surface catalogue.
+- [Model registry reference](../model_registry_reference.rst) — the registered model catalogue.

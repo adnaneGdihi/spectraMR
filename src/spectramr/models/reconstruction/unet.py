@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.infrastructure.physics.dc_settings import DC_SSOT_KEYS
 from spectramr.models.blocks.attention import CBAMSpatialAttention as SpatialAttention
 from spectramr.models.blocks.attention import ChannelAttention
 from spectramr.models.blocks.base import BaseGANBlock
@@ -428,14 +429,20 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             kwargs.pop("feature_dim", None)
             kwargs.pop("max_features", None)
             kwargs.pop("num_residual_blocks", None)
-            kwargs.pop("use_dc", None)
-            kwargs.pop("dc_method", None)
-            kwargs.pop("dc_weight", None)
+            # ``physics.data_consistency`` is forwarded into every **kwargs
+            # generator by ``generator_kwargs`` step 3c, unconditionally — the
+            # block is always present (schema default) and step 3c does not
+            # consult ``enabled``. UNet builds no DC layer, so it discards the
+            # whole set. Derive it from DC_SSOT_KEYS rather than restating it:
+            # a hand-copied subset is what broke here when the table grew the
+            # three noise keys and this list did not (non-negotiable 17).
+            for _dc_kwarg, _dc_field in DC_SSOT_KEYS:
+                kwargs.pop(_dc_kwarg, None)
             # Top-level model.* fields auto-forwarded by GeneratorBuilder.build()
             # since the May 2026 spec-card refactor — UNetConfig doesn't know
             # about them and the strict TypeError below otherwise breaks every
-            # ``standard_unet`` arm. Keep this pop-list aligned with the
-            # ``_SKIP`` set in src/infrastructure/builders/leaf/model_builders.py.
+            # ``standard_unet`` arm. Their owner is ``SKIP_MODEL_FIELDS`` in
+            # src/spectramr/infrastructure/builders/generator_contract.py.
             kwargs.pop("spatial_dims", None)
             kwargs.pop("input_type", None)
             kwargs.pop("output_type", None)

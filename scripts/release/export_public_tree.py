@@ -368,6 +368,45 @@ def main() -> int:
             print(f"  {p}")
         if args.strict:
             return 2
+
+    # Non-negotiable 16: this gate was written for exactly this tree and had
+    # never once run against it. Its only invocations are in the *published*
+    # `pr-required.yml`, and spectramr receives snapshots as direct pushes to
+    # `main`, never PRs -- so the single lane that runs it cannot fire on a
+    # snapshot. The research repository's CI does not run it either. Pointing it
+    # at the export here is what turns it from a script into a gate.
+    #
+    # It runs from THIS checkout, never from the export's own shipped copy: the
+    # export is the subject under test, and a tree that stopped shipping the
+    # gate would otherwise quietly stop being checked by it.
+    doc_pages = [r for r in shipped if r.endswith((".rst", ".md"))]
+    if not doc_pages:
+        # Not a vacuous pass. An export shipping no prose has no pasteable line
+        # to dangle, and the shape where docs were MEANT to ship and did not is
+        # already owned by the dead-allowance check above -- every `docs/`
+        # allowance would read as dead. One owner per invariant (17).
+        print("docs gate  : skipped -- this export ships no .rst/.md page")
+    else:
+        gate = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "check_docs_paths_exist.py"
+        if not gate.is_file():
+            print(f"FAIL: {gate} is missing -- refusing to publish an unchecked doc set.")
+            return 2
+        # The count is the TRIGGER, not the scan: the gate reads docs/ and the
+        # root-level pages, while this counts every shipped .rst/.md. Saying
+        # "over N pages" would overstate what was checked.
+        print(f"docs gate  : {len(doc_pages)} .rst/.md shipped -- running {gate.name}")
+        rc = subprocess.run(
+            [sys.executable, str(gate), "--root", str(args.out), "--commands-only"],
+            check=False,
+        ).returncode
+        if rc != 0:
+            print(
+                "FAIL: a published page tells a reader to run a path this export does\n"
+                "      not carry. This is unconditional, unlike a dead allowance: it is\n"
+                "      a defect in the product rather than in the export's configuration,\n"
+                "      so there is no non-strict reading under which it is acceptable."
+            )
+            return 2
     return 0
 
 

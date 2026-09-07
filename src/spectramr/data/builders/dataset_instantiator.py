@@ -301,6 +301,17 @@ class DatasetInstantiator:
         # M4Raw, because complex-averaging phase-incoherent reps cancels signal
         # rather than averaging it. A bare attribute read fails loud instead.
         target_mode = config.target_mode
+        # The VALIDATION split may serve a different NEX target than training
+        # (#695 follow-up). It exists for r2r, whose target is redrawn every
+        # __getitem__: validating against it would score the noise draw, and
+        # `track_best_metric` would checkpoint the luckiest epoch. None means
+        # "same as training". Bare attribute read, for the reason above.
+        val_target_mode = config.val_target_mode or target_mode
+        # Read unconditionally so the knob is never silently defaulted: the
+        # schema already refuses r2r_alpha under any other target_mode, and a
+        # wrong alpha does not raise anywhere downstream -- it just shifts noise
+        # between the two R2R halves. Bare attribute read, for the reason above.
+        r2r_alpha = config.r2r_alpha
         nex_exclude_input = config.nex_target_exclude_input
         nex_fallback = config.nex_fallback
         # ``use_repetitions`` defaults to None in the schema: the ROUTE decides.
@@ -325,6 +336,7 @@ class DatasetInstantiator:
             single_contrast=single_contrast,
             log_scaling=config.processing.enable_log_scaling,
             target_mode=target_mode,
+            r2r_alpha=r2r_alpha,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
             slice_level_records=slice_level_records,
@@ -339,7 +351,8 @@ class DatasetInstantiator:
             num_virtual_coils=num_virtual_coils,
             single_contrast=single_contrast,
             log_scaling=config.processing.enable_log_scaling,
-            target_mode=target_mode,
+            target_mode=val_target_mode,
+            r2r_alpha=r2r_alpha,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
             slice_level_records=slice_level_records,

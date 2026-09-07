@@ -3520,10 +3520,19 @@ class DataConfigSchema(BaseModel):
         default=False,
         description="Return image domain target for perceptual losses (SSIM/LPIPS)",
     )
-    target_mode: Literal["complex_mean", "phase_aligned_mean", "rep_pair"] = Field(
+    target_mode: Literal["complex_mean", "phase_aligned_mean", "rep_pair", "r2r"] = Field(
         default="complex_mean",
         description=(
-            "M4Raw NEX target. 'complex_mean' plain-averages complex k-space "
+            "M4Raw NEX target. 'r2r' is Recorrupted-to-Recorrupted (Pang 2021): "
+            "BOTH halves are built from the input repetition alone as "
+            "input = y + alpha*z, target = y - z/alpha with z ~ CN(0, Sigma_n) "
+            "drawn fresh per sample, so Cov(input, target) = Sigma_n - Sigma_z = 0 "
+            "and the L1/L2 minimiser is the clean image. It is the only mode that "
+            "needs ONE excitation, so it is the only one deployable on a "
+            "single-repetition scan. R2R is a second-moment construction: a "
+            "per-acquisition artefact appears in both halves with the same sign "
+            "and is PRESERVED, not removed -- use 'rep_pair' to decorrelate that. "
+            "'complex_mean' plain-averages complex k-space "
             "(legacy; cancels signal under inter-rep phase drift). "
             "'phase_aligned_mean' corrects each rep's global phase to rep0 first. "
             "'rep_pair' is the Noise2Noise target: ONE other repetition, phase-"
@@ -3532,6 +3541,37 @@ class DataConfigSchema(BaseModel):
             "repetition; it requires nex_target_exclude_input: true and >= 2 "
             "repetitions per group (a 1-repetition group has no pair and raises "
             "whatever nex_fallback says)."
+        ),
+    )
+    val_target_mode: Literal["complex_mean", "phase_aligned_mean", "rep_pair"] | None = Field(
+        default=None,
+        description=(
+            "M4Raw NEX target for the VALIDATION split only. None (default) "
+            "serves data.target_mode on both splits. 'r2r' is excluded here at "
+            "the TYPE level, and that exclusion is the reason the knob exists: "
+            "r2r draws a fresh z on every __getitem__, so an r2r validation "
+            "target is a different random image each epoch. PSNR against it "
+            "measures the draw rather than the model, and best-checkpoint "
+            "selection (track_best_metric) would keep whichever epoch drew the "
+            "kindest noise. Declaring the SAME val_target_mode across a cohort "
+            "is also what makes its arms comparable: the validation reference "
+            "is then ONE fixed definition while the training target varies per "
+            "arm, so a PSNR difference is attributable to the training target. "
+            "Read by dataset_type 'm4raw' only."
+        ),
+    )
+    r2r_alpha: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Recorruption strength for data.target_mode='r2r'. Read ONLY under "
+            "that mode. alpha CANCELS from the decorrelation identity "
+            "(Cov(y + alpha*z, y - z/alpha) = Sigma_n - Sigma_z for every "
+            "alpha > 0), so it does not trade bias -- it trades VARIANCE between "
+            "the two halves: the input carries (1 + alpha^2)*Sigma_n and the "
+            "target (1 + 1/alpha^2)*Sigma_n. alpha=1.0 (default) splits it evenly "
+            "at 2*Sigma_n each; alpha<1 gives a cleaner input and a noisier "
+            "target, alpha>1 the reverse."
         ),
     )
     nex_target_exclude_input: bool = Field(
@@ -3569,6 +3609,25 @@ class DataConfigSchema(BaseModel):
         never made (CLAUDE.md non-negotiable 8).
         """
         if isinstance(data, dict):
+            mode = data.get("target_mode")
+            if mode != "r2r" and "r2r_alpha" in data:
+                raise ValueError(
+                    "data.r2r_alpha is read only under data.target_mode='r2r' (it "
+                    "scales the recorruption that mode draws); declaring it with "
+                    f"target_mode={mode!r} advertises a choice that is never made "
+                    "(CLAUDE.md non-negotiable 8). Drop it, or select 'r2r'."
+                )
+            if mode == "r2r" and data.get("val_target_mode") is None:
+                raise ValueError(
+                    "data.target_mode='r2r' draws a FRESH recorruption z on every "
+                    "__getitem__, so an r2r validation target is a different "
+                    "random image each epoch: PSNR against it measures the draw, "
+                    "not the model, and best-checkpoint selection would keep the "
+                    "luckiest epoch rather than the best one. Declare "
+                    "data.val_target_mode (e.g. 'phase_aligned_mean') to give the "
+                    "validation split a fixed reference; r2r stays on the "
+                    "training split, which is the only split that needs it."
+                )
             if data.get("target_mode") == "rep_pair" and not data.get(
                 "nex_target_exclude_input", False
             ):
@@ -3586,6 +3645,52 @@ class DataConfigSchema(BaseModel):
                     "reference is an unread knob. Drop it, or enable leave-one-out."
                 )
         return data
+
+    @model_validator(mode="after")
+    def _r2r_requires_a_linear_path_to_the_loss(self) -> "DataConfigSchema":
+        """R2R decorrelation survives linear maps only.
+
+        ``Cov(A a, A b) = A Cov(a, b) A^H``, so the identity
+        ``Cov(input, target) = 0`` that makes the L1/L2 minimiser the CLEAN image
+        is preserved by every linear stage between injection and loss -- the
+        percentile divide (one scalar per subject, applied to both halves),
+        ``ifft2c`` (unitary), channel interleaving. It is destroyed by a
+        nonlinearity, and destroyed SILENTLY: training converges, the loss falls,
+        and the network has learned the wrong fixed point.
+
+        Two stages in this pipeline are nonlinear, so under ``r2r`` both raise
+        rather than degrade (CLAUDE.md non-negotiable 3):
+
+        * ``coils.processing_mode`` other than ``none``. ``rss`` computes
+          ``|I|_rss * exp(j*angle(I_ref))`` -- phase-preserving, but the MODULUS
+          is nonlinear. It maps Gaussian to Rician, so ``E[|target|] != |x|``.
+          ``magnitude``/``rss_image`` are worse, ``svd`` fits its basis to the
+          data so it is not a fixed linear map either.
+        * ``processing.enable_log_scaling``. ``log1p`` on magnitude is nonlinear.
+        """
+        if self.target_mode != "r2r":
+            return self
+        if self.coils.processing_mode != "none":
+            raise ValueError(
+                "data.target_mode='r2r' requires data.coils.processing_mode='none', "
+                f"got {self.coils.processing_mode!r}. R2R decorrelates the two "
+                "halves in the second moment, which survives LINEAR maps only; a "
+                "coil combine that takes a magnitude turns the Gaussian residual "
+                "Rician, so E[target] is no longer the clean image and the trained "
+                "fixed point is wrong. Nothing downstream can detect this -- the "
+                "loss still falls. Serve the coils uncombined (4 coils -> 8 "
+                "interleaved real channels for M4Raw)."
+            )
+        if self.processing.enable_log_scaling:
+            raise ValueError(
+                "data.target_mode='r2r' is incompatible with "
+                "data.processing.enable_log_scaling=True: log1p on magnitude is "
+                "nonlinear, so it breaks the R2R decorrelation the same way a "
+                "magnitude coil combine does. The percentile divide alone is safe "
+                "(one scalar per subject, applied to both halves, and a common "
+                "scalar divides out of the covariance)."
+            )
+        return self
 
     @model_validator(mode="after")
     def _slice_level_records_is_read_by_m4raw_only(self) -> "DataConfigSchema":

@@ -727,28 +727,26 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 external/
 
 # ---- docs: the curated public site (Workstream G) --------------------------
-# Still deliberately NOT "docs/": the tree holds 2,332 files and the exclusion note
-# that used to sit here measured ~68% of them citing pre-refactor src/<x>/ paths.
-# The curated set below was measured on its own terms rather than inheriting that
-# figure -- 35 src/<x>/ citations across 9 of its 58 content pages -- and
+# Deliberately NOT "docs/": the tree holds 2,332 files, most of them internal
+# working notes. The published set is the user-facing guide and nothing else, and
 # scripts/ci/check_docs_paths_exist.py (shipped below) is the gate that keeps a
 # published page from naming a path the published tree does not have.
 #
-# This list reproduces what adnaneGdihi/spectramr already carries. It was hand-
-# assembled there, so until now a re-export would have DELETED 57 of these pages.
 # docs/index.rst ships FROM THIS BRANCH, not from the overlay. The public toctree may
 # name only pages that ship (Read the Docs builds with -W), and there were two ways to
 # get that: overlay a public index over an internal one, or make the tracked index the
 # public one and move the internal-only entries to a separate `:orphan:` page. The
 # second wins -- see docs/index_internal.rst, which is not allowlisted below and so is
 # excluded by construction. The overlay form kept two hand-maintained lists of the same
-# 38 pages with nothing comparing them; the split form is checked by
-# check_docs_navigation.py, which is what reported the 38 duplicate toctree entries when
-# the orphan page was briefly made comprehensive. One audience, one list, one owner.
-docs/tutorials/
+# pages with nothing comparing them; the split form is checked by
+# check_docs_navigation.py. One audience, one list, one owner.
+#
+# THREE SUBDIRECTORIES ARE SELECTED PER FILE, NOT WHOLESALE. A blank directory line
+# is a standing invitation to publish the next page dropped into it: that is how
+# docs/reference/workflow_backlog.md shipped for months while already being listed in
+# docs/index_internal.rst as private-only. Where only part of a directory is public,
+# the files are named one by one so that adding a page is a deliberate act.
 docs/how_to/
-docs/explanation/
-docs/reference/
 docs/modules/
 docs/_static/
 docs/conf.py
@@ -758,37 +756,38 @@ docs/index.rst                      # the PUBLIC index; internal-only entries li
 #
 # Getting started / using it
 docs/getting_started.rst
-docs/user_guide.rst
 docs/troubleshooting.rst
-docs/known_limitations.rst          # E6: what the shipped tree does NOT do, stated
-docs/versioning.rst                 # what MAJOR.MINOR.BUILD means, which branch carries
-#                                     which number, and why a nightly is `.devN` and not
-#                                     `+build` (PyPI rejects local versions outright)
+docs/known_limitations.rst          # what the shipped package does NOT do, stated
+docs/versioning.rst                 # what MAJOR.MINOR.BUILD means, and which branch
+#                                     carries which number
+docs/tutorials/index.rst
+docs/tutorials/tutorial_01_basic_reconstruction.rst
+docs/tutorials/tutorial_02_gan_super_resolution.rst
+docs/tutorials/tutorial_03_diffusion_training.rst
+docs/tutorials/tutorial_04_physics_constraints.rst
+docs/tutorials/tutorial_05_custom_loss.rst
+docs/tutorials/tutorial_06_hyperparameter_optimization.rst
 #
 # Driving it from configuration
 docs/config_schema_reference.rst
-docs/config_key_reference.rst       # generated; its generator ships below
+docs/explanation/workflows.md       # the regime x task contract and the profile table
 docs/transform_registry.rst
 docs/environment_variables.rst
-docs/CLUSTER_DATA_LAYOUT.md
 #
 # Running it
 docs/running_pipelines.rst
 docs/execution_modes.rst
 docs/cli_reference.rst
 docs/plugins.rst
-docs/campaigns_user_guide.rst
 docs/hpo_guide.md
 docs/audit_ladder_user_guide.rst
 docs/accelerated_run_contract.rst
 docs/distributed_training.rst
 docs/training_throughput.rst
 #
-# Results, logging, debugging
+# Results and logging
 docs/run_provenance_and_logging.rst
-docs/reporting.md
-docs/reporting_pipeline.rst
-docs/debug_snapshot_contract.rst
+docs/reporting.rst
 #
 # What you can configure
 docs/models_reference.rst
@@ -799,9 +798,8 @@ docs/strategies_reference.rst
 docs/losses_reference.rst
 docs/metrics_reference.rst
 #
-# API + theory
+# Scripting
 docs/scripting_api.rst
-docs/sim2rank_reliability_theory.rst
 #
 # Read the Docs reads its config from the REPO ROOT, which is why the file moved
 # there from docs/ in this change rather than being configured with a custom path.

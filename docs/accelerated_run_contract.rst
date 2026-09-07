@@ -10,30 +10,30 @@ they never silently degrade to CPU.**
 "Heavy" means anything that consumes real GPU-hours: training, sanity-check,
 experiment, inference, prediction, validation, evaluation, HPO, ablation,
 benchmarking, distributed runs, campaigns, PGGS reconstruction (Gaussian
-splatting with latent-diffusion refinement and test-time optimisation, gated
-since 2026-09-03) and the Tier-2 audit probe. The set is :data:`HEAVY_PIPELINES`.
+splatting with latent-diffusion refinement and test-time optimisation) and the
+Tier-2 audit probe. The set is :data:`HEAVY_PIPELINES`.
 
 Why
 ===
 
-Device resolution had grown eight independent implementations, seven of which
-ended in some variant of ``if not torch.cuda.is_available(): device = "cpu"``.
-The consequences were invisible by construction:
+A silent CPU fallback is invisible by construction, which is what makes it the
+most expensive kind:
 
-* An sbatch that landed on a GPU-less node, or whose CUDA driver faulted, ran
-  the full job on CPU at roughly 100x slowdown — and **reported success**. The
-  wall-clock allocation was spent; the warning scrolled past in a 40-hour log.
-* ``initialize_device`` wrapped its whole body in a bare ``except Exception``
-  that logged *"Falling back to CPU mode..."*, so a driver mismatch, an ECC
-  fault, or an OOM on the probe allocation all produced a *successful* CPU run.
-* ``bootstrap.build_container`` flattened ``"auto"`` to ``"cpu"`` **before**
-  constructing :class:`~spectramr.infrastructure.services.device_manager.DeviceManager`,
-  whose own (correct) CUDA guard therefore never fired on the live path.
+* A batch job that lands on a GPU-less node, or whose CUDA driver faults, would
+  run to completion on CPU at roughly 100x slowdown — and **report success**.
+  The wall-clock allocation is spent; a warning scrolls past in a 40-hour log.
+* A device resolver that wraps its body in a bare ``except Exception`` and logs
+  *"Falling back to CPU mode..."* turns a driver mismatch, an ECC fault and an
+  OOM on the probe allocation alike into a *successful* CPU run.
+* Flattening ``"auto"`` to ``"cpu"`` **before**
+  :class:`~spectramr.infrastructure.services.device_manager.DeviceManager` is
+  constructed means that class's own (correct) CUDA guard never fires on the
+  live path.
 
-Both are the same standing rule at the hardware layer -- *a silent fallback is
+This page is the standing rule at the hardware layer -- *a silent fallback is
 forbidden: an unavailable or unknown option raises rather than degrading to a
 default* -- together with its companion, *a warning is not an acceptable resting
-state*, in its most expensive form.
+state*.
 
 The policy
 ==========
@@ -89,27 +89,25 @@ Each path is logged loudly and stamped into the resolved
    the only device it can see is the CLI's ``--device`` — ``None`` whenever the
    caller omits it, which the SLURM dispatcher always does.
    ``pipelines/train.py`` therefore back-fills ``provenance["device"]`` from
-   ``pipeline.device`` once the environment is built. Until 2026-07-25 it did
-   not, and every cluster run stamped ``"device": null`` while training on a
-   V100 — leaving the record unable to answer the one question it exists for.
-   See the LDM two-stage dispatch triage (F2).
+   ``pipeline.device`` once the environment is built. Without that back-fill the
+   record stamps ``"device": null`` while training on a GPU, and cannot answer
+   the one question it exists for.
 
 .. warning::
 
    ``FORCE_CPU`` is validated against the accepted boolean spellings and
    **raises** on anything else (``FORCE_CPU=maybe`` fails at startup). An
-   advertised knob that silently ignores an unknown value is pitfall #15.
+   advertised knob that silently ignores an unknown value is a defect.
 
 Which device the launch surface asks for
 ========================================
 
 :func:`resolve_compute_device` can only honour what it is handed, so the
-*launch* surface has to hand it the user's actual request -- and until
-2026-08-22 four verbs could not. ``infer``, ``infer-dataset``, ``predict`` and
-``hpo`` declared ``--device`` with ``default="cuda"``, so argparse produced a
-non-``None`` value on every invocation and the config's own device was
-unreachable by construction: a knob the schema advertises with no consumer on
-those paths (pitfall #15). Those four defaults are now ``None``.
+*launch* surface has to hand it the user's actual request. ``--device`` defaults
+to ``None`` on every verb but the two pinned exceptions below, ``infer``,
+``infer-dataset``, ``predict`` and ``hpo`` included: a non-``None`` argparse
+default makes the config's own device unreachable by construction — a knob the
+schema advertises with no consumer on those paths.
 
 The resolution order for a launch verb is:
 
@@ -123,7 +121,7 @@ of ``"cuda"``, and the resolver treats an explicit ``"cuda"`` as a hard
 requirement that ``FORCE_CPU`` may not relax while ``auto`` is relaxable --
 so substituting the default for a declaration would quietly convert every
 undeclared arm into a CUDA-mandatory one. :func:`spectramr.main._declared_device`
-is the single owner of that distinction (non-negotiable 17); it gates on
+is the single owner of that distinction; it gates on
 Pydantic's ``model_fields_set`` and returns ``None`` when the key is absent.
 
 **One resolution, every consumer.** A verb resolves the device once and must
@@ -131,12 +129,9 @@ then hand *that* value to both halves of the run: the accelerator it arms and
 the pipeline (or container) it launches. Passing the resolved device to one and
 the raw ``--device`` argument to the other reintroduces the divergence this
 contract exists to remove, and it does so invisibly -- both values are
-well-formed device strings, so nothing raises. It was live on the train path:
-``__common_train_setup`` resolved the device, armed the accelerator with it,
-and then handed ``run_training_pipeline`` the raw ``args.device``, so
-``--dry-run`` validated a device the live run never used. Treat the resolved
-value as the only device string in scope after resolution; a second read of the
-argument or the config below that point is the defect.
+well-formed device strings, so nothing raises. Treat the resolved value as the
+only device string in scope after resolution; a second read of the argument or
+the config below that point is the defect.
 
 Two verbs keep a pinned device on purpose and are exempt: ``meta-evaluate``
 defaults to ``auto``, and ``design-mrf-sequence`` to ``cpu``. Sim2Rank's
@@ -145,17 +140,13 @@ documented CPU backing is the same deliberate exception.
 Audit: the Tier-2 acceleration gate
 ===================================
 
-``spectramr audit <yaml> --probe`` now **checks that the run is accelerated by a
+``spectramr audit <yaml> --probe`` **checks that the run is accelerated by a
 device other than CPU**, and fails otherwise.
 
-This closes a live facade. The Tier-2 probe's headline value is catching CUDA
-OOM at the configured batch/patch size and AMP / GradScaler double-unscale
-traps — and **neither exists on CPU**. The audit CLI used to default to
-``--device cpu``, and the internal sweep wrapper that drove it never overrode
-that default. So every Tier-2 probe run before this gate landed was the degraded
-kind: it
-certified "did not crash on CPU", never "this arm will run on the GPU it was
-scheduled for".
+This closes a facade. The Tier-2 probe's headline value is catching CUDA OOM at
+the configured batch/patch size and AMP / GradScaler double-unscale traps — and
+**neither exists on CPU**. A probe that runs on CPU certifies "did not crash on
+CPU", never "this arm will run on the GPU it was scheduled for".
 
 The gate (``_gate_probe_acceleration`` in :mod:`spectramr.cli.app`) resolves the
 probe device as **CLI ``--device`` > the config's own ``training.device`` > a

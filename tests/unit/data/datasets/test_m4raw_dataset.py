@@ -10,6 +10,9 @@ makes the RSS guard fire only for the explicit ``"rss"`` mode.
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
+import re
 from typing import ClassVar
 
 import h5py
@@ -35,7 +38,9 @@ from spectramr.data.datasets.m4raw_dataset import (
 
 
 def test_valid_target_modes_is_the_advertised_set() -> None:
-    assert frozenset({"complex_mean", "phase_aligned_mean", "rep_pair"}) == _VALID_TARGET_MODES
+    assert (
+        frozenset({"complex_mean", "phase_aligned_mean", "rep_pair", "r2r"}) == _VALID_TARGET_MODES
+    )
 
 
 def test_average_reps_complex_mean_is_plain_mean() -> None:
@@ -509,12 +514,12 @@ def test_all_retries_exhausted_raises_not_zero_fill(tmp_path, monkeypatch) -> No
     input/target with no hard failure — the "loads zero/random" facade
     (pitfall #9/#16).
     """
-    from spectramr.data.datasets.m4raw_dataset import _SkipSample
+    from spectramr.data.datasets.m4raw_dataset import _SkipSampleError
 
     ds = _build_single_contrast_ds(tmp_path, hw=(16, 16))
 
     def _always_skip(self, idx):
-        raise _SkipSample("simulated unreadable k-space file")
+        raise _SkipSampleError("simulated unreadable k-space file")
 
     monkeypatch.setattr(M4RawRepetitionDataset, "_load_item", _always_skip)
 
@@ -768,7 +773,7 @@ class TestRepetitionLoadFailuresAreLoud:
         `_filter_none` (only Robust/Physics do), so the None died deep in
         collate as `TypeError: 'NoneType' object is not subscriptable`."""
         paths, m = self._paths(tmp_path, n_ok=0, n_missing=3)
-        with pytest.raises(m._SkipSample, match="all 3 repetition files"):
+        with pytest.raises(m._SkipSampleError, match="all 3 repetition files"):
             m._load_reps_or_skip(paths, "idx=0")
 
     def test_partial_failure_is_a_counted_warning_not_debug(
@@ -808,14 +813,14 @@ class TestRepetitionLoadFailuresAreLoud:
         """An unreadable-file error that does not name the file makes the
         operator grep a manifest by hand."""
         paths, m = self._paths(tmp_path, n_ok=0, n_missing=2)
-        with pytest.raises(m._SkipSample) as exc:
+        with pytest.raises(m._SkipSampleError) as exc:
             m._load_reps_or_skip(paths, "idx=0")
         for p in paths:
             assert p.name in str(exc.value)
 
     def test_both_paths_use_the_one_loader(self) -> None:
         """The single-contrast and cross-contrast paths had drifted onto two
-        different failure protocols — `return None` and `_SkipSample`. Deriving
+        different failure protocols — `return None` and `_SkipSampleError`. Deriving
         both from one helper is what keeps them from drifting again."""
         import inspect
 
@@ -836,9 +841,20 @@ class TestSingleSurvivingRepIsRefused:
         from spectramr.data.datasets.m4raw_dataset import M4RawRepetitionDataset
 
         src = inspect.getsource(M4RawRepetitionDataset)
-        assert "self.use_repetitions and len(kspace_reps) < 2" in src, (
+        assert "len(kspace_reps) < 2" in src, (
             "the single-surviving-rep guard is gone; a NEX arm can silently "
             "train input->input again"
+        )
+        # The guard carries exactly ONE exemption. R2R builds both halves from
+        # the input repetition, so a 1-rep group is the case it exists to serve,
+        # not a degenerate one -- but the exemption must stay narrow, and a
+        # substring pin is the cheapest way to notice a second one appearing.
+        assert 'self.target_mode != "r2r"' in src, (
+            "the r2r exemption is gone; single-excitation groups would be skipped, "
+            "which is exactly the data the r2r arm exists to use"
+        )
+        assert src.count("len(kspace_reps) < 2") == 1, (
+            "a second single-rep guard appeared; elect one owner (non-negotiable 17)"
         )
 
     def test_the_message_offers_the_deliberate_opt_out(self) -> None:
@@ -1048,6 +1064,21 @@ def test_leave_one_out_refuses_a_two_rep_group_at_construction(tmp_path) -> None
     refuses BEFORE any sample is served, naming the contrast and the fix."""
     with pytest.raises(ValueError, match=r"fewer than 3 repetitions.*T1.*nex_fallback: all_reps"):
         _build_reps_ds(tmp_path, n_reps=2, nex_target_exclude_input=True)
+
+
+def test_the_loo_minimum_is_not_bypassed_for_averaging_modes(tmp_path) -> None:
+    """Anti-vacuity for the test above: every averaging mode still refuses.
+
+    An early return placed one line too high would silently disable the whole
+    #695 contract, and the r2r test alone could not tell.
+    """
+    with pytest.raises(ValueError, match="fewer than 3 repetitions"):
+        _build_reps_ds(
+            tmp_path,
+            n_reps=2,
+            target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+        )
 
 
 def test_leave_one_out_constructs_when_every_group_has_three_reps(tmp_path) -> None:
@@ -1272,7 +1303,7 @@ def test_rss_reference_coil_is_chosen_per_record(tmp_path) -> None:
 def test_an_out_of_range_slice_raises(tmp_path) -> None:
     """Planted violation: a record promising a slice the file lacks is an index
     defect. It is raised, not censused as an unreadable repetition and not
-    skipped by the retry loop (which only catches ``_SkipSample``)."""
+    skipped by the retry loop (which only catches ``_SkipSampleError``)."""
     _vol, sl = _slice_route_pair(tmp_path, slices=(3, 2))
     sl.index[0]["slice_index"] = 99
     with pytest.raises(IndexError, match=r"out of range.*3 slice"):
@@ -1424,3 +1455,231 @@ def test_dry_iter_has_one_shell_per_slice_record(tmp_path) -> None:
     slices, which is the whole no-double-sampling argument."""
     _vol, sl = _slice_route_pair(tmp_path, slices=(3, 2))
     assert len(sl.dry_iter()) == 5
+
+
+# ── target_mode='r2r': Recorrupted-to-Recorrupted from ONE excitation ───────
+# The arithmetic lives in infrastructure/physics/m4raw_noise.py and is tested
+# there. What these pin is the DATASET's half of the contract: that it branches
+# before the repetition logic, that it does not skip single-excitation groups,
+# and that it injects on the sampled support of RAW k-space.
+
+
+def _write_noisy_kspace_h5(path, shape, *, unsampled_cols: int = 0) -> None:
+    """M4Raw-style H5 with non-zero k-space and optional zero-filled PE columns.
+
+    The shipped ``_write_kspace_h5`` writes zeros, which r2r refuses (a wholly
+    zero k-space has no sampled support to inject into).
+    """
+    rng = np.random.default_rng(0)
+    data = (rng.normal(size=shape) + 1j * rng.normal(size=shape)).astype(np.complex64)
+    if unsampled_cols:
+        data[..., -unsampled_cols:] = 0
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("kspace", data=data)
+
+
+def _build_r2r_ds(tmp_path, *, reps=("01", "02"), unsampled_cols=0, alpha=1.0, **kw):
+    files = []
+    for rep in reps:
+        p = tmp_path / f"2022_T1{rep}.h5"
+        _write_noisy_kspace_h5(p, (2, 4, 32, 24), unsampled_cols=unsampled_cols)
+        files.append(p)
+    return M4RawRepetitionDataset(
+        h5_files=files,
+        single_contrast=True,
+        coil_processing_mode="none",
+        use_repetitions=True,
+        target_mode="r2r",
+        r2r_alpha=alpha,
+        **kw,
+    )
+
+
+class TestR2RTargetMode:
+    def test_serves_a_pair_that_is_not_the_identity_task(self, tmp_path) -> None:
+        subject = _build_r2r_ds(tmp_path)[0]
+        assert not torch.equal(subject["input"].data, subject["target"].data)
+
+    def test_a_single_excitation_group_is_served_not_skipped(self, tmp_path) -> None:
+        """The whole point: r2r needs ONE repetition.
+
+        Every other target_mode refuses a 1-rep group because its target would be
+        the input. R2R's target is a recorruption, so the group is usable -- and
+        skipping it would discard exactly the single-excitation data the arm
+        exists to prove it can train on.
+        """
+        ds = _build_r2r_ds(tmp_path, reps=("01",))
+        assert len(ds) == 1
+        assert ds[0]["input"].data.shape[0] == 8  # 4 coils x (Re, Im)
+
+    @pytest.mark.parametrize("reps", [("01",), ("01", "02")])
+    def test_leave_one_out_does_not_gate_r2r(self, tmp_path, reps) -> None:
+        """An r2r arm carries ``nex_target_exclude_input: true`` for its VAL split.
+
+        It is ONE config knob shared by both datasets, and the validation split
+        -- built with ``data.val_target_mode``, an averaging mode -- is the half
+        that needs leave-one-out. The training split runs r2r, which never
+        averages and so never leaves anything out. Without the exemption in
+        ``_refuse_undersized_loo_groups`` the training dataset would refuse a 1-
+        or 2-repetition group for a leave-one-out it does not perform, and a
+        1-rep group is precisely the data this arm exists to train on.
+        """
+        ds = _build_r2r_ds(tmp_path, reps=reps, nex_target_exclude_input=True)
+        assert len(ds) == 1
+        subject = ds[0]
+        # served, and still an r2r PAIR -- not silently degraded to an average
+        assert not torch.equal(subject["input"].data, subject["target"].data)
+
+    def test_halves_recover_the_acquisition_and_the_injected_noise(self, tmp_path) -> None:
+        """At alpha=1, ``(input + target) / 2 == y`` and ``(input - target) / 2 == z``.
+
+        So the served pair carries its own reference: the mean of the halves must
+        be the untouched repetition. This is what fails if the branch ever starts
+        recorrupting the target twice, or injects after normalization.
+        """
+        ds = _build_r2r_ds(tmp_path, reps=("01",))
+        # ``index[...]["paths"]`` holds STRINGS (they are stringified at build
+        # time); ``_load_reps_or_skip`` wants ``Path``.
+        stored = pathlib.Path(ds.index[0]["paths"][0])
+        raw = m4raw_mod._load_reps_or_skip([stored], "r2r reference", None)[0]
+        subject = ds[0]
+        inp, tgt = subject["input"].data, subject["target"].data
+        recovered = torch.complex(*(((inp + tgt) / 2)[i::2] for i in (0, 1)))
+        assert torch.allclose(recovered.permute(3, 0, 1, 2), raw, atol=1e-3)
+
+    def test_unsampled_phase_encode_columns_stay_exactly_zero(self, tmp_path) -> None:
+        """~24 % of M4Raw PE columns are zero-filled (partial phase FOV).
+
+        Noise written into one fabricates a line the scanner never acquired. The
+        support is derived from the DATA because M4Raw's ``encodingLimits``
+        report a COUNT where ISMRMRD specifies an INCLUSIVE maximum -- see
+        ``test_m4raw_encoding_limits_report_counts_not_inclusive_maxima``.
+        """
+        subject = _build_r2r_ds(tmp_path, reps=("01",), unsampled_cols=6)[0]
+        for half in ("input", "target"):
+            assert torch.count_nonzero(subject[half].data[..., -6:, :]) == 0
+            assert torch.count_nonzero(subject[half].data[..., :-6, :]) > 0
+
+    def test_alpha_splits_the_variance(self, tmp_path) -> None:
+        """Input carries ``(1 + a^2) Sigma``, target ``(1 + 1/a^2) Sigma``."""
+        subject = _build_r2r_ds(tmp_path, reps=("01",), alpha=3.0)[0]
+        inp_var = subject["input"].data.var().item()
+        tgt_var = subject["target"].data.var().item()
+        assert inp_var > tgt_var  # a > 1 puts the noise in the input
+
+    @pytest.mark.parametrize("alpha", [0.5, 1.0, 3.0])
+    def test_alpha_weighted_mean_of_the_halves_is_the_acquisition(self, tmp_path, alpha) -> None:
+        """``(input + a^2 * target) / (1 + a^2) == y`` exactly, for every alpha.
+
+        The alpha=1 case above is the special one where the plain mean works.
+        This is its general form, and it is the sharper pin: it fails if the
+        target loses its minus sign, if the target's ``1/alpha`` degrades to
+        ``alpha`` or to 1, or if the two halves stop sharing one draw of ``z``.
+        An inequality on the variances catches none of those.
+        """
+        ds = _build_r2r_ds(tmp_path, reps=("01",), alpha=alpha)
+        stored = pathlib.Path(ds.index[0]["paths"][0])
+        raw = m4raw_mod._load_reps_or_skip([stored], "r2r reference", None)[0]
+        subject = ds[0]
+        combo = (subject["input"].data + alpha**2 * subject["target"].data) / (1 + alpha**2)
+        recovered = torch.complex(combo[0::2], combo[1::2])
+        assert torch.allclose(recovered.permute(3, 0, 1, 2), raw, atol=1e-3)
+
+    def test_average_reps_refuses_r2r(self) -> None:
+        """R2R sets BOTH halves, so it is not expressible as an averaging mode."""
+        reps = [torch.randn(1, 2, 4, 4, dtype=torch.complex64)]
+        with pytest.raises(ValueError, match="must be handled at the construction site"):
+            _average_reps(reps, "r2r")
+
+    def test_cross_contrast_route_refuses_r2r(self, tmp_path) -> None:
+        """R2R recorrupts ONE contrast against itself; cross-contrast pairs two."""
+        files = []
+        for name in ("2022_T101.h5", "2022_T201.h5"):
+            p = tmp_path / name
+            _write_noisy_kspace_h5(p, (2, 4, 32, 24))
+            files.append(p)
+        ds = M4RawRepetitionDataset(
+            h5_files=files,
+            single_contrast=False,
+            coil_processing_mode="none",
+            target_mode="r2r",
+        )
+        with pytest.raises(ValueError, match="single-contrast denoising target"):
+            _ = ds[0]
+
+
+# ── the header convention this cohort relies on, executed rather than asserted ──
+# The r2r support mask is derived from the array because M4Raw's `encodingLimits`
+# do not follow the ISMRMRD convention. That claim is load-bearing (it decides
+# where noise may be injected), so it is measured against the real corpus rather
+# than left as a comment. Skips where the corpus is absent -- a visible skip.
+
+_M4RAW_CORPUS = pathlib.Path(
+    os.environ.get("M4RAW_DIR", pathlib.Path(__file__).parents[4] / "tests_experiments")
+)
+
+
+def _encoding_limit(xml: str, tag: str) -> tuple[int, int, int]:
+    """``(minimum, maximum, center)`` for one ``encodingLimits`` axis."""
+    block = re.search(rf"<ns0:{tag}>(.*?)</ns0:{tag}>", xml, re.S)
+    assert block is not None, f"no <{tag}> in ismrmrd_header"
+    body = block.group(1)
+
+    def field(name: str) -> int:
+        m = re.search(rf"<ns0:{name}>(-?\d+)</ns0:{name}>", body)
+        assert m is not None, f"no <{name}> in <{tag}>"
+        return int(m.group(1))
+
+    return field("minimum"), field("maximum"), field("center")
+
+
+@pytest.mark.skipif(
+    not sorted(_M4RAW_CORPUS.glob("*.h5")),
+    reason=f"no real M4Raw .h5 files at {_M4RAW_CORPUS} (set M4RAW_DIR to point at them)",
+)
+def test_m4raw_encoding_limits_report_counts_not_inclusive_maxima() -> None:
+    """``maximum`` equals the COUNT, so a spec-conforming ``max + 1`` over-reads.
+
+    ISMRMRD defines ``encodingLimits/*/maximum`` as an INCLUSIVE index, so an
+    18-slice volume should report 17. M4Raw reports 18. Measured over the whole
+    local corpus, on both axes this cohort touches:
+
+    * ``slice/maximum``               == number of slices in ``kspace``
+    * ``kspace_encoding_step_1/max``  == number of sampled phase-encode columns
+
+    This is why ``_recorrupt_r2r`` derives its support mask from the array. If a
+    future M4Raw release fixes the writer, this test goes red and the support
+    derivation can be revisited -- which is the point of pinning it.
+    """
+    files = sorted(_M4RAW_CORPUS.glob("*.h5"))
+    checked = 0
+    for path in files:
+        with h5py.File(str(path), "r") as f:
+            if "ismrmrd_header" not in f or "kspace" not in f:
+                continue
+            raw = f["ismrmrd_header"][()]
+            xml = raw.decode() if isinstance(raw, bytes) else str(raw)
+            kspace = f["kspace"][()]
+
+        n_slices = kspace.shape[0]
+        # A column the scanner never sampled is EXACTLY zero across slice+coil+row.
+        n_sampled_cols = int((np.abs(kspace).sum(axis=(0, 1, 2)) > 0).sum())
+
+        _, slice_max, _ = _encoding_limit(xml, "slice")
+        _, pe_max, _ = _encoding_limit(xml, "kspace_encoding_step_1")
+
+        assert slice_max == n_slices, (
+            f"{path.name}: slice/maximum={slice_max} but the array has {n_slices} "
+            f"slices. The count convention no longer holds -- re-check whether "
+            f"_recorrupt_r2r should still ignore the header."
+        )
+        assert pe_max == n_sampled_cols, (
+            f"{path.name}: kspace_encoding_step_1/maximum={pe_max} but "
+            f"{n_sampled_cols} columns carry signal."
+        )
+        checked += 1
+
+    assert checked > 0, (
+        f"{len(files)} .h5 files under {_M4RAW_CORPUS} but none carried both "
+        "'ismrmrd_header' and 'kspace' -- the assertion never ran."
+    )

@@ -13,25 +13,12 @@ know your way around, the :doc:`../how_to/index` answer single questions instead
    :local:
    :depth: 1
 
-First steps
-===========
-
-Start here if you have just installed the framework.
-
-.. toctree::
-   :maxdepth: 1
-
-   quickstart
-   first_reconstruction
-
-:doc:`quickstart` gets a run moving in a few minutes. :doc:`first_reconstruction`
-covers the same ground slowly, explaining the config, the data pipeline and the
-validation output as it goes. Either one leads into Tutorial 1 below.
-
 Core tutorials
 ==============
 
-A sequence — each builds on concepts from the previous one.
+A sequence — each builds on concepts from the previous one. Start at Tutorial 1
+with the framework installed; :doc:`../getting_started` covers the install and
+the first run.
 
 .. toctree::
    :maxdepth: 1
@@ -117,8 +104,8 @@ Suggested paths
 
 **Learning the framework:** Tutorial 1 → 4 (physics constraints) → 2 (GAN).
 
-**Research:** Tutorial 1 → 2 (GAN) → 3 (diffusion), then read
-:doc:`../campaigns_user_guide` for running arms at scale.
+**Research:** Tutorial 1 → 2 (GAN) → 3 (diffusion), then
+:doc:`../execution_modes` for running many arms at scale.
 
 **Extending:** Tutorial 1 → 5 (custom loss) → 6 (HPO), then
 :doc:`../how_to/add_model` and :doc:`../how_to/add_paradigm`.
@@ -127,7 +114,6 @@ Where to go next
 ================
 
 - :doc:`../how_to/index` — task-focused recipes.
-- :doc:`../explanation/index` — why the framework is shaped this way.
 - :doc:`../config_schema_reference` — every YAML key, with defaults.
 - :doc:`../troubleshooting` — when a run misbehaves.
-- :doc:`../user_guide` — the detailed framework reference.
+- :doc:`../cli_reference` — every command and flag.

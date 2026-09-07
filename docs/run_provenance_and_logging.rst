@@ -3,14 +3,10 @@ Run Provenance & Traceability
 
 Every training run started through :func:`spectramr.pipelines.train.run_training_pipeline`
 (i.e. ``spectramr train`` / ``sanity_check`` / ``experiment`` / ``ablation``)
-now captures a **provenance record** — *what code, what machine, when, how
-long, how big* — so a result on the cluster can always be tied back to the
-exact commit and environment that produced it.
-
-This closes a long-standing gap: the run log used to say *which services
-started* but nothing about the commit SHA, host, wall-clock, or model/data
-size. A bundle was not self-describing, and "why won't this reproduce?" had no
-answer in the artifacts.
+captures a **provenance record** — *what code, what machine, when, how long,
+how big* — so a result on the cluster can always be tied back to the exact
+commit and environment that produced it. A bundle is self-describing: "why
+won't this reproduce?" is answerable from the artifacts alone.
 
 What gets captured
 ------------------
@@ -45,9 +41,8 @@ Field                          Meaning
 Node hardware: allocated vs. physical
 -------------------------------------
 
-``env.node`` answers *what machine did this actually run on* — the question the
-record could not answer before 2026-07-25. It has three sub-records, each
-probed independently and each fail-open:
+``env.node`` answers *what machine did this actually run on*. It has three
+sub-records, each probed independently and each fail-open:
 
 .. code-block:: json
 
@@ -83,16 +78,17 @@ Two distinctions carry the weight:
     constraint that actually binds — the affinity mask (``os.sched_getaffinity``,
     which sees cpusets and ``taskset``), the scheduler grant
     (``SLURM_CPUS_PER_TASK`` / ``SLURM_MEM_PER_NODE``), the container cgroup
-    quota, and the node total. Without it a job granted 8 of 128 cores produced
-    a record indistinguishable from one that owned the whole machine, and
-    "why did this OOM / run slow?" had no answer in the bundle.
+    quota, and the node total. Without it a job granted 8 of 128 cores produces
+    a record indistinguishable from one that owns the whole machine, and
+    "why did this OOM / run slow?" has no answer in the bundle.
 
 **Visible ≠ present.**
     ``count``/``types`` are what torch can use (the ``CUDA_VISIBLE_DEVICES``
     subset); ``node_count``/``node_types`` come from ``nvidia-smi`` and describe
     every GPU on the box. The gap separates *this node has no GPU* from *this
     job was given none of its 4* — the distinction that matters when auditing
-    non-negotiable 9b (:doc:`accelerated_run_contract`). When ``count == 0`` but
+    the accelerated-run contract (:doc:`accelerated_run_contract`). When
+    ``count == 0`` but
     ``node_count > 0``, the banner says so explicitly:
 
     .. code-block:: text
@@ -129,13 +125,13 @@ the ``_ledger`` block below:
 ``resolved_config.json``
     ``config.model_dump(mode="json")`` — the frozen ``TrainingSettings`` as it
     actually drove the run (after defaults + migrations), so post-hoc tooling
-    needn't re-parse the source YAML. Carries a ``_ledger`` block (below) and,
-    since 2026-09-03, a ``_declared`` block: the unset-excluded dump, the one
+    needn't re-parse the source YAML. Carries a ``_ledger`` block (below) and a
+    ``_declared`` block: the unset-excluded dump, the one
     shape that ``TrainingSettings.model_validate`` turns back into the resolved
     settings (the full dump does not re-validate, because cross-field
     validators read a materialised default as a declaration). ``predict`` and
     ``infer`` rebuild their settings from that block when the artifact sits
-    beside the checkpoint (#1379).
+    beside the checkpoint.
 
 ``provenance_run_<run_id>.json`` / ``resolved_config_run_<run_id>.json``
     Run-id-qualified **copies** of the two above, written only when a ``run_id``
@@ -144,8 +140,8 @@ the ``_ledger`` block below:
     ``output_dir`` derives from the config, not from the run, so relaunching an
     arm into the same directory replaces the previous run's record while its
     checkpoints, images and debug snapshots all survive beside it. The result
-    was a directory whose config described a *different* run than its images —
-    self-consistent, parseable, and wrong (#1299, #1379). Build the name with
+    result is a directory whose config describes a *different* run than its
+    images — self-consistent, parseable, and wrong. Build the name with
     :func:`~spectramr.infrastructure.validation.resolved_config_artifact.resolved_config_run_name`
     rather than re-deriving the spelling at the reading site.
 
@@ -161,7 +157,7 @@ describe one config differently.
 ``substitutions``
     One record per divergence, each with a dotted path, the requested and
     resolved values, and a severity. The classes are ``EXTRA_IGNORE_DROPPED``
-    (declared, not a field, silently discarded — the issue #550 mechanism),
+    (declared, not a field, silently discarded),
     ``EXTRA_ALLOW_UNTYPED`` (carried but never validated),
     ``RAW_DICT_UNVALIDATED`` (a ``dict[str, Any]`` field whose sub-keys bypass
     pydantic entirely) and ``VALUE_CHANGED_ON_FINALIZE``.
@@ -180,19 +176,11 @@ describe one config differently.
    ``fold``-posture rename does — makes the walker descend and its remaining
    fields countable.
 
-   Measured on one ``kspace_filling`` arm across the 2026-08-02 canonical-key
-   drain, whose resolved document is byte-identical either way
-   (``verify_config_migration`` leg (ii), 58/58)::
-
-       legacy spellings     defaults_injected = 563
-       canonical spellings                    = 625
-
-   Same run, +62. So compare the **paths**, not the total, when the two configs
-   are written at different depths — 88 paths appear only under the canonical
-   spelling. This is why the field is a list: the integer averaged the effect
-   away, and the per-key form is what makes it visible.
-
-   ``schema_version`` is ``2``; v1 had no ``defaults`` list.
+   Two configs that resolve to a byte-identical document can therefore report
+   different totals purely because one names a block the other leaves implicit.
+   Compare the **paths**, not the total. This is why the field is a list: the
+   integer averages the effect away, and the per-key form is what makes it
+   visible.
 
 ``run_summary.json``
     The footer, written on completion: success flag, best metrics, final loss,
@@ -214,7 +202,7 @@ The console / log file also gets a scannable banner at startup::
     run_id     : exp_gan-20260611_201500-61cf45551c5e
     git        : 61cf45551c5e @ dev (DIRTY)
     host       : node07 (pid 4242, <user>)
-    torch      : 2.11.0+cu129 · 2x A100(40.0GB)
+    torch      : 2.8.0+cu126 · 2x A100(40.0GB)
     gpu        : 2 visible / 4 on node · 2 allocated · driver 550.54.15 · CUDA_VISIBLE_DEVICES=0,1
     node       : 8/128 cores · 64.0/1007.5 GB RAM · AMD EPYC 7763 64-Core Processor
     python     : 3.12.12
@@ -227,14 +215,14 @@ The console / log file also gets a scannable banner at startup::
 
 Identical devices are grouped (``2x A100(40.0GB)``) so an 8-GPU node stays one
 readable line. The ``gpu`` and ``node`` lines are omitted entirely when the
-probes returned nothing, so a pre-2026-07-25 record still renders.
+probes returned nothing, so a record missing them still renders.
 
 On a *build* failure (before the loop), the banner is still emitted with the
 git/env it managed to capture, so even a crash-at-startup is traceable to a
 commit + host.
 
 Cluster pre-flight: ``spectramr doctor``
---------------------------------------
+----------------------------------------
 
 The same environment probe powers the pre-flight gate (see
 :doc:`cli_reference`)::
@@ -280,26 +268,25 @@ Where this run's log actually went
 
 A run can write ``provenance.json``, ``resolved_config.json``, a TensorBoard
 event file, its ``debug_snapshots/`` and every validation PNG — and not one log
-line. That happened on 2026-08-18, and neither artifact could say why, because
-the log path was the one thing no artifact recorded.
+line — and until the path is recorded, no artifact can say why.
 
 Two mechanisms put a log somewhere other than beside the run:
 
 **1. ``logging.sinks.dir`` outranks the run directory.**
 :meth:`LoggingServiceFactory.create` passes ``log_dir=config.sinks.dir``
 straight through, and ``ComprehensiveLoggingService`` resolves
-``sinks.dir or log_dir``. That precedence is **correct** — non-negotiable 3b
-forbids a caller default from replacing a declared value — so an arm declaring
+``sinks.dir or log_dir``. That precedence is **correct** — a caller default
+must not replace a declared value — so an arm declaring
 
 .. code-block:: yaml
 
    logging:
      sinks:
-       dir: experiments/results/experiment_11_attention_none/logs
+       dir: experiments/results/my_arm/logs
 
-writes its log there even when ``--output-dir`` puts the artifacts under
-``tests_experiments/``. Nothing was wrong except that the two halves could not be
-connected: *"the log is missing"* and *"the log is in the other tree"* looked
+writes its log there even when ``--output-dir`` puts the artifacts somewhere
+else. Nothing is wrong, but the two halves cannot be connected unless the path
+is recorded: *"the log is missing"* and *"the log is in the other tree"* look
 identical from the run directory.
 
 **2. An unwritable directory relocates the whole log, silently.**
@@ -320,15 +307,15 @@ log"*:
    service.resolved_log_path        # the file it actually opened, or None
    service.log_dir_relocated_from   # the intended dir, when relocation happened
 
-and ``train.py`` stamps them into provenance beside the **declared** value, per
-the declared-vs-applied rule of non-negotiable 14:
+and ``train.py`` stamps them into provenance beside the **declared** value, so
+the two can be compared:
 
 .. code-block:: json
 
    "logging": {
      "resolved_path": "/tmp/spectramr_logs_ab3f/kspace_cold_diffusion.log",
-     "declared_sinks_dir": "experiments/results/experiment_11_attention_none/logs",
-     "relocated_from": "experiments/results/experiment_11_attention_none/logs",
+     "declared_sinks_dir": "experiments/results/my_arm/logs",
+     "relocated_from": "experiments/results/my_arm/logs",
      "incomplete": ["the declared log directory was not writable; the log was
        moved to a temporary directory that a compute node wipes at job teardown"]
    }
@@ -342,15 +329,15 @@ is running and the file can still be copied out::
 
 Relocation also raises a ``RuntimeWarning`` in addition to the log warning. That
 is deliberate redundancy: a *log* warning about the log sink failing is precisely
-the message most likely to be lost, and ``audit`` treats warnings as failures
-(non-negotiable 4), so the condition surfaces in a pre-flight too.
+the message most likely to be lost, and ``audit`` treats warnings as failures,
+so the condition surfaces in a pre-flight too.
 
 The stamp is **not** rank-gated. Non-zero ranks write ``provenance_rank{N}.json``
 (see the parallel-topology section above), and each names its own log — an N-rank
 run has N logs, and only rank 0's was ever discoverable.
 
-Console-logging configuration & the 2026-06-19 de-duplication
-=============================================================
+Console-logging configuration
+=============================
 
 Run *provenance* (above) is the on-disk record of a run. Separately, the
 **console logging** — the colored, badge-prefixed lines you see in a terminal —
@@ -376,68 +363,24 @@ filters survive) rather than stacking a duplicate" is the
 delegate to it. ``setup`` passes ``install_if_missing=log_to_console`` so silent
 mode upgrades existing handlers but never *adds* a console sink.
 
-This routine used to be copy-pasted in three places, which is the kind of
-redundancy that drifts. The 2026-06-19 logging-duplication audit consolidated
-it; the fixes (each pinned by a test) were:
+Two behaviours follow from having one owner. ``ComprehensiveLoggingService.log``
+injects default metadata and delegates; the base
+:meth:`LoggingService.log` is the single throttle authority, and it rate-limits
+only ``INFO`` / ``DEBUG`` — a ``WARNING`` or above is never throttled. The file
+handler's format string is the single ``_FILE_LOG_FORMAT`` constant, shared by
+the normal path and the permission-fallback path.
 
-* **#1 / #2 — three-way handler-setup duplication.** ``bootstrap_console_logging``
-  and ``setup`` (twice — root logger and the service's own logger) each carried
-  a private "upgrade-or-install colored console" block; a stale comment even
-  referenced a ``_upgrade_existing_handlers`` method that never existed. All now
-  call the one helper.
-* **#3 — file-handler format string.** The ``"%(asctime)s - %(name)s -
-  %(levelname)s - %(message)s"`` literal was duplicated across the ``try`` and
-  the permission-fallback ``except`` of ``setup``; it is now the single
-  ``_FILE_LOG_FORMAT`` constant.
-* **#4 — double-counted throttle (behaviour bug).**
-  ``ComprehensiveLoggingService.log`` re-throttled on the *same*
-  ``_throttle_counts`` dict and key before delegating to ``super().log``, so an
-  ``INFO`` / ``DEBUG`` line meant to print three times printed once — and it
-  also throttled ``WARNING`` / ``ERROR`` / ``CRITICAL``, violating the
-  "warnings are not OK" rule the base class is careful to honour
-  (it rate-limits only ``INFO`` / ``DEBUG``). The override now just injects
-  default metadata and delegates; the base
-  :meth:`LoggingService.log` is the single throttle authority.
-* **#6 — duplicate** ``__all__``. ``infrastructure/logging/__init__.py``
-  declared ``__all__`` twice; the second assignment silently replaced the first,
-  dropping the eagerly re-exported names (``banner``, ``phase``,
-  ``smart_progress``, the provenance helpers) from ``import *``. It is now one
-  merged list — which also cleared eight latent ``ruff`` ``F822`` errors.
-
-Regression tests:
-``tests/unit/infrastructure/services/test_logging_service_dedup_2026_06_19.py``
-(helper behaviour + AST guards for #3/#4) and
-``tests/unit/infrastructure/logging/test_package_exports.py`` (#6), alongside the
-existing ``tests/unit/infrastructure/logging/test_no_basicconfig_force.py`` which
-pins the bootstrap contract (idempotent, upgrade-in-place, ``force`` reset).
+The bootstrap contract — idempotent, upgrade-in-place, ``force`` reset — is
+pinned by ``tests/unit/infrastructure/logging/test_no_basicconfig_force.py``.
 
 TensorBoard: one writer, and what it records
 --------------------------------------------
 
-There were **two** ``SummaryWriter`` constructions and the configured one was
-unreachable. This page previously logged that as a known-untouched finding; it
-has now been fixed, and the paragraph is kept because the *shape* of the defect
-is the reusable part.
-
-* :meth:`LoggingServiceFactory.create` returns a **base** ``LoggingService``,
-  and ``bootstrap.py`` registers that same instance under the
-  ``ComprehensiveLoggingService`` key as well. So the subclass — the only thing
-  that read ``logging.tracking.tensorboard_dir`` — was never constructed. The
-  other construction path, :func:`create_logging_service`, never passes
-  ``logging_config`` and has no callers.
-* The writer everyone actually used was built in ``pipelines/train.py`` at a
-  **hardcoded** ``<run_dir>/tensorboard`` and ignored the knob entirely.
-
-21 committed arms declare ``tensorboard_dir`` and it did nothing for all of
-them. ``tests/unit/config/test_schema_key_consumption.py`` did not catch it
-because it indexes consumers with ripgrep: a textual read in dead code counts as
-consumption (issue #928).
-
 :class:`~spectramr.infrastructure.services.tensorboard_writer.TensorBoardWriter`
-is now the single writer, owned by ``pipelines/train.py``. Per-run isolation is
-kept as the default, but the knob is live: **the directory resolves relative to
-the run directory**, so every relative declaration in the corpus lands inside
-the run and an absolute one still overrides.
+is the single writer, owned by ``pipelines/train.py``. Per-run isolation is the
+default and the knob is live: **the directory resolves relative to the run
+directory**, so a relative declaration lands inside the run and an absolute one
+overrides.
 
 .. code-block:: yaml
 
@@ -450,13 +393,12 @@ the run and an absolute one still overrides.
      intervals:
        histogram: 1000           # weight/grad histogram cadence
 
-``service`` is a closed :class:`~spectramr.config.schemas.enums.TrackingService`.
-It was a bare ``str`` compared against the literal ``"tensorboard"``, so any
-other value — including the ``wandb`` its own description advertised — fell off
-the branch and the run trained to completion with **no tracking, no warning and
-a zero exit**. W&B is refused rather than accepted-and-ignored, because
-``logging.wandb_project`` / ``wandb_entity`` are inert (issue #675). A missing
-``tensorboard`` install now raises instead of warning and continuing.
+``service`` is a closed
+:class:`~spectramr.config.schemas.enums.TrackingService`, so an unrecognised
+value is refused rather than silently dropping tracking for the whole run. W&B
+is refused rather than accepted-and-ignored, because ``logging.wandb_project``
+and ``wandb_entity`` are inert. A missing ``tensorboard`` install raises rather
+than warning and continuing.
 
 What the writer records:
 
@@ -469,13 +411,13 @@ Feature                       Why it is there
 ``add_images``                validation panels, gated by ``images.log_validation``
 ``add_histogram``             weight/gradient **distributions**. A collapsed layer
                               and a saturated one can share a norm but never a
-                              shape (pitfall #20). Cadence-gated — see below.
+                              shape. Cadence-gated — see below.
 ``add_text``                  resolved-config dump, so provenance travels with
                               the event files
 ``add_hparams``               the run's hyper-parameters paired with its final
-                              metrics. Pitfall #17 (confounded ablation) is this
-                              repo's second-largest failure class; the HParams
-                              dashboard is what makes it visible across runs.
+                              metrics. A confounded ablation — two knobs moved
+                              in one run — is what the HParams dashboard makes
+                              visible across runs.
                               Read off the resolved config, so it records what
                               the run USED, not what the arm claimed.
 ``purge_step``                set to the resume iteration, so a resumed chart
@@ -484,12 +426,13 @@ Feature                       Why it is there
 
 ``add_histogram`` copies every parameter to host memory, which is a GPU sync per
 tensor. It is therefore gated on ``logging.intervals.histogram`` (default
-**1000**), and the writer checks the cadence *before* touching a tensor —
-non-negotiable #9. Lower it only for a short debugging run.
+**1000**), and the writer checks the cadence *before* touching a tensor, so the
+sync happens only on the iterations that log. Lower it only for a short
+debugging run.
 
 Deliberately **not** wired, so the advertised surface stays equal to the wired
-one: ``add_graph`` (590 models with complex tensors and dict batches — tracing
-fails often, and the natural ``try/except`` around it is pitfall #9),
+one: ``add_graph`` (tracing fails often on complex tensors and dict batches, and
+the natural ``try/except`` around it would swallow the failure silently),
 ``add_embedding``, ``add_video``, ``add_figure``, and ``add_pr_curve`` (no
 classification task exists here).
 
@@ -500,22 +443,21 @@ their exact meaning and nothing here is collective.
 Artifacts must describe the run that wrote them
 -----------------------------------------------
 
-An arm's output directory is **reused across runs**, so three artifacts could
-attribute one run's evidence to another. All three were found together while
-triaging ``experiment_11_attention_none`` (issues #585-#587); each is a
-different way for a bundle to stop being self-describing.
+An arm's output directory is **reused across runs**, so an artifact that does
+not bound itself to the run that wrote it attributes one run's evidence to
+another. Each rule below closes one way for a bundle to stop being
+self-describing.
 
-``final_metrics.json`` is windowed to the current run (#586)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``final_metrics.json`` is windowed to the current run
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``logs/training_metrics.csv`` is **appended to** by every run writing into the
-directory. The ``best`` block used to be the minimum/maximum over the whole
-file, so it reported whichever historical run scored best. The observed case: a
-3000-iteration run with ``logging.log_interval: 5000`` wrote **zero** rows, and
-its ``final_metrics.json`` reproduced, byte-identical, the minimum of a
-five-run-blended CSV spanning the previous week.
+directory. A ``best`` block folded over the whole file would therefore report
+whichever historical run scored best — and a run shorter than its own log
+cadence, which writes zero rows, would reproduce a previous run's minimum
+byte-identically while having measured nothing.
 
-Two filters now bound the window, in
+Two filters bound the window, in
 :func:`spectramr.pipelines.train._summarise_best_metrics_from_csv`:
 
 #. :func:`~spectramr.pipelines.train._select_current_run_rows` keeps the final
@@ -527,28 +469,28 @@ Two filters now bound the window, in
 
 A run that logged nothing therefore reports ``best: {}`` rather than inheriting.
 
-No run logs nothing any more, and the header stops over-promising
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Every run writes rows, and the header promises only what it can fill
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The two sections above bound the *consequences* of an empty metrics CSV. The
-cause is now fixed at the writer.
+The section above bounds the *consequences* of an empty metrics CSV. The writer
+prevents the cause.
 
-**Every run yields at least two rows.** The row gate in
-:func:`spectramr.pipelines.training_loop._execute_training_loop` was
-``iteration % log_interval == 0`` alone. ``logging.intervals.log`` defaults to
-``100`` and arms set it as high as ``5000``, so any run shorter than the cadence
-satisfied it *zero* times: a header with no data rows, and — through the same
-gate — no ``train`` TensorBoard scalars either, while the run exited reporting
-success. The first and last iterations are now logged unconditionally.
+**Every run yields at least two rows.** A row gate of
+``iteration % log_interval == 0`` alone would be satisfied *zero* times by any
+run shorter than ``logging.intervals.log`` — a header with no data rows, and,
+through the same gate, no ``train`` TensorBoard scalars either, while the run
+exits reporting success. The first and last iterations are therefore logged
+unconditionally, in
+:func:`spectramr.pipelines.training_loop._execute_training_loop`.
 
 Two details matter for anyone changing that gate:
 
 * The first iteration is ``start_iteration + 1``, **not** ``1``. On a resumed run
   the opening data point is at the resume offset, which is exactly the case a
   bare modulo loses.
-* The gate is also the **only host transfer in the loop** (#707) — it exists so
-  ``get_last_metrics`` can hand back on-device tensors, honouring
-  non-negotiable 9. The widening is therefore bounded to two extra iterations per
+* The gate is also the **only host transfer in the loop** — it exists so
+  ``get_last_metrics`` can hand back on-device tensors rather than synchronising
+  every step. The widening is therefore bounded to two extra iterations per
   *run*; a coarser modulo would put a ``.item()`` back into the hot path.
 
 An arm whose whole budget is under its cadence still only gets a two-point curve,
@@ -557,44 +499,34 @@ warning rather than an info deliberately: ``LoggingService.setup`` clamps every
 logger *and handler* to ``logging.sinks.level``, which is ``warning`` on the arms
 this was found on, so an ``INFO`` would be discarded precisely where it is needed.
 
-**The training CSV no longer declares ``val_*`` columns.** The row written is
+**The training CSV declares no ``val_*`` columns.** The row written is
 ``{"iteration", "epoch", **losses_scalar}`` and ``losses_scalar`` derives from the
 training step's ``losses_history``; validation metrics are written to
-``logs/validation_metrics.csv`` on their own cadence. Measured across every
-populated training CSV under ``tests_experiments/`` — **70 files, 20,959 data
-rows, zero ``val_*`` cells populated**. Same defect class as #340: a header for a
-column no code path can fill.
-
-An always-empty column is worse than an absent one, because a reader cannot
+``logs/validation_metrics.csv`` on their own cadence. A header for a column no
+code path can fill is worse than an absent one, because a reader cannot
 distinguish *"validation did not run"* from *"this file never carries this
-column"*. Three downstream workarounds for that ambiguity already existed and
-each becomes a no-op:
+column"*. Three downstream consumers therefore key off the header actually
+present:
 
 * :func:`~spectramr.pipelines.train._summarise_best_metrics_from_csv` folds the
-  validation CSV as well (#481, below);
+  validation CSV as well (below);
 * :func:`~spectramr.pipelines.train._select_current_run_rows` plus
-  ``final_iteration`` empty the window instead of inheriting (#586, above);
+  ``final_iteration`` empty the window instead of inheriting (above);
 * ``_melt_metrics_csv`` in :mod:`spectramr.infrastructure.reporting.aggregator`
   drops all-empty columns so they cannot surface as phantom all-NaN series in the
   learning-curve figure.
 
-All three key off the header actually present, so dropping the columns is safe for
-every known consumer.
+So the set of columns is free to change without a consumer silently reading a
+phantom series.
 
-``best`` covers validation too, and ``run_summary`` finally receives it (#481)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``best`` covers validation too, and ``run_summary`` receives it
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Two independent gaps made a healthy run read as *"validation never ran"*.
+Validation and training are written to different files, so an aggregate that
+reads one of them reports *"validation never ran"* for a healthy run — and hides
+the case that matters most, a ``val_psnr`` far below its ``train_psnr``.
 
-**The aggregate read one file.** ``logs/training_metrics.csv`` declares ``val_*``
-columns and never populates them — validation writes to
-``logs/validation_metrics.csv`` instead — and the ``best`` block was folded from
-the training file alone. So ``final_metrics.best`` carried only ``train_*`` keys
-on runs where validation had produced ``val_psnr`` ≈ 6 dB against ``train_psnr``
-≈ 30 dB. Anyone triaging from the normal surfaces saw no validation rather than
-*validation is catastrophically worse than training*.
-
-:func:`~spectramr.pipelines.train._summarise_best_metrics_from_csv` now folds both
+:func:`~spectramr.pipelines.train._summarise_best_metrics_from_csv` folds both
 files, each windowed to the current run independently — they are written on
 different cadences (``logging.log_interval`` vs
 ``validation.schedule.interval_steps``), so a run can produce rows in one and none
@@ -603,34 +535,29 @@ in the other. The pairing goes through
 writer and the reader; two copies of a path rule is how they end up pointing at
 different files while both look correct.
 
-**The producer never returned it.** ``run_summary.json`` fills ``best_metrics``
-from ``result.get("best_metrics")``, but no return path of
-``_execute_training_loop`` ever set that key, so the field was ``null`` on every
-run ever written. The payload carrying the answer was assembled a few lines
-earlier, written to ``final_metrics.json``, and dropped. Every dict-returning path
-now carries it, pinned by a source-level test — a behavioural test can only cover
-the paths it happens to exercise, and the requirement is that *no* path omits it.
+``run_summary.json`` fills ``best_metrics`` from ``result["best_metrics"]``, and
+**every** dict-returning path of ``_execute_training_loop`` carries that key —
+pinned by a source-level test, because a behavioural test can only cover the
+paths it happens to exercise while the requirement is that *no* path omits it.
 
-Validation renders carry the training iteration (#585)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Validation renders carry the training iteration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The saved-image step label used to come from ``validation_step_count``, a
-counter bumped once per **cascade level**. A single validation event at
-iteration 3000 wrote::
+The ``step`` in a saved validation filename is the **training iteration**, the
+same number on every cascade level of one validation event::
 
-    validation_R2x_epoch000_step003000_...png    <- correct
-    validation_R8x_epoch000_step000001_...png    <- actually iteration 3000
-    validation_R32x_epoch000_step000002_...png   <- actually iteration 3000
+    validation_R2x_epoch000_step003000_...png
+    validation_R8x_epoch000_step003000_...png
+    validation_R32x_epoch000_step003000_...png
 
-Any consumer sorting by step then reads the later cascade levels as the
-**oldest** files on disk — the same failure class as the "latest image" bug.
-Worse, the counter never returns to zero, so after the first event all three
-levels were mislabelled. :meth:`~spectramr.infrastructure.training.strategies.
-diffusion.DiffusionTrainingStrategy._validation_image_step` now returns the
-training iteration unconditionally.
+A per-level counter would label the later levels with small numbers, so any
+consumer sorting by step would read them as the oldest files on disk.
+:meth:`~spectramr.infrastructure.training.strategies.
+diffusion.DiffusionTrainingStrategy._validation_image_step` returns the training
+iteration unconditionally.
 
-Debug snapshots state their scale (#587)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Debug snapshots state their scale
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The fallback ``model_output`` snapshot pairs the generator's raw output
 (network units) with ``target``/``input`` as they entered ``train_step`` —
@@ -675,7 +602,7 @@ dataset vocabulary, so :func:`~spectramr.infrastructure.logging.provenance.descr
 ``subjects_dataset``, a wrapper's ``dataset``), may expose
 ``provenance_counts() -> dict`` and its keys are merged in. A dataset that cannot
 answer in richer units simply gets the two universal keys -- nothing is invented,
-which matters because this block serves all 153 strategies and ``patients`` is
+which matters because this block serves every strategy while ``patients`` is
 M4Raw vocabulary.
 
 Two deliberate refusals:
@@ -691,7 +618,7 @@ Two deliberate refusals:
   ``iterations_per_epoch``, which walks ``dry_iter()``; that is affordable only
   because ``dry_iter`` returns metadata shells with a shared 1-voxel stub.
   ``provenance_counts`` likewise walks the in-memory index and opens no HDF5
-  file (non-negotiable 9).
+  file.
 
 Nested breakdowns stay in the JSON, and the banner filters them by *type* --
 ``_format_split_counts`` keeps only ``int`` values -- so a dataset may publish a
@@ -704,7 +631,7 @@ what makes its repetition budget legible::
 ``per_contrast`` counts *groups*, so it is uniform for a corpus with equal
 subject counts whatever the repetition budget -- it reads identically whether
 FLAIR ships 2 repetitions or 3. ``files_per_contrast`` is the key that states the
-difference (#1392). It matters beyond bookkeeping because the NEX target is an
+difference. It matters beyond bookkeeping because the NEX target is an
 average over a group's repetitions: a T1/T2 target averages 3 and a FLAIR target
 averages 2, so the input repetition's own noise survives into its own target at
 1/2 rather than 1/3, and leave-one-out (``data.nex_target_exclude_input``) is
@@ -720,7 +647,7 @@ both T2 and FLAIR is counted once, under T1. A record naming neither contrast
 key contributes nothing, so ``sum(files_per_contrast) < files`` is the signal
 that something was unattributable rather than a bucket holding a guess.
 
-The slice-level M4Raw route (``data.slice_level_records: true``, #1757) changes
+The slice-level M4Raw route (``data.slice_level_records: true``) changes
 the record unit, and the record states it. By default one record is one
 (patient, contrast) group, and one ``[256, 256, 1]`` patch served from it costs
 a full read of every repetition of the group: 18 slices per served slice, times
@@ -737,17 +664,15 @@ an error, as it does a patch depth other than 1. Under
 ``coils.processing_mode: rss`` the phase-reference coil is selected per record,
 which on this route is per slice.
 
-An empty loader now records ``batches: 0``. The old truthiness test
-(``len(loaders[split]) if loaders.get(split) else None``) wrote ``null`` for it,
-because a ``DataLoader`` defines ``__len__`` and an empty one is falsy --
-indistinguishable from a split that was never built. ``0`` is a finding; ``null``
-is a shrug.
+An empty loader records ``batches: 0``, not ``null``. A truthiness test would
+write ``null``, because a ``DataLoader`` defines ``__len__`` and an empty one is
+falsy -- indistinguishable from a split that was never built. ``0`` is a
+finding; ``null`` is a shrug.
 
 A count that could not be taken is named in ``incomplete`` rather than dropped,
-and the banner renders that marker so it cannot be misread as a zero. The data
-block and the banner are also no longer gated on a model having been built --
-only the parameter count is -- so the in-process ``env=`` entry point keeps its
-record instead of silently losing it.
+and the banner renders that marker so it cannot be misread as a zero. Only the
+parameter count is gated on a model having been built, so the in-process ``env=``
+entry point keeps its data record either way.
 
 These counts also make one *unread* knob visible.
 ``TorchIOQueueBuilder.build_val_queue`` has no production caller (the director
@@ -755,15 +680,16 @@ builds validation through ``DataLoaderBuilder``), so ``data.modes.val.sampler``
 and a resolved ``use_queue_for_validation: True`` are never read and the val
 loader hands out whole volumes rather than patches. The signature on the record
 is ``samples == groups`` for that split, where a patch-sampled split would show
-``samples == groups x samples_per_volume``. Tracked as #1210; wiring it would
-move every validation metric on every arm carrying the block, so it is a science
-decision rather than plumbing.
+``samples == groups x samples_per_volume``. Wiring it would move every
+validation metric on every arm carrying the block, so it is a science decision
+rather than plumbing.
+
 Parallel topology: nodes, ranks and which GPU each one got
 ==========================================================
 
-"Provenance says the training used 1 GPU, but I asked for 4 with DDP" was, until
-2026-08-18, a question the artifact could not answer either way. Three separate
-mechanisms conspired:
+"Provenance says the training used 1 GPU, but I asked for 4 with DDP" is a
+question the record has to be able to answer. Three mechanisms have to hold for
+it to:
 
 #. **The declaration never reached provenance.** ``parallel.num_devices`` and
    ``num_nodes`` were written to ``resolved_config.json`` and stopped there, so
@@ -785,8 +711,8 @@ What the record now carries
 ---------------------------
 
 Under ``parallel``, declared and applied sit side by side, so a divergence is
-the finding rather than a puzzle (the same declared-vs-applied discipline
-non-negotiable 14 imposes on debug snapshots):
+the finding rather than a puzzle — the same declared-vs-applied discipline the
+debug snapshots follow:
 
 ==============================  ===================================================
 Key                             Meaning
@@ -809,7 +735,7 @@ Key                             Meaning
 
 ``declared_*`` is ``None`` — not the schema default of ``1`` — when no
 ``parallel:`` block was authored, so "no block" and "``num_devices: 1``" stay
-distinguishable (non-negotiable 3b).
+distinguishable.
 
 Two new sibling blocks sit beside ``slurm``:
 
@@ -830,13 +756,13 @@ Why the per-rank inventory is a gather, and where it has to live
 ----------------------------------------------------------------
 
 :func:`~spectramr.infrastructure.logging.provenance.gpu_resources` shells out to
-``nvidia-smi`` on the **local** host. On a multi-node run that meant rank 0's
-record described one node and silently implied it was the whole job.
+``nvidia-smi`` on the **local** host. On a multi-node run that alone would make
+rank 0's record describe one node and silently imply that node is the whole job.
 :func:`~spectramr.infrastructure.logging.provenance.rank_device_inventory` gathers
 one small record per rank instead, which is the only way the artifact can show
 that two ranks landed on the *same* physical device — a failure that presents as
-a mysterious halving of throughput rather than as an error, and which is now
-warned about explicitly.
+a mysterious halving of throughput rather than as an error, and which is warned
+about explicitly.
 
 ``all_gather_object`` is a **collective**: every rank must reach it or the job
 hangs forever. That inverts this module's usual fail-open posture and makes the
@@ -858,8 +784,8 @@ call's *placement* load-bearing rather than stylistic:
 * The local record is built with a per-field ``try``, so a broken ``nvidia-smi``
   or an unset CUDA device degrades one string instead of stranding the job. If
   the gather itself fails, the reason lands in ``incomplete`` rather than being
-  omitted (pitfall #16): "no inventory" and "inventory says one node" must not
-  look the same.
+  omitted: "no inventory" and "inventory says one node" must not look the
+  same.
 
 A rank whose ``device_index`` could not be resolved is **excluded** from
 collision detection rather than grouped. ``device_index`` is ``None`` on every
@@ -893,18 +819,18 @@ data would be worse than no per-rank file at all.
 ``world_size`` prefers the live group
 -------------------------------------
 
-:func:`~spectramr.infrastructure.logging.provenance.effective_batch_size` used to
-read the world size from the environment only. Just ``torchrun`` exports
-``WORLD_SIZE``: a ``torch.multiprocessing.spawn`` worker — which
-``launcher.launch_distributed`` uses for *every* single-node multi-GPU run —
-receives its world size as an ``init_process_group`` **argument** and the
-environment is never set. So the record reported ``world_size: 1``, and an
-``effective`` batch N times too small, for every spawned run. Under torchrun
-inside a 1-task Slurm allocation ``SLURM_NTASKS`` is likewise 1 while the true
-world size is the GPU count.
+Reading the world size from the environment alone is not enough. Only
+``torchrun`` exports ``WORLD_SIZE``: a ``torch.multiprocessing.spawn`` worker —
+which ``launcher.launch_distributed`` uses for *every* single-node multi-GPU
+run — receives its world size as an ``init_process_group`` **argument**, and the
+environment is never set, so the record would read ``world_size: 1`` and an
+``effective`` batch N times too small. Under torchrun inside a 1-task Slurm
+allocation ``SLURM_NTASKS`` is likewise 1 while the true world size is the GPU
+count.
 
-The live process group now wins, and ``world_size_source`` names which of the
-two answered — otherwise a genuine single-process run cannot be told from one
+:func:`~spectramr.infrastructure.logging.provenance.effective_batch_size`
+therefore prefers the live process group, and ``world_size_source`` names which
+of the two answered — otherwise a genuine single-process run cannot be told from one
 whose group had not been initialised when the banner rendered.
 
 The banner says it inline
@@ -923,72 +849,40 @@ The ``ranks`` line is collapsed per host: a 32-rank job would otherwise push 32
 lines into a banner whose whole value is being scannable, and the fact a reader
 needs is *did every rank get its own GPU, on the host I expected*.
 
-Both detectors were miscalibrated (#1276)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+What the two banner warnings mean
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-They were wrong in opposite directions, and each in a way that made it useless
-on the shape it existed for.
+**"declared num_devices=N but M rank(s) on this node".** ``num_devices`` is
+authored beside ``num_nodes`` and is **per-node**, so it is compared against the
+ranks on *this* node, never against the global ``dist.get_world_size()`` — a
+correct 2 × 4 run uses all eight devices and must not be warned about. A shape
+that cannot be resolved, multi-node with no per-node count, is left alone rather
+than divided: dividing would guess that the ranks were spread evenly, and a
+banner warning that is wrong once is distrusted forever. The "extra devices are
+NOT being used" clause is direction-gated, since a declaration *smaller* than
+the rank count is a stale declaration, not idle hardware.
 
-**The declaration is per-node; the world size is global.** ``num_devices`` is
-authored beside ``num_nodes``, and ``pipelines/distributed.py`` overwrites it
-from ``LOCAL_WORLD_SIZE`` — per-node on both origins. Comparing it against
-``dist.get_world_size()`` told a correct 2 × 4 run
-``declared num_devices=4 but world=8: the extra devices are NOT being used``
-while it was using all eight. The comparison is now against the ranks on **this
-node**, which also keeps the detector's one genuinely useful case alive: a plain
-``spectramr train`` that declares 4 devices and runs one process, where nothing
-overwrote the authored value.
+**"ddp declared on a single process" / "on an initialised 1-rank group".** These
+are named apart because they are different situations: no process group at all,
+versus a group that came up with one rank. Only the second silently wastes
+hardware — the first raises out of ``_require_process_group`` during ``adopt``
+anyway. The banner says it because that raise lands at Stage B, after the model
+and the data are built, while the banner renders before anything is. A
+deliberate single-rank DeepSpeed run — ZeRO-3 or CPU offload on one GPU is a
+real memory strategy — gets a line it does not need; that is banner noise rather
+than a false alarm, and the cheaper error.
 
-A shape that cannot be resolved — multi-node with no per-node count — is left
-alone rather than divided, because dividing would be a guess about whether the
-ranks were spread evenly. That is the same ambiguity-passes discipline as the
-``idle_device_refusal`` predicate: a banner warning that is wrong once is
-distrusted forever. The "extra devices are NOT being used" clause is also
-direction-gated now, since a declaration *smaller* than the rank count is a
-stale declaration, not idle hardware.
+Multi-node launches use ``train-distributed``
+---------------------------------------------
 
-**The single-rank tripwire fired only where the run already dies.** It was
-gated on ``not par.get("initialized")``, and a declared strategy with no process
-group is exactly what ``_require_process_group`` refuses inside ``adopt``. So it
-could not fire on the state that silently wastes hardware — an *initialised*
-one-rank group — which is what the incident ran; its log printed ``group=nccl``,
-a clause the banner appends only when the group is up.
-
-The conjunct is gone, and the two states are now named apart (``on a single
-process`` / ``on an initialised 1-rank group``). This is still worth saying in
-the banner rather than leaving to ``adopt``: the raise lands at Stage B, after
-the model and the data are built, while the banner renders before anything is.
-A deliberate single-rank DeepSpeed run — ZeRO-3 or CPU offload on one GPU is a
-real memory strategy — now gets a line it does not need. That is banner noise
-rather than a false alarm, and it is the cheaper error than a detector that
-cannot fire at all.
-
-.. note::
-
-   For the ``experiment_11_attention_none`` run that prompted this work,
-   ``world_size: 1`` was **correct**: ``SLURM_NTASKS=1``, ``SLURM_GPUS=1``, one
-   V100, and the process group *was* initialised. The committed sibling
-   launchers derive ``--nproc_per_node`` from ``SLURM_GPUS_ON_NODE``, so a
-   ``--gpus=1`` allocation yields exactly that. The defect was never a wrong
-   number — it was that provenance could not make any of this legible.
-
-The launch line named the wrong subcommand
-------------------------------------------
-
-``infrastructure/distributed/launcher.py`` emitted ``-m spectramr.cli train`` for
-its multi-node torchrun command. That is the one spelling that cannot work:
-``train`` never calls ``setup_distributed``, so no process group exists, and
-every group-requiring strategy then raises out of ``_require_process_group``
-during ``adopt`` — at Stage B, after the model and data are already built. A
-user who copied the line got a crash that read like a DDP or DeepSpeed problem
-rather than a launcher typo. It now emits ``train-distributed``, which
-``cli/app.py`` registers and whose own help string already documented this exact
-invocation; the paired test pins the emitted subcommand against the real parser
-so the two cannot drift apart again.
-
-The pre-existing test asserted ``"torchrun" in cmd``, ``--nproc_per_node`` and
-``--nnodes`` — which is precisely why the defect survived. Every flag was right
-and the thing being launched was not.
+``infrastructure/distributed/launcher.py`` emits ``-m spectramr.cli
+train-distributed`` for its multi-node torchrun command, and a paired test pins
+that subcommand against the real parser. ``train`` is the one spelling that
+cannot work here: it never calls ``setup_distributed``, so no process group
+exists and every group-requiring strategy raises out of
+``_require_process_group`` during ``adopt`` — at Stage B, after the model and
+data are already built, which reads like a DDP or DeepSpeed problem rather than
+a wrong verb. If you write your own launch line, use ``train-distributed``.
 
 .. _validation-cadence:
 
@@ -1019,28 +913,12 @@ step-interval event an arm selects its checkpoint from. That is the safe
 direction — the opposite reading could silently delete the only event feeding
 ``checkpoint_best.pt``.
 
-.. rubric:: Why it never fired (#711)
+.. rubric:: ``on_epoch`` defaults to ``false``
 
-The epoch trigger was gated on ``eval_interval <= 0``. ``eval_interval`` is
-``interval_steps``, which the schema declares ``ge=1``, or ``max_iterations`` —
-so the condition was unsatisfiable on **every config the schema admits**. The
-knob nonetheless defaulted to ``true``, so all 1048 arms declaring it read as
-having epoch-based validation enabled while none of them ever performed one.
-``interval_epochs`` — documented as "only consulted in epoch-based mode" — was
-read by nothing at all: the N of a mode that could not be entered.
-
-.. rubric:: Why the default flipped to ``false``
-
-Because that is what every run has always *done*. Leaving the default ``true``
-while making the trigger live would have switched epoch-boundary validation on
-across the whole corpus as a side effect of a bug fix — extra validation passes,
-extra wall-clock, and a changed metric cadence, on arms that never asked.
-
-The flip is behaviour-preserving, and that was **measured, not assumed**: zero
-arms declare ``validation.schedule.on_epoch: true``, and all 1395 declarations
-of the legacy ``validation.eval_on_epoch`` (905 files, folded to the same path)
-are ``false``. A test pins that measurement, so if an arm ever does request
-epoch mode the corpus impact is re-measured before the default can be trusted.
+Epoch-boundary validation is opt-in. Turning it on adds validation passes and
+wall-clock and changes the metric cadence, so an arm that wants it declares
+``validation.schedule.on_epoch: true`` and sets ``interval_epochs``; that field
+is consulted only in epoch mode.
 
 .. _run-summary-checkpoints:
 
@@ -1060,12 +938,11 @@ epoch mode the corpus impact is re-measured before the default can be trusted.
 not travel with a retrieved artifact bundle, and the bundle's ``checkpoints/``
 directory arrives **empty** — which reads as "no checkpoint was saved".
 
-That is not hypothetical: ``exp_vf_01`` retrieved an empty directory while its
-own log named two files it had written (#503). Both were true. The arm's
-``checkpoint.checkpoint_dir`` pointed outside the collected run directory, so
-the weights existed on the cluster and the bundle never contained them. No
-weights were recoverable from any completed run of that arm, and
-``early_stopping.restore_best_weights`` could not function across a resume.
+An arm whose ``checkpoint.checkpoint_dir`` points outside the collected run
+directory produces exactly that: the log names files it wrote, the weights exist
+on the cluster, and the retrieved bundle contains none of them. Both statements
+are true at once. No weights are then recoverable from a completed run, and
+``early_stopping.restore_best_weights`` cannot function across a resume.
 
 "Written elsewhere" and "never written" need opposite responses — fix the sync
 versus fix the run — so the footer now records enough to tell them apart, and

@@ -1,38 +1,30 @@
 .. _metrics_reference:
 
-========================================
+=========================================
 Metrics Registry — Mathematical Reference
-========================================
+=========================================
 
 .. sectionauthor:: spectraMR Research
 
 Metrics are registered with the ``@register_metric`` decorator and resolved
-through the ``MetricsRegistry`` singleton. The
+through the ``MetricsRegistry`` singleton. Most take a 2-D image pair. Three do
+not, and return NaN on *every* 2-D evaluation: ``through_plane_fwhm`` needs a
+3-D volume, ``persistence_diameter`` consumes an MRF trajectory, and
+``topological_mask_certificate`` consumes a sparse k-space mask. Give each of
+those its native input.
 
 .. note::
 
-   **This page is hand-written and not exhaustive.** It documents 115 of the
-   211 metrics the registry holds, so a name's absence here is **not** evidence
-   that it does not exist -- check the registry before concluding one is
-   unavailable. Counts are deliberately not restated in the prose above: a frozen
-   number in a hand-maintained page drifts silently, and this one had -- it read "100+".
+   **This page is hand-written and not exhaustive.** A name's absence here is
+   **not** evidence that it does not exist — ask the registry before concluding
+   a metric is unavailable:
 
    .. code-block:: python
 
       from spectramr.core.metrics.registry import MetricsRegistry
 
       MetricsRegistry.list_available()
-      len(MetricsRegistry.list_available())
 
-   Tracked as issue #1643 -- these pages should be generated from the
-   registries, the way ``docs/config_key_reference.rst`` already is.
-sim2rank sweep selects **121** of them (see
-:ref:`sim2rank-zero-metric-review`). On 2026-05-25 three registry metrics
-whose input contract is not a 2-D image pair were dropped from the sweep
-because they returned NaN on *every* 2-D evaluation: ``through_plane_fwhm``
-(needs a 3-D volume), ``persistence_diameter`` (consumes an MRF trajectory),
-and ``topological_mask_certificate`` (consumes a sparse k-space mask). All
-three remain registered for their native input contracts.
 All metrics implement ``__call__(prediction, target, **kwargs) → float``,
 plus ``name`` and ``higher_is_better`` properties.
 
@@ -41,7 +33,7 @@ plus ``name`` and ``higher_is_better`` properties.
    :local:
 
 Derived validation keys: the zero-filled baseline
-================================================
+=================================================
 
 Not every ``val_*`` key names a registered metric. The diffusion validation
 path emits three families per rung:
@@ -76,30 +68,20 @@ Arms that record no measurement -- every non-cold-diffusion arm -- emit none of
 these keys, on every batch and every rank. Absence is uniform by construction,
 because the distributed all-reduce packs ``sorted(keys)`` positionally.
 
-Strict-duplicate registration (post-2026-05-09 audit)
-=====================================================
+Strict-duplicate registration
+=============================
 
-Per CLAUDE.md rule #9 (silent fallbacks forbidden), ``MetricsRegistry``
-refuses to silently overwrite a registration:
+Because silent fallbacks are forbidden, ``MetricsRegistry`` refuses to
+silently overwrite a registration:
 
 * Re-registering the **same** class under the **same** name is idempotent.
 * Registering a **different** class under the **same** canonical name
   raises :py:class:`ValueError` immediately at import time.
 * Re-binding an alias to a **different** canonical name also raises.
 
-The pre-fix behaviour was a "warn-then-overwrite" branch that depended
-on import order: e.g. ``hfen`` was sometimes resolved to
-``evaluation_metrics.HFEN`` (5D-aware L2) and sometimes to
-``hfen.HFENMetric`` (4D L1) within the same training run. The strict
-guard makes that class of bug impossible.
-
-Two registered metrics regained visibility at the same audit pass:
-``feature_fidelity_index`` and ``fabrication_rate`` — their host module
-``hallucination_metrics`` was missing from
-``src/spectramr/core/metrics/__init__.py`` so the decorators never fired.
-
-See ``TODO/audit/00_implementation_tracker.md`` and the regression tests
-under ``tests/unit/models/test_registry_strict_duplicates.py``.
+Without this, a name could resolve to two different classes within one
+training run depending on import order. The regression tests are under
+``tests/unit/models/test_registry_strict_duplicates.py``.
 
 .. _metric-direction-ssot:
 
@@ -108,11 +90,8 @@ Optimization direction (``higher_is_better``) — single source of truth
 
 Every registered metric must expose a boolean ``higher_is_better``. It is
 part of the :class:`IMetric` protocol and is consumed by the reporting
-layer (training-curve direction, results tables, ablation strips) and by
-the meta-evaluation ranker. A *missing* attribute used to default to
-``False`` in ``metric_adapter``, which silently ranked PSNR/SSIM as
-"lower is better" — exactly the kind of silent fallback CLAUDE.md rule #9
-forbids.
+layer: training-curve direction, results tables and ablation strips all read
+it to decide which way is better.
 
 A metric declares its direction in **exactly one** of two places:
 
@@ -124,17 +103,13 @@ A metric declares its direction in **exactly one** of two places:
   and is injected onto the class by the ``@register_metric`` decorator at
   registration time.
 
-The map lives in ``core/`` because ``core/`` may not import ``scripts/``,
-where the sim2rank ``METRIC_SPECS`` list independently annotates direction.
-``METRIC_SPECS`` is a downstream consumer;
-``tests/unit/core/metrics/test_metric_directions.py`` asserts the two never
-disagree, so the core map remains authoritative.
+The map lives in ``core/`` because ``core/`` may not import from the layers
+above it. Downstream consumers that annotate direction independently are checked
+against this map rather than the other way round, so the core map is
+authoritative.
 
-The registry gate tests
-(``tests/contracts/test_metric_registry.py`` and
-``tests/unit/core/metrics/test_metric_registry_health.py``) fail loudly if a
-registered metric ends up with neither a self-declared nor a mapped
-direction.
+Registration fails loudly if a registered metric ends up with neither a
+self-declared nor a mapped direction.
 
 .. note::
 
@@ -150,11 +125,10 @@ Perceptual-metric input finiteness guard
 Perceptual metrics (:class:`~spectramr.core.metrics.evaluation_metrics.LPIPS`,
 :class:`~spectramr.core.metrics.evaluation_metrics.FID`) range-normalise their
 inputs and expand them to three channels before a frozen VGG / Inception
-backbone. The historical normalisers used a silent ``torch.clamp``, which
-leaves ``NaN`` / ``Inf`` **unchanged** — so a model that diverged and emitted
-non-finite predictions had its ``NaN`` forwarded into torchmetrics, where it
-surfaced as a misleading *"values in range [nan, nan] … expected [-1, 1]"*
-range error (the 2026-06-24 ``exp_hm_06`` / ``exp_hm_10`` Hyper-Mamba crash).
+backbone. A plain ``torch.clamp`` leaves ``NaN`` / ``Inf`` **unchanged**, so a
+model that diverges and emits non-finite predictions would forward its ``NaN``
+into torchmetrics, where it surfaces as a misleading *"values in range
+[nan, nan] … expected [-1, 1]"* range error that blames the metric.
 
 The single source of truth for the *finiteness* half of the perceptual-metric
 input contract is
@@ -170,15 +144,15 @@ than to the metric:
    ValueError: Metric 'lpips' received non-finite 'preds' (12 NaN, 0 Inf of
    65536 elements). The model produced unstable (NaN/Inf) output; fix model /
    training stability rather than the metric — silently normalising NaN would
-   hide the divergence (CLAUDE.md pitfall #9).
+   hide the divergence.
 
-This keeps a diverged run failing loudly at the right layer (pitfall #9, no
-silent fallbacks; pitfall #10, a non-finite metric must not pass). Regression
+This keeps a diverged run failing loudly at the right layer: a silent fallback
+is forbidden, and a non-finite metric must not pass. Regression
 tests: ``tests/unit/core/metrics/test_metric_input_prep.py``,
 ``test_lpips_finite_guard.py``, ``test_fid_finite_guard.py``.
 
-Perceptual-metric backend availability (2026-07-07)
-===================================================
+Perceptual-metric backend availability
+=======================================
 
 torchmetrics is genuinely optional (undeclared conflicts: it requires
 ``huggingface-hub<1.0``). When it cannot be imported, the torchmetrics-backed
@@ -202,20 +176,13 @@ Two refinements make that failure mode safe:
   ``test_config_health_checker.py`` (``TestMetricBackendAvailable``),
   ``test_computer.py`` (``test_repeated_metric_failure_warns_once``).
 
-The durable resolution on the cluster is an env re-sync:
-``pip install -e ".[dev]"``.
+The durable resolution is an environment re-sync: ``pip install -e ".[dev]"``.
 
 .. note::
 
-   This specific conflict is **resolved**. It was caused by ``torchmetrics``
-   failing to import under ``huggingface-hub>=1.0``, and the standing advice
-   here used to be to pin ``huggingface-hub<1.0``. Re-measured 2026-08-29:
-   ``torchmetrics 1.9.0`` imports cleanly against ``huggingface-hub 1.27.0``,
-   so that pin would now *downgrade* a working environment. The failure mode
-   the section describes — a dependency that is installed and
-   version-satisfied yet raises on import — is real and still worth
-   understanding; only the pin is obsolete. ``verify_dependencies.py
-   --import-check`` is what detects it.
+   A dependency can be installed and version-satisfied and still raise on
+   import, because a *transitive* dependency moved. Resolve it by re-syncing the
+   environment rather than by pinning against a version you have not measured.
 
 Usage
 =====
@@ -246,18 +213,11 @@ How a ``compute_*`` flag reaches a CSV column
 
 Two things have to agree for a flag to produce a number: something must *select*
 the metric for computation, and something must *declare a column* for it in
-``losses.csv``. Until 2026-08-04 those were two hand-written dictionaries —
-43 entries in ``MetricsMixin._extract_metrics_from_config`` and 78 in
-``pipelines.training_loop._CSV_METRIC_NAME_MAP`` — and the gap between them was
-not a policy. **22 flags sat in the header map alone while naming a metric that
-is registered and computable**, so enabling one produced a column header with
-nothing ever written under it (#340).
+``losses.csv``. If the two disagree, enabling a flag produces a column header
+with nothing ever written under it — which reads as "we measured it and it came
+back blank" rather than "we never selected it".
 
-That failure mode is worse than a missing column, and worth naming: an empty
-column *under a header* reads as "we measured it and it came back blank", not
-"we never selected it". It is pitfall #16 at the artifact layer.
-
-Both maps now derive from a single function:
+Both maps derive from a single function, so they cannot disagree:
 
 .. code-block:: python
 
@@ -279,24 +239,21 @@ selectors at all. Today that is ``compute_advanced_metrics``, a legacy master
 switch. The distinction is load-bearing rather than cosmetic: it **defaults
 True**, so if it were treated as an ordinary flag whose name happens to be
 unregistered, the mixin's dangling-flag warning would fire on every arm in the
-corpus — and warnings exit 2 under ``audit --strict`` (non-negotiable #4).
+corpus — and warnings exit 2 under ``audit --strict``.
 
 The other 16 dangling flags (``compute_blur``, ``compute_dvars``, ``compute_fd``,
 ``compute_gcor``, ``compute_pe_cross_corr``, ``compute_precision_recall``, …) all
-default False and are left **visible**: they name a metric that is simply not
-registered yet, which is the open half of #340. Silencing them would hide the
-work rather than do it.
+default False and are left **visible**: they name a metric that is not
+registered. Silencing them would hide the gap rather than close it.
 
 .. warning::
 
    Reachability is ``MetricsRegistry.is_registered``, which consults the
-   296-entry **alias** table. Counting against ``MetricsRegistry._metrics``
-   alone — as the census snippet in ``CLAUDE.md`` does — reports 4 more dangling
-   flags than really are: ``compute_fwhm``, ``compute_gsr``, ``compute_ndc`` and
+   **alias** table. Counting against the canonical metric dictionary alone
+   under-reports it: ``compute_fwhm``, ``compute_gsr``, ``compute_ndc`` and
    ``compute_volume_similarity`` each name an alias of a canonical metric and are
-   perfectly selectable. The census measures *canonical* coverage, which is what
-   the drain-to-``metrics.compute`` migration tracks; it is not a reachability
-   figure and should not be quoted as one.
+   perfectly selectable. ``MetricsRegistry.list_available()`` likewise returns
+   canonical names only — use ``is_registered`` to ask whether a name resolves.
 
 .. _metric-reachability:
 
@@ -307,13 +264,11 @@ Two independent things, and they fail separately:
 
 1. **The name survives validation.** ``MetricsMixin._extract_metrics_from_config``
    raises on any ``metrics.compute`` entry that is not
-   ``MetricsRegistry.is_registered`` (#173), so a typo fails at strategy
+   ``MetricsRegistry.is_registered``, so a typo fails at strategy
    construction rather than becoming a missing column.
 2. **The metric constructs.** ``ValidationMetricsComputer`` then calls
    ``MetricsRegistry.get(name, device=self.device)``. That is the *only* way a
    metric is built from config, and it supplies exactly one kwarg.
-
-Step 2 is where reachability was quietly broken for eight metrics.
 
 .. rubric:: The ``nn.Module`` signature trap
 
@@ -324,18 +279,10 @@ lies, kept that way for backward compatibility.
 
 ``MetricsRegistry.get`` filters kwargs to the constructor's signature so that a
 generic ``get(name, device=...)`` does not crash metrics whose ``__init__`` never
-declared ``device``. It read the advertised signature, saw ``**kwargs``, and
-forwarded everything — correct for a class that defines its own ``__init__``, and
-exactly wrong for one that inherits ``nn.Module``'s.
-
-The consequence was not a degraded score but a dead run: ``velocity_rmse``,
-``peak_velocity_error``, ``net_flow_error``, ``vnr``, ``cbf_rmse``, ``att_mae``,
-``negative_voxels`` and ``ndc_diffusion`` were registered, workflow-tagged and
-selectable, and **crashed in validation** for any arm that asked for them. This
-is the mechanism behind #340's observation that a flow or perfusion arm "cannot
-be graded on its own physics".
-
-The filter now resolves which class in the MRO actually *owns* ``__init__``:
+declared ``device``. The advertised signature is not enough to filter on: a class
+that inherits ``nn.Module``'s ``__init__`` advertises ``**kwargs`` and accepts
+none. The filter therefore resolves which class in the MRO actually *owns*
+``__init__``:
 
 .. code-block:: python
 
@@ -367,186 +314,25 @@ to every constructor that genuinely declares it.
        is installed; absence is environmental, not a registry defect.
 
 ``tests/unit/config/test_metrics_schema_coverage.py::TestEveryRegisteredMetricIsReachable``
-gates both halves and is green, so it can finally ratchet — the next metric added
-with a broken constructor turns it red. Its predecessor,
-``test_no_new_registry_orphans``, asserted that every metric needs a ``compute_*``
-flag; that property is **backwards** under the drain-to-``metrics.compute``
-migration, and it was red on clean ``dev``, so it could never have signalled
-anything (#343).
+gates both halves, so the next metric added with a broken constructor turns it
+red.
 
 ---
 
-.. _sim2rank-zero-metric-review:
+Additional registered metric families
+=====================================
 
-Sim2Rank zero-metric review (2026-05-24)
-========================================
+The families below are registered like every other metric and are selectable
+through ``metrics.compute``.
 
-In the ``sim2rank_20260524_132408`` per-axis table
-(``metric_evaluations_per_axis.csv``) **15 metrics scored identically zero on
-every degradation axis**. The per-axis value is a metric's *discriminative
-power* — how monotonically it responds to increasing degradation — so a metric
-that is zero everywhere contributes nothing to the ranking. Diagnosis grouped
-the 15 into three families, each defined by a *physical dimension that a single
-real magnitude image cannot carry*:
+Full-reference and gradient-based IQA
+-------------------------------------
 
-.. list-table:: Zero-metric families and root causes
-   :header-rows: 1
-   :widths: 18 30 52
-
-   * - Family
-     - Metrics
-     - Root cause
-   * - Distributional
-     - ``fid``, ``kid``, ``inception_score``, ``mmd_metric``,
-       ``sliced_wasserstein``, ``wasserstein_1d``,
-       ``kernelised_stein_discrepancy``
-     - Need a *population* of samples, not one (degraded, clean) pair. The
-       per-axis loop only ran the per-image sweep, so these ``SUMMARY`` metrics
-       were never fed a population and defaulted to ``0``. A second, latent bug:
-       the engine called every distributional metric with the torchmetrics
-       ``update()/compute()`` accumulator pattern, but the direct comparators
-       (sliced-Wasserstein, W1, MMD, KSD) return their distance from
-       ``__call__(preds, target)`` and yielded ``None`` → NaN → 0.
-   * - Phase
-     - ``ipen``, ``phase_mse``
-     - A magnitude image has no phase. The engine promoted them to
-       ``complex(real, 0)``, so ``angle()`` was a flat zero field and the metric
-       was identically zero — even though both metrics already carry a Fourier
-       fallback for real input.
-   * - k-space / physics
-     - ``g_factor``, ``asymptotic_gfactor``, ``through_plane_fwhm``
-     - ``g_factor`` returns a constant ``1.0`` when called without sensitivity
-       maps (and its computation ignored the acceleration); ``asymptotic_gfactor``
-       returned an init-time constant. ``through_plane_fwhm`` needs a 3-D volume.
-
-The unifying insight: each zero-metric needs a dimension the magnitude sweep
-discarded (phase, the coil/k-space axis, or the population axis). The
-**Fourier bridge** is the inverse operation that re-lifts magnitude back into
-the domain each metric requires.
-
-The Fourier bridge
-------------------
-
-``scripts/sim2rank/fourier_bridge.py`` (:class:`FourierBridge`) reuses the
-canonical physics primitives (``fft2c``/``ifft2c``, ``create_synthetic_csm``,
-``sense_forward``, :class:`MaskGenerator`) — never a raw ``torch.fft`` — to
-synthesize the discarded dimensions. For M4Raw the real phase and coil maps are
-preferred (see :ref:`sim2rank-native-data-eval`); the bridge is the fallback for
-magnitude-only inputs:
-
-* ``to_complex_image(mag)`` attaches a smooth, deterministic background phase
-  :math:`\varphi` (a stand-in for B0 / receiver phase), forming
-  :math:`x = |x|\,e^{i\varphi}` without changing the magnitude.
-* ``image_phase_reference(mag)`` returns the centred k-space
-  :math:`\mathcal{F}(|x|\,e^{i\varphi})`. The forward FFT couples *magnitude
-  structure* into k-space phase, so two different magnitude images have
-  measurably different k-space phases — the property that restores signal to
-  ``ipen`` / ``phase_mse``.
-* ``to_multicoil_kspace(mag, num_coils, accel)`` synthesizes birdcage
-  sensitivity maps and a severity-tied undersampling mask, producing the SENSE
-  forward :math:`y = M F S x` for the parallel-imaging metrics.
-
-Population-based distributional evaluation
-------------------------------------------
-
-Distributional metrics now receive a *different evaluation strategy*: at each
-severity :math:`\theta` on each axis we degrade a **population** of reference
-images and compare its distribution to the clean population via
-``Sim2RankEngine.evaluate_distributional`` (wired per axis by
-``evaluate_axis_distributional``). The engine dispatches by interface —
-``summarize=True`` metrics (FID, KID, IS) use the accumulator pattern;
-``summarize``-falsy metrics (sliced-Wasserstein, W1, MMD, KSD) are called
-directly as two-population comparators. As :math:`\theta` grows the
-distributions diverge and the distance rises.
-
-Severity-tied g-factor
------------------------
-
-The g-factor is an *encoding-property* metric — it measures parallel-imaging
-noise amplification from the sampling + coil geometry, independent of the image.
-It is therefore only meaningful on undersampling axes, where the engine maps
-severity to an acceleration :math:`R \in [1, R_{\max}]`, synthesizes coil maps,
-and evaluates a textbook SENSE g-factor
-
-.. math::
-
-   g_k = \sqrt{[(E^H E)^{-1}]_{kk}\,[E^H E]_{kk}},
-   \qquad E \in \mathbb{C}^{n_c \times R},
-
-which rises as :math:`R \to n_c`. ``asymptotic_gfactor`` uses the
-Marchenko–Pastur worst-case bound :math:`1+\sqrt{c}` with :math:`c = R/n_c`. On
-non-undersampling axes both stay constant — which is physically correct.
-``through_plane_fwhm`` is intentionally left for volumetric (3-D) evaluation; it
-cannot be measured from a 2-D slice, and as of 2026-05-25 it is removed from the
-sim2rank ``METRIC_SPECS`` sweep (it raised on every 2-D call → NaN). It stays in
-the registry for true 3-D evaluation.
-
-.. note::
-
-   **No-reference registry ↔ sweep coherence (2026-07-24 NR audit).**
-   ``g_factor`` is registered ``requires_reference=False``: its ``__call__``
-   ignores ``target`` and measures the coil/sampling geometry alone, so the
-   registry flag now agrees with its ``NO_REFERENCE`` type in ``METRIC_SPECS``
-   (it previously fell to the implicit ``requires_reference=True`` default — a
-   two-SSOT drift, now guarded by
-   ``tests/unit/test_sim2rank_canonical_counts.py::test_no_reference_specs_agree_with_registry``).
-   Three further ``requires_reference=False`` metrics —
-   ``composed_spectral_norm_bound`` and ``max_layer_spectral_norm``
-   (``lipschitz_bound_metrics``) and ``srf_bound`` — are deliberately **not** in
-   the sweep: they score a *model / operator* property (spectral-norm and
-   super-resolution-factor bounds), not a degraded image, so ramping artifact
-   severity :math:`\theta` through them is undefined. They stay in the registry
-   for model-analysis use. Every one of the remaining registered no-reference
-   metrics (the ``nr_*`` / ``no_reference_*`` / ``physics_nr_metrics`` battery)
-   is both registered and swept.
-
-.. _sim2rank-native-data-eval:
-
-Native-data evaluation (M4Raw, 2026-05-25)
-------------------------------------------
-
-The Fourier bridge described above *synthesizes* phase and coil maps — but for
-M4Raw the pipeline already computes them in **real** form and then discards
-them. ``synthesize_pseudo_gt`` loads the native complex multi-coil k-space,
-averages repetitions, estimates **ESPIRiT** coil sensitivities, SENSE-combines
-to a complex (phase-bearing) image, and only then takes the magnitude. The real
-complex image and the real coil maps existed one step before the ``.abs()``.
-
-The engine now **prefers the real quantities when supplied**, falling back to
-the bridge only for magnitude-only inputs (synthetic phantoms, fastMRI
-magnitude):
-
-* **Phase metrics** (``ipen``, ``phase_mse``): the degradation sweep emits the
-  SENSE-combined complex degraded image per timestep
-  (``DegradationSweep.sweep_combined(..., return_complex=True)``), and the
-  reference complex GT comes from ``coil_combine_sense``. ``Sim2RankEngine``
-  feeds these complex tensors straight to the metric, which takes
-  :math:`\angle(\cdot)` of the *real image-domain phase* — degradation-sensitive
-  and physically meaningful, unlike the bridge's magnitude-independent synthetic
-  phase.
-* **Parallel-imaging metrics** (``g_factor``): the engine uses the real ESPIRiT
-  ``smaps`` instead of a synthetic birdcage array, and caps the severity-tied
-  acceleration at the real coil count :math:`n_c` (the SENSE g-factor is
-  degenerate, :math:`\equiv 1`, for :math:`R > n_c`; M4Raw has 4 coils).
-
-Threaded via ``evaluate_sweep(..., smaps=, complex_degraded=, complex_gt=)`` and
-``evaluate_timestep(..., smaps=, complex_deg=, complex_gt=)``. All real tensors
-are moved onto the engine device, so the path is correct on CUDA — which is now
-the **canonical backend** (``--device`` defaults to ``auto``: CUDA when
-available, else CPU), because the native path adds GPU-bound ESPIRiT SVD,
-complex k-space degradation, and Inception feature extraction. The
-central-slice limitation still stands: ``synthesize_pseudo_gt`` keeps only the
-central slice, so ``through_plane_fwhm`` and other 3-D metrics remain deferred
-until the volume is carried through.
-
-Newly added IQA metrics (2026-05-24)
-------------------------------------
-
-The 2026 MRI-IQA survey [ReassessFR2025]_ flags several widely used closed-form
-full-reference metrics this framework lacked. Five are added by wrapping the
-validated ``piq`` implementations (optional ``[iqa]`` extra; skipped gracefully
-when ``piq`` is absent, like the radiomic metrics): ``haarpsi`` (higher better),
-``mdsi`` (lower), ``vsi`` (higher), ``dss`` (higher), ``ms_gmsd`` (lower).
+Five closed-form full-reference metrics widely used in the MRI-IQA literature
+[ReassessFR2025]_ wrap the validated ``piq`` implementations (optional ``[iqa]``
+extra; skipped gracefully when ``piq`` is absent, like the radiomic metrics):
+``haarpsi`` (higher better), ``mdsi`` (lower), ``vsi`` (higher), ``dss``
+(higher), ``ms_gmsd`` (lower).
 
 The gradient-based no-reference family is grounded in the MRI motion-autofocus
 literature:
@@ -554,7 +340,7 @@ literature:
 * ``gradient_entropy`` — Shannon entropy of the gradient-magnitude histogram;
   the *Entropy Focus Criterion* validated for MRI motion correction
   [Atkinson1997]_.
-* ``normalized_gradient_squared`` (**new**) — the lower-cost autofocus
+* ``normalized_gradient_squared`` — the lower-cost autofocus
   counterpart [McGee2000]_, gradient energy normalized by image energy:
 
   .. math::
@@ -563,16 +349,14 @@ literature:
                          {\sum_i I^2 + \epsilon},
 
   intensity-scale invariant, higher for sharper images.
-* ``gradient_error`` — full-reference Sobel gradient-magnitude :math:`L_1`,
-  already present; pinned by regression tests.
+* ``gradient_error`` — full-reference Sobel gradient-magnitude :math:`L_1`.
 
-Extended no-reference artifact-detection sweep (2026-05-25)
------------------------------------------------------------
+No-reference artifact detection
+-------------------------------
 
-A broader blind-IQA pass added classical computer-vision and MRI artifact
-measures that flag a specific degradation **without a clean reference**,
-complementing the learned blind metrics (BRISQUE, NIQE). All collapse complex /
-multi-coil input to a single grayscale channel
+Classical computer-vision and MRI artifact measures flag a specific degradation
+**without a clean reference**, complementing the learned blind metrics (BRISQUE,
+NIQE). All collapse complex / multi-coil input to a single grayscale channel
 (``spectramr.core.metrics.no_reference_extended``):
 
 .. list-table:: No-reference artifact-detection metrics
@@ -610,39 +394,30 @@ multi-coil input to a single grayscale channel
      - Laplacian oscillation energy in a band beside strong edges; flags
        Fourier-truncation ringing.
 
-Four further full-reference / no-reference metrics from ``piq`` were wired:
+Four further full-reference / no-reference metrics come from ``piq``:
 ``iw_ssim`` (information-weighted SSIM, upsampled to :math:`\ge 161`),
 ``srsim`` (spectral-residual similarity), ``vif_p`` (pixel-domain VIF), and
 ``total_variation`` (no-reference; rises with noise).
 
-.. note::
+Fabrication and region-restricted metrics
+-----------------------------------------
 
-   Metrics still considered for future addition (not yet wired): the learned
-   blind metrics CLIP-IQA, MUSIQ, PaQ-2-PiQ, MetaIQA and PieAPP — all require
-   pretrained-weight downloads (available via the ``pyiqa`` toolbox), which is
-   impractical on the offline cluster.
+Two further ``(prediction, target)`` quality metrics:
 
-VF-campaign reporting metrics
------------------------------------------------------------
-
-The Virtual-Fiducial campaign (`experiments/inprogress/vf/`) referenced metric
-names that the plan claimed were unregistered. Two are genuine
-``(prediction, target)`` quality metrics and were added to the registry:
-
-.. list-table:: VF-campaign quality metrics
+.. list-table:: Fabrication and region-restricted metrics
    :header-rows: 1
    :widths: 26 12 62
 
-   * - Metric (arm)
+   * - Metric
      - Direction
      - Definition / home
-   * - ``hallucination_rate`` (vf_08)
+   * - ``hallucination_rate``
      - lower = fewer fabrications
      - **Alias** of ``fabrication_rate`` (``hallucination_metrics``):
        :math:`|F_{\text{pred}} \setminus F_{\text{target}}| / |F_{\text{pred}}|`,
        the fraction of predicted structure absent from the target. Not a
        duplicate implementation — the same quantity under the arm's name.
-   * - ``banding_region_mse`` (vf_10)
+   * - ``banding_region_mse``
      - lower = better
      - Region-restricted MSE over a banding ROI supplied via the
        ``region_mask`` / ``banding_mask`` kwarg
@@ -651,42 +426,31 @@ names that the plan claimed were unregistered. Two are genuine
 
 .. note::
 
-   **Stale plan claims corrected.** ``g_factor`` was already registered
-   (``physics_nr_metrics``), so it was not re-added. ``param_count`` and
-   ``inference_latency_ms`` (referenced by Method B) are **model-level**
-   quantities, *not* ``(prediction, target)`` metrics — registering them in the
-   metric registry breaks the registry-wide finite-scalar contract
-   (``tests/contracts/test_metric_registry.py``). They are reported through the
-   profiling path instead — :class:`spectramr.core.metrics.performance.PerformanceMetrics`
-   already tracks ``parameters``, ``forward_time`` and ``throughput``. Method B's
-   listing them under ``metrics:`` is a benign warn-skip; moving those two names
-   to a reporting/profiling context is the recommended follow-up.
+   ``param_count`` and ``inference_latency_ms`` are **model-level** quantities,
+   not ``(prediction, target)`` metrics, so they are not in the metric registry —
+   registering them there would break the registry-wide finite-scalar contract.
+   They are reported through the profiling path instead:
+   :class:`spectramr.core.metrics.performance.PerformanceMetrics` tracks
+   ``parameters``, ``forward_time`` and ``throughput``. Listing either name under
+   ``metrics:`` is a warn-skip, not an error.
 
 ---
 
 Image Quality Metrics
 =====================
 
-.. note::
+The registered metrics group into four categories.
 
-   This section used to embed rendered per-metric maps computed on a real M4Raw
-   FLAIR slice at 4x Cartesian undersampling. Those images are **not published**:
-   ``docs/figures/`` has never been tracked -- a blanket ``*.png`` rule in
-   ``.gitignore`` covers the whole path -- so every directive resolved to nothing
-   and rendered as a broken image. The category headings below are kept, because
-   they enumerate what is actually registered. Regenerate the plots locally
-   against your own data if you want them.
-
-**Reference IQA Metrics** — PSNR, SSIM (2 degradations), GMSD, HFEN, FSIM, MS-SSIM per scale, VIF:
+**Reference IQA metrics** — PSNR, SSIM, GMSD, HFEN, FSIM, MS-SSIM, VIF.
 
 
-**Error Metrics** — MSE, MAE, RMSE, NMSE, NRMSE, Phase MSE, error distribution, relative error:
+**Error metrics** — MSE, MAE, RMSE, NMSE, NRMSE, phase MSE, relative error.
 
 
-**No-Reference, Artifact & Statistical Metrics** — SNR, CNR, EFC, FBER, Gradient Entropy, Ghosting, Spike Detection, Pearson/Cosine, Power Spectrum:
+**No-reference, artifact and statistical metrics** — SNR, CNR, EFC, FBER, gradient entropy, ghosting, spike detection, Pearson/cosine, power spectrum.
 
 
-**Segmentation & Quantitative Metrics** — Dice, IoU, Tofts Ktrans, CRLB, g-factor:
+**Segmentation and quantitative metrics** — Dice, IoU, Tofts Ktrans, CRLB, g-factor.
 
 
 Peak Signal-to-Noise Ratio (PSNR)
@@ -704,7 +468,7 @@ The most widely used image quality metric in MRI reconstruction:
 where :math:`L` is the dynamic range of the signal (typically 1.0 for
 normalized MRI).
 
-**Graded per sample, then averaged** (issue #1347). :math:`N` above ranges over
+**Graded per sample, then averaged.** :math:`N` above ranges over
 one image's voxels, never over a batch's:
 
 .. math::
@@ -723,7 +487,7 @@ no fixture caught it.
 
 :math:`L_b` carries the same rule wherever the range is a **per-image peak** —
 ``domain="kspace"`` and ``use_target_max`` both resolve it per sample, so the
-loudest spectrum in a batch no longer sets the reference for every other image.
+loudest spectrum in a batch does not set the reference for every other image.
 The default range is the one deliberate exception: it resolves a *contract*
 (``[0, 1]`` vs ``[-1, 1]``) from the sign of the data, and a per-sample sign
 test would read an all-positive sample of a ``[-1, 1]`` dataset as ``[0, 1]``
@@ -731,10 +495,9 @@ and halve its range. On mixed-sign data that contract can still differ between
 two batch compositions; declare ``metrics.data_range`` to pin it.
 
 The epoch value is weighted by each batch's **sample** count, not by batch
-count, so a short final batch under ``drop_last=False`` no longer weighs as much
-as a full one. Both conventions are stamped into ``provenance.json`` under
-``metric_aggregation`` — this change restates numbers the corpus has already
-recorded, and nothing else in the artifact would say so.
+count, so a short final batch under ``drop_last=False`` does not weigh as much as
+a full one. Both conventions are stamped into ``provenance.json`` under
+``metric_aggregation``.
 
 .. note::
 
@@ -922,9 +685,7 @@ averaged. It is the validation-side reading of the ``cubical_ph_w2`` loss:
 owns the diagram routine and the matching, and the metric calls it without a
 gradient, so the validation number of an arm that trains on the term is
 its own objective. It is ``0`` at ``pred == target`` and bounded by the L2 error
-(Cohen-Steiner, :math:`W_2 \le \|\hat{x} - x\|_2`). Added for the
-``geomamba_ulf`` cohort (2026-09-03), whose claim is topological but whose arms
-selected on ``val_psnr`` alone.
+(Cohen-Steiner, :math:`W_2 \le \|\hat{x} - x\|_2`).
 
 Needs the ``[topology]`` extra (``gudhi`` + ``POT``). Without it the
 constructor raises the loss's ``ImportError`` (it does not return ``0.0``),
@@ -987,7 +748,7 @@ The two are complementary — run both.
 
 **Caveats (state these when citing the numbers):**
 
-* **Slice-Dice, not volume-Dice.** With ``data.slice_2d: true`` the validation loop
+* **Slice-Dice, not volume-Dice.** With ``data.sampling.enable_slice_2d: true`` the validation loop
   passes one axial slice at a time, so the reported figure is a mean of *per-slice*
   Dice; small slices carry the same weight as large ones. Evaluate a representative
   slice set — the val loader is **unshuffled**, so a small
@@ -1072,7 +833,7 @@ MRI-aware and never silently truncates channels.
 discarding channel 4 and beyond. ``FID`` and ``KID`` only handled
 ``C == 1``, so 4-channel inputs reached InceptionV3 with the wrong
 shape and produced meaningless features. Both are silent-fallback
-anti-patterns of the kind CLAUDE.md item #9 forbids.
+anti-patterns, which the framework forbids.
 
 **API:**
 
@@ -1247,9 +1008,8 @@ synchronisation). Both are passed the model via a ``model`` kwarg (or a
 return ``nan`` when those are absent.
 
 Because their input contract is not an image pair, they are annotated
-``MetricType.DOMAIN_SPECIFIC`` in ``scripts/sim2rank/metrics_list.py`` so they
-are excluded from both swept buckets (``PER_IMAGE_SPECS``, ``SUMMARY_SPECS``)
-and the registry-contract harness (:doc:`audit_ladder_user_guide`) skips the
+``MetricType.DOMAIN_SPECIFIC``, and the registry-contract harness
+(:doc:`audit_ladder_user_guide`) skips the
 synthetic ``(pred, target)`` forward call. They are consumed by the reporting /
 profiling pipeline, not the per-image validation loop, and back the
 ``metadata.secondary_metrics`` references in the HyperMamba VF arm.
@@ -1280,9 +1040,8 @@ appears when the dynamics are faster than the kernel.
 Both read ``[B, T, H, W]`` real series with time on axis 1 and require
 **T ≥ 2**: a single frame has no temporal axis to measure. As with the
 model-profiling metrics above, their input contract is not an image pair, so
-they are annotated ``MetricType.DOMAIN_SPECIFIC`` in
-``scripts/sim2rank/metrics_list.py`` — excluded from ``PER_IMAGE_SPECS`` /
-``SUMMARY_SPECS``, and the registry-contract harness skips the synthetic
+they are annotated ``MetricType.DOMAIN_SPECIFIC`` and the registry-contract
+harness skips the synthetic
 ``(pred, target)`` forward call instead of hard-failing on the ``nan`` they
 correctly return for it.
 
@@ -1394,6 +1153,10 @@ WMH Dice Evaluator
 
 **Class:** :class:`~spectramr.core.metrics.wmh_dice_evaluator.WMHDiceEvaluator` —
 **File:** ``src/spectramr/core/metrics/wmh_dice_evaluator.py``
+
+This evaluator is **not in the metric registry** — it needs a segmenter backend,
+which ``metrics.compute`` has no way to supply. Construct it directly, as below;
+naming it under ``metrics.compute`` fails validation.
 
 A downstream clinical evaluator that measures White-Matter-Hyperintensity (WMH)
 overlap between reconstructed FLAIR volumes and ground-truth WMH annotations.
@@ -1960,10 +1723,6 @@ Full Registry Table
      - ``WashSlope``
      - ↑
      - Quantitative MRI
-   * - ``wmh_dice``
-     - ``WMHDiceEvaluator``
-     - ↑
-     - Segmentation (Clinical)
    * - ``zipper_detection``
      - ``ZipperDetection``
      - ↓
@@ -2136,9 +1895,9 @@ where :math:`\sigma_{noise}` is estimated from a signal-free spectral region.
 
 ---
 
-===========================================================
+============================================================
 Fréchet Radiomic Distance (FRD) & Radiomic Feature Stability
-===========================================================
+============================================================
 
 **File:** ``src/spectramr/core/metrics/radiomic.py`` | **Dependency:** ``pip install pyradiomics``
 
@@ -2255,7 +2014,7 @@ Field-domain metrics and the parametrization guard
 
 Field-valued claims (a B0 off-resonance map in Hz, a spiral trajectory deviation
 in cycles/FOV) are graded against an *independently known* reference. The danger
-is the **inert-mechanism facade** (pitfall #16): a model that advertises a field
+is the **inert-mechanism facade**: a model that advertises a field
 output but actually emits an *image* (e.g. a corrected bSSFP frame) smoke-PASSes
 while the field claim is measured by nothing. The guard makes this un-gradeable
 rather than silently-wrong.
@@ -2300,10 +2059,8 @@ RMS error (cycles/FOV) between an estimated trajectory deviation ``Δk̂`` and t
 better). It reuses the same guard with ``kind="trajectory"``,
 ``units="cycles_per_fov"``: a Cartesian per-readout-line ``Δk [B, 2, H]`` graded
 against a spiral ``Δk(t) [n_samp, 2]`` is a shape mismatch and is skipped — the
-diff_trajectory_opt facade the metric exists to block. The headline metric for
-the spiral-trajectory-recovery arm ``exp_vf_35`` (problem formulation in
-``docs/superpowers/specs/2026-06-08-spiral-trajectory-recovery-vf35.md``); its
-static twin is the model's declared ``trajectory_parametrization`` capability.
+diff_trajectory_opt facade the metric exists to block. Its static twin is the
+model's declared ``trajectory_parametrization`` capability.
 
 The two-lock units invariant
 ----------------------------
@@ -2319,9 +2076,8 @@ facade:
 * **Runtime** — ``field_comparability`` above, on the realised tensor.
 
 The model recovers ΔB0 from the banding via a frozen elliptical-signal-model
-phase-cycle DFT prior plus a learned residual; see the problem formulation in
-``docs/superpowers/specs/2026-06-08-bssfp-banding-b0-vf29.md`` and the synthesis
-in ``spectramr.infrastructure.physics.multi_acquisition`` (``bssfp_banding`` /
+phase-cycle DFT prior plus a learned residual; the synthesis lives in
+``spectramr.infrastructure.physics.multi_acquisition`` (``bssfp_banding`` /
 ``invert_bssfp_banding``).
 
 The trajectory metric is locked the same way:
@@ -2338,8 +2094,7 @@ The ``trajectory_recon`` paradigm (``TrajectoryReconstructionStrategy`` +
 ``spiral_trajectory_estimator``) supervises ``Δk̂ = G_θ(k_nominal)`` against the
 measured deviation; only the GIRF path is differentiable (the NUFFT does not
 backprop to the trajectory), so ``gradient_entropy`` is a no-grad sharpness
-diagnostic, never a θ-objective. See
-``docs/superpowers/specs/2026-06-08-spiral-trajectory-recovery-vf35.md``.
+diagnostic, never a θ-objective.
 
 
 References
@@ -2378,7 +2133,7 @@ References
     Undersampled k-Space Data by Dictionary Learning." IEEE TMI, 2011.
     (HFEN metric definition)
 
-.. rubric:: Sim2Rank zero-metric review (2026-05-24)
+.. rubric:: Full-reference and gradient-based IQA
 
 .. [Atkinson1997] Atkinson, D., Hill, D.L.G., Stoyle, P.N.R., Summers, P.E.,
    Keevil, S.F. "Automatic Correction of Motion Artifacts in Magnetic
@@ -2398,7 +2153,7 @@ References
    "A Haar Wavelet-Based Perceptual Similarity Index for Image Quality
    Assessment." Signal Processing: Image Communication 61, 2018. (HaarPSI)
 
-.. rubric:: Extended no-reference artifact-detection sweep (2026-05-25)
+.. rubric:: No-reference artifact detection
 
 .. [Brenner1971] Brenner, J.F., et al. "An Automated Microscope for Cytologic
    Research." J. Histochem. Cytochem. 19(11), 1971. (Brenner focus measure)

@@ -41,6 +41,19 @@ _ONE_SAMPLE_PER_RECORD_DATASETS = frozenset({"mrixfields", "nifti_paired", "cont
 # Under this many iterations per epoch, per-epoch worker respawn stops amortizing.
 _SHORT_EPOCH_ITERS = 50
 
+#: The ONE ``data.target_mode`` that complex-averages phase-incoherent M4Raw
+#: repetitions and so cancels signal. Named positively, because the alternative
+#: -- an allowlist of the acceptable modes -- is a second owner of the schema's
+#: ``target_mode`` vocabulary and drifts from it in silence: this module listed
+#: ``("phase_aligned_mean", "rep_pair")`` when ``r2r`` joined the Literal, and an
+#: r2r arm was consequently told it "declares data.target_mode: complex_mean
+#: explicitly", naming a value it does not declare. Every other member is
+#: coherent by construction -- ``phase_aligned_mean`` aligns before averaging,
+#: ``rep_pair`` takes one already-aligned partner repetition, and ``r2r`` never
+#: crosses repetitions at all -- so a mode added to the Literal is coherent
+#: unless it is this one.
+_INCOHERENT_NEX_TARGET_MODE = "complex_mean"
+
 #: Checks whose failure means the run CANNOT succeed, so the pipeline aborts
 #: before ``bootstrap.build_container`` instead of warning and continuing.
 #:
@@ -5926,6 +5939,11 @@ class ConfigHealthChecker:
         same posture ``check_workflow_declared`` takes for an absent
         ``workflow:`` block.
 
+        **The vocabulary has one owner: the schema.** This check names only
+        ``complex_mean`` (see ``_INCOHERENT_NEX_TARGET_MODE``) and treats every
+        other member of the Literal as coherent. It used to enumerate the good
+        modes instead, which silently went stale when ``r2r`` was added.
+
         **Absence is the finding, not the resolved value.** ``target_mode`` is a
         declared field with a default, so ``config.data.target_mode`` reads
         ``complex_mean`` whether the arm chose it or said nothing at all. Only
@@ -5946,10 +5964,11 @@ class ConfigHealthChecker:
 
         declared = "target_mode" in data.model_fields_set
         mode = data.target_mode
-        if declared and mode in ("phase_aligned_mean", "rep_pair"):
-            # ``rep_pair`` is phase-aligned by construction (the single other
-            # repetition is aligned to the input repetition), so it is coherent
-            # in the same sense; it just is not an average (cohort review 2026-09-02).
+        if declared and mode != _INCOHERENT_NEX_TARGET_MODE:
+            # Phrased as "anything but complex_mean" on purpose -- see
+            # ``_INCOHERENT_NEX_TARGET_MODE`` for why an allowlist here is a
+            # second owner of the schema Literal, and for the r2r arm it
+            # mislabelled while it was one.
             return HealthCheckResult(
                 passed=True,
                 check_name=check_name,
@@ -5960,7 +5979,14 @@ class ConfigHealthChecker:
             )
 
         detail = (
-            "declares data.target_mode: complex_mean explicitly"
+            # ``mode``, never a literal name -- printing a constant here is how
+            # an r2r arm came to be told it had declared complex_mean. With the
+            # guard above admitting every mode but ``complex_mean`` this branch
+            # can no longer be reached by anything else, so the f-string is
+            # insurance against that guard being narrowed again rather than a
+            # difference any test can observe today (measured: swapping it back
+            # for the constant turns nothing red).
+            f"declares data.target_mode: {mode} explicitly"
             if declared
             else ("does not declare data.target_mode, so it takes the schema default complex_mean")
         )

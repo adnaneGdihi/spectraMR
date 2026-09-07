@@ -177,13 +177,12 @@ def repo(tmp_path):
 def test_every_source_build_dist_reads_agrees_after_a_bump(repo):
     """The writer is checked by asking the comparator, not by re-listing paths."""
     assert mod.main(["minor", "--root", str(repo), "--apply"]) == 0
-    versions = {
+    others = {
         "init": build_dist.declared_version((repo / "src/spectramr/__init__.py").read_text()),
-        "changelog": build_dist.changelog_version((repo / "CHANGELOG.md").read_text()),
         "citation": build_dist.citation_version((repo / "CITATION.cff").read_text()),
-        "wheel": "0.2.0",
     }
-    assert build_dist.version_disagreements(versions) == []
+    changelog = (repo / "CHANGELOG.md").read_text()
+    assert build_dist.version_disagreements("0.2.0", others, changelog) == []
 
 
 def test_a_nightly_bump_leaves_the_changelog_alone(repo):
@@ -191,6 +190,33 @@ def test_a_nightly_bump_leaves_the_changelog_alone(repo):
     assert mod.main(["nightly", "--root", str(repo), "--apply"]) == 0
     assert (repo / "CHANGELOG.md").read_text() == before, "a dev build got a release heading"
     assert '__version__ = "0.1.1.dev1"' in (repo / "src/spectramr/__init__.py").read_text()
+
+
+def test_show_accepts_the_tree_a_nightly_bump_just_wrote(repo, capsys):
+    """`show` and `build_dist` must agree, because they are one comparator now.
+
+    They were two: `show` compared `set(values)` and could not express a dev
+    build, so it printed DISAGREEMENT on the exact tree `nightly` produces --
+    the state the whole 0.1.3 series has been in.
+    """
+    assert mod.main(["nightly", "--root", str(repo), "--apply"]) == 0
+    assert mod.main(["show", "--root", str(repo)]) == 0
+    assert "0.1.1.dev1" in capsys.readouterr().out
+
+
+def test_show_still_reports_a_genuinely_stale_citation(repo, capsys):
+    """Accepting the dev shape must not accept a source that really did drift."""
+    assert mod.main(["nightly", "--root", str(repo), "--apply"]) == 0
+    (repo / "CITATION.cff").write_text("cff-version: 1.2.0\nversion: 0.1.0\n")
+    assert mod.main(["show", "--root", str(repo)]) == 1
+    assert "DISAGREEMENT" in capsys.readouterr().err
+
+
+def test_show_reports_a_dev_tree_whose_unreleased_section_was_deleted(repo, capsys):
+    assert mod.main(["nightly", "--root", str(repo), "--apply"]) == 0
+    (repo / "CHANGELOG.md").write_text("# Changelog\n\n## [0.1.0] - 2026-08-31\n")
+    assert mod.main(["show", "--root", str(repo)]) == 1
+    assert "no '## [Unreleased]' section" in capsys.readouterr().err
 
 
 def test_a_dry_run_writes_nothing(repo):

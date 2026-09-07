@@ -35,6 +35,8 @@ def _config(**processing_overrides):
     return SimpleNamespace(
         data=SimpleNamespace(
             target_mode="phase_aligned_mean",
+            val_target_mode=None,
+            r2r_alpha=1.0,
             nex_target_exclude_input=False,
             nex_fallback="error",
             slice_level_records=False,
@@ -681,6 +683,31 @@ def test_declared_block_stamps_the_nex_fallback_policy() -> None:
     record = build_snapshot_provenance(_config())
     assert record["declared"]["nex_fallback"] == "error"
     assert record["declared"]["nex_target_exclude_input"] is False
+
+
+def test_declared_block_stamps_both_splits_targets_and_the_alpha() -> None:
+    """Under r2r the two splits are built DIFFERENTLY, and the snapshot must say so.
+
+    A snapshot naming only ``target_mode`` would describe the training half and
+    silently misdescribe what the reported PSNR was graded against -- the exact
+    divergence non-negotiable 14 exists to surface. ``r2r_alpha`` joins it
+    because two runs differing only in alpha are different constructions that no
+    other stamped field distinguishes.
+    """
+    config = _config()
+    config.data.target_mode = "r2r"
+    config.data.val_target_mode = "phase_aligned_mean"
+    config.data.r2r_alpha = 0.25
+
+    declared = build_snapshot_provenance(config)["declared"]
+
+    assert declared["target_mode"] == "r2r"
+    assert declared["val_target_mode"] == "phase_aligned_mean"
+    # Anti-tautology: `model_dump`-style stamping emits every declared field, so
+    # a presence assertion passes even if the stamp read `target_mode` twice.
+    # Only the INEQUALITY can see that.
+    assert declared["val_target_mode"] != declared["target_mode"]
+    assert declared["r2r_alpha"] == 0.25
 
 
 def test_declared_block_stamps_the_slice_level_index() -> None:

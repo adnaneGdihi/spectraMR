@@ -45,6 +45,8 @@ from pathlib import Path
 PACKAGE = "spectramr"
 _WHEEL_VERSION = re.compile(rf"^{PACKAGE}-(?P<v>[^-]+)-py3-none-any\.whl$")
 _TAG_REF = re.compile(r"^(?:refs/tags/)?v?(?P<v>\d+\.\d+[^\s]*)$")
+_DEV_VERSION = re.compile(r"^(?P<release>\d+\.\d+\.\d+)\.dev\d+$")
+_UNRELEASED_HEADING = re.compile(r"^##[ \t]*\[Unreleased\]", re.M | re.I)
 
 
 def wheel_payload_paths(wheel: Path) -> set[str]:
@@ -86,6 +88,39 @@ def changelog_version(text: str) -> str | None:
     return None
 
 
+def changelog_disagreement(text: str, version: str) -> str | None:
+    """Why ``CHANGELOG.md`` fails to state ``version``, or ``None`` if it states it.
+
+    **A release and a dev build record themselves in different places**, so string
+    equality against the newest heading is the wrong test for one of the two.
+    ``bump_version.py nightly`` writes no heading at all -- a dev build is not a
+    release, and a heading per build makes the file's release history unreadable --
+    so a ``0.1.3.dev1`` tree correctly carries ``0.1.2`` as its newest heading, and
+    comparing the two strings rejects a tree that is right. That rejection is what
+    made ``nightly`` unbuildable while ``docs/versioning.rst`` advertised it as the
+    branch that "exists to be installed and tried".
+
+    What a dev build must instead show is the open ``[Unreleased]`` section it
+    accumulates into, and that its own release has not already been cut: a
+    ``0.1.3.dev1`` beside a dated ``[0.1.3]`` heading is a build of a version that
+    already shipped, which is the one dev-series mistake that costs a filename.
+    """
+    newest = changelog_version(text)
+    m = _DEV_VERSION.match(version)
+    if m is None:
+        if newest is None:
+            return f"no released heading -- {version!r} needs '## [{version}] - <date>'"
+        return None if newest == version else f"newest heading {newest!r} != {version!r}"
+    if _UNRELEASED_HEADING.search(text) is None:
+        return f"no '## [Unreleased]' section for the {version} series to accumulate into"
+    if newest == m.group("release"):
+        return (
+            f"{m.group('release')!r} already has a dated heading, so {version!r} builds a "
+            "version that has already been released -- 'bump_version.py nightly' opens the next"
+        )
+    return None
+
+
 def citation_version(text: str) -> str | None:
     """``version:`` from CITATION.cff, read without a YAML dependency."""
     m = re.search(r'^version:\s*["\']?([^"\'\s]+)', text, re.M)
@@ -105,17 +140,33 @@ def tag_version(ref: str) -> str | None:
     return m.group("v") if m else None
 
 
-def version_disagreements(versions: dict[str, str | None]) -> list[str]:
-    """Every source whose version differs from the wheel's, plus any unreadable one."""
-    reference = versions.get("wheel")
-    problems = [f"{k}: unreadable" for k, v in versions.items() if v is None]
+def version_disagreements(
+    reference: str | None, others: dict[str, str | None], changelog: str
+) -> list[str]:
+    """Every source in ``others`` that does not state ``reference``, unreadable included.
+
+    ``reference`` is whichever source the caller holds authoritative -- the wheel
+    filename during a build, ``src/spectramr/__init__.py`` when ``bump_version.py
+    show`` reports a working tree. ``changelog`` is the raw ``CHANGELOG.md`` text,
+    judged by :func:`changelog_disagreement` rather than by equality, because the
+    two version shapes state themselves there differently.
+
+    **One comparator, two callers** (non-negotiable 17). ``bump_version.py show``
+    used to reimplement this as ``len(set(values)) != 1``, which cannot express the
+    dev-build shape and so reported ``DISAGREEMENT`` on every correct dev tree.
+    A second comparator does not announce itself: both return a plausible verdict,
+    and the divergence surfaces as a wrong version on PyPI rather than as an error.
+    """
+    problems = [f"{k}: unreadable" for k, v in others.items() if v is None]
     if reference is None:
-        return problems or ["wheel: unreadable"]
+        return [*problems, "reference version: unreadable"]
     problems += [
-        f"{k}: {v!r} != wheel {reference!r}"
-        for k, v in versions.items()
-        if v is not None and k != "wheel" and v != reference
+        f"{k}: {v!r} != {reference!r}"
+        for k, v in others.items()
+        if v is not None and v != reference
     ]
+    if (why := changelog_disagreement(changelog, reference)) is not None:
+        problems.append(f"CHANGELOG.md: {why}")
     return problems
 
 
@@ -240,18 +291,24 @@ def main(argv: list[str] | None = None) -> int:
     failures += [f"build artefact in payload: {d}" for d in dirty[:20]]
 
     wheel_v = m.group("v") if (m := _WHEEL_VERSION.match(wheel.name)) else None
-    versions = {
-        "wheel": wheel_v,
+    changelog_text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    others = {
         "__init__.py": declared_version(
             (repo / "src" / PACKAGE / "__init__.py").read_text(encoding="utf-8")
         ),
-        "CHANGELOG.md": changelog_version((repo / "CHANGELOG.md").read_text(encoding="utf-8")),
         "CITATION.cff": citation_version((repo / "CITATION.cff").read_text(encoding="utf-8")),
     }
     if args.expect_version is not None:
-        versions["git tag"] = tag_version(args.expect_version)
-    print("\nversions     : " + ", ".join(f"{k}={v}" for k, v in versions.items()))
-    failures += [f"version disagreement -- {p}" for p in version_disagreements(versions)]
+        others["git tag"] = tag_version(args.expect_version)
+    shown = ", ".join(f"{k}={v}" for k, v in others.items())
+    print(
+        f"\nversions     : wheel={wheel_v}, {shown}, "
+        f"CHANGELOG.md newest heading={changelog_version(changelog_text)}"
+    )
+    failures += [
+        f"version disagreement -- {p}"
+        for p in version_disagreements(wheel_v, others, changelog_text)
+    ]
 
     pyproject = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
     target = entry_point_target(pyproject)

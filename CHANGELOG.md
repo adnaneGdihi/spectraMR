@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`dev` ships builds.** `.github/workflows/dev-publish.yml` publishes
+  `X.Y.B.dev<run number>` to PyPI when it is dispatched against the public
+  repository's `dev`, so a change is installable with `pip install --pre
+  spectramr` without waiting for the next release. It is dispatch-only because a
+  branch push is autonomous CI (`test_push_triggers_are_tag_only` admits a `push:`
+  only when tag-scoped) and a `schedule:` cron registers from the default branch,
+  where this file will not be until a release export puts it there. The `pypi` job
+  is gated on the **ref**, so a dispatch from any other branch rehearses the build
+  and uploads nothing. The counter is `github.run_number` because it
+  is the only monotonic one available and PyPI never re-issues a filename; the
+  lane refuses to run from a tree carrying a release version, since a
+  `0.1.3.dev<n>` wheel would sort before an 0.1.3 that has already shipped. The
+  file ships to both repositories -- the export allowlist selects `.github/`
+  wholesale and the overlay is replace-only -- so every job carries
+  `if: github.repository == 'adnaneGdihi/spectraMR'`.
+- **The branch model is written down.** `docs/versioning.rst` states what `main`,
+  `dev` and `nightly` each are and what moves them, and records that nothing
+  currently moves `nightly`: on 2026-09-06 it sat 10 commits behind `main`,
+  carrying a documentation set `main` had already corrected.
+- **A `docs` branch, documenting the other three.** Read the Docs builds the
+  public repository and maps one version to one ref, so with `latest` reading
+  `main` the published site could only ever describe the release: a docs
+  correction was unreadable until the next release carried it, and restoring
+  `main` to a release tree takes those corrections back off the site. `latest`
+  now reads `docs`, which is *moved* to a snapshot whose documentation has been
+  reviewed. It is a whole snapshot rather than a `docs/` directory, because
+  without an importable `spectramr` Sphinx drops 77 of the 105 rendered
+  `spectramr.*` signatures and seven of the nine autodoc pages' API sections
+  and still exits 0 (`conf.py` suppresses `autodoc.import_object`, so
+  `fail_on_warning` has nothing to fail on). What separates it from `dev` is the
+  mover: `dev` advances on every export, `docs` only on a reviewed one. It lives
+  in the published repository only -- the research repository already carries refs
+  under `refs/heads/docs/` (40 of them on 2026-09-06), and git cannot hold a ref at
+  `docs` and refs beneath `docs/` at the same time.
+
+### Fixed
+- **The dev series could not be built at all.** `build_dist.py` compared
+  `CHANGELOG.md`'s newest dated heading against the wheel's version as strings,
+  but `bump_version.py nightly` deliberately writes a dev build no heading -- so
+  on the 0.1.3 series the changelog read `0.1.2`, the wheel read `0.1.3.dev1`,
+  and the build failed on a tree that was correct. `docs/versioning.rst`
+  meanwhile described `nightly` as the branch that "exists to be installed and
+  tried". The changelog is now judged by shape: a release must carry its own
+  dated heading, a dev build must carry an open `[Unreleased]` section and must
+  not name a version already released.
+- **Two comparators owned "do the version sources agree".** `bump_version.py
+  show` compared `len(set(values)) != 1`, which cannot express a dev build, and
+  so reported `DISAGREEMENT` on every tree its own `nightly` mode had just
+  written. Both now call `build_dist.version_disagreements`, which takes the
+  reference version and the raw changelog text (non-negotiable 17).
+
+### Security
+- **Six open vulnerability alerts on the published repository, closed by three
+  lockfile bumps.** `urllib3` 2.5.0 -> 2.7.0 (four *high* advisories: cross-origin
+  forwarding of sensitive headers through a proxy, and three decompression-bomb
+  paths patched in 2.6.0 / 2.6.3 / 2.7.0), `idna` 3.13 -> 3.15 (specification
+  deviation) and `pydantic-settings` 2.14.1 -> 2.14.2 (`NestedSecretsSettingsSource`
+  follows symlinks). Dependabot raised all three against `adnaneGdihi/spectraMR`
+  (#11, #12, #13); they are applied here because an export snapshot **replaces** the
+  published tree, so a bump that lands only there is reverted by the next publish
+  (#1878). `pydantic-settings>=2.14` in `pyproject.toml` already admits 2.14.2, and
+  the other two are transitive, so no declared constraint changes.
+
 ## [0.1.2] - 2026-09-05
 
 ### Fixed

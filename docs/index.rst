@@ -2,7 +2,7 @@
 spectraMR
 =========
 
-spectraMR is a multi-paradigm PyTorch research framework for MRI reconstruction,
+spectraMR is a multi-paradigm PyTorch framework for MRI reconstruction,
 super-resolution, contrast translation and synthesis. It is registry-dispatched
 and driven from YAML: you select components by name in a configuration file and
 run a CLI verb, and there is no per-experiment Python to write.
@@ -12,21 +12,10 @@ run a CLI verb, and there is no per-experiment Python to write.
    **NOT FOR CLINICAL USE.** Research software only. It is not a medical device
    and has not been evaluated by any regulatory authority. See ``DISCLAIMER.md``.
 
-.. note::
-
-   **This is the public documentation set, and it is a subset.** It documents
-   version |release|. These pages were written against the internal research
-   tree, where an experiment corpus of several hundred configurations and a
-   directory of internal tooling sit beside the framework. Neither is published.
-   Pages here therefore sometimes *name* an internal script or an experiment arm
-   as the provenance of a measured number. Naming a source is fine; telling you
-   to **run** a file this repository does not contain is not, and any such block
-   that survives here is a documentation defect worth an issue rather than an
-   instruction worth following. :doc:`known_limitations` records what this tree
-   does not do, and it is worth reading before the tutorials rather than after.
-
-Start here
-==========
+:doc:`getting_started` installs the package and runs the first reconstruction.
+From there the sections below follow the order you will need them in: describe a
+run in a configuration file, launch it, choose the components it uses, and read
+what it produced.
 
 .. toctree::
    :maxdepth: 2
@@ -34,44 +23,30 @@ Start here
 
    getting_started
    tutorials/index
-   how_to/index
-   user_guide
    troubleshooting
    known_limitations
 
 .. toctree::
    :maxdepth: 2
-   :caption: Driving it from configuration
+   :caption: Configuring a run
 
    config_schema_reference
-   config_key_reference
+   explanation/workflows
    transform_registry
    environment_variables
-   CLUSTER_DATA_LAYOUT
 
 .. toctree::
    :maxdepth: 2
    :caption: Running the framework
 
+   cli_reference
    running_pipelines
    execution_modes
-   cli_reference
-   plugins
-   campaigns_user_guide
    hpo_guide
    audit_ladder_user_guide
    accelerated_run_contract
    distributed_training
    training_throughput
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Results, logging and debugging
-
-   run_provenance_and_logging
-   reporting
-   reporting_pipeline
-   debug_snapshot_contract
 
 .. toctree::
    :maxdepth: 2
@@ -87,13 +62,14 @@ Start here
 
 .. toctree::
    :maxdepth: 2
-   :caption: Reference
+   :caption: Results and extension
 
-   reference/index
-   explanation/index
-   versioning
+   run_provenance_and_logging
+   reporting
+   how_to/index
+   plugins
    scripting_api
-   sim2rank_reliability_theory
+   versioning
    modules/unet
    modules/loader
    modules/bloch

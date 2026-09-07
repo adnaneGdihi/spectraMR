@@ -77,6 +77,8 @@ def _m4raw_cfg(**overrides) -> SimpleNamespace:
         "log_scaling": False,
         "validation_split": 0,
         "target_mode": _DataSchema.model_fields["target_mode"].default,
+        "val_target_mode": _DataSchema.model_fields["val_target_mode"].default,
+        "r2r_alpha": _DataSchema.model_fields["r2r_alpha"].default,
         "nex_target_exclude_input": _DataSchema.model_fields["nex_target_exclude_input"].default,
         "nex_fallback": _DataSchema.model_fields["nex_fallback"].default,
         "use_repetitions": _DataSchema.model_fields["use_repetitions"].default,
@@ -218,7 +220,15 @@ def test_m4raw_honours_an_explicit_use_repetitions(monkeypatch, declared) -> Non
 
 
 @pytest.mark.parametrize(
-    "missing", ["target_mode", "nex_target_exclude_input", "nex_fallback", "use_repetitions"]
+    "missing",
+    [
+        "target_mode",
+        "val_target_mode",
+        "r2r_alpha",
+        "nex_target_exclude_input",
+        "nex_fallback",
+        "use_repetitions",
+    ],
 )
 def test_m4raw_nex_knob_missing_from_receiver_fails_loud(monkeypatch, missing) -> None:
     """A receiver without the field must RAISE, never resolve to a default.
@@ -245,6 +255,106 @@ def test_m4raw_nex_knob_missing_from_receiver_fails_loud(monkeypatch, missing) -
         )
 
 
+def test_m4raw_threads_r2r_alpha(monkeypatch) -> None:
+    """``data.r2r_alpha`` must reach the dataset, and reach BOTH splits.
+
+    Nothing downstream raises on a wrong alpha -- it silently shifts noise
+    between the two R2R halves -- so a dropped forward is invisible at runtime.
+    """
+    cap = _capture_m4raw(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(
+            target_mode="r2r", r2r_alpha=0.25, val_target_mode="phase_aligned_mean"
+        ),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    # ``cap`` holds the LAST construction, i.e. the val dataset -- so this also
+    # pins that val is not left on the default while train gets the declared
+    # value (they are two separate call sites). alpha forwards to BOTH splits
+    # even though only the training split reads it, because the two datasets are
+    # otherwise built from identical kwargs; the target MODE is the one thing
+    # that differs.
+    assert cap["r2r_alpha"] == 0.25
+    assert cap["target_mode"] == "phase_aligned_mean"
+
+
+def test_m4raw_threads_the_r2r_alpha_default_when_the_arm_is_silent(monkeypatch) -> None:
+    cap = _capture_m4raw(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert cap["r2r_alpha"] == _DataSchema.model_fields["r2r_alpha"].default
+    assert cap["r2r_alpha"] == 1.0  # anti-vacuity: pin today's value
+
+
+def _capture_m4raw_both(monkeypatch) -> list[dict]:
+    """Record BOTH constructions, in order: train first, val second.
+
+    ``_capture_m4raw`` keeps only the last kwargs, so it cannot see the two
+    splits diverging -- which is exactly what ``val_target_mode`` does.
+    """
+    import spectramr.data.datasets.m4raw_dataset as m4raw_mod
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        m4raw_mod,
+        "M4RawRepetitionDataset",
+        lambda _h5, **kw: (calls.append(kw), _StubDS())[1],
+    )
+    return calls
+
+
+def test_val_target_mode_reaches_the_val_split_only(monkeypatch) -> None:
+    """The training split trains on r2r; the validation split scores against NEX.
+
+    This is the whole point of the knob. An r2r validation target is redrawn
+    every ``__getitem__``, so validating against it scores the noise draw and
+    ``track_best_metric`` keeps the luckiest epoch. If this forward were dropped
+    the run would still train, still log a falling loss, and still write
+    checkpoints -- picked on noise. Nothing downstream raises.
+    """
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(target_mode="r2r", val_target_mode="phase_aligned_mean"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert len(calls) == 2, "expected one train and one val construction"
+    train_kw, val_kw = calls
+    assert train_kw["target_mode"] == "r2r"
+    assert val_kw["target_mode"] == "phase_aligned_mean"
+
+
+def test_val_target_mode_none_serves_the_training_mode_to_both_splits(monkeypatch) -> None:
+    """The default must not silently change what every existing arm validates on.
+
+    111 M4Raw arms declare ``target_mode`` and none declares the new knob, so
+    ``None`` has to mean exactly "what it did before".
+    """
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(target_mode="phase_aligned_mean"),  # val_target_mode -> schema default
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert len(calls) == 2
+    train_kw, val_kw = calls
+    assert train_kw["target_mode"] == "phase_aligned_mean"
+    assert val_kw["target_mode"] == "phase_aligned_mean"
+    assert _DataSchema.model_fields["val_target_mode"].default is None  # anti-vacuity
+
+
 def test_the_m4raw_stub_declares_every_nex_field_the_schema_declares() -> None:
     """The stub must not omit a field a real config always carries (anti-F16).
 
@@ -252,7 +362,7 @@ def test_the_m4raw_stub_declares_every_nex_field_the_schema_declares() -> None:
     threading tests above would certify a code path production cannot reach.
     """
     cfg = _m4raw_cfg()
-    for field in ("target_mode", "nex_target_exclude_input"):
+    for field in ("target_mode", "val_target_mode", "r2r_alpha", "nex_target_exclude_input"):
         assert field in _DataSchema.model_fields, f"{field} left the schema"
         assert hasattr(cfg, field), (
             f"the m4raw stub omits `{field}`, which DataConfigSchema declares -- "

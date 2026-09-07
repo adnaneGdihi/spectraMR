@@ -325,6 +325,70 @@ class TestFastMRIManifestFiltering:
         )
         assert len(index) == 0
 
+    def test_m4raw_filename_tokens_are_T1_T2_FLAIR_not_T1w(self, tmp_path):
+        """M4Raw's tokens are ``T1``/``T2``/``FLAIR`` -- never the NIfTI ``T1w``.
+
+        The filter is an uppercased SUBSTRING match on ``file_id``, and M4Raw
+        ships ``<subject>_T101.h5`` / ``<subject>_FLAIR01.h5`` (the trailing two
+        digits are the repetition index). So:
+
+        * ``T1`` matches ``2022061203_T101``; ``T1W`` does not.
+        * The corpus convention is the other way round -- all 51 arms declaring
+          ``pairing.contrasts`` are ``nifti_paired`` with ``T1w``/``T2w``, and the
+          schema field's own description advertises ``['T1w', 'FLAIR']``, which
+          matches NOTHING on M4Raw.
+
+        This matters because the n2n cohort excludes FLAIR by contrast filter:
+        FLAIR ships 2 repetitions and the leave-one-out NEX reference needs 3, so
+        a wrong token silently changes which contrasts the cohort trains on. The
+        fixture is M4Raw-shaped rather than borrowed from the NIfTI convention
+        (a fixture must come from the producer).
+        """
+        import pickle
+
+        manifest_dir = tmp_path / "manifests"
+        manifest_dir.mkdir()
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        # Real M4Raw basenames: subject id, contrast token, 2-digit repetition.
+        files = [
+            "2022061203_T101",
+            "2022061203_T201",
+            "2022061401_FLAIR01",
+        ]
+        manifest_path = manifest_dir / "m4raw_manifest.pkl"
+        with open(manifest_path, "wb") as f:
+            pickle.dump(
+                {
+                    "version": 2,
+                    "data_root": str(data_dir),
+                    "use_relative": True,
+                    "files": [{"path": f"{n}.h5", "file_id": n} for n in files],
+                },
+                f,
+            )
+
+        from spectramr.data.datasets.universal_dataset import parse_fastmri_index
+
+        unfiltered = parse_fastmri_index(str(manifest_path), data_root=str(data_dir))
+        assert len(unfiltered) == 3  # anti-vacuity: the fixture is not empty
+
+        # The n2n cohort's declaration: keep the 3-repetition contrasts, drop FLAIR.
+        kept = parse_fastmri_index(
+            str(manifest_path), data_root=str(data_dir), contrasts=["T1", "T2"]
+        )
+        assert {r["file_id"] for r in kept} == {"2022061203_T101", "2022061203_T201"}
+        assert not any("FLAIR" in r["file_id"] for r in kept)
+
+        # The NIfTI token the schema description advertises matches nothing here.
+        assert parse_fastmri_index(
+            str(manifest_path), data_root=str(data_dir), contrasts=["T1w"]
+        ) == []
+
+        # ...and it fails LOUDLY downstream rather than training on an empty set:
+        # `load_fastmri_splits` raises "Train split is empty" on this result.
+
     def test_parse_fastmri_index_target_contrasts(self, tmp_path):
         """Test parse_fastmri_index with target contrast filtering."""
         import pickle

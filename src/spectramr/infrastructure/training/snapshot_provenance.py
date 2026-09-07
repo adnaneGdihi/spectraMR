@@ -52,6 +52,15 @@ _NORMALIZATION_FIELDS = (
 #: so the two legitimately look different.
 _CONSTRUCTION_FIELDS = (
     "target_mode",
+    # The validation split's target may differ from training's, and under
+    # `target_mode: r2r` it MUST (r2r redraws its target every __getitem__, so
+    # it is not a metric reference). A snapshot that named only `target_mode`
+    # would describe the wrong half of the run for every r2r arm.
+    "val_target_mode",
+    # Read only under `target_mode: r2r`; it splits the noise budget between
+    # the two recorrupted halves, so two runs differing only in alpha are
+    # different constructions that no other stamped field distinguishes.
+    "r2r_alpha",
     "nex_target_exclude_input",
     "nex_fallback",
     # One record per slice (depth-1 subjects, one slice read per repetition)

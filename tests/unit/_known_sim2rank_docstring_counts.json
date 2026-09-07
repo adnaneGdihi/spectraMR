@@ -1,14 +1,14 @@
 {
   "_comment": [
     "Counts in scripts/sim2rank/ docstrings that the #1521 sweep FOUND but did",
-    "NOT adjudicate. Tracked as a body of work (see the issue linked below), not",
+    "NOT adjudicate. Tracked as a body of work (named below), not",
     "blessed as correct. Keyed by [path, qualname, exact matched text] so that",
     "editing a waived claim un-waives it -- a file-level key would waive the",
     "whole file forever. NEVER regenerate this file to make the guard green:",
     "NEVER regenerate this file to make the guard green: remove entries as each claim is verified or rewritten to name its SSOT. Tracked by:"
   ],
   "seeded": "2026-08-28",
-  "issue": "https://github.com/adnaneGdihi/gan_mri/issues/1585",
+  "issue": "internal issue #1585",
   "waived": [
     [
       "scripts/sim2rank/build_report.py",
@@ -176,5 +176,5 @@
       "31 metrics"
     ]
   ],
-  "found_by": "https://github.com/adnaneGdihi/gan_mri/pull/1584 (#1521)"
+  "found_by": "internal PR #1584 (#1521)"
 }

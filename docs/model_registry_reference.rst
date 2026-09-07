@@ -20,9 +20,6 @@ Models are instantiated via the ``ModelFactory`` using the ``@register_model`` d
       populate_model_registry()   # REQUIRED -- empty without it
       sorted(MODEL_REGISTRY)
 
-   Tracked as issue #1643 -- these pages should be generated from the
-   registries, the way ``docs/config_key_reference.rst`` already is.
-
 .. contents:: Table of Contents
    :local:
    :depth: 2
@@ -2392,13 +2389,10 @@ environment variable:
    (regression gate).  Shrink the allowlist by adding per-model overrides to
    ``tests/utils/minimal_builders._OVERRIDES``.
 
-Phase 3 Re-implemented Models (2026-05-22)
-==========================================
+Models built from published formulations
+========================================
 
-Twelve models from the ``d8ccb8452`` deletion ledger that previously had no
-implementation were built from their published formulations. See
-``TODO/deleted_model_types_reimplementation_plan.md`` and
-``TODO/phase3_model_implementations_detailed.md``. Each is registered via
+Twelve further models, each built from its published formulation, registered via
 ``@register_model`` and constructible with no kwargs (hyperparameters flow
 through ``model.model_kwargs`` in YAML).
 
@@ -2474,30 +2468,29 @@ GAN / reconstruction
    (``spectramr.models.generators.gated_gnn_reconstructor.GatedGNNReconstructor``)
    — GRU message-passing over a k-space graph (Li et al., ICLR 2016).
 
-Restored aliases (Phase 1)
---------------------------
+Name aliases
+------------
 
-Twenty purged name-variants were re-wired as aliases of their canonical
+Twenty name-variants are registered as aliases of their canonical
 registrations in ``spectramr.models.stubs.register_aliases`` (e.g.
 ``vq_vae`` → ``vqvae``, ``stylegan`` → ``stylegan2``,
 ``standard_vit`` → ``vision_transformer``). The frozen mapping and its
 regression test live in ``tests/unit/models/test_registry_aliases.py``.
 
-Rejected aspirational names (Phase 4)
--------------------------------------
+Rejected names
+--------------
 
-Twenty-four ledger names with no implementation and no anchoring
+Twenty-four names with no implementation and no anchoring
 specification are recorded in ``spectramr.models.registry.REJECTED_NAMES``
 with a per-name rationale. They are absent from ``VALID_MODEL_TYPES``; the
 ``namespace_axis`` audit check surfaces the rationale as a fix hint if a
 YAML references one.
 
-Audit-ladder hardening (Phase 0)
---------------------------------
+Audit checks on model_type
+--------------------------
 
-Two Tier-1 checks were added to ``ConfigHealthChecker`` to make the
-advertised-but-unresolvable failure mode (the cause of the deletion ledger)
-impossible going forward:
+Two Tier-1 checks in ``ConfigHealthChecker`` make an advertised-but-unresolvable
+``model_type`` a load-time error rather than a runtime one:
 
 ``check_registered_model_resolves``
    A registered ``model_type`` must resolve to a concrete class (not an

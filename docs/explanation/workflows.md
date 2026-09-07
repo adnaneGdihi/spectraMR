@@ -25,24 +25,6 @@ arm emits off-regime — MRS consumes a `spectrum` and emits resonance maps in t
 `image` domain — so an emits-reading would reject the very arms these regimes
 exist for.
 
-The `regime` field was called `name` until 2026-07-31; the old spelling raises
-and names its replacement.
-
-Two `Task` members were resolved on 2026-07-31, and the two had opposite fixes.
-`acquisition_design` was **wired**: `PILOTStrategy` and `BALDAcquisitionStrategy`
-really do design acquisitions, but both subclass `ReconstructionTrainingStrategy`
-and inherited its `{RECONSTRUCTION}` tag, so a real capability never announced
-itself. `segmentation` was **removed**: across 152 strategy classes none tagged
-it, no loss carried it, no profile listed it, and no arm declared it — the only
-segmentation the framework has is metrics, and a task you can score but not
-train is not a task an arm can declare.
-
-`WorkflowProfile.optional_axes` was deleted the same day. It was inert twice
-over — nothing read it and no profile populated it — and unlike an
-unread-but-populated field it did not want a reader: `required_axes` alone
-drives `check_workflow_required_axes`, and an *optional* axis states no rule,
-since by construction its absence cannot make an arm inadmissible.
-
 Both `regime` and `task` are closed enums
 (`spectramr.config.schemas.enums.Regime` / `Task`), so a typo fails at Tier-0
 (Pydantic `ValidationError`) rather than silently mislabelling the arm.
@@ -92,9 +74,8 @@ Maturity is not hand-waved. It is **declared** on the frozen
 regime that has no tagged metric fails it too. This is the anti-facade
 guarantee — the claim cannot lie.
 
-`EVAL_ONLY` currently has **no members** — `mri_spectroscopy` was the last one and
-reached LIVE on 2026-07-16. The rung stays in the ladder because it describes a
-real state (a regime you can grade but not train), and
+`EVAL_ONLY` currently has **no members**. The rung stays in the ladder because
+it describes a real state (a regime you can grade but not train), and
 `test_no_mr_regime_with_real_physics_is_left_at_eval_only` keeps the list empty by
 naming any regime that slides back into it.
 
@@ -110,14 +91,14 @@ entry *promises* `adjoint()`, and generic callers — `DataConsistencyLayer`,
 `⟨Ax,y⟩ = ⟨x,A†y⟩`. A nonlinear map has no adjoint, so it goes in the
 `SignalModelRegistry`, whose contract has **no adjoint in it at all**.
 
-Until 2026-07-16 the clause read `forward_operator is not None`, and it failed in
-both directions at once. It was far too weak for most regimes — *every* MR profile
-declares `fft2d`, because MR k-space is FFT-reconstructed, so the clause tested
-"is this MR?" rather than "is this regime's physics wired?". And it was impossible
-for `mri_perfusion`, whose tracer-kinetic map is nonlinear: the only way to satisfy
-it was to register a fake `adjoint`, so **the rule actively rewarded the facade it
-existed to prevent**. `mri_diffusion_weighted` honestly declares both — `fft2d` for
-the readout, `adc_monoexp` for the decay.
+A clause of the form `forward_operator is not None` would fail in both
+directions at once. It is far too weak for most regimes — *every* MR profile
+declares `fft2d`, because MR k-space is FFT-reconstructed, so such a clause
+tests "is this MR?" rather than "is this regime's physics wired?". And it is
+impossible for `mri_perfusion`, whose tracer-kinetic map is nonlinear: the only
+way to satisfy it would be to register a fake `adjoint`, so the rule would
+reward the very facade it exists to prevent. `mri_diffusion_weighted` honestly
+declares both — `fft2d` for the readout, `adc_monoexp` for the decay.
 
 **Metrics are required; losses deliberately are not.** The asymmetry is real. A
 regime may honestly train on agnostic objectives — `mri_structural` trains on
@@ -141,16 +122,13 @@ metrics-only regime is *literally the EVAL_ONLY state*. Since PARTIAL allows
 `train` while EVAL_ONLY raises on it, the permissive form would let a single
 metric tag buy a trainable claim.
 
-This branch did not exist until 2026-07-16: PARTIAL fell through the
-`if/elif/elif` with no assertions at all, so five regimes sat there for months
-with nothing tagged. Two things hid it — the missing branch, and a leak where
-`capabilities` (a `ClassVar`) was read with `getattr`, so all 63 subclasses of
-the structural strategy inherited its `mri_structural` tag for free. 64 strategies
-reported the tag; one declared it. The ledger now reads each class's own
-`__dict__`: inheriting a parent's regime is not opting into it.
+The ledger reads each class's own `__dict__`, never `getattr`: `capabilities` is
+a `ClassVar`, so an attribute read would let all 63 subclasses of the structural
+strategy inherit its `mri_structural` tag for free — 64 strategies reporting a
+tag one declared. Inheriting a parent's regime is not opting into it.
 
-In this repository the ledger stands as — **all nine MR regimes with real physics
-are LIVE as of 2026-07-16, and EVAL_ONLY is empty**:
+The ledger stands as — **all nine MR regimes with real physics are LIVE, and
+EVAL_ONLY is empty**:
 
 - `mri_structural` — **LIVE** (`ReconstructionTrainingStrategy`, `fft2d`, graded
   by the anatomical IQMs `cjv`/`wm2max`). Its losses are agnostic *by design*.
@@ -170,9 +148,7 @@ are LIVE as of 2026-07-16, and EVAL_ONLY is empty**:
   `b0_field_rmse` / `geodesic_qmap_error` / `cross_scanner_t1t2_concordance`.
 - `mri_fingerprinting` — **LIVE**: `ConformalMRFDictlessReconStrategy` +
   `mrf_dictionary_match`, which does MRF's defining operation (softmax-relaxed
-  inner-product matching against a Bloch dictionary). The regime previously had
-  *no honest loss at all* — every MRF-named one is a themed name over generic
-  maths, `tropical_mrf_consistency`'s reference fan being literally `torch.randn`.
+  inner-product matching against a Bloch dictionary).
 - `mri_diffusion_weighted` — **LIVE**, and the one regime declaring both kinds of
   forward model: `fft2d` for the readout, `adc_monoexp` for the decay.
 - `mri_dynamic` — **LIVE**: `LowRankSparseStrategy`, the SToRM manifold
@@ -197,8 +173,7 @@ are LIVE as of 2026-07-16, and EVAL_ONLY is empty**:
   spectrum's, and `spectral_linewidth` takes a magnitude spectrum; and the
   frequency fit has a ±30 Hz capture range, though — unlike perfusion's `vp` —
   a bad fit shows a residual three orders of magnitude worse, so the residual
-  can be trusted. The per-combination backlog is maintained with the internal
-  documentation and is not published with this release.
+  can be trusted.
 - `nmr_spectroscopy`, `ct`, `xray`, `ultrasound`, `optical` — **STUB** (typed
   seams the framework does not implement).
 
@@ -207,8 +182,71 @@ it tracked local data, `mri_flow` would be PARTIAL here (no 4D-flow data) and
 LIVE at a flow site — incoherent for a frozen profile. Data availability is a
 separate, already-wired gate: `check_workflow_required_axes`.
 
-The full table is auto-derived in
-[Workflow profiles](../reference/workflow_profiles.md).
+## The profile table
+
+The frozen facts backing each imaging regime live in
+`spectramr.domain.workflows.profiles.WORKFLOW_PROFILES`. Each entry is a
+`WorkflowProfile`: its maturity, the spatial ranks and non-spatial axes it
+needs, the physics forward operator that reconstructs it (a key into the
+`OperatorRegistry` — a profile naming an unregistered operator fails the
+maturity-ledger test), and the tasks it supports.
+
+| Regime | Modality | Maturity | Ranks | Required axes | Forward operator | Signal model |
+|---|---|---|---|---|---|---|
+| `mri_structural` | MR | LIVE | 2, 3 | — | `fft2d` | — |
+| `mri_quantitative` | MR | LIVE | 2, 3 | ECHO | `fft2d` | — |
+| `mri_fingerprinting` | MR | LIVE | 2, 3 | TRANSIENT | `fft2d` | — |
+| `mri_functional` | MR | LIVE | 3 | TEMPORAL | `fft2d` | — |
+| `mri_diffusion_weighted` | MR | LIVE | 2, 3 | DIFFUSION_ENCODING | `fft2d` | `adc_monoexp` |
+| `mri_dynamic` | MR | LIVE | 2, 3 | TEMPORAL | `fft2d` | — |
+| `mri_perfusion` | MR | LIVE | 2, 3 | TEMPORAL | — | `extended_tofts` |
+| `mri_spectroscopy` | MR | LIVE | 2, 3 | SPECTRAL | — | `mrs_lorentzian` |
+| `mri_flow` | MR | LIVE | 2, 3 | VELOCITY_ENCODING | `phase_contrast` | — |
+| `nmr_spectroscopy` | MR | STUB | — | SPECTRAL | — | — |
+| `ct` | X-ray transmission | STUB | 2, 3 | — | — | — |
+| `xray` | X-ray transmission | STUB | 2 | — | — | — |
+| `ultrasound` | Ultrasound | STUB | 2, 3 | — | — | — |
+| `optical` | Optical | STUB | 2, 3 | — | — | — |
+
+Maturity is asserted rather than merely declared: the maturity-ledger test
+checks each claim against the live strategy / loss / metric / operator /
+signal-model registries. PARTIAL requires a regime-tagged strategy, or *both*
+tagged losses and tagged metrics; LIVE requires a resolving forward model, a
+tagged strategy, and tagged metrics. Losses are deliberately not part of the
+LIVE rule — see [the three LIVE clauses](#the-three-live-clauses).
+
+```{eval-rst}
+.. currentmodule:: spectramr.domain.workflows.profiles
+
+.. autoclass:: WorkflowProfile
+   :members:
+
+.. autofunction:: get_profile
+```
+
+### The two forward-model columns
+
+A regime declares its physics in **exactly one of two fields, chosen by whether
+an adjoint exists** — not by taste:
+
+- **`forward_operator`** — a key into the `OperatorRegistry`. **Linear**, and its
+  contract *promises* `adjoint()`; generic callers (`DataConsistencyLayer`,
+  `FISTAMBIRSolver`, `NullSpaceProjection`) consume that promise assuming
+  `⟨Ax,y⟩ = ⟨x,A†y⟩`.
+- **`signal_model`** — a key into the `SignalModelRegistry`. **Nonlinear**, with
+  **no adjoint anywhere in the contract**, so nothing in it can be mistaken for a
+  linear operator.
+
+`mri_perfusion` declares only a signal model, and `—` in the operator column is
+the **correct answer, not a gap**: no linear operator inverts a tracer-kinetic
+map. `mri_diffusion_weighted` honestly declares **both** — DWI is FFT-reconstructed
+*and* obeys the mono-exponential decay.
+
+The `forward_operator` column alone is a weak signal: every MR regime declares
+`fft2d` for the same trivial reason — MR k-space is FFT-reconstructed — so on
+its own it distinguishes "is this MR?", not "is this regime's physics wired?".
+That is why the LIVE rule also requires a regime-tagged strategy and
+regime-tagged metrics.
 
 ## Component tagging (`None` = agnostic)
 
@@ -241,9 +279,7 @@ how allow-lists rot *without anyone tagging anything*. The ledger reads
 own docstring says *"despite the `b0_mapping` name, this strategy does not
 estimate a B0 off-resonance field map in Hz"* (it is deformable registration).
 Tagging it `mri_quantitative` on the strength of its name would have asserted a
-claim the code explicitly disclaims. The deliberate non-tags, and the reason for
-each, are recorded in the internal workflow backlog, which is not published
-with this release.
+claim the code explicitly disclaims.
 
 The registry-walk that reads these tags lives in
 `spectramr.infrastructure.validation.workflow_ledger` (in `infrastructure`, not
@@ -259,16 +295,14 @@ Two layers enforce the contract.
 - the regime is a `STUB` the framework cannot run;
 - the `task` is not in the regime's `supported_tasks`.
 
-An **absent** `workflow:` block is **advisory** (`info`), not an error — the
-"optional now, required later" seam. None of the 1,465 experiment YAMLs on `dev`
-predates this feature with a `workflow:` block, so erroring would redden every
-arm on the first `spectramr audit` (which is `--strict` by default) rather than
-enforce anything. The two checks above still fire on any arm that *did* declare,
-so a **wrong** declaration never passes silently. Ratchet the absent case to
-`error` once the cohorts are annotated — see internal issue 283.
+An **absent** `workflow:` block is **advisory** (`info`), not an error: a config
+written before the block existed would otherwise fail `spectramr audit` (which
+is `--strict` by default) for a declaration it never had the chance to make. The
+two checks above still fire on any arm that *did* declare, so a **wrong**
+declaration never passes silently.
 
-`check_workflow_required_axes` (Tier-1) is the machine-readable form of
-**pitfall 19** ("hypothesis untestable on this data"): it errors when a
+`check_workflow_required_axes` (Tier-1) is the machine-readable form of the
+rule that a hypothesis must be testable on the data at hand: it errors when a
 regime's `required_axes` are absent from what the arm exposes — e.g.
 `mri_functional` (needs `TEMPORAL`) on `dataset_type: image` (exposes none).
 
@@ -283,19 +317,18 @@ Axes resolve by **two routes, declared first** (both in
    claim about a whole corpus, hand-written in `DATASET_TYPE_AXES`.
 
 The declaration wins because it is the stronger claim, and because some types
-cannot be annotated at all. `bart_kspace` is the worked example: five of its
-arms declare an `echo` axis and three declare `flip`, so no single table row is
-true for both — and until the declared route existed, every one of those eight
-arms **skipped** the one rule whose job is to consume exactly the fact they were
-declaring.
+cannot be annotated at all. `bart_kspace` is the worked example: one arm may
+declare an `echo` axis while its sibling declares `flip`, so no single table row
+is true for both. Only the per-arm declaration lets the rule consume exactly the
+fact the arm is stating.
 
 `_BART_ROLE_TO_AXIS` is the single adapter between the BART role vocabulary and
 `Axis`; a coverage test asserts every BART role is either mapped or excused with
 a reason, so a role added later cannot map to nothing in silence. Roles no
 regime states a rule about (`flip`, `map`, `repetition`) deliberately get no
-`Axis` member — the member's only reader would be a rule that cannot fire, the
-argument that deleted `optional_axes`. `repetition` in particular must never
-become `TEMPORAL`: NEX averages of a static object are not a time series.
+`Axis` member — the member's only reader would be a rule that cannot fire.
+`repetition` in particular must never become `TEMPORAL`: NEX averages of a
+static object are not a time series.
 
 An arm that neither declares nor is annotated is skipped, never guessed. Note
 the load-bearing distinction between `None` and `frozenset()`: the first skips,
@@ -366,13 +399,3 @@ and raises `WorkflowNotImplementedError`:
 
 An arm that declares no `workflow:` block is a runtime no-op — a missing
 declaration is the audit's job, not the runtime's.
-
-## Migration posture
-
-`workflow:` is optional on `TrainingSettings` today, and a missing block is an
-**advisory** audit finding rather than an error (internal issue 283) — decoupled from
-Pydantic construction, so the field can be flipped to required once every config
-declares it. The ratchet is deliberate: annotate the cohorts *first*, then raise
-the severity; doing it in the other order just reddens 1,465 arms at once. The dead
-`DataType` enum (which annotated no field and carried a constant `"mri"`) was
-deleted in the same change.

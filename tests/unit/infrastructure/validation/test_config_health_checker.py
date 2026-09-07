@@ -3510,7 +3510,16 @@ class TestConditionOnInputDoublesTheInput:
 
 
 class TestNexTargetModeAcceptsThePair:
-    """``rep_pair`` is phase-aligned by construction, so it is a coherent NEX target."""
+    """Only ``complex_mean`` is the finding; every other Literal member is coherent.
+
+    The check used to enumerate the ACCEPTABLE modes, which made it a second
+    owner of ``data.target_mode``'s vocabulary. When ``r2r`` was added to the
+    schema Literal the list was not updated, so an r2r arm fell through to the
+    finding branch and was told it "declares data.target_mode: complex_mean
+    explicitly" -- a value it does not declare. These tests pin both halves of
+    that fix: the whole vocabulary is accepted, and the message names the mode
+    it actually read.
+    """
 
     @staticmethod
     def _cfg(mode: str):
@@ -3520,6 +3529,15 @@ class TestNexTargetModeAcceptsThePair:
             dataset_type="m4raw",
             target_mode=mode,
             nex_target_exclude_input=(mode == "rep_pair"),
+            # r2r is refused without a fixed validation reference (its own
+            # target is redrawn every __getitem__), so give it one.
+            val_target_mode="phase_aligned_mean" if mode == "r2r" else None,
+            # r2r is ALSO refused unless the coils arrive uncombined: rss/svd
+            # take a magnitude, which turns the Gaussian residual Rician and
+            # breaks the second-moment decorrelation the mode rests on. The
+            # m4raw preset injects `svd`, so this has to be said out loud --
+            # exactly as the n2n cohort's arms say it.
+            coils={"processing_mode": "none"},
         )
         return SimpleNamespace(data=data)
 
@@ -3527,12 +3545,60 @@ class TestNexTargetModeAcceptsThePair:
         result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("rep_pair"))
         assert result.passed is True and "rep_pair" in result.message
 
+    def test_r2r_is_coherent(self) -> None:
+        """R2R builds both halves from ONE repetition, so it never averages."""
+        result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("r2r"))
+        assert result.passed is True
+        assert "r2r" in result.message
+
+    def test_every_declared_mode_but_complex_mean_is_coherent(self) -> None:
+        """The schema Literal is the vocabulary; this check owns only one member.
+
+        Reads the members off ``DataConfigSchema`` rather than restating them,
+        so a mode added to the Literal joins this test automatically instead of
+        silently becoming an unclassified value the check mislabels.
+        """
+        import typing
+
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        modes = set(typing.get_args(DataConfigSchema.model_fields["target_mode"].annotation))
+        assert "complex_mean" in modes and len(modes) >= 4, modes
+        for mode in sorted(modes - {"complex_mean"}):
+            result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg(mode))
+            assert result.passed is True, f"{mode} was reported as a finding"
+            assert mode in result.message
+
     def test_complex_mean_is_still_the_finding(self) -> None:
         """Planted violation."""
         result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(
             self._cfg("complex_mean")
         )
         assert result.passed is False
+
+    def test_a_coherent_mode_never_carries_the_complex_mean_prose(self) -> None:
+        """The r2r symptom, pinned at the surface an owner actually reads.
+
+        SCOPE, measured rather than assumed: replacing the finding branch's
+        f-string with the old hardcoded "complex_mean" does NOT turn this red,
+        and no test can make it -- once the accept branch admits every mode but
+        ``complex_mean``, the finding branch is reachable ONLY with
+        ``mode == "complex_mean"``, so the derived name and the constant are
+        behaviourally identical. The f-string is kept as insurance against a
+        future narrowing of that branch, not because it is observable today.
+        What IS observable, and what a stale allowlist breaks, is this: a
+        coherent mode passes and its message carries none of the
+        complex-averaging prose.
+        """
+        finding = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(
+            self._cfg("complex_mean")
+        )
+        assert "declares data.target_mode: complex_mean explicitly" in finding.message
+        assert "cancels signal" in finding.message
+
+        passing = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("r2r"))
+        assert "complex_mean" not in passing.message
+        assert "cancels signal" not in passing.message
 
 
 class TestSliceLevelRecordsQueueShape:

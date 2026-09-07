@@ -4,633 +4,543 @@
 Getting Started
 ===============
 
-Welcome to the spectraMR framework! This guide will help you set up your environment and run your first MRI reconstruction experiment.
+spectraMR is driven from a YAML file and a CLI verb. This page takes you from an
+empty environment to a trained model: install the package, write one
+configuration, check it, train it, and read the results.
 
-.. contents:: Table of Contents
+.. contents:: On this page
    :local:
    :depth: 2
 
-System Requirements
+System requirements
 ===================
 
 Hardware
 --------
 
-**Minimum:**
+============  ===================================  =====================================
+Resource      Minimum                              Comfortable
+============  ===================================  =====================================
+CPU           4 cores                              8+ cores
+RAM           16 GB                                32+ GB
+Storage       50 GB free                           200+ GB SSD
+GPU           NVIDIA, 8 GB VRAM                    NVIDIA, 16+ GB VRAM
+============  ===================================  =====================================
 
-- CPU: 4+ cores (Intel i5 or AMD equivalent)
-- RAM: 16 GB
-- Storage: 50 GB free space
-- GPU: NVIDIA GPU with 8GB+ VRAM (GTX 1080 or better)
-
-**Recommended:**
-
-- CPU: 8+ cores (Intel i7/i9 or AMD Ryzen 7/9)
-- RAM: 32+ GB
-- Storage: 200+ GB SSD
-- GPU: NVIDIA GPU with 16GB+ VRAM (RTX 3090, RTX 4090, A100, or V100)
+A GPU is not optional for training. Every heavy pipeline — ``train``, ``infer``,
+``hpo``, ``ablation``, and the ``audit --probe`` forward pass — runs on an
+accelerator or raises rather than falling back to CPU. CPU is reachable only when
+you ask for it explicitly (``--device cpu``, or ``device: cpu`` in the YAML). See
+:doc:`accelerated_run_contract`.
 
 Software
 --------
 
-- **Operating System**: Linux (Ubuntu 20.04+), macOS, or Windows with WSL2
-- **Python**: 3.9, 3.10, 3.11, or 3.12
-- **CUDA**: 11.8 or 12.1+ (for GPU acceleration)
-- **Git**: For cloning the repository
+- **Operating system**: Linux, or Windows with WSL2. macOS has no CUDA lane,
+  so it can run the CLI and the CPU-only paths but not training.
+- **Python**: 3.12 or newer.
+- **CUDA**: 12.6. The project pins the ``pytorch-cu126`` wheel index
+  deliberately — cu126 is the last lane that still ships ``sm_70`` kernels, which
+  V100-class cards need. A cu129 or newer wheel fails every kernel launch on a
+  V100 with ``cudaErrorNoKernelImageForDevice``.
 
 Installation
 ============
 
-Step 1: Clone the Repository
------------------------------
+There are two routes. Install from PyPI if you want to *run* the framework;
+clone if you also want the example configurations and the source.
+
+From PyPI
+---------
+
+.. code-block:: bash
+
+   pip install spectraMR              # core
+   pip install "spectraMR[mri]"       # + TorchIO / MONAI / NiBabel / torchkbnufft
+   pip install "spectraMR[all]"       # everything that resolves in one shot
+
+From source
+-----------
 
 .. code-block:: bash
 
    git clone https://github.com/adnaneGdihi/spectramr.git
    cd spectramr
 
-Step 2: Create Python Environment
-----------------------------------
-
-Using **conda** (recommended):
-
-.. code-block:: bash
-
-   # Create environment
-   conda create -n spectramr python=3.11
-   conda activate spectramr
-
-Using **venv**:
-
-.. code-block:: bash
-
-   # Create environment
-   python3.11 -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\\Scripts\\activate
-
-Step 3: Install Dependencies
------------------------------
-
-**Basic Installation** (CPU-only or existing CUDA):
-
-.. code-block:: bash
-
-   pip install -e .
-
-**With Medical Imaging Tools** (TorchIO, MONAI, NiBabel, torchkbnufft):
-
-.. code-block:: bash
-
-   pip install -e ".[mri]"
-
-**With Development Tools** (everything in ``all`` below, plus the
-config-migration toolchain):
-
-.. code-block:: bash
-
-   pip install -e ".[dev]"
-
-**Complete Installation** (everything that resolves in one ``pip install`` —
-every feature group *and* every role group, so ``docs``, ``test``, ``qa`` and
-``profile`` come along too). Only ``mamba``, ``attention`` and ``radiomics`` are
-excluded, each because it cannot build under isolation:
-
-.. code-block:: bash
+   python3.12 -m venv .venv
+   source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
    pip install -e ".[all]"
 
-**Mamba / SSM models** (``hilbert_mamba``, ``geomamba``, ``bloch_mamba``, …)
-require the official CUDA selective-scan kernel. It compiles from source, so it
-is a separate extra installed with build isolation **off** on an ``nvcc``-equipped
-machine (it is intentionally excluded from ``all`` because it cannot resolve in a
-one-shot install):
+``[all]`` is every feature group that resolves in a single ``pip install``. Three
+extras are deliberately outside it because they cannot build under isolation:
+``mamba``, ``attention`` and ``radiomics``.
+
+Mamba and SSM models (``hilbert_mamba``, ``geomamba``, ``bloch_mamba``, …) need
+the official CUDA selective-scan kernel, which compiles from source. Install it
+as a second step on a machine with ``nvcc``:
 
 .. code-block:: bash
 
-   pip install -e ".[all]"
    pip install -e ".[mamba]" --no-build-isolation
 
-You can confirm every declared dependency for a chosen extra set is installed,
-version-correct, and importable with the SSOT checker:
+Check the installation
+----------------------
+
+Both routes install the ``spectramr`` console script. Every command on these
+pages uses it.
+
+.. code-block:: bash
+
+   spectramr --help
+   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+
+From a clone you can also confirm that every dependency an extra declares is
+installed, version-correct and importable:
 
 .. code-block:: bash
 
    python scripts/verify/verify_dependencies.py --all --import-check
 
-Step 4: Verify Installation
-----------------------------
+Your first configuration
+========================
 
-.. code-block:: bash
-
-   # Check PyTorch and CUDA
-   python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}')"
-
-   # Check framework installation
-   python -c "from spectramr.config.settings import TrainingSettings; print('spectraMR installed successfully!')"
-
-Expected output::
-
-   PyTorch: 2.1.0+cu118
-   CUDA Available: True
-   spectraMR installed successfully!
-
-Dataset Setup
-=============
-
-The framework supports multiple MRI datasets. We'll demonstrate with **FastMRI** (publicly available).
-
-Option 1: FastMRI Dataset (Recommended for Beginners)
-------------------------------------------------------
-
-1. **Register and Download**:
-
-   - Visit `fastMRI <https://fastmri.med.nyu.edu/>`_
-   - Create an account and accept the data usage agreement
-   - Download the **Brain** dataset (multicoil training data)
-
-2. **Organize Data**:
-
-   .. code-block:: bash
-
-      # Create directories
-      mkdir -p databases/fastmri/datasets
-
-      # Extract downloaded data
-      # Assuming you downloaded to ~/Downloads/
-      tar -xzf ~/Downloads/brain_multicoil_train.tar.gz -C databases/fastmri/datasets/
-      tar -xzf ~/Downloads/brain_multicoil_val.tar.gz -C databases/fastmri/datasets/
-
-   Expected structure::
-
-      databases/
-      └── fastmri/
-          └── datasets/
-              ├── multicoil_brain_train/
-              │   ├── file_brain_AXT1_200_2000001.h5
-              │   ├── file_brain_AXT1_200_2000002.h5
-              │   └── ...
-              └── multicoil_brain_val/
-                  └── ...
-
-3. **Generate Dataset Index**:
-
-   .. code-block:: bash
-
-      # Create manifests directory
-      mkdir -p data/manifests
-
-      # Run preprocessing to generate index
-      python scripts/data/regenerate_cluster_manifests.py \\
-          --data-base databases \\
-          --datasets fastmri_brain
-
-Option 2: M4Raw Dataset
-------------------------
-
-M4Raw is another excellent dataset for rapid prototyping.
-
-.. code-block:: bash
-
-   # Fetch M4Raw from its own release (CC-BY-4.0) and unpack it under
-   # databases/m4raw/ -- see https://doi.org/10.5281/zenodo.8056074
-   #
-   # Then build the manifests:
-   python scripts/data/regenerate_cluster_manifests.py \\
-       --data-base databases \\
-       --datasets m4raw
-
-Option 3: Using Sample Data (Quick Start)
-------------------------------------------
-
-For testing without downloading large datasets. To *train* on a synthetic set
-rather than merely probe one, :doc:`tutorials/first_reconstruction` builds a
-phantom dataset from scratch in about twenty lines.
-
-.. code-block:: bash
-
-   # Exercise a config end to end without any dataset at all: the Tier-2
-   # probe synthesises its own batch, builds the model, and runs a forward
-   # and backward pass through it.
-   spectramr audit experiments/templates/comprehensive_config_template.yaml --probe
-
-Your First Experiment
-======================
-
-We'll train a basic U-Net for MRI reconstruction with 4× acceleration.
-
-Step 1: Understand the Configuration
--------------------------------------
-
-Experiments are defined using YAML configuration files. Let's examine a simple configuration:
+An experiment is one YAML file. Nothing else — there is no per-experiment Python
+to write. Save the following as ``my_first_run.yaml``. It trains a complex-valued
+U-Net to reconstruct 4×-undersampled Cartesian k-space from the M4Raw dataset,
+and it completes in well under a minute on one GPU.
 
 .. code-block:: yaml
-   :caption: experiments/configs/quickstart_basic_reconstruction.yaml
 
-   config_version: '6.0'
+   config_version: '1.0'
+
+   run:
+     device: cuda
+     seed: 42
+
+   workflow:
+     regime: mri_structural
+     task: reconstruction
+
    model:
-     model_type: standard_unet
+     model_type: complex_unet
      in_channels: 2
      out_channels: 2
-
-   training:
-     task: reconstruction
-     input_domain: image
-     output_domain: image
-     strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
-     max_iterations: 10000
-     epochs: 10
-     device: cuda
+     spatial_dims: 2
 
    data:
-     dataset_type: kspace
-     data_root: databases/fastmri/datasets
+     dataset_type: m4raw
+     trajectory: cartesian
+     coils:
+       processing_mode: rss
+     target_mode: phase_aligned_mean
+     pairing:
+       single_contrast: true
      datasets:
-       - name: fastmri_train
-         path: databases/fastmri/datasets/multicoil_train
-     index_path: data/manifests/fastmri_brain_multicoil_train.json
-     batch_size: 4
+       - name: m4raw_multicoil
+         path: databases/m4raw/data/multicoil_train
+     split:
+       type: auto
+       validation_fraction: 0.15
+     processing:
+       data_range: 70.0
+     sampling:
+       patch_size: [256, 256, 1]
+       samples_per_volume: 4
+       queue_length: 32
+     loader:
+       batch_size: 1
+       num_workers: 2
 
-   acceleration:
-     base_acceleration: 4
+   undersampling:
+     base_acceleration: 4.0
      center_fraction: 0.08
      acceleration_type: cartesian_vd
 
+   training:
+     task: reconstruction
+     input_domain: kspace
+     output_domain: kspace
+     strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
+     epochs: 1
+     output_dir: experiments/results/my_first_run
+
    optimization:
-     optimizer_type: adam
-     learning_rate: 0.0001
+     optimizer:
+       type: adam
+       learning_rate: 0.0001
 
-**Key Parameters:**
+   validation:
+     schedule:
+       on_epoch: true
+       interval_epochs: 1
 
-- ``model_type: standard_unet`` - Using U-Net architecture
-- ``in_channels: 2`` - Real and imaginary k-space components
-- ``training_mode: reconstruction`` - Direct image reconstruction (not generative)
-- ``acceleration: 4`` - 4× undersampling (keep 25% of k-space data)
-- ``center_fraction: 0.08`` - Keep 8% of central k-space (important low-frequency data)
+   logging:
+     identity:
+       experiment: my_first_run
+     intervals:
+       log: 10
+       save: 5
 
-Step 2: Run Your First Training
---------------------------------
+   losses:
+     image_losses:
+       - name: l1
+         weight: 1.0
+     policy:
+       output_domain: kspace
+     reconstruction:
+       warmup_iterations: 0
+
+   metrics:
+     compute: [psnr, ssim]
+     train_metric_interval: 6
+
+   checkpoint:
+     checkpoint_dir: experiments/results/my_first_run/checkpoints
+
+What these keys do
+------------------
+
+``config_version: '1.0'``
+   The configuration schema version. It is required, and ``'1.0'`` is the
+   current one.
+
+``run.device`` / ``run.seed``
+   Where the run executes and what seeds it. ``run`` is the canonical home for
+   both.
+
+``workflow.regime`` / ``workflow.task``
+   What kind of imaging problem this is. Both are closed vocabularies. Declaring
+   them buys extra validation: the checker can then reject a component that does
+   not belong in this regime.
+
+``model.model_type``
+   The registered model to build. ``complex_unet`` is registered as a *k-space*
+   model, which is the domain this data route produces — so the model consumes
+   the loader's output directly and no adapter chain is needed.
+   ``in_channels``/``out_channels`` are ``2`` because one complex coil is carried
+   as interleaved real and imaginary channels.
+
+   Choosing a model whose registered domain matches your data is the difference
+   between a configuration that runs and one that needs a bridge. The domain each
+   model declares is in :doc:`model_capabilities`.
+
+``data.datasets`` and ``data.split``
+   Point at a directory of ``.h5`` files and let ``split.type: auto`` carve a
+   validation fraction out of it. This is the simplest data route; a manifest
+   file (``data.source.index_path``) is the alternative and is described under
+   `Using a manifest instead of a directory`_.
+
+``data.coils.processing_mode: rss``
+   How the four receive coils are combined. ``rss`` reduces them to one complex
+   coil, which is what makes ``in_channels: 2`` correct.
+
+``data.pairing.single_contrast: true``
+   Pair each volume with itself rather than with a second contrast. Without it
+   the loader concatenates two contrasts along the channel axis and hands the
+   model twice the channels it declares.
+
+``data.sampling.patch_size``
+   The patch the queue extracts. It must fit inside the volume: M4Raw is
+   256×256, and the default ``[320, 320, 1]`` matches nothing, so every subject
+   is filtered out and the run ends with an empty sampler.
+
+``data.processing.data_range``
+   The intensity range the range-sensitive metrics measure against. M4Raw
+   magnitudes are not normalised to ``[0, 1]``, and ``psnr``/``ssim`` refuse to
+   infer a range from unnormalised data — they report ``NaN`` with a
+   ``NOT APPLICABLE`` warning rather than guessing. Declaring the range makes
+   them compute.
+
+``undersampling``
+   The retrospective acceleration applied to fully sampled data.
+   ``base_acceleration: 4.0`` keeps a quarter of the phase-encode lines;
+   ``center_fraction: 0.08`` always keeps the central 8 %, which carries the
+   low-frequency content.
+
+``training.strategy_class``
+   The training loop to run. Reconstruction is one strategy among many — see
+   :doc:`strategies_reference`.
+
+``training.output_dir``
+   Where checkpoints, logs and reports land. It must begin with
+   ``experiments/results/``; the health checker warns otherwise, and a warning
+   fails the audit.
+
+``validation.schedule``
+   When validation runs. ``on_epoch: true`` with ``interval_epochs: 1``
+   validates at the end of every epoch. A run that never validates has no
+   ``val_*`` metrics and no best-metric checkpoint.
+
+``losses.reconstruction.warmup_iterations: 0``
+   **This line is load-bearing.** Several losses, ``l1`` among them, are ramped
+   in over a warmup period that defaults to 1000 iterations. A configuration
+   that declares only ``l1`` and leaves the default therefore has *zero
+   gradient* for its first 1000 steps. Setting the warmup to ``0`` makes the
+   loss live from step one.
+
+``losses.policy.output_domain``
+   Required whenever you configure losses as lists
+   (``image_losses`` / ``kspace_losses`` / ``complex_losses``). It states the
+   domain the losses are evaluated in.
+
+``metrics.compute``
+   The metrics to compute, by registered name. Names are validated against the
+   registry, so a typo raises instead of silently computing nothing.
+
+``metrics.train_metric_interval``
+   How often training metrics are computed. It must be small enough to fire
+   inside your iteration budget — the pipeline says so explicitly when it is
+   not.
+
+``checkpoint.checkpoint_dir``
+   Keeps checkpoints inside the run directory. Without it they are written to
+   ``./checkpoints``, outside the run, where an artifact bundle will not collect
+   them.
+
+Every key, with its default and its type, is in
+:doc:`config_schema_reference`.
+
+Check it before you run it
+==========================
+
+Run the audit before you spend GPU hours:
 
 .. code-block:: bash
 
-   # Activate environment
-   conda activate spectramr
+   spectramr audit my_first_run.yaml --probe
 
-   # Train the model
-   python -m spectramr.cli train --config experiments/templates/comprehensive_config_template.yaml
+The audit loads the configuration, resolves every component you named, and runs
+the full health-check suite over the result. With ``--probe`` it goes further: it
+synthesises a batch, builds the model, and runs a real forward and backward pass
+on the accelerator. **The probe needs no dataset** — it does not read one — so
+this works before you have downloaded anything, and equally so it cannot tell
+you whether your data route resolves. A green ``--probe`` says the model builds
+and its gradients flow; only ``train`` says the loader agrees.
 
-**What to expect:**
+A clean run ends like this:
 
 .. code-block:: text
 
-   [2024-12-26 10:30:00] INFO - Loading configuration from experiments/templates/comprehensive_config_template.yaml
-   [2024-12-26 10:30:01] INFO - Initializing DI container...
-   [2024-12-26 10:30:02] INFO - Loading dataset: fastmri_brain
-   [2024-12-26 10:30:05] INFO - Dataset loaded: 5000 training samples, 500 validation samples
-   [2024-12-26 10:30:06] INFO - Model initialized: Mamba (2.4M parameters)
-   [2024-12-26 10:30:07] INFO - Starting training...
+   ✅ [strategy_class_matches_training_mode] strategy_class and training_mode agree
+   ✅ [validation_metric_names_resolve] all 1 validation/selector name(s) resolve (strategy ReconstructionTrainingStrategy)
+   ✅ [tier2_probe_accelerated] Tier-2 probe runs accelerated on cuda (source=run.device).
+   ✅ [tier2_probe] complex_unet: forward (1, 2, 256, 256) -> (1, 2, 256, 256) + backward OK on cuda.
 
-   Epoch 1/100:
-   [=====>                    ] 20% | Loss: 0.0245 | PSNR: 28.3 dB
+Read the exit code, not the volume of output:
 
-**Training will output:**
+- **0** — every check passed.
+- **2** — at least one check failed *or* warned. Warnings are not tolerated:
+  the audit runs strict, because a passed-with-warnings run is how dropped
+  losses and validation-time OOM reach a cluster queue.
 
-- Checkpoints: ``experiments/results/comprehensive_experiment_template/checkpoints/``
-- Logs: ``experiments/results/comprehensive_experiment_template/logs/``
-- Visualizations: ``experiments/results/comprehensive_experiment_template/visualizations/``
+The audit also prints advisory lines marked ``📌`` and ``💡``. Those are
+recommendations, not failures — they do not change the exit code.
 
-Step 3: Monitor Training
--------------------------
+Two failures are worth recognising on sight:
 
-**Option A: Real-time with Weights & Biases**
+``domain_alignment``
+   The channel count your model declares does not match what the adapter chain
+   and coil handling actually produce. This one aborts the run before any GPU
+   memory is allocated, which is the difference between a five-second failure
+   and a five-hour one.
 
-If you have W&B enabled in your config (``logging.enable_wandb: true``):
+``the CONFIGURED loss g_total_loss is 0.0 at iteration 0``
+   The probe computed your loss and got zero gradient. Usually the warmup trap
+   described above.
 
-1. Create a free account at `wandb.ai <https://wandb.ai/>`_
-2. Log in:
+``spectramr train --config my_first_run.yaml --dry-run`` is the lighter check:
+it resolves the configuration and builds the services, then stops without
+training. It does not run the probe. :doc:`audit_ladder_user_guide` describes
+the audit's tiers in full.
 
-   .. code-block:: bash
-
-      wandb login
-
-3. View training at: ``https://wandb.ai/<your-username>/spectramr_research``
-
-**Option B: TensorBoard**
-
-.. code-block:: bash
-
-   # In a separate terminal
-   tensorboard --logdir experiments/results/comprehensive_experiment_template/logs
-
-   # Open browser to: http://localhost:6006
-
-**Option C: Console Output**
-
-Training metrics are printed to console every ``log_interval`` iterations (default: 25).
-
-Step 4: Run Inference
-----------------------
-
-Once training completes, run inference on test data:
-
-.. code-block:: bash
-
-   python -m spectramr.cli infer \\
-       --config experiments/templates/comprehensive_config_template.yaml \\
-       --checkpoint experiments/results/comprehensive_experiment_template/checkpoints/best.pt \\
-       --input databases/fastmri/datasets/multicoil_brain_val \\
-       --output output/inference_results
-
-Step 5: Evaluate Results
--------------------------
-
-.. code-block:: bash
-
-   spectramr report --exp-dir experiments/results/comprehensive_experiment_template
-
-**Expected output:**
-
-.. code-block:: text
-
-   Evaluation Results:
-   ├── PSNR: 32.5 ± 2.1 dB
-   ├── SSIM: 0.89 ± 0.04
-   └── MSE: 0.0012 ± 0.0003
-
-Next Steps
-==========
-
-Now that you've run your first experiment, explore:
-
-1. **Different Model Architectures**:
-
-   - Try a GAN: ``experiments/configs/e2e_gan_super_resolution_mri.yaml``
-   - Try diffusion: ``experiments/active/experiment_31_consistency_distillation.yaml``
-
-2. **Advanced Topics**:
-
-   - :doc:`user_guide` - Deep dive into the framework
-   - :doc:`tutorials/index` - Step-by-step tutorials
-
-3. **Custom Development**:
-
-   - Tutorial 05 (Custom Loss) — coming soon in the next release
-
-Common Issues
+Get some data
 =============
 
-Issue: CUDA Out of Memory
---------------------------
+The framework reads HDF5 and NIfTI volumes. Two public datasets are convenient
+starting points.
 
-**Symptom:**
+M4Raw
+-----
 
-.. code-block:: text
+M4Raw is small, openly licensed (CC-BY-4.0), and needs no registration — the
+quickest route to a real training run. Fetch it from
+`its Zenodo record <https://doi.org/10.5281/zenodo.8056074>`_ and unpack it so
+the multicoil training volumes sit at ``databases/m4raw/data/multicoil_train/``.
+That is the path the configuration above already names.
 
-   RuntimeError: CUDA out of memory. Tried to allocate 512.00 MiB
+FastMRI
+-------
 
-**Solutions:**
+`fastMRI <https://fastmri.med.nyu.edu/>`_ requires an account and acceptance of
+a data-usage agreement. Download the brain multicoil training set and unpack it.
 
-1. Reduce batch size in config:
+Using a manifest instead of a directory
+---------------------------------------
 
-   .. code-block:: yaml
-
-      training:
-        batch_size: 2  # Reduce from 16
-
-2. Reduce image size:
-
-   .. code-block:: yaml
-
-      data:
-        img_size: [256, 256]  # Reduce from [320, 320]
-
-3. Enable gradient checkpointing (trades compute for memory):
-
-   .. code-block:: yaml
-
-      optimization:
-        use_gradient_checkpointing: true
-
-4. Use mixed precision training (already enabled in most configs):
-
-   .. code-block:: yaml
-
-      optimization:
-        use_amp: true  # Automatic Mixed Precision
-
-Issue: Dataset Not Found
--------------------------
-
-**Symptom:**
-
-.. code-block:: text
-
-   FileNotFoundError: Manifest not found: data/manifests/fastmri_brain_multicoil_train.pkl
-
-**Solution:**
-
-Generate the dataset index:
+``data.datasets`` discovers the corpus from the directory. A *manifest* indexes
+it once instead, recording each volume's path and shape, which makes the corpus
+a fixed, reviewable list rather than whatever the directory holds today. From a
+clone:
 
 .. code-block:: bash
 
-   python scripts/data/regenerate_cluster_manifests.py \\
-       --data-base databases \\
-       --datasets fastmri_brain
+   python scripts/data/regenerate_cluster_manifests.py \
+       --data-base databases \
+       --datasets m4raw_multicoil_train
 
-Issue: Slow Training
----------------------
+Pass ``--datasets`` one or more logical dataset names, or omit it to regenerate
+every dataset found under ``--data-base``. Each writes a JSON file under
+``data/manifests/``; ``--dry-run`` reports what would be written without writing
+it. Point the configuration at the result by replacing the ``datasets``/``split``
+block with:
 
-**Symptom:**
+.. code-block:: yaml
 
-Training takes > 1 minute per iteration.
+   data:
+     source:
+       root: databases/m4raw/data
+       index_path: data/manifests/m4raw_train.json
 
-**Solutions:**
+Train
+=====
 
-1. **Enable data caching** (loads full dataset into RAM):
+.. code-block:: bash
 
-   .. code-block:: yaml
+   spectramr train --config my_first_run.yaml
 
-      data:
-        caching:
-          strategy: full  # Options: none, partial, full
+The run finishes with a summary line, and everything it produced lands under
+``training.output_dir``:
 
-2. **Increase num_workers** (parallel data loading):
+=========================  ==================================================
+``checkpoints/``           ``checkpoint_epoch_<E>_step_<S>.pt``; a
+                           ``checkpoint_best.pt`` appears once more than one
+                           validation event has been scored
+``logs/``                  ``training_metrics.csv`` and
+                           ``validation_metrics.csv``
+``resolved_config.json``   the fully resolved configuration, as run
+``provenance.json``        run id, seed, device, config hash, git state
+``final_metrics.json``     the metric values the run ended on
+``debug_snapshots/``       input, prepared input and target for the first
+                           steps, so you can see what the model was fed
+``analysis/``              gradient logs
+``report/``                written by ``spectramr report`` (below)
+=========================  ==================================================
 
-   .. code-block:: yaml
+Each of ``resolved_config.json`` and ``provenance.json`` is also written with a
+per-run suffix, so a directory reused across runs keeps every run's record
+rather than overwriting it.
 
-      data:
-        num_workers: 8  # Set to number of CPU cores
+``resolved_config.json`` is the one to keep. It records every value the run
+actually used, defaults included, so a result stays reproducible even after you
+edit the YAML. :doc:`run_provenance_and_logging` describes what is stamped and
+where.
 
-3. **Pin memory** (faster GPU transfer):
+Useful flags on ``train``:
 
-   .. code-block:: yaml
+``--resume auto``
+   Continue from the latest checkpoint in the output directory.
 
-      data:
-        pin_memory: true
+``--override KEY=VALUE`` (``-O``)
+   Change one value without editing the file, e.g.
+   ``-O optimization.optimizer.learning_rate=0.0005``. Repeatable.
 
-Issue: NaN Loss
-----------------
+``--device cpu``
+   The explicit opt-out from the accelerated-run contract.
 
-**Symptom:**
+Watch it train
+==============
 
-.. code-block:: text
+**Console.** Metrics print every ``logging.intervals.log`` iterations.
 
-   Epoch 3, Iteration 150: Loss = nan
+**TensorBoard.** Tracking is on by default
+(``logging.tracking.service`` defaults to ``tensorboard``). The writer logs to a
+``tensorboard/`` directory beside the run's other output — the run log names the
+exact path as it starts:
 
-**Solutions:**
+.. code-block:: bash
 
-1. Reduce learning rate:
+   tensorboard --logdir experiments/results/my_first_run/tensorboard
 
-   .. code-block:: yaml
+Set ``logging.tracking.service: none`` to turn it off. Those two are the whole
+vocabulary — there is no third tracking backend.
 
-      optimization:
-        learning_rate: 0.00001  # 10× smaller
+**CSV.** ``logs/training_metrics.csv`` accumulates every logged metric and is
+what ``spectramr report`` reads.
 
-2. Enable gradient clipping:
+If throughput rather than correctness is the problem,
+:doc:`training_throughput` covers the knobs that move it.
 
-   .. code-block:: yaml
-
-      optimization:
-        clip_grad_norm: 1.0
-
-3. Check data normalization:
-
-   .. code-block:: yaml
-
-      data:
-        normalize_images: true
-        normalization: znorm  # or minmax
-
-Config Validation (--dry-run)
+Predict with the trained model
 ==============================
 
-Before committing a long GPU run, validate your YAML configuration in
-seconds using the ``--dry-run`` flag. This runs the full
-:class:`~spectramr.infrastructure.validation.config_health_checker.ConfigHealthChecker`
-pipeline without instantiating models or loading data:
+.. code-block:: bash
+
+   spectramr infer \
+       --checkpoint experiments/results/my_first_run/checkpoints/checkpoint_epoch_<E>_step_<S>.pt \
+       --input <directory of input volumes> \
+       --output output/my_first_run
+
+``ls`` the ``checkpoints/`` directory and substitute the file you want.
+A ``checkpoint_best.pt`` is written there instead once more than one
+validation event has been scored.
+
+``--config`` is optional here: the checkpoint's run directory carries
+``resolved_config.json``, and ``infer`` reads it unless you pass ``--from-yaml``.
+That is the reproducible path — it uses the settings the checkpoint was trained
+with, not whatever the YAML says today.
+
+``infer`` reads each input volume directly, so **the files you point it at must
+already carry the channel layout the model expects.** It applies no coil
+combination of its own: a checkpoint trained on RSS-combined data
+(``in_channels: 2``) needs single-coil input, and a raw multi-coil volume is
+rejected with a message naming both counts rather than being reshaped to fit.
+Training-time coil handling belongs to ``data.coils.processing_mode``, and it
+runs in the data pipeline, not here.
+
+Report on the results
+=====================
 
 .. code-block:: bash
 
-   python -m spectramr.cli train --config <your-arm>.yaml --dry-run
+   spectramr report --exp-dir experiments/results/my_first_run
 
-**Example output:**
+This reads the run's metric CSVs and writes into
+``experiments/results/my_first_run/report/``: ``figures/`` (each figure as both
+PNG and PDF, with a ``.meta.json`` beside it), ``report_summary.md``,
+``qc_report.html`` and ``report_manifest.json``. It reports how many figures and
+tables it produced, and says which figures it declined to draw and why — a
+metric with no spread across cases is not plotted as a distribution.
 
-.. code-block:: text
+Add ``--recursive`` to treat the directory as a cohort root and report on every
+run beneath it. :doc:`reporting` covers the figure set and the ``reporting:``
+configuration block.
 
-   ✅ [required_section] Section 'data' present
-   ✅ [required_section] Section 'model' present
-   ✅ [model_registry] model_type='kspace_cold_diffusion' registered
-   ✅ [strategy_registry] strategy='.DiffusionTrainingStrategy' → valid strategy
-   ✅ [domain_alignment] model.in_channels=8 matches expected=8
-        (coil_processing_mode='svd' with num_virtual_coils=4 → 2×4)
-   ⚠️  [physics_config] physics config is inert for k-space strategy='DiffusionTrainingStrategy'
-        (dataset_type='kspace'): physics.data_consistency.enabled is False and no
-        undersampling: block is declared. Nothing constrains the reconstruction to the
-        acquired measurements. This may be intentional for a denoising/restoration arm
-        whose degradation is not k-space undersampling — verify before treating this as a bug.
-   Config Health: 6/7 checks passed
+Where to go next
+================
 
-The checks run are:
+**Learn the framework by example.** The :doc:`tutorials/index` build on this
+page: :doc:`tutorials/tutorial_01_basic_reconstruction` takes the reconstruction
+arm further, and :doc:`tutorials/tutorial_02_gan_super_resolution`,
+:doc:`tutorials/tutorial_03_diffusion_training` and
+:doc:`tutorials/tutorial_04_physics_constraints` each swap in a different
+paradigm.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 30 15 55
+**Change what you configure.** :doc:`models_reference` and
+:doc:`model_capabilities` list the models and what each one can do;
+:doc:`strategies_reference`, :doc:`losses_reference` and
+:doc:`metrics_reference` do the same for the other registries.
+:doc:`config_schema_reference` is the exhaustive key reference.
 
-   * - Check Name
-     - Severity
-     - Description
-   * - ``required_section``
-     - Error
-     - Ensures data, model, training, optimization, logging are all present
-   * - ``model_registry``
-     - Error
-     - Verifies ``model.model_type`` is registered in the ``ModelFactory``
-   * - ``strategy_registry``
-     - Error
-     - Verifies ``training.strategy_class`` or ``training.training_mode`` resolves
-   * - ``domain_alignment``
-     - Error
-     - Pre-flight channel count check: derives expected ``in_channels`` from
-       ``coil_processing_mode`` × ``num_virtual_coils`` and compares to
-       ``model.in_channels`` / ``model.out_channels``
-   * - ``loss_weights``
-     - Warning
-     - Warns if all reconstruction loss weights are 0.0
-   * - ``physics_config``
-     - Info
-     - Flags a k-space diffusion/reconstruction arm whose ``physics:`` block is
-       present but inert (``physics.data_consistency.enabled`` is ``False`` and no
-       ``undersampling:`` block is declared) — advisory, since this is sometimes a
-       deliberate no-physics denoising/restoration control
+**Run more than one experiment.** :doc:`hpo_guide` covers hyper-parameter
+search, :doc:`execution_modes` and :doc:`running_pipelines` cover the other CLI
+verbs, and :doc:`distributed_training` covers multi-GPU and multi-node runs.
 
-.. admonition:: Domain Alignment is a Hard Failure
-   :class: warning
+**Extend it.** :doc:`tutorials/tutorial_05_custom_loss` registers a loss of your
+own, and :doc:`plugins` loads components from outside the source tree.
+:doc:`scripting_api` is the Python entry point for anything the CLI does not
+cover.
 
-   If ``domain_alignment`` emits an **error**, the training pipeline aborts
-   immediately — before any GPU memory is allocated. This prevents silent
-   dimension mismatch crashes after hours of training.
-
-   Fix by aligning ``model.in_channels`` with
-   ``data.coil_processing_mode`` × ``data.num_virtual_coils``.
-
-Additional Resources
-====================
-
-- **User guide**: :doc:`user_guide`
-- **API reference**: :doc:`scripting_api`
-- **GitHub Issues**: `Report bugs <https://github.com/adnaneGdihi/spectramr/issues>`_
-
-Quick Reference Commands
-=========================
-
-.. code-block:: bash
-
-   # Training
-   python -m spectramr.cli train --config <path-to-yaml>
-
-   # Inference
-   python -m spectramr.cli infer --config <config> --checkpoint <checkpoint> --input <dir> --output <dir>
-
-   # Evaluation
-   spectramr report --exp-dir <experiment-output-dir>
-
-   # Hyperparameter optimization
-   python -m spectramr.tools.tune --config <config> --trials 50
-
-   # Dry run (config validation)
-   python -m spectramr.cli train --config <config> --dry-run
-
-   # View logs
-   tensorboard --logdir experiments/<experiment-name>/logs
-
-   # Run tests
-   pytest tests/
-
-   # Build documentation
-   cd docs && make html
-
-What's Next?
-============
-
-You're ready to explore! Here are suggested learning paths:
-
-**Path 1: Reconstruction Specialist**
-
-1. Complete this getting started guide ✓
-2. Try :doc:`tutorials/tutorial_01_basic_reconstruction`
-3. Experiment with different acceleration factors (2×, 4×, 8×)
-4. Compare U-Net vs Transformer vs Mamba architectures
-
-**Path 2: Generative Models Researcher**
-
-1. Complete this getting started guide ✓
-2. Understand diffusion models: :doc:`tutorials/tutorial_03_diffusion_training`
-3. Train a GAN: :doc:`tutorials/tutorial_02_gan_super_resolution`
-4. Advanced: Try Rectified Flow (InstaFlow) for 1-step generation
-
-**Path 3: Physics-Informed ML**
-
-1. Complete this getting started guide ✓
-2. Tutorial: :doc:`tutorials/tutorial_04_physics_constraints`
-3. Experiment: ``experiments/active/experiment_41_physics_informed_motion_networks_pimn.yaml``
-
-Welcome to spectraMR! 🚀
+**When something breaks.** :doc:`troubleshooting` is organised by the error
+message you actually saw. :doc:`known_limitations` records what this release
+does not do.

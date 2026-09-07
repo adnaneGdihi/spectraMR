@@ -546,3 +546,58 @@ class TestUNetPreservesInputSpatialSize:
         out = model(x)
         out = out[0] if isinstance(out, tuple) else out
         assert out.shape[-2:] == x.shape[-2:]
+
+
+class TestUNetDiscardsEveryDataConsistencyKwarg:
+    """UNet has no DC layer, so it must drop the whole ``DC_SSOT_KEYS`` set.
+
+    ``generator_kwargs`` step 3c forwards every row of
+    :data:`~spectramr.infrastructure.physics.dc_settings.DC_SSOT_KEYS` into any
+    generator whose constructor takes ``**kwargs`` — unconditionally, without
+    consulting ``physics.data_consistency.enabled``. UNet accepts those kwargs
+    only to throw them away, so its discard set has to be the table itself
+    (non-negotiable 17: one owner), not a hand-copied subset of it.
+    """
+
+    @staticmethod
+    def _dc_kwargs_from_schema_defaults() -> dict:
+        """What step 3c forwards for a config that declares no ``physics:``."""
+        from spectramr.config.schemas.physics import DataConsistencyConfig
+        from spectramr.infrastructure.physics.dc_settings import ssot_pairs
+
+        return dict(ssot_pairs(DataConsistencyConfig()))
+
+    def test_default_physics_block_does_not_break_construction(self):
+        # REGRESSION: DC_SSOT_KEYS grew the three noise keys, and UNet's
+        # hand-written pop-list did not grow with it, so every ``standard_unet``
+        # arm raised "Unexpected keyword argument 'train_noise_level' for
+        # UNetConfig" at build time — including the 121 arms that declare no
+        # physics block at all and the 24 that declare enabled: false.
+        from spectramr.models.reconstruction.unet import UNet
+
+        model = UNet(in_channels=1, out_channels=1, **self._dc_kwargs_from_schema_defaults())
+        assert model.config.in_channels == 1
+
+    def test_every_ssot_row_is_discarded(self):
+        """Each row on its own, so a seventh row cannot land unhandled.
+
+        This pin cannot go red by *addition* any more, and that is the point:
+        UNet derives its discard set from ``DC_SSOT_KEYS`` rather than
+        restating it, so growing the table grows the discard set. It goes red
+        if someone reintroduces a hand-written list.
+        """
+        from spectramr.infrastructure.physics.dc_settings import DC_SSOT_KEYS
+        from spectramr.models.reconstruction.unet import UNet
+
+        forwarded = self._dc_kwargs_from_schema_defaults()
+        for kwarg, _field in DC_SSOT_KEYS:
+            UNet(in_channels=1, out_channels=1, **{kwarg: forwarded[kwarg]})
+
+    def test_an_unknown_kwarg_still_raises(self):
+        """The discard set widened; the strict check did not go away."""
+        import pytest
+
+        from spectramr.models.reconstruction.unet import UNet
+
+        with pytest.raises(TypeError, match="not_a_unet_field"):
+            UNet(in_channels=1, out_channels=1, not_a_unet_field=1)

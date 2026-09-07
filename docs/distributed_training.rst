@@ -39,11 +39,11 @@ with ``strategy``:
      fsdp:
        enabled: true          # must equal (strategy == 'fsdp')
 
-Declaring only one half raises at load time. They used to be **independent**
-switches, which produced opposite failures depending on which you set:
-``strategy: 'fsdp'`` raised ``ValueError`` after the whole training environment
-had been built, while ``strategy: 'none'`` + ``fsdp.enabled: true`` silently
-sharded. The reference template advertised the first spelling.
+Declaring only one half raises at load time. The agreement is checked when the
+config loads rather than at dispatch, so a mismatch can never reach the point
+where ``strategy: 'none'`` with ``fsdp.enabled: true`` would silently shard, or
+where ``strategy: 'fsdp'`` alone would raise only after the whole training
+environment had been built.
 
 Launching
 ---------
@@ -56,18 +56,18 @@ Launching
    # ddp, fsdp, deepspeed
    torchrun --nproc_per_node=4 -m spectramr.cli train-distributed --config <arm>.yaml
 
-The launcher does **not** rewrite ``parallel.strategy``. It used to force it to
-``"ddp"`` on every distributed launch, which is what made ``fsdp`` and
-``deepspeed`` unreachable from this entry point: the declaration was overwritten
-before dispatch ever saw it. ``num_devices``/``num_nodes`` *are* overwritten,
-because those are observed facts about the launcher rather than declarations.
+The launcher does **not** rewrite ``parallel.strategy``. Forcing it to ``"ddp"``
+on every distributed launch would make ``fsdp`` and ``deepspeed`` unreachable
+from this entry point, overwriting the declaration before dispatch ever saw it.
+``num_devices``/``num_nodes`` *are* overwritten, because those are observed
+facts about the launcher rather than declarations.
 
 There is no auto-detection. A config that names a strategy will not start a
 process group on its own, and forgetting ``torchrun`` is an **error** for every
 process-group-backed strategy -- not a fallback. That matters more than it
-sounds: FSDP used to warn and return the *unwrapped* model, so the run completed,
-reported success, and stamped ``fsdp`` into its own provenance while never having
-sharded anything.
+sounds: a warn-and-continue FSDP path returns the *unwrapped* model, so the run
+completes, reports success, and stamps ``fsdp`` into its own provenance while
+never having sharded anything.
 
 ``--nproc_per_node`` is checked against the allocation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -233,6 +233,13 @@ Install the extra first (it is deliberately excluded from ``[all]``):
 
    pip install -e '.[deepspeed]'
 
+.. warning::
+
+   **ZeRO does nothing at ``world_size=1``.** ZeRO partitions optimizer state
+   (and, from stage 2, gradients) *across data-parallel ranks*; with a single
+   rank there is nothing to partition, so the run pays the engine's overhead
+   for no saving. Raise the GPU count to make the sharding do any work.
+
 **There is no ``config_path``.** The schema is the source of truth and the
 ``ds_config`` dict is derived from it by ``build_deepspeed_config``, written
 beside the run's provenance. A hand-edited ``ds_config.json`` is a
@@ -387,9 +394,9 @@ when the file has no ``generator`` key, and
 :meth:`~spectramr.infrastructure.builders.directors.checkpoint_director.CheckpointDirector.with_parallel_runtime`
 is what supplies that adapter. **A director built without it resolves**
 ``DefaultCheckpointAdapter`` **and cannot read any sharded strategy's
-checkpoint** -- which is how ``early_stopping.restore_best_weights`` used to
-fail a finished DeepSpeed run with ``KeyError('generator')``, discarding the best
-weights while they sat on disk. Every director that saves *or* loads must be
+checkpoint** -- which is how ``early_stopping.restore_best_weights`` fails a
+finished DeepSpeed run with ``KeyError('generator')``, discarding the best
+weights while they sit on disk. Every director that saves *or* loads must be
 handed the run's ``ParallelRuntime``.
 
 Three consequences worth stating. The tag directory is the only source of ZeRO
@@ -462,71 +469,6 @@ Both declare ``metadata.baseline: b1_structural_recon_m4raw``, so the pair is a
 genuine single-knob comparison: sharding must not change what is optimised, and
 a seed-matched b1/b2 run at ``world_size=1`` is the cheapest check that it did
 not.
-
-Cohort rollout: ``kspace_filling``
-----------------------------------
-
-All 58 arms under ``experiments/inprogress/kspace_filling/`` declare ZeRO-2,
-added by ``scripts/migrations/add_deepspeed_parallel_block.py``. The script is
-the sanctioned path rather than a hand edit because it verifies the b3 premise
-per file — resolve, insert, resolve, deep-diff, and **restore unless every
-differing path starts with** ``parallel``. A rollout that quietly moved a
-learning rate would otherwise be indistinguishable from one that did not until
-the runs disagreed.
-
-Two places it deliberately departs from b3, both of which a reviewer diffing the
-two files will otherwise try to "fix":
-
-**It leaves precision alone.** b3 declares ``bfloat16``; the cohort runs fp32
-(``optimization.precision.enabled: false``) and stays there. Flipping 58
-controlled arms to bf16 changes their numerics, which is the one thing the b3
-premise forbids. It is also sufficient: ``resolve_amp_precision`` returns
-``enabled=False``, so ``build_deepspeed_config`` emits neither an ``fp16`` nor a
-``bf16`` block and the complex+fp16 engine-side cast cannot arise. bf16 remains
-available as a later cohort-wide decision — but it is a science change, not a
-sharding one.
-
-**It compiles nothing.** DeepCompile stays off (it is an audit error alongside
-``optimization.compile``, which the cohort pins to ``false``), and
-``offload_optimizer: none`` additionally avoids DeepSpeedCPUAdam's JIT build.
-Since the engine adopts the optimizer ``OptimizationBuilder`` already
-constructed, no fused optimizer is compiled either. The only compilation left is
-DeepSpeed's own op build at ``pip install -e '.[deepspeed]'`` time, which needs
-nvcc and is why the extra is excluded from ``[all]``.
-
-.. warning::
-
-   **``--gpus=1`` makes this inert.** ZeRO-2 partitions optimizer state and
-   gradients *across data-parallel ranks*; at ``world_size=1`` there is nothing
-   to partition, so the arm pays the engine's overhead for no saving. The two
-   cohort submitters (``submit_exp11_fpk_ablation.sbatch``,
-   ``submit_exp11_ema_warmup_ablation.sbatch``) still request one GPU and derive
-   ``--nproc_per_node`` from ``SLURM_GPUS_ON_NODE``, so they run correctly —
-   raise ``--gpus`` to make the sharding do any work.
-
-Both submitters were switched from ``cli train`` to
-``torchrun … cli train-distributed`` in the same change, because a
-process-group strategy without its launcher is an error rather than a fallback.
-That contract spans two files, so ``tests/unit/scripts/test_submit_exp11_*``
-pin the launch line — reverting one half alone would otherwise stay green.
-
-Those two are the only arms in the cohort with a dedicated submitter. The other
-56 have none and should go through the generic launcher, which also handles the
-multi-node ``srun``/``torchrun`` rendezvous the per-arm scripts do not::
-
-   sbatch --nodes=1 --gpus=N \
-     --export=ALL,CONFIG=experiments/inprogress/kspace_filling/<arm>.yaml \
-     scripts/training/train_distributed.sbatch
-
-.. note::
-
-   The sibling ``ldm_two_stage_ulf_to_hf`` rollout (PR #1073) chose **ZeRO-1 +
-   DeepCompile**, where this cohort uses **ZeRO-2 and no compilation**. The
-   difference is deliberate, not drift: stage 2 partitions gradients as well as
-   optimizer state, and DeepCompile is declined here because these arms are
-   complex-valued and the cohort pins ``optimization.compile.enabled: false``.
-   Both rollouts run **fp32**, which is the part that must stay common — it is
-   what keeps the complex+fp16 engine-side cast out of reach.
 
 What is verified where
 ----------------------

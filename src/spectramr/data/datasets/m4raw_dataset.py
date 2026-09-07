@@ -51,6 +51,7 @@ Build directly or via :class:`spectramr.infrastructure.builders.directors.data_p
 when ``data.use_repetitions: true`` is set in the training config.
 """
 
+import contextlib
 import logging
 import pickle
 from collections.abc import Callable
@@ -81,10 +82,9 @@ def _clamp_worker_threads_once() -> None:
     global _NUM_THREADS_CLAMPED
     if _NUM_THREADS_CLAMPED:
         return
-    try:
+    # PyTorch build without OpenMP support has no set_num_threads.
+    with contextlib.suppress(AttributeError):
         torch.set_num_threads(1)
-    except AttributeError:
-        pass  # PyTorch build without OpenMP support
     _NUM_THREADS_CLAMPED = True
 
 
@@ -149,7 +149,9 @@ _UNIMPLEMENTED_COIL_MODES: frozenset[str] = frozenset({"svd"})
 # because M4Raw reps are separate acquisitions with global phase drift it CANCELS
 # signal (SNR below a single rep). ``phase_aligned_mean`` corrects each rep's
 # global phase to rep0 first, recovering the coherent sqrt(N) gain.
-_VALID_TARGET_MODES: frozenset[str] = frozenset({"complex_mean", "phase_aligned_mean", "rep_pair"})
+_VALID_TARGET_MODES: frozenset[str] = frozenset(
+    {"complex_mean", "phase_aligned_mean", "rep_pair", "r2r"}
+)
 #: ``rep_pair`` needs one input repetition and one other; the averaged modes need
 #: two others so leave-one-out still averages (``_MIN_REPS_FOR_LOO``).
 _MIN_REPS_FOR_REP_PAIR: int = 2
@@ -215,6 +217,16 @@ def _average_reps(
         raise ValueError(
             f"[M4Raw] Unknown target_mode: {mode!r}. Valid: {sorted(_VALID_TARGET_MODES)}"
         )
+    if mode == "r2r":
+        # R2R sets input AND target together from ONE repetition, so it cannot be
+        # expressed as "combine these repetitions into a target". It branches at
+        # the construction site instead. Reaching here means the branch was
+        # bypassed and the caller is about to get an average where it asked for a
+        # recorruption -- raise rather than return a plausible wrong tensor.
+        raise ValueError(
+            "[M4Raw] target_mode='r2r' builds both halves from the input repetition "
+            "and must be handled at the construction site, not by _average_reps."
+        )
     if mode == "rep_pair":
         # Noise2Noise: the target is ONE other repetition, never an average, so
         # its noise is independent of the input's. ``anchor`` is the input
@@ -253,7 +265,7 @@ def _average_reps(
     return torch.stack(aligned, dim=0).mean(dim=0)
 
 
-class _SkipSample(Exception):
+class _SkipSampleError(Exception):
     """Raised internally when a sample is unrecoverable (e.g. all rep files corrupt).
 
     Caught in :meth:`M4RawRepetitionDataset.__getitem__` to transparently
@@ -264,10 +276,10 @@ class _SkipSample(Exception):
 def _load_reps_or_skip(
     rep_paths: list[Path], context: str, slice_index: int | None = None
 ) -> list[torch.Tensor]:
-    """Load every repetition of a NEX group, or raise ``_SkipSample``.
+    """Load every repetition of a NEX group, or raise ``_SkipSampleError``.
 
     One helper for both the single-contrast and cross-contrast paths, which had
-    drifted: the cross-contrast one raised ``_SkipSample`` (the retry protocol
+    drifted: the cross-contrast one raised ``_SkipSampleError`` (the retry protocol
     ``__getitem__`` implements) while the single-contrast one returned ``None``
     for "collate to filter". The collate m4raw actually selects is
     ``ImageCollateStrategy``, which has no ``_filter_none`` -- only
@@ -291,7 +303,7 @@ def _load_reps_or_skip(
         The repetitions that loaded, in manifest order.
 
     Raises:
-        _SkipSample: none of them loaded.
+        _SkipSampleError: none of them loaded.
         IndexError: ``slice_index`` is outside a repetition's slice range. That
             is an index defect (the record promised a slice the file does not
             have), not an unreadable file, so it is never censused: dropping
@@ -330,7 +342,7 @@ def _load_reps_or_skip(
         )
 
     if not kspace_reps:
-        raise _SkipSample(
+        raise _SkipSampleError(
             f"[M4Raw] {context}: all {len(rep_paths)} repetition files failed to "
             f"load. Failures: {'; '.join(failures)}"
         )
@@ -399,10 +411,7 @@ def _load_kspace(path: Path, slice_index: int | None = None) -> torch.Tensor:
 
     # Handle real-valued storage with trailing channel-2 dimension
     if not torch.is_complex(t):
-        if t.shape[-1] == 2:
-            t = torch.view_as_complex(t.contiguous().float())
-        else:
-            t = t.float()
+        t = torch.view_as_complex(t.contiguous().float()) if t.shape[-1] == 2 else t.float()
     else:
         t = t.to(torch.complex64)
 
@@ -565,6 +574,7 @@ class M4RawRepetitionDataset(Dataset):
         single_contrast: bool = False,
         log_scaling: bool = False,
         target_mode: str = "complex_mean",
+        r2r_alpha: float = 1.0,
         nex_target_exclude_input: bool = False,
         nex_fallback: str = "error",
         slice_level_records: bool = False,
@@ -632,6 +642,15 @@ class M4RawRepetitionDataset(Dataset):
                 f"Valid modes: {sorted(_VALID_TARGET_MODES)}"
             )
         self.target_mode = target_mode
+        # Built eagerly under r2r so a bad covariance/alpha fails at construction
+        # rather than at iteration 1 in a worker process, where the traceback is
+        # a DataLoader crash with no arm in it.
+        self.r2r_alpha = float(r2r_alpha)
+        self._r2r_sampler: Any = None
+        if target_mode == "r2r":
+            from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
+
+            self._r2r_sampler = M4RawNoiseSampler(alpha=self.r2r_alpha)
         # Leave-one-out NEX target: exclude the input rep (rep 0) from the
         # averaged target so target and input noise are uncorrelated. Default
         # False keeps the all-reps average (byte-identical legacy behaviour).
@@ -755,6 +774,15 @@ class M4RawRepetitionDataset(Dataset):
         """
         if not (self.use_repetitions and self.nex_target_exclude_input):
             return
+        if self.target_mode == "r2r":
+            # R2R builds both halves from the input repetition alone -- it never
+            # averages, so it never leaves anything out and a 1-rep group is the
+            # POINT of the mode. `nex_target_exclude_input` still arrives True
+            # here because it is ONE config knob shared by both splits, and the
+            # VALIDATION dataset (built with `data.val_target_mode`, an averaging
+            # mode) is the half that needs it. Without this return, an r2r arm
+            # would be refused for a leave-one-out its training split does not do.
+            return
         if not self.single_contrast:
             logger.warning(
                 "[M4Raw] nex_target_exclude_input=True has no effect in cross-contrast "
@@ -844,11 +872,9 @@ class M4RawRepetitionDataset(Dataset):
         groups: dict[str, list[Path]] = {}
         for path in h5_files:
             stem = path.name.split(".")[0]  # filename without ANY extensions
-            if len(stem) < 3:
-                # Cannot strip 2 digits—treat as singleton group
-                base = stem
-            else:
-                base = stem[:-2]  # strip last 2 chars (rep number, e.g., "01", "02", "03")
+            # <3 chars cannot carry a 2-digit rep suffix -> singleton group.
+            # Otherwise strip the rep number ("01", "02", "03").
+            base = stem if len(stem) < 3 else stem[:-2]
             if base not in groups:
                 groups[base] = []
             groups[base].append(path)
@@ -1048,7 +1074,7 @@ class M4RawRepetitionDataset(Dataset):
                 if result is None:
                     continue  # single-contrast branch returned None for corrupt file
                 return result
-            except _SkipSample as exc:
+            except _SkipSampleError as exc:
                 logger.warning(
                     "[M4Raw] Skipping idx=%d (attempt %d/%d): %s",
                     probe_idx,
@@ -1072,11 +1098,50 @@ class M4RawRepetitionDataset(Dataset):
         # at once rather than after a wasted run.
         raise RuntimeError(
             f"[M4Raw] All {max_retries} retries exhausted for idx={idx}: every "
-            f"probed repetition group raised _SkipSample. This is a systemic "
+            f"probed repetition group raised _SkipSampleError. This is a systemic "
             f"data-loading failure (check data.data_root resolves on this host, "
             f"the manifest is present, and the k-space files are readable) — "
             f"refusing to substitute a zero-filled sample and train on garbage."
         )
+
+    def _recorrupt_r2r(self, kspace: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split ONE acquired repetition into an R2R ``(input, target)`` pair.
+
+        ``input = y + alpha*z``, ``target = y - z/alpha`` with
+        ``z ~ CN(0, Sigma_n)`` drawn fresh per sample, so
+        ``Cov(input, target) = Sigma_n - Sigma_z = 0`` and the L1/L2 minimiser is
+        the clean image -- from a single excitation, with no clean reference.
+
+        The support mask is derived from the DATA, not the header: M4Raw ships
+        ~24 % of its phase-encode columns as exact zeros (partial phase FOV), and
+        its ``encodingLimits`` report a COUNT where ISMRMRD specifies an
+        INCLUSIVE maximum -- measured over all 52 files on this host,
+        ``kspace_encoding_step_1/maximum`` equals the number of sampled columns
+        exactly (195 for T1/T2, 198 for FLAIR) and ``slice/maximum`` equals the
+        slice count (18), so a spec-conforming ``range(min, max + 1)`` over-reads
+        by one. Trusting it would put noise in a column the scanner never sampled.
+        Sampled columns always carry noise, so a zero column-sum discriminates
+        them exactly.
+
+        The draw uses the global RNG, which ``DataLoader`` seeds per worker, so a
+        run is reproducible from ``run.seed`` and every sample sees a different
+        recorruption across epochs (which is the point -- it is an augmentation
+        over the noise, not a fixed second copy).
+        """
+        if self._r2r_sampler is None:  # pragma: no cover - guarded in __init__
+            raise RuntimeError("[M4Raw] r2r requested but no sampler was built.")
+        if kspace.dim() < 3:
+            raise ValueError(
+                f"[M4Raw] r2r needs at least (C, H, W) k-space, got {tuple(kspace.shape)}."
+            )
+        support = kspace.abs().sum(dim=tuple(range(kspace.dim() - 1))) > 0
+        if not bool(support.any()):
+            raise ValueError(
+                "[M4Raw] r2r found no sampled phase-encode columns in this group "
+                "(the whole k-space is zero). Recorrupting it would train on noise "
+                "alone."
+            )
+        return self._r2r_sampler.recorrupt(kspace, support_mask=support)
 
     def _note_loo_declined(self, n_reps: int) -> None:
         """Report that the leave-one-out NEX gate declined, once per rep count.
@@ -1157,7 +1222,7 @@ class M4RawRepetitionDataset(Dataset):
             rep_paths = [Path(p) for p in stored_paths["paths"]]
             contrast_name = stored_paths.get("contrast", "UNKNOWN")
 
-            # Load all repetitions for this contrast. Raises _SkipSample when
+            # Load all repetitions for this contrast. Raises _SkipSampleError when
             # none load -- the protocol __getitem__ already implements (warn,
             # retry the next group, then fail systemically). It used to return
             # None "for collate to filter", but m4raw selects
@@ -1177,8 +1242,12 @@ class M4RawRepetitionDataset(Dataset):
             # config says denoising (pitfall #16). Refuse the group instead;
             # __getitem__ retries the next one. Arms that deliberately want
             # input==target set `use_repetitions: false` and never reach here.
-            if self.use_repetitions and len(kspace_reps) < 2:
-                raise _SkipSample(
+            # R2R is exempt: it builds BOTH halves from the input repetition, so a
+            # one-repetition group is not a degenerate case for it -- it is the
+            # case it exists to serve. Skipping here would discard exactly the
+            # single-excitation data the arm is meant to prove it can use.
+            if self.use_repetitions and self.target_mode != "r2r" and len(kspace_reps) < 2:
+                raise _SkipSampleError(
                     f"[M4Raw] idx={idx} contrast={contrast_name}: only "
                     f"{len(kspace_reps)} of {len(rep_paths)} repetitions loaded. "
                     "The NEX target would be the input itself (SNR boost "
@@ -1189,7 +1258,17 @@ class M4RawRepetitionDataset(Dataset):
 
             # Input = first repetition (noisy), Target = averaged reps (high-SNR)
             input_kspace = kspace_reps[0].clone()
-            if self.use_repetitions and len(kspace_reps) > 1:
+            if self.target_mode == "r2r":
+                # Recorrupted-to-Recorrupted: both halves come from THIS single
+                # repetition. Injected here, on raw k-space, for two reasons a
+                # registered transform could not satisfy:
+                #   * registry transforms are appended AFTER normalization, so the
+                #     draw would be scaled by a per-subject factor and no longer
+                #     match Sigma_n;
+                #   * with ~24 % of phase-encode columns zero-filled, image-space
+                #     noise is spatially correlated, so it cannot be drawn there.
+                input_kspace, target_kspace = self._recorrupt_r2r(input_kspace)
+            elif self.use_repetitions and len(kspace_reps) > 1:
                 # Leave-one-out only when it leaves >=2 reps to average (>=3
                 # total); with exactly 2 reps LOO would yield a single noisy
                 # rep, so fall back to the all-reps average.
@@ -1331,6 +1410,17 @@ class M4RawRepetitionDataset(Dataset):
                 target_kspace = _rss_combine(target_kspace)
 
             return input_kspace, target_kspace
+
+        if self.target_mode == "r2r":
+            # The cross-contrast route pairs a SOURCE contrast with a different
+            # TARGET contrast; R2R's two halves are one contrast recorrupted
+            # against itself. Composing them would silently produce a
+            # contrast-translation target the arm never asked for.
+            raise ValueError(
+                "[M4Raw] target_mode='r2r' is a single-contrast denoising target and "
+                "has no meaning in the cross-contrast route (which pairs two "
+                "different contrasts). Declare data.pairing.single_contrast: true."
+            )
 
         source_in, source_tgt = process_reps(source_paths)
         target_in, target_tgt = process_reps(target_paths)

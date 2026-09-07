@@ -72,11 +72,6 @@ them and stops at the first failure.
    ``dc_weight``. Gradient checkpointing is applied too, so the probe's
    backward pass exercises the same recompute path a run will.
 
-   Before this, the probe assembled its own constructor arguments and skipped
-   those injections, so an arm could pass Tier 2 and still build a *different*
-   model in training — the probe's verdict did not transfer. If an arm now
-   fails Tier 2 with a config-conflict message it previously passed, the
-   conflict was always there; only the detection is new.
 
 Quick start
 ===========
@@ -133,18 +128,11 @@ recreate tables like the one in
 
 .. note::
 
-   **2026-07-14 fix (no unfounded greens).** ``check_advertised_options`` used to
-   append an unconditional ``passed=True`` result — *"All <model> model_kwargs are
-   in the advertised set."* — whenever it found no violations. It did so even for a
-   model with **no** ``OPTION_SCHEMA``, i.e. one whose advertised set it had never
-   read, because there was none: the message asserted a fact the check had not
-   established.
-
-   That is the pitfall-#16 shape the checker exists to catch, turned inward. Since
-   ``audit`` is ``--strict`` by default, a confident-but-baseless ``info`` is not
-   harmless padding — it is the reassuring noise that hides the real finding. The
-   check now stays **silent** unless it actually compared a declared kwarg against
-   an advertised set, and when it does pass it names what it checked
+   **No unfounded greens.** ``check_advertised_options`` stays **silent** unless
+   it actually compared a declared kwarg against an advertised set — a model with
+   no ``OPTION_SCHEMA`` has no advertised set to compare against, so a green
+   result there would assert a fact the check never established. When it does
+   pass it names what it checked
    (``"All checked <model> model_kwargs are in the advertised set: ['attention_type']"``)
    so the claim is auditable rather than a blanket all-clear.
 
@@ -158,18 +146,8 @@ or features. Under ``--strict`` every warning is promoted to an error.
 
 .. note::
 
-   **2026-08-22: ``--strict`` is the parser default, and ``--no-strict`` is the
-   opt-out.** CLAUDE.md non-negotiable 4, this page, ``execution_ledger.py``'s
-   docstring and ``scripts/ci/cluster_verify.sh``'s comment had all said
-   "``audit`` is ``--strict`` by default" for months; only argparse disagreed
-   (``action="store_true"``, i.e. default ``False``), so an interactive
-   ``spectramr audit <arm>`` exited **1** on warnings and read as a soft pass.
-
-   Blast radius, measured before the flip over all 647 arms under
-   ``experiments/inprogress`` (Tier 0+1, no probe): **507 pass / 3 warn /
-   137 error**. The flip moves exactly the three
-   ``vf/exp_vf_01_subvoxel_superres*_v2.yaml`` arms from exit 1 to exit 2; the
-   137 already exit 2 and are untouched. Per-arm opt-out stays in the config
+   **``--strict`` is the parser default; ``--no-strict`` is the opt-out.** A
+   warning therefore exits 2, not 1. Per-arm opt-out belongs in the config
    (``synthetic_forward_probe_skip``), which is the reviewable place for it —
    ``--no-strict`` exists for interactive triage, not for gates.
 
@@ -236,7 +214,7 @@ Errors (always block)
        does not exist on disk. Warning severity (``--strict`` escalates),
        so an arm whose upstream artefact was never built is gated before
        dispatch rather than crashing at load. **Campaign-dependency
-       deferral (Option A, 2026-06-16):** a downstream eval / calibration /
+       deferral:** a downstream eval / calibration /
        DPS arm may set ``checkpoint.produced_by_arm: <upstream-arm>`` to
        declare that an upstream campaign arm builds its checkpoint. When
        set, a still-absent *campaign-artefact-rooted* checkpoint (under
@@ -244,7 +222,7 @@ Errors (always block)
        deferred dependency and **info-passes** the standalone ``--strict``
        pre-flight instead of hard-failing — the campaign runner builds the
        producer first, and the real existence gate still fires at actual
-       checkpoint-load. The deferral is deliberately narrow (CLAUDE.md #15):
+       checkpoint-load. The deferral is deliberately narrow:
        it does **not** wave through a non-artefact path (typo'd local path →
        error) or a precomputed data artefact (marker basis / template tensor,
        which no training arm produces → still warns).
@@ -255,19 +233,13 @@ Errors (always block)
        producer's conv-weight shapes against the consumer's model block, so a
        deferred dependency can info-pass while the producer is either missing or
        architecturally incompatible (a latent load-time crash, the checkpoint
-       analogue of pitfall #16). Two obligations when wiring a
-       ``produced_by_arm``: (a) a runnable arm of that name exists (e.g. under
-       ``experiments/inprogress/<paradigm>/``); (b) its ``model`` block
-       (``model_type`` + channels + ``model_kwargs``) **mirrors the consumer's
-       exactly**. The 2026-06-22 ``m4raw_ddpm.ckpt`` case is the cautionary
-       example: ``exp_vf_twin_dps`` (``enhanced_deep_unet`` in/out=8 complex) and
-       ``exp_p2_b2_bloch_manifold_dps`` (in/out=1 RSS magnitude) both deferred to
-       the *same* ``baseline_m4raw_ddpm`` / ``m4raw_ddpm.ckpt`` — but no such arm
-       existed, and a 1-channel state_dict cannot load into an 8-channel U-Net.
-       The fix was **two** producer arms (``baseline_m4raw_ddpm`` 8ch and
-       ``baseline_m4raw_ddpm_rss`` 1ch), each mirroring its consumer's model
-       block and trained as an epsilon-prediction DDPM, with each consumer
-       repointed at its own producer's ``checkpoints/best.pt``.
+       analogue of an inert mechanism). Two obligations when wiring a
+       ``produced_by_arm``: (a) a runnable arm of that name exists; (b) its
+       ``model`` block (``model_type`` + channels + ``model_kwargs``)
+       **mirrors the consumer's exactly**. Two consumers with different channel
+       counts cannot share one producer — a 1-channel ``state_dict`` will not
+       load into an 8-channel U-Net, and the deferral info-passes right up to
+       the load that fails.
    * - ``forward_pass_shape``
      - 2
      - Model forward returns wrong shape, or its forward / backward
@@ -336,17 +308,10 @@ Advisory (reported, never blocks)
     them. Nothing else in the ladder can see this class, because the resolved
     config is *correct* — the value simply is not in it.
 
-    Measured over ``experiments/inprogress/`` on 2026-08-02: **430 of 636 arms**
-    carry at least one, **2,139 declarations** across **80 distinct paths**.
-    Some look load-bearing — ``checkpoint.save_dir`` (134 arms),
-    ``data.volume_format`` (214), ``physics.concomitant.field_strength_T`` (68),
-    ``loss_logging.enabled`` (285).
-
-    It is **advisory on purpose.** At that corpus size a warning would exit 2
-    under the strict smoke wrapper and fail hundreds of arms at once for
-    something that changes no behaviour. Same polarity as
-    ``check_workflow_declared``: report now, ratchet to error once the corpus is
-    drained. Closes issues #675 and #681.
+    A discarded key is common enough that this is **advisory on purpose**: as a
+    warning it would exit 2 under ``--strict`` for something that changes no
+    behaviour. Same polarity as ``check_workflow_declared`` — report it, and
+    treat a hit as a key to remove from the YAML rather than a run to abort.
 
     It reads ``ExecutionLedger.current()``, which ``spectramr audit`` arms before
     resolving the config. **If no ledger is armed the check says "NOT
@@ -384,16 +349,10 @@ Advisory (reported, never blocks)
     forward output bit-identical, and an invalid value does not raise, because
     the validating resolver is never called with it.
 
-    **Not a duplicate of** ``scripts/ci/check_model_kwargs_are_read.py``. That
-    gate asks whether a key exists *anywhere* in ``src/spectramr`` — as a dict key
-    or as any function's named parameter — and targets a name that exists
-    NOWHERE (issue #1075). Its permissiveness is exactly what lets this class
-    through: ``activation`` and ``use_complex_conv`` *are* named parameters of
-    ``KSpaceUNetBlock.__init__``, so the package-wide vocabulary counts them as
-    read, and neither appears in that gate's 763-entry baseline. This check asks
-    the narrower question — does the class *this arm resolves to* read the key?
-    The CI gate catches ``process_type`` (which exists nowhere); this catches
-    ``activation`` (which exists, but not on this arm's path).
+    The question it asks is narrow on purpose: does the class *this arm
+    resolves to* read the key? A name can be a real parameter somewhere in the
+    package and still be unread on the path this arm takes, and that is the
+    case this catches.
 
     **Arm-scoped on purpose.** A dead parameter nobody sets is untidiness; a
     dead parameter an *experiment declares* is a false controlled variable — it
@@ -401,23 +360,13 @@ Advisory (reported, never blocks)
     ablation cohort it looks like a held-fixed axis. Only the intersection of
     "unread by this model" and "written by this arm" is reported.
 
-    Measured over ``experiments/inprogress/`` on 2026-08-20 (647 arms with a
-    resolvable ``model_type`` and a ``model_kwargs`` block): **90 arms (13.9 %)**
-    declare at least one — ``activation`` (82), ``use_complex_conv`` (82),
-    ``img_size`` (5), ``features`` (1), ``bottleneck_only`` (1).
+    ``activation`` and ``use_complex_conv`` are the two names this catches most
+    often. ``img_size`` is suppressed by ``DELIBERATELY_UNREAD``.
 
-    **85 of those, across 9 cohorts, are what the check actually reports**: the
-    5 ``img_size`` arms are suppressed by ``DELIBERATELY_UNREAD``. The two
-    numbers answer different questions — 90 is the raw corpus, 85 is the
-    reported surface, and it is 85 that has to reach zero before the ratchet.
-
-    It is **advisory on purpose, and unlike its sibling the corpus IS counted.**
-    ``component_kwargs_reach_constructor`` stays advisory because nobody had
-    measured its corpus; this one is advisory because the measurement came back
-    90, and a warning exits 2 under the strict smoke wrapper — failing 90 arms
-    for a defect none of them introduced. Ratchet to ``warning`` once the corpus
-    is drained. The fix is to give the constructor a real parameter (forward it
-    to the component that owns the behaviour) or delete the key — never to
+    It is **advisory on purpose**: a warning exits 2 under a strict gate, and a
+    dead constructor parameter is a config-hygiene finding rather than a reason
+    to stop a run. The fix is to give the constructor a real parameter (forward
+    it to the component that owns the behaviour) or delete the key — never to
     silence the check.
 
     **Scope, and what a pass does not mean.** The detector is static and
@@ -458,47 +407,23 @@ Advisory (reported, never blocks)
     A k-space reconstruction/diffusion arm has ``physics`` present (the
     schema always constructs one) but INERT:
     ``physics.data_consistency.enabled`` is false AND no ``undersampling:``
-    block is declared. Re-aimed 2026-08-12 (#933) from an unsatisfiable
-    ``physics is None`` gate that could never fire.
+    block is declared.
 
-    Measured over ``experiments/inprogress/`` on 2026-08-12: 120 arms are
-    recon/diffusion-on-k-space (applicable), and **2** are physics-inert by
-    this predicate —
-    ``experiments/inprogress/workflow_baselines/b0_structural_denoise_m4raw.yaml``
-    and
-    ``experiments/inprogress/quality_matching/exp_qm_02b_restore_on_real.yaml``.
+    It is **advisory on purpose**. A no-physics control arm is legitimate: an
+    arm whose degradation is already physically real needs no acceleration, no
+    ``physics`` block, no data consistency and no coil maps, and says so in its
+    own header. A blanket ``workflow.task == "denoising"`` exemption would not
+    capture it either, because the same no-undersampling posture is also
+    declared under ``workflow.task: reconstruction`` — a task-keyed allowlist
+    would have to characterise more than one spelling. Reporting it leaves the
+    judgement with the author; a hard error here would fire on legitimate,
+    documented, intentional use.
 
-    It is **advisory on purpose, not by corpus size** (unlike
-    ``declared_keys_are_not_discarded`` above, whose count is what makes it
-    advisory). At least one of the two flagged arms is a *documented,
-    deliberate* no-physics control — ``b0_structural_denoise_m4raw.yaml``'s
-    own header says "the only task on this cluster whose degradation is
-    PHYSICALLY REAL... No acceleration, no physics block, no DC, no coil
-    maps, no adapters" and it declares ``workflow.task: denoising``. Both
-    flagged arms already fail ``spectramr audit --strict`` today independent
-    of this check, via the pre-existing ``acceleration_present`` error (and,
-    for ``exp_qm_02b_restore_on_real.yaml``, three further pre-existing
-    errors — ``domain_alignment`` ×2, ``data_model_compatibility``,
-    ``workflow_dataset_signal_domain``) — so this check adds zero net-new
-    corpus breakage even at this severity.
+"Reported" means both surfaces
+------------------------------
 
-    A blanket ``workflow.task == "denoising"`` exemption would not be
-    correct either: ``exp_qm_02b_restore_on_real.yaml`` shares the same
-    no-undersampling posture but declares ``workflow.task: reconstruction``,
-    so a task-keyed allowlist would need to characterise more than one
-    spelling. Report now, design a real no-physics-task vocabulary (or an
-    explicit per-arm opt-out, mirroring
-    ``synthetic_forward_probe_skip``) and ratchet to error later, rather
-    than landing a repointed check that reproduces the exact failure mode
-    ``check_legacy_schema_mixing`` was deleted for (firing on legitimate,
-    documented, intentional use).
-
-"Reported" means both surfaces (#1275)
---------------------------------------
-
-The heading above says *reported*, and until 2026-08-20 that was only true of
-``spectramr audit``. The two surfaces render a report differently, and the
-difference fell exactly on this tier:
+The two surfaces render a report differently, and the difference falls exactly
+on this tier:
 
 ``spectramr audit``
     ``cli/app.py`` prints **every** result, and ``HealthCheckResult.__rich__``
@@ -506,30 +431,20 @@ difference fell exactly on this tier:
     (``report.to_dict``) and the ledger artifact.
 
 ``spectramr train`` / ``train-distributed``
-    ``HealthCheckReport.log_summary`` rendered a result **only when it did not
-    pass**. An advisory returns ``passed=True`` by design — that is the polarity
-    that keeps it out of ``report.passed`` and ``report.warnings`` — so its text
-    could not reach a training log at all. It was counted in the
-    ``Config Health: n/m checks passed`` denominator and discarded.
+    ``HealthCheckReport.log_summary`` renders a result only when it did not
+    pass — and an advisory returns ``passed=True`` by design, the polarity that
+    keeps it out of ``report.passed`` and ``report.warnings``.
 
-Advisory and invisible are different things, and the code could not express the
-first without the second. ``HealthCheckResult.always_report`` now does:
-``log_summary`` emits a **passing** result at ``info`` when it is set, reading
-nothing that decides pass/fail, so a check's exit-code behaviour is unchanged.
+Advisory and invisible are different things. ``HealthCheckResult.always_report``
+separates them: ``log_summary`` emits a **passing** result at ``info`` when it is
+set, reading nothing that decides pass/fail, so a check's exit-code behaviour is
+unchanged.
 
-Set it on the **branch that states a finding**, never on the check as a whole.
-Measured on ``experiments/inprogress/kspace_filling/attention_shootout/
-experiment_11_attention_none.yaml``: 140 of 141 results are passing ``info``
-results and 16 of those carry a ``category`` — but nearly all 16 read
-"not applicable", "not configured" or "check skipped". Emitting on
-``severity == "info"``, or on ``category``, would have traded one invisible
-finding for sixteen visible non-findings.
-
-The casualty that prompted this was
-``check_deepspeed_zero_stage_has_ranks_to_shard``. On the run that held four
-GPUs and trained on one, it produced its diagnosis verbatim
-("``zero_stage=2 at a DECLARED world size of 1 ... partitions nothing``") and
-the operator saw ``Config Health: 141/141 checks passed`` instead.
+Set it on the **branch that states a finding**, never on the check as a whole. A
+typical run produces well over a hundred passing ``info`` results, and most of
+the ones carrying a ``category`` read "not applicable", "not configured" or
+"check skipped". Emitting on ``severity == "info"``, or on ``category``, trades
+one invisible finding for a screenful of visible non-findings.
 
 .. note::
 
@@ -575,7 +490,7 @@ describe a structural property of the model's forward path, and they
 must stay consistent with whatever the training strategy actually
 does at runtime. If you flip ``condition_with_smaps`` off without
 also disabling the strategy's concat, real training will crash with
-the same shape mismatch the probe used to hide.
+a shape mismatch.
 
 Probe input: Shepp-Logan, not white noise
 =========================================
@@ -612,15 +527,10 @@ deterministic spectral content (``F-PHANTOM-RANK3``).
 
 .. note::
 
-   **2026-07-14 fix.** ``add_phase`` was silently ignored on the rank-3 path —
-   the 1-D branch returned before the phase ramp, so a complex 1-D phantom came
-   back with a **zero imaginary part**: a real signal wearing a complex dtype,
-   which is the one thing this helper exists to avoid. Any complex 1-D model
-   (MRF fingerprints are complex) was therefore probed with a purely real input,
-   so the probe could not exercise the complex path at all — an unwired knob
-   (pitfall #15) hiding inside the tool meant to catch them. All ranks now share
-   one ``_apply_dtype_and_phase`` tail, so a future rank cannot silently skip a
-   step.
+   All ranks share one ``_apply_dtype_and_phase`` tail, so ``add_phase`` applies
+   on every path. A complex phantom that came back with a zero imaginary part
+   would be a real signal wearing a complex dtype — the one thing this helper
+   exists to avoid.
 
 Opt out with ``--noise``:
 
@@ -644,8 +554,8 @@ because of an inspection artefact.
 ``--strict`` mode and the no-warnings rule
 ==========================================
 
-The user discourages silent fallbacks (CLAUDE.md pitfall #9). The
-``--strict`` flag turns that rule into an exit-code:
+Silent fallbacks are forbidden. The ``--strict`` flag turns that rule into an
+exit-code:
 
 ============= ============ ==============================================
 Audit outcome Default exit Under ``--strict`` exit
@@ -707,8 +617,8 @@ The existing ``--retry-log`` flag still works: a failed audit produces
 a ``❌ FAIL: <name>`` line in the log just like a failed train, so
 ``--retry-log path/to/previous.log`` re-runs only the failed arms.
 
-Cluster-mount path exemption (F5c)
-==================================
+Cluster-mount path exemption
+============================
 
 Tier 1 includes a ``hardcoded_cluster_paths`` check that rejects YAML
 fields (``data.data_root``, ``data.index_path``, ``data.validation_index_path``,
@@ -727,7 +637,7 @@ mechanisms (any one is enough):
       # In your cluster .env:
       export SPECTRAMR_DATA_ROOT=/project/<allocation>/<your-account>/spectramr
 
-2. **Auto-detect via cwd + $USER** (F5c, 2026-05-20) — when no env-var
+2. **Auto-detect via cwd + $USER** — when no env-var
    is set, the check inspects ``$USER`` and the current working
    directory. If ``cwd`` lives under a forbidden cluster prefix AND
    the path-segment immediately after the prefix equals ``$USER``,
@@ -774,13 +684,12 @@ The three categories the check inspects:
      - The strategy concatenates conditioning channels at runtime by
        design. The runtime DomainMismatch check at
        ``strategies/base.py:660`` covers it; static verification adds
-       nothing. (F6, 2026-05-20.)
+       nothing.
    * - ``adapters.pre_model`` declared and every step is in
        ``_ADAPTER_CHANNEL_EFFECTS``
      - **info**
      - ``check_adapter_chain_channel_resolution`` already resolves
        the post-adapter width statically. No blind spot remains.
-       (F6b, 2026-05-20.)
    * - ``adapters.pre_model`` declared with ≥1 unknown-effect adapter
      - warning
      - The static derivation cannot fold an unknown channel transform.
@@ -796,16 +705,15 @@ The three categories the check inspects:
      - **info**
      - The user has explicitly declared the expected channel count.
        The runtime DomainMismatch check is the source of truth for
-       the actual header value. (F6c, 2026-05-20.)
+       the actual header value.
 
 Audit anchor: ``tests/unit/infrastructure/validation/test_health_checker_json_and_new_checks.py``
 (``test_channel_audit_assumptions_*``).
 
-Capability-contract & channel refinements (2026-06-05)
-======================================================
+Capability-contract and channel refinements
+===========================================
 
-Three precision fixes landed while clearing the ``experiments/inprogress``
-structural-error backlog (config-fix branch):
+Three precision rules narrow checks that would otherwise over-report:
 
 * **Agnostic losses pass any block.** ``check_loss_domain_block_match``
   now treats a loss registered ``@register_loss(domain="agnostic")``
@@ -847,7 +755,7 @@ Audit anchor:
 Forbidden silent fallbacks
 ==========================
 
-The "discourage fallbacks" rule from CLAUDE.md is enforced by the
+The no-silent-fallbacks rule is enforced by the
 ``advertised_options`` check. To opt your model in, declare an
 ``OPTION_SCHEMA`` class attribute mapping kwarg names to allowed
 values:
@@ -880,7 +788,7 @@ Cookbook
 
 .. code-block:: bash
 
-   python -m spectramr.cli audit experiments/inprogress/<paradigm>/<arm>.yaml
+   python -m spectramr.cli audit experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml
 
 "Audit a whole directory of arms in under a minute"
 ---------------------------------------------------
@@ -979,12 +887,10 @@ driver holds no table of its own.
        incapable of firing.  Repairing the check turns the test **red**, which
        is the point: the marker cannot rot into a silent pass.
 
-**Only mark ``tier0`` when the schema rejection *is* the named violation.**
-Three fixtures were formerly rejected at Tier 0 for reasons unrelated to their
-check — a retired top-level ``objectives:`` block, ``optimization.epochs``, and
-``validation.val_frequency``, none of which are fields any more.  Annotating
-those as tier-0 would have turned them green while testing nothing; they were
-repaired instead.
+**Only mark ``tier0`` when the schema rejection *is* the named violation.** A
+fixture rejected at Tier 0 for an unrelated reason — a key the schema no longer
+declares, say — goes green while testing nothing. Repair the fixture instead of
+annotating it.
 
 **Adding a new check to the corpus:**
 
@@ -1000,54 +906,8 @@ repaired instead.
    as ``null``, and several checks early-return ``passed=True`` on a null
    section, which silently disarms the fixture.
 
-.. warning::
-
-   **A checker crash is not evidence that the check fired.**  Until 2026-08-09
-   this driver built a ``SimpleNamespace`` from the raw YAML and wrapped
-   ``run_all_checks`` in ``except Exception: return``, commented *"A crash in
-   the checker itself counts as the check firing."*  It does not: the crash came
-   from the stub lacking ``data.source``, inside ``check_train_val_split_leakage``
-   — a check unrelated to any fixture's name, which a perfectly valid config
-   would trigger identically.  Combined with all 30 fixtures still declaring the
-   refused ``config_version: '6.0'``, every entry aborted before any check ran
-   and every abort was absorbed: 25 reported ``skipped`` and 5 reported
-   ``passed``.  The corpus verified nothing while looking green (issue #922).
-
-   The driver now loads real ``TrainingSettings`` and lets any unanticipated
-   exception propagate.  Two checks were consequently marked ``known-dead``
-   (issue #933): ``legacy_schema_mixing``, whose ``_LEGACY_CONFLICTS`` legacy
-   leaves were all removed by the block decomposition and whose distinction the
-   fold erases anyway, and ``physics_config``, whose ``physics is None`` gate
-   was never true because the schema always constructs a
-   ``PhysicsConfigSchema``. Both asked a **raw-document** question of a
-   resolved object; that question belongs to the execution ledger, which still
-   sees the pre-fold document.
-
-   **Repaired 2026-08-12 (#933).** ``legacy_schema_mixing`` was deleted
-   outright — its own premise was obsolete (``enable_image_normalization``
-   and ``normalization_type`` are not rivals) and both ``data.*`` legacy
-   leaves are ``fold`` posture, so a repointed version could not distinguish
-   "user set both" from "user set one" and would have fired on legitimate
-   canonical configs. Its corpus fixture
-   (``legacy_schema_mixing__normalize_images_and_normalization_type.yaml``)
-   was removed with it. ``physics_config`` was re-aimed at the answerable
-   question — data consistency disabled AND no ``undersampling:`` block —
-   and its corpus fixture's ``known-dead`` marker was removed since the
-   check now genuinely fires on it. The re-aimed predicate was measured
-   locally against all 647 ``experiments/inprogress`` arms before landing:
-   120 are recon/diffusion-on-k-space, and 2 are physics-inert. A first
-   landing at ``severity="error"`` was reverted after review: at least one
-   of the two (``workflow_baselines/b0_structural_denoise_m4raw.yaml``) is a
-   documented, deliberate no-physics control, not a bug, so "small blast
-   radius" was not sufficient on its own — the brief's error-severity branch
-   requires each flagged arm to *genuinely* have inert physics, which does
-   not hold here. It lands ``severity="info"`` (advisory-first); see
-   "Advisory (reported, never blocks)" above for the corpus detail and both
-   arm paths. (Local CPU measurement — the cluster audit is still the
-   authority on whether any given arm is clean.)
-
-target_domain vs registered output_domain (E-VIZ2, 2026-06-16)
-==============================================================
+target_domain vs registered output_domain
+=========================================
 
 ``ConfigHealthChecker.check_target_domain_matches_registered_output_domain``
 closes a gap the sibling ``check_model_loss_output_domain`` could not see.
@@ -1101,7 +961,7 @@ alias); every other ``model_type`` skips with an informational pass.
      - ``force_pure_kspace: true`` + ``backbone_type: unet`` (builds
        ``PureKSpaceUNet``, which has no attention seam) with any
        ``attention_type`` other than ``none`` — the request would be silently
-       dropped (pitfall #16 facade). The constructor default is ``self``, so an
+       dropped. The constructor default is ``self``, so an
        arm that omits the key also fails. **Fix:** set ``attention_type: none``,
        or ``backbone_type: complex_unet`` to keep block-level attention.
    * - R2
@@ -1112,9 +972,9 @@ alias); every other ``model_type`` skips with an informational pass.
    * - R3
      - error
      - ``backbone_type: complex_unet`` requesting an attention that does not
-       support the derived ``feature_domain``. Vacuously green today (every
-       attention supports both domains after the 2026-07-03 change); this is the
-       ratchet a future single-domain attention block registers against.
+       support the derived ``feature_domain``. Vacuously green while every
+       registered attention supports both domains; this is the ratchet a future
+       single-domain attention block registers against.
 
 The single source of truth for the advertised set, the per-type domain support,
 and the ``complex_unet`` block-dispatch coverage is
@@ -1124,13 +984,13 @@ and R3 as build-time ``ValueError`` raises, so a non-YAML caller cannot slip
 past. Regression coverage:
 ``tests/unit/infrastructure/validation/test_attention_domain_compatibility.py``.
 
-Witnesses added by the 2026-09 cohort review
-============================================
+Witnesses
+=========
 
-Seven witnesses landed with the corpus-wide review of ``experiments/inprogress/``
-(2026-09-02). Each ships with a planted violation in its test module under
-``tests/unit/infrastructure/validation/witness/checks/``; the ratchet notes say
-which ones are still advisory and what promotes them.
+Each witness ships with a planted violation in its test module under
+``tests/unit/infrastructure/validation/witness/checks/``, so the detector is
+known to fire on the shape it claims to catch. The ratchet notes say which are
+advisory and what promotes them.
 
 .. list-table::
    :header-rows: 1
@@ -1143,7 +1003,7 @@ which ones are still advisory and what promotes them.
      - error
      - ``data.use_repetitions: true`` on a route other than ``m4raw``: only that
        route builds a repetition-averaged target, so the arm advertised a
-       reference it never received (79 arms were drained).
+       reference it never received.
    * - ``held_out_test_split_disjoint``
      - error
      - a declared ``data.source.test_index_path`` that shares a subject or file
@@ -1166,7 +1026,7 @@ which ones are still advisory and what promotes them.
        (``data.trajectory``, ``data.image_undersampling``, a dynamic mask, the
        digital twin, or a strategy declaring ``applies_undersampling``). Error on
        image-domain datasets; on k-space datasets whose strategy has not declared
-       the flag it is reported as UNVERIFIED until the declaration census is done.
+       the flag it is reported as UNVERIFIED.
        ``base_acceleration: 1.0`` with no range and no dynamic mask is the
        explicit fully-sampled declaration and passes: there is nothing to apply.
    * - ``strategy_class_matches_training_mode``
@@ -1183,24 +1043,18 @@ which ones are still advisory and what promotes them.
        pass reads it: the twin does not undersample (``enable_undersampling`` false)
        or the strategy is not one of the twin-driven readers (``virtual_fiducial``,
        ``vf_admm`` and subclasses, which re-score every rung as
-       ``val_ood_{R}x_<metric>``). Its predecessor
-       ``undersampling.out_of_distribution_range`` was declared on 58 arms and
-       read by nothing (VF review 2026-09-03).
+       ``val_ood_{R}x_<metric>``).
    * - ``image_losses_reach_the_objective``
      - error / info
      - a ``losses.image_losses`` entry the strategy neither computes inline
        (``inline_losses``) nor folds (``folds_image_losses`` with a registered
        name) is dropped at runtime while the loss census reads it as the
-       objective; 26 mrixfields arms declared an ``l1`` on score-matching and
-       velocity strategies (2026-09-03). A strategy that has not declared its
-       ownership is reported UNVERIFIED.
+       objective. A strategy that has not declared its ownership is reported
+       UNVERIFIED.
    * - ``no_dead_precision_flag``
      - error
      - ``training.enable_mixed_precision`` declared: no code path reads it and the
-       run uses ``optimization.precision.enabled`` either way (#887). The
-       ``inprogress/`` corpus was drained on 2026-09-03; the witness reports the
-       spelling in the other trees until they drain and a ``raise`` rename record
-       can retire it corpus-wide.
+       run uses ``optimization.precision.enabled`` either way. Use the latter.
    * - ``validation_metric_names_resolve``
      - error / info
      - a name in ``validation.scoring.compute``, ``metrics.best_metric_name`` or
@@ -1222,17 +1076,12 @@ synthesis, super-resolution, ...) passes without a block. The check and
 so the two cannot demand opposite things of one arm.
 
 The bulk audit (``spectramr audit <directory>``) and the single-arm audit now build
-one report: the Tier-0/1 witness ladder, bridged to health-check results. The
-bulk loop used to call the health checker directly, so no witness that is not a
-health check (``schedule.*``, the budget, undersampling, validation-metric and
-strategy-dispatch witnesses) ever ran over a directory, and it counted results by
-severity, so a passed advisory (the concomitant correction at 3 T) became an
-``ERROR(strict)`` the single-arm run could not reproduce. Both surfaces now read
-``HealthCheckReport.errors`` / ``warnings`` (a *failed* result of that severity),
-and that advisory is an INFO that is always reported. A directory run therefore
+one report: the Tier-0/1 witness ladder, bridged to health-check results. Both
+surfaces read ``HealthCheckReport.errors`` / ``warnings`` — a *failed* result of
+that severity — so a passed advisory stays an INFO on both. A directory run
 reports what the per-arm runs report, at about a second per arm.
 
-Four detectors changed with the first directory-wide witness run (2026-09-03):
+Four rules the two surfaces share:
 
 - The training-budget rule has one owner, ``spectramr.config.training_budget``,
   read by both the validator registry's ``epochs_valid`` (the train-time gate)
@@ -1245,9 +1094,9 @@ Four detectors changed with the first directory-wide witness run (2026-09-03):
   noised target; the output keeps the loaded width.
 - The compatibility-matrix resolver's data domain is what the loader emits
   (dataset family, then a coil-processing mode of ``rss_image`` or
-  ``magnitude``), one derivation shared with the spec card; it used to be the
-  model's declared target domain.
-- The matrix's ``domain_chain`` rule is deleted: ``data_model_compatibility``
+  ``magnitude``) — not the model's declared target domain. That is one
+  derivation, shared with the spec card.
+- The matrix has no ``domain_chain`` rule: ``data_model_compatibility``
   owns the data-to-model leg, folds the declared adapter chain and knows which
   strategies adjoint k-space to the image domain internally.
 

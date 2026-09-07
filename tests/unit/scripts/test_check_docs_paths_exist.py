@@ -237,3 +237,51 @@ def test_shipped_pages_does_not_descend_below_the_repository_root(tmp_path: Path
     (nested / "NOTES.md").write_text("Run ``python scripts/gone.py``.\n")
     names = {p.name for p in gate.shipped_pages(tmp_path, docs)}
     assert names == {"index.rst", "README.md"}
+
+
+def test_a_docs_dir_holding_no_page_refuses_rather_than_reporting_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal one level down from the missing-``docs/`` case.
+
+    An empty ``docs/`` scans nothing and prints OK, which is indistinguishable
+    from a clean tree. That was survivable while this gate only ran in CI; it
+    sets the exit code of the public export now, and there "no page was checked"
+    must never be readable as "every page is clean".
+    """
+    (tmp_path / "docs").mkdir()
+    monkeypatch.setattr("sys.argv", ["check_docs_paths_exist.py", "--root", str(tmp_path)])
+    assert gate.main() == 1
+    assert "refusing to report a vacuous pass" in capsys.readouterr().out
+
+
+def test_a_tree_whose_prose_is_all_root_level_is_scanned_not_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``docs/`` at all, but a root page carrying a real plant.
+
+    Every other root-level case above builds a ``docs/`` first, so this shape --
+    a distribution whose prose is entirely root-level -- was refused as a
+    misconfigured scan root rather than scanned. The refusal keys on the page
+    set now, and the plant must be found.
+    """
+    (tmp_path / "README.md").write_text("Install:\n\n```bash\npython scripts/gone.py\n```\n")
+    assert not (tmp_path / "docs").exists()
+    monkeypatch.setattr("sys.argv", ["check_docs_paths_exist.py", "--root", str(tmp_path)])
+    assert gate.main() == 1
+    out = capsys.readouterr().out
+    assert "scripts/gone.py" in out
+    assert "COMMAND" in out
+    assert "vacuous" not in out, "this must fail on the finding, not on the missing docs/"
+
+
+def test_the_same_root_only_tree_passes_once_the_file_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The widened shape must be able to pass, or its failure says nothing."""
+    (tmp_path / "README.md").write_text("Install:\n\n```bash\npython scripts/gone.py\n```\n")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "gone.py").write_text("")
+    monkeypatch.setattr("sys.argv", ["check_docs_paths_exist.py", "--root", str(tmp_path)])
+    assert gate.main() == 0
+    assert "OK:" in capsys.readouterr().out

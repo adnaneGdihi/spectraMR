@@ -4,28 +4,32 @@ Hyperparameter optimization in this repo is a thin layer over Optuna with three 
 
 1. **Subprocess-isolated trials** — each trial spawns its own `python -m spectramr.cli train` so a single trial crash (NaN, OOM, lib mismatch) cannot poison the parent study's TPE state.
 2. **Auto-write-back of `best_config.yaml` + `best_params.json`** at study completion — the winning hyperparameters land as a runnable YAML you can directly feed into `train --config best_config.yaml`.
-3. **Schema-aware search spaces** — every dotted-path field in `TrainingSettings` is targetable, including per-loss weights via `[name=foo]` list-selector syntax. There are 1176 dotted paths total; 5 named presets cover the common cases.
+3. **Schema-aware search spaces** — every dotted-path field in `TrainingSettings` is targetable, including per-loss weights via `[name=foo]` list-selector syntax. `--list-schema-paths` prints the full set; named presets cover the common cases.
 
 ## TL;DR
 
 ```bash
-# Most common: search the plan §4.2 KAN dual-domain space
+# Sweep learning rate and weight decay on a shipped baseline arm
 python -m spectramr.cli hpo \
-    --config experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml \
-    --model-type kspace_cold_diffusion \
-    --search-preset kan_dual_domain \
-    --n-trials 80 \
+    --config experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml \
+    --model-type complex_unet \
+    --search-preset optimizer_basic \
+    --n-trials 40 \
     --max-iter 30000 \
-    --storage sqlite:///experiments/hpo/kan.db
+    --storage sqlite:///experiments/hpo/optimizer.db
 
-# Output: experiments/results/.../hpo/hpo_kspace_cold_diffusion/
+# Output: <training.output_dir>/hpo/hpo_complex_unet/
 #   ├── best_config.yaml   ← rerun training with this
-#   ├── best_params.json   ← provenance for the paper
+#   ├── best_params.json   ← raw Optuna params + objective value
 #   └── trial_NNNN/        ← per-trial configs + checkpoints + metrics
 
 # Train the winner directly
 python -m spectramr.cli train --config <output_dir>/best_config.yaml
 ```
+
+`--model-type` names the study and its output directory; it does **not** select
+the model. Each trial trains whatever `model.model_type` the config declares, so
+pass the config's own value or the output directory will be mislabelled.
 
 ## Three ways to specify the search space
 
@@ -36,18 +40,27 @@ Pick the *least invasive* mechanism that fits your needs.
 5 named presets ship with the repo:
 
 ```bash
-python -m spectramr.cli hpo --list-presets
+# --config and --model-type are required even though this flag reads neither;
+# any loadable path and any registered model_type will do.
+python -m spectramr.cli hpo --config <yaml> -m <model> --list-presets
 ```
 
 | Preset | Dimension | What it tunes |
 |---|---|---|
-| `kan_dual_domain` | 12 | Plan §4.2 — LR, KAN grid/order/hidden, radial bands, 4 loss weights, curriculum |
+| `kan_dual_domain` | 12 | LR, KAN grid/order/hidden, radial bands, 4 loss weights, curriculum |
 | `loss_weights_only` | 4 | Just the 4 composite-loss weights (use after picking a fixed architecture) |
 | `optimizer_basic` | 2 | LR + weight decay (use after picking architecture + loss weights) |
 | `full_kan_block` | 8 | Every KAN block hyperparameter (deeper sweep than `kan_dual_domain`) |
 | `diffusion_curriculum` | 3 | Curriculum ramp + identity-collapse threshold |
 
 Pick one with `--search-preset <name>`.
+
+`optimizer_basic` applies to any config. `diffusion_curriculum` needs a diffusion
+arm, which declares the curriculum fields it targets. The other three target
+`losses.kspace_losses[name=...]` entries and
+`model.model_kwargs.kan_dual_domain_kwargs.*`: a list selector raises
+`no list item with name=...` on trial 1 if the config does not already declare
+that loss, so check what your arm declares before picking one.
 
 ### 2. Composite presets (compose narrow ones)
 
@@ -67,11 +80,12 @@ Conflicts (same dotted path defined in multiple presets) raise an error by defau
 For arbitrary search spaces, write your own YAML:
 
 ```bash
-# Generate a starter template
-python -m spectramr.cli hpo --print-template > my_space.yaml
+# Generate a starter template. --config/--model-type are required here too,
+# and unread here too.
+python -m spectramr.cli hpo --config <yaml> -m <model> --print-template > my_space.yaml
 
-# List every dotted-path field TrainingSettings exposes (1176 of them)
-python -m spectramr.cli hpo --list-schema-paths
+# List every dotted-path field TrainingSettings exposes
+python -m spectramr.cli hpo --config <yaml> -m <model> --list-schema-paths
 
 # Run with your spec
 python -m spectramr.cli hpo --config <yaml> -m <model> --search-space my_space.yaml
@@ -80,27 +94,28 @@ python -m spectramr.cli hpo --config <yaml> -m <model> --search-space my_space.y
 YAML format:
 
 ```yaml
-# Each top-level key is a dotted-path config field
-optimization.learning_rate:
+# Each top-level key is a dotted-path config field. Use the canonical nested
+# spelling.
+optimization.optimizer.learning_rate:
   dist: loguniform        # or uniform, int_uniform, int_loguniform, categorical
   low: 1.0e-5
   high: 2.0e-4
 
-optimization.weight_decay:
+optimization.optimizer.weight_decay:
   dist: loguniform
   low: 1.0e-7
   high: 1.0e-3
 
-# List-selector syntax for losses: targets the entry with name=log_spectral
-losses.kspace_losses[name=log_spectral].weight:
+# List-selector syntax for losses: targets the entry with name=l1
+losses.kspace_losses[name=l1].weight:
   dist: loguniform
   low: 0.01
   high: 1.0
 
 # Categorical with explicit choices
-model.model_kwargs.kan_dual_domain_kwargs.kan_grid_size:
+training.batch_size:
   dist: categorical
-  choices: [4, 5, 6, 8]
+  choices: [2, 4, 8]
 
 # Free-form dict fields (model_kwargs etc.) accept any sub-key
 model.model_kwargs.some_new_flag:
@@ -112,80 +127,74 @@ Distributions supported: `uniform(low, high)`, `loguniform(low, high)`, `int_uni
 
 ## Worked examples
 
-### Tune just the loss weights for the headline KAN dual-domain
+### Tune a loss weight with a custom search space
+
+The built-in loss-weight presets name losses a config must already declare. To
+tune the losses *your* arm declares, write the search space yourself — the
+baseline arm above declares one `kspace_losses` entry, `l1`:
+
+```yaml
+# my_space.yaml
+losses.kspace_losses[name=l1].weight:
+  dist: loguniform
+  low: 0.1
+  high: 10.0
+optimization.optimizer.learning_rate:
+  dist: loguniform
+  low: 1.0e-5
+  high: 2.0e-4
+```
 
 ```bash
 python -m spectramr.cli hpo \
-    --config experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml \
-    --model-type kspace_cold_diffusion \
-    --search-preset loss_weights_only \
+    --config experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml \
+    --model-type complex_unet \
+    --search-space my_space.yaml \
     --n-trials 50 \
     --max-iter 30000 \
     --storage sqlite:///experiments/hpo/loss_weights.db
 ```
 
-This searches the four loss weights (`log_spectral`, `sobolev_kspace`, `complex_spatial_gradient`, `sense_adjoint_l1`) over their plan-recommended log-uniform ranges. ~50 trials is enough to converge on a 4D space.
+A selector must name the list the loss actually lives in. Plain dotted keys
+auto-create missing intermediate dicts, so a `model_kwargs` path an arm never
+declares is harmless; list selectors are the opposite and raise on trial 1.
 
-### Tune the KAN block, then the optimizer, sequentially
+### Search in two passes
 
-Two-pass HPO is often more efficient than searching everything at once because TPE handles a smaller-D space better. Pass 1: pick the right KAN architecture; Pass 2: tune optimizer for that architecture.
+Two-pass HPO is often more efficient than searching everything at once, because
+TPE handles a smaller-dimensional space better. Pass 1 fixes the schedule; pass 2
+tunes the optimizer against it.
 
 ```bash
-# Pass 1: KAN block hyperparams
+# Pass 1: diffusion curriculum
 python -m spectramr.cli hpo \
-    --config experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml \
-    -m kspace_cold_diffusion \
-    --search-preset full_kan_block \
+    --config experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml \
+    -m score_based_diffusion \
+    --search-preset diffusion_curriculum \
     --n-trials 60 \
     --storage sqlite:///experiments/hpo/pass1.db
 
-# Pass 2: optimizer + curriculum, starting from Pass 1's best_config.yaml
+# Pass 2: optimizer, starting from Pass 1's best_config.yaml
 python -m spectramr.cli hpo \
-    --config experiments/results/<pass1_output>/hpo/hpo_kspace_cold_diffusion/best_config.yaml \
-    -m kspace_cold_diffusion \
+    --config <pass1_output>/hpo/hpo_score_based_diffusion/best_config.yaml \
+    -m score_based_diffusion \
     --search-preset optimizer_basic \
-    --search-preset diffusion_curriculum \
     --n-trials 40 \
     --storage sqlite:///experiments/hpo/pass2.db
 ```
 
-Pass 2 starts from Pass 1's winning config so the architecture is fixed; only the optimizer + curriculum vary.
-
-### Use a custom YAML to search S-map FiLM intensity
-
-Suppose you want to ablate the S-map FiLM hidden width while also tuning the KAN ADC's grid size:
-
-```yaml
-# my_smap_kan_adc.yaml
-model.model_kwargs.kan_dual_domain_kwargs.smap_film_hidden:
-  dist: categorical
-  choices: [16, 32, 64, 128]
-model.model_kwargs.kan_dc_kwargs.kan_grid_size:
-  dist: categorical
-  choices: [4, 5, 6, 8]
-model.model_kwargs.kan_dc_kwargs.kan_hidden:
-  dist: categorical
-  choices: [8, 16, 24]
-```
-
-```bash
-python -m spectramr.cli hpo \
-    --config experiments/inprogress/kspace_filling/attention_enhancements/experiment_11_attn_kan_smap.yaml \
-    -m kspace_cold_diffusion \
-    --search-space my_smap_kan_adc.yaml \
-    --n-trials 40 \
-    --storage sqlite:///experiments/hpo/smap.db
-```
+Pass 2 starts from Pass 1's winning config, so the schedule is fixed and only the
+optimizer varies.
 
 ### Multi-objective: PSNR vs training time
 
 ```bash
 python -m spectramr.cli hpo \
     --config <yaml> -m <model> \
-    --search-preset full_kan_block \
+    --search-preset optimizer_basic \
     --multi-objective \
     --cost-weight 0.3 \
-    --objective-metric val_robust_mri_psnr_4x \
+    --objective-metric val_psnr \
     --n-trials 60 \
     --storage sqlite:///experiments/hpo/pareto.db
 ```
@@ -199,16 +208,16 @@ The `--storage sqlite:///path.db` URL makes the study resumable across machine r
 ```bash
 # Same command, same study name (defaults to model_type), --load-if-exists is implicit
 python -m spectramr.cli hpo --config <yaml> -m <model> \
-    --search-preset kan_dual_domain \
+    --search-preset optimizer_basic \
     --n-trials 30 \
-    --storage sqlite:///experiments/hpo/kan.db
+    --storage sqlite:///experiments/hpo/optimizer.db
 ```
 
 To parallelize across nodes (each worker contributes additional trials to the same study):
 
 ```bash
 # On each node — same storage URL, same model_type, fresh n-trials per worker
-python -m spectramr.cli hpo --config <yaml> -m <model> --search-preset kan_dual_domain \
+python -m spectramr.cli hpo --config <yaml> -m <model> --search-preset optimizer_basic \
     --n-trials 20 --storage sqlite:///shared/hpo.db
 ```
 
@@ -220,11 +229,21 @@ Default pruner is Hyperband with intermediate reports at iters 4K / 8K / 16K / 3
 
 ```bash
 python -m spectramr.cli hpo --config <yaml> -m <model> \
-    --search-preset kan_dual_domain \
-    --pruner median           # or successive_halving, threshold, none
+    --search-preset optimizer_basic \
+    --pruner median           # or successive_halving
 ```
 
-`--pruner none` disables pruning entirely (every trial trains to completion). Useful for short `--max-iter` runs (≤5K) where pruning would kill trials before they've stabilized.
+> **`--pruner none` does not disable pruning, and `--pruner threshold` does not run.**
+> The CLI's `choices=` list and the factory that consumes the string are two
+> unsynced vocabularies.
+> `none` is translated to `nop`, the pruner factory has no `nop` branch, and the
+> fall-through returns **MedianPruner** — so trials you expected to run to
+> completion get pruned instead. `threshold` raises
+> `TypeError: Either lower or upper must be specified.` before the first trial,
+> because nothing plumbs its bounds. The pruners that behave as documented are
+> `hyperband`, `median` and `successive_halving`. Likewise `--sampler nsga2` is
+> matched as `nsgaii` in the factory and silently degrades to TPE unless
+> `--multi-objective --cost-weight >0` is also set.
 
 ## Output layout
 
@@ -253,11 +272,15 @@ The output directory defaults to `<base.training.output_dir>/hpo` so HPO trial a
 
 * **Conflict between presets.** `--search-preset a --search-preset b` raises if `a` and `b` define the same path. This is intentional — silent precedence rules are usually a bug. If you genuinely want one to override the other, pass `--preset-merge-policy override` (later wins) or `keep` (first wins).
 
-* **Pruning at iter 4K when `--max-iter 5000`.** The Hyperband milestones don't auto-rescale to your `--max-iter`. For short runs, either disable pruning (`--pruner none`) or pick a budget where pruning makes sense (`--max-iter 30000+`).
+* **Pruning at iter 4K when `--max-iter 5000`.** The Hyperband milestones don't auto-rescale to your `--max-iter`. Pick a budget where pruning makes sense (`--max-iter 30000+`) — you cannot currently opt out, because `--pruner none` silently becomes MedianPruner.
+
+* **`train --override` cannot express a `[name=...]` selector.** The selector syntax works in a *search space*, which resolves paths through `apply_dotted_override`. `train --override` uses a different resolver that splits on the first `=` — which lands inside the selector — and then discards the result while logging `Overrides applied (1)`. Applying a winning loss weight by hand means editing the YAML, or just running the `best_config.yaml` that HPO already wrote.
+
+* **A search-space path must be the one the schema declares.** A search space *adds* a key to a config that already carries one, so a path that is merely close raises on trial 1 rather than being quietly accepted. Write the full nested path — `optimization.optimizer.learning_rate`, not a shorter spelling — and check it against the schema before running.
 
 * **Wavelet-attention configs cannot use the `kan_dual_domain` preset directly.** The preset defines paths inside `model.model_kwargs.kan_dual_domain_kwargs` which the wavelet attention type ignores. For wavelet HPO, write a custom YAML targeting the wavelet-specific paths (e.g., `num_levels`, `score_fn`).
 
-* **A `[name=...]` selector must name the list the loss actually lives in.** Plain dotted keys auto-create missing intermediate dicts, so a `model_kwargs` path an arm never declares is harmless. List selectors are the opposite: they raise `no list item with name=...` and kill the run on trial 1. Until 2026-07-30 the `kan_dual_domain` and `loss_weights_only` presets targeted `losses.image_losses[name=complex_spatial_gradient]` and `[name=sense_adjoint_l1]`, but both losses live in `losses.kspace_losses` (57 and 56 arms corpus-wide, and in `image_losses` nowhere), so both presets crashed on their first trial. When adding a preset path, check which list the arm declares the loss under — `tests/unit/pipelines/test_hpo_search_spaces.py::test_every_preset_applies_cleanly_to_headline_yaml` now applies every built-in preset to the headline arm to keep them honest.
+* **A `[name=...]` selector must name the list the loss actually lives in.** Plain dotted keys auto-create missing intermediate dicts, so a `model_kwargs` path an arm never declares is harmless. List selectors are the opposite: they raise `no list item with name=...` and kill the run on trial 1. The same loss name can be declared under `losses.kspace_losses` or `losses.image_losses` depending on the arm, and the selector does not search across both — read the config's `losses:` block and write the list it uses.
 
 ## Programmatic API
 
@@ -278,17 +301,17 @@ space = load_presets(["optimizer_basic", "loss_weights_only"])
 
 # (c) Programmatic — use tuple specs for terseness or dict specs for readability
 space = SearchSpace.from_dict({
-    "optimization.learning_rate": ("loguniform", 1e-5, 2e-4),
-    "model.model_kwargs.kan_dual_domain_kwargs.kan_grid_size": ("categorical", 4, 5, 6, 8),
-    "losses.kspace_losses[name=log_spectral].weight": ("loguniform", 0.01, 1.0),
+    "optimization.optimizer.learning_rate": ("loguniform", 1e-5, 2e-4),
+    "optimization.optimizer.weight_decay": ("loguniform", 1e-7, 1e-3),
+    "losses.kspace_losses[name=l1].weight": ("loguniform", 0.1, 10.0),
 })
 
 # Run HPO
 request = HPORequest(
-    config_path="experiments/inprogress/kspace_filling/experiment_11_kan_dual_domain.yaml",
-    model_types=["kspace_cold_diffusion"],
+    config_path="experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml",
+    model_types=["complex_unet"],
     n_trials=60,
-    objective_metric="val_robust_mri_psnr_2x",
+    objective_metric="val_psnr",
     max_iter_per_trial=30000,
     storage_url="sqlite:///my_study.db",
     search_space_dict={
@@ -309,7 +332,7 @@ for model_type, result in response.results.items():
 
 ## Testing
 
-The HPO machinery has 37 unit tests covering: distribution validation, search-space construction (dict / YAML / programmatic), preset registry, composite merging with conflict policies, dotted-path tokenization (including `[name=foo]` list selectors), schema enumeration, and end-to-end trial-YAML application of the `kan_dual_domain` preset against the real headline YAML. Run them locally:
+The HPO machinery's unit tests cover distribution validation, search-space construction (dict / YAML / programmatic), the preset registry, composite merging with conflict policies, dotted-path tokenization (including `[name=foo]` list selectors), schema enumeration, and end-to-end application of a preset to a trial YAML. Run them locally:
 
 ```bash
 pytest tests/unit/pipelines/test_hpo_search_spaces.py \

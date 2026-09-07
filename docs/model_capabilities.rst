@@ -10,9 +10,9 @@ This reference provides a comprehensive matrix of all models in the framework, s
    :local:
    :depth: 2
 
-====================
+=======================
 Model Capability Matrix
-====================
+=======================
 
 Core Reconstruction Models
 ===========================
@@ -200,9 +200,9 @@ Specialized Models
 
 ---
 
-====================
+=====================
 Training Mode Details
-====================
+=====================
 
 Reconstruction
 ==============
@@ -456,9 +456,9 @@ Compressed Sensing
 
 ---
 
-====================
+=====================
 Quick Selection Guide
-====================
+=====================
 
 By Use Case
 ===========
@@ -512,5 +512,5 @@ By Computational Budget
 **See Also:**
 
 - :doc:`getting_started` - Quick start guide
-- :doc:`user_guide` - Framework usage
+- :doc:`getting_started` - Install and first run
 - :doc:`tutorials/index` - Step-by-step tutorials

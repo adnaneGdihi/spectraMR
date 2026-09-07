@@ -1,49 +1,30 @@
 Training throughput: which lever, in what order
 ================================================
 
-Every acceleration mechanism in this framework is wired and reachable from YAML.
-Almost none of them is used. Measured across the 642 arms under
-``experiments/inprogress/`` (resolved settings, not a grep — see the warning
-below):
+Every acceleration mechanism in this framework is wired and reachable from YAML,
+and a default run uses almost none of them:
 
 .. list-table::
    :header-rows: 1
-   :widths: 34 12 54
+   :widths: 40 60
 
    * - Lever
-     - Arms
      - Where it is declared
    * - Gradient accumulation
-     - 199
      - ``optimization.gradient.accumulation_steps``
    * - AMP (autocast)
-     - 46
      - ``optimization.precision.enabled`` / ``.dtype``
    * - Gradient checkpointing
-     - 24
      - ``optimization.gradient.enable_checkpointing``
    * - ``torch.compile``
-     - 3
      - ``optimization.compile.enabled``
    * - FSDP / DeepSpeed
-     - 3
      - ``parallel.strategy``
    * - Fused optimizer step
-     - 0
      - ``optimization.optimizer.fused``
 
 So the common case is a single-GPU, eager, fp32 run. That is usually not a
 deliberate choice — it is the default nobody revisited.
-
-.. warning::
-
-   **Do not measure adoption with grep.** Several of these knobs have legacy flat
-   spellings that ``RENAMES`` folds onto the canonical path, so a declaration in
-   the old spelling is live and invisible to a text search. A sweep for
-   ``optimization.precision.enabled: true`` returns **0**; the resolver returns
-   **46**, because those arms declare ``optimization.use_amp``. The same trap
-   understated ``compile`` as 0 against a true 3. Load the config and read the
-   resolved value.
 
 No in-repo speedup numbers exist
 --------------------------------
@@ -62,8 +43,8 @@ to, so stopping early is usually right.
 
 **1. Gradient accumulation** — ``optimization.gradient.accumulation_steps``
 
-Buys effective batch size at no memory cost and no numerical change. Already the
-most-used lever here (199 arms). Not a throughput win on its own: it trades
+Buys effective batch size at no memory cost and no numerical change, and is the
+cheapest of these to adopt. Not a throughput win on its own: it trades
 wall-clock for batch size, so reach for it when the batch is the constraint, not
 when the clock is.
 
@@ -90,8 +71,8 @@ carries the loss-scaler failure modes documented in :doc:`troubleshooting`.
    **Diffusion arms are excluded.** They train in full fp32 —
    ``precision: {enabled: false, dtype: float32}`` — and
    ``check_diffusion_precision_policy`` makes anything else a hard audit error,
-   for bf16 as well as fp16. When that check landed it fired on 12 arms that
-   were training a noise-prediction objective under autocast. The policy and the
+   for bf16 as well as fp16. Training a noise-prediction objective under
+   autocast is exactly the failure it exists to catch. The policy and the
    reasoning are under "Mixed precision" in :doc:`troubleshooting`.
 
    (Referenced by page rather than by label so this page does not depend on the

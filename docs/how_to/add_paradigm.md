@@ -136,20 +136,23 @@ for the pattern.
 Place it under `experiments/inprogress/<paradigm>/<arm>.yaml`:
 
 ```yaml
-config_version: '6.0'
+config_version: '1.0'
 
 metadata:
   name: my_paradigm_baseline
   description: "Minimal reference config for my_paradigm."
   tags: {paradigm: my_paradigm, type: baseline, novelty: my_paradigm}
-  version: '6.0'
+  version: '1.0'
 
 data:
   dataset_type: nifti_paired
-  data_root: ${SPECTRAMR_DATA_ROOT}/processed/ulf_to_hf_ldm/train
-  patch_size: [256, 256, 1]
-  batch_size: 4
 
+  loader:
+    batch_size: 4
+  sampling:
+    patch_size: [256, 256, 1]
+  source:
+    root: ${SPECTRAMR_DATA_ROOT}/processed/ulf_to_hf_ldm/train
 model:
   model_type: enhanced_deep_unet
   in_channels: 1
@@ -158,33 +161,37 @@ model:
   model_kwargs: {features: [32, 64, 128, 256]}
 
 losses:
-  output_domain: image
   image_losses:
     - {name: l1, weight: 1.0, enabled: true}
 
+  policy:
+    output_domain: image
 training:
   training_mode: my_paradigm
   strategy_class: spectramr.infrastructure.training.strategies.my_paradigm.MyParadigmStrategy
   epochs: 100
-  seed: 42
   device: cuda
   output_dir: experiments/results/my_paradigm_baseline
 
 optimization:
-  optimizer_type: adamw
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
 
+  optimizer:
+    type: adamw
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-5
 validation:
   enabled: true
-  metrics: [psnr, ssim]
 
-acceleration: {base_acceleration: 4, center_fraction: 0.08}
+  scoring:
+    compute: [psnr, ssim]
+undersampling: {base_acceleration: 4, center_fraction: 0.08}
 checkpoint: {enabled: true}
 logging: {experiment_name: my_paradigm_baseline, level: info}
 loss_logging: {enabled: true}
 metrics: {best_metric_name: val_psnr, best_metric_mode: max, domain: image}
 physics: {}
+run:
+  seed: 42
 ```
 
 Use `${SPECTRAMR_DATA_ROOT}` for any path outside the package source tree
@@ -197,14 +204,14 @@ spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml
 ```
 
 Tier 0+1 takes ~100 ms; add `--probe` for the Tier 2 synthetic forward pass.
-See the [audit ladder](../explanation/audit_ladder.md) for what each tier checks.
+See the [audit ladder](../audit_ladder_user_guide.rst) for what each tier checks.
 
 ### 4. Land tests + docs
 
 Two files, both required by [CONTRIBUTING.md](https://github.com/adnaneGdihi/spectramr/blob/main/CONTRIBUTING.md):
 
 ```
-tests/unit/infrastructure/training/test_my_paradigm_strategy.py
+tests/unit/infrastructure/training/test_<your_paradigm>_strategy.py
 docs/how_to/<your_topic>.md  (or extend an existing page)
 ```
 
@@ -234,4 +241,4 @@ A worked-out example is
 
 - [Add a model](add_model.md) — how to register a new architecture for use in this paradigm.
 - [Add a loss](add_loss.md) — how to register a new loss function.
-- [Write an experiment YAML](write_experiment_yaml.md) — the v6.0 schema reference.
+- [Write an experiment YAML](write_experiment_yaml.md) — the schema reference.

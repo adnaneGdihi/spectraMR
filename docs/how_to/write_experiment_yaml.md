@@ -1,14 +1,12 @@
 # Write an experiment YAML
 
-Every experiment in spectraMR is one YAML file. The schema is the canonical
-v6.0 layout — frozen Pydantic v2 models defined in
-`src/spectramr/config/schemas/`. The audit ladder catches mistakes before
+Every experiment in spectraMR is one YAML file. The schema is a set of frozen
+Pydantic v2 models defined in `src/spectramr/config/schemas/`, and every file
+declares `config_version: '1.0'`. The audit ladder catches mistakes before
 training starts.
 
 This page is the short, opinionated walkthrough. The dry exhaustive
-reference is at [YAML schema](../reference/yaml_schema.md). For
-multi-experiment campaigns see
-[campaigns_user_guide](https://github.com/adnaneGdihi/spectramr/blob/main/docs/campaigns_user_guide.rst).
+reference is at [configuration schema reference](../config_schema_reference.rst).
 
 ## Where the file lives
 
@@ -23,22 +21,31 @@ multi-experiment campaigns see
 The promotion path is **always** `inprogress → active`, never the other
 direction. See the [four-step paradigm recipe](https://github.com/adnaneGdihi/spectramr/blob/main/CONTRIBUTING.md#adding-a-new-training-paradigm-four-step-recipe).
 
-## The 12 required blocks
+## The house-style skeleton
 
-Every YAML must declare all of these. The Pydantic schema rejects the
-file with a clear error if anything is missing.
+**This is a skeleton, not a runnable file.** Every `<...>` below is a
+placeholder you must replace — `model_type: <registered_name>` fails the audit
+as written, which is the point: the audit rejects an unregistered name rather
+than substituting a default.
+
+Only four of these blocks are required by the schema itself (`model`, `data`,
+`optimization`, `logging`). The rest are optional to *load* and expected in
+practice — a paradigm that needs one still fails Tier 1 without it, and `audit`
+is `--strict` by default, so a missing `validation:` or `physics:` block
+usually surfaces as a warning that exits 2 rather than as a schema error.
+Declare them all unless you have a reason not to.
 
 ```yaml
-config_version: '6.0'
+config_version: '1.0'
 
 metadata:
   name: <arm_name>
   description: |
     What this experiment does, why, and what it's compared against.
   tags: {paradigm: ..., type: ..., novelty: ...}
-  version: '6.0'
+  version: '1.0'
 
-acceleration:
+undersampling:
   base_acceleration: 4
   center_fraction: 0.08
 
@@ -52,25 +59,32 @@ checkpoint:
   save_interval: 10000
 
 data:
-  coil_processing_mode: rss          # or 'sense', 'as_is'
   dataset_type: nifti_paired         # see schema for full list
-  data_root: ${SPECTRAMR_DATA_ROOT}/processed/ulf_to_hf_ldm/train
-  patch_size: [256, 256, 1]
-  batch_size: 2
-  num_workers: 4
 
+  loader:
+    batch_size: 2
+    num_workers: 4
+  coils:
+    processing_mode: rss          # or 'sense', 'as_is'
+  sampling:
+    patch_size: [256, 256, 1]
+  source:
+    root: ${SPECTRAMR_DATA_ROOT}/processed/ulf_to_hf_ldm/train
 losses:
-  output_domain: image               # or 'kspace', 'complex', 'latent'
   image_losses:
     - {name: l1,  weight: 1.0, enabled: true}
     - {name: ssim, weight: 0.5, enabled: true}
   kspace_losses: []
   complex_losses: []
 
+  policy:
+    output_domain: image               # or 'kspace', 'complex', 'latent'
 logging:
-  experiment_name: <arm_name>
-  level: info
 
+  identity:
+    experiment: <arm_name>
+  sinks:
+    level: info
 loss_logging:
   enabled: true
   csv_path: experiments/results/<arm_name>/logs/losses.csv
@@ -88,25 +102,30 @@ model:
   model_kwargs: {}
 
 optimization:
-  optimizer_type: adamw
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
-  use_amp: false
 
+  optimizer:
+    type: adamw
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-5
+  precision:
+    enabled: false
 training:
   training_mode: <registered_mode>
   strategy_class: spectramr.infrastructure.training.strategies.<...>
   epochs: 100
   device: cuda
-  seed: 42
   output_dir: experiments/results/<arm_name>
 
 validation:
   enabled: true
-  metrics: [psnr, ssim]
-  eval_interval: 5000
 
+  schedule:
+    interval_steps: 5000
+  scoring:
+    compute: [psnr, ssim]
 physics: {}                          # required block; may be empty
+run:
+  seed: 42
 ```
 
 ## The gotcha checklist
@@ -187,10 +206,11 @@ only if the data pipeline mounts the relevant wrapper. Flip the flag:
 
 ```yaml
 data:
-  expose_conformal_jacobian: true
-  expose_cortex_flatten_grid: true
-  expose_glm_design_matrix: true
-  expose_scanner_id: true
+  expose:
+    conformal_jacobian: true
+    cortex_flatten_grid: true
+    glm_design_matrix: true
+    scanner_id: true
 ```
 
 Without the flag, the strategy gets a `KeyError` mid-training. The
@@ -211,7 +231,7 @@ Never hardcode a cluster path. The audit's `hardcoded_cluster_paths`
 check rejects any data field starting with `/project/<user>/` or
 `/scratch/<user>/` *unless* that prefix matches your own
 `SPECTRAMR_DATA_ROOT` / `PROJECT_ROOT` env var (see
-[CLUSTER_DATA_LAYOUT.md](../CLUSTER_DATA_LAYOUT.md)).
+[environment variables](../environment_variables.rst)).
 
 ## Validate before launching
 
@@ -235,19 +255,17 @@ spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml --probe     # adds 
 
 ## Reference YAMLs to copy from
 
-| Strategy class | Reference YAML |
+| What you are building | Config to copy |
 |---|---|
-| `ReconstructionTrainingStrategy` | `experiments/active/experiment_42_bloch_cycles.yaml` |
-| `ScoreFieldTomographyStrategy` | `experiments/inprogress/novel_2026/idea_2_score_field_tomography.yaml` |
-| `BeltramiMotionCorrectionStrategy` | `experiments/inprogress/sfc_conformal_2026/idea_4_beltrami_motion_correction.yaml` |
-| `RiemannianMRFDiffusionStrategy` | `experiments/inprogress/mrf_2026/idea_2_riemannian_mrf_diffusion.yaml` |
-| Cold diffusion (Teichmüller) | `experiments/inprogress/sfc_conformal_2026/idea_6_teichmuller_cold_diffusion.yaml` |
-| Generic GAN | `experiments/active/dummy_gan.yaml` (minimal GAN reference) |
+| Anything, from scratch | `experiments/templates/comprehensive_config_template.yaml` (`model_type: unet`, `training_mode: reconstruction`) |
+| Self-supervised reconstruction | `experiments/inprogress/reconstruction/ssdu_selfsup_m4raw.yaml` (`model_type: unrolled_reconstruction`) |
+| Score-based diffusion | `experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml` (`model_type: score_based_diffusion`) |
+| Complex-valued reconstruction | `experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml` (`model_type: complex_unet`) |
 
 Copy-and-modify is cheaper than writing from scratch.
 
 ## Next steps
 
-- [YAML schema reference](../reference/yaml_schema.md) — every field, every type.
-- [Audit ladder](../explanation/audit_ladder.md) — what each tier checks.
+- [Configuration schema reference](../config_schema_reference.rst) — every field, every type.
+- [Audit ladder](../audit_ladder_user_guide.rst) — what each tier checks.
 - [Add a paradigm](add_paradigm.md) — when a new training mode is needed.
