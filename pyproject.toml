@@ -307,7 +307,7 @@ graph = ["torch-geometric>=2.6"]
 # wheel (no ANTs C++ build). Move the pin only after reading the candidate's
 # METADATA and confirming the cap is gone -- a range would let an unmeasured
 # release back in, which is exactly how the cap arrived.
-registration = ["antspyx==0.5.3"]
+registration = ["antspyx==0.6.3"]
 
 # Symbolic-regression generator (models/generators/symbolic_regression_wrapper.py),
 # behind a deferred import.
