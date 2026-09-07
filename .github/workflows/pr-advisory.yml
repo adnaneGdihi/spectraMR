@@ -139,7 +139,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39  # v3.2.4
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
       # STILL ADVISORY, and no longer for the old reason. The unpinned-uses
       # backlog is drained -- every `uses:` in this tree is a SHA and
       # .github/zizmor.yml carries a single `"*": "hash-pin"` policy -- but
