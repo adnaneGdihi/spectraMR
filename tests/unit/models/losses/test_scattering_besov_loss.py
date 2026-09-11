@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.models.losses.scattering_besov_loss import ScatteringBesovLoss
 

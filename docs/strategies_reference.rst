@@ -1969,12 +1969,60 @@ default — surface the failure.
 - Wrapping a strategy's *distinctive* terms — a cross-contrast LNCC, a SIREN PDE
   Laplacian — in an ``except Exception:`` that zeroes or drops them. Any
   shape / NaN / AMP error then collapses the arm to a plain reconstruction while
-  smoke still PASSes. A genuine failure must raise. Reading the loop iteration
-  from ``kwargs.get("step", 0)`` has the same effect on step-gated schedules: the
-  loop never sets that key, so the schedule freezes at 0. Use
-  ``resolve_loop_iteration(self)``.
+  smoke still PASSes. A genuine failure must raise. (Reading the loop iteration
+  from a frozen ``step`` key has the same silent-collapse effect on step-gated
+  schedules — section 5 below owns that rule and enumerates all three spellings.)
 - Catching a teacher-checkpoint load failure and setting ``self._teacher = None``,
   which trains the student as a plain reconstruction even though
   ``checkpoint.resume_from`` was configured. A configured-but-unloadable teacher
   must raise; the genuinely-optional no-teacher path returns early, before the
   load is attempted.
+
+5. Read the loop iteration from ``loop_state``, never from ``env.step``
+-----------------------------------------------------------------------
+
+:class:`~spectramr.infrastructure.training.contexts.TrainingEnvironment` is
+``frozen=True`` and declares **no** ``step`` field, and the training loop passes
+``iteration=`` into every step hook — never ``step=``. So all three of these read a
+constant ``0`` for the whole run:
+
+.. code-block:: python
+
+   getattr(self.env, "step", 0)     # frozen: no such field
+   self.env.step                    # frozen: no such field
+   kwargs.get("step", 0)            # the loop passes `iteration=`, not `step=`
+
+The single owner is
+:func:`~spectramr.infrastructure.training.loop_state.resolve_loop_iteration`, which
+reads the ``LoopState`` the loop writes at every step:
+
+.. code-block:: python
+
+   from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
+
+   iteration = resolve_loop_iteration(self)
+
+Frozen at ``0`` the damage takes two forms. A metric throttle
+(``current_step % train_metric_interval``) fires on **every** batch, because
+``0 % n == 0`` for every ``n``. And a warm-up gate never opens: ``resolve_loss_weight``
+returns ``0.0`` while ``iteration < warmup_iterations`` (default 1000), and the
+computers gate on ``if lambda_x > 0`` — so the term is **absent from** ``components``,
+not scaled to zero, and nothing reports it.
+
+**Concrete fixes (September 2026, issue #1937).** Five holdouts were migrated:
+``vae.py`` (``VQVAETrainingStrategy``), ``disentangled_vae_strategy.py``,
+``slice_to_volume_strategy.py``, ``pinn_strategy.py`` and ``vf_admm_strategy.py``.
+The last was live on five ``vf`` arms, where the shut gate removed ``l1`` — a loss
+those arms never declare, resolved from the ``lambda_l1`` schema default of ``10.0``
+against ``1.0`` each for the only two terms they enable — from every training step.
+
+Two spellings are **not** violations and are left alone:
+``kwargs.get("iteration", kwargs.get("step", 0))`` reaches the real value through the
+first key, and ``int(kwargs.get("iteration", 0) or 0)`` reads what the loop actually
+passes. Note the inverted form ``kwargs.get("step", kwargs.get("iteration", 0))``
+*is* a violation — it resolves to ``0`` before ever consulting ``iteration``.
+
+The corpus guard is ``tests/architecture/test_strategies_read_live_iteration.py``,
+which scans ``infrastructure/training/`` by AST. It must stay AST-based: ten lines
+under ``strategies/`` spell these forms inside *comments* describing the historical
+defect, and a text scan false-positives on all ten.

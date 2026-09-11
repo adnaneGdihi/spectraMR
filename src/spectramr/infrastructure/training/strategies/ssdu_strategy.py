@@ -10,7 +10,7 @@ The held-out residual is scored by the already-registered ``ssdu`` /
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -109,6 +109,13 @@ class SSDUReconstructionStrategy(ReconstructionTrainingStrategy):
     the held-out residual ``||M_Theta(F x_hat - y)||`` is scored by the
     registered ``ssdu`` loss.
     """
+
+    #: Loss ownership (issue #1918). Iterates env.losses (route 5) but the loop body is `if "ssdu" in name`:
+    #: every declared image loss whose name lacks that substring is SKIPPED. The
+    #: textual route marker cannot see the filter, so the flag -- not the pin --
+    #: is what records that this strategy folds only its own ssdu terms.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(
         self,

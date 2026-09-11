@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.training.backward_guard import ensure_backward_ready
 from spectramr.infrastructure.training.memory_context_managers import (
     gpu_memory_monitor,
     memory_cleanup_context,
@@ -166,13 +167,24 @@ class StepExecutor:
         guard = getattr(self.amp_policy, "guard_loss", None)
         if callable(guard):
             guard(loss, name=name, global_step=global_step, scaler=scaler)
-            return
-        if scaler is None and not torch.isfinite(loss).all():
+        elif scaler is None and not torch.isfinite(loss).all():
             raise RuntimeError(
                 f"Non-finite loss for config {name!r} at step {global_step} "
                 "before backward; refusing to poison weights (check coil maps / "
                 "fidelity terms)."
             )
+
+        # Second invariant, and deliberately NOT delegated to the policy: the
+        # loss must be connected to the autograd graph. DeepSpeed legitimately
+        # no-ops the finite check above (it owns its own overflow detect + step
+        # skip), but no backend can make a severed graph correct, so routing
+        # this through ``guard_loss`` would make it silently absent on exactly
+        # one backend -- the failure shape it exists to prevent. Runs last so a
+        # loss that is both non-finite and severed still reports the
+        # numerically actionable failure first. Runs here, before the
+        # accumulation divide and before ``scaler.scale()``, because both are
+        # multiplies that give a leaf a ``grad_fn`` and hide it (#1952).
+        ensure_backward_ready(loss, name=name, global_step=global_step)
 
     def execute_step(
         self,

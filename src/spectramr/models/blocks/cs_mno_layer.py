@@ -127,7 +127,7 @@ class CSMNOLayer(nn.Module):
         # N806: `N` is the token count in this file's `[B, C, N]` shape
         # vocabulary, matching `B, C` above -- a tensor-dimension symbol,
         # not a variable that wants snake_case.
-        N = math.prod(spatial)  # noqa: N806
+        N = math.prod(spatial)
 
         # SFC branch: linearise → scan → de-linearise.
         x_flat = x.reshape(B, C, N)  # [B, C, N]

@@ -47,10 +47,10 @@ help:
 # the recipe on its first line -- `make test-nightly` never reached pytest.
 VENV := [ -f .venv/bin/activate ] && . .venv/bin/activate || true;
 
-# ruff format is the formatter SSOT: it is what .pre-commit-config.yaml runs and what
-# the pr-required lint gate checks against. black used to be invoked here despite
-# being declared in no extra of pyproject.toml, so the two fought over every file a
-# commit touched.
+# ruff format is the formatter SSOT: it is what the added-line gate checks an ADDED
+# file against, in the pre-commit hook and in pr-required alike. black used to be
+# invoked here despite being declared in no extra of pyproject.toml, so the two fought
+# over every file a commit touched.
 format:
 	ruff check --fix src/ tests/ || true
 	ruff format src/ tests/

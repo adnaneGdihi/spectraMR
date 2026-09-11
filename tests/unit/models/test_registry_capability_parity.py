@@ -13,7 +13,7 @@ written against the base name receives.
 
 The concrete failure this file was written for: ``latent_gaussian_diffusion`` is
 ``class LatentGaussianDiffusion(LatentDiffusionGenerator): pass`` — the same behaviour,
-by construction — but its registration re-declared 1 of 6 capabilities. It reported
+by construction — but its registration redeclared 1 of 6 capabilities. It reported
 ``spatial_dims=None`` while the base reported ``(2,)``. PR #1073 widened that gap
 without noticing, by narrowing the base from ``(2, 3)`` to ``(2,)``.
 
@@ -80,6 +80,22 @@ KNOWN_UNDER_DECLARED: dict[str, str] = {
 KNOWN_ALIAS_DIVERGENCE: dict[frozenset[str], str] = {
     frozenset({"graph_unet", "graph_unet_diffusion"}): (
         "same class registered under two training modes on purpose; only `mode` differs"
+    ),
+    frozenset(
+        {
+            "patch_gan",
+            "patchgan_discriminator",
+            "patch_latent_discriminator",
+            "multiscale_latent_discriminator",
+        }
+    ): (
+        "PatchGANDiscriminator scores two different input spaces, so `input_domain` is a "
+        "property of the REGISTRATION and not of the class: the first two names score "
+        "images, the two `latent` names score a post-VAE-encoder code. Collapsing them "
+        'onto a permissive `("image", "kspace")` tuple would be accurate about tensor '
+        "shapes and useless as a contract — `resolve_conversion` returns None as soon as "
+        "any accepted side matches, so it would never convert. See the decorator block in "
+        "models/discriminators/patchgan_discriminator.py, which is where the reason lives."
     ),
 }
 

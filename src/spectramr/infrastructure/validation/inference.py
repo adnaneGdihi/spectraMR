@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.infrastructure.validation.recommendations import (
     Recommendation,
     RecommendationLevel,
@@ -46,20 +47,25 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
 
 
 def _model_capabilities(config: Any) -> ModelCapabilities | None:
-    from spectramr.models.registry import MODEL_REGISTRY
+    """The configured model's declared capabilities, or None.
+
+    Delegates to :func:`get_model_capabilities`. This function used to carry
+    its own copy of that body -- the entry lookup, the ``isinstance`` check
+    and the all-fields-None "unannotated" sentinel -- which made it a second
+    owner of the sentinel's definition (non-negotiable 17). The two agreed
+    only because the copy iterated ``__dataclass_fields__`` dynamically; a
+    sentinel keyed on an explicit field list, in either copy, would have
+    silently diverged the moment a field was added.
+    """
+    from spectramr.models.registry import get_model_capabilities
 
     model = getattr(config, "model", None)
     if model is None:
         return None
     mt = getattr(model, "model_type", None)
-    if not mt or mt not in MODEL_REGISTRY:
+    if not mt:
         return None
-    caps = MODEL_REGISTRY[mt].get("capabilities")
-    if not isinstance(caps, ModelCapabilities):
-        return None
-    if all(getattr(caps, f) is None for f in caps.__dataclass_fields__):
-        return None
-    return caps
+    return get_model_capabilities(str(mt))
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +255,7 @@ def derive_tags(config: Any) -> list[Tag]:
     sense_loss_names = {"sense_adjoint_l1", "sense_adjoint_consistency"}
     if losses is not None:
         all_loss_entries = []
-        for k in ("image_losses", "kspace_losses", "complex_losses"):
+        for k in LOSS_LIST_DOMAINS:
             all_loss_entries.extend(getattr(losses, k, None) or [])
         names = {getattr(e, "name", None) for e in all_loss_entries}
         if names & sense_loss_names:
@@ -374,10 +380,19 @@ def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
 
     # Model side
     mt = getattr(model, "model_type", None)
-    from spectramr.models.registry import MODEL_REGISTRY
+    from spectramr.models.registry import MODEL_REGISTRY, model_supports
 
-    entry = MODEL_REGISTRY.get(mt) if mt else None
-    supports_contrast = bool(entry and entry.get("supports_contrast_conditioning", False))
+    # Read through ``model_supports``, not ``entry.get(...)``. This site used
+    # to reach past the helper into the registry entry's top-level keys, which
+    # is why a grep for the helper's callers did not find it -- and once the
+    # flag moved onto the nested ``ModelCapabilities`` (#1916), a top-level
+    # ``.get`` would have answered False for every model that declares it and
+    # raised this recommendation against 27 correctly-annotated models.
+    supports_contrast = (
+        bool(mt)
+        and mt in MODEL_REGISTRY
+        and model_supports(str(mt), "supports_contrast_conditioning")
+    )
 
     if mc_enabled and not supports_contrast:
         out.append(
@@ -744,7 +759,7 @@ def recommend_sense_loss_needs_sense_maps(config: Any) -> list[Recommendation]:
         return out
     sense_loss_names = {"sense_adjoint_l1", "sense_adjoint_consistency"}
     has_sense = False
-    for k in ("image_losses", "kspace_losses", "complex_losses"):
+    for k in LOSS_LIST_DOMAINS:
         for entry in getattr(losses, k, None) or []:
             if getattr(entry, "name", None) in sense_loss_names:
                 has_sense = True

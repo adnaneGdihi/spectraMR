@@ -57,9 +57,11 @@ from spectramr.infrastructure.training.utils.transform_ops import (
     FFTTransformer,
 )
 from spectramr.models.capabilities import StrategyCapabilities
+from spectramr.models.losses.reporting import active_loss_names, format_loss_objective
 from spectramr.models.losses.weights import (
     LossWeightTable,
     build_loss_weight_table,
+    canonical_loss_name,
     resolve_loss_weight,
 )
 
@@ -309,17 +311,39 @@ class BaseTrainingStrategy(
     #: name such as ``cocycle_consistency`` when the strategy owns that term).
     #: ``None`` = ownership not declared: the audit's
     #: ``image_losses_reach_the_objective`` witness reports such a strategy as
-    #: UNVERIFIED and errors only on declared ones. The fold
+    #: UNVERIFIED and errors only on declared ones, and ``LossBuilder.validate()``
+    #: refuses its empty loss stack -- silence is not a claim of ownership. Declared
+    #: here alongside ``folds_image_losses = False``, an empty stack is the design
+    #: instead and the build proceeds (``loss_folding.declares_inline_objective``,
+    #: the one owner of that pairing). The fold
     #: (``loss_folding.fold_builder_image_losses``) skips exactly this set, so a
     #: declared inline term is never counted twice (mrixfields review 2026-09-03).
     inline_losses: ClassVar[frozenset[str] | None] = None
 
-    #: True when every other ``losses.image_losses`` entry reaches the objective:
-    #: through the parent's builder path (``super()._compute_losses_impl``) or the
-    #: strategy's own ``_apply_builder_image_losses`` call. ``test_loss_ownership``
-    #: pins the value against the source; a strategy that overrides
-    #: ``_compute_losses_impl`` with neither route declares False, and the witness
-    #: then rejects any declared entry outside ``inline_losses`` as a decoy.
+    #: True when every other ``losses.image_losses`` entry reaches the objective.
+    #: There are FIVE routes, all enumerated in ``test_loss_ownership.ROUTE_MARKERS``
+    #: (the one owner of that vocabulary): the parent's builder path
+    #: (``super()._compute_losses_impl``), the strategy's own
+    #: ``_apply_builder_image_losses`` call, the shared ``fold_builder_image_losses``
+    #: helper, forwarding ``env.losses`` as ``losses_dict`` to a unified loss
+    #: computer, and iterating ``env_losses.items()`` to accumulate
+    #: ``weight * loss``. A strategy that overrides ``_compute_losses_impl`` with
+    #: none of them declares False, and the witness then rejects any declared entry
+    #: outside ``inline_losses`` as a decoy.
+    #:
+    #: The fourth route is a HAND-OFF, not a fold: it only reaches the objective if
+    #: the receiving computer reads the dict. ``UnifiedMAELossComputer`` and
+    #: ``UnifiedDisentangledLossComputer`` accept ``losses_dict`` and discard it, so
+    #: a strategy handing off to either declares False (issue #1918).
+    #:
+    #: ``test_loss_ownership`` pins a True value against the source for every one of
+    #: the 153 strategy classes. The pin is ONE-DIRECTIONAL by design: declaring
+    #: False costs you nothing but honesty -- the witness then reports every
+    #: non-inline declared entry through ``unreachable_image_losses`` -- while
+    #: declaring True buys a silent PASS. Only the silent direction is gated, which
+    #: also lets a strategy whose fold is FILTERED (``SSDUReconstructionStrategy``
+    #: runs only names containing ``ssdu``) declare False truthfully even though it
+    #: matches a route marker textually.
     folds_image_losses: ClassVar[bool | None] = None
 
     logging_service: ILoggingService
@@ -2217,6 +2241,113 @@ class BaseTrainingStrategy(
             table = build_loss_weight_table(getattr(self.config, "losses", None))
             self._loss_weight_table = table
         return table
+
+    @property
+    def _declared_loss_keys(self) -> frozenset[str]:
+        """The loss names THIS strategy must guarantee in its per-step loss dict.
+
+        The CSV header is built ONCE at startup and the row writer drops any key the
+        header lacks (``extrasaction="ignore"``), so a declared loss that never reaches
+        the dict leaves a blank column for the whole run (#1919).
+
+        Derived from the loss-weight SSOT, never hand-listed. The lists this replaced
+        read one schema block each, so they were empty for every arm that declares its
+        objective in ``losses.image_losses`` / ``losses.kspace_losses`` — 58 of the
+        kspace_filling cohort. Builder-owned losses are subtracted via the existing
+        skip-set SSOT so they are not zero-filled here and then reported missing.
+        """
+        keys = getattr(self, "_declared_loss_key_cache", None)
+        if keys is None:
+            # Function-local, mirroring ``infrastructure/loss_audit.py``: the builder
+            # module owns the skip set, and importing it at module scope would put a
+            # builder import into every strategy.
+            from spectramr.infrastructure.training.builders.loss_builder import (
+                STRATEGY_MANAGED_LOSSES,
+            )
+
+            keys = active_loss_names(self._weight_table) - STRATEGY_MANAGED_LOSSES
+            self._declared_loss_key_cache = keys
+        return keys
+
+    @property
+    def _warmup_gated_loss_keys(self) -> frozenset[str]:
+        """Declared keys that are LEGITIMATELY absent while the warm-up gate holds.
+
+        ``adversarial`` is the common case: it is declared active, but
+        :func:`resolve_loss_weight` returns 0.0 while ``iteration <
+        warmup_iterations``, so the branch that would produce it never runs. Absent is a
+        state to report, never to infer (NN18) — but a *gated* absence is expected, and
+        reporting it would emit one line per step for the whole warm-up.
+        """
+        keys = getattr(self, "_warmup_gated_loss_key_cache", None)
+        if keys is None:
+            table = self._weight_table
+            keys = frozenset(
+                name
+                for name in self._declared_loss_keys
+                if name in table and table[name].warmup_gated
+            )
+            self._warmup_gated_loss_key_cache = keys
+        return keys
+
+    def _log_loss_objective(self, prefix: str) -> None:
+        """Announce this arm's declared objective, once, at strategy setup.
+
+        The banner is the only surface that shows the weight the user actually
+        wrote: a strategy-inline term such as ``pre_dc_kspace`` reaches the CSV
+        under a renamed key, and a warm-up-gated term reads back 0.0 from any
+        resolver called at iteration 0.
+        """
+        for line in format_loss_objective(self._weight_table, prefix=prefix):
+            self.logging_service.log_info(line)
+
+    def _ensure_declared_losses_present(
+        self, loss_dict: dict[str, torch.Tensor], *, iteration: int
+    ) -> frozenset[str]:
+        """Zero-fill declared losses this step did not produce; report the real drops.
+
+        Presence is tested on the CANONICAL name: an arm declaring ``mse`` resolves to
+        ``l2`` in the table while the computer may key either, and comparing raw strings
+        would fill a duplicate column and report a phantom miss every step.
+
+        Returns the names that were filled, so callers and tests can assert on it
+        instead of scraping the log.
+        """
+        declared = self._declared_loss_keys
+        if not declared:
+            return frozenset()
+
+        present = {canonical_loss_name(key) for key in loss_dict}
+        missing = declared - present
+        if missing:
+            device = next(
+                (v.device for v in loss_dict.values() if isinstance(v, torch.Tensor)),
+                None,
+            )
+            for loss_name in missing:
+                loss_dict[loss_name] = torch.zeros((), device=device)
+
+        # Anything missing that the warm-up gate does not explain is reported: the arm
+        # declared it at a live weight and this step did not produce it under that name.
+        # Two shapes reach here and the message must not pick one — the term may be
+        # genuinely uncomputed (a silent drop, NN3), or computed and keyed differently
+        # (``losses.diffusion.lambda_mse`` canonicalises to ``l2`` while the computer
+        # emits ``diffusion``). Reported once per distinct set, not per step (NN9).
+        expected_absent = (
+            self._warmup_gated_loss_keys
+            if iteration < self._weight_table.warmup_iterations
+            else frozenset()
+        )
+        unexplained = missing - expected_absent
+        if unexplained and unexplained != getattr(self, "_reported_missing_losses", None):
+            self._reported_missing_losses = unexplained
+            self.logging_service.log_warning(
+                f"[Train] Declared but absent from the loss dict ({len(unexplained)}): "
+                f"{sorted(unexplained)} — filled with 0.0 so the CSV column exists. "
+                "Either nothing on this path computes them, or the producer keys them "
+                "under a different name; both report as zeros for the whole run."
+            )
+        return frozenset(missing)
 
     def _get_loss_weight(self, loss_name: str, epoch: int = 0, **kwargs: Any) -> float:
         """The weight for ``loss_name``. Delegates to the loss-weight SSOT.

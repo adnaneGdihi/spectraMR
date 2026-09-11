@@ -128,9 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version statements that `build_dist.py` compares -- a writer with its own idea of
   where the version lives is the second owner non-negotiable 17 forbids.
 - The published repository's settings are a **declared, diffable model**
-  (`scripts/release/public_repo_settings.yaml`) with `public_settings_diff.py` to
-  compare it against the live repository and `public_settings_apply.py` to converge it,
-  rather than console state nobody can review.
+  (`public_repo_settings.yaml` in the research tree's release lane, which the export
+  deliberately withholds) with `public_settings_diff.py` to compare it against the live
+  repository and `public_settings_apply.py` to converge it, rather than console state
+  nobody can review.
 - The published repository runs a **two-lane CI**: a blocking `pr-required` lane and an
   advisory lane, shipped through the export overlay, plus a `manual-full-suite` workflow
   for the tiers too long to gate a PR on.

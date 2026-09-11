@@ -24,6 +24,7 @@ import torch
 from spectramr.infrastructure.physics.kinematic_forward import KinematicForwardOperator
 from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.loss_folding import declared_loss_weights
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
@@ -88,11 +89,24 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         self.loss_ssim = create_loss("ssim").to(self.device)
         self.loss_hfen = create_loss("hfen").to(self.device)
 
-        # Loss weights from config (direct access, SSOT)
-        recon_config = self.config.losses.reconstruction
-        self._lambda_l1 = recon_config.lambda_l1
-        self._lambda_ssim = recon_config.lambda_ssim
-        self._lambda_hfen = recon_config.lambda_hfen
+        # Loss weights from the loss-weight SSOT — NOT from ``config.losses.
+        # reconstruction`` directly. That read (whose comment used to call itself
+        # "SSOT") saw only the *category* paradigm: an arm on the domain paradigm
+        # (``losses.image_losses: [{name: l1, weight: ...}]``, no ``reconstruction:``
+        # block) still gets a fully-defaulted ``ReconstructionLossesConfig`` back, so
+        # the strategy silently applied ``lambda_l1``'s SCHEMA DEFAULT of 10.0 and
+        # ignored the weight the arm actually declared. The one live arm
+        # (``experiment_vf_hyper_mamba_meta_v2``) escapes only by the coincidence that
+        # its declared weight is also 10.0 — and its own in-repo comment ("the run
+        # actually used 10.0 (lambda_l1 won). Materialized.") records the divergence
+        # having already fired once and been papered over by editing the YAML.
+        # ``declared_loss_weights`` reads BOTH surfaces and raises when they disagree;
+        # ``.get(..., 0.0)`` keeps "undeclared means off" intact (an undeclared term
+        # contributes ``0.0 * loss``, byte-identical to not being summed).
+        declared = declared_loss_weights(self.config)
+        self._lambda_l1 = declared.get("l1", 0.0)
+        self._lambda_ssim = declared.get("ssim", 0.0)
+        self._lambda_hfen = declared.get("hfen", 0.0)
 
         # Motion parameters from config or defaults
         if hasattr(self.config.training, "motion"):

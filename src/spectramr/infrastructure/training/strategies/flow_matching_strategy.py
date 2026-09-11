@@ -33,7 +33,7 @@ with explicit Euler steps or Heun (2nd-order, trapezoidal) steps.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.nn import functional as func
@@ -52,6 +52,11 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
     :meth:`DiffusionTrainingStrategy._generator_accepts_time` (signature
     introspection, no ``except TypeError`` swallow).
     """
+
+    #: Loss ownership (issue #1918). mse_loss(pred, u_t) regresses the VELOCITY FIELD, not the target image;
+    #: the hook does not route to the builder's losses.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def _compute_losses_impl(
         self,

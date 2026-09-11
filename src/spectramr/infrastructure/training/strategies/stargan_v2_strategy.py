@@ -50,10 +50,8 @@ import logging
 from typing import Any
 
 import torch
-
-logger = logging.getLogger(__name__)
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
@@ -75,6 +73,8 @@ from spectramr.models.generators.stargan_v2 import (
     StyleEncoder,
 )
 from spectramr.models.losses.gan_loss_library import LSGANLoss, R1RegularizationLoss
+
+logger = logging.getLogger(__name__)
 
 
 class _DomainBoundDiscriminator(nn.Module):

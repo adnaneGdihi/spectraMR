@@ -46,7 +46,7 @@ def complex_image() -> torch.Tensor:
     # N806: upper-case here matches H, W on the line above and the image-space
     # convention used throughout the physics tree. Lower-casing only these two
     # would be less readable, not more.
-    Y, X = torch.meshgrid(  # noqa: N806
+    Y, X = torch.meshgrid(
         torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing="ij"
     )
     mag = (X**2 + Y**2 < 0.5).float()

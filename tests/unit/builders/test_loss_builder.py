@@ -174,17 +174,13 @@ class TestLossBuilder:
         gan_config.label_smoothing = 0.0
 
         builder = LossBuilder(mock_config, "cpu")
-        with pytest.raises(
-            ConfigurationError, match="Unknown gan_loss_type"
-        ) as exc_info:
+        with pytest.raises(ConfigurationError, match="Unknown gan_loss_type") as exc_info:
             builder._build_composite_gan(gan_config, None)
         # The offending value is surfaced in the message.
         assert "not_a_real_loss_type" in str(exc_info.value)
 
     @patch("spectramr.infrastructure.training.builders.loss_builder.create_loss")
-    def test_build_composite_gan_known_type_does_not_raise(
-        self, mock_create_loss, mock_config
-    ):
+    def test_build_composite_gan_known_type_does_not_raise(self, mock_create_loss, mock_config):
         """TB-03: a valid gan_loss_type still resolves through the registry map."""
         gan_config = MagicMock()
         gan_config.gan_loss_type = "lsgan"
@@ -209,20 +205,30 @@ class TestLossBuilder:
         ssim_entry.weight = 0.5
         ssim_entry.enabled = True
         mock_config.losses.image_losses = [ssim_entry]
+        # A config double has no ``model_fields_set``, so ``build_loss_weight_table``
+        # falls back to ``__dict__`` and reads every ``lambda_*`` the fixture set as
+        # an author declaration. The fixture's ``lambda_ssim = 0.0`` would therefore
+        # contradict the list entry above; make the two surfaces agree.
+        mock_config.losses.reconstruction.lambda_ssim = ssim_entry.weight
         builder = LossBuilder(mock_config, "cpu")
         # Isolate the guard: don't actually build list losses (needs registry).
         builder._build_list_based_losses = lambda: None
         return builder
 
-    def test_recon_managed_l1_not_flagged_as_unmigrated(self, mock_config):
-        """direct_ulf_to_hf_sr pattern: l1 is wired via reconstruction.enable_l1
+    def test_recon_managed_loss_not_flagged_as_unmigrated(self, mock_config):
+        """direct_ulf_to_hf_sr pattern: a loss wired via reconstruction.enable_<x>
         (consumed by the reconstruction computer) and deliberately kept OUT of
-        image_losses. The unmigrated-key guard must NOT reject it."""
-        mock_config.losses.reconstruction.enable_l1 = True
-        mock_config.losses.reconstruction.lambda_l1 = 1.0
-        # get_enabled_losses reports both the recon l1 and the list ssim.
-        mock_config.losses.get_enabled_losses.return_value = {"l1": 1.0, "ssim": 0.5}
-        mock_config.losses.reconstruction_managed_losses.return_value = {"l1", "ssim"}
+        image_losses. The unmigrated-key guard must NOT reject it.
+
+        ``hfen`` rather than ``l1``: ``losses.reconstruction.lambda_l1`` now sits in
+        ``COMPUTER_RESOLVED_LAMBDA_SOURCES``, so an l1 case would pass through that
+        exemption and never reach the recon-managed branch this test names.
+        """
+        mock_config.losses.reconstruction.enable_hfen = True
+        mock_config.losses.reconstruction.lambda_hfen = 1.0
+        # get_enabled_losses reports both the recon hfen and the list ssim.
+        mock_config.losses.get_enabled_losses.return_value = {"hfen": 1.0, "ssim": 0.5}
+        mock_config.losses.reconstruction_managed_losses.return_value = {"hfen", "ssim"}
 
         builder = self._list_based(mock_config)
         builder._build_all_dynamic()  # must NOT raise ConfigurationError

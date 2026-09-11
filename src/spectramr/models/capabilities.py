@@ -53,6 +53,22 @@ class ModelCapabilities:
     accepts_complex: bool | None = None  # torch.complex tensor input
     expects_real_imag_interleaved: bool | None = None  # 2C real channels = C complex coils
     requires_paired_data: bool | None = None  # cycle GANs etc set False explicitly
+    # Conditioning capabilities. These say what EXTRA SIGNAL the model's
+    # ``forward`` consumes, not what shape it consumes -- so they are
+    # deliberately NOT part of ``CONTRACT_FIELDS`` below.
+    #
+    # ``supports_contrast_conditioning`` is True when ``forward`` accepts a
+    # ``contrast_idx`` / ``contrast_id`` tensor and actually uses it for
+    # FiLM-style conditioning. ``supports_vendor_conditioning`` is the same
+    # statement for a vendor id.
+    #
+    # ``None`` means unannotated, exactly as for every other field; ``False``
+    # is a positive claim that the model ignores the id. The distinction is
+    # load-bearing here: the audit fails an arm that enables multi-contrast
+    # against a model that ignores the id, and "nobody said" must not read as
+    # "declared unsupported".
+    supports_contrast_conditioning: bool | None = None
+    supports_vendor_conditioning: bool | None = None
     # Physical-quantity tags for the field/trajectory metrics. A model that
     # emits a B0 field declares output_field_units="Hz"; a spiral-trajectory
     # estimator declares trajectory_parametrization="spiral". The field-domain
@@ -67,6 +83,22 @@ class ModelCapabilities:
     # that are genuinely regime/task-specific.
     workflows: frozenset[Regime] | None = None
     tasks: frozenset[Task] | None = None
+
+
+#: The fields that constitute a model's *dimension contract* -- the shape/domain
+#: agreement the audit cross-checks data → model → loss against.
+#:
+#: This is deliberately narrower than "every field of :class:`ModelCapabilities`".
+#: Two audit gates need to ask "did this model declare a contract?", and both
+#: used to answer it with "is ``get_model_capabilities`` non-None?" -- a proxy
+#: that was only ever correct while the dataclass held nothing BUT contract
+#: fields. Adding the conditioning flags broke that proxy: a model declaring
+#: only ``supports_contrast_conditioning`` would have started reading as
+#: contract-annotated and silently dropped out of the default-deny bucket.
+#:
+#: One constant, imported by both gates, so the two cannot drift apart
+#: (non-negotiable 17).
+CONTRACT_FIELDS: tuple[str, ...] = ("spatial_dims", "input_domain", "output_domain")
 
 
 @dataclass(frozen=True)

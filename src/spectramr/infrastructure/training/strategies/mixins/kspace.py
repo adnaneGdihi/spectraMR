@@ -616,14 +616,31 @@ class KspaceMixin:
         # [ROBUSTNESS FIX] Use config.data.domain.target_channels (SSOT) to determine the
         # source/target split boundary instead of assuming C_total // 2.
         target_ch = self.config.data.domain.target_channels
+        source_channels = 0
         if target_ch is not None and C_total > target_ch:
-            C_source = C_total - target_ch  # e.g. 16 - 8 = 8 source channels
-            # Force mask of 1.0 on the Source channels (preserve fully-sampled prior)
-            mask[:, :C_source, ...] = 1.0
+            source_channels = C_total - target_ch  # e.g. 16 - 8 = 8 source channels
         elif C_total > self.config.model.out_channels and C_total % 2 == 0:
             # Legacy fallback: assume equal split
-            C_source = C_total // 2
-            mask[:, :C_source, ...] = 1.0
+            source_channels = C_total // 2
+
+        if source_channels > 0:
+            # [#1917] This is the ONLY in-place write to a mask that came out of
+            # ``expand_mask_to_channels``; the other ten call sites just multiply.
+            # Copy on this path alone, for two independent reasons:
+            #   1. a widened [B, 1, H, W] mask is a stride-0 broadcast view, so
+            #      every channel aliases one row of memory and the write raises
+            #      "more than one element of the written-to tensor refers to a
+            #      single memory location";
+            #   2. a mask that already had C_total channels is returned unchanged,
+            #      and the ``.to(device).float()`` above is a no-op for an
+            #      already-float tensor on the same device -- so the write would
+            #      reach through and corrupt ``batch_data["mask"]`` for every
+            #      later consumer of that batch.
+            # Copying here keeps the cheap broadcast view for the read-only
+            # callers (non-negotiable 9: no needless allocation in the loop).
+            mask = mask.clone()
+            # Force mask of 1.0 on the Source channels (preserve fully-sampled prior)
+            mask[:, :source_channels, ...] = 1.0
 
         # Saturation check. Gate on the LIVE iteration (loop_state seam): the
         # old ``self.env.step`` was a frozen 0, so ``0 in [0, 1, 2]`` was always

@@ -1,4 +1,4 @@
-"""Regression guard: train-metric throttle must read the LIVE loop iteration.
+"""Regression guard: the train-metric throttle is fed the LIVE loop iteration.
 
 Background (pitfall #16). ``MetricsMixin._compute_training_metrics`` throttles the
 per-step reconstruction-quality metrics (SSIM / PSNR / MAE) with::
@@ -6,32 +6,34 @@ per-step reconstruction-quality metrics (SSIM / PSNR / MAE) with::
     if current_step % train_metric_interval != 0:
         return metrics
 
-Several strategies used to feed it ``getattr(self.env, "step", 0)``. But
-``TrainingEnvironment`` is ``frozen=True`` and never carries a live ``step``, so
-that read is *always* 0 — and ``0 % interval == 0`` for every interval, defeating
-the throttle: the (host-syncing) metrics were recomputed and logged on EVERY step
-instead of once per ``train_metric_interval``.
+Fed a frozen ``0`` the throttle is defeated -- ``0 % interval == 0`` for every
+interval -- and the (host-syncing) metrics are recomputed and logged on EVERY step.
+This module pins the POSITIVE half of the contract: the call site passes the live
+``iteration``.
 
-``gan.py`` / ``diffusion.py`` / the disentangled strategies were migrated to the
-``loop_state`` seam; ``vae.py`` and ``reconstruction.py`` were missed. Both now
-reuse the live ``iteration`` they already resolve from ``kwargs`` for their loss
-schedules. These tests pin that wiring so a revert to the frozen ``env.step`` form
-fails loudly, and verify the throttle contract the fix depends on.
+**The NEGATIVE half moved out, and why (non-negotiable 17).** This file used to also
+assert ``'getattr(self.env, "step"' not in src``. That pin now lives in
+``tests/architecture/test_strategies_read_live_iteration.py``, which scans every
+module under ``infrastructure/training/`` by AST for all three frozen-read shapes.
+The old pin is deleted rather than kept as defence in depth: it was the weaker of
+the two owners and, kept alongside, neither would be audited as the sole line of
+defence.
 
-Sequel, and a qualification of the contract asserted below: fixing the step to be
-live flipped SHORT runs from always-on to NEVER. Over iterations 1..40 with the
-schema-default interval of 100 the satisfying set is empty, so
-``experiment_11_attention_none`` computed no train metric at all and every
-``train_*`` column in ``training_metrics.csv`` stayed blank while the loss columns
-filled normally. ``_compute_training_metrics`` therefore ALSO fires on the first
-and final iteration now, mirroring the CSV row gate in ``training_loop.py``. A
-non-multiple step is still throttled -- as asserted here -- unless it is one of
-those two ends. See ``TestComputeTrainingMetrics`` in
-``tests/unit/infrastructure/training/strategies/mixins/test_metrics_mixin_expansion.py``.
+**It was weaker in a way that mattered.** ``_loss_impl_source`` returned on the
+FIRST class ``inspect.getmembers`` yielded -- alphabetical -- so for ``vae.py`` it
+read ``VAETrainingStrategy`` (lines 118-301) and never reached
+``VQVAETrainingStrategy`` (lines 525-620), which carried
+``getattr(self.env, "step", 0)`` at line 605. The guard written to forbid that exact
+line named the module containing it and passed green. The docstring here compounded
+it, asserting ``vae.py`` "was migrated" and "now reuses the live ``iteration``" --
+true of one of its two strategies. A detector defect outranks an equal-scoring code
+defect (non-negotiable 15), so the walk below yields EVERY class that defines
+``_compute_losses_impl``, and the case ids name the class rather than the module.
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 
@@ -41,33 +43,79 @@ from spectramr.infrastructure.training.strategies import reconstruction as _reco
 from spectramr.infrastructure.training.strategies import vae as _vae_mod
 
 
-def _loss_impl_source(module: object) -> str:
-    """Return the source of the module's ``_compute_losses_impl`` method."""
+def _loss_impl_sources(module: object) -> list[tuple[str, str]]:
+    """``(qualname, source)`` for EVERY class in ``module`` defining the hook.
+
+    Deliberately not ``getmembers`` + first hit: that ordering is alphabetical and
+    silently drops every later class (see the module docstring).
+    """
+    found: list[tuple[str, str]] = []
     for _name, obj in inspect.getmembers(module, inspect.isclass):
         if obj.__module__ != module.__name__:
             continue
         fn = obj.__dict__.get("_compute_losses_impl")
         if fn is not None:
-            return inspect.getsource(fn)
-    raise AssertionError(f"no _compute_losses_impl found in {module.__name__}")
+            found.append(
+                (f"{module.__name__.rsplit('.', 1)[-1]}.{obj.__name__}", inspect.getsource(fn))
+            )
+    if not found:
+        raise AssertionError(f"no _compute_losses_impl found in {module.__name__}")
+    return found
+
+
+def _all_hooks() -> list[tuple[str, str]]:
+    return [rec for mod in (_recon_mod, _vae_mod) for rec in _loss_impl_sources(mod)]
+
+
+#: resolved once -- the ids must be the qualnames, never the source bodies
+_HOOKS: list[tuple[str, str]] = _all_hooks()
+
+
+def test_the_walk_reaches_every_class_not_just_the_first() -> None:
+    """The blindness that let ``vae.py:605`` survive: pin the walk itself.
+
+    ``vae`` defines two strategies with the hook; a first-hit walk sees one.
+    """
+    names = [name for name, _ in _loss_impl_sources(_vae_mod)]
+    assert names == ["vae.VAETrainingStrategy", "vae.VQVAETrainingStrategy"], names
+
+
+def test_hook_count_matches_the_source() -> None:
+    """Cross-check the runtime walk against a static parse of the same files.
+
+    A class the import machinery does not expose (conditionally defined, renamed on
+    export) would make the walk quietly narrower than the file.
+    """
+    import pathlib
+
+    for mod in (_recon_mod, _vae_mod):
+        path = pathlib.Path(inspect.getfile(mod))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        static = [
+            cls.name
+            for cls in tree.body
+            if isinstance(cls, ast.ClassDef)
+            and any(
+                isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+                and m.name == "_compute_losses_impl"
+                for m in cls.body
+            )
+        ]
+        runtime = [name.split(".", 1)[1] for name, _ in _loss_impl_sources(mod)]
+        assert sorted(runtime) == sorted(static), (
+            f"{path.name}: runtime walk saw {runtime}, the file defines {static}"
+        )
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("module", [_recon_mod, _vae_mod], ids=["reconstruction", "vae"])
-def test_train_metrics_fed_live_iteration_not_frozen_env_step(module: object) -> None:
-    src = _loss_impl_source(module)
-
-    # The metrics call must be present and fed the live iteration.
+@pytest.mark.parametrize(("qualname", "src"), _HOOKS, ids=[n for n, _ in _HOOKS])
+def test_train_metrics_fed_live_iteration(qualname: str, src: str) -> None:
     call = re.search(r"_compute_training_metrics\((.*?)\)", src, re.DOTALL)
-    assert call is not None, "no _compute_training_metrics call site found"
+    assert call is not None, f"{qualname}: no _compute_training_metrics call site found"
     assert "current_step=iteration" in call.group(1), (
-        "train-metric throttle is not fed the live loop iteration; a frozen "
-        "step would recompute SSIM/PSNR/MAE every step (pitfall #16)"
-    )
-
-    # And the frozen-env.step antipattern must not have crept back in.
-    assert 'getattr(self.env, "step"' not in src, (
-        "reintroduced the frozen self.env.step read for the metric throttle"
+        f"{qualname}: the train-metric throttle is not fed the live loop iteration "
+        f"(got `{' '.join(call.group(1).split())}`). A frozen step recomputes "
+        "SSIM/PSNR/MAE every step (pitfall #16, #1937)."
     )
 
 

@@ -109,8 +109,8 @@ REVIVED = {arm for arm, w in BASELINE.items() if all(v == 0.0 for v in w.values(
 #: one: its header says a value there is a measurement, not a preference, and
 #: rewriting it from a migrated tree is what made this proof circular the first time.
 #:
-#: Every entry cites the commit that made the change and a journal section, so the set
-#: cannot be used to wave a genuine regression through.
+#: Every entry cites the commit that made the change and where the decision is
+#: recorded, so the set cannot be used to wave a genuine regression through.
 SUPERSEDED: dict[str, str] = {
     "experiments/inprogress/mrixfields2026/task3/b34_ablate_euclidean.yaml": (
         "c8c2a7579 -- FisherRaoGeodesicStrategy is inline-loss: it reads "
@@ -124,6 +124,31 @@ SUPERSEDED: dict[str, str] = {
     "experiments/inprogress/mrixfields2026/task3/b34_fisher_rao.yaml": (
         "c8c2a7579 -- the same inline-loss facade as b34_ablate_euclidean above."
     ),
+    "experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion.yaml": (
+        "f7f5491cc -- the kspace_filling cohort was conformed to its reference arm "
+        "(experiment_11_attention_none), by the owner's explicit decision that every "
+        "key which is not arm identity or the arm's own ablation axis takes the "
+        "template's value. sense_adjoint_l1 is not this arm's axis (its axis is the "
+        "cold-diffusion backbone itself), and it was already a four-arm outlier: 42 of "
+        "the 46 kspace_filling arms in the frozen baseline carried 0.3 and only these "
+        "four carried 0.5, so the rewrite retired a drift rather than overwriting a "
+        "deliberate setting. All 57 declaring arms now read 0.3. The migration "
+        "(836d29785) carried the changed value faithfully -- it is the conformity "
+        "step, not the category->domain move, that the baseline can no longer "
+        "express, so the arm is pinned to its current declaration."
+    ),
+    "experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion_perceptual.yaml": (
+        "f7f5491cc -- the same conformity rewrite as experiment_11_kspace_cold_diffusion "
+        "above; this arm's axis is the VGG perceptual term, not sense_adjoint_l1."
+    ),
+    "experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion_sampled.yaml": (
+        "f7f5491cc -- the same conformity rewrite as experiment_11_kspace_cold_diffusion "
+        "above; this arm's axis is the full 28-step reverse trajectory."
+    ),
+    "experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion_varnet.yaml": (
+        "f7f5491cc -- the same conformity rewrite as experiment_11_kspace_cold_diffusion "
+        "above; this arm's axis is the unrolled VarNet backbone."
+    ),
     "experiments/inprogress/vf/exp_vf_01_subvoxel_superres_v2.yaml": (
         "550e3eec9 -- the five terms the baseline records (complex_mse, hfen, ssim, "
         "concomitant_phase_residual, phase_smoothness_complex) were REMOVED as "
@@ -134,6 +159,26 @@ SUPERSEDED: dict[str, str] = {
         "'this term no longer exists'; the arm's current declaration is asserted "
         "instead. See issue #935 for the contradiction the later `losses:` block "
         "introduced."
+    ),
+    "experiments/inprogress/multi_contrast/exp_ssl_finetune_translation.yaml": (
+        "29c35889b -- the 10.0 was never this arm's declaration. _build_composite_gan "
+        "read recon_config.lambda_l1 raw, and the arm does not set it, so the 10.0 the "
+        "materializer froze is the ReconstructionLossesConfig schema default reflected "
+        "back. #2003 removed that reader (issue #1949), leaving the declared 1.0 as the "
+        "only source; measured on this arm, l1 falls 11.0 -> 2.0, the residual 1.0 being "
+        "the lambda_rec fallback #1997 tracks."
+    ),
+    "experiments/inprogress/multi_contrast/exp_vendor_harmonisation.yaml": (
+        "29c35889b -- the same reflected schema default as exp_ssl_finetune_translation "
+        "above, on the same GANTrainingStrategy path."
+    ),
+    "experiments/inprogress/multi_contrast/exp_cycle_seg_equivariance.yaml": (
+        "29c35889b -- CycleBlochStrategy hard-codes create_loss(\'l1\') and reads neither "
+        "the built module nor any weight table, so the 10.0 came from applying the "
+        "LossBuilder path to a strategy that does not use it -- the b34_ablate_euclidean "
+        "shape above. The weight is inert on this arm at either value; it is restored so "
+        "the declaration states what the arm asks for rather than what a retired reader "
+        "resolved."
     ),
 }
 
@@ -168,9 +213,7 @@ def test_ssot_weight_matches_the_weight_the_arm_actually_trained_at(arm: Path) -
         # Both assert the SAME thing -- the SSOT honours the DECLARED weight, not the
         # baseline -- so neither exemption is a way to stop asserting. The authority
         # moves; the guard stays.
-        why = SUPERSEDED.get(
-            rel, "every declared loss resolved to 0.0 before the migration"
-        )
+        why = SUPERSEDED.get(rel, "every declared loss resolved to 0.0 before the migration")
         kind = "superseded" if rel in SUPERSEDED else "revived"
         for list_name in LOSS_LISTS:
             for entry in doc["losses"].get(list_name) or []:
@@ -210,9 +253,10 @@ def test_the_revived_set_has_not_grown() -> None:
 def test_no_arm_is_migrated_to_an_empty_objective() -> None:
     """The migration must never disable an arm's LAST loss.
 
-    ``LossBuilder.validate()`` raises ``No losses were built`` on an empty stack, so an arm
-    whose every declaration got ``enabled: false`` cannot start at all -- it does not train
-    a degraded objective, it dies. The first migration did this to 52 arms and every test
+    ``LossBuilder.validate()`` raises ``No losses were built`` on an empty stack unless the
+    arm's strategy declares it computes its objective inline, so an arm whose every
+    declaration got ``enabled: false`` cannot start at all -- it does not train a degraded
+    objective, it dies. The first migration did this to 52 arms and every test
     stayed green, because nothing asserted the stack was non-empty. Now something does.
 
     Scoped to arms that HAD declarative losses (i.e. appear in the baseline): the inline-only
@@ -271,11 +315,7 @@ def test_folding_strategy_set_matches_the_source() -> None:
                 if not isinstance(sub, ast.Call):
                     continue
                 fn = sub.func
-                name = (
-                    fn.attr
-                    if isinstance(fn, ast.Attribute)
-                    else getattr(fn, "id", None)
-                )
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
                 if name in fold_names:
                     return True
         return False
@@ -307,7 +347,9 @@ def test_every_superseded_entry_is_real_and_cites_its_commit() -> None:
     still carries it (otherwise nothing is being exempted and the row is dead), and
     the reason names the commit that made the change.
     """
-    skip_if_public_export("experiments/ does not ship, so every superseded entry reads as a deleted arm")
+    skip_if_public_export(
+        "experiments/ does not ship, so every superseded entry reads as a deleted arm"
+    )
     import re
 
     for rel, why in SUPERSEDED.items():
@@ -321,9 +363,7 @@ def test_every_superseded_entry_is_real_and_cites_its_commit() -> None:
             f"got {why[:40]!r}"
         )
     overlap = set(SUPERSEDED) & REVIVED
-    assert (
-        not overlap
-    ), f"an arm cannot be both revived and superseded: {sorted(overlap)}"
+    assert not overlap, f"an arm cannot be both revived and superseded: {sorted(overlap)}"
 
 
 def test_the_corpus_is_actually_covered() -> None:
@@ -389,14 +429,10 @@ def test_canonical_keys_are_pinned() -> None:
         pytest.skip("golden regenerated")
 
     golden = _read_golden()
-    remapped = {
-        n: (golden[n], c) for n, c in current.items() if n in golden and golden[n] != c
-    }
+    remapped = {n: (golden[n], c) for n, c in current.items() if n in golden and golden[n] != c}
     assert not remapped, (
         "A loss name now files its weight under a DIFFERENT canonical key:\n"
-        + "\n".join(
-            f"  {n}: {was!r} -> {now!r}" for n, (was, now) in sorted(remapped.items())
-        )
+        + "\n".join(f"  {n}: {was!r} -> {now!r}" for n, (was, now) in sorted(remapped.items()))
         + "\n\nEvery consumer resolving the old key now finds nothing declared. Co-edit them "
         "(config/schemas/loss.py, pipelines/training_loop.py, reporting/plotters/generative/"
         "gan_diagnostics.py), then regenerate with SPECTRAMR_UPDATE_LOSS_KEY_GOLDEN=1."

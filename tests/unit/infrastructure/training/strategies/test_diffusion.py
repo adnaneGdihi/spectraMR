@@ -12,6 +12,7 @@ import ast
 import inspect
 import math
 import textwrap
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,7 @@ import pytest
 import torch
 
 from spectramr.config.schemas.enums import PredictionType
+from spectramr.data.batch_types import TrainingBatch
 from spectramr.data.transforms.normalization import (
     DECOMPRESS_MAGNITUDE_CEILING,
     decompress_kspace_log,
@@ -127,6 +129,130 @@ def test_forward_through_model_latent_forwards_condition_and_context() -> None:
     )
     assert torch.equal(received["condition_image"], cond)
     assert received["context"] == {"contrast_idx": cidx}
+
+
+# ---------------------------------------------------------------------------
+# Validation-path contrast conditioning (#1931).
+#
+# The train path was fixed in half 1: ``_contrast_idx_from_batch`` is the ONE
+# owner of the extraction (non-negotiable 17). ``_generate_validation_prediction``
+# kept a SECOND resolver behind ``isinstance(batch_data, dict)`` -- and what
+# ``select_validation_extra_fields`` (pipelines/train.py) forwards as
+# ``batch_data`` is a ``TrainingBatch``: a dataclass, not a mapping, whose
+# non-core fields live in ``.metadata``. So the guard never matched and every
+# multi-contrast arm trained CONDITIONED and validated UNCONDITIONED -- the
+# train/val mismatch of pitfall #18, silent, with the checkpoint selected on
+# metrics the model was never conditioned for.
+#
+# These drive the REAL method rather than the extraction in isolation, because
+# the whole body sits inside ``except Exception: return None`` -- an assertion
+# on a helper would not notice the swallow.
+# ---------------------------------------------------------------------------
+
+
+def _validation_strategy(chunk_size: int = 8):
+    """A strategy mock that reaches the plain ``_forward_through_model`` branch.
+
+    Two ``MagicMock`` hazards are deliberately avoided here:
+
+    * ``hasattr(mock, anything)`` is always True, so a ``MagicMock`` generator
+      would satisfy ``hasattr(gen, "sample")`` and route into the latent
+      sampler. ``generator_model`` is therefore a real bare object.
+    * ``mock._contrast_idx_from_batch(...)`` would return a ``Mock`` -- truthy,
+      forwarded, and the test would pass whether or not the extraction works.
+      The REAL staticmethod is bound instead, which is the whole subject.
+    """
+    mock = MagicMock()
+    mock.generator_model = SimpleNamespace()  # no .sample/.generate/.module
+    mock._is_cold_diffusion.return_value = False
+    mock._is_latent_diffusion.return_value = False
+    mock._contrast_idx_from_batch = DiffusionTrainingStrategy._contrast_idx_from_batch
+    mock.config = SimpleNamespace(
+        model=SimpleNamespace(model_type="diffusion_unet"),  # skips the smaps block
+        validation=SimpleNamespace(loader=SimpleNamespace(chunk_size=chunk_size)),
+        training=None,  # the legacy-forward branch reads config.training.diffusion
+    )
+    mock.q_sample.side_effect = lambda x, t, noise: x
+    mock._forward_through_model.return_value = torch.zeros(1, 1, 8, 8)
+    return mock
+
+
+def _drive_validation(mock, batch_data, *, target: torch.Tensor | None = None):
+    """Run the real method and fail loudly if its blanket except swallowed."""
+    inp = torch.randn(1, 1, 8, 8)
+    tgt = target if target is not None else torch.zeros(1, 1, 8, 8)
+    mock._forward_through_model.return_value = torch.zeros_like(tgt)
+    DiffusionTrainingStrategy._generate_validation_prediction(
+        mock,
+        input_batch=inp,
+        target_batch=tgt,
+        timestep=torch.tensor([1]),
+        batch_data=batch_data,
+        kwargs={},
+        scale_factor=torch.tensor(1.0),
+    )
+    swallowed = [
+        c.args[0]
+        for c in mock.logging_service.log_warning.call_args_list
+        if c.args and "Validation generation failed" in str(c.args[0])
+    ]
+    assert not swallowed, f"the method's blanket except fired: {swallowed}"
+    assert mock._forward_through_model.called, "never reached the generator forward"
+    return mock._forward_through_model.call_args.kwargs["gen_kwargs"]
+
+
+def test_validation_conditions_on_a_training_batch_not_only_a_dict() -> None:
+    """The load-bearing test: a ``TrainingBatch`` is what production delivers."""
+    c_idx = torch.tensor([2])
+    batch = TrainingBatch(
+        input=torch.randn(1, 1, 8, 8),
+        target=torch.zeros(1, 1, 8, 8),
+        metadata={"contrast_idx": c_idx},
+    )
+    assert not isinstance(batch, dict)  # the guard that used to stand here
+
+    gen_kwargs = _drive_validation(_validation_strategy(), batch)
+
+    assert "contrast_idx" in gen_kwargs, (
+        "validation reached the generator with no contrast_idx while the train "
+        "path sends one — the arm validates unconditioned (pitfall #18)"
+    )
+    assert torch.equal(gen_kwargs["contrast_idx"], c_idx)
+
+
+def test_validation_still_conditions_on_a_plain_dict_batch() -> None:
+    """Routing through the owner must not drop the shape that DID work."""
+    c_idx = torch.tensor([1])
+    gen_kwargs = _drive_validation(
+        _validation_strategy(),
+        {"input": torch.randn(1, 1, 8, 8), "contrast_idx": c_idx},
+    )
+    assert torch.equal(gen_kwargs["contrast_idx"], c_idx)
+
+
+def test_validation_realigns_contrast_ids_when_5d_targets_are_flattened() -> None:
+    """This site's own concern, kept out of the owner: only validation flattens.
+
+    Two volumes of three slices arrive as one batch of six, so a per-volume
+    contrast id must be repeated per slice. Getting this wrong is the silent
+    shape: ``repeat`` instead of ``repeat_interleave`` labels slice 0 of volume
+    1 with volume 0's contrast and still trains without error.
+    """
+    c_idx = torch.tensor([0, 2])
+    batch = TrainingBatch(
+        input=torch.randn(2, 1, 3, 8, 8),
+        target=torch.zeros(2, 1, 3, 8, 8),
+        metadata={"contrast_idx": c_idx},
+    )
+    gen_kwargs = _drive_validation(_validation_strategy(), batch, target=torch.zeros(6, 1, 8, 8))
+    assert torch.equal(gen_kwargs["contrast_idx"], torch.tensor([0, 0, 0, 2, 2, 2]))
+
+
+def test_validation_sends_no_contrast_idx_when_the_batch_carries_none() -> None:
+    """A single-contrast arm must not gain a fabricated id (#9)."""
+    batch = TrainingBatch(input=torch.randn(1, 1, 8, 8), target=torch.zeros(1, 1, 8, 8))
+    gen_kwargs = _drive_validation(_validation_strategy(), batch)
+    assert "contrast_idx" not in gen_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -299,17 +425,17 @@ def _timestep_strategy(
 ):
     """Unbound-call harness for ``sample_timesteps``.
 
-    The method only needs ``generator_model.training``, the resolved curriculum
-    state, the sampling-strategy name, ``num_timesteps``, ``device`` and the
-    operator floor — so a MagicMock strategy exercises it without building a
-    model.
+        The method only needs ``generator_model.training``, the resolved curriculum
+        state, the sampling-strategy name, ``num_timesteps``, ``device`` and the
+        operator floor — so a MagicMock strategy exercises it without building a
+        model.
 
-The curriculum is not hand-set (#1296): the fixture binds the REAL
-    ``_resolve_curriculum_once`` so the state is derived from the same config
-    declared two lines below it. A fixture that stated the answer independently
-    could disagree with the config beside it, which is the shape that lets a
-    mock-fed test pass while production does something else -- and here it would
-    also stub out the very resolver these cases exist to exercise.
+    The curriculum is not hand-set (#1296): the fixture binds the REAL
+        ``_resolve_curriculum_once`` so the state is derived from the same config
+        declared two lines below it. A fixture that stated the answer independently
+        could disagree with the config beside it, which is the shape that lets a
+        mock-fed test pass while production does something else -- and here it would
+        also stub out the very resolver these cases exist to exercise.
     """
     strategy = MagicMock(spec=DiffusionTrainingStrategy)
     strategy.generator_model = SimpleNamespace(training=True)
@@ -353,9 +479,7 @@ def test_the_short_run_bypass_uses_the_full_range_despite_a_declared_ramp() -> N
     assert not state.effective
     assert state.declared
     strategy.logging_service.log_warning.assert_called_once()
-    drawn = DiffusionTrainingStrategy.sample_timesteps(
-        strategy, batch_size=4096, iteration=200
-    )
+    drawn = DiffusionTrainingStrategy.sample_timesteps(strategy, batch_size=4096, iteration=200)
     assert drawn.max().item() == 27
     # Resolved ONCE: the sampler above must reuse the cached state rather than
     # re-reading the config every step (non-negotiable 9), and the latched
@@ -1319,9 +1443,7 @@ def test_denom_scale_is_sized_from_the_prediction_not_the_published_field(
     producer's is what reached the multiply.
     """
     calls = _spy_on_alignment(monkeypatch)
-    _call_with_flattened_batch(
-        _cold_diffusion_mock(), torch.tensor([224.36, 198.15]), batch=36
-    )
+    _call_with_flattened_batch(_cold_diffusion_mock(), torch.tensor([224.36, 198.15]), batch=36)
 
     assert calls, "the scale-alignment seam was never reached"
     assert calls[0]["batch_size"] == 36
@@ -1338,9 +1460,7 @@ def test_the_multiply_that_crashed_the_cluster_no_longer_collides(
     )
 
     assert calls, "the scale-alignment seam was never reached"
-    assert "must match the size" not in str(error or ""), (
-        f"the 36-vs-2 collision is back: {error}"
-    )
+    assert "must match the size" not in str(error or ""), f"the 36-vs-2 collision is back: {error}"
 
 
 def test_the_aligned_scale_is_subject_major_at_this_site_too(monkeypatch) -> None:
@@ -1352,9 +1472,7 @@ def test_the_aligned_scale_is_subject_major_at_this_site_too(monkeypatch) -> Non
     error raised.
     """
     calls = _spy_on_alignment(monkeypatch)
-    _call_with_flattened_batch(
-        _cold_diffusion_mock(), torch.tensor([10.0, 20.0]), batch=6
-    )
+    _call_with_flattened_batch(_cold_diffusion_mock(), torch.tensor([10.0, 20.0]), batch=6)
 
     assert calls, "the scale-alignment seam was never reached"
     assert calls[0]["aligned"].flatten().tolist() == [
@@ -1395,10 +1513,7 @@ def test_the_model_input_key_follows_whether_smaps_were_concatenated() -> None:
     )
 
     assert cold_model_input_key({"noisy_kspace": 1, "target": 2}) == "noisy_kspace"
-    assert (
-        cold_model_input_key({"noisy_kspace": 1, "model_input": 2, "smaps": 3})
-        == "model_input"
-    )
+    assert cold_model_input_key({"noisy_kspace": 1, "model_input": 2, "smaps": 3}) == "model_input"
 
 
 def test_both_cold_emitters_answer_through_the_same_rule() -> None:
@@ -1426,6 +1541,7 @@ def test_both_cold_emitters_answer_through_the_same_rule() -> None:
         assert '"model_input" if "model_input" in' not in src, (
             f"{method.__name__} still carries a hand-written copy of the rule"
         )
+
 
 # ---------------------------------------------------------------------------
 # S-maps are FFT'd before they are concatenated onto a k-space input (#1297)
@@ -1457,9 +1573,7 @@ def _concat_arg_names(func) -> list[list[str]]:
             continue
         if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
             continue
-        out.append(
-            [e.id for e in node.args[0].elts if isinstance(e, ast.Name)]
-        )
+        out.append([e.id for e in node.args[0].elts if isinstance(e, ast.Name)])
     return out
 
 
@@ -1468,9 +1582,7 @@ def _calls_named(func, name: str) -> int:
     return sum(
         1
         for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == name
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
     )
 
 
@@ -1490,9 +1602,7 @@ def test_smaps_are_prepared_before_the_kspace_concat(method_name: str) -> None:
     concats = [names for names in _concat_arg_names(method) if "smaps_k" in names]
     assert concats, f"{method_name} does not concatenate the prepared maps"
     for names in concats:
-        assert "smaps" not in names, (
-            f"{method_name} still concatenates the raw image-domain maps"
-        )
+        assert "smaps" not in names, f"{method_name} still concatenates the raw image-domain maps"
 
 
 @pytest.mark.unit
@@ -1509,9 +1619,7 @@ def test_current_smaps_is_never_rebound_to_the_kspace_form() -> None:
         "_prepare_diffusion_inputs",
         "_generate_validation_prediction",
     ):
-        src = textwrap.dedent(
-            inspect.getsource(getattr(DiffusionTrainingStrategy, method_name))
-        )
+        src = textwrap.dedent(inspect.getsource(getattr(DiffusionTrainingStrategy, method_name)))
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
@@ -1543,9 +1651,7 @@ def test_snapshot_declares_the_concatenated_smaps_as_kspace() -> None:
     the previewer has to IFFT it -- and the comment that justified excluding it
     has to go with it, or the next reader trusts a stale claim.
     """
-    src = textwrap.dedent(
-        inspect.getsource(DiffusionTrainingStrategy._prepare_diffusion_inputs)
-    )
+    src = textwrap.dedent(inspect.getsource(DiffusionTrainingStrategy._prepare_diffusion_inputs))
     assert '"noisy_kspace", "target", "smaps"' in src
     assert "smaps are image-domain despite their real-stacked" not in src
     assert "smaps_conditioning" in src
@@ -1687,9 +1793,7 @@ class TestMultistepStartTimestepPassthrough:
             self.calls: list[dict] = []
 
         def sample(self, measurement, mask, inference_timesteps, smaps, start_timestep):
-            self.calls.append(
-                {"n": measurement.shape[0], "start_timestep": start_timestep}
-            )
+            self.calls.append({"n": measurement.shape[0], "start_timestep": start_timestep})
             return measurement
 
     @staticmethod
@@ -1801,8 +1905,7 @@ class TestFiveDimensionalCapabilityProbe:
             and n.args[1].value == "rep_fusion"
         ]
         assert not offenders, (
-            "a 5D-capability decision is again being made from a rep_fusion "
-            f"hasattr: {offenders}"
+            f"a 5D-capability decision is again being made from a rep_fusion hasattr: {offenders}"
         )
 
     def test_both_sites_ask_the_generator_for_5d_support(self) -> None:
@@ -1853,9 +1956,9 @@ def test_unsampled_weight_returns_none_when_fully_sampled() -> None:
     """
     ref = torch.randn(2, 8, 16, 16)
     mask = torch.ones(2, 1, 16, 16)
-    assert (
-        DiffusionTrainingStrategy._unsampled_weight(mask, ref) is None
-    ), "an all-ones mask must yield None, not a zeroed weight"
+    assert DiffusionTrainingStrategy._unsampled_weight(mask, ref) is None, (
+        "an all-ones mask must yield None, not a zeroed weight"
+    )
 
 
 def test_unsampled_weight_is_not_none_when_bins_are_missing() -> None:
@@ -2594,8 +2697,7 @@ class TestZeroFilledBaselineWiring:
             if isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Name)
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert sources == ["masked_input"], (
@@ -2616,8 +2718,7 @@ class TestZeroFilledBaselineWiring:
             and isinstance(node.value, ast.Constant)
             and node.value.value is None
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert len(top_level_clears) == 1
@@ -2631,8 +2732,7 @@ class TestZeroFilledBaselineWiring:
             and isinstance(node.value, ast.Constant)
             and node.value.value is None
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert len(clears) == 1, "the consumer must clear what it read"
@@ -2810,6 +2910,8 @@ class TestEveryProducerCallSiteHasAConsumerOrADiscard:
         assert any(any(_clears_the_stash(stmt) for stmt in t.finalbody) for t in tries), (
             "the discard is not in a finally: block"
         )
+
+
 class TestDiffusionDeclaredMetricKeys:
     """#1682 -- ``pre_dc_kspace_l1`` gets a column exactly when it is stamped.
 
@@ -3128,3 +3230,214 @@ class TestValidationEnsemble:
         ) == ["psnr"]
         with pytest.raises(ValueError, match="neither registered nor emitted"):
             host._registry_backed_validation_metrics(["val_nmse"])
+
+
+# ===========================================================================
+# The strategy may not keep its own list of what the arm optimizes
+# (#1918, #1919)
+# ===========================================================================
+
+_LOSS_OWNING_METHODS = ("_setup_strategy_specific_components", "_compute_losses_impl")
+# `diffusion.py` defines TWO strategy classes and both override both methods
+# (`XDiffusionTrainingStrategy` at :7658 -- setup :7867, step :8014). The claim
+# below is about the FILE, so the detector ranges over both; scoped to
+# `DiffusionTrainingStrategy` alone it could not see a hand-written list appear
+# in the sibling, which is the blindness shape non-negotiable 15 exists to catch.
+_LOSS_OWNING_CLASSES = ("DiffusionTrainingStrategy", "XDiffusionTrainingStrategy")
+_LOSS_OWNING_SITES = [(c, m) for c in _LOSS_OWNING_CLASSES for m in _LOSS_OWNING_METHODS]
+
+
+def _loss_site_tree(name: str, cls_name: str = "DiffusionTrainingStrategy"):
+    """Parse one loss-owning method.
+
+    NOT named ``_method_tree``: this module already defines that at module scope
+    for the validation-metric tests, with a different parameter (a method object,
+    not a name) and a different return type (``FunctionDef``, not ``Module``). A
+    second ``def`` of the same name is a silent rebinding -- the later one wins
+    for every caller in the file, including the eight that came first.
+    """
+    from spectramr.infrastructure.training.strategies import diffusion
+
+    cls = getattr(diffusion, cls_name)
+    # An inherited method would hand back `base.py`'s source under the subclass's
+    # name -- auditing the same bytes twice and counting it as coverage.
+    assert name in vars(cls), f"{cls_name} does not define {name}; the site moved"
+    return ast.parse(textwrap.dedent(inspect.getsource(getattr(cls, name))))
+
+
+def _named_losses(tree) -> set[str]:
+    """Registered canonical loss names appearing as string constants.
+
+    Keyed on the registry rather than "any string", so the surviving
+    `["g_total_loss", "loss", "diffusion"]` metric filter — none of which is a
+    registered loss — does not read as a violation.
+    """
+    from spectramr.models.losses.registry import LossRegistry
+
+    known = set(LossRegistry.list_available())
+    return {
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in known
+    }
+
+
+@pytest.mark.unit
+class TestNoSecondDeclarationSurface:
+    """Three hand-written lists claimed to know the objective and each read one
+    schema block, so all three were empty for the 58 `kspace_filling` arms that
+    declare theirs in the domain lists. The weight table is the owner now
+    (non-negotiable 17); a list here is a fourth owner reappearing."""
+
+    @pytest.mark.parametrize(("cls_name", "method"), _LOSS_OWNING_SITES)
+    def test_the_method_names_no_loss(self, cls_name: str, method: str) -> None:
+        named = _named_losses(_loss_site_tree(method, cls_name))
+        assert named == set(), (
+            f"{cls_name}.{method} names losses directly: {sorted(named)}. Read "
+            "`self._declared_loss_keys` / `self._weight_table` instead — a list "
+            "here mirrors one schema block and silently misses the rest."
+        )
+
+    @pytest.mark.parametrize(("cls_name", "method"), _LOSS_OWNING_SITES)
+    def test_the_method_holds_no_enable_weight_triples(self, cls_name: str, method: str) -> None:
+        """The second shape the same defect took: `[(name, enabled, weight), ...]`.
+
+        Caught separately because a triple list can be built from `getattr`
+        lookups with no loss name spelled as a constant at all.
+        """
+        tree = _loss_site_tree(method, cls_name)
+        triples = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.List)
+            and sum(isinstance(e, ast.Tuple) and len(e.elts) == 3 for e in node.elts) >= 2
+        ]
+        assert not triples, (
+            f"{cls_name}.{method} rebuilds an (name, enabled, weight) table; "
+            "`build_loss_weight_table` already resolved exactly that."
+        )
+
+    def test_this_module_binds_no_helper_name_twice(self) -> None:
+        """A second module-level ``def`` of a live name is a silent rebinding.
+
+        This file already had ``_method_tree`` (a method object -> FunctionDef)
+        when these tests were written; adding a same-named helper taking a
+        string re-pointed all eight earlier call sites at the new one. Nothing
+        raised at import, ruff saw nothing, and the tests added here still
+        passed -- only the tests that were NOT re-run went red. Checked here
+        because this module is where the collision happened.
+        """
+        import collections
+
+        tree = ast.parse(Path(__file__).read_text())
+        names = [
+            n.name
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        dupes = {n: c for n, c in collections.Counter(names).items() if c > 1}
+        assert not dupes, (
+            f"module-level names bound more than once: {dupes}. The last "
+            "definition wins for every caller in the file, including earlier ones."
+        )
+
+    def test_the_registry_oracle_is_not_vacuous(self) -> None:
+        """If the loss registry were empty the two tests above would pass on any
+        code at all."""
+        from spectramr.models.losses.registry import LossRegistry
+
+        known = set(LossRegistry.list_available())
+        assert len(known) > 100
+        assert {"complex_l1", "log_spectral", "hfen", "l1", "l2"} <= known
+
+
+@pytest.mark.unit
+class TestTheProductionPathCallsTheSSOT:
+    """Non-negotiable 16: registering the helper is the easy half."""
+
+    def test_setup_emits_the_banner(self) -> None:
+        tree = _loss_site_tree("_setup_strategy_specific_components")
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_log_loss_objective" in calls
+
+    def test_the_step_fills_from_the_declared_set(self) -> None:
+        tree = _loss_site_tree("_compute_losses_impl")
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_ensure_declared_losses_present" in calls
+
+    def test_the_banner_actually_reaches_the_logger(self) -> None:
+        """Observed, not inferred: drive the real method and read the spy."""
+        from types import SimpleNamespace
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+
+        arm = _KSPACE_ARM_DIR / "experiment_11_sense_bridge_critic.yaml"
+        assert arm.exists(), f"missing experiment config: {arm}"
+
+        strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
+        strategy.config = TrainingSettings.from_yaml(str(arm))
+        lines: list[str] = []
+        strategy.logging_service = SimpleNamespace(log_info=lines.append, log_warning=lines.append)
+
+        strategy._log_loss_objective("[DiffusionStrategy]")
+
+        assert lines, "the banner printed nothing — the state this work removed"
+        assert lines[0].startswith("[DiffusionStrategy] Configured Losses (")
+        assert not lines[0].startswith("[DiffusionStrategy] Configured Losses (0)"), (
+            "this arm trains seven losses; a zero count is the original bug"
+        )
+        assert any("adversarial" in ln and "0.0100" in ln for ln in lines)
+
+
+_KSPACE_ARM_DIR = (
+    Path(__file__).resolve().parents[5] / "experiments" / "inprogress" / "kspace_filling"
+)
+_KSPACE_ARMS = sorted(p.relative_to(_KSPACE_ARM_DIR) for p in _KSPACE_ARM_DIR.rglob("*.yaml"))
+
+
+@pytest.mark.unit
+class TestFillSetMatchesTheCsvHeader:
+    """The zero-fill exists so a declared loss gets a CSV column. If the two
+    sets disagree the fix is worse than the bug: a key the header lacks is
+    dropped by the writer (`extrasaction="ignore"`) and reported missing on
+    every single step."""
+
+    def test_the_cohort_is_not_empty(self) -> None:
+        assert len(_KSPACE_ARMS) > 50, f"corpus not found under {_KSPACE_ARM_DIR}"
+
+    @pytest.mark.parametrize("arm", [str(a) for a in _KSPACE_ARMS])
+    def test_declared_keys_equal_the_header_keys(self, arm: str) -> None:
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.training.builders.loss_builder import (
+            STRATEGY_MANAGED_LOSSES,
+        )
+        from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+        from spectramr.models.losses.weights import canonical_loss_name
+
+        strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
+        strategy.config = TrainingSettings.from_yaml(str(_KSPACE_ARM_DIR / arm))
+
+        # The CSV header's own owner: `training_loop` builds it from this call.
+        header = {
+            canonical_loss_name(name)
+            for name, weight in strategy.config.losses.get_enabled_losses().items()
+            if weight > 0
+        } - STRATEGY_MANAGED_LOSSES
+
+        declared = strategy._declared_loss_keys
+        assert not (header - declared), (
+            f"header promises columns the fill set misses: {sorted(header - declared)}"
+        )
+        assert not (declared - header), (
+            f"fill set writes keys the header lacks (dropped, then reported "
+            f"missing every step): {sorted(declared - header)}"
+        )

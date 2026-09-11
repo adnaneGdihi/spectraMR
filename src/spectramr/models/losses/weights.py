@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, get_args
 
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.models.losses.registry import LossRegistry
 
@@ -53,10 +54,16 @@ WEIGHT_SEMANTICS_VERSION = "2"
 #: Every sub-block of ``losses:`` that may carry ``lambda_<name>`` fields.
 #: ``pinn`` is included deliberately: no legacy resolver scanned it, so 48 arms
 #: declaring ``losses.pinn.lambda_pde`` were silently ignored.
+#:
+#: ``"adversarial"`` was removed (#1925). It named no ``LossConfigSchema`` block --
+#: the adversarial lambda is ``losses.gan.lambda_adv``, which is why
+#: :data:`NAME_ALIASES` below exists -- so every walk over this tuple resolved it to
+#: ``None`` and skipped it. Nothing changed when it went: the entry contributed no
+#: schema default and no read path. :func:`_lambda_sections` now **raises** on such a
+#: name rather than skipping it, so the constant cannot silently drift again.
 LAMBDA_SECTIONS: tuple[str, ...] = (
     "reconstruction",
     "latent",
-    "adversarial",
     "diffusion",
     "gan",
     "physics",
@@ -67,8 +74,21 @@ LAMBDA_SECTIONS: tuple[str, ...] = (
     "pinn",
 )
 
-#: The declarative loss lists (v6.0+).
-LOSS_LISTS: tuple[str, ...] = ("image_losses", "kspace_losses", "complex_losses")
+#: The declarative loss lists (v6.0+). **Derived** from the schema's SSOT, never
+#: hand-written: this was a three-element literal that omitted ``latent_losses``,
+#: while :data:`LAMBDA_SECTIONS` above *does* carry ``latent``. One resolver
+#: reading two surfaces where only one of them knows about latents made
+#: :func:`build_loss_weight_table` silently wrong in two directions --
+#: ``latent_losses: [{name: kl, weight: 0.37}]`` resolved to **0.0**, and a
+#: 0.5-vs-0.37 contradiction across the two surfaces raised **nothing** where the
+#: byte-identical shape on ``image_losses`` raises ``ConfigurationError`` (#1924).
+#:
+#: Order changed with the derivation (the dict is keyed kspace/image/complex/latent).
+#: That is inert by construction: :func:`_declared_list_entries` accumulates every
+#: source under ``setdefault(...).append(...)`` rather than taking a first match, so
+#: no resolved weight depends on the order -- only the ``"+"``-joined ``source``
+#: string does.
+LOSS_LISTS: tuple[str, ...] = tuple(LOSS_LIST_DOMAINS)
 
 #: Spellings of a loss that the registry does not know, because the schema field and the
 #: component the computers stack are named differently. Mirrors the remap
@@ -144,17 +164,9 @@ def _schema_defaults() -> dict[str, tuple[str, float]]:
     fell through to the three disagreeing hardcoded tables (an undeclared ``adversarial``
     resolved to 1.0 or 0.01; ``kl_divergence`` to 1.0 or 1e-4). Those RAISE.
     """
-    from spectramr.config.schemas.loss import LossConfigSchema
-
     defaults: dict[str, tuple[str, float]] = {}
-    for section_name in LAMBDA_SECTIONS:
-        field = LossConfigSchema.model_fields.get(section_name)
-        if field is None:
-            continue
-        section_cls = _section_type(field)
-        if section_cls is None:
-            continue
-        for field_name, spec in getattr(section_cls, "model_fields", {}).items():
+    for section_name, section_cls in _lambda_sections():
+        for field_name, spec in section_cls.model_fields.items():
             if not field_name.startswith("lambda_"):
                 continue
             default = spec.default
@@ -173,6 +185,94 @@ def _section_type(field: Any) -> Any:
         if isinstance(candidate, type) and hasattr(candidate, "model_fields"):
             return candidate
     return None
+
+
+def _lambda_sections() -> Iterator[tuple[str, Any]]:
+    """``(name, model)`` for every entry in :data:`LAMBDA_SECTIONS`. One walk.
+
+    Raises when a name is not a ``LossConfigSchema`` block, or when its annotation
+    holds no model. That is non-negotiable 3, and it is not hypothetical: this walk
+    used to carry two ``continue`` statements, and ``"adversarial"`` sat in
+    :data:`LAMBDA_SECTIONS` naming no field at all -- contributing silently nothing to
+    the schema defaults for the whole life of the constant. A section that names no
+    block is a typo in the constant, not a configuration state, so it must be loud.
+
+    Note the annotation is ``X | None`` for every section, so ``_section_type`` is
+    load-bearing: reading ``.model_fields`` off the raw annotation raises
+    ``AttributeError`` on a ``types.UnionType`` and a permissive ``getattr`` walk
+    silently enumerates **zero** fields.
+    """
+    from spectramr.config.schemas.loss import LossConfigSchema
+
+    for section_name in LAMBDA_SECTIONS:
+        field = LossConfigSchema.model_fields.get(section_name)
+        section_cls = _section_type(field) if field is not None else None
+        if section_cls is None:
+            raise ConfigurationError(
+                f"LAMBDA_SECTIONS names {section_name!r}, which is not a block on "
+                f"LossConfigSchema (or whose annotation holds no model). Every walk "
+                f"over LAMBDA_SECTIONS would skip it, so its lambdas would resolve to "
+                f"no schema default and appear in no read-path export. Remove the name "
+                f"or add the block; do not let the walk swallow it."
+            )
+        yield section_name, section_cls
+
+
+#: What :func:`accessor_read_paths` stamps as the reader of a ``lambda_*`` field.
+_LAMBDA_READER = (
+    "models.losses.weights.build_loss_weight_table -> _declared_lambdas: "
+    "getattr(section, field) over model_fields_set (runtime-built name)"
+)
+_LIST_READER = (
+    "models.losses.weights.build_loss_weight_table -> _declared_list_entries: "
+    "getattr(loss_config, list_name) over LOSS_LISTS (runtime-built name)"
+)
+_TABLE_READER = (
+    "models.losses.weights.build_loss_weight_table: getattr(reconstruction, ...) "
+    "for the table-level warm-up knobs"
+)
+
+
+def accessor_read_paths() -> dict[str, str]:
+    """Config paths :func:`build_loss_weight_table` reads, keyed by **full dotted path**.
+
+    The reachability index matches a read by finding its field name as a *token* in the
+    source (``key_reachability``). This accessor names none: it builds every field name
+    at runtime from :data:`LAMBDA_SECTIONS` and ``model_fields_set``, so 52 of the 108
+    paths below carry **no token anywhere in the tree** and the index reports
+    ``NO_READ_FOUND`` for them -- the shape its own docstring warns "a human must read
+    the would-be consumer before acting on". This function is that human's answer,
+    declared beside the reader (#1925).
+
+    Keyed by the full path, never the leaf. ``losses.physics.lambda_bloch_residual`` is
+    read here; ``training.multi.stages.stage_config.loss.physics.lambda_bloch_residual``
+    is the same leaf under a prefix this accessor never receives --
+    ``config_health_checker`` passes the **root** ``config.losses`` -- and must stay
+    unread. A leaf-keyed map would call 54 such stage-scoped paths consumed.
+
+    Returns:
+        ``{dotted path: prose naming the reader}``. The value is documentation, not a
+        contract; callers branch on membership only.
+
+    The set is derived from the same two constants the readers iterate, so it cannot
+    drift from them by construction. It *can* drift from the two hand-written
+    table-level fields, which is what
+    ``test_weights.py::test_the_static_export_equals_the_executed_read_set`` exists to
+    catch: it moves every field of the schema and asserts the set that moves the table
+    is exactly this one.
+    """
+    paths = {
+        f"losses.{section_name}.{field_name}": _LAMBDA_READER
+        for section_name, section_cls in _lambda_sections()
+        for field_name in section_cls.model_fields
+        if field_name.startswith("lambda_")
+    }
+    paths.update({f"losses.{list_name}": _LIST_READER for list_name in LOSS_LISTS})
+    # Read off ``reconstruction`` by literal name in ``build_loss_weight_table``; see
+    # the two-oracle test above for why these two are safe to name here.
+    paths["losses.reconstruction.warmup_iterations"] = _TABLE_READER
+    paths["losses.reconstruction.warmup_losses"] = _TABLE_READER
+    return paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +497,7 @@ def build_loss_weight_table(
     )
 
 
-def is_loss_configured(table: "LossWeightTable", name: str) -> bool:
+def is_loss_configured(table: LossWeightTable, name: str) -> bool:
     """Is ``name`` REQUESTED by this config? A configuration question, not a temporal one.
 
     ``resolve_loss_weight`` answers "what is this loss's weight RIGHT NOW", which
@@ -478,3 +578,86 @@ def resolve_loss_weight(
     if spec.warmup_gated and iteration < table.warmup_iterations:
         return 0.0
     return spec.weight
+
+
+def lambda_schema_default(section: str, field: str) -> float | None:
+    """What ``losses.<section>.<field>`` reads once it is no longer written.
+
+    ``None`` when the section is absent, the field is absent, or the default is
+    not numeric — three states a caller must report rather than read as 0.0 (#9).
+    """
+    from spectramr.config.schemas.loss import LossConfigSchema
+
+    info = LossConfigSchema.model_fields.get(section)
+    if info is None:
+        return None
+    spec = getattr(_section_type(info), "model_fields", {}).get(field)
+    default = getattr(spec, "default", None)
+    return float(default) if isinstance(default, (int, float)) else None
+
+
+def _materialised_values(
+    losses: Any, *, dropping: tuple[str, str] | None = None
+) -> dict[str, set[float]]:
+    """``{canonical loss -> every value a MATERIALISED load stamps for it}``.
+
+    The cluster loads a config with every schema default written out as an
+    explicit value, so a loss with a ``lambda_`` field in two sections is
+    declared twice whatever the YAML says. ``dropping`` names a
+    ``(section, field)`` to read at its schema default instead of its configured
+    value — what an edit that deleted that field would leave behind.
+    """
+    values: dict[str, set[float]] = {}
+    for section_name in LAMBDA_SECTIONS:
+        section = getattr(losses, section_name, None)
+        if section is None or not hasattr(section, "model_dump"):
+            continue
+        for field, value in section.model_dump().items():
+            if not field.startswith("lambda_") or not isinstance(value, (int, float)):
+                continue
+            if dropping == (section_name, field):
+                default = lambda_schema_default(section_name, field)
+                if default is None:
+                    continue
+                value = default
+            values.setdefault(_loss_name_for_field(field), set()).add(float(value))
+    return values
+
+
+def materialised_weight_conflicts(losses: Any) -> dict[str, set[float]]:
+    """Losses whose lambda declarations disagree once schema defaults are stamped.
+
+    ``build_loss_weight_table`` raises when one loss is declared twice at
+    different values, and it counts a field as declared when it was *written*. A
+    name reported here is written in one section and defaulted in another to a
+    different number, so the two agree only while the first stays written. Sole
+    owner of the reading (non-negotiable 17): the cohort regression test
+    ``tests/unit/config/test_exp11_kspace_filling_loss_weights.py``, the audit's
+    pin rule and the lambda migration all call it.
+
+    Bound: this compares lambda fields with each other, never with a domain-list
+    entry. A lambda default disagreeing with a list weight is a second shape, and
+    an empty result here is not a claim that the arm has none of it.
+    """
+    return {name: v for name, v in _materialised_values(losses).items() if len(v) > 1}
+
+
+def deleting_lambda_would_conflict(losses: Any, section: str, field: str) -> bool:
+    """Whether ``losses.<section>.<field>`` is PINNING a materialised agreement.
+
+    A lambda whose value differs from its own schema default, on a loss another
+    section also aliases, is the only thing holding the two declarations equal:
+    delete it and they disagree, though the written surface showed a redundant
+    field. ``reconstruction.lambda_l2`` (default 0.0) against
+    ``diffusion.lambda_mse`` (default 1.0) is the live case; the divergent
+    per-section defaults behind it are issue #421.
+
+    The caller is the audit's pairing rule, which reads a ``False`` as permission
+    to delete — so this answers "would deleting it introduce a disagreement",
+    not "does this arm load today". The two arms it protects load either way;
+    what their deletion broke was the cohort regression test above.
+    """
+    name = _loss_name_for_field(field)
+    before = _materialised_values(losses).get(name, set())
+    after = _materialised_values(losses, dropping=(section, field)).get(name, set())
+    return len(after) > 1 and len(before) <= 1

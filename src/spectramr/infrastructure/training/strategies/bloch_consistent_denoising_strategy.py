@@ -29,7 +29,7 @@ and is intentionally omitted rather than faked.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 class BlochConsistentDenoisingStrategy(ReconstructionTrainingStrategy):
     """Self-supervised Bloch-consistent denoiser."""
+
+    #: Loss ownership (issue #1918). Bloch-consistency terms only; the hook overrides ReconstructionTrainingStrategy's
+    #: without calling super() or the fold, so nothing from losses.image_losses runs.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

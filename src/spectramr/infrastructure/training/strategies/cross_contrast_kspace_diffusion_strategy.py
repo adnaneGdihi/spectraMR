@@ -29,7 +29,7 @@ Wired components:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +42,11 @@ from .mixins.utils import _callable_accepts_kwarg
 
 class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
     """Cold-diffusion in k-space for cross-contrast translation."""
+
+    #: Loss ownership (issue #1918). mse_loss(dst_hat, k_dst) is a K-SPACE term against the destination contrast,
+    #: not an image loss against the target, and the hook routes nowhere.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     sigma_max: float = 0.05
     lambda_destination: float = 1.0

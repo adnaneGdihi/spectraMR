@@ -37,12 +37,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from spectramr.infrastructure.validation.spec_card import derive_loader_output_domain
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.domain.entities.experiment_context import (
     DataProfile,
     PhysicsProfile,
     ResolvedExperimentContext,
 )
+from spectramr.infrastructure.validation.spec_card import derive_loader_output_domain
 from spectramr.models.capabilities import (
     AdapterCapabilities,
     LossCapabilities,
@@ -107,7 +108,7 @@ def _iter_loss_names(config: Any) -> list[str]:
     losses = _get(config, "losses")
     if losses is None:
         return names
-    for block in ("image_losses", "kspace_losses", "complex_losses"):
+    for block in LOSS_LIST_DOMAINS:
         entries = getattr(losses, block, None) or []
         try:
             for entry in entries:

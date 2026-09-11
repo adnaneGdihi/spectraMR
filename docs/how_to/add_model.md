@@ -27,7 +27,8 @@ from spectramr.models.registry import register_model
     spatial_dims=(2,),
     accepts_complex=False,
     expects_real_imag_interleaved=False,
-    supports_contrast_conditioning=False,
+    # Omitted rather than set False: this model has no opinion on contrast
+    # conditioning, and None is how you say that (see the table below).
 )
 class MyUNet(nn.Module):
     """One-paragraph summary of what this architecture does.
@@ -59,7 +60,16 @@ Decorator arguments:
 | `spatial_dims` | `tuple[int, ...]` | Which spatial dimensionalities the forward pass accepts. `(2,)` = 2D only. `(2, 3)` = both. `(1,)` = fingerprint / time-series. The audit's `data_model_compatibility` check uses this. |
 | `accepts_complex` | `bool` | True if `forward` receives `torch.complex64` tensors directly. |
 | `expects_real_imag_interleaved` | `bool` | True if the model wants `[B, 2C, H, W]` where each complex channel is split into real/imag pairs (the typical real-valued encoding of k-space). |
-| `supports_contrast_conditioning` | `bool` | True if the model accepts a contrast embedding as a second argument. |
+| `supports_contrast_conditioning` | `bool \| None` | True if the model accepts a contrast embedding (`contrast_idx`) in its `forward`. |
+| `role` | `"generator" \| "discriminator"` | Which `ModelFactory` bucket the model lands in. Defaults to `"generator"`; **discriminators must say so explicitly**. |
+
+Every capability argument defaults to `None`, and that is not the same as
+`False`. `None` means *nobody has declared this*; `False` is a positive claim
+that the model does not support it. `get_model_capabilities()` returns `None`
+for an all-`None` dataclass, which is how the audit tells "unannotated" from
+"annotated as not-supported" — so passing `False` everywhere out of tidiness
+opts the model into checks it was previously exempt from. Declare the flags you
+have actually thought about, and leave the rest alone.
 
 ## Where to put the file
 
@@ -120,7 +130,7 @@ After registration, `MODEL_REGISTRY["my_unet"]` is a dict:
 {
     "class": MyUNet,                       # the class itself
     "mode": "reconstruction",              # the default training_mode
-    "supports_contrast_conditioning": False,
+    "role": "generator",                   # which ModelFactory bucket
     "capabilities": ModelCapabilities(
         spatial_dims=(2,),
         input_domain=None,                 # set explicitly if your model
@@ -128,9 +138,25 @@ After registration, `MODEL_REGISTRY["my_unet"]` is a dict:
         accepts_complex=False,             # domain — used by adapter
         expects_real_imag_interleaved=False,
         requires_paired_data=None,
+        supports_contrast_conditioning=None,
     ),
 }
 ```
+
+**Every capability flag lives on `ModelCapabilities` and nowhere else.** Until
+#1916 the decorator also fanned `supports_contrast_conditioning` and
+`supports_vendor_conditioning` out to *top-level* entry keys, so
+`model_supports()` read one surface and `get_model_capabilities()` the other —
+130 disagreements over 588 models, with neither reader erroring. If you are
+adding a flag, add it to the dataclass; a top-level key is now a test failure
+(`test_no_entry_carries_a_top_level_capability_key`).
+
+`role` is a routing key, not a capability: it says which `ModelFactory` bucket
+the model belongs to. It defaults to `"generator"`, so an ordinary generator
+says nothing — but **a discriminator must declare `role="discriminator"`** or
+`create_discriminator("<name>")` will raise `not registered` (#1932). Class
+inheritance is not consulted: registering an `IDiscriminator` subclass while
+declaring `role="generator"` raises at registration rather than mis-filing it.
 
 The instance you get back from `entry["class"](in_channels=..., **kwargs)` is
 a plain `nn.Module`. The YAML's `model.model_kwargs` block becomes the

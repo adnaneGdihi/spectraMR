@@ -11,7 +11,14 @@ from spectramr.models.interfaces import IDiscriminator
 from spectramr.models.registry import register_model
 
 
-@register_model(name="patchgan_3d_discriminator", training_mode="gan")
+# 3-D convolution stack, no internal transform (see ``patchgan_discriminator.py`` for why
+# the domain is declared on the registration rather than read off the class).
+@register_model(
+    role="discriminator",
+    name="patchgan_3d_discriminator",
+    training_mode="gan",
+    input_domain="image",
+)
 class PatchGAN3DDiscriminator(IDiscriminator, nn.Module):
     """A 3D PatchGAN discriminator."""
 

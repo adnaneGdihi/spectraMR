@@ -165,3 +165,43 @@ def test_declaring_an_inline_term_makes_its_weight_resolvable() -> None:
         _cfg([("l1", 1.0), ("cocycle_consistency", 0.1)]).losses
     )
     assert table.weight("cocycle_consistency", iteration=1_000_000) == pytest.approx(0.1)
+
+
+# --- declares_inline_objective: the pairing LossBuilder.validate() rests on -----------
+
+
+@pytest.mark.parametrize(
+    ("inline", "folds", "expected"),
+    [
+        (frozenset(), False, True),  # owns its objective, folds nothing
+        (frozenset({"l1"}), False, True),  # a non-empty declaration is ownership too
+        (frozenset(), True, False),  # folds the builder's modules -- it needs them
+        (None, False, False),  # half-declared: never says what it computes
+        (None, None, False),  # silent
+        (frozenset(), None, False),  # half-declared the other way
+    ],
+    ids=["empty-nofold", "named-nofold", "empty-folds", "nofold-only", "silent", "inline-only"],
+)
+def test_declares_inline_objective_truth_table(inline, folds, expected) -> None:
+    """Both declarations are tri-state and ``None`` is falsy, so the predicate must test
+    ``is False`` rather than ``not folds`` -- the ``nofold-only`` and ``inline-only`` rows
+    are what separate the two spellings."""
+    from spectramr.infrastructure.training.strategies.loss_folding import (
+        declares_inline_objective,
+    )
+
+    cls = type("_Probe", (), {"inline_losses": inline, "folds_image_losses": folds})
+    assert declares_inline_objective(cls) is expected
+
+
+def test_the_bases_own_none_is_not_a_declaration() -> None:
+    """``BaseTrainingStrategy`` sets both ClassVars to ``None`` in its own ``__dict__``.
+    A subclass that declares nothing must still read as undeclared, or every strategy in
+    the tree would inherit the exemption."""
+    from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+    from spectramr.infrastructure.training.strategies.loss_folding import (
+        declares_inline_objective,
+    )
+
+    silent = type("_SilentStrategy", (BaseTrainingStrategy,), {})
+    assert declares_inline_objective(silent) is False

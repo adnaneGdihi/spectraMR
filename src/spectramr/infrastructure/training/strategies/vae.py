@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.precision_annotations import (
     VAEPrecisionManager,
     VQVAEPrecisionManager,
@@ -601,13 +602,15 @@ class VQVAETrainingStrategy(BaseTrainingStrategy):
         if "loss" not in self._loss_dict_reuse:
             self._loss_dict_reuse["loss"] = total_loss
 
-        # [ENHANCEMENT] Compute training metrics (PSNR, SSIM, MAE) for monitoring
-        current_step = getattr(self.env, "step", 0) if self.env else 0
+        # [ENHANCEMENT] Compute training metrics (PSNR, SSIM, MAE) for monitoring.
+        # Live iteration (loop_state seam), not the frozen ``self.env.step``
+        # (=0) — restores the train-metric interval throttle (pitfall #16).
+        iteration = resolve_loop_iteration(self)
         train_metrics = self._compute_training_metrics(
             pred=reconstruction,
             target=target_batch,
             config=self.config,
-            current_step=current_step,
+            current_step=iteration,
         )
 
         # Phase 5: Ensure strict type compliance (dict[str, Tensor])

@@ -41,7 +41,7 @@ NAN = float("nan")
 def _content_family_tensor_ref(traj, families, contents):
     if not families or not contents:
         return torch.zeros((0, 0, 0))
-    T = len(next(iter(traj.values()))) if traj else 0  # noqa: N806 (verbatim)
+    T = len(next(iter(traj.values()))) if traj else 0
     out = torch.full((len(contents), len(families), T), float("nan"), dtype=torch.float64)
     for i, c in enumerate(contents):
         for j, fam in enumerate(families):

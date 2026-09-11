@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.blocks.domain_adaptation import grad_reverse
 from spectramr.models.losses.registry import register_loss
 
 
@@ -46,40 +47,6 @@ class IDomainAdversarialLoss(Protocol):
         ...
 
 
-class GradientReversalLayer(torch.autograd.Function):
-    """Gradient Reversal Layer for domain adversarial training.
-    Mathematical Formulation:
-    .. math::
-
-        \\mathcal{O}_{GradientReversal}(x) = \begin{cases} x & \text{forward} \\ -\alpha \frac{\\partial L}{\\partial x} & \text{backward} \\end{cases}"""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-        """forward.
-
-        Args:
-            ctx (Any): Description.
-            x (torch.Tensor): Description.
-            alpha (float): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """backward.
-
-        Args:
-            ctx (Any): Description.
-            grad_output (torch.Tensor): Description.
-        Returns:
-            tuple[torch.Tensor, None]: Description.
-        """
-        return grad_output.neg() * ctx.alpha, None
-
-
 class GradientReversalLayerModule(nn.Module):
     """Gradient Reversal Layer module wrapper.
     Mathematical Formulation:
@@ -116,7 +83,7 @@ class GradientReversalLayerModule(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         self.iter_num += 1
         coeff = self._get_coefficient()
-        return GradientReversalLayer.apply(x, coeff)
+        return grad_reverse(x, coeff)
 
     def _get_coefficient(self) -> float:
         """Get reversal coefficient based on training progress."""

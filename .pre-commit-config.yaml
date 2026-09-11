@@ -20,19 +20,6 @@ repos:
       - id: check-merge-conflict
       - id: detect-private-key
 
-  # The rev must not fall behind the `ruff>=0.15` floor in pyproject.toml. It
-  # did: this hook was pinned to v0.5.0, eleven minor versions below the floor,
-  # so it reformatted files into a style the project's own ruff immediately
-  # reverted -- `ruff format --check` reported "1 file would be reformatted" on
-  # a file this hook had just written. Two formatters with different opinions
-  # and no owner is a formatting war, not a gate (non-negotiable 17).
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.2
-    hooks:
-      - id: ruff
-        args: ["--fix"]
-      - id: ruff-format
-
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.10.0
     hooks:
@@ -54,7 +41,16 @@ repos:
         # must spell as the registry does -- same reason as `te` above.
         # `nce` is Noise-Contrastive Estimation: it appears only as a LaTeX
         # subscript in the InfoNCE loss formulas on losses_reference.rst.
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce"]
+        # `strat` is a real identifier in two independent places, not a
+        # misspelling of "start"/"strata":
+        #   - a local abbreviation for `strategy_class`
+        #     (`config_health_checker.py:12441` and 11 more), in the tree since
+        #     the spectraMR rename (c2d17404a) -- codespell had been failing on
+        #     every commit that touched that file;
+        #   - the conventional local name for a strategy instance across
+        #     tests/unit/infrastructure/training/strategies/ (144 occurrences in
+        #     the 30 files issue #1918 touched alone).
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint
@@ -98,6 +94,24 @@ repos:
         always_run: true
         pass_filenames: false
         stages: [pre-commit]
+      # Replaces the whole-file `ruff` + `ruff-format` hooks from
+      # astral-sh/ruff-pre-commit, which failed a one-line edit on debt the commit
+      # did not write and, carrying `--fix`, rewrote the working tree on the way out
+      # (#1874). One owner for the added-line policy now, shared with the blocking
+      # `lint-diff` lane, so the hook and CI can no longer disagree about a commit.
+      # The script derives its own file list from the index, hence
+      # `pass_filenames: false`; `types:` still decides whether it runs at all, and
+      # `always_run` would escape that. `language: python` pins ruff here rather than
+      # trusting the committer's PATH (#1981) -- keep it at or above the `ruff>=0.15`
+      # floor in pyproject.toml, which a pin eleven minor versions below once broke.
+      - id: ruff-changed-lines
+        name: ruff, on the lines this commit adds
+        entry: python scripts/ci/lint_changed_lines.py --staged
+        language: python
+        additional_dependencies: [ruff==0.16.2]
+        types: [python]
+        pass_filenames: false
+        stages: [pre-commit]
       - id: test-paired-with-source
         name: source change requires paired test change
         entry: python scripts/ci/check_test_paired_with_source.py
@@ -107,6 +121,28 @@ repos:
       - id: witness-corpus
         name: witness corpus (no newly-discarded declared keys)
         entry: python scripts/ci/check_witness_corpus.py experiments/inprogress
+        language: system
+        pass_filenames: false
+        files: ^experiments/inprogress/.*\.yaml$
+      # A SECOND tree needs a SECOND hook id and its own baseline. Reusing the
+      # id above with a different root would share one debt record between two
+      # corpora: run against tests/audit/corpus it reported all 2658 experiments
+      # entries as "now clean" and invited an --update-baseline that would have
+      # erased them (#1930). The audit fixtures start at zero, so a fixture
+      # declaring a key the schema discards -- the #1933 defect, which made a
+      # planted violation carry none of the shape it advertised -- fails here on
+      # the commit that introduces it.
+      - id: witness-corpus-audit-fixtures
+        name: audit fixtures declare no key the schema discards
+        entry: >-
+          python scripts/ci/check_witness_corpus.py tests/audit/corpus
+          --baseline scripts/ci/witness_baseline_audit_corpus.txt
+        language: system
+        pass_filenames: false
+        files: ^tests/audit/corpus/.*\.yaml$
+      - id: identity-paths-unique
+        name: no two arms write to the same identity path
+        entry: python scripts/ci/check_identity_paths_unique.py experiments/inprogress
         language: system
         pass_filenames: false
         files: ^experiments/inprogress/.*\.yaml$

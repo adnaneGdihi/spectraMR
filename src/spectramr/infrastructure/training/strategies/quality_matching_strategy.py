@@ -16,7 +16,7 @@ import logging
 import statistics
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import yaml
@@ -324,7 +324,7 @@ def paired_agreement(
     a = synthetic.float()
     b = real_lq.float()
     if a.shape != b.shape:
-        import torch.nn.functional as F  # noqa: N812
+        import torch.nn.functional as F
 
         a = F.interpolate(
             a[None, None], size=tuple(b.shape), mode="trilinear", align_corners=False
@@ -970,6 +970,11 @@ class QualityMatchingStrategy(ReconstructionTrainingStrategy):
     subsequent step is a no-op returning an exactly-zero, differentiable loss so the
     harness's backward/step cycle stays valid while no parameter moves.
     """
+
+    #: Loss ownership (issue #1918). Terminates in `return {"loss_total": self._zero_loss()}` -- it computes no
+    #: loss at all and folds nothing.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def _setup_strategy_specific_components(self) -> None:
         self._verify_strategy_config(expected_modes=("quality_matching",))

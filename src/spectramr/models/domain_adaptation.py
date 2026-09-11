@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from spectramr.models.blocks.domain_adaptation import grad_reverse
 from spectramr.models.registry import register_model
 
 
@@ -95,7 +96,14 @@ class ScannerSpecificNormalization(nn.Module):
         return (x - batch_mean) / torch.sqrt(batch_var + self.eps) * batch_weight + batch_bias
 
 
-@register_model(name="domain_discriminator", training_mode="ssl")
+# ``input_domain`` is deliberately LEFT UNDECLARED (#1920). This critic does not score an
+# MRI signal at all: its first layer is ``AdaptiveAvgPool2d(1)`` -> ``Flatten`` ->
+# ``Linear(in_channels, ...)``, i.e. it pools an ENCODER FEATURE MAP to a vector and
+# classifies which of ``num_domains`` it came from. No word in the ``Domain`` vocabulary
+# ("image", "kspace", "complex_image", "latent", ...) names that input, and a wrong
+# declaration is a hard error at ``resolve_conversion`` while an absent one is only
+# advisory (NN18: absent is a state to report, never one to infer).
+@register_model(role="discriminator", name="domain_discriminator", training_mode="ssl")
 class DomainDiscriminator(nn.Module):
     """Domain discriminator for adversarial domain adaptation."""
 
@@ -145,36 +153,6 @@ class DomainDiscriminator(nn.Module):
         return self.discriminator(x)
 
 
-class GradientReversalLayer(torch.autograd.Function):
-    """Gradient reversal layer for adversarial training."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-        """forward.
-
-        Args:
-            ctx (Any): Description.
-            x (torch.Tensor): Description.
-            alpha (float): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """backward.
-
-        Args:
-            ctx (Any): Description.
-            grad_output (torch.Tensor): Description.
-        Returns:
-            tuple[torch.Tensor, None]: Description.
-        """
-        return grad_output.neg() * ctx.alpha, None
-
-
 class DomainAdaptationLayer(nn.Module):
     """Domain adaptation layer with gradient reversal."""
 
@@ -216,7 +194,7 @@ class DomainAdaptationLayer(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        reversed_x = GradientReversalLayer.apply(x, self.alpha)
+        reversed_x = grad_reverse(x, self.alpha)
         domain_logits = self.discriminator(reversed_x)
         return domain_logits
 

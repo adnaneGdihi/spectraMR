@@ -315,3 +315,267 @@ def test_composite_lpips_import_failure_raises_with_install_hint(
     monkeypatch.setitem(sys.modules, "spectramr.models.losses.lpips_loss", None)
     with pytest.raises(ImportError, match="pip install lpips"):
         _composite(lambda_lpips=0.8)
+
+
+# ---------------------------------------------------------------------------
+# gradient_penalty_loss: the FOURTH critic call of a discriminator step
+#
+# ``UnifiedGANLossComputer.compute_discriminator_loss`` scores ``real`` and
+# ``fake`` itself and R1 scores ``real`` again; the gradient penalty then calls
+# the critic a fourth time, on the interpolates, from inside
+# ``CompositeGANLoss``. That call was bare until #1931 half 2, and it fails in
+# two independent ways -- one per defect below. Both were observed firing on
+# the production path (``fit(paradigm='diffusion')``) before being fixed, not
+# reasoned about: a conditioned critic raised ``ValueError: ... was called
+# without timesteps``, and a complex-domain critic produced
+# ``grad can be implicitly created only for real scalar outputs but got
+# torch.complex64``.
+# ---------------------------------------------------------------------------
+
+
+class _ViaRealViewD(torch.nn.Module):
+    """Scores a complex input and its stacked real view identically.
+
+    The oracle both complex-safety tests below are written against: because the
+    score is the same function of the same numbers either way, a penalty on the
+    complex tensor MUST equal the penalty on the real view. Any discrepancy is
+    the penalty's own arithmetic, not the critic's.
+    """
+
+    def __init__(self, w: torch.Tensor) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_complex(x):
+            x = torch.cat([x.real, x.imag], dim=1)
+        return (x * self.w).flatten(1).sum(1)
+
+
+class _KwargSpyD(torch.nn.Module):
+    """Records what each call received, and scores whatever it is given."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = torch.nn.Conv2d(1, 1, 3, padding=1)
+        self.calls: list[dict] = []
+
+    def forward(self, x: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        self.calls.append(kwargs)
+        return self.net(x).flatten(1).mean(1)
+
+
+def test_the_gradient_penalty_forwards_its_conditioning_to_the_critic() -> None:
+    """Defect A, at the function.
+
+    Planted violation: restore ``discriminator(interp)`` and this records
+    ``{}``. That is not hypothetical -- it is what the function did, and it is
+    why a critic declaring ``supports_contrast_conditioning`` died on step 1 of
+    every arm that left ``lambda_gp`` at the schema default.
+    """
+    from spectramr.models.losses.gan_loss_library import gradient_penalty_loss
+
+    disc = _KwargSpyD()
+    t = torch.full((2,), 137)
+    c = torch.tensor([0, 2])
+    gradient_penalty_loss(
+        disc,
+        torch.randn(2, 1, 8, 8),
+        torch.randn(2, 1, 8, 8),
+        critic_cond={"timesteps": t, "contrast_idx": c},
+    )
+
+    assert len(disc.calls) == 1, "the penalty calls the critic exactly once"
+    assert set(disc.calls[0]) == {"timesteps", "contrast_idx"}
+    assert torch.equal(disc.calls[0]["timesteps"], t)
+    assert torch.equal(disc.calls[0]["contrast_idx"], c)
+
+
+def test_the_composite_forwards_conditioning_into_the_penalty() -> None:
+    """Defect A, at the seam -- the half that a signature change cannot fix.
+
+    ``gradient_penalty_loss`` accepting ``critic_cond`` is worthless if its one
+    production caller never passes it (pitfall #16). This is that caller.
+    """
+    disc = _KwargSpyD()
+    real = torch.randn(2, 1, 8, 8)
+    fake = torch.randn(2, 1, 8, 8)
+    scores = disc.net(real).flatten(1).mean(1)
+    disc.calls.clear()
+
+    out = _composite(lambda_gp=10.0).compute_discriminator_loss(
+        real_outputs_d=scores,
+        fake_outputs_d=scores.detach().clone(),
+        discriminator=disc,
+        real_images=real,
+        fake_images=fake,
+        critic_cond={"timesteps": torch.zeros(2, dtype=torch.long)},
+    )
+
+    assert "gp_loss" in out and out["gp_loss"].requires_grad
+    assert [set(k) for k in disc.calls] == [{"timesteps"}], (
+        "the penalty's critic call arrived unconditioned — CompositeGANLoss "
+        "dropped the payload between its own signature and the penalty"
+    )
+
+
+def test_an_unconditioned_penalty_still_calls_the_critic_bare() -> None:
+    """The default must reproduce the pre-#1931 call for every other arm.
+
+    ``_StrictD.forward`` takes no ``**kwargs``, so any payload -- even an empty
+    dict passed positionally as a kwarg -- would raise here.
+    """
+    from spectramr.models.losses.gan_loss_library import gradient_penalty_loss
+
+    class _StrictD(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = torch.nn.Conv2d(1, 1, 3, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x).flatten(1).mean(1)
+
+    val = gradient_penalty_loss(_StrictD(), torch.randn(2, 1, 8, 8), torch.randn(2, 1, 8, 8))
+    assert val.ndim == 0 and not val.is_complex()
+
+
+def test_the_penalty_on_complex_input_equals_the_penalty_on_its_real_view() -> None:
+    """Defect B: the norm must be Euclidean over (real, imag), not a complex square.
+
+    ``_align_for_critic`` (#1920) hands a k-space critic declaring
+    ``accepts_complex`` genuinely complex tensors, so ``grads ** 2`` computed
+    ``a**2 - b**2 + 2abi`` and the whole D loss came out complex. The assertion
+    is deliberately an EQUALITY against the same computation on the stacked
+    real view rather than "is real": a fix that merely took ``.real`` of the
+    complex square would pass an is-real check and still be the wrong number.
+    """
+    from spectramr.models.losses.gan_loss_library import gradient_penalty_loss
+
+    disc = _ViaRealViewD(torch.randn(1, 2, 8, 8))
+    real_c = torch.randn(3, 1, 8, 8, dtype=torch.complex64)
+    fake_c = torch.randn(3, 1, 8, 8, dtype=torch.complex64)
+    real_r = torch.cat([real_c.real, real_c.imag], dim=1)
+    fake_r = torch.cat([fake_c.real, fake_c.imag], dim=1)
+
+    # The same seed gives the same interpolation coefficients, so the two runs
+    # differ only in the dtype of the tensor the penalty differentiates.
+    torch.manual_seed(1931)
+    gp_complex = gradient_penalty_loss(disc, real_c, fake_c)
+    torch.manual_seed(1931)
+    gp_real = gradient_penalty_loss(disc, real_r, fake_r)
+
+    assert not gp_complex.is_complex(), (
+        "the penalty is complex — d_total_loss inherits it and backward() dies"
+    )
+    assert torch.allclose(gp_complex, gp_real, atol=1e-5), (
+        f"complex {gp_complex.item():.6f} != real-view {gp_real.item():.6f}"
+    )
+
+
+def test_a_complex_penalty_backpropagates() -> None:
+    """The end the production failure was reported at: ``loss.backward()``."""
+    from spectramr.models.losses.gan_loss_library import gradient_penalty_loss
+
+    class _ComplexD(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = torch.nn.Conv2d(2, 1, 3, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(torch.cat([x.real, x.imag], dim=1)).flatten(1).mean(1)
+
+    disc = _ComplexD()
+    gp = gradient_penalty_loss(
+        disc,
+        torch.randn(2, 1, 8, 8, dtype=torch.complex64),
+        torch.randn(2, 1, 8, 8, dtype=torch.complex64),
+    )
+    gp.backward()
+    assert disc.net.weight.grad is not None
+    assert torch.isfinite(disc.net.weight.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# R1: the SAME complex-square defect, in the sibling regularizer
+#
+# ``R1RegularizationLoss`` is the second critic call of the D step and it
+# differentiates ``D(real)`` w.r.t. ``real`` -- the same shape of quantity the
+# gradient penalty takes on the interpolates, computed with the same
+# ``grads.pow(2)`` that was wrong there. It reaches complex input by the same
+# route: ``UnifiedGANLossComputer.compute_discriminator_loss`` passes the
+# ``_align_for_critic`` output straight into ``self.r1_regularizer(...)``
+# (unified_gan.py), and for a critic declaring ``accepts_complex`` that tensor
+# is genuinely complex. Fixing only ``gradient_penalty_loss`` would have left
+# the identical bug one config key (``losses.gan.lambda_r1``) away.
+# ---------------------------------------------------------------------------
+
+
+def test_r1_on_complex_input_equals_r1_on_its_real_view() -> None:
+    """The mirror of the gradient-penalty complex test, for R1.
+
+    EQUALITY, not "is real", for the same reason: a fix that took ``.real`` of
+    the complex square would produce a real tensor holding ``a^2 - b^2``.
+    """
+    from spectramr.models.losses.gan_loss_library import R1RegularizationLoss
+
+    disc = _ViaRealViewD(torch.randn(1, 2, 8, 8))
+    r1 = R1RegularizationLoss(weight=1.0)
+
+    real_c = torch.randn(3, 1, 8, 8, dtype=torch.complex64)
+    real_r = torch.cat([real_c.real, real_c.imag], dim=1)
+
+    # R1 draws no randomness, so the two runs differ only in the dtype of the
+    # tensor being differentiated.
+    out_c = r1(disc, real_c)
+    out_r = r1(disc, real_r)
+
+    assert not out_c.is_complex(), (
+        "R1 is complex — it is summed into d_total_loss, so backward() dies "
+        "with 'grad can be implicitly created only for real scalar outputs'"
+    )
+    assert torch.allclose(out_c, out_r, atol=1e-5), (
+        f"complex {out_c.item():.6f} != real-view {out_r.item():.6f} — R1 is "
+        "computing a^2 - b^2, not a^2 + b^2"
+    )
+
+
+def test_a_complex_r1_backpropagates() -> None:
+    """R1's end of the same production failure: ``loss.backward()``."""
+    from spectramr.models.losses.gan_loss_library import R1RegularizationLoss
+
+    class _ComplexR1D(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = torch.nn.Conv2d(2, 1, 3, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(torch.cat([x.real, x.imag], dim=1)).flatten(1).mean(1)
+
+    disc = _ComplexR1D()
+    out = R1RegularizationLoss(weight=2.0)(disc, torch.randn(2, 1, 8, 8, dtype=torch.complex64))
+    out.backward()
+    assert disc.net.weight.grad is not None
+    assert torch.isfinite(disc.net.weight.grad).all()
+
+
+def test_r1_still_forwards_its_conditioning_after_the_norm_fix() -> None:
+    """Regression guard pinning the two halves of R1 together.
+
+    The ``critic_cond`` forwarding and the complex-safe norm were fixed in
+    separate commits of the same PR, in the same function. This asserts the
+    second did not disturb the first.
+    """
+    from spectramr.models.losses.gan_loss_library import R1RegularizationLoss
+
+    disc = _KwargSpyD()
+    t = torch.full((2,), 42)
+    c = torch.tensor([1, 0])
+    R1RegularizationLoss(weight=1.0)(
+        disc,
+        torch.randn(2, 1, 8, 8),
+        critic_cond={"timesteps": t, "contrast_idx": c},
+    )
+
+    assert len(disc.calls) == 1
+    assert set(disc.calls[0]) == {"timesteps", "contrast_idx"}
+    assert torch.equal(disc.calls[0]["timesteps"], t)

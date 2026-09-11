@@ -7,6 +7,7 @@ Scans source code to verify:
 - Registry matches source code
 """
 
+import ast
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -21,28 +22,82 @@ class RegistrationScanner:
         self.base_path = base_path
         self.registrations: dict[str, list[tuple[str, int]]] = defaultdict(list)
 
+    @staticmethod
+    def _registered_name(decorator: ast.expr) -> str | None:
+        """The model name a single ``@register_model(...)`` decorator declares.
+
+        Accepts BOTH forms the tree actually uses -- ``name="x"`` in any keyword
+        position, and the positional ``@register_model("x", "y")`` idiomatic in
+        older generators like ``pma_varnet``. Returns ``None`` for anything that
+        is not a ``register_model`` call, or whose name is not a literal.
+        """
+        if not isinstance(decorator, ast.Call):
+            return None
+        func = decorator.func
+        # Matches a bare ``register_model(...)`` and a qualified
+        # ``registry.register_model(...)`` alike.
+        called = getattr(func, "id", None) or getattr(func, "attr", None)
+        if called != "register_model":
+            return None
+        for keyword in decorator.keywords:
+            if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                value = keyword.value.value
+                return value if isinstance(value, str) else None
+        if decorator.args and isinstance(decorator.args[0], ast.Constant):
+            value = decorator.args[0].value
+            return value if isinstance(value, str) else None
+        return None
+
     def scan_file(self, file_path: Path):
-        """Scan a Python file for @register_model decorators."""
+        """Scan a Python file for @register_model decorators.
+
+        Parsed with ``ast``, not matched with a regex. The regex this replaced
+        required ``name=`` to be the FIRST keyword
+        (``@register_model\\s*\\(\\s*name\\s*=``), which stopped being true the moment a
+        change put ``role=`` first and ruff-format broke the call across lines.
+        Measured at the time: the regex saw 492 registrations where the tree has
+        513, missing 21 -- every discriminator, because that is where ``role=``
+        leads. It saw nothing the AST does not, so the blindness was pure loss.
+
+        The failure mode is what makes this worth parsing properly: a scanner
+        that under-counts does not go red. ``get_duplicates`` simply stops
+        reporting duplicates among the names it cannot see, and the sibling
+        census test asserts *static names are live*, which a smaller static set
+        satisfies trivially. Only the capability-parity test happened to fail
+        loudly. A detector that narrows in silence is the shape NN15 is about.
+
+        ``ast.walk`` rather than a scan of ``tree.body``: registrations are not
+        all module-level -- some sit inside a function that builds a family of
+        variants -- and a top-level-only walk would reintroduce a blind spot of
+        its own.
+        """
         try:
-            with open(file_path, encoding="utf-8") as f:
-                content = f.read()
-        except Exception:
+            content = file_path.read_text(encoding="utf-8")
+            tree = ast.parse(content, filename=str(file_path))
+        except (OSError, UnicodeDecodeError, SyntaxError):
             return
 
-        # Find all @register_model decorators
-        pattern = r'@register_model\s*\(\s*name\s*=\s*["\']([^"\']+)["\']'
-
-        for match in re.finditer(pattern, content):
-            model_name = match.group(1)
-            line_number = content[: match.start()].count("\n") + 1
-
-            relative_path = str(file_path.relative_to(self.base_path))
-            self.registrations[model_name].append((relative_path, line_number))
+        relative_path = str(file_path.relative_to(self.base_path))
+        for node in ast.walk(tree):
+            for decorator in getattr(node, "decorator_list", []):
+                model_name = self._registered_name(decorator)
+                if model_name is not None:
+                    self.registrations[model_name].append((relative_path, decorator.lineno))
 
     def scan_directory(self, directory: Path):
-        """Recursively scan directory for registrations."""
+        """Recursively scan ``directory`` for registrations, skipping test files.
+
+        The skip is matched against the path RELATIVE to the scan root. Matching
+        the absolute path -- ``if "test" not in str(py_file)``, which this
+        replaced -- makes the scanner a property of where the repository happens
+        to be checked out: under ``~/testing/`` or a ``pytest`` ``tmp_path``,
+        every file is skipped, ``registrations`` is empty, and every assertion in
+        this file passes over nothing. That is not a hypothetical -- it is how
+        the plant below first came back green-on-empty.
+        """
         for py_file in directory.rglob("*.py"):
-            if "test" not in str(py_file):  # Skip test files
+            relative = py_file.relative_to(directory)
+            if not any("test" in part for part in relative.parts):
                 self.scan_file(py_file)
 
     def get_duplicates(self) -> dict[str, list[tuple[str, int]]]:
@@ -56,6 +111,92 @@ class RegistrationScanner:
     def get_all_registrations(self) -> dict[str, list[tuple[str, int]]]:
         """Return all registrations."""
         return dict(self.registrations)
+
+
+#: One planted registration per SHAPE the scanner must see, with the line it sits on.
+#:
+#: NN15: a gate is only a gate for the violation shape it has been watched to fail on.
+#: The regex this scanner replaced had gone green for years on shape 2 while being blind
+#: to the other three, so "it passes" was never evidence. Shape 1 is the one that
+#: actually broke it -- ``role=`` ahead of ``name=``, split across lines by ruff-format.
+_PLANTED_SHAPES = """
+from spectramr.models.registry import register_model
+
+
+@register_model(
+    role="discriminator", name="PLANT_role_first", training_mode="gan",
+)
+class _RoleFirst:
+    pass
+
+
+@register_model(name="PLANT_name_first", role="discriminator")
+class _NameFirst:
+    pass
+
+
+@register_model("PLANT_positional", "gan")
+class _Positional:
+    pass
+
+
+def _build_family():
+    @register_model(role="discriminator", name="PLANT_function_local")
+    class _FunctionLocal:
+        pass
+"""
+
+
+class TestTheScannerSeesEveryDecoratorShape:
+    """The scanner is exercised against planted registrations, not only the tree.
+
+    Planted rather than asserted against a count: a count pinned to today's tree
+    goes stale on the next registration and gets bumped without being read, which
+    is how the regex's 21-name blind spot survived. A shape either parses or it
+    does not, and that answer does not drift.
+    """
+
+    @pytest.fixture
+    def planted(self, tmp_path: Path) -> "RegistrationScanner":
+        (tmp_path / "planted_models.py").write_text(_PLANTED_SHAPES, encoding="utf-8")
+        scanner = RegistrationScanner(tmp_path)
+        scanner.scan_directory(tmp_path)
+        return scanner
+
+    @pytest.mark.parametrize(
+        "name,lineno",
+        [
+            ("PLANT_role_first", 5),
+            ("PLANT_name_first", 12),
+            ("PLANT_positional", 17),
+            ("PLANT_function_local", 23),
+        ],
+    )
+    def test_the_shape_is_seen_at_its_own_line(self, planted, name: str, lineno: int) -> None:
+        """Each shape is found, and attributed to the DECORATOR's line.
+
+        The line number matters because it is what a duplicate report points a
+        reader at; a decorator span reported at the class's line sends them to
+        the wrong one of four stacked registrations.
+        """
+        assert name in planted.registrations, (
+            f"{name} is declared in the planted file and the scanner did not see it — "
+            f"it saw {sorted(planted.registrations)}"
+        )
+        assert planted.registrations[name] == [("planted_models.py", lineno)]
+
+    def test_the_plant_would_catch_the_regression_it_was_written_for(self, planted) -> None:
+        """The retired regex fails this plant, so the plant discriminates.
+
+        Without this leg the plant could be satisfied by any scanner at all,
+        including the broken one, and would document nothing.
+        """
+        retired = re.compile(r'@register_model\s*\(\s*name\s*=\s*["\']([^"\']+)["\']')
+        assert sorted(retired.findall(_PLANTED_SHAPES)) == ["PLANT_name_first"], (
+            "the retired regex no longer misses the three shapes this plant exists to "
+            "cover — re-derive the plant rather than deleting this assertion"
+        )
+        assert len(planted.registrations) == 4
 
 
 class TestRegistryIntegrity:

@@ -61,11 +61,16 @@ Known unsoundness
   splatting and a field name built at runtime
   (``getattr(cfg, f"compute_{name}")``) both reach a field without spelling it,
   and land as ``NO_READ_FOUND``. This is the same blind spot the rg index
-  documents; it is neither added nor removed here, and ``ReadEvidence`` exists
-  so a consumer can see it rather than infer it.
+  documents, and no analysis fixes it -- a name never written cannot be
+  recovered. It can only be *declared*, beside the accessor that knows: pass
+  ``external_reads`` to :func:`is_key_reachable` and the path is reported as
+  :attr:`ReadEvidence.ACCESSOR_READ` rather than as an absence. See
+  ``docs/contributing/ci.rst``, "Declaring a read the token index cannot see".
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 # ``PACKAGE_DIR`` is re-exported: it is a documented public constant that
 # moved to the index module with the code that derives it. ``as`` is the
@@ -79,6 +84,7 @@ from spectramr.config.key_reachability_model import (
     ReadEvidence,
     _Index,
     _Scope,
+    accessor_verdict,
 )
 
 __all__ = [
@@ -164,7 +170,11 @@ def class_liveness(name: str) -> ClassVerdict:
     )
 
 
-def is_key_reachable(dotted_path: str) -> ReachabilityVerdict:
+def is_key_reachable(
+    dotted_path: str,
+    *,
+    external_reads: Mapping[str, str] | None = None,
+) -> ReachabilityVerdict:
     """Can any read of ``dotted_path`` execute?
 
     Args:
@@ -172,6 +182,16 @@ def is_key_reachable(dotted_path: str) -> ReachabilityVerdict:
             ``logging.tracking.enable_tensorboard``. Matched by its **leaf**
             name, like the rg index it replaces, because a consumer reaches the
             field through an attribute chain no single token spells.
+        external_reads: Paths an accessor declares it reads, mapped to prose
+            naming that accessor. Keyed by the **full dotted path**, unlike the
+            token index above -- an accessor receives a specific config block, so
+            ``losses.gan.lambda_adv`` being read says nothing about
+            ``training.multi.stages.stage_config.loss.gan.lambda_adv``, and
+            matching this map by leaf would call 54 such stage-scoped paths
+            consumed. Optional, and there is no default: this module sits at the
+            bottom of the dependency chain and may not import the ``models/``
+            package where the loss accessor lives (NN5), so the caller that owns
+            both ends injects it.
 
     Returns:
         A :class:`ReachabilityVerdict`. ``reachable=True`` means "not shown
@@ -180,6 +200,16 @@ def is_key_reachable(dotted_path: str) -> ReachabilityVerdict:
         ``evidence``: ``NO_LIVE_READ`` means every read sits in a scope shown
         unable to run, while ``NO_READ_FOUND`` means no token was found at all
         and a splatted or runtime-named consumer cannot be ruled out.
+
+        The four evidence kinds are decided in strict order: a live token read
+        wins (``LIVE_READ``), then a declared accessor read (``ACCESSOR_READ``),
+        then dead token reads (``NO_LIVE_READ``), then nothing (``NO_READ_FOUND``).
+        The order changes only which *evidence* is reported, never ``reachable``:
+        a path that is both live-read and declared is reachable either way, and
+        reporting the call graph is strictly more informative than reporting a
+        declaration. Checking the map before the dead-sites case is what makes a
+        key with real-but-dead token reads answer ``ACCESSOR_READ`` instead of
+        ``NO_LIVE_READ`` -- that key IS read, by the accessor.
     """
     index = _index()
     leaf = dotted_path.rsplit(".", 1)[-1]
@@ -194,19 +224,6 @@ def is_key_reachable(dotted_path: str) -> ReachabilityVerdict:
         )
     )
     sites = tuple(_describe(index, packed) for packed in reads)
-    if not reads:
-        return ReachabilityVerdict(
-            reachable=False,
-            sites=(),
-            reason=(
-                f"no read of `{leaf}` anywhere in src/spectramr/ outside "
-                "config/schemas/ -- nothing names it. NOT a call-graph finding: a "
-                "consumer that names no token (`**model_dump()` splatting, "
-                "`**kwargs` forwarding, a runtime-built field name) looks "
-                "identical from here. Read the would-be consumer before acting."
-            ),
-            evidence=ReadEvidence.NO_READ_FOUND,
-        )
 
     live = [packed for packed in reads if _unpack(packed)[0] in index.live_scopes]
     if live:
@@ -221,6 +238,24 @@ def is_key_reachable(dotted_path: str) -> ReachabilityVerdict:
                 + (f" -- reached because {_scope_reason(scope)}" if scope.kind != "module" else "")
             ),
             evidence=ReadEvidence.LIVE_READ,
+        )
+
+    accessor = (external_reads or {}).get(dotted_path)
+    if accessor is not None:
+        return accessor_verdict(dotted_path, leaf, sites, accessor)
+
+    if not reads:
+        return ReachabilityVerdict(
+            reachable=False,
+            sites=(),
+            reason=(
+                f"no read of `{leaf}` anywhere in src/spectramr/ outside "
+                "config/schemas/ -- nothing names it. NOT a call-graph finding: a "
+                "consumer that names no token (`**model_dump()` splatting, "
+                "`**kwargs` forwarding, a runtime-built field name) looks "
+                "identical from here. Read the would-be consumer before acting."
+            ),
+            evidence=ReadEvidence.NO_READ_FOUND,
         )
 
     return ReachabilityVerdict(

@@ -19,7 +19,7 @@ from spectramr.models.registry import register_model
 
 
 @register_model(name="configurable_vae", training_mode="vae")
-class ConfigurableVAE(IGenerator):
+class ConfigurableVAE(IGenerator, nn.Module):
     """Variational Autoencoder with fully configurable architecture.
 
     Example usage:

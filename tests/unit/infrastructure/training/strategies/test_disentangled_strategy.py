@@ -14,10 +14,10 @@ from spectramr.infrastructure.training.strategies.disentangled_strategy import (
 )
 
 # Shared patch targets for BaseTrainingStrategy.__init__ dependencies
-_LOSS_BUILDER_PATCH = (
-    "spectramr.infrastructure.training.builders.loss_builder.LossBuilder"
+_LOSS_BUILDER_PATCH = "spectramr.infrastructure.training.builders.loss_builder.LossBuilder"
+_BLOCH_PATCH = (
+    "spectramr.infrastructure.training.strategies.disentangled_strategy.MultiPhysicsBlochLayer"
 )
-_BLOCH_PATCH = "spectramr.infrastructure.training.strategies.disentangled_strategy.MultiPhysicsBlochLayer"
 
 
 def _mock_loss_builder():
@@ -32,9 +32,7 @@ def _mock_loss_builder():
 @pytest.fixture(autouse=True)
 def mock_resolve_service():
     """Mock resolve_service to bypass DI container requirements in unit tests."""
-    with patch(
-        "spectramr.infrastructure.di.di_container.resolve_service"
-    ) as mock_resolve:
+    with patch("spectramr.infrastructure.di.di_container.resolve_service") as mock_resolve:
         mock_resolve.return_value = MagicMock()
         yield mock_resolve
 
@@ -48,9 +46,7 @@ def mock_env():
     # Mock generator structure (DisentangledModel)
     gen = MagicMock()
     gen.enc_c = MagicMock(return_value=torch.randn(2, 8, 16, 16))  # content code
-    gen.enc_s = MagicMock(
-        return_value=(torch.randn(2, 4), torch.randn(2, 4))
-    )  # style (mu, logvar)
+    gen.enc_s = MagicMock(return_value=(torch.randn(2, 4), torch.randn(2, 4)))  # style (mu, logvar)
     gen.reparameterize = MagicMock(return_value=torch.randn(2, 4))  # style code
     gen.gen = MagicMock(return_value=torch.randn(2, 1, 64, 64))  # decoded image
     gen.predict_physics = MagicMock(return_value=torch.rand(2, 4))  # physics params
@@ -363,9 +359,7 @@ def test_validation_visual_target_is_ground_truth_4d(strategy, mock_env):
     # validation_metrics_computer is a read-only property delegating here.
     _metrics_computer = MagicMock()
     _metrics_computer.compute.return_value = {}
-    strategy._get_validation_metrics_computer = MagicMock(
-        return_value=_metrics_computer
-    )
+    strategy._get_validation_metrics_computer = MagicMock(return_value=_metrics_computer)
 
     input_batch = torch.full((1, 1, 64, 64), 0.2)  # SOURCE
     target_batch = torch.full((1, 1, 64, 64), 0.8)  # GROUND-TRUTH TARGET
@@ -416,9 +410,9 @@ class TestGetLastMetricsStaysOnDevice:
 
         out = DisentangledTrainingStrategy.get_last_metrics(strategy)
 
-        assert isinstance(
-            out["total_loss"], torch.Tensor
-        ), "converting here re-pays the per-step sync #707 removed"
+        assert isinstance(out["total_loss"], torch.Tensor), (
+            "converting here re-pays the per-step sync #707 removed"
+        )
 
     def test_non_tensor_entries_still_pass_through(self):
         """`loss_output.to_dict()` may carry non-numeric fields."""
@@ -470,9 +464,7 @@ class TestGetLastMetricsStaysOnDevice:
             # Parse rather than grep: every one of these docstrings QUOTES the
             # `{k: float(v)}` it replaced, so a substring scan matches the
             # explanation and reports the fix as the defect.
-            fn = ast.parse(
-                textwrap.dedent(inspect.getsource(owner.get_last_metrics))
-            ).body[0]
+            fn = ast.parse(textwrap.dedent(inspect.getsource(owner.get_last_metrics))).body[0]
             calls = {
                 n.func.id
                 for n in ast.walk(fn)
@@ -619,3 +611,100 @@ class TestLossWeightsMappingTargetsExist:
         mapping = self._mapping()
         assert mapping["lambda_content_consistency"] == "content"
         assert "lambda_content" not in mapping
+
+
+class TestPCGradClosureReturnsAConnectedLoss:
+    """The PCGrad branch of ``gen_closure`` (#1952).
+
+    This branch used to ``return loss_output.total.detach().requires_grad_(True)``
+    -- a **leaf**. It worked only because ``backward()`` on a leaf is a silent
+    no-op, which is exactly the mechanism that lets a severed loss train nothing.
+    PCGrad has already written every ``p.grad`` by hand at that point, so the
+    closure's job is to hand the executor a tensor that (a) carries a graph, so
+    the new pre-backward guard admits it, (b) still reports the real loss value,
+    because the executor logs what it is given, and (c) contributes exactly zero
+    gradient, so the hand-written projections survive ``backward()``.
+
+    Nothing covered this branch before, in this file or any other -- the only
+    ``pcgrad`` test in the tree exercises the projection helper itself
+    (``tests/unit/infrastructure/optimization/test_pcgrad.py``), not this seam.
+    """
+
+    @staticmethod
+    def _drive(strategy, mock_env, *, total_value: float = 0.5):
+        """Run ``train_step``'s generator closure with the PCGrad branch live.
+
+        Returns ``(loss, params, recon_total)``.
+        """
+        from spectramr.models.losses.computers.base import LossOutput
+
+        # A real parameter, so ``autograd.grad`` and ``p.grad`` are real.
+        param = torch.nn.Parameter(torch.randn(4, requires_grad=True))
+        mock_env.generator.parameters = MagicMock(return_value=[param])
+
+        # Both losses must be grad-connected THROUGH ``param``: PCGrad calls
+        # ``autograd.grad(loss, params)`` on each, and a total unrelated to
+        # ``params`` yields all-None grads, which silently skips the projection
+        # loop and would make this test vacuous.
+        recon_total = (param * 2.0).sum() * 0.0 + total_value
+        adv_total = (param * 3.0).sum() * 0.0 + 0.25
+
+        strategy._enable_pcgrad = True
+        mock_env.config.losses.reconstruction.use_curriculum_scheduling = False
+        mock_env.config.losses.latent.use_capacity_scheduling = False
+        # The shared ``mock_env`` leaves ``config.metrics`` a bare MagicMock, so
+        # the training-metrics mixin compares a MagicMock with ``>`` and raises
+        # (``metrics_mixin.py:988``). That is pre-existing fixture rot -- it is
+        # why ``test_train_step_execution`` is red on ``dev`` today -- and it is
+        # not this seam's subject, so switch the block off rather than repair it
+        # here (NN17: the metrics cadence has its own owner).
+        mock_env.config.metrics.enable_tracking = False
+
+        adv_computer = MagicMock()
+        adv_computer.compute_generator_loss.return_value = LossOutput(
+            total=adv_total, components={"adv": adv_total.detach()}, metrics={}
+        )
+        strategy.adv_loss_computer = adv_computer
+
+        with patch.object(strategy.loss_computer, "compute") as mock_compute:
+            mock_compute.return_value = LossOutput(
+                total=recon_total, components={"recon": recon_total.detach()}, metrics={}
+            )
+            batch = {
+                "input": torch.randn(2, 1, 64, 64),
+                "target": torch.randn(2, 1, 64, 64),
+            }
+            steps = strategy.train_step(batch, epoch=0)
+            loss = steps[0]["closure"]()
+
+        return loss, [param], recon_total
+
+    def test_the_branch_is_actually_reached(self, strategy, mock_env):
+        """Guard against a vacuous pass: if the setup stops short of the PCGrad
+        branch the closure returns ``total_gen_loss`` instead, and every
+        assertion below would hold for the wrong reason."""
+        _, params, _ = self._drive(strategy, mock_env)
+        # PCGrad writes p.grad by hand BEFORE backward(); the non-PCGrad return
+        # path never touches it.
+        assert params[0].grad is not None, "PCGrad branch was not entered"
+
+    def test_the_returned_loss_carries_a_graph(self, strategy, mock_env):
+        loss, _, _ = self._drive(strategy, mock_env)
+        assert loss.grad_fn is not None, (
+            "closure returned a leaf; the pre-backward guard would refuse it"
+        )
+
+    def test_the_reported_value_is_the_real_loss(self, strategy, mock_env):
+        loss, _, recon_total = self._drive(strategy, mock_env)
+        # The zero-weighted parameter term supplies the graph without moving the
+        # value the executor logs.
+        assert loss.item() == pytest.approx(recon_total.item())
+
+    def test_backward_leaves_the_projected_gradients_untouched(self, strategy, mock_env):
+        loss, params, _ = self._drive(strategy, mock_env)
+        before = [p.grad.clone() for p in params]
+        loss.backward()
+        for p, b in zip(params, before, strict=True):
+            assert torch.equal(p.grad, b), (
+                "backward() perturbed the gradients PCGrad had already written"
+            )

@@ -11,7 +11,7 @@ Benefits over legacy version:
 """
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -20,6 +20,13 @@ from torch import nn
 from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
 from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
     _call_safe_loss,
+)
+from spectramr.models.losses.critic_domain import (
+    critic_accepts_complex,
+    critic_input_domain,
+    generator_output_domain,
+    resolve_conversion,
+    to_critic_input,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,11 +101,68 @@ def _sum_tensors(values: "Iterable[torch.Tensor]") -> torch.Tensor | None:
     return total
 
 
+def _fold_adversarial(
+    g_adv: "dict[str, torch.Tensor] | torch.Tensor",
+    lambda_adv: float,
+    components: dict[str, Any],
+) -> tuple[torch.Tensor | None, set[str]]:
+    """Fold a GENERATOR adversarial result into ``components``, pre-weighted.
+
+    Two return shapes arrive here and both must leave ``components`` holding
+    values that are already scaled, so that neither is re-weighted downstream:
+
+    * ``CompositeGANLoss`` / ``CompositeLoss`` return a **dict** whose entries
+      ``gan_loss_library`` has already multiplied by their lambdas, carrying
+      their own authoritative sum -- absorbed by :func:`_absorb_preweighted`.
+    * ``StandardGANLoss``, ``LSGANLoss``, ``RALSGANLoss``, ``WGANLoss`` and
+      ``HingeLoss`` -- five of the seven concrete strategies -- return a bare
+      **tensor** that still owes ``lambda_adv``. It is applied here, once.
+
+    One helper rather than two copies (non-negotiable 17): ``compute`` and
+    ``compute_generator_loss`` both fold a generator adversarial result and had
+    drifted into different answers -- the copy in ``compute`` stored the tensor
+    branch **unweighted** under ``adv_generator``, a name with no
+    ``lambda_adv_generator`` schema field, so ``_stack_components`` refused to
+    invent a weight and raised before any caller could observe the key.
+
+    Returns:
+        ``(total, keys)`` -- the caller excludes ``keys`` from whatever it
+        stacks and adds ``total`` exactly once. ``total`` is ``None`` only when
+        an empty dict was folded.
+    """
+    if isinstance(g_adv, dict):
+        return _absorb_preweighted(g_adv, components)
+    components["adversarial"] = g_adv * lambda_adv
+    return components["adversarial"], {"adversarial"}
+
+
 class UnifiedGANLossComputer(BaseLossComputer):
     """Unified GAN loss computer implementing SSOT pattern.
 
     Computes generator and discriminator losses in standardized format.
     """
+
+    # The critic-domain seam (#1920/#1921). Resolved ONCE by
+    # ``_resolve_critic_seam``, which ``_initialize_losses`` calls first thing
+    # and ``BaseLossComputer.__init__`` calls unconditionally -- never per step
+    # (non-negotiable 9). ``_resolve_critic_seam`` is the ONLY writer.
+    #
+    # These live on the CLASS, not in ``__init__``, because this computer is an
+    # ``nn.Module``: its ``__getattr__`` raises for a missing attribute, so a
+    # bare ``object.__new__`` shell -- the construction four existing unit tests
+    # use to exercise one method in isolation -- would ``AttributeError`` inside
+    # ``_to_critic`` instead of running the arithmetic under test. The class
+    # default is the identity behaviour (no conversion), which is safe because
+    # every real construction path resolves the seam; that guarantee is asserted
+    # by ``test_the_production_path_resolves_the_seam`` rather than inferred
+    # here (non-negotiable 18).
+    _critic_from_domain: str | None = None
+    _critic_to_domain: Any = None
+    _critic_takes_complex: bool = False
+    _critic_conversion: str | None = None
+    #: False on a shell that never ran ``__init__``; the test above is what
+    #: makes that distinguishable from "resolved, nothing to convert".
+    _critic_seam_resolved: bool = False
 
     def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
         """Initialize GAN loss computer.
@@ -121,6 +185,8 @@ class UnifiedGANLossComputer(BaseLossComputer):
         sensible defaults if config is missing or builder fails.
         """
         from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
+
+        self._resolve_critic_seam()
 
         if self.config is not None:
             # Build errors with a real config MUST propagate (pitfall #9). The
@@ -151,6 +217,71 @@ class UnifiedGANLossComputer(BaseLossComputer):
         self.adversarial_loss_fn = None
         self.r1_regularizer = None
 
+    def _resolve_critic_seam(self) -> None:
+        """Resolve the generator/critic domain pair ONCE, at build time.
+
+        #1920 declared where each critic scores; #1921 makes this computer honour
+        it. Three registry/config reads per training step would be a hot-loop
+        cost for a value that cannot change after the config is frozen
+        (non-negotiable 1), so they are done here (non-negotiable 9).
+
+        ``resolve_conversion`` RAISES when the two sides are declared, differ,
+        and have no Fourier relationship (an ``image`` generator against a
+        ``latent`` critic). Resolving at build time means that arm fails while
+        the computer is being constructed rather than on training step 1.
+        """
+        self._critic_from_domain = None
+        self._critic_to_domain = None
+        self._critic_takes_complex = False
+        self._critic_conversion = None
+        # Set here, not at the end: reaching this method IS the resolution, and
+        # the config-less early return below is a resolved state too.
+        self._critic_seam_resolved = True
+        if self.config is None:
+            return
+        self._critic_from_domain = generator_output_domain(self.config)
+        self._critic_to_domain = critic_input_domain(self.config)
+        self._critic_conversion = resolve_conversion(
+            self._critic_from_domain, self._critic_to_domain
+        )
+        if self._critic_conversion is not None:
+            self._critic_takes_complex = critic_accepts_complex(self.config)
+
+    def _to_critic(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` rendered in the domain the critic declared it scores in.
+
+        **Returns the SAME OBJECT when no conversion is owed.** That identity is
+        the guarantee that this seam is a byte-for-byte no-op on every arm in the
+        corpus: all 23 critic-bearing ``inprogress`` arms are same-side after
+        #1920 (22 image/image, one kspace/kspace), so ``_critic_conversion`` is
+        ``None`` for every one of them and this method is ``return x``.
+
+        The short-circuit is deliberate rather than delegating unconditionally to
+        ``to_critic_input``: that helper also interleaves a complex tensor into
+        2C when the critic does not accept complex, which is correct where a
+        conversion happens but would be a NUMBER CHANGE on a same-side arm that
+        feeds a complex tensor today. ``diffusion.py`` takes the same
+        short-circuit for the same reason -- ``_critic_for_domain`` returns the
+        bare critic, unwrapped, when ``resolve_conversion`` is ``None``.
+
+        Call this at every site that feeds the CRITIC, and at no site that feeds
+        a reconstruction loss. The two are not distinguishable by parameter name:
+        ``CompositeGANLoss.compute_generator_loss`` and
+        ``compute_discriminator_loss`` both take ``real_images``/``fake_images``,
+        but the first spends them on L1/perceptual/SSIM/LPIPS in IMAGE space
+        while the second spends them only on the gradient penalty's own critic
+        call. Converting both would silently move the reconstruction loss into
+        k-space -- invisible on all 23 same-side arms, wrong on a mismatched one.
+        """
+        if self._critic_conversion is None:
+            return x
+        return to_critic_input(
+            x,
+            from_domain=self._critic_from_domain,
+            to_domain=self._critic_to_domain,
+            takes_complex=self._critic_takes_complex,
+        )
+
     def compute(
         self,
         pred: torch.Tensor,
@@ -167,7 +298,12 @@ class UnifiedGANLossComputer(BaseLossComputer):
             target: Real images (B, C, H, W)
             epoch: Current epoch
             iteration: Current iteration
-            **kwargs: discriminator, discriminator_outputs, etc.
+            **kwargs: discriminator, discriminator_outputs, ``critic_cond``, etc.
+                ``critic_cond`` is read out of ``**kwargs`` rather than named,
+                to match how ``discriminator`` itself arrives here -- the two
+                travel together and a caller that has one has the other.
+                ``compute_generator_loss`` names it explicitly instead, because
+                that signature names ``discriminator`` explicitly.
 
         Returns:
             LossOutput with total loss and components
@@ -178,40 +314,85 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # ``components`` (so they still reach logs and metrics) but excluded from
         # the total, which is the generator's.
         discriminator_only: dict[str, Any] = {}
+        # Set by ``_fold_adversarial`` below: the authoritative total of the
+        # already-weighted adversarial terms, and the keys that carry them.
+        library_total: torch.Tensor | None = None
+        preweighted: set[str] = set()
 
         # 1. RECONSTRUCTION LOSS
         lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
         if lambda_rec > 0 and self.reconstruction_loss_fn:
+            # Image/generator-space: the reconstruction loss compares the
+            # generator's own output against the target in the domain the
+            # generator emits. Never routed through ``_to_critic``.
             rec_loss = self.reconstruction_loss_fn(pred, target)
             components["reconstruction"] = rec_loss
 
         # 2. ADVERSARIAL LOSS
         discriminator = kwargs.get("discriminator")
+        # Conditioning for every ``discriminator(...)`` call below (#1931).
+        # ``compute_discriminator_loss`` on this same class already accepts and
+        # forwards this; the G-side methods did not, so one class gave two
+        # answers to "does the critic take conditioning" (non-negotiable 17).
+        # ``{}`` reproduces the unconditioned call byte-for-byte, which is what
+        # every caller in the tree passes today.
+        # ``get``, not ``pop``: the key is left in ``**kwargs``, which is
+        # forwarded wholesale to ``_call_safe_loss`` below. That is safe and
+        # deliberate -- ``_call_safe_loss`` filters kwargs against the callee's
+        # signature, so a loss that does not declare ``critic_cond`` never sees
+        # it, and one that declares ``**kwargs`` received it before this change
+        # too. Popping would make the two paths disagree about the payload.
+        cond = dict(kwargs.get("critic_cond") or {})
         lambda_adv = self._get_loss_weight("adversarial", epoch, iteration)
 
         if lambda_adv > 0 and discriminator and self.adversarial_loss_fn:
             # Get or compute discriminator outputs
             if "discriminator_outputs" in kwargs:
+                if self._critic_conversion is not None:
+                    raise ValueError(
+                        "discriminator_outputs= was supplied for an arm whose critic "
+                        f"scores in {self._critic_to_domain!r} while the generator emits "
+                        f"{self._critic_from_domain!r}. This computer cannot verify which "
+                        "space those logits were scored in, and silently trusting them is "
+                        "how a critic ends up trained on one domain and scored on another "
+                        "(#1921). Pass discriminator= and let this computer score, or "
+                        "convert before scoring."
+                    )
                 disc_out = kwargs["discriminator_outputs"]
                 fake_pred = disc_out.get("fake_pred")
                 real_pred = disc_out.get("real_pred")
             else:
                 # Compute on the fly
                 with torch.no_grad():
-                    fake_pred = discriminator(pred.detach())
-                    real_pred = discriminator(target)
+                    # Both halves are required and orthogonal. ``_to_critic``
+                    # puts the tensor in the domain the critic DECLARED (#1920);
+                    # ``**cond`` forwards the t/contrast conditioning the D step
+                    # already passes (#1931). Dropping either is silent: a wrong
+                    # domain still scores a plausible number, and an unforwarded
+                    # condition still returns logits.
+                    fake_pred = discriminator(self._to_critic(pred.detach()), **cond)
+                    real_pred = discriminator(self._to_critic(target), **cond)
 
             # Generator loss (fool discriminator)
             if hasattr(self.adversarial_loss_fn, "compute_generator_loss"):
                 g_adv = self.adversarial_loss_fn.compute_generator_loss(
                     fake_outputs_d=fake_pred,
+                    # NOT converted, deliberately. The parameter names are the
+                    # same as ``compute_discriminator_loss``'s and the domain
+                    # requirement is the OPPOSITE: this method never calls the
+                    # critic (``fake_outputs_d`` arrives pre-scored above), and
+                    # spends these two on l1 / perceptual / feat-match / ssim /
+                    # ms-ssim / lpips. Converting here would compute L1 in
+                    # k-space -- invisible on every same-side arm, wrong on a
+                    # cross-domain one (#1921).
                     real_images=target if "target" in locals() else target,
                     fake_images=pred if "pred" in locals() else pred,
                 )
-                if isinstance(g_adv, dict):
-                    components.update(g_adv)
-                else:
-                    components["adv_generator"] = g_adv
+                # Pre-weighted, and excluded from the stack below. Folding the
+                # dict raw re-weighted terms ``gan_loss_library`` had already
+                # scaled (and raised on ``g_adv_loss``, which has no schema
+                # field); the tensor branch dropped ``lambda_adv`` entirely.
+                library_total, preweighted = _fold_adversarial(g_adv, lambda_adv, components)
 
             # Discriminator loss.
             #
@@ -236,8 +417,13 @@ class UnifiedGANLossComputer(BaseLossComputer):
                     real_outputs_d=real_pred,
                     fake_outputs_d=fake_pred,
                     discriminator=discriminator,
-                    real_images=target,
-                    fake_images=pred,
+                    # CRITIC-space: ``CompositeGANLoss.compute_discriminator_loss``
+                    # spends these ONLY on ``gradient_penalty_loss``, which calls
+                    # the critic on the interpolates. Contrast the sibling
+                    # ``compute_generator_loss`` call above, whose identically
+                    # named arguments feed L1/perceptual/SSIM and stay raw.
+                    real_images=self._to_critic(target),
+                    fake_images=self._to_critic(pred),
                 )
 
                 if isinstance(d_loss_result, dict):
@@ -261,7 +447,16 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # 4. R1 REGULARIZATION
         if discriminator and self.r1_regularizer:
             if self._should_apply_r1(epoch, iteration):
-                r1_loss = self.r1_regularizer(discriminator, target)
+                # R1 is a FEED SITE, not just a penalty: ``R1RegularizationLoss``
+                # calls ``discriminator(real_images)`` itself to get the logits it
+                # differentiates -- so it owes the critic BOTH its declared domain
+                # and the conditioning. An unconditioned call here regularizes a
+                # gradient the critic never takes; ``forward`` names ``critic_cond``
+                # explicitly because its ``**kwargs`` would have swallowed the
+                # payload silently.
+                r1_loss = self.r1_regularizer(
+                    discriminator, self._to_critic(target), critic_cond=cond
+                )
                 components["r1_penalty"] = r1_loss
 
         # 5. DYNAMIC COMPONENT LOSSES (from losses_dict)
@@ -324,8 +519,28 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # 6. COMPUTE TOTAL LOSS — GENERATOR terms only.
         # ``components`` still carries the d_* entries for reporting; the total
         # must not, because it is what ``backward()`` runs on for G.
-        generator_components = {k: v for k, v in components.items() if k not in discriminator_only}
-        total = self._stack_components(generator_components, epoch=epoch)
+        # ``preweighted`` is excluded for the opposite reason to
+        # ``discriminator_only``: those terms DO belong to the generator's total,
+        # they are simply already scaled, so they are added once via
+        # ``library_total`` instead of being re-weighted by the stack.
+        generator_components = {
+            k: v
+            for k, v in components.items()
+            if k not in discriminator_only and k not in preweighted
+        }
+        # ``iteration=`` is forwarded, not dropped: every ``_get_loss_weight``
+        # above already spends it, and withholding it here froze the warm-up
+        # gate at 0 for the stacked terms alone -- the same value resolving two
+        # ways inside one method (#1950).
+        total = (
+            self._stack_components(generator_components, epoch=epoch, iteration=iteration)
+            if generator_components
+            else None
+        )
+        if library_total is not None:
+            total = library_total if total is None else total + library_total
+        if total is None:
+            total = torch.zeros((), device=device)
 
         return LossOutput(
             total=total,
@@ -341,6 +556,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
         epoch: int = 0,
         iteration: int = 0,
         losses_dict: dict[str, Any] | None = None,
+        critic_cond: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> LossOutput:
         """Compute generator-only loss (for separate G training).
@@ -350,6 +566,14 @@ class UnifiedGANLossComputer(BaseLossComputer):
             target: Real images
             discriminator: Discriminator model
             epoch: Current epoch
+            critic_cond: Conditioning forwarded to the ``discriminator(pred)``
+                call below (#1931). An EXPLICIT parameter, mirroring
+                ``compute_discriminator_loss`` on this same class: this
+                signature already absorbs stray keywords into ``**kwargs``, so a
+                caller that passed conditioning would have had it accepted and
+                dropped, and the generator would have been trained against a
+                critic scoring the wrong conditional distribution.
+                ``None``/``{}`` reproduces the unconditioned call byte-for-byte.
             **kwargs: Additional arguments
 
         Returns:
@@ -364,16 +588,28 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # Reconstruction loss (always for generator)
         lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
         if lambda_rec > 0 and self.reconstruction_loss_fn:
+            # Image/generator-space: the reconstruction loss compares the
+            # generator's own output against the target in the domain the
+            # generator emits. Never routed through ``_to_critic``.
             rec_loss = self.reconstruction_loss_fn(pred, target)
             components["reconstruction"] = rec_loss
 
         # Adversarial loss (if discriminator provided)
         lambda_adv = self._get_loss_weight("adversarial", epoch, iteration)
         if lambda_adv > 0 and discriminator and self.adversarial_loss_fn:
-            fake_pred = discriminator(pred)
+            # Domain (#1920) and conditioning (#1931), same as the D step above.
+            fake_pred = discriminator(self._to_critic(pred), **dict(critic_cond or {}))
             if hasattr(self.adversarial_loss_fn, "compute_generator_loss"):
                 g_adv = self.adversarial_loss_fn.compute_generator_loss(
                     fake_outputs_d=fake_pred,
+                    # NOT converted, deliberately. The parameter names are the
+                    # same as ``compute_discriminator_loss``'s and the domain
+                    # requirement is the OPPOSITE: this method never calls the
+                    # critic (``fake_outputs_d`` arrives pre-scored above), and
+                    # spends these two on l1 / perceptual / feat-match / ssim /
+                    # ms-ssim / lpips. Converting here would compute L1 in
+                    # k-space -- invisible on every same-side arm, wrong on a
+                    # cross-domain one (#1921).
                     real_images=target if "target" in locals() else target,
                     fake_images=pred if "pred" in locals() else pred,
                 )
@@ -382,12 +618,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
                 # scaled by their lambdas, plus ``g_total_loss`` = their sum.
                 # Re-weighting them raised on ``g_adv_loss`` (no schema field)
                 # and would otherwise have double-counted every G term.
-                if isinstance(g_adv, dict):
-                    library_total, preweighted = _absorb_preweighted(g_adv, components)
-                else:
-                    components["adversarial"] = g_adv * lambda_adv
-                    preweighted = {"adversarial"}
-                    library_total = components["adversarial"]
+                library_total, preweighted = _fold_adversarial(g_adv, lambda_adv, components)
 
         # Perceptual loss
         lambda_percep = self._get_loss_weight("perceptual", epoch, iteration)
@@ -459,6 +690,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
         epoch: int = 0,
         iteration: int = 0,
         losses_dict: dict[str, Any] | None = None,
+        critic_cond: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> LossOutput:
         """Compute discriminator-only loss (for separate D training).
@@ -469,6 +701,20 @@ class UnifiedGANLossComputer(BaseLossComputer):
             discriminator: Discriminator model
             epoch: Current epoch
             iteration: Current iteration
+            critic_cond: Conditioning forwarded to EVERY call of
+                ``discriminator`` in this method -- real, fake and R1 alike
+                (#1931). ``None``/``{}`` reproduces the unconditioned call
+                byte-for-byte, which is what all but one arm in the corpus
+                take. The caller decides whether to build a payload by asking
+                the registry whether the configured critic declares
+                ``supports_contrast_conditioning``; this method never
+                introspects the critic, so a critic that declares the flag and
+                cannot accept the kwargs raises on step 1 instead of training a
+                whole run unconditioned.
+
+                Real and fake share one payload deliberately: the critic's job
+                is to separate them *within* a condition, and giving the two
+                sides different labels would let it win by reading the label.
             **kwargs: Additional arguments
 
         Returns:
@@ -482,17 +728,29 @@ class UnifiedGANLossComputer(BaseLossComputer):
         preweighted: set[str] = set()
 
         # Adversarial loss (main discriminator loss)
+        cond = dict(critic_cond or {})
         if self.adversarial_loss_fn:
-            real_pred = discriminator(real)
-            fake_pred = discriminator(fake.detach())  # Detach to not affect generator
+            real_pred = discriminator(self._to_critic(real), **cond)
+            fake_pred = discriminator(
+                self._to_critic(fake.detach()), **cond
+            )  # Detach: no G gradient
 
             if hasattr(self.adversarial_loss_fn, "compute_discriminator_loss"):
+                # ``critic_cond`` travels with ``discriminator`` wherever the
+                # discriminator does. This delegation is the third and fourth
+                # critic calls of the step -- ``CompositeGANLoss`` scores
+                # nothing itself, but its gradient penalty calls the critic on
+                # the interpolates, and that call was unconditioned until
+                # #1931 half 2. Real, fake, interpolate: one payload, because
+                # they are three points of one conditional distribution.
                 d_loss_result = self.adversarial_loss_fn.compute_discriminator_loss(
                     real_outputs_d=real_pred,
                     fake_outputs_d=fake_pred,
                     discriminator=discriminator,
-                    real_images=real,
-                    fake_images=fake,
+                    # CRITIC-space, for the gradient penalty's own critic call.
+                    real_images=self._to_critic(real),
+                    fake_images=self._to_critic(fake),
+                    critic_cond=cond,
                 )
 
                 # These sub-terms arrive PRE-WEIGHTED and pre-summed:
@@ -531,8 +789,15 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # EXACTLY ONCE. The pre-fix code multiplied by lambda_r1 here AND let
         # _stack_components weight the "r1" key by lambda_r1 again, giving a
         # lambda_r1^3 (~1000x at the default 10) over-penalty.
+        #
+        # R1 differentiates D(real) w.r.t. real, so it must score under the SAME
+        # conditioning as the adversarial term above -- an unconditioned
+        # gradient penalty regularizes a function the critic never computes
+        # (#1931). ``critic_cond`` is forwarded rather than swallowed by the
+        # regularizer's ``**kwargs``, which is why it is an explicit parameter
+        # there.
         if self.r1_regularizer and self._should_apply_r1(epoch, iteration):
-            r1 = self.r1_regularizer(discriminator, real)
+            r1 = self.r1_regularizer(discriminator, self._to_critic(real), critic_cond=cond)
             components["r1_penalty"] = r1
 
         # Total discriminator loss.

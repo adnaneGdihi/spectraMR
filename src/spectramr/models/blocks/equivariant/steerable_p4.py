@@ -29,7 +29,7 @@ Reference: T. S. Cohen and M. Welling, "Group equivariant convolutional networks
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 from torch import nn
 
 _GROUP_ORDER = 4  # C_4: 90-degree rotations

@@ -160,12 +160,7 @@ def test_total_loss_is_the_documented_weighted_sum(flow_strategy):
 
     losses = flow_strategy._compute_losses_impl(img_64, img_3t, epoch=0)
 
-    expected = (
-        losses["l1_self"]
-        + 10.0 * losses["l_trans"]
-        + 5.0 * losses["l_anat"]
-        + losses["kl"]
-    )
+    expected = losses["l1_self"] + 10.0 * losses["l_trans"] + 5.0 * losses["l_anat"] + losses["kl"]
     assert torch.allclose(losses["g_total_loss"], expected)
 
 
@@ -222,9 +217,7 @@ def test_validation_step_returns_val_prefixed_floats(val_strategy):
     img_64 = torch.randn(2, 1, 16, 16)
     img_3t = torch.randn(2, 1, 16, 16)
 
-    metrics = val_strategy.validation_step(
-        {"input": img_64, "target": img_3t}, img_64, img_3t
-    )
+    metrics = val_strategy.validation_step({"input": img_64, "target": img_3t}, img_64, img_3t)
 
     assert metrics["val_psnr"] == pytest.approx(31.5)
     assert all(isinstance(v, float) for v in metrics.values())
@@ -253,3 +246,91 @@ def test_validation_step_puts_the_generator_in_eval_mode(val_strategy):
     val_strategy.validation_step({"input": img, "target": img}, img, img)
 
     assert not val_strategy.env.generator.training
+
+
+# --------------------------------------------------------------------------- #
+# The train-metric iteration seam (#1937)
+#
+# ``_compute_losses_impl`` held TWO answers to one question, 75 lines apart: line 258
+# resolved a live ``iteration = int(kwargs.get("iteration", 0) or 0)`` and fed it to all
+# three ``loss_computer.compute`` calls, while the metric throttle at line 333 read
+# ``kwargs.get("step", 0)``. The training loop passes ``iteration=`` and never
+# ``step=``, so the second was a constant 0 and ``0 % interval == 0`` for every
+# interval -- the host-syncing metrics were recomputed on every step while the loss
+# schedule advanced correctly. One invariant, two owners (non-negotiable 17).
+#
+# The metric read is now ``resolve_loop_iteration(self)``, the elected owner. These
+# tests pin BOTH halves, so a future edit cannot fix one and re-freeze the other.
+# --------------------------------------------------------------------------- #
+
+from types import SimpleNamespace  # noqa: E402
+
+import torch.nn as nn  # noqa: E402
+
+from spectramr.infrastructure.training.loop_state import LoopState  # noqa: E402
+
+_LIVE_ITERATION = 1337
+
+
+class _TupleVAE(nn.Module):
+    """The generator contract this strategy checks for: 3-tuple + content codec."""
+
+    def forward(self, img, phys):
+        return img, torch.zeros(img.shape[0], 4), torch.zeros(img.shape[0], 4)
+
+    def encode_content(self, img):
+        return img
+
+    def decode(self, z, phys):
+        return z
+
+
+def _dvae_with_spy(iteration: int):
+    s = DisentangledVAETrainingStrategy.__new__(DisentangledVAETrainingStrategy)
+    s.env = SimpleNamespace(generator=_TupleVAE(), losses={})
+    s.config = SimpleNamespace(training=SimpleNamespace(kl_anneal_end=10))
+    s._loss_dict_reuse = {}
+    s.loop_state = LoopState(iteration=iteration, epoch=1)
+    s._anatomy_criterion = lambda a, b: torch.zeros(())
+    s._get_loss_weight = lambda name, epoch: 1.0
+    compute_iters: list[int] = []
+
+    def _compute(**kw):
+        compute_iters.append(kw["iteration"])
+        return SimpleNamespace(total=torch.zeros((), requires_grad=True), components={})
+
+    s.loss_computer = SimpleNamespace(compute=_compute)
+    metric_steps: list[int] = []
+
+    def _spy(pred, target, config, current_step):
+        metric_steps.append(current_step)
+        return {}
+
+    s._compute_training_metrics = _spy
+    return s, metric_steps, compute_iters
+
+
+@pytest.mark.unit
+def test_train_metrics_receive_the_live_iteration_not_a_frozen_zero() -> None:
+    dvae, metric_steps, _ = _dvae_with_spy(_LIVE_ITERATION)
+    x = torch.rand(2, 1, 8, 8)
+    dvae._compute_losses_impl(input_batch=x, target_batch=x, epoch=1)
+    assert metric_steps == [_LIVE_ITERATION], (
+        "the metric throttle must be fed the live loop iteration; frozen at 0 it "
+        "recomputed SSIM/PSNR on every step (pitfall #16, #1937)"
+    )
+
+
+@pytest.mark.unit
+def test_the_loss_schedule_and_the_metric_throttle_now_agree() -> None:
+    """The NN17 half: both readers of "which iteration is it" must return the same value.
+
+    The loop supplies ``iteration=``; the metric read resolves it from ``loop_state``.
+    Divergence here is what the defect looked like.
+    """
+    dvae, metric_steps, compute_iters = _dvae_with_spy(_LIVE_ITERATION)
+    x = torch.rand(2, 1, 8, 8)
+    dvae._compute_losses_impl(input_batch=x, target_batch=x, epoch=1, iteration=_LIVE_ITERATION)
+    assert compute_iters == [_LIVE_ITERATION] * 3, compute_iters
+    assert metric_steps == [_LIVE_ITERATION]
+    assert set(compute_iters) == set(metric_steps), "two owners disagreed about the iteration"

@@ -1,3 +1,14 @@
+"""Structural (``Protocol``) contracts for model shapes.
+
+These are typing contracts only -- nothing inherits from them and no isinstance
+check runs against them, so none is ``@runtime_checkable``.
+
+``IGenerator``, ``IDiscriminator``, ``IModel`` and the other nominal interfaces
+are ABCs owned by :mod:`spectramr.models.interfaces.models`, and this package's
+``__init__`` re-exports them from there. A same-named ``Protocol`` defined here
+is unreachable through ``from spectramr.domain.interfaces import ...``.
+"""
+
 from typing import Protocol
 
 from torch import Tensor
@@ -66,52 +77,6 @@ class ReconstructionModel(Protocol):
             mask: Sampling mask [B, 1, H, W] or [B, C, H, W]
         Returns:
             x: Reconstructed image [B, C, H, W]
-        """
-        ...
-
-
-class IGenerator(Protocol):
-    """
-    Protocol for Generator models (image-to-image, latent-to-image).
-
-    All generators must implement this interface for consistent I/O contracts.
-    """
-
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
-        """
-        Generate output from input.
-
-        Args:
-            x: Input tensor [B, C, H, W] (image or k-space)
-            **kwargs: Additional conditioning inputs
-
-        Returns:
-            Generated tensor [B, C_out, H, W]
-        """
-        ...
-
-    def get_parameter_count(self) -> int:
-        """Return total trainable parameters."""
-        ...
-
-
-class IDiscriminator(Protocol):
-    """
-    Protocol for Discriminator models (PatchGAN, global discriminator).
-
-    All discriminators must implement this interface.
-    """
-
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
-        """
-        Discriminate input tensor.
-
-        Args:
-            x: Input tensor [B, C, H, W]
-            **kwargs: Conditional inputs (e.g., class labels)
-
-        Returns:
-            Discrimination scores [B, 1] or [B, 1, H', W'] for PatchGAN
         """
         ...
 

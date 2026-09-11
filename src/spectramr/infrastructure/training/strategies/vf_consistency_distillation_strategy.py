@@ -91,6 +91,11 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
             left unset.
     """
 
+    #: Loss ownership (issue #1918). mse_loss(student_pred, teacher_pred) is a DISTILLATION term against the
+    #: teacher, not the target; the hook folds nothing from the builder.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
+
     #: Defaults applied when the heavyweight base init has run (training path).
     _DEFAULTS: ClassVar[dict[str, Any]] = {
         "beta0": 0.5,

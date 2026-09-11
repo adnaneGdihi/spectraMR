@@ -650,6 +650,24 @@ ignore = ["E501"]  # line length handled by formatter
 # Narrow on purpose: only the ambiguous-character rule, only these scripts.
 "docs/analysis/**" = ["RUF001"]
 
+# pep8-naming reads a symbol as a style violation; in MRI these ARE the symbols --
+# `B, C, D, H, W` the tensor axes every forward pass names, `B0/B1/M0/T1/T2/TR/TE/PD`
+# the sequence parameters -- so they were never debt the ratchet could retire, only
+# noise it had to carry. Measured, not chosen by taste: the list clears 3,574 of
+# `src/`'s 4,783 N8xx findings (1,452 of 1,802 under `tests/`, 360 of 523 under
+# `scripts/`) while `C_source` and 481 other suffixed names keep firing, which is
+# what makes it narrow rather than a blanket N806 disable. Two consequences worth
+# naming here rather than leaving to be found: `ignore-names` is pep8-naming-FAMILY-
+# wide, so N803, N812 and four single-letter function names go quiet alongside N806;
+# and 50 `# noqa` directives become redundant and start reporting RUF100, 38 of them
+# the same line, `import torch.nn.functional as F`. `extend-` keeps ruff's defaults.
+[tool.ruff.lint.pep8-naming]
+extend-ignore-names = [
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+  "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  "B0", "B1", "M0", "T1", "T2", "TR", "TE", "PD",
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

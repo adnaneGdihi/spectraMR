@@ -15,6 +15,7 @@ import torch
 from PIL import Image
 
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.generators.siren_pinn import SirenSensNet, get_last_shared_layer
 from spectramr.models.losses.registry import create_loss
@@ -489,7 +490,10 @@ class ConcretePINNSensitivityStrategy(BaseTrainingStrategy):
         super().on_epoch_end(epoch, metrics)
 
         if epoch % self._csm_save_interval == 0 or epoch == 0:
-            step = getattr(self.env, "step", 0)
+            # Live iteration (loop_state seam): the frozen ``self.env.step``
+            # labelled every saved sensitivity map "step 0", so successive
+            # epochs wrote indistinguishable filenames (pitfall #16).
+            step = resolve_loop_iteration(self)
             self._save_sensitivity_maps(epoch=epoch, step=step)
 
     # ------------------------------------------------------------------

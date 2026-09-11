@@ -47,6 +47,12 @@ def mock_env():
     # schema defaults; bare MagicMock fails StandardOptimizerStepper's raise-on-unknown
     env.config.optimization.gradient.clip.method = "norm"
     env.config.optimization.gradient.clip.value = 1.0
+    # metrics_mixin.py:988 compares these against ints; a bare MagicMock raises
+    # TypeError before _compute_losses_impl ever reaches the Bloch branch, which
+    # is what made test_compute_losses_impl_structure red without ever exercising
+    # the loss it names.
+    env.config.metrics.train_metric_interval = 0
+    env.config.training.max_iterations = 0
     env.config.model.model_type = "physics_driven"
     env.config.model.target_domain = "image"
     env.model_type = "physics_driven"
@@ -150,3 +156,104 @@ def test_generate_predictions_no_b0_map_when_simulator_absent(strategy, mock_env
     strategy._generate_predictions(torch.randn(2, 1, 64, 64), {}, {"use_dc": False})
     _, kwargs = mock_env.generator.call_args
     assert "b0_map" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# The Bloch-residual weight is resolved through the loss-weight SSOT, not by
+# reading ``config.losses.physics.lambda_bloch_residual`` directly (#1918).
+#
+# The direct read was wrong in BOTH directions, so these use REAL schema objects
+# rather than a MagicMock: the whole point is what the schema's own defaults and
+# its declarative surface resolve to, and a mock would simply return whatever the
+# test told it to (the fixture above is fine for the agreeing case, because
+# ``build_loss_weight_table`` really does read ``losses.physics`` off it).
+# ---------------------------------------------------------------------------
+
+
+def _losses(**kw):
+    """A real LossConfigSchema — never a mock, see the note above."""
+    from spectramr.config.schemas.loss import LossConfigSchema
+
+    return LossConfigSchema(**kw)
+
+
+def _bloch_ran(strategy, mock_env) -> tuple[bool, float]:
+    """Drive ``_compute_losses_impl`` and report whether the Bloch term fired.
+
+    The parent ``ReconstructionTrainingStrategy._compute_losses_impl`` is stubbed:
+    with a real ``LossConfigSchema`` it raises "All declared losses failed to
+    compute" against this file's mocked ``env.losses``, which would mask the branch
+    under test. Stubbing it leaves the Bloch weight resolution itself untouched --
+    that is the code these tests exist to pin -- and supplies the
+    ``_last_prediction`` the real parent would have stashed.
+    """
+    pred = torch.randn(2, 5, 3, 64, 64, requires_grad=True)
+    strategy._last_prediction = pred
+    batch = {
+        "T1": torch.randn(2, 1, 64, 64),
+        "T2": torch.randn(2, 1, 64, 64),
+        "PD": torch.randn(2, 1, 64, 64),
+    }
+    with (
+        patch(
+            "spectramr.infrastructure.training.strategies.reconstruction."
+            "ReconstructionTrainingStrategy._compute_losses_impl",
+            return_value={"g_total_loss": torch.zeros((), requires_grad=True)},
+        ),
+        patch("spectramr.models.losses.physics_losses.BlochResidualLoss") as mock_loss,
+    ):
+        mock_loss.return_value.to.return_value.return_value = torch.tensor(0.5)
+        losses = strategy._compute_losses_impl(
+            torch.randn(2, 3, 64, 64), torch.randn(2, 5, 3, 64, 64), epoch=0, batch=batch
+        )
+    return "bloch_loss" in losses, float(losses.get("bloch_loss", 0.0))
+
+
+def test_bloch_weight_read_from_declarative_list_when_no_physics_block(strategy, mock_env):
+    """An arm on the domain-list paradigm still gets its Bloch residual computed.
+
+    ``losses.physics`` is None when the arm declares its losses by domain, so the
+    old ``if self.config.losses.physics:`` guard short-circuited and the term was
+    silently skipped at whatever weight the rest of the system was applying.
+    """
+    from spectramr.config.schemas.loss import LossComponentConfig
+
+    mock_env.config.losses = _losses(
+        physics=None,
+        policy={"output_domain": "kspace"},
+        kspace_losses=[LossComponentConfig(name="bloch_residual", weight=0.7, enabled=True)],
+    )
+    assert mock_env.config.losses.physics is None  # the shape that used to skip
+
+    ran, value = _bloch_ran(strategy, mock_env)
+    assert ran, "bloch_residual declared on kspace_losses but the term never ran"
+    assert value == pytest.approx(0.5)
+
+
+def test_bloch_does_not_run_on_the_schema_default_lambda(strategy, mock_env):
+    """``lambda_bloch_residual`` DEFAULTS to 1.0 while ``enable_*`` defaults to False.
+
+    Reading the lambda directly therefore saw ``1.0 > 0`` and ran a physics loss on
+    every arm that never mentions the term. The SSOT honours the enable flag.
+    """
+    from spectramr.config.schemas.loss import PhysicsLossesConfig
+
+    defaults = PhysicsLossesConfig()
+    assert defaults.lambda_bloch_residual == 1.0, "premise: the lambda default is non-zero"
+    assert defaults.enable_bloch_residual is False, "premise: the term is off by default"
+
+    mock_env.config.losses = _losses(physics=defaults)
+    ran, _ = _bloch_ran(strategy, mock_env)
+    assert not ran, "bloch ran off the defaulted lambda despite enable_bloch_residual=False"
+
+
+def test_bloch_runs_when_the_lambda_surface_declares_it(strategy, mock_env):
+    """Regression pin: the classic category-block declaration is unchanged."""
+    from spectramr.config.schemas.loss import PhysicsLossesConfig
+
+    mock_env.config.losses = _losses(
+        physics=PhysicsLossesConfig(lambda_bloch_residual=0.5, enable_bloch_residual=True)
+    )
+    ran, value = _bloch_ran(strategy, mock_env)
+    assert ran
+    assert value == pytest.approx(0.5)

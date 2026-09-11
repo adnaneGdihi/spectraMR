@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.models.capabilities import ModelCapabilities
 
 
@@ -169,14 +170,17 @@ def _derive_loss_form(config: Any) -> dict[str, Any]:
     if losses is None:
         return {"present": False}
 
+    # The seed keys and the walk below both come from LOSS_LIST_DOMAINS, so they
+    # cannot drift apart. Seeding by hand is how ``latent_losses`` went missing from
+    # the card while the schema declared it (#1924) -- and note that seeding matters
+    # independently of the walk: ``out[k].append`` below would KeyError on a list the
+    # seed omits.
     out: dict[str, Any] = {
         "present": True,
         "output_domain": _safe_get(losses, "policy.output_domain", "output_domain"),
-        "image_losses": [],
-        "kspace_losses": [],
-        "complex_losses": [],
     }
-    for k in ("image_losses", "kspace_losses", "complex_losses"):
+    out.update({name: [] for name in LOSS_LIST_DOMAINS})
+    for k in LOSS_LIST_DOMAINS:
         for entry in getattr(losses, k, None) or []:
             if getattr(entry, "enabled", True) is False:
                 continue
@@ -267,7 +271,7 @@ def _format_card(
     if loss.get("present"):
         lines.append("  losses:")
         lines.append(f"    output_domain:       {loss.get('output_domain') or '<unset>'}")
-        for k in ("image_losses", "kspace_losses", "complex_losses"):
+        for k in LOSS_LIST_DOMAINS:
             for e in loss.get(k, []):
                 lines.append(f"    {k:<19} {e['name']} (weight={e['weight']})")
 

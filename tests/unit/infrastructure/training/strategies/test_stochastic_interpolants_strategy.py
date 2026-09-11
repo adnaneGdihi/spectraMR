@@ -109,16 +109,12 @@ class TestTimeDispatchDoesNotSwallowForwardError:
 
 class TestSourceUsesIntrospectionNotTryExcept:
     def test_source_dispatches_via_accepts_time(self):
-        src = inspect.getsource(
-            StochasticInterpolantsStrategy._compute_losses_impl
-        )
+        src = inspect.getsource(StochasticInterpolantsStrategy._compute_losses_impl)
         assert "self._generator_accepts_time(gen)" in src
         # The silent ``except TypeError:`` *fallback statement* is gone. Strip
         # comment lines first so the explanatory comment that legitimately
         # names the old pattern does not trip the assertion.
-        code_lines = [
-            ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
-        ]
+        code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
         code_only = "\n".join(code_lines)
         assert "except TypeError" not in code_only
 
@@ -188,3 +184,17 @@ class TestModelInputContract:
                 "declared input must be the STOCHASTIC interpolant, not the "
                 "deterministic flow-matching path"
             )
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: mse_loss(pred, true_velocity) regresses the interpolant velocity.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert StochasticInterpolantsStrategy.__dict__["folds_image_losses"] is False
+    assert StochasticInterpolantsStrategy.__dict__["inline_losses"] == frozenset()

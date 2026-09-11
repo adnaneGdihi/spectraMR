@@ -337,7 +337,27 @@ class DisentangledTrainingStrategy(
                             p.grad = new_grad.clone()
                         else:
                             p.grad += new_grad
-                return loss_output.total.detach().requires_grad_(True)
+                # PCGrad populated ``p.grad`` by hand above, so this closure
+                # must hand the executor something it can run backward on
+                # WITHOUT disturbing those gradients -- and whose *value* is
+                # still the real loss, because the executor logs what it gets
+                # (``losses_record[name] = loss.detach()``).
+                #
+                # ``.detach()`` supplies the value; the zero-weighted parameter
+                # term supplies a graph. ``d(0 * p.sum())/dp == 0``, so every
+                # ``p.grad`` accumulates exactly 0.0 and keeps its projected
+                # value. Attaching to one parameter rather than multiplying the
+                # total by zero keeps this O(1): the latter would cost a second
+                # full traversal of the loss graph every step, on top of the two
+                # ``autograd.grad`` traversals PCGrad already pays.
+                #
+                # This used to return ``loss_output.total.detach().requires_grad_(True)``,
+                # which worked only because ``backward()`` on a leaf is a silent
+                # no-op -- the same mechanism that lets a genuinely severed loss
+                # train nothing (#1952). The pre-backward graph guard now refuses
+                # leaves, and this path is not exempted from it: an exemption
+                # would be indistinguishable from the defect.
+                return loss_output.total.detach() + 0.0 * params[0].sum()
 
             return total_gen_loss
 

@@ -14,7 +14,7 @@ Generative Models" (NeurIPS 2022).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 class EDMTrainingStrategy(DiffusionTrainingStrategy):
     """Diffusion strategy with Karras EDM noise schedule + preconditioning."""
+
+    #: Loss ownership (issue #1918). EDM preconditioned denoising score matching; computes no image loss and
+    #: reaches neither the parent's builder path nor the computer.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

@@ -141,6 +141,25 @@ pitfall taxonomy:
   sibling names as its baseline. Invariant B covers ``ema.decay`` only, so nothing
   held the line. Arms that deliberately test the flag live under ``ablations*/``
   and are out of scope by construction.
+* O (run identity, pitfall #15/#17) — the six values that decide WHERE an arm's
+  run artefacts land must name the arm itself: ``training.output_dir``,
+  ``checkpoint.checkpoint_dir``, ``metrics.output_dir``,
+  ``loss_logging.output_dir`` and ``logging.sinks.dir`` are
+  ``experiments/results/<yaml stem>`` (plus the block's suffix), and
+  ``logging.identity.experiment`` is the bare stem. A new arm is almost always
+  created by copying a sibling, and a copy that changes the science but not the
+  identity is invisible: it loads, audits green, and then writes its
+  checkpoints, logs, metrics and loss CSV into the COPIED-FROM arm's tree,
+  competing for its ``keep_best_n`` slots. ``check_output_dir_convention``
+  cannot see it — that check only asserts the ``experiments/results/`` PREFIX
+  and never compares the ``<name>`` segment to anything, though its docstring
+  and its own ``fix_hint`` both claim the stem. Found live on
+  ``experiment_11_sense_bridge_critic``, which pointed all six at
+  ``experiment_11_attention_none`` from the day it was created.
+  ``reporting.method_name`` is deliberately NOT asserted here: 51 of 60 arms
+  follow ``<stem minus experiment_>``, but the four ``kspace_cold_diffusion``
+  variants share one family label on purpose, so a stem rule there would be
+  wrong rather than merely strict.
 """
 
 from __future__ import annotations
@@ -178,11 +197,7 @@ _IDS = [str(p.relative_to(_COHORT_ROOT)) for p in _ARMS]
 def _meta(settings: TrainingSettings, key: str) -> Any:
     """Read a metadata field from either the top-level or the free-form ``tags`` dict."""
     md = settings.metadata
-    md = (
-        md
-        if isinstance(md, dict)
-        else (md.model_dump() if hasattr(md, "model_dump") else {})
-    )
+    md = md if isinstance(md, dict) else (md.model_dump() if hasattr(md, "model_dump") else {})
     if md.get(key) not in (None, ""):
         return md[key]
     tags = md.get("tags") or {}
@@ -275,9 +290,7 @@ def _skip_if_cross_contrast(arm_path: Path) -> None:
 def test_arms_discovered() -> None:
     """Guard against an empty parametrization silently passing every invariant."""
     skip_if_public_export("experiments/ does not ship; the kspace_filling cohort is empty here")
-    assert (
-        len(_ARMS) >= 30
-    ), f"expected the full kspace_filling cohort, found {len(_ARMS)}"
+    assert len(_ARMS) >= 30, f"expected the full kspace_filling cohort, found {len(_ARMS)}"
 
 
 def test_a_multistep_cold_sampling_enabled(settings: TrainingSettings) -> None:
@@ -385,22 +398,18 @@ def test_d_kspace_fidelity_present(settings: TrainingSettings) -> None:
 
 
 def test_e_falsifiable_claim_declared(settings: TrainingSettings) -> None:
-    assert _meta(
-        settings, "hypothesis"
-    ), "M4/#19: metadata.hypothesis is missing (the tell)."
-    assert _meta(
-        settings, "primary_metric"
-    ), "M4/#18: metadata.primary_metric is missing."
+    assert _meta(settings, "hypothesis"), "M4/#19: metadata.hypothesis is missing (the tell)."
+    assert _meta(settings, "primary_metric"), "M4/#18: metadata.primary_metric is missing."
     if _meta(settings, "role") != "baseline":
-        assert _meta(
-            settings, "baseline"
-        ), "M4/#17: a non-baseline arm must name its control via metadata.baseline."
+        assert _meta(settings, "baseline"), (
+            "M4/#17: a non-baseline arm must name its control via metadata.baseline."
+        )
 
 
 def test_f_input_dependence_gate_set(settings: TrainingSettings) -> None:
-    assert (
-        settings.validation.gates.input_dependence_tol is not None
-    ), "m5/#20: validation.input_dependence_tol is unset; the measurement-collapse gate cannot fire."
+    assert settings.validation.gates.input_dependence_tol is not None, (
+        "m5/#20: validation.input_dependence_tol is unset; the measurement-collapse gate cannot fire."
+    )
 
 
 def test_g_inert_dynamic_mask_not_advertised(settings: TrainingSettings) -> None:
@@ -414,9 +423,7 @@ def test_g_inert_dynamic_mask_not_advertised(settings: TrainingSettings) -> None
 def test_h_no_inactive_dc_mechanism_advertised(settings: TrainingSettings) -> None:
     if _dc_method(settings) in _ADAPTIVE_DC_FAMILY:
         return  # the KAN/adaptive DC layer is genuinely built; the claim is honest
-    claim = " ".join(
-        str(_meta(settings, k) or "") for k in ("description", "hypothesis")
-    )
+    claim = " ".join(str(_meta(settings, k) or "") for k in ("description", "hypothesis"))
     hit = _KAN_DC_OVERCLAIM_RE.search(claim)
     assert hit is None, (
         f"#16: dc_method={_dc_method(settings)!r} builds soft/hard DC, but the metadata "
@@ -429,9 +436,9 @@ def test_h_no_inactive_dc_mechanism_advertised(settings: TrainingSettings) -> No
 def test_i_acceleration_spread_matches_base(settings: TrainingSettings, arm_path: Path) -> None:
     _skip_if_cross_contrast(arm_path)
     # (1) the learning-spread curriculum — the negative-transfer fix
-    strat = _attr(settings.training, "timestep_sampling_strategy")
-    assert strat == "balanced_high_t", (
-        f"#17/#20: timestep_sampling_strategy={strat!r}; the cohort spreads learning across "
+    strategy = _attr(settings.training, "timestep_sampling_strategy")
+    assert strategy == "balanced_high_t", (
+        f"#17/#20: timestep_sampling_strategy={strategy!r}; the cohort spreads learning across "
         "the 2x-32x cascade via 'balanced_high_t' ((1-eps)·P(t) ∝ t + eps·uniform). Pure "
         "'high_t_emphasis' starves low t (R2x val collapse); 'importance'/'uniform' bias "
         "toward the easy low-R end and let the shared net abandon high t (R8x/R32x collapse)."
@@ -567,9 +574,7 @@ def test_i2_curriculum_uniform_within_each_sub_cohort() -> None:
     _assert_single_valued(groups, "curriculum pairs")
 
 
-def _assert_single_valued(
-    groups: dict[str, dict[Any, list[str]]], what: str
-) -> None:
+def _assert_single_valued(groups: dict[str, dict[Any, list[str]]], what: str) -> None:
     """Every sub-cohort must declare exactly one value of whatever was keyed.
 
     Split out of ``test_i2`` so it can be planted directly: a corpus-level scan
@@ -641,8 +646,7 @@ def test_i3_ladder_uniform_within_each_sub_cohort() -> None:
 # --------------------------------------------------------------------------
 
 _PLANT_BASE_REL = (
-    "experiments/inprogress/kspace_filling/attention_shootout/"
-    "experiment_11_attention_channel.yaml"
+    "experiments/inprogress/kspace_filling/attention_shootout/experiment_11_attention_channel.yaml"
 )
 
 
@@ -698,15 +702,56 @@ def test_plant_unpinned_ramp_rate_is_red(tmp_path: Path) -> None:
         test_i_acceleration_spread_matches_base(s, _plant_base())
 
 
+#: The cadence both patience plants below assert against. Pinned HERE rather
+#: than inherited from ``_plant_base()``: on 2026-09-07 a cohort conformity
+#: rewrite moved that live arm from 70000/5000 to 70000/17500, which silently
+#: re-aimed both plants -- the boundary plant went red (4 points, not 14) and
+#: the truncating plant kept passing on ``test_m``'s DENSITY assertion instead
+#: of the patience assertion it exists to verify, because all three assertions
+#: in ``test_m`` share the ``M/#18`` prefix its ``match=`` used. A detector's
+#: own proof must not be a function of the corpus it polices (non-negotiable
+#: 15). ``max_iterations`` comes from the arm and is asserted, not planted, so
+#: a budget change is loud here rather than silent.
+_PLANT_INTERVAL_STEPS = 5000
+_PLANT_BUDGET = 70_000
+
+
+def test_plant_cadence_is_pinned_not_inherited(tmp_path: Path) -> None:
+    """The two patience plants below are arithmetic on a cadence they pin.
+
+    Without this the pair could drift back to inheriting the base arm's
+    cadence and nothing would say so -- which is exactly how they broke.
+    """
+    s = _planted(tmp_path, validation__schedule__interval_steps=_PLANT_INTERVAL_STEPS)
+    assert s.training.max_iterations == _PLANT_BUDGET, (
+        f"{_plant_base().name} moved off the {_PLANT_BUDGET}-iteration budget the "
+        f"patience plants below compute against; re-derive _PLANT_BUDGET and both "
+        f"planted patience values together, they are a coupled set."
+    )
+    assert s.validation.schedule.interval_steps == _PLANT_INTERVAL_STEPS
+    assert _PLANT_BUDGET // _PLANT_INTERVAL_STEPS >= _MIN_VALIDATION_POINTS, (
+        "the pinned cadence must clear the density floor, or both plants below "
+        "exercise the density assertion instead of the patience one"
+    )
+
+
 def test_plant_truncating_patience_is_red(tmp_path: Path) -> None:
     """A patience that CAN fire inside the budget must turn test_m red.
 
     patience 8 over 70000/5000 stops at (8 + 1) * 5000 = 45000, discarding 36%
     of the budget -- the exact regression this cohort hit when the budget was
     raised from 30000 and patience was left behind.
+
+    ``match=`` pins the patience assertion's own wording, not the shared
+    ``M/#18`` prefix: with the prefix alone this plant was satisfied by the
+    density assertion for the whole window the base arm sat at 17500.
     """
-    s = _planted(tmp_path, early_stopping__patience=8)
-    with pytest.raises(AssertionError, match="M/#18"):
+    s = _planted(
+        tmp_path,
+        early_stopping__patience=8,
+        validation__schedule__interval_steps=_PLANT_INTERVAL_STEPS,
+    )
+    with pytest.raises(AssertionError, match="counts validation EVENTS"):
         test_m_selection_density_and_fixed_budget(s)
 
 
@@ -718,7 +763,11 @@ def test_plant_boundary_patience_is_green(tmp_path: Path) -> None:
     so the arm cannot truncate. Without this case the correction is unverified
     and could silently revert.
     """
-    s = _planted(tmp_path, early_stopping__patience=14)
+    s = _planted(
+        tmp_path,
+        early_stopping__patience=14,
+        validation__schedule__interval_steps=_PLANT_INTERVAL_STEPS,
+    )
     test_m_selection_density_and_fixed_budget(s)
 
 
@@ -778,7 +827,9 @@ def test_plant_divergent_ladders_within_a_sub_cohort_are_red() -> None:
     }
     with pytest.raises(AssertionError, match="#17"):
         _assert_single_valued(divergent, "mask ladders")
-    _assert_single_valued({"attention_shootout": {(1.0, (1.0, 2.0), True): ["a.yaml"]}}, "mask ladders")
+    _assert_single_valued(
+        {"attention_shootout": {(1.0, (1.0, 2.0), True): ["a.yaml"]}}, "mask ladders"
+    )
 
 
 _EXPECTED_PATCH_HW = (256, 256)
@@ -840,6 +891,32 @@ def test_j_dense_attn_token_budget_uniform(settings: TrainingSettings) -> None:
 _KAN_ABL_DIR = _COHORT_ROOT / "ablations_kan_dual_domain"
 _KAN_ARMS = tracked_yamls(_KAN_ABL_DIR, recursive=False)
 _KAN_IDS = [p.name for p in _KAN_ARMS]
+_KAN_CONTROL = _COHORT_ROOT / "experiment_11_kan_dual_domain.yaml"
+
+
+@pytest.fixture(scope="module")
+def kan_control_settings() -> TrainingSettings:
+    """The headline control these 11 ablations are a one-knob delta from.
+
+    Invariant C stopped asserting the literal ``val_robust_mri_psnr_mean`` on
+    2026-07-29 -- "it must be PSNR" was never the rule. This test kept the
+    literal, and on 2026-09-06 the cohort-wide move to ``val_hfen_mean`` turned
+    all 11 ablations red *for conforming to their control*: the assertion was
+    firing on agreement, which is the opposite of what it exists to catch.
+
+    The rule is already written in the comment below -- the ablation set's own
+    base value IS the invariant -- so read the control instead of hardcoding its
+    current answer. A future selection-metric change then moves control and
+    ablations together, and only a genuine per-arm DRIFT goes red. The ``_mean``
+    shape is re-asserted here because ``ablations_kan_dual_domain/`` is out of
+    ``test_c``'s scope by construction, so following the control blindly would
+    otherwise let a single-R proxy through.
+    """
+    assert _KAN_CONTROL.exists(), (
+        f"KAN control arm missing: {_KAN_CONTROL}. The 11 ablations are defined "
+        "as a one-knob delta off it; without it they have no invariant."
+    )
+    return TrainingSettings.from_yaml(str(_KAN_CONTROL))
 
 
 @pytest.fixture(scope="module", params=_KAN_ARMS, ids=_KAN_IDS)
@@ -852,41 +929,54 @@ def test_kan_ablations_discovered() -> None:
     assert len(_KAN_ARMS) == 11, f"expected 11 KAN ablations, found {len(_KAN_ARMS)}"
 
 
-def test_kan_ablation_shares_cohort_invariants(kan_settings: TrainingSettings) -> None:
+def test_kan_ablation_shares_cohort_invariants(
+    kan_settings: TrainingSettings, kan_control_settings: TrainingSettings
+) -> None:
     """The shared invariants (A/B/C/D/F/I) must match the headline — an ablation
     differs from its control by exactly its one declared knob, never by the
     selection metric / sampler / EMA / collapse-gate recipe."""
     s = kan_settings
-    assert (
-        s.validation.sampling.enable_multistep_cold is True
-    ), "A/#16: single forward blurs at heavy R"
+    assert s.validation.sampling.enable_multistep_cold is True, (
+        "A/#16: single forward blurs at heavy R"
+    )
     if s.ema.enabled:
         assert s.ema.decay <= 0.999 + 1e-12, f"B/#20: ema.decay={s.ema.decay} too high"
-    assert (
-        s.metrics.best_metric_name == "val_robust_mri_psnr_mean"
-    ), f"C/#18: best_metric_name={s.metrics.best_metric_name!r}; select on the cascade mean."
-    assert (
-        s.early_stopping.metric == "val_robust_mri_psnr_mean"
-    ), "C/#18: early-stop metric drift"
-    assert "complex_l1" in _loss_names(
-        s.losses, "kspace_losses"
-    ), "D/#20: k-space fidelity dropped"
-    assert (
-        s.validation.gates.input_dependence_tol is not None
-    ), "F/#20: collapse gate disabled"
-    assert (
-        _attr(s.training, "timestep_sampling_strategy") == "balanced_high_t"
-    ), "I/#17: sampler drifted off 'balanced_high_t' (superseded high_t_emphasis)."
-    # Literal here, unlike test_i: these 11 ablations are compared against ONE
-    # control (experiment_11_kan_dual_domain.yaml), which carries (4, 0.005), so
-    # the ablation set's own base value IS the invariant. Verified 2026-08-28:
-    # all 11 sit at (4, 0.005, timesteps 28).
-    assert (
-        _attr(s.training, "curriculum_start_timestep") == 4
-    ), "I/#17: curriculum_start drift vs the kan_dual_domain control"
-    assert (
-        _attr(s.training, "curriculum_ramp_rate") == 0.005
-    ), "I/#17: curriculum_ramp_rate drift vs the kan_dual_domain control"
+    selector = kan_control_settings.metrics.best_metric_name
+    assert selector and selector.endswith("_mean"), (
+        f"C/#18: the kan_dual_domain control selects on {selector!r}, which is not "
+        "a cascade mean; the ablations inherit it, so the control is the defect."
+    )
+    assert s.metrics.best_metric_name == selector, (
+        f"C/#18: best_metric_name={s.metrics.best_metric_name!r} but the "
+        f"kan_dual_domain control selects on {selector!r}. An ablation differs "
+        "from its control by exactly its one declared knob, never by the "
+        "selection metric."
+    )
+    assert s.early_stopping.metric == selector, (
+        f"C/#18: early-stop metric drift: early_stopping.metric="
+        f"{s.early_stopping.metric!r} != control selector {selector!r}"
+    )
+    assert "complex_l1" in _loss_names(s.losses, "kspace_losses"), "D/#20: k-space fidelity dropped"
+    assert s.validation.gates.input_dependence_tol is not None, "F/#20: collapse gate disabled"
+    assert _attr(s.training, "timestep_sampling_strategy") == "balanced_high_t", (
+        "I/#17: sampler drifted off 'balanced_high_t' (superseded high_t_emphasis)."
+    )
+    # Read from the control, not hardcoded: these 11 ablations are compared
+    # against ONE control (experiment_11_kan_dual_domain.yaml), so the control's
+    # own value IS the invariant -- that sentence was always the rule, but it was
+    # spelled as the literals (4, 0.005) it happened to hold on 2026-08-28. On
+    # 2026-09-06 the cohort standardization moved control and all 11 ablations
+    # together to (1, 0.0005), and the literals went red on a set that had not
+    # drifted at all. Comparing against the control keeps catching the thing this
+    # guards -- one ablation's curriculum diverging from its baseline -- without
+    # re-breaking every time the baseline is legitimately re-tuned.
+    for knob in ("curriculum_start_timestep", "curriculum_ramp_rate"):
+        expected = _attr(kan_control_settings.training, knob)
+        assert _attr(s.training, knob) == expected, (
+            f"I/#17: {knob}={_attr(s.training, knob)!r} but the kan_dual_domain "
+            f"control carries {expected!r}; the ablation Δ would be confounded by "
+            "a curriculum difference on top of its one declared knob."
+        )
     assert (
         int(s.data.sampling.patch_size[0]),
         int(s.data.sampling.patch_size[1]),
@@ -899,15 +989,11 @@ def test_kan_ablation_shares_cohort_invariants(kan_settings: TrainingSettings) -
 def test_kan_ablation_declares_falsifiable_claim(
     kan_settings: TrainingSettings,
 ) -> None:
-    assert _meta(
-        kan_settings, "hypothesis"
-    ), "#19: metadata.hypothesis missing (the tell)."
-    assert _meta(
-        kan_settings, "primary_metric"
-    ), "#18: metadata.primary_metric missing."
-    assert _meta(
-        kan_settings, "baseline"
-    ), "#17: ablation must name its control via metadata.baseline."
+    assert _meta(kan_settings, "hypothesis"), "#19: metadata.hypothesis missing (the tell)."
+    assert _meta(kan_settings, "primary_metric"), "#18: metadata.primary_metric missing."
+    assert _meta(kan_settings, "baseline"), (
+        "#17: ablation must name its control via metadata.baseline."
+    )
 
 
 # Losses that carry their own DifferentiableFourierBridge, so a bridged list would
@@ -981,6 +1067,84 @@ def test_m_selection_density_and_fixed_budget(settings: TrainingSettings) -> Non
         f"which must exceed max_iterations={budget} so a fixed-budget head-to-head "
         f"cannot truncate an arm ({points} validation events fit in this budget)."
     )
+
+
+#: ``(dotted path, suffix under experiments/results/<stem>)``. A ``None`` suffix
+#: means the value is the bare stem rather than a path. Six entries, each
+#: declared by all 60 arms of the cohort and satisfied by 59 of them when this
+#: was written -- the sole violator was a copied arm that had never been run.
+_IDENTITY_PATHS: tuple[tuple[str, str | None], ...] = (
+    ("training.output_dir", ""),
+    ("checkpoint.checkpoint_dir", "/checkpoints"),
+    ("metrics.output_dir", "/metrics"),
+    ("loss_logging.output_dir", "/metrics"),
+    ("logging.sinks.dir", "/logs"),
+    ("logging.identity.experiment", None),
+)
+
+
+def _dotted(settings: TrainingSettings, path: str) -> Any:
+    """Resolve a dotted attribute path, returning None at the first missing hop."""
+    node: Any = settings
+    for part in path.split("."):
+        node = getattr(node, part, None)
+        if node is None:
+            return None
+    return node
+
+
+def test_o_identity_paths_name_this_arm(settings: TrainingSettings, arm_path: Path) -> None:
+    """Every run-artefact destination names THIS arm, not the arm it was copied from."""
+    stem = arm_path.stem
+    wrong = {
+        path: (got, stem if suffix is None else f"experiments/results/{stem}{suffix}")
+        for path, suffix in _IDENTITY_PATHS
+        for got in (_dotted(settings, path),)
+        if got != (stem if suffix is None else f"experiments/results/{stem}{suffix}")
+    }
+    assert not wrong, (
+        f"IDENTITY/#15: {arm_path.name} sends run artefacts somewhere that is not its "
+        f"own results tree: "
+        + "; ".join(f"{k} = {g!r} (expected {w!r})" for k, (g, w) in sorted(wrong.items()))
+        + ". A copied arm that kept the template's identity overwrites the template's "
+        "checkpoints, logs and metrics. check_output_dir_convention cannot catch this "
+        "-- it tests the experiments/results/ prefix only."
+    )
+
+
+def test_plant_identity_pointing_at_another_arm_is_red(tmp_path: Path) -> None:
+    """The live shape: a copied arm keeping the template's ``training.output_dir``."""
+    s = _planted(tmp_path, training__output_dir="experiments/results/experiment_11_attention_none")
+    with pytest.raises(AssertionError, match="IDENTITY/#15"):
+        test_o_identity_paths_name_this_arm(s, _plant_base())
+
+
+def test_plant_identity_nested_sink_dir_is_red(tmp_path: Path) -> None:
+    """The SECOND shape: a two-level path. A checker walking one level is blind here."""
+    s = _planted(
+        tmp_path, logging__sinks__dir="experiments/results/experiment_11_attention_none/logs"
+    )
+    with pytest.raises(AssertionError, match="IDENTITY/#15"):
+        test_o_identity_paths_name_this_arm(s, _plant_base())
+
+
+def test_plant_identity_bare_stem_label_is_red(tmp_path: Path) -> None:
+    """The THIRD shape: not a path at all. ``logging.identity.experiment`` is the bare
+    stem, so a prefix-based rule cannot express it and a path-based one skips it."""
+    s = _planted(tmp_path, logging__identity__experiment="experiment_11_attention_none")
+    with pytest.raises(AssertionError, match="IDENTITY/#15"):
+        test_o_identity_paths_name_this_arm(s, _plant_base())
+
+
+def test_plant_identity_prefix_alone_is_not_enough(tmp_path: Path) -> None:
+    """The blindness itself: a path with the RIGHT prefix and the WRONG name.
+
+    This is exactly what ``check_output_dir_convention`` returns green on, and
+    it is the reason this invariant exists rather than deferring to that check.
+    """
+    s = _planted(tmp_path, training__output_dir="experiments/results/not_this_arm")
+    with pytest.raises(AssertionError, match="IDENTITY/#15"):
+        test_o_identity_paths_name_this_arm(s, _plant_base())
 
 
 @pytest.mark.parametrize("arm", _ARMS, ids=_IDS)
@@ -1161,7 +1325,9 @@ def test_the_cross_contrast_exemption_is_not_a_blanket_pass() -> None:
 
 def test_every_exempted_arm_exists() -> None:
     """Anti-rot: an exemption for a deleted or renamed arm guards nothing."""
-    skip_if_public_export("experiments/ does not ship, so every exemption reads as naming a deleted arm")
+    skip_if_public_export(
+        "experiments/ does not ship, so every exemption reads as naming a deleted arm"
+    )
     present = {p.name for p in tracked_yamls(_COHORT_ROOT)}
     missing = sorted((set(_CROSS_CONTRAST_ARMS) | set(_INERT_LADDER_ARMS)) - present)
     assert not missing, f"exemption names an arm that no longer exists: {missing}"

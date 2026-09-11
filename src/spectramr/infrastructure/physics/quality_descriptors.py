@@ -154,7 +154,7 @@ def resample_to_spacing(
             through-plane, and a synthetic "low-quality" volume carrying invented
             detail is worse than useless.
     """
-    import torch.nn.functional as F  # noqa: N812
+    import torch.nn.functional as F
 
     vol = _as_slice_stack(volume)
     n_slices, rows, cols = vol.shape

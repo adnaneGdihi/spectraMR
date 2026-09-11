@@ -119,7 +119,7 @@ class LinearOperator:
         return self._rmatvec(v)
 
     @property
-    def H(self) -> LinearOperator:  # noqa: N802 — Hermitian-adjoint convention
+    def H(self) -> LinearOperator:
         """The adjoint operator :math:`L^H`."""
         return LinearOperator(self.adjoint, self._matvec, name=f"{self.name}^H")
 

@@ -12,10 +12,38 @@ from spectramr.models.interfaces.models import IDiscriminator
 from spectramr.models.registry import register_model
 
 
-@register_model(name="patch_gan", training_mode="gan")
-@register_model(name="patchgan_discriminator", training_mode="gan")
-@register_model(name="patch_latent_discriminator", training_mode="gan")
-@register_model(name="multiscale_latent_discriminator", training_mode="gan")
+# ``PatchGANDiscriminator.forward`` is ``self.model(x)`` over a plain 2-D convolution
+# stack; it calls no ``fft2c``/``ifft2c``. So unlike the critics in
+# ``kspace_discriminator.py`` -- whose ``forward`` transforms its own input and therefore
+# *declares itself* -- the class body cannot say which space it scores in. Any real 4-D
+# tensor fits it: a magnitude image, and 2C-interleaved k-space equally well.
+#
+# The domain is therefore a property of the REGISTRATION, not of the class, and each name
+# below declares its own. A single class-wide value would be wrong for the two latent
+# names; a permissive ``("image", "kspace")`` tuple would be accurate about tensor shapes
+# and useless as a contract, because ``resolve_conversion`` returns ``None`` as soon as
+# any accepted side matches -- so it would never convert, and #1920 would stay open for
+# exactly the case it was filed about.
+@register_model(role="discriminator", name="patch_gan", training_mode="gan", input_domain="image")
+@register_model(
+    role="discriminator", name="patchgan_discriminator", training_mode="gan", input_domain="image"
+)
+# The two latent names share this architecture but not its input space: they score a
+# post-VAE-encoder latent, which is not an MRI signal domain at all. ``latent`` sits
+# deliberately outside ``critic_domain.TRANSFORMABLE``, so pairing one of these with an
+# image- or k-space-emitting generator RAISES instead of FFT-ing a latent into nonsense.
+@register_model(
+    role="discriminator",
+    name="patch_latent_discriminator",
+    training_mode="gan",
+    input_domain="latent",
+)
+@register_model(
+    role="discriminator",
+    name="multiscale_latent_discriminator",
+    training_mode="gan",
+    input_domain="latent",
+)
 class PatchGANDiscriminator(IDiscriminator, nn.Module):
     """PatchGAN discriminator implementation following SOLID principles.
 

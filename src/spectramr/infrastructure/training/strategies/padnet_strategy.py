@@ -9,7 +9,7 @@ Implements the physics-driven loop:
 4. Compute loss on final image
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -132,6 +132,13 @@ class PaDNetTrainingStrategy(DiffusionTrainingStrategy):
         - Cohen et al. (2021): MRI Parameter Mapping with Accelerated Pocket Dictionaries
         - Knoll et al. (2020): Physics-Based Deep Learning
     """
+
+    #: Loss ownership (issue #1918). The physics loss module returns l2_image, an image-space L2 against the
+    #: target -- declared inline so the fold does not count it twice. Nothing
+    #: else from losses.image_losses reaches the objective: the hook returns the
+    #: physics module's dict and never calls super() or the fold.
+    inline_losses: ClassVar[frozenset[str]] = frozenset({"l2"})
+    folds_image_losses: ClassVar[bool] = False
 
     #: PaDNet does NOT degrade its input inside the step, so the base contract
     #: holds and ``first_steps/input_prepared`` really is the model input:

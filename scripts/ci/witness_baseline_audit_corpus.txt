@@ -1,0 +1,9 @@
+# Configs that declare a key the schema then discards (issue #550).
+# One `<path>::<class>: <dotted key>` per line.
+#
+# A path here is tracked DEBT, not permission: removing one is the goal,
+# adding one needs a reason in the PR that adds it. Fix by declaring the
+# key on the schema block that should own it, or by deleting the stale
+# key from the YAML.
+#
+# Regenerate: python scripts/ci/check_witness_corpus.py --update-baseline

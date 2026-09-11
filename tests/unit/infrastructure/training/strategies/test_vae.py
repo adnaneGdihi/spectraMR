@@ -31,9 +31,7 @@ def _mock_self(recon: torch.Tensor):
     mu = torch.zeros(recon.shape[0], 4, 1, 1)
     logvar = torch.zeros(recon.shape[0], 4, 1, 1)
     mock.env.generator = MagicMock(return_value=(recon, mu, logvar))
-    mock.precision_manager.prepare_latent_for_kl_computation = MagicMock(
-        return_value=(mu, logvar)
-    )
+    mock.precision_manager.prepare_latent_for_kl_computation = MagicMock(return_value=(mu, logvar))
     mock.env.losses = {}
     mock.loss_computer.compute = MagicMock(side_effect=_SentinelError)
     return mock
@@ -109,9 +107,7 @@ class TestBareTensorPosteriorRecovery:
         logvar = torch.full((1, 8, 4, 4), -0.25)
 
         mock = self._mock_with_last_aux(recon, mu, logvar)
-        VAETrainingStrategy._compute_losses_impl(
-            mock, inp, recon.clone(), epoch=0, iteration=0
-        )
+        VAETrainingStrategy._compute_losses_impl(mock, inp, recon.clone(), epoch=0, iteration=0)
 
         posterior = mock.loss_computer.compute.call_args.kwargs["posterior"]
         got_mu, got_logvar = posterior
@@ -138,10 +134,77 @@ class TestBareTensorPosteriorRecovery:
         mock.env.losses = {}
         mock.loss_computer.compute = MagicMock(return_value=self._loss_output())
 
-        VAETrainingStrategy._compute_losses_impl(
-            mock, inp, recon.clone(), epoch=0, iteration=0
-        )
+        VAETrainingStrategy._compute_losses_impl(mock, inp, recon.clone(), epoch=0, iteration=0)
 
         got_mu, got_logvar = mock.loss_computer.compute.call_args.kwargs["posterior"]
         assert torch.count_nonzero(got_mu) == 0
         assert torch.count_nonzero(got_logvar) == 0
+
+
+# --------------------------------------------------------------------------- #
+# VQVAETrainingStrategy: the train-metric iteration seam (#1937)
+#
+# ``VQVAETrainingStrategy._compute_losses_impl`` fed the metric throttle
+# ``getattr(self.env, "step", 0)``. ``TrainingEnvironment`` is ``frozen=True`` and
+# declares no ``step``, so the value was a constant 0 -- and ``0 % interval == 0`` for
+# every interval, so the host-syncing SSIM/PSNR/MAE were recomputed on EVERY step.
+#
+# The guard that existed to forbid exactly this line
+# (``test_train_metric_step_wiring.py``) named this module and passed green: its walk
+# returned on the first class ``inspect.getmembers`` yields, alphabetically
+# ``VAETrainingStrategy`` (lines 118-301), and never reached ``VQVAETrainingStrategy``
+# (lines 525-620) where the read lived. That walk is fixed in the same change; these
+# tests observe the value arrive (non-negotiable 16) rather than reading the source.
+# --------------------------------------------------------------------------- #
+
+from spectramr.infrastructure.training.loop_state import LoopState  # noqa: E402
+from spectramr.infrastructure.training.strategies.vae import VQVAETrainingStrategy  # noqa: E402
+
+#: Not 0, and not the schema-default train_metric_interval.
+_LIVE_ITERATION = 1337
+
+
+def _vqvae_with_spy(iteration: int):
+    """A VQ-VAE stitched with only what the hook's metric branch touches."""
+    s = VQVAETrainingStrategy.__new__(VQVAETrainingStrategy)
+    # A plain-tensor generator output keeps vq_loss/perplexity None, so the
+    # precision manager is not on this path.
+    s.state = SimpleNamespace(generator=lambda x: x, model=None)
+    s.env = SimpleNamespace(losses={})
+    s.config = SimpleNamespace()
+    s._loss_dict_reuse = {}
+    s.loop_state = LoopState(iteration=iteration, epoch=1)
+    s.loss_computer = SimpleNamespace(
+        compute=lambda **kw: SimpleNamespace(
+            total=torch.zeros((), requires_grad=True), components={}
+        )
+    )
+    seen: list[int] = []
+
+    def _spy(pred, target, config, current_step):
+        seen.append(current_step)
+        return {}
+
+    s._compute_training_metrics = _spy
+    return s, seen
+
+
+@pytest.mark.unit
+def test_vqvae_train_metrics_receive_the_live_iteration_not_a_frozen_zero() -> None:
+    strategy, seen = _vqvae_with_spy(_LIVE_ITERATION)
+    x = torch.rand(1, 1, 8, 8)
+    strategy._compute_losses_impl(input_batch=x, target_batch=x, epoch=1)
+    assert seen == [_LIVE_ITERATION], (
+        "the train-metric throttle must be fed the live loop iteration; frozen at 0 "
+        "it recomputed SSIM/PSNR/MAE on every step (pitfall #16, #1937)"
+    )
+
+
+@pytest.mark.unit
+def test_vqvae_iteration_advances_with_the_loop() -> None:
+    strategy, seen = _vqvae_with_spy(0)
+    x = torch.rand(1, 1, 8, 8)
+    strategy._compute_losses_impl(input_batch=x, target_batch=x, epoch=0)
+    strategy.loop_state.iteration = _LIVE_ITERATION
+    strategy._compute_losses_impl(input_batch=x, target_batch=x, epoch=0)
+    assert seen == [0, _LIVE_ITERATION]

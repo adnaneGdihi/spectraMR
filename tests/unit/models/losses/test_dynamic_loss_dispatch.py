@@ -57,7 +57,17 @@ class _Cfg:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
         self.optimization = type("opt", (), {"learning_rate": 1e-4, "use_amp": False})()
-        self.model = type("m", (), {"model_type": "test", "in_channels": 2})()
+        # ``discriminator_component`` is a DECLARED field on
+        # ``ModelConfigSchema`` and Pydantic materializes every declared field,
+        # so a real config always carries it -- defaulted to None when the arm
+        # configures no critic. A double that omits it asserts a schema shape
+        # the schema does not have, and the elected critic-name owner raises on
+        # it by design (#1921, non-negotiable 3).
+        self.model = type(
+            "m",
+            (),
+            {"model_type": "test", "in_channels": 2, "discriminator_component": None},
+        )()
         # Deliberately bare: each test path resolves weights via _get_loss_weight
         # which falls through `getattr` and defaults to 1.0 when attributes are
         # missing.

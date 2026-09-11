@@ -278,34 +278,18 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             if torch.is_complex(hr_fakes):
                 hr_fakes = torch.cat([hr_fakes.real, hr_fakes.imag], dim=1)
 
-            # Compute discriminator loss with fallback logic
-            d_loss_output = (
-                self.loss_computer.compute_discriminator_loss(
-                    real=target_batch,
-                    fake=hr_fakes,
-                    discriminator=discriminator,
-                    epoch=epoch,
-                    iteration=iteration,
-                )
-                if hasattr(self.loss_computer, "compute_discriminator_loss")
-                else None
+            # Called unguarded: ``setup_adversarial`` installs
+            # ``UnifiedGANLossComputer`` unconditionally, so the deleted
+            # ``hasattr``/``is None`` fallback could only route an unexpected
+            # computer down a second critic feed that disagreed with the other
+            # copy. A computer lacking the method must fail loudly (NN3).
+            d_loss_output = self.loss_computer.compute_discriminator_loss(
+                real=target_batch,
+                fake=hr_fakes,
+                discriminator=discriminator,
+                epoch=epoch,
+                iteration=iteration,
             )
-
-            if d_loss_output is None:
-                # Fallback: compute via general loss computer
-                disc_outputs_d = {
-                    "real_pred": discriminator(target_batch),
-                    "fake_pred": discriminator(hr_fakes),
-                }
-                d_loss_output = self.loss_computer.compute(
-                    pred=hr_fakes,
-                    target=target_batch,
-                    epoch=epoch,
-                    iteration=iteration,
-                    discriminator=discriminator,
-                    discriminator_outputs=disc_outputs_d,
-                    losses_dict=losses_dict,
-                )
 
             d_total = d_loss_output.total if hasattr(d_loss_output, "total") else d_loss_output
 
@@ -374,49 +358,20 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             if getattr(self.config.training, "enforce_output_range", False):
                 hr_fakes = clamp_to_range(hr_fakes, enable=True, telemetry=False)
 
-            # Compute generator loss with fallback logic
-            g_loss_output = (
-                self.loss_computer.compute_generator_loss(
-                    pred=hr_fakes,
-                    target=target_batch,
-                    discriminator=discriminator,
-                    epoch=epoch,
-                    iteration=iteration,
-                )
-                if hasattr(self.loss_computer, "compute_generator_loss")
-                else None
+            # Called unguarded: ``setup_adversarial`` installs
+            # ``UnifiedGANLossComputer`` unconditionally, so the deleted
+            # ``hasattr``/``is None`` fallback could only route an unexpected
+            # computer down a second critic feed -- realified here, raw in
+            # ``AdversarialMixin`` -- or, with no critic, silently swap the whole
+            # adversarial objective for plain L1. Both must now fail loudly (NN3).
+            g_loss_output = self.loss_computer.compute_generator_loss(
+                pred=hr_fakes,
+                target=target_batch,
+                discriminator=discriminator,
+                epoch=epoch,
+                iteration=iteration,
             )
-
-            if g_loss_output is None:
-                # Fallback: compute via general loss computer
-                if discriminator:
-                    hr_fakes_disc = (
-                        torch.cat([hr_fakes.real, hr_fakes.imag], dim=1)
-                        if torch.is_complex(hr_fakes)
-                        else hr_fakes
-                    )
-                    disc_outputs = {
-                        "fake_pred": discriminator(hr_fakes_disc),
-                    }
-                    g_loss_output = self.loss_computer.compute(
-                        pred=hr_fakes,
-                        target=target_batch,
-                        epoch=epoch,
-                        iteration=iteration,
-                        discriminator=discriminator,
-                        discriminator_outputs=disc_outputs,
-                        losses_dict=losses_dict,
-                    )
-                    g_total = (
-                        g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
-                    )
-                else:
-                    criterion = getattr(self.env, "criterion_l1", None) or nn.L1Loss().to(
-                        target_batch.device
-                    )
-                    g_total = criterion(hr_fakes, target_batch)
-            else:
-                g_total = g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
+            g_total = g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
 
             # Store detached metrics as TENSORS (no host transfer). float() here
             # fired a GPU sync per key every step; get_last_metrics() converts to

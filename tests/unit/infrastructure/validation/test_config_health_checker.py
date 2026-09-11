@@ -15,6 +15,8 @@ making the tests fragile to v6.0 schema evolution.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from types import SimpleNamespace
 from typing import Any
 
@@ -3690,3 +3692,367 @@ class TestSliceLevelRecordsQueueShape:
 
         src = inspect.getsource(ConfigHealthChecker.run_all_checks)
         assert "self.check_slice_level_records_queue_shape(config)" in src
+
+
+class TestMultiContrastModelSupport:
+    """``data.multi_contrast.enabled`` is checked against BOTH consumers.
+
+    Pattern C emits ``contrast_idx`` on every batch; any model that receives
+    the batch and does not declare ``supports_contrast_conditioning=True``
+    drops it silently. The check read only ``model.model_type`` until
+    2026-09-07, so ``experiment_11_sense_bridge_critic`` -- a contrast-aware
+    generator paired with a critic that declares the flag ``False`` -- audited
+    clean while doing exactly what the check forbids (#1931). Shape 3 below is
+    that arm; it is the reason this class exists.
+
+    Built from the REAL ``TrainingSettings`` rather than a ``SimpleNamespace``:
+    ``ModelComponentSchema.name`` defaults to ``""`` (not ``None``) and
+    ``ModelConfigSchema`` is ``extra="ignore"``, and both of those are
+    properties of the shipped schema that a stub would not reproduce -- shape
+    6 tests the first directly.
+    """
+
+    _MISSING = object()
+
+    @staticmethod
+    def _settings(
+        *,
+        model_type: str | None = "kspace_cold_diffusion",
+        critic: Any = _MISSING,
+        enabled: bool = True,
+    ) -> Any:
+        from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
+        from spectramr.config.settings import TrainingSettings
+
+        model: dict[str, Any] = {}
+        if model_type is not None:
+            model["model_type"] = model_type
+        if critic is not TestMultiContrastModelSupport._MISSING:
+            model["discriminator_component"] = {} if critic is None else {"name": critic}
+        return TrainingSettings.settings_from_dict(
+            {
+                "config_version": CANONICAL_CONFIG_VERSION,
+                "model": model,
+                "data": {
+                    "dataset_type": "m4raw",
+                    "multi_contrast": {"enabled": enabled},
+                },
+                "optimization": {},
+                "logging": {},
+            }
+        )
+
+    @staticmethod
+    def _check(settings: Any) -> Any:
+        return ConfigHealthChecker().check_multi_contrast_model_support(settings)
+
+    def test_disabled_multi_contrast_skips_even_with_an_unconditioned_critic(self) -> None:
+        """The gate is the opt-in flag, so the red set is exactly the arms that
+        asked for Pattern C -- not every arm that owns a critic."""
+        r = self._check(self._settings(critic="sense_bridge_patchgan", enabled=False))
+        assert r.passed and r.severity == "info"
+        assert "disabled" in r.message
+
+    def test_missing_model_type_is_rejected(self) -> None:
+        """PLANT (shape 1): the pre-existing shape, previously unplanted."""
+        r = self._check(self._settings(model_type=None))
+        assert not r.passed and r.severity == "error"
+        assert "model.model_type" in r.yaml_keys
+
+    def test_unconditioned_generator_is_rejected(self) -> None:
+        """PLANT (shape 2): ``unet`` is registered and declares the flag
+        ``False`` -- the shape the check has always caught."""
+        r = self._check(self._settings(model_type="unet"))
+        assert not r.passed and r.severity == "error"
+        assert "supports_contrast_conditioning" in r.message
+        assert r.yaml_keys == ["data.multi_contrast.enabled", "model.model_type"]
+
+    def test_unconditioned_critic_is_rejected(self) -> None:
+        """PLANT (shape 3): THE NEW SHAPE. A contrast-aware generator with an
+        unconditioned critic -- ``experiment_11_sense_bridge_critic`` exactly.
+        Before 2026-09-07 this returned ``passed=True``."""
+        r = self._check(self._settings(critic="sense_bridge_patchgan"))
+        assert not r.passed and r.severity == "error"
+        assert "sense_bridge_patchgan" in r.message
+        assert "model.discriminator_component.name" in r.yaml_keys
+        # The generator is fine, so it must NOT be blamed.
+        assert "model.model_type" not in r.yaml_keys
+
+    def test_both_consumers_are_reported_in_one_result(self) -> None:
+        """PLANT (shape 4): not first-failure-wins. A chain of early returns
+        would name the generator only, and the critic would be met on a second
+        audit run after the first fix."""
+        r = self._check(self._settings(model_type="unet", critic="sense_bridge_patchgan"))
+        assert not r.passed
+        assert "unet" in r.message and "sense_bridge_patchgan" in r.message
+        assert r.yaml_keys == [
+            "data.multi_contrast.enabled",
+            "model.model_type",
+            "model.discriminator_component.name",
+        ]
+
+    def test_critic_absent_from_the_registry_is_reported_not_inferred(self) -> None:
+        """PLANT (shape 5): ``patch_gan_discriminator`` is a real corpus critic
+        name (3 arms) that ``ModelFactory`` builds but ``MODEL_REGISTRY`` does
+        not carry, so no capability flag exists for it. Passing would infer
+        support from absence (non-negotiable 18); deferring would defer to
+        nobody, since ``check_model_registry`` reads ``model.model_type`` only.
+        The message must NOT claim the critic "does not declare" the flag."""
+        r = self._check(self._settings(critic="patch_gan_discriminator"))
+        assert not r.passed and r.severity == "error"
+        assert "cannot be established" in r.message
+        assert "does not declare" not in r.message
+        assert "model.discriminator_component.name" in r.yaml_keys
+
+    def test_a_declared_component_with_an_empty_name_is_treated_as_absent(self) -> None:
+        """PLANT (shape 6): ``ModelComponentSchema.name`` defaults to ``""``,
+        so ``discriminator_component: {}`` declares no critic. Testing
+        ``is None`` instead of falsiness would send this down the
+        absent-from-registry branch and fail an arm that owns no critic."""
+        r = self._check(self._settings(critic=None))
+        assert r.passed and r.severity == "info"
+        assert "no discriminator declared" in r.message
+
+    def test_no_critic_at_all_passes_when_the_generator_is_conditioned(self) -> None:
+        r = self._check(self._settings())
+        assert r.passed and r.severity == "info"
+
+    def test_a_contrast_aware_critic_passes(self) -> None:
+        """The check must be falsifiable in the passing direction too: without
+        this case it could reject every critic and stay green. No registered
+        discriminator declares the flag today (0 of 14 discriminator names in
+        ``MODEL_REGISTRY``, #1931), so the conditioned critic has to be planted. ``populate_model_registry`` is
+        additive and idempotent -- a planted entry survives it, and survives
+        ``force=True`` -- so the check's internal call cannot erase it."""
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        populate_model_registry()
+        entry = dict(MODEL_REGISTRY["sense_bridge_patchgan"])
+        # Plant into the NESTED capability -- since #1916 that is the only
+        # declaration surface, and a top-level key here would be ignored,
+        # making this plant vacuous (it would assert on an unaware critic).
+        entry["capabilities"] = replace(entry["capabilities"], supports_contrast_conditioning=True)
+        name = "_test_contrast_aware_critic"
+        MODEL_REGISTRY[name] = entry
+        try:
+            r = self._check(self._settings(critic=name))
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+        assert r.passed and r.severity == "info", r.message
+        assert name in r.message
+
+    def test_the_check_runs_inside_the_real_ladder(self) -> None:
+        """Wired behaviourally rather than by pinning source text: a
+        ``getsource`` substring is satisfiable by a comment, so it cannot tell
+        a called check from a mentioned one."""
+        report = ConfigHealthChecker().run_all_checks(
+            self._settings(critic="sense_bridge_patchgan")
+        )
+        named = [r for r in report.results if r.check_name == "multi_contrast_model_support"]
+        assert named, "check did not run inside run_all_checks"
+        assert not named[0].passed
+
+    @staticmethod
+    def _plant_critic(name: str, *, contrast_aware: bool) -> None:
+        """Copy a real discriminator entry under ``name``.
+
+        The copy is shallow, so it keeps the original ``role`` -- the key
+        ``_contrast_aware_critics`` now counts on (#1916 replaced its
+        ``IDiscriminator``/module-path union with the declared role). A plant
+        the census cannot tell from a genuine registration.
+        """
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        populate_model_registry()
+        entry = dict(MODEL_REGISTRY["sense_bridge_patchgan"])
+        entry["capabilities"] = replace(
+            entry["capabilities"], supports_contrast_conditioning=contrast_aware
+        )
+        MODEL_REGISTRY[name] = entry
+
+    def test_the_hint_names_a_contrast_aware_critic_when_one_exists(self) -> None:
+        """PLANT (shape 7): the hint's advice must track the registry.
+
+        With a conditioned critic registered, telling the user "there is no
+        drop-in replacement" is false -- and a hard-coded sentence cannot know.
+        """
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        name = "_test_hint_aware_critic"
+        self._plant_critic(name, contrast_aware=True)
+        try:
+            r = self._check(self._settings(critic="sense_bridge_patchgan"))
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+        assert not r.passed
+        assert name in r.fix_hint, r.fix_hint
+        assert "no registered discriminator declares" not in r.fix_hint
+
+    def test_the_denominator_is_counted_not_quoted(self) -> None:
+        """PLANT (shape 8): registering one more critic must move the count.
+
+        This is the assertion a constant cannot satisfy. The published number
+        was ``0 of 21`` while no registry held 21 -- it matched neither
+        ``MODEL_REGISTRY`` (14 discriminator names) nor ``ModelFactory``'s
+        separate registry (13). Pinning the *literal* would have re-frozen the
+        same defect, so pin the *delta* instead.
+
+        The test owns its own baseline. The ``(0 of N)`` sentence only renders
+        while **no** critic declares the flag; half 2 of #1931 registers one,
+        at which point the hint takes the ``available: [...]`` branch. Left
+        alone this test would then fail saying the census did not run -- false,
+        and misleading to whoever lands half 2 -- so it clears the flag on any
+        aware critic first and restores it in ``finally``.
+        """
+        import re
+
+        from spectramr.infrastructure.validation.config_health_checker import (
+            _contrast_aware_critics,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        def denominator(text: str | None) -> int:
+            assert text, "check produced no fix_hint at all (did the critic leg run?)"
+            m = re.search(r"\(0 of (\d+) discriminator names\)", text)
+            assert m, f"hint did not report a census: {text}"
+            return int(m.group(1))
+
+        populate_model_registry()
+        census = _contrast_aware_critics(MODEL_REGISTRY)
+        saved = {n: MODEL_REGISTRY[n] for n in census[0]}
+        for n, entry in saved.items():
+            MODEL_REGISTRY[n] = {
+                **entry,
+                "capabilities": replace(
+                    entry["capabilities"], supports_contrast_conditioning=False
+                ),
+            }
+
+        name = "_test_extra_unconditioned_critic"
+        try:
+            before = denominator(
+                self._check(self._settings(critic="sense_bridge_patchgan")).fix_hint
+            )
+            self._plant_critic(name, contrast_aware=False)
+            after = denominator(
+                self._check(self._settings(critic="sense_bridge_patchgan")).fix_hint
+            )
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+            MODEL_REGISTRY.update(saved)
+        assert after == before + 1, f"{before} -> {after}: the count is not being recomputed"
+
+
+class TestNoAllZeroReconstructionWeightWarning:
+    """``check_loss_weights`` was deleted in #1927. It warned "All major
+    reconstruction weights (L1, L2, Perceptual, SSIM) are 0.0!" by reading only
+    the legacy ``losses.reconstruction.lambda_*`` surface.
+
+    Two measurements condemned it:
+
+    * **It fired on 0 of 660 corpus arms.** ``lambda_l1`` and
+      ``lambda_perceptual`` both default to ``10.0``, so the all-zero condition
+      needs an author to write every lambda to zero by hand, and none does.
+    * **When it did fire, it was wrong.** Declaring the objective through
+      ``losses.image_losses`` while writing every legacy reconstruction lambda
+      to ``0.0`` is a legal config with a real objective — and it is exactly
+      the shape the check calls "no objective". Severity was ``warning`` and
+      ``audit`` is ``--strict`` by default (non-negotiable 4), so such an arm
+      would have failed its own pre-flight.
+
+    Note what the second bullet does **not** claim. A completed domain-list
+    migration does not produce that shape:
+    ``scripts/migrations/migrate_loss_lambdas_to_domain_lists.py`` **removes**
+    the legacy line rather than zeroing it (``lambda_perceptual`` is the one
+    unconditional ``DENY`` entry it keeps as written), and a removed key
+    resolves to the schema default ``10.0``. Measured on the corpus: all 60
+    migrated ``kspace_filling`` arms carry ``lambda_l1`` **absent**, so a
+    migrated arm cannot satisfy the all-zero condition at all. The check was
+    *silent* on the 506 domain-only arms, not wrong about them; reaching the
+    wrong state takes a hand-written all-zero legacy surface, which is what
+    the first test below builds.
+
+    So the check's only two states were *silent* and *wrong*. The
+    "does this arm have an objective at all?" invariant is real but has no
+    owner in the config layer, which cannot see what a strategy computes
+    inline; it is tracked against the ``inline_losses`` declaration work
+    (#1918).
+
+    The first test pins the emitted behaviour and stays meaningful whatever
+    mechanism a future author reaches for; the second is the tombstone.
+    """
+
+    @staticmethod
+    def _arm_with_objective_and_zeroed_legacy_lambdas() -> Any:
+        """An arm whose objective is declared ONLY through ``image_losses``,
+        with every legacy reconstruction lambda hand-written to ``0.0``.
+
+        This is *not* what the domain-list migration emits — that script
+        deletes the legacy lines, and a deleted key defaults back to ``10.0``.
+        It is the hand-written shape that made the deleted check fire.
+        """
+        import pathlib
+        import tempfile
+
+        import yaml
+
+        from spectramr.config.settings import TrainingSettings
+
+        src = require_repo_file(
+            "experiments/inprogress/kspace_filling/experiment_11_sense_bridge_critic.yaml"
+        )
+        raw = yaml.safe_load(src.read_text())
+        losses = raw.setdefault("losses", {})
+        losses["image_losses"] = [{"name": "l1", "weight": 1.0}]
+        recon = losses.setdefault("reconstruction", {})
+        # Every lambda the deleted check read, including its k-space escape hatch.
+        for field in (
+            "lambda_l1",
+            "lambda_l2",
+            "lambda_perceptual",
+            "lambda_ssim",
+            "lambda_complex_l1",
+            "lambda_complex_mse",
+            "lambda_sobolev_kspace",
+            "lambda_log_spectral",
+            "lambda_sense_adjoint_l1",
+            "lambda_kspace",
+            "lambda_frequency_domain",
+        ):
+            recon[field] = 0.0
+        tmp = pathlib.Path(tempfile.mkdtemp()) / "arm.yaml"
+        tmp.write_text(yaml.safe_dump(raw))
+        settings = TrainingSettings.from_yaml(str(tmp))
+        # The plant must survive the load: a resolved config is not a read
+        # config, and a silently-defaulted lambda would make this vacuous.
+        assert settings.losses.reconstruction.lambda_l1 == 0.0
+        assert settings.losses.reconstruction.lambda_perceptual == 0.0
+        assert [c.name for c in settings.losses.image_losses] == ["l1"]
+        return settings
+
+    def test_zeroed_legacy_surface_with_a_domain_objective_is_not_warned(self) -> None:
+        settings = self._arm_with_objective_and_zeroed_legacy_lambdas()
+        report = ConfigHealthChecker().run_all_checks(settings)
+        offenders = [
+            r
+            for r in report.results
+            if not r.passed and "major reconstruction weights" in (r.message or "")
+        ]
+        assert not offenders, (
+            "an arm declaring losses.image_losses=[l1] with the legacy "
+            "reconstruction lambdas zeroed HAS an objective; warning about it "
+            f"fails the arm's own --strict audit (NN4). Got: "
+            f"{[(r.check_name, r.severity, r.message) for r in offenders]}"
+        )
+
+    def test_the_deleted_check_is_not_resurrected(self) -> None:
+        assert not hasattr(ConfigHealthChecker, "check_loss_weights"), (
+            "check_loss_weights is back. It cannot answer 'does this arm have "
+            "an objective' from config alone — 25 of 34 empty-weight-table arms "
+            "declare inline_losses=frozenset() and 9 leave it None (undeclared), "
+            "so a config-layer re-base false-positives on all 34. The invariant "
+            "belongs with the strategy-side declaration work (#1918)."
+        )

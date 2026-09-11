@@ -21,7 +21,18 @@ class LossOutput:
     """Standard loss computation output - SSOT for all loss computers.
 
     Attributes:
-        total: Main scalar loss for backward pass (requires_grad=True)
+        total: Main scalar loss for the backward pass, carried through exactly as
+            the computer produced it -- this class does not adjust
+            ``requires_grad``. It used to: a ``__post_init__`` "ensured
+            gradients" with ``total.detach().requires_grad_(True)``, which does
+            not restore a graph but *manufactures a leaf* (``grad_fn is None``).
+            ``backward()`` on that leaf succeeds, every ``param.grad`` stays
+            ``None``, and the run checkpoints having learned nothing (#1952).
+            The graph contract belongs at the backward seam
+            (``infrastructure.training.backward_guard.ensure_backward_ready``),
+            not here: at validation a grad-free total is *legitimate*, because
+            the prediction was produced under ``no_grad``, so asserting it here
+            would fire on every validation batch.
         components: Detailed loss components for logging (detached)
         metrics: Non-differentiable metrics (e.g., PSNR, SSIM)
     """
@@ -29,11 +40,6 @@ class LossOutput:
     total: torch.Tensor  # Scalar loss for backward
     components: dict[str, torch.Tensor] = field(default_factory=dict)  # Detailed losses
     metrics: dict[str, float] = field(default_factory=dict)  # Monitoring metrics
-
-    def __post_init__(self):
-        """Ensure total requires gradients."""
-        if self.total is not None and not self.total.requires_grad:
-            self.total = self.total.detach().requires_grad_(True)
 
     def to_dict(self) -> dict[str, torch.Tensor]:
         """Convert to dictionary for logging.

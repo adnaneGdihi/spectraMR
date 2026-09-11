@@ -11,6 +11,7 @@ import yaml
 from spectramr.infrastructure.physics.chain_fitter import FitResult
 from spectramr.infrastructure.physics.degradation_chain import ChainLink, DegradationChain
 from spectramr.infrastructure.training.strategies.quality_matching_strategy import (
+    QualityMatchingStrategy,
     require_quality_matching_config,
     write_calibration_artifact,
 )
@@ -299,9 +300,9 @@ def test_the_registered_strategy_actually_calls_fit_chain():
 
     # And the strategy must really call the orchestration, from a TRAINING hook --
     # setup alone runs before any data exists and could not fit anything.
-    assert hasattr(
-        QualityMatchingStrategy, "_compute_losses_impl"
-    ), "the strategy overrides no training hook, so the fit can never run"
+    assert hasattr(QualityMatchingStrategy, "_compute_losses_impl"), (
+        "the strategy overrides no training hook, so the fit can never run"
+    )
     body = inspect.getsource(QualityMatchingStrategy._compute_losses_impl)
     assert "run_quality_matching(" in body
 
@@ -558,9 +559,7 @@ def test_synthesised_input_is_actually_degraded_relative_to_its_target(tmp_path)
 
     src = [_fake_h5(tmp_path / "v.h5")]
     chain = DegradationChain(links=(ChainLink(axis="t2star_blur", theta=0.9),))
-    doc = json.loads(
-        synthesise_pairs(chain, src, tmp_path / "out", seed=1).read_text()
-    )
+    doc = json.loads(synthesise_pairs(chain, src, tmp_path / "out", seed=1).read_text())
     rec = doc["records"][0]
 
     lq = NiftiStrategy().load(rec["primary_path"])["data"].squeeze().unsqueeze(1)
@@ -679,9 +678,7 @@ def test_acquisition_prior_reaches_the_fit_and_is_recorded(tmp_path):
     )
     assert cfg.acquisition_prior_enabled is True
 
-    run_quality_matching(
-        cfg, torch.rand(2, 32, 32), hq_header=_HEADER_HQ_3T
-    )
+    run_quality_matching(cfg, torch.rand(2, 32, 32), hq_header=_HEADER_HQ_3T)
 
     doc = yaml.safe_load((tmp_path / "out" / "calibration.yaml").read_text())
     prior = doc["acquisition_prior"]
@@ -951,8 +948,16 @@ def test_explicit_pairs_honour_contrast(tmp_path):
     m.write_text(
         json.dumps(
             [
-                {"input_path": "/d/a_ulf.nii.gz", "target_path": "/d/a_hf.nii.gz", "contrast": "t1w"},
-                {"input_path": "/d/b_ulf.nii.gz", "target_path": "/d/b_hf.nii.gz", "contrast": "t2w"},
+                {
+                    "input_path": "/d/a_ulf.nii.gz",
+                    "target_path": "/d/a_hf.nii.gz",
+                    "contrast": "t1w",
+                },
+                {
+                    "input_path": "/d/b_ulf.nii.gz",
+                    "target_path": "/d/b_hf.nii.gz",
+                    "contrast": "t2w",
+                },
             ]
         )
     )
@@ -999,10 +1004,16 @@ def test_cluster_manifest_paths_resolve_against_data_root(tmp_path):
                 "manifest_version": "3.0",
                 "data_root": "databases/brain/fastmri/singlecoil_train",
                 "records": [
-                    {"relative_path": "sub01/file_brain_AXT1_01.h5",
-                     "filename": "file_brain_AXT1_01.h5", "file_id": "file_brain_AXT1_01"},
-                    {"relative_path": "sub02/file_brain_AXT1_02.h5",
-                     "filename": "file_brain_AXT1_02.h5", "file_id": "file_brain_AXT1_02"},
+                    {
+                        "relative_path": "sub01/file_brain_AXT1_01.h5",
+                        "filename": "file_brain_AXT1_01.h5",
+                        "file_id": "file_brain_AXT1_01",
+                    },
+                    {
+                        "relative_path": "sub02/file_brain_AXT1_02.h5",
+                        "filename": "file_brain_AXT1_02.h5",
+                        "file_id": "file_brain_AXT1_02",
+                    },
                 ],
             }
         )
@@ -1062,8 +1073,12 @@ def test_field_selection_also_resolves_relative_paths(tmp_path):
             {
                 "data_root": "databases/external/mrixfields2026",
                 "records": [
-                    {"relative_path": "T1w/0.1T/v1.nii.gz", "field_strength": 0.1,
-                     "contrast": "t1w", "subject_id": "v1"},
+                    {
+                        "relative_path": "T1w/0.1T/v1.nii.gz",
+                        "field_strength": 0.1,
+                        "contrast": "t1w",
+                        "subject_id": "v1",
+                    },
                 ],
             }
         )
@@ -1121,3 +1136,17 @@ class TestHqManifestReachesTheFit:
         from spectramr.config.schemas.data import DataConfigSchema
 
         assert DataConfigSchema().source.index_path is None
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: the hook returns self._zero_loss(): it computes no loss at all.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert QualityMatchingStrategy.__dict__["folds_image_losses"] is False
+    assert QualityMatchingStrategy.__dict__["inline_losses"] == frozenset()

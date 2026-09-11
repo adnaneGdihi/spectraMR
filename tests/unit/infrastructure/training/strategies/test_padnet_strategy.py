@@ -3,14 +3,13 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-from tests.utils.config_block_stub import block_stub
 import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.training.strategies.padnet_strategy import (
     PaDNetTrainingStrategy,
 )
+from tests.utils.config_block_stub import block_stub
 
 
 class MockConfig:
@@ -104,9 +103,7 @@ def mock_env():
         gradient_clip_method="norm",
         gradient_clip_value=1.0,
     )
-    config.model = MockConfig(
-        model_type="padnet", domain="image", in_channels=2, out_channels=2
-    )
+    config.model = MockConfig(model_type="padnet", domain="image", in_channels=2, out_channels=2)
     config.losses = MockConfig()
     config.losses.reconstruction = MockConfig(enable_l1=False, lambda_l1=0.0)
     config.physics = MockConfig()
@@ -162,9 +159,7 @@ def test_compute_losses_impl_padnet(strategy, mock_env):
     # Batch metadata via kwargs
     batch_kwargs = {"batch": {"tr": 500.0, "te": 10.0}}
 
-    losses = strategy._compute_losses_impl(
-        input_batch, target_batch, epoch=0, **batch_kwargs
-    )
+    losses = strategy._compute_losses_impl(input_batch, target_batch, epoch=0, **batch_kwargs)
 
     assert "g_total_loss" in losses
     assert "g_loss_mse" in losses
@@ -249,9 +244,7 @@ class TestModelInputContract:
         would never emit a stashed tensor, so a declaration here would be dead
         weight that silently pinned one step's activations.
         """
-        mock_env.generator.predict_q_maps = lambda x: torch.randn(
-            1, 3, 32, 32, requires_grad=True
-        )
+        mock_env.generator.predict_q_maps = lambda x: torch.randn(1, 3, 32, 32, requires_grad=True)
         strategy._declared_model_input = None
 
         strategy._compute_losses_impl(
@@ -262,3 +255,17 @@ class TestModelInputContract:
         )
 
         assert strategy._declared_model_input is None
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: only the physics module's l2_image runs; nothing else reaches the objective.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert PaDNetTrainingStrategy.__dict__["folds_image_losses"] is False
+    assert PaDNetTrainingStrategy.__dict__["inline_losses"] == frozenset({"l2"})

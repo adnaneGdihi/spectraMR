@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import enum
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -156,12 +156,24 @@ class R1RegularizationLoss(nn.Module):
         self.weight = weight
 
     def forward(
-        self, discriminator: Any, real_images: torch.Tensor, *args, **kwargs
+        self,
+        discriminator: Any,
+        real_images: torch.Tensor,
+        *args,
+        critic_cond: "Mapping[str, Any] | None" = None,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Args:
             discriminator: Discriminator network (or prediction tensor in dummy calls)
             real_images: Real input images [B, C, H, W] (or target tensor in dummy calls)
+            critic_cond: Conditioning for the ``discriminator(real_images)`` call
+                below (#1931). An explicit parameter rather than a read out of
+                ``**kwargs``: this signature already absorbs stray keywords
+                silently, so a caller that passed conditioning would have had it
+                accepted and dropped, and the penalty would have regularized a
+                gradient the critic never takes. ``None`` reproduces the
+                unconditioned call exactly.
         """
         if self.weight <= 0:
             return torch.tensor(
@@ -178,7 +190,7 @@ class R1RegularizationLoss(nn.Module):
             return torch.tensor(0.0, device=dev)
 
         real_images.requires_grad_(True)
-        real_logits = discriminator(real_images)
+        real_logits = discriminator(real_images, **(critic_cond or {}))
 
         # Compute gradients of logits w.r.t input images
         grads = torch.autograd.grad(
@@ -193,10 +205,21 @@ class R1RegularizationLoss(nn.Module):
         if grads is None:
             return torch.tensor(0.0, device=real_images.device)
 
-        # R1 penalty: 0.5 * ||grad||^2
-        # flatten all dims except batch
+        # R1 penalty: 0.5 * ||grad||^2, flattened over all dims except batch.
+        #
+        # ``(g.conj() * g).real`` rather than ``g.pow(2)`` because this critic's
+        # input may be complex (#1931). For complex ``g = a + bi``, ``g**2`` is
+        # ``a^2 - b^2 + 2abi`` -- not a squared magnitude, and not even real, so
+        # the penalty poisons the total loss and ``backward()`` dies with "grad
+        # can be implicitly created only for real scalar outputs". Torch's
+        # convention for a real loss gives ``g == dL/da + i*dL/db``, so
+        # ``(g.conj() * g).real == (dL/da)^2 + (dL/db)^2`` is exactly the squared
+        # Euclidean norm over the real view, and is identical to ``g**2`` when
+        # ``g`` is real. ``g.abs().pow(2)`` computes the same value but is
+        # differentiated by ``create_graph=True`` and is undefined at zero.
+        # Same defect, same fix as :func:`gradient_penalty_loss`.
         grads = grads.view(grads.size(0), -1)
-        r1_penalty = 0.5 * grads.pow(2).sum(dim=1).mean()
+        r1_penalty = 0.5 * (grads.conj() * grads).real.sum(dim=1).mean()
 
         if torch.isnan(r1_penalty) or torch.isinf(r1_penalty):
             return torch.tensor(0.0, device=real_images.device)
@@ -396,21 +419,48 @@ class HingeLoss(AdversarialLossStrategy):
         return real_loss, fake_loss
 
 
-def gradient_penalty_loss(discriminator, real_data, fake_data, eps=1e-8):
-    """gradient_penalty_loss.
+def gradient_penalty_loss(discriminator, real_data, fake_data, eps=1e-8, critic_cond=None):
+    """WGAN-GP: penalise the critic gradient norm away from 1 on interpolates.
+
+    This is the **fourth** critic call on a discriminator step -- ``real``,
+    ``fake``, R1 and this one -- and it is the one the conditioning seam missed
+    (#1931). ``critic_cond`` is forwarded here exactly as the real and fake
+    calls forward it, so a critic declaring ``supports_contrast_conditioning``
+    is scored under its condition instead of raising on step 1. Passing
+    ``None`` reproduces the old unconditioned call byte-for-byte, which is what
+    every caller outside :class:`CompositeGANLoss` still does.
+
+    Real and fake share one payload (see
+    ``UnifiedGANLossComputer.compute_discriminator_loss``), so a point on the
+    segment between them carries that same payload -- there is no interpolation
+    to do on the condition itself.
+
+    **The norm is complex-safe.** ``_align_for_critic`` (#1920) hands this
+    function complex tensors whenever the configured critic declares
+    ``accepts_complex``, and ``autograd.grad`` then returns a complex gradient.
+    ``grads ** 2`` on a complex tensor is the complex square
+    ``a**2 - b**2 + 2abi``, not ``a**2 + b**2``: the penalty came out complex,
+    ``d_total_loss`` with it, and ``backward()`` died with "grad can be
+    implicitly created only for real scalar outputs but got torch.complex64".
+    Under torch's convention a real loss gives ``g = dL/da + i * dL/db``, so
+    ``(g.conj() * g).real`` is ``(dL/da)**2 + (dL/db)**2`` -- the squared
+    Euclidean norm over the real view -- and is identical to ``g ** 2`` when
+    ``g`` is real. It is preferred over ``g.abs() ** 2`` because ``abs`` is not
+    differentiable at zero, and ``create_graph=True`` differentiates through it.
 
     Args:
-        discriminator (Any): Description.
-        real_data (Any): Description.
-        fake_data (Any): Description.
-        eps (Any): Description.
+        discriminator (Any): The critic; called once, on the interpolates.
+        real_data (Any): Real samples in the critic's own domain.
+        fake_data (Any): Generated samples, same domain and shape.
+        eps (Any): Added under the square root so its gradient stays finite.
+        critic_cond (Any): Keyword payload forwarded to the critic, or ``None``.
     Returns:
-        Any: Description.
+        Any: The scalar penalty. Always real, whatever the input dtype.
     """
     batch = real_data.size(0)
     alpha = torch.rand(batch, 1, 1, 1, device=real_data.device)
     interp = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
-    disc_interp = discriminator(interp)
+    disc_interp = discriminator(interp, **(critic_cond or {}))
     grads = autograd.grad(
         outputs=disc_interp,
         inputs=interp,
@@ -419,7 +469,7 @@ def gradient_penalty_loss(discriminator, real_data, fake_data, eps=1e-8):
         retain_graph=True,
     )[0]
     grads = grads.view(batch, -1)
-    grad_norm = torch.sqrt(torch.sum(grads**2, dim=1) + eps)
+    grad_norm = torch.sqrt(torch.sum((grads.conj() * grads).real, dim=1) + eps)
     return ((grad_norm - 1) ** 2).mean()
 
 
@@ -660,8 +710,16 @@ class CompositeGANLoss(nn.Module):
         discriminator: nn.Module,
         real_images: torch.Tensor,
         fake_images: torch.Tensor,
+        critic_cond: "Mapping[str, Any] | None" = None,
     ) -> dict[str, torch.Tensor]:
         """compute_discriminator_loss.
+
+        ``real_outputs_d``/``fake_outputs_d`` were already scored by the
+        caller, so ``discriminator`` is used for one thing here: the gradient
+        penalty's own call on the interpolates. ``critic_cond`` exists for that
+        single call (#1931) -- declared explicitly rather than absorbed into
+        ``**kwargs`` so that an implementer which cannot honour it fails at the
+        call rather than dropping the payload silently.
 
         Args:
             real_outputs_d (torch.Tensor): Description.
@@ -669,6 +727,9 @@ class CompositeGANLoss(nn.Module):
             discriminator (nn.Module): Description.
             real_images (torch.Tensor): Description.
             fake_images (torch.Tensor): Description.
+            critic_cond (Optional[Mapping[str, Any]]): Conditioning forwarded to
+                the gradient penalty's critic call; ``None`` leaves it
+                unconditioned, as every non-conditioned arm expects.
         Returns:
             dict[str, torch.Tensor]: Description.
         """
@@ -682,7 +743,9 @@ class CompositeGANLoss(nn.Module):
         }
         total = losses["d_loss_real"] + losses["d_loss_fake"]
         if self.lambda_gp > 0:
-            gp = gradient_penalty_loss(discriminator, real_images, fake_images)
+            gp = gradient_penalty_loss(
+                discriminator, real_images, fake_images, critic_cond=critic_cond
+            )
             losses["gp_loss"] = gp * self.lambda_gp
             total = total + losses["gp_loss"]
         losses["d_total_loss"] = total
@@ -987,6 +1050,7 @@ class CompositeLoss(nn.Module):
         *,
         real_outputs_d: torch.Tensor | None = None,
         fake_outputs_d: torch.Tensor | None = None,
+        critic_cond: "Mapping[str, Any] | None" = None,
         **_unused: object,
     ) -> dict[str, torch.Tensor]:
         """compute_discriminator_loss.
@@ -999,6 +1063,10 @@ class CompositeLoss(nn.Module):
             fake_images (Optional[torch.Tensor]): Description.
             real_outputs_d (Optional[torch.Tensor]): Description.
             fake_outputs_d (Optional[torch.Tensor]): Description.
+            critic_cond (Optional[Mapping[str, Any]]): Forwarded to the core
+                loss, and from there to the gradient penalty's critic call
+                (#1931). Named explicitly: ``**_unused`` would have swallowed
+                it and left the penalty unconditioned with no error at all.
         Returns:
             dict[str, torch.Tensor]: Description.
         """
@@ -1029,6 +1097,7 @@ class CompositeLoss(nn.Module):
             discriminator=discriminator,
             real_images=real_images,
             fake_images=fake_images,
+            critic_cond=critic_cond,
         )
         zero = resolved_real.new_zeros(())
         return {

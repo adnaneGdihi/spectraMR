@@ -103,6 +103,136 @@ context owned by the GAN strategy.
 Pinned by
 :py:func:`tests.unit.test_loss_computers.TestUnifiedReconstructionLossComputer.test_declarative_mse_only_yaml_still_computes_loss_pre_warmup`.
 
+One weight, one declaration surface
+------------------------------------
+
+A loss weight can be written in two places: ``losses.<section>.lambda_<name>``
+and an entry in one of the domain lists. When both are present,
+:py:func:`~spectramr.models.losses.weights.build_loss_weight_table` resolves them
+to a single number, and raises when the two values differ, so an arm declaring
+both trains correctly today. The redundancy still costs something, because only the list entry constructs
+the loss module and selects the FFT bridge. The matching lambda adds no term to
+the objective, and editing it changes nothing.
+
+**The domain list is the single source of truth.** Delete the redundant
+``lambda_``, not the list entry.
+
+Two detectors cover the two directions, at different times:
+
+``check_loss_weight_declaration_ssot``
+   Reports a name declared on both surfaces. Runs under ``spectramr audit``, at
+   ``severity="warning"``, category ``duplication``. It does not filter on
+   ``enabled``: a disabled list entry with a live lambda is the one an author
+   re-enables later, at the weight the list holds. Two entries in *different*
+   lists are not reported: the list a term appears in selects its domain bridge,
+   so two lists declare a two-domain objective.
+
+``LossBuilder``'s ``unmigrated`` guard
+   Raises when a weight resolves on the lambda surface alone, which would
+   otherwise train without the supervision the YAML advertises (non-negotiable 9).
+   It runs at build time, and only for arms that already populate a domain list —
+   ``_build_all_dynamic`` returns earlier when
+   ``uses_list_based_losses`` is false. An arm that has not begun migrating is
+   therefore outside its scope; the duplicate shape above is what ``audit``
+   covers corpus-wide.
+
+Planted violations for both live in
+``tests/unit/infrastructure/validation/test_config_health_checker_loss_ssot_2026_09.py``
+and ``tests/unit/infrastructure/training/builders/test_loss_builder_unmigrated_guard_2026_09.py``.
+
+Two exemptions from the pairing rule
+-------------------------------------
+
+The weight table aliases ``lambda_mse`` onto the key ``l2``, so
+``losses.diffusion.lambda_mse`` shares a table entry with an ``mse`` entry in
+``image_losses``. They weight different terms. The lambda is step 3 of
+``_resolve_diffusion_weight``
+(``models/losses/computers/unified_diffusion_reconstruction.py``), which weights
+the diffusion term; the list entry builds an MSE module on the image branch.
+Deleting the lambda would drop the diffusion weight to the fallback and leave
+the image term where it was.
+
+``COMPUTER_RESOLVED_LAMBDA_SOURCES``
+(``infrastructure/training/builders/loss_builder.py``) names the lambdas a
+computer reads directly under a meaning of their own. The audit does not report
+them and the migration does not delete them.
+
+The second exemption has an unrelated cause. ``losses.reconstruction.lambda_l2``
+defaults to 0.0 and ``losses.diffusion.lambda_mse`` defaults to 1.0, and both
+alias the table key ``l2``. A config load stamps every schema default as a value,
+so an arm that trains an MSE term at 1.0 has to write the first field for the two
+to agree. On the written surface that field reads as a duplicate of the ``mse``
+list entry, and deleting it leaves the two declarations 0.0 apart from 1.0.
+
+:py:func:`~spectramr.models.losses.weights.deleting_lambda_would_conflict` answers
+this by re-reading the config with the field at its schema default and comparing
+the result. Two ``kspace_filling`` arms carry the shape and keep the field. The
+divergent per-section defaults are issue #421; closing it retires the exemption.
+
+The pairing rule has one owner (non-negotiable 17):
+:py:func:`~spectramr.infrastructure.validation.config_health_checker.dual_surface_loss_declarations`
+returns ``(name, weight, lambda_sites, list_sites)`` for each weight written on
+both surfaces, with the exemption applied. ``check_loss_weight_declaration_ssot``
+renders it as a finding, and the corpus migration script gates every deletion on
+it, so the script cannot remove a field the audit would not have reported.
+
+Migrating a cohort
+------------------
+
+The migration is driven by ``migrate_loss_lambdas_to_domain_lists.py``, kept in the
+research tree's ``scripts/migrations`` directory. The distribution does not carry
+it: it rewrites the ``experiments/`` corpus, which is not published either. Pointed
+at a cohort directory it dry-runs by default and writes only under ``--apply``:
+
+.. code-block:: bash
+
+   python migrate_loss_lambdas_to_domain_lists.py <cohort-dir>          # dry run, the default
+   python migrate_loss_lambdas_to_domain_lists.py <cohort-dir> --apply
+
+A field is deleted only if three independent surfaces agree. A **domain list**
+names it — the script scans the YAML text, so a ``lambda_`` outside a category
+block under top-level ``losses:`` is never a candidate at all. The **deny-list**
+lets it go. And ``dual_surface_loss_declarations`` **reports that exact
+block/name pair**. A candidate the audit does not report is kept and named in the
+verdict as ``UNREPORTED``, never folded into "already migrated": a divergence
+between the text scan and the audit is a finding, not a no-op. It is the one
+non-fatal verdict that makes the **run exit 1**, so a cohort sweep cannot report
+success over it — including on an arm that migrated *and* diverged, where the
+verdict still carries the ``MIGRATED`` head. ``DENIED`` exits 0: it is a recorded
+exemption that a fully migrated cohort reports on every run.
+
+The edit is then written, the arm reloaded, and rolled back unless two censuses
+come back identical. The first is the **resolved weight table** — weight, enabled
+*and* warmup gating per term, so a migration that changed a term's gating without
+changing its number cannot pass as inert. The second is a **raw-reader census**,
+which exists because the weight table cannot see every consumer: some readers
+resolve a ``lambda_`` off the config field directly and bypass the SSOT entirely.
+The script also refuses outright rather than emptying a category block.
+
+The deny-list is for the removals **neither census can catch**, and both its
+entries are latent rather than live — which is exactly why a before/after
+comparison is not enough on its own:
+
+* ``lambda_perceptual`` is read raw to construct ``gan_composite``, inside a
+  branch taken only when the arm declares a critic. No arm in the residue does, so
+  deleting an explicit ``0.1`` changes nothing measurable today and becomes a 100x
+  jump against the ``10.0`` schema default the moment one is added.
+* ``losses.diffusion.lambda_mse`` is resolved by its literal dotted path, while the
+  SSOT canonicalizes ``lambda_mse`` onto ``l2`` — a different term. The audit is
+  silent here **on purpose**: ``REINTERPRETED_LAMBDA_SOURCES`` exempts it precisely
+  because a lambda a computer reads under a different meaning is a second knob, not
+  a duplicate. So the audit gate would already keep the field, and the deny-list
+  entry does two other jobs — it makes the verdict say ``DENIED`` (a recorded,
+  reasoned exemption) rather than ``UNREPORTED`` (a divergence to go look at), and
+  it is what still stands between the field and a deletion if that exemption is
+  ever narrowed.
+
+Scope: ``experiments/inprogress/`` only. Done: ``kspace_filling``, 2026-09-07.
+What survives there is pinned per arm by
+``tests/audit/test_kspace_filling_loss_ssot_2026_09.py`` rather than counted here —
+that test fails if a dual-surface declaration returns to the cohort, and its
+per-arm exemption list shrinks as each pin is retired.
+
 Per-entry constructor arguments: ``kwargs:``, never ``config:``
 ---------------------------------------------------------------
 

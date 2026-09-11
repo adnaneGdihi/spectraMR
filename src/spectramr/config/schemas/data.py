@@ -233,7 +233,11 @@ class MultiContrastConfigSchema(BaseModel):
     contrast_idx=...)``. The model is responsible for consuming it (typically
     via ``nn.Embedding(n_contrasts, embed_dim)`` feeding a FiLM γ/β MLP);
     the Tier-1 audit ``multi_contrast_model_support`` guards against silently
-    selecting a model that ignores the id.
+    selecting a model that ignores the id. It checks **both** consumers --
+    ``model.model_type`` and, when one is declared,
+    ``model.discriminator_component.name`` -- because an unconditioned critic
+    drops ``contrast_idx`` just as silently as an unconditioned generator
+    (#1931).
 
     Distinguish from:
 
@@ -3731,7 +3735,9 @@ class DataConfigSchema(BaseModel):
         description=(
             "Opt-in: enable per-sample contrast-id conditioning so a single "
             "model can handle T1/T2/FLAIR/PD by reading a `contrast_idx` "
-            "tensor on every batch. Requires `model.model_type` to declare "
+            "tensor on every batch. Requires every model the batch reaches "
+            "-- `model.model_type` and, when declared, "
+            "`model.discriminator_component.name` -- to declare "
             "`supports_contrast_conditioning=True`; the Tier-1 audit check "
             "`multi_contrast_model_support` enforces this. Datasets that "
             "expose contrast metadata (M4Raw, slice, contrast_aware_paired) "

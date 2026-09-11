@@ -142,6 +142,9 @@ from spectramr.infrastructure.training.builders.director import (
 from spectramr.infrastructure.training.mixed_precision import (  # noqa: E402
     resolve_amp_precision,
 )
+from spectramr.infrastructure.training.strategies.loss_folding import (  # noqa: E402
+    declares_inline_objective,
+)
 from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
 from spectramr.infrastructure.validation.config_health_checker import (
     FATAL_HEALTH_CHECKS,
@@ -426,7 +429,7 @@ def _preprocess_validation_tensor(t: Any, config: Any) -> Any:
         # doubly dead: DataConfigSchema never declares `image_size` and is
         # extra="ignore", so hasattr was permanently False; and `migrate_legacy_sizes`
         # (data.py) already folds img_size / target_size / image_size into
-        # `patch_size`, which the branch above consumes. Re-declaring the key
+        # `patch_size`, which the branch above consumes. Redeclaring the key
         # would resurrect a spelling the migration exists to retire.
 
         if target_size is not None and (target_size[0] != H or target_size[1] != W):
@@ -876,7 +879,11 @@ def run_training_pipeline(
     # Use the 'losses' property which consolidates losses_dict and single modules
     losses = pipeline.losses
 
-    if not losses:
+    # Reached only on the ``env=`` scripting path, which skips the director and so
+    # never runs ``LossBuilder.validate()``. Both readers ask the strategy the same
+    # question (NN17), so a strategy that declares it owns its objective inline is
+    # not warned about here either.
+    if not losses and not declares_inline_objective(type(strategy)):
         logging_service.log_warning("No losses were built by LossBuilder; training may fail.")
 
     # Legacy Gradient Logger (Pending refactor to proper service)

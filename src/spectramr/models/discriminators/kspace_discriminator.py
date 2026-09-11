@@ -19,7 +19,12 @@ from spectramr.models.registry import register_model
 logger = logging.getLogger(__name__)
 
 
-@register_model(name="kspace_discriminator", training_mode="gan")
+# ``input_domain="image"`` despite the name (#1920): this critic FFTs its own
+# input via ``_to_kspace`` -> ``fft2c``, so the k-space it scores is one it
+# MANUFACTURES. Handing it k-space would compute ``F{F{x}}`` -- the spatially
+# reversed image -- finite, brain-shaped and wrong. The declaration is read off
+# ``forward``, never off the class name.
+@register_model(role="discriminator", name="kspace_discriminator", training_mode="gan", input_domain="image")
 class KSpaceDiscriminator(nn.Module):
     """Discriminator that operates in both spatial and frequency domains.
 
@@ -223,7 +228,12 @@ class KSpaceDiscriminator(nn.Module):
         return combined_out
 
 
-@register_model(name="frequency_domain_discriminator", training_mode="gan")
+# ``input_domain="image"`` despite the name (#1920): this critic FFTs its own
+# input via ``_to_kspace`` -> ``fft2c``, so the k-space it scores is one it
+# MANUFACTURES. Handing it k-space would compute ``F{F{x}}`` -- the spatially
+# reversed image -- finite, brain-shaped and wrong. The declaration is read off
+# ``forward``, never off the class name.
+@register_model(role="discriminator", name="frequency_domain_discriminator", training_mode="gan", input_domain="image")
 class FrequencyDomainDiscriminator(nn.Module):
     """Pure frequency-domain discriminator operating only on k-space.
 
@@ -398,8 +408,10 @@ class FrequencyDomainDiscriminator(nn.Module):
         return magnitude
 
 
-@register_model(name="kspace_aware_discriminator", training_mode="gan")
-class KSpaceAwareDiscriminator(IDiscriminator):
+# ``input_domain="image"`` (#1920): delegates every call to a
+# ``KSpaceDiscriminator``, so it inherits that critic's domain exactly.
+@register_model(role="discriminator", name="kspace_aware_discriminator", training_mode="gan", input_domain="image")
+class KSpaceAwareDiscriminator(IDiscriminator, nn.Module):
     """Full implementation of k-space aware discriminator implementing
     IDiscriminator interface.
 
@@ -430,6 +442,10 @@ class KSpaceAwareDiscriminator(IDiscriminator):
             spectral_norm (bool): Description.
         """
         super().__init__()
+        # Stored because ``get_output_shape`` needs the DEPTH, and the depth is
+        # not recoverable from the built module: ``_build_spatial_discriminator``
+        # appends three modules per level, so ``len(Sequential)`` is 3*(n+1).
+        self.num_layers = num_layers
         self.spatial_disc = KSpaceDiscriminator(
             in_channels=in_channels,
             base_channels=base_channels,
@@ -449,9 +465,31 @@ class KSpaceAwareDiscriminator(IDiscriminator):
         return self.forward(x)
 
     def get_feature_maps(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Extract feature maps for feature matching."""
-        # For now, return empty dict as feature extraction is not implemented # IMPL
-        return {}
+        """Refuse: this critic exposes no intermediate activations (#1920).
+
+        Returning ``{}`` -- what this did -- is the silent-failure shape
+        non-negotiable 3 forbids. A feature-matching loss iterates the returned
+        maps and sums over them; an empty dict makes that sum ``0`` for every
+        batch, so the term is declared, weighted, logged, and contributes
+        nothing. The run trains and the number is wrong.
+
+        ``SenseBridgeDiscriminator.get_feature_maps`` forwards to its inner
+        critic, so an arm naming this class as ``inner_critic`` now fails at the
+        first step instead of training against a constant zero.
+
+        Args:
+            x: the tensor that would be scored.
+
+        Raises:
+            NotImplementedError: always.
+        """
+        raise NotImplementedError(
+            "KSpaceAwareDiscriminator exposes no feature maps: it wraps a "
+            "KSpaceDiscriminator whose spatial and frequency branches are "
+            "separate nn.Sequential stacks with no activation taps. Use a critic "
+            "that implements get_feature_maps (e.g. patch_gan) for a "
+            "feature-matching loss, or drop the feature-matching term."
+        )
 
     @property
     def name(self) -> str:
@@ -463,13 +501,29 @@ class KSpaceAwareDiscriminator(IDiscriminator):
         return "KSpaceAwareDiscriminator"
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """Get output shape for given input shape."""
-        # Simplified calculation - actual shape depends on network architecture
-        batch_size, channels, height, width = input_shape
-        # Approximate output size after downsampling
-        out_height = height // (2 ** self.spatial_disc.spatial_disc.__len__())
-        out_width = width // (2 ** self.spatial_disc.spatial_disc.__len__())
-        return (batch_size, 1, out_height, out_width)
+        """Output shape of :meth:`forward` for ``input_shape``.
+
+        The factor is ``2 ** (num_layers + 1)``: ``_build_spatial_discriminator``
+        runs ``for i in range(num_layers + 1)`` and every level is a stride-2
+        conv, while ``spatial_out`` is 1x1 and does not downsample.
+
+        This read ``2 ** len(self.spatial_disc.spatial_disc)`` (#1920). That
+        length counts MODULES, not levels -- three per level (conv, norm,
+        activation) -- so it reported ``2 ** 12 = 4096`` where the network
+        downsamples by 16, and integer division drove the answer to ``0``. The
+        formula below is pinned against a real forward in
+        ``test_kspace_discriminator.py`` rather than against this arithmetic,
+        because the arithmetic is exactly what was wrong before.
+
+        Args:
+            input_shape: ``(batch, channels, height, width)``.
+
+        Returns:
+            ``(batch, 1, height // f, width // f)`` with ``f`` as above.
+        """
+        batch_size, _channels, height, width = input_shape
+        factor = 2 ** (self.num_layers + 1)
+        return (batch_size, 1, height // factor, width // factor)
 
     def get_parameter_count(self) -> int:
         """Get total parameter count."""

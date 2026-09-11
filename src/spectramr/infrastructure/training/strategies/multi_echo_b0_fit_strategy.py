@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.core.metrics.b0_field_rmse import B0FieldRMSE

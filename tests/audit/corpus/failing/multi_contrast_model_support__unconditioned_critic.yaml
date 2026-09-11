@@ -1,0 +1,72 @@
+# FAILING YAML — trips: multi_contrast_model_support (ConfigHealthChecker)
+# Violation: data.multi_contrast.enabled is true and the GENERATOR is
+#   contrast-aware, but the CRITIC named by model.discriminator_component.name
+#   declares supports_contrast_conditioning=False.  contrast_idx is emitted on
+#   every batch and dropped at the discriminator boundary.
+# check_name: multi_contrast_model_support
+# severity: error
+#
+# Why this fixture exists (2026-09-07, #1931):
+#   check_multi_contrast_model_support read only model.model_type, so this
+#   exact pairing audited GREEN.  experiment_11_sense_bridge_critic.yaml is the
+#   live arm with this shape — the corpus had no witness for it because the
+#   check could not produce one.  The generator here is deliberately compliant
+#   (kspace_cold_diffusion declares the flag True): a fixture that failed on
+#   BOTH consumers would still pass the driver while the critic leg was blind.
+
+config_version: '1.0'
+
+run:
+  seed: 42
+metadata:
+  name: Failing — multi_contrast_model_support (contrast-aware generator, unconditioned critic)
+
+training:
+  strategy_class: spectramr.infrastructure.training.strategies.gan.GANTrainingStrategy
+  training_mode: gan
+  max_iterations: 10
+  device: cuda
+  task: reconstruction
+  output_dir: experiments/results/corpus_failing_mc_critic
+
+data:
+  dataset_type: synthetic
+  coil_processing_mode: rss
+  patch_size: [32, 32, 1]
+  batch_size: 2
+  num_workers: 0
+  multi_contrast:
+    enabled: true          # <<< Pattern C on: contrast_idx is emitted every batch
+    n_contrasts: 3
+  datasets:
+    - name: dummy
+      path: databases/m4raw/data/multicoil_train
+
+model:
+  model_type: kspace_cold_diffusion   # declares supports_contrast_conditioning=True
+  in_channels: 1
+  out_channels: 1
+  discriminator_component:
+    name: sense_bridge_patchgan       # <<< declares the flag FALSE — the violation
+
+optimization:
+  learning_rate: 0.0001
+  optimizer_type: adam
+
+logging:
+  log_interval: 5
+  level: warning
+  log_dir: experiments/results/corpus_failing_mc_critic/logs
+
+losses:
+  output_domain: image
+  image_losses:
+    - name: mse
+      weight: 1.0
+      enabled: true
+  kspace_losses: []
+  complex_losses: []
+  gan:
+    enable_adversarial: true
+    lambda_adv: 0.01
+    gan_loss_type: lsgan

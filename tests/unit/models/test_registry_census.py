@@ -19,7 +19,7 @@ future edit re-softens the guard, the roster/floor assertions here fail in CI.
 
 from __future__ import annotations
 
-import re
+import ast
 from pathlib import Path
 
 import pytest
@@ -129,18 +129,50 @@ def test_sota_roster_present_with_mode(registry: dict, name: str, mode: str) -> 
 
 
 def _static_register_model_names() -> set[str]:
-    """First string arg of every ``@register_model`` decorator (kw or positional
-    form), scanned from source at line-start (ignores mentions in comments)."""
+    """The name every ``@register_model`` decorator declares, parsed with ``ast``.
+
+    Not a regex. The one this replaced required ``name=`` to be the decorator's
+    FIRST argument, which stopped being true when a change put ``role=`` ahead of
+    it: the scan then saw 509 names where the tree declares 530.
+
+    The 21 it lost were invisible because of the DIRECTION this test asserts in.
+    ``test_no_dark_decorators`` checks that every *statically declared* name is
+    live, so dropping names from the static set cannot fail it — it just stops
+    asking about them. A detector that quietly narrows still reports success,
+    which is why the sibling scanner in ``test_registry_integrity.py`` is parsed
+    the same way and carries planted decorators for each shape.
+
+    The test-file skip is matched against the path RELATIVE to the scan root, so
+    it does not depend on where the repository is checked out.
+    """
     base = Path(__file__).resolve().parents[3] / "src" / "spectramr" / "models"
-    pat = re.compile(
-        r"""^\s*@register_model\s*\(\s*(?:name\s*=\s*)?["']([^"']+)["']""",
-        re.MULTILINE,
-    )
     names: set[str] = set()
     for py in base.rglob("*.py"):
-        if "test" in str(py):
+        if any("test" in part for part in py.relative_to(base).parts):
             continue
-        names.update(pat.findall(py.read_text(encoding="utf-8")))
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            for dec in getattr(node, "decorator_list", []):
+                if not isinstance(dec, ast.Call):
+                    continue
+                called = getattr(dec.func, "id", None) or getattr(dec.func, "attr", None)
+                if called != "register_model":
+                    continue
+                declared = next(
+                    (
+                        kw.value.value
+                        for kw in dec.keywords
+                        if kw.arg == "name" and isinstance(kw.value, ast.Constant)
+                    ),
+                    None,
+                )
+                if declared is None and dec.args and isinstance(dec.args[0], ast.Constant):
+                    declared = dec.args[0].value
+                if isinstance(declared, str):
+                    names.add(declared)
     return names
 
 

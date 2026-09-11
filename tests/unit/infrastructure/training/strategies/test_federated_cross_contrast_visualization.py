@@ -16,29 +16,38 @@ Fix scaffold:
      ``kspace_to_image`` — so the RSS only mixes coils within one
      contrast.
 
-The two grep-pins below read the source text; the rest exercise
+The single grep-pin below reads ``m4raw_dataset.py``'s source text — the
+producer half, which no test here executes. The strategy half is driven for
+real instead: :func:`test_the_marker_reaches_the_logger_from_a_producer_batch`
+runs ``_compute_validation_metrics`` and reads the kwarg the logger actually
+received. The rest exercise
 :meth:`DiffusionTrainingStrategy._resolve_federated_target_start` directly.
 """
 
 from __future__ import annotations
 
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from spectramr.core.metrics.computer import ValidationMetricsComputer
+from spectramr.core.metrics.types import MetricSpec, ValidationMetricsConfig
+from spectramr.data.batch_types import BatchAdapter
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
 )
 
-# The grep-pins read files by path, so anchor on the repo root rather than the
+# The grep-pin reads a file by path, so anchor on the repo root rather than the
 # process cwd — tests/unit/infrastructure/training/strategies/ -> parents[5].
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 
 
-# ─── Grep-pins: the dataset must publish the marker, the strategy must
-# forward it. A refactor that drops either side is the regression we
-# want to catch in CI before the bug reaches a smoke run.
+# ─── Grep-pin: the dataset must publish the marker. This one stays a source
+# read because nothing here constructs an M4Raw subject; the strategy side is
+# pinned behaviourally below instead.
 
 
 def test_m4raw_dataset_publishes_federated_split_metadata():
@@ -57,25 +66,160 @@ def test_m4raw_dataset_publishes_federated_split_metadata():
     )
 
 
-def test_diffusion_strategy_forwards_federated_marker():
-    """The diffusion strategy must extract and forward the marker.
+# ─── The strategy half, driven rather than grepped (#1939).
+#
+# ``batch_data`` reaches ``_compute_validation_metrics`` from
+# ``pipelines.train.select_validation_extra_fields``, which forwards whatever
+# the loader produced. Since ``train.py`` adapts every validation batch through
+# ``BatchAdapter.from_dict`` that is a ``TrainingBatch``: not a mapping, and
+# with every non-core key in ``.metadata``, where attribute lookup cannot see
+# it. The fixtures below are therefore built through that same producer — a
+# hand-assembled batch would agree by construction and prove nothing.
 
-    A refactor that calls ``_log_validation_images_to_tensorboard`` without
-    forwarding the marker reintroduces the doubled-target bug for
-    federated cross-contrast configs.
+
+def _metrics_mock() -> MagicMock:
+    """A ``self`` complete enough to run ``_compute_validation_metrics`` to return.
+
+    ``output_transform="none"`` makes ``_apply_metric_transforms`` the identity,
+    which isolates the seam under test (the batch read) from the transform's own
+    behaviour.
     """
-    src = (
-        REPO_ROOT / "src/spectramr/infrastructure/training/strategies/diffusion.py"
-    ).read_text(encoding="utf-8")
-    assert "federated_target_channel_start" in src, (
-        "diffusion.py must read federated_target_channel_start from the batch "
-        "and forward it into _log_validation_images_to_tensorboard so the "
-        "validation save can slice the target half."
+    mock = MagicMock()
+    mock.config = SimpleNamespace(
+        data=SimpleNamespace(
+            processing=SimpleNamespace(
+                enable_kspace_normalization=False, enable_log_scaling=False
+            )
+        ),
+        model=SimpleNamespace(input_type="image", model_type="kspace_cold_diffusion"),
+        validation=SimpleNamespace(
+            scoring=SimpleNamespace(
+                enable_image_metrics=True, domain="image", output_transform="none"
+            )
+        ),
     )
-    assert "_resolve_federated_target_start" in src, (
-        "diffusion.py must validate/normalize the marker via "
-        "_resolve_federated_target_start before slicing — otherwise a "
-        "malformed marker silently corrupts the visualization."
+    mock._is_cold_diffusion = MagicMock(return_value=True)
+    mock._apply_metric_transforms = lambda pred, target, cfg: (pred, target)
+    mock._measure_prediction_scale = lambda pred, target: {
+        "pred_above_target_fraction": 0.0,
+        "target_abs_max": 1.0,
+        "pred_target_scale_ratio": 1.0,
+    }
+    mock._convert_metrics_to_floats = lambda d: d
+    mock._PRED_SCALE_WARN_FRACTION = DiffusionTrainingStrategy._PRED_SCALE_WARN_FRACTION
+    mock._ZF_BASELINE_METRICS = DiffusionTrainingStrategy._ZF_BASELINE_METRICS
+    mock.validation_metrics_computer = ValidationMetricsComputer(
+        ValidationMetricsConfig(
+            metrics=[MetricSpec(name="psnr")], primary_metric="psnr"
+        ),
+        device="cpu",
+    )
+    mock._zf_measurement = None
+    return mock
+
+
+def _forwarded_marker(batch_data):
+    """Run the real method and return the marker the logger was handed."""
+    torch.manual_seed(0)
+    pred = torch.rand(2, 1, 8, 8)
+    target = torch.rand(2, 1, 8, 8)
+    inputs = torch.rand(2, 1, 8, 8)
+    mock = _metrics_mock()
+    DiffusionTrainingStrategy._compute_validation_metrics(
+        mock,
+        pred,
+        target,
+        inputs,
+        torch.zeros(2, dtype=torch.long),
+        batch_data,
+        torch.ones(2),
+    )
+    mock._log_validation_images_to_tensorboard.assert_called_once()
+    return mock._log_validation_images_to_tensorboard.call_args.kwargs[
+        "federated_target_channel_start"
+    ]
+
+
+def test_the_marker_reaches_the_logger_from_a_producer_batch():
+    """The regression: a TrainingBatch publishing the marker must forward it.
+
+    Both legs of the replaced ``isinstance(dict)`` / ``getattr`` pairing missed
+    here — the batch is a dataclass, so the mapping leg was False, and the
+    marker lives in ``.metadata``, which attribute lookup cannot reach. The
+    logger received ``None`` and rendered the full 16-channel stack: the
+    doubled-target PNG this module exists to prevent, silently restored.
+    """
+    marker = torch.tensor(8, dtype=torch.long)
+    batch = BatchAdapter.from_dict(
+        {
+            "input": torch.rand(2, 1, 8, 8),
+            "target": torch.rand(2, 1, 8, 8),
+            "federated_target_channel_start": marker,
+        }
+    )
+
+    # The fixture is only the hard case if BOTH legs of the old read miss it.
+    # Asserted rather than assumed: a producer that grew an attribute for this
+    # key would make the test below pass for the wrong reason.
+    assert not isinstance(batch, dict)
+    assert getattr(batch, "federated_target_channel_start", None) is None
+
+    forwarded = _forwarded_marker(batch)
+    assert forwarded is not None, (
+        "the marker the batch published was read as absent — the logger will "
+        "RSS both contrasts into one render"
+    )
+    assert int(forwarded) == 8
+
+
+def test_a_dict_batch_still_forwards_the_marker():
+    """``read_batch_field`` is a superset, so the dict path must be unchanged.
+
+    Nothing in the pipeline hands this method a dict today, but the replaced
+    code had a working dict leg and dropping it would be a silent narrowing.
+    """
+    assert int(_forwarded_marker({"federated_target_channel_start": 8})) == 8
+
+
+def test_a_batch_without_the_marker_forwards_none():
+    """Absent stays absent: ``None`` means "render the full stack"."""
+    batch = BatchAdapter.from_dict(
+        {"input": torch.rand(2, 1, 8, 8), "target": torch.rand(2, 1, 8, 8)}
+    )
+    assert _forwarded_marker(batch) is None
+    assert _forwarded_marker(None) is None
+
+
+def test_a_resolved_marker_announces_the_split_in_the_log():
+    """Observed firing, not inferred from the wiring (non-negotiable 16).
+
+    The line goes through ``logging_service.log_info``, so ``caplog`` is blind
+    to it; the service is spied instead.
+    """
+    mock = MagicMock()
+    mock.metrics_service.save_images_batch = MagicMock(return_value=([], []))
+    mock._slice_to_target_contrast = lambda pred, target: (pred, target)
+    mock._slice_to_target_contrast_single = lambda ksp: ksp
+    mock._resolve_federated_target_start = (
+        DiffusionTrainingStrategy._resolve_federated_target_start
+    )
+    stack = torch.zeros(2, 16, 8, 8)
+
+    DiffusionTrainingStrategy._log_validation_images_to_tensorboard(
+        mock,
+        stack,
+        stack.clone(),
+        stack.clone(),
+        {},
+        batch_idx=0,
+        is_image_domain=False,
+        federated_target_channel_start=torch.tensor(8, dtype=torch.long),
+    )
+
+    assert any(
+        "Federated split active" in str(c.args[0])
+        for c in mock.logging_service.log_info.call_args_list
+        if c.args
     )
 
 

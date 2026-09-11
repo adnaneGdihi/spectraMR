@@ -23,8 +23,11 @@ class MockReconConfig:
         self.lambda_complex_l1 = 0.0
         self.enable_smooth_l1 = False
         self.lambda_smooth_l1 = 0.0
-        self.enable_l2 = False
-        self.lambda_l2 = 0.0
+        # ``l2`` and ``mse`` are the same loss under alias collapse, so the two
+        # declarations must agree: the weight SSOT compares the raw declared values
+        # and rejects 0.0-beside-1.0 regardless of the ``enable_*`` flags.
+        self.enable_l2 = True
+        self.lambda_l2 = 1.0
         self.enable_complex_mse = False
         self.lambda_complex_mse = 0.0
         self.enable_weighted_kspace_l1 = False
@@ -176,12 +179,23 @@ class MockMetricsConfig:
 
 
 class MockModelConfig:
+    """The `model:` block readers walk; the flat double was missing the critic.
+
+    Same defect as `MockDataConfig` below: `discriminator_component` is a
+    declared field on `ModelConfigSchema`, so Pydantic materializes it on every
+    real config -- `None` when the arm configures no critic. Omitting it here
+    made this double assert a shape the schema does not have, and the elected
+    critic-name owner raises on that by design rather than reporting "this arm
+    has no critic" (#1921, non-negotiable 3).
+    """
+
     def __init__(self):
         self.domain = "image"
         self.target_domain = "image"
         self.in_channels = 1
         self.out_channels = 1
         self.model_type = "gan"
+        self.discriminator_component = None
 
 
 def MockDataConfig():  # noqa: N802 -- factory, so call sites are unchanged

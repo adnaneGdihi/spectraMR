@@ -26,6 +26,7 @@ from typing import Any
 import torch
 
 from spectramr.infrastructure.physics.vf_operators import MarkerPriorProjection
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.ood_acceleration_readout import (
     ood_acceleration_readout,
@@ -226,11 +227,15 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         if self.env and hasattr(self.env, "losses"):
             env_losses = self.env.losses or {}
 
+        # Live iteration (loop_state seam). Frozen at 0 the warm-up gate never
+        # opened, so ``l1`` — undeclared by these arms and resolved from the
+        # ``lambda_l1`` schema default of 10.0 — was absent from ``components``
+        # for the whole run (pitfall #16, #1937).
         loss_output = self.loss_computer.compute(
             pred=pred_anchored,
             target=clean_target,
             epoch=epoch,
-            iteration=getattr(self.env, "step", 0) if self.env else 0,
+            iteration=resolve_loop_iteration(self),
             losses_dict=env_losses,
         )
 

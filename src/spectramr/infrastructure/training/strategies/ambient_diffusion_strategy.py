@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -83,6 +83,12 @@ def ambient_diffusion_step(
 
 class AmbientDiffusionStrategy(DiffusionTrainingStrategy):
     """Reference-free diffusion reconstruction via the Ambient (SSDU-lifted) objective."""
+
+    #: Loss ownership (issue #1918). Ambient-noise objective: mse_loss(eps_pred, noise) predicts the NOISE, not
+    #: the target, so no declared image loss is computed here -- and the hook
+    #: overrides DiffusionTrainingStrategy's without calling it or the computer.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(
         self,

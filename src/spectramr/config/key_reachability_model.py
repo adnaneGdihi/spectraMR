@@ -32,9 +32,19 @@ class ReadEvidence(StrEnum):
         (``getattr(cfg, f"compute_{name}")``, where :func:`_name_tokens` can only
         see the fragment ``"compute_"``). **A human must read the would-be
         consumer before acting on one of these.**
+
+    ``ACCESSOR_READ``
+        A human did read that consumer, and the consumer now declares what it
+        touches. The key was not found by token, but an accessor whose read set
+        is exported beside it claims this exact path -- so the key is read, and
+        this analysis simply cannot see the read. Distinct from ``LIVE_READ``
+        because the evidence is a *declaration*, not a call graph: it is only as
+        good as the export, which is why the exporting module owes a test that
+        the declaration matches what the accessor executes.
     """
 
     LIVE_READ = "live_read"
+    ACCESSOR_READ = "accessor_read"
     NO_LIVE_READ = "no_live_read"
     NO_READ_FOUND = "no_read_found"
 
@@ -59,6 +69,33 @@ class ReachabilityVerdict:
     sites: tuple[str, ...]
     reason: str
     evidence: ReadEvidence
+
+
+def accessor_verdict(
+    dotted_path: str,
+    leaf: str,
+    sites: tuple[str, ...],
+    accessor: str,
+) -> ReachabilityVerdict:
+    """The verdict for a path an accessor declares it reads.
+
+    ``sites`` stays the AST sites -- usually empty, because a token-less read is
+    why the path is in the map at all. Fabricating a site for a token that does
+    not exist would make ``sites`` a lie, and the ledger tests that ask "does this
+    entry really have read sites" would read the fabrication as evidence. The
+    accessor belongs in ``reason``, where prose goes.
+    """
+    return ReachabilityVerdict(
+        reachable=True,
+        sites=sites,
+        reason=(
+            f"no live token read of `{leaf}`, but an accessor declares it reads "
+            f"`{dotted_path}`: {accessor}. The read names no token this index can "
+            "see, so the declaration is the evidence -- it is checked against what "
+            "the accessor executes by the exporting module's own tests."
+        ),
+        evidence=ReadEvidence.ACCESSOR_READ,
+    )
 
 
 @dataclass(frozen=True)

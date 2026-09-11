@@ -225,3 +225,17 @@ class TestForwardGeneratorIsIntrospectionOnly:
         UniversalReconstructionStrategy._forward_generator(gen, source, prompt)
 
         assert gen.saw_prompt is True
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: l1_loss(pred, target) is the whole objective and nothing else is folded.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert UniversalReconstructionStrategy.__dict__["folds_image_losses"] is False
+    assert UniversalReconstructionStrategy.__dict__["inline_losses"] == frozenset({"l1"})

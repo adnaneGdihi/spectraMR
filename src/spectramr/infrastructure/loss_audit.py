@@ -580,10 +580,11 @@ def verify_startup_losses(config: LossConfigSchema) -> bool:
         RuntimeError: If a configured list-based loss name is not
             registered.
     """
+    from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
     from spectramr.models.losses.registry import LossRegistry
 
     list_loss_names: list[str] = []
-    for attr in ("kspace_losses", "image_losses", "complex_losses"):
+    for attr in LOSS_LIST_DOMAINS:
         for component in getattr(config, attr, None) or []:
             name = getattr(component, "name", None)
             if name:

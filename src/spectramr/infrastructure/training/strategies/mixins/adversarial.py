@@ -118,6 +118,12 @@ class AdversarialMixin:
             device=device,
         )
 
+        # Announce the objective from the loss-weight SSOT, not the ``enable_*`` /
+        # ``lambda_*`` pairs (#1918, #1919). The prefix names the concrete class
+        # because four strategies share this setup and their banners are otherwise
+        # indistinguishable in one log.
+        self._log_loss_objective(f"[{type(self).__name__}]")
+
         StrategyInitializationHelper.initialize_profiling_service(self, fallback_enabled=False)
 
         self.async_metrics_reporter = AsyncMetricsReporter(batch_size=10)
@@ -231,31 +237,18 @@ class AdversarialMixin:
                 if hr_fakes.device != target_batch.device:
                     hr_fakes = hr_fakes.to(target_batch.device)
 
-                d_loss_output = (
-                    self.loss_computer.compute_discriminator_loss(
-                        real=target_batch,
-                        fake=hr_fakes,
-                        discriminator=self.discriminator_model,
-                        epoch=epoch,
-                        iteration=iteration,
-                    )
-                    if hasattr(self.loss_computer, "compute_discriminator_loss")
-                    else None
+                # Called unguarded: ``setup_adversarial`` installs
+                # ``UnifiedGANLossComputer`` unconditionally, so the deleted
+                # ``hasattr``/``is None`` fallback could only route an unexpected
+                # computer down a second critic feed that disagreed with
+                # ``gan.py``'s. A computer lacking the method must fail loudly (NN3).
+                d_loss_output = self.loss_computer.compute_discriminator_loss(
+                    real=target_batch,
+                    fake=hr_fakes,
+                    discriminator=self.discriminator_model,
+                    epoch=epoch,
+                    iteration=iteration,
                 )
-
-                if d_loss_output is None:
-                    disc_outputs_d = {
-                        "real_pred": self.discriminator_model(target_batch),
-                        "fake_pred": self.discriminator_model(hr_fakes),
-                    }
-                    d_loss_output = self.loss_computer.compute(
-                        pred=hr_fakes,
-                        target=target_batch,
-                        epoch=epoch,
-                        iteration=iteration,
-                        discriminator=self.discriminator_model,
-                        discriminator_outputs=disc_outputs_d,
-                    )
 
                 d_total = d_loss_output.total if hasattr(d_loss_output, "total") else d_loss_output
 
@@ -288,40 +281,20 @@ class AdversarialMixin:
             ):
                 hr_fakes = clamp_to_range(hr_fakes, enable=True, telemetry=False)
 
-            g_loss_output = (
-                self.loss_computer.compute_generator_loss(
-                    pred=hr_fakes,
-                    target=target_batch,
-                    discriminator=self.discriminator_model,
-                    epoch=epoch,
-                    iteration=iteration,
-                )
-                if hasattr(self.loss_computer, "compute_generator_loss")
-                else None
+            # Called unguarded: ``setup_adversarial`` installs
+            # ``UnifiedGANLossComputer`` unconditionally, so the deleted
+            # ``hasattr``/``is None`` fallback could only route an unexpected
+            # computer down a second critic feed -- raw here, realified in
+            # ``gan.py`` -- or, with no critic, silently swap the whole
+            # adversarial objective for plain L1. Both must now fail loudly (NN3).
+            g_loss_output = self.loss_computer.compute_generator_loss(
+                pred=hr_fakes,
+                target=target_batch,
+                discriminator=self.discriminator_model,
+                epoch=epoch,
+                iteration=iteration,
             )
-
-            if g_loss_output is None:
-                if self.discriminator_model:
-                    disc_outputs = {
-                        "fake_pred": self.discriminator_model(hr_fakes),
-                    }
-                    g_loss_output = self.loss_computer.compute(
-                        pred=hr_fakes,
-                        target=target_batch,
-                        epoch=epoch,
-                        iteration=iteration,
-                        input_batch=input_batch,
-                        discriminator=self.discriminator_model,
-                        discriminator_outputs=disc_outputs,
-                    )
-                    g_total = (
-                        g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
-                    )
-                else:
-                    criterion = self.env.criterion_l1 or nn.L1Loss().to(target_batch.device)
-                    g_total = criterion(hr_fakes, target_batch)
-            else:
-                g_total = g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
+            g_total = g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
 
             # Store detached metrics. Keep them on-device — `get_last_metrics`
             # resolves to Python floats at a coarser cadence, so no per-step

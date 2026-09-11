@@ -1,0 +1,539 @@
+# FROZEN byte-copy of
+# experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion_perceptual.yaml
+# as it stood at dev ddeda3b0b, before #1923 made its `lambda_perceptual` removable.
+#
+# Why a frozen copy and not the live arm: the migration tests below need an arm that
+# still declares `perceptual` on BOTH surfaces -- `losses.reconstruction
+# .lambda_perceptual: 0.1` and `losses.image_losses[perceptual].weight: 0.1`. The live
+# arm is migrated by this same change, and the rest of the corpus follows, so a test
+# aimed at it would go vacuous the moment the duplicate it needs is gone.
+#
+# Why a copy of a REAL arm and not a synthesised one: a synthesised fixture was tried
+# first and was silently vacuous twice over -- inserting a second `image_losses:` key
+# made PyYAML drop the planted entry, so the name never entered the removable set and
+# the assertion passed against a migrator that did nothing at all. The tests therefore
+# assert the dual-surface premise explicitly before acting on it.
+#
+# Not an experiment: this file is not under experiments/ and is not a runnable arm.
+config_version: '1.0'
+workflow:
+  # 2026-07-29 standing migration (CLAUDE.md): read and reasoned about while
+  # propagating the #570 config-honesty fixes and the #583 mask fix across the
+  # cohort. M4Raw 0.3T structural brain k-space, reconstructed from an
+  # undersampled measurement -> structural regime, reconstruction task.
+  regime: mri_structural
+  task: reconstruction
+metadata:
+  name: Universal K-Space Cold Diffusion (+ VGG Perceptual)
+  description: 'Contrast-agnostic cold diffusion model that learns to fill accelerated
+    k-space to fully-sampled, regardless of contrast (T1, T2, FLAIR), anatomy, or
+    noise. Uses FiLM conditioning via contrast_idx embedding. Single-contrast mode:
+    each sample = 1 contrast with repetition averaging.'
+  author: Adnane
+  created_at: null
+  tags:
+    type: reconstruction
+    paradigm: diffusion
+    domain: kspace
+    # hypothesis/primary_metric/role live under tags: ExperimentMetadataSchema is
+    # extra="forbid" and exposes no top-level hypothesis/primary_metric/baseline
+    # fields, but tags is a free-form dict (mirrors the _gaussian sibling).
+    hypothesis: A single contrast-agnostic k-space cold-diffusion model (FiLM contrast conditioning, soft data-consistency) fills accelerated k-space back to fully-sampled across contrasts (T1/T2/FLAIR) and across the 2x-32x acceleration cascade, reconstructing measurement-dependent (non-collapsed) images on M4Raw 0.3T.
+    primary_metric: val_robust_mri_psnr_mean
+    # This IS the cohort baseline (referenced as `baseline:` by the
+    # _imgdomain_ablation and ema_ablation arms); it does not derive from another.
+    role: variant
+    baseline: experiment_11_kspace_cold_diffusion
+  primary_metric: hfen
+model:
+  model_type: kspace_cold_diffusion
+  model_domain: kspace
+  input_type: kspace
+  in_channels: 8
+  out_channels: 8
+  spatial_dims: 2
+  model_kwargs:
+    base_channels: 64
+    num_res_blocks: 4
+    # MUST equal training.diffusion.timesteps — used as ``max_timesteps``
+    # for the time-embedding scaling at
+    # ``kspace_cold_diffusion_generator.py:2369``. If this is 1000 and the
+    # diffusion schedule only uses [0, 27] the sinusoidal embedding
+    # collapses all 28 codes into a tiny region near zero and the model
+    # can't distinguish neighbouring timesteps.
+    timesteps: 29
+    sampling_steps: 29
+    time_embedding_dim: 256
+    num_physical_coils: 4
+    use_complex_conv: true
+    activation: complex
+    force_pure_kspace: true
+    backbone_type: complex_unet
+    attention_type: dual_domain
+    process_type: cold_diffusion
+    num_contrasts: 3
+    reflect_padding_bottleneck_layers: 0
+    # VERIFIED LIVE: with dc_method=adaptive the generator routes to
+    # AdaptiveDataConsistency, whose __init__(self) takes NO args and whose blend is a
+    # LEARNED per-pixel sigmoid — dc_weight is NEVER passed to it, so it was INERT (the
+    # old 0.25 "lowering" was a no-op). Do NOT re-add dc_passthrough_center_size — it
+    # deterministically makes the blob.
+    dc_method: hard
+    reverse_sampling_mode: replace_freeze_dc
+    reverse_clip_ratio: 1.3
+    selection_rule: fixed
+    sampler_sigma: 0.0
+    sampler_seed: 42
+    output_kspace_clip_reference: band_local
+    output_kspace_clip_ratio: 1.3
+    kspace_feature_norm: rms
+  output_type: kspace
+# Sharding: DeepSpeed ZeRO-2. Copied from the wiring reference
+# workflow_baselines/b3_structural_recon_m4raw_deepspeed.yaml; full rationale in
+# docs/distributed_training.rst. Sharding must NOT change what is optimised, so
+# this block is the ONLY thing that differs from the pre-DeepSpeed arm.
+#
+# LAUNCH CHANGES -- a process-group strategy without its launcher is an ERROR,
+# never a fallback, so plain `spectramr train` no longer runs this arm:
+#     pip install -e '.[deepspeed]'      # needs nvcc; deliberately not in [all]
+#     torchrun --nproc_per_node=$N -m spectramr.cli train-distributed --config <this>
+#
+# Stage 2 (optimizer state + gradients), not 3: stage 3 also partitions
+# parameters for ~50% more communication, which this backbone does not need.
+# The saving scales with world size -- at nproc_per_node=1 ZeRO-2 is inert.
+#
+# No compilation anywhere here, deliberately. DeepCompile stays off (declaring
+# it alongside optimization.compile is an audit error), and offload_optimizer:
+# none avoids DeepSpeedCPUAdam's JIT build. Precision is untouched: this cohort
+# runs fp32 (optimization.precision.enabled: false), so unlike b3 it does not
+# declare bfloat16 -- flipping 58 controlled arms would change their numerics,
+# and fp32 sidesteps the complex+fp16 engine-side cast entirely.
+parallel:
+  strategy: deepspeed
+  backend: nccl
+  deepspeed:
+    enabled: true                 # must equal (strategy == 'deepspeed')
+    zero_stage: 2
+    offload_optimizer: none
+    offload_param: none
+    save_consolidated_best: true  # false makes the run resume-only
+    allow_multi_engine: false     # every arm here is single-optimizer diffusion
+data:
+  # See TODO/audit/smoke_audit_experiment_11_kspace_cold_diffusion_20260615.md.
+  dataset_type: m4raw
+  use_repetitions: true
+  modes:
+    val:
+      sampler:
+        type: uniform
+        samples_per_volume: 4
+        queue_length: 100
+        shuffle: false
+  target_mode: phase_aligned_mean
+  # NEX target = mean over ALL reps, so the input rep's own noise sits in
+  # the target at 1/N and input/target noise are correlated. Set true for a
+  # leave-one-out target (uncorrelated, sqrt(N-1) instead of sqrt(N) SNR);
+  # it changes the reference metrics grade against, so flip it cohort-wide,
+  # never per-arm. Engages only at >=3 reps (M4Raw FLAIR ships 2).
+  nex_target_exclude_input: false
+  collation:
+    strategy: image
+    padding_mode: zeros
+    padding_value: 0.0
+    allow_variable_shapes: false
+    squeeze_depth_dim: null
+    validate_nans: true
+    log_strategy_selection: true
+  multi_contrast:
+    enabled: true
+    n_contrasts: 3
+    embed_dim: 128
+  loader:
+    batch_size: 2
+    num_workers: 8
+  coils:
+    processing_mode: none
+    num_virtual_coils: 1
+  split:
+    type: manifest
+  domain:
+    output: kspace
+    target_channels: 8
+  processing:
+    enable_kspace_normalization: true
+    kspace_percentile: 0.95
+    kspace_scale_domain: image
+    enable_log_scaling: true
+    log_scaling_center_fraction: 0.25
+  sampling:
+    patch_size:
+    - 256
+    - 256
+    - 1
+    samples_per_volume: 4
+    queue_length: 100
+  pairing:
+    single_contrast: true
+  source:
+    root: databases/m4raw/data
+    index_path: data/manifests/m4raw_train.json
+    validation_index_path: data/manifests/m4raw_multicoil_val.json
+logging:
+  log_gradients: false
+  progress_bar_enabled: true
+  log_validation_graphs: true
+  save_images_per_epoch: 30
+  identity:
+    experiment: experiment_11_kspace_cold_diffusion_perceptual
+  sinks:
+    level: warning
+    to_console: true
+    to_file: true
+    dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/logs
+  intervals:
+    log: 5000
+    validation_images: 30
+  images:
+    log_input: true
+    log_validation: true
+    log_difference: true
+    save_validation: true
+    max_per_batch: 8
+  tracking:
+    enabled: true
+    service: tensorboard
+    enable_tensorboard: true
+  snapshots:
+    enabled: true  # pinned: forensics/mosaics need per-arm tensors (don't rely on schema default)
+training:
+  strategy_class: spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy
+  epochs: 50
+  batch_size: 2
+  max_iterations: 70000
+  task: diffusion
+  device: cuda
+  deterministic: false
+  output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual
+  enable_gradient_checkpointing: false
+  training_mode: diffusion
+  # Curriculum bounds the timestep sampler at iter i to
+  # ``min(num_timesteps, start_t + i * rate)`` (diffusion.py:432-435).
+  # With T=28 the previous start_t=100 saturated from iter 0 — no
+  # curriculum at all. Start at 4 (one step-bucket width on the
+  # 7-bucket schedule, ratio=4/28=14% ≈ first bucket) and ramp at
+  # 0.005/iter so the full range is reached around iter 4800.
+  curriculum_start_timestep: 1
+  curriculum_ramp_rate: 0.0005
+  timestep_sampling_strategy: balanced_high_t
+  # Reverse-diffusion stride; MUST be ≤ num_timesteps (T=28).
+  identity_collapse_threshold: 0.00005
+  early_training_steps: 4800
+  diffusion:
+    degradation_source: input
+    timesteps: 29
+    noise_schedule: cosine
+    sampler: cold_mri
+    sampling_steps: 29
+    cond_drop_prob: 0.1
+    guidance_scale: 1.0
+    type: cold
+    prediction_type: sample
+    degradation: kspace_mask
+    degradation_dynamics: null
+    enable_diffusion_amp: false
+    enforce_output_range: false
+    lambda_mse: 0.0
+  input_domain: kspace
+  output_domain: kspace
+metrics:
+  domain: image
+  transform: ifft_sense_adjoint
+  compute: [hfen, kspace_error, mae, phase_mse, robust_mri_psnr]  # was 16 compute_* flags
+  enable_tracking: true
+  enable_paradigm_specific: true
+  eval_on_epoch: false
+  metric_interval: 2500
+  track_best_metric: true
+  best_metric_name: val_hfen_mean
+  best_metric_mode: min
+  output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/metrics
+optimization:
+  lr_scheduler_strategy: cosine
+  scheduler:
+    warmup_steps: 3500
+    T_0: 50000
+    T_mult: 2
+    eta_min: 1.0e-06
+    warmup_start_lr: 1.0e-06
+  optimizer:
+    type: adamw
+    learning_rate: 5.0e-05
+    weight_decay: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    kwargs:
+      eps: 0.0001
+  gradient:
+    accumulation_steps: 2
+    enable_checkpointing: true
+    detect_anomalies: false
+    clip:
+      enabled: true
+      method: norm
+      value: 0.5
+  precision:
+    enabled: false
+    dtype: float32
+  compile:
+    enabled: false
+    mode: reduce-overhead
+    backend: inductor
+    fullgraph: false
+undersampling:
+  acceleration_type: density_nested
+  base_acceleration: 1.0
+  max_acceleration: 32.0
+  center_fraction: 0.08
+  min_center_fraction: 0.02
+  # #1157 -- 28 rungs over 28 timesteps, the same widening #1156 applied to the
+  # attention_shootout cohort. `schedule_type: step` holds each rung for
+  # T/len(acceleration_range) steps, so the previous 7-rung ladder re-emitted an
+  # identical mask for 3 of every 4 steps: 21 of 28 levels were inert (audit
+  # `schedule.no_inert_steps`), the time embedding was trained to separate
+  # pixel-identical states, and 21 reverse steps had nothing to reveal (#535's
+  # forward-side counterpart). At len(range) == timesteps the index
+  # min(int(t*28/27), 27) is a bijection, so every timestep now moves the mask.
+  # Spaced geometrically in LINE COUNT -- the quantity the phase mask actually
+  # quantizes (128 -> 32 -> 8 lines at 256, two factor-4 spans) -- rather than in
+  # R, where a uniform step is ~64 lines at R=2 and ~0.25 lines at R=32.
+  # The midpoint anchor keeps _CASCADING_LEVELS (2/8/32, diffusion.py:3074) exact
+  # literals: timestep_for_acceleration raises on an off-grid level and the
+  # cascade catches that and SKIPS the validation rung, so an inexact 8.0 would
+  # silently cost a severity level.
+  # Measured at 256x256 via describe_ladder: 0 inert, 0 nesting leaks, 0
+  # declared_ladder_defects, and R_effective == R_nominal on all 28 rungs.
+  acceleration_range:
+  - 1.0
+  - 2.0
+  - 2.226
+  - 2.485
+  - 2.753
+  - 3.048
+  - 3.413
+  - 3.765
+  - 4.197
+  - 4.655
+  - 5.224
+  - 5.818
+  - 6.4
+  - 7.111
+  - 8.0
+  - 8.828
+  - 9.846
+  - 10.667
+  - 11.636
+  - 12.8
+  - 14.222
+  - 16.0
+  - 18.286
+  - 19.692
+  - 21.333
+  - 23.273
+  - 25.6
+  - 28.444
+  - 32.0
+  mask_direction: phase
+  schedule_type: step
+  # Must equal training.diffusion.timesteps (audit:
+  # acceleration_schedule_steps_match) — kept in sync at 28.
+  schedule_steps: 29
+  enable_dynamic_mask: true
+  mask_seed: 42
+  train_identity_rung: true
+  # Cold diffusion's forward process requires a monotone degradation ladder
+  # (M_{t+1} subset-of M_t). Nesting was previously only INCIDENTAL -- it held
+  # for this family but was never guaranteed. enforce_nested makes it
+  # structural via the cumulative intersection (sampling.py:_first_drop_map),
+  # and raises rather than silently collapsing the sampling budget.
+  enforce_nested: true
+physics:
+  kspace:
+    enable_kspace_recon: true
+    enforce_hermitian_symmetry: false
+    data_range: 1.0
+    max_magnitude: 1.0
+  data_consistency:
+    enabled: true
+    method: hard
+    weight: 0.5
+  coil_sensitivity:
+    enable_estimation: true
+  coil_processing:
+    output: {domain: kspace, channels: complex}
+    # combine is the DATA-LOAD combine: 'none' keeps the multi-coil data the
+    # kspace-cold-diffusion model consumes (mode=none). The post-model / metric
+    # combine is a separate stage (validation.transform), not this knob.
+    compression: {method: none}
+    estimation: {method: power_iter, enabled: true, kernel_size: 12, acs_size: 24}
+    combine: {method: none}
+loss_logging:
+  frequency: 1
+  output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/metrics
+validation:
+  enabled: true
+  use_training_loss: true
+  schedule:
+    interval_steps: 17500
+    on_epoch: false
+  loader:
+    batch_size: 2
+    chunk_size: 1
+    shuffle: true
+  scoring:
+    compute:
+    - psnr
+    - robust_mri_psnr
+    - hfen
+    domain: image
+    output_transform: ifft_magnitude
+    enable_image_metrics: true
+  visualization:
+    enabled: true
+  sampling:
+    enable_multistep_cold: true
+  gates:
+    input_dependence_tol: 0.01
+checkpoint:
+  enabled: true
+  save_interval: 5000
+  checkpoint_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/checkpoints
+  keep_last_n: 3
+  keep_best_n: 2
+  save_on_epoch: true
+
+early_stopping:
+  # patience is denominated in VALIDATION EVENTS, not iterations, and it is sized
+  # to CLEAR THE CURRICULUM LADDER rather than to plateau-detect. It is solved
+  # against the `validation.schedule.interval_steps: 17500` THIS ARM CARRIES, not
+  # against any remembered prior value; the rule is unchanged, only the interval.
+  #
+  # Earliest possible stop = (patience + 1) * interval_steps -- one event sets
+  # `best`, then `patience` non-improving events fire it. The ladder does not fully
+  # open until iteration 56008 (t=28, R=32, first drawn), so the constraint is
+  # `earliest stop >= 56008`:
+  #   patience 2 -> 52500 -> BELOW 56008, rung t=28 could get zero draws
+  #   patience 3 -> 70000 -> the terminal event; the run ends there anyway
+  #   patience 4 -> 87500 -> beyond the budget; unreachable
+  # 3 is the smallest value satisfying the ladder rule. See
+  # attention_shootout/experiment_11_attention_none.yaml for the full derivation,
+  # including why a LARGER patience is strictly worse here: it also disables the
+  # non-finite-monitor abort, which fires on
+  # `consecutive_nonfinite_monitor >= patience` (pipelines/training_loop.py:2091-2101).
+  #
+  # early_stopping.enabled must stay true because the best-checkpoint writer is
+  # gated on `wait_count == 0` inside the `if early_stopping_service:` block
+  # (pipelines/training_loop.py:2079,2177).
+  enabled: true
+  patience: 3
+  metric: val_hfen_mean
+  mode: min
+  min_delta: 0.001
+  restore_best_weights: true
+ema:
+  enabled: true
+  decay: 0.999
+  update_frequency: 1
+  warmup: true
+losses:
+  # ------------------------------------------------------------------
+  # 2026-05-30 DC-blob root-cause fix (L1, PRIMARY). VERIFIED LIVE: the
+  # declarative list weights below (image_losses/kspace_losses[].weight)
+  # are read only by the LossBuilder enable-gate; at COMPUTE time the
+  # effective weight is resolved by BaseLossComputer._get_loss_weight
+  # (computers/base.py), which searches losses.<section>.lambda_<name>
+  # across [reconstruction, latent, adversarial, diffusion, gan, physics,
+  # registration, ssl, spatial, evidential]. With no explicit blocks the
+  # schema defaults give lambda_complex_l1=0.0 and lambda_log_spectral=0.0
+  # -> the two k-space data-fidelity terms are DROPPED, leaving a
+  # measurement-independent contrast-mean (the DC blob) a near-optimal
+  # minimizer.
+  #
+  # CRITICAL: each lambda must live in the schema class that OWNS it, or
+  # extra='ignore' SILENTLY DROPS it (falling back to its default):
+  #   lambda_complex_l1/log_spectral/sobolev_kspace/sense_adjoint_l1 ->
+  #     ReconstructionLossesConfig
+  #   lambda_complex_spatial_gradient -> PhysicsLossesConfig (default 1.0!)
+  # The 'physics' section IS searched by _get_loss_weight, so
+  # losses.physics.lambda_complex_spatial_gradient resolves to 0.2 (putting
+  # it under reconstruction would be ignored and silently stay 1.0).
+  # MUST land with the w^2 de-squaring edit in
+  # models/losses/computers/unified_diffusion_reconstruction.py (a partial
+  # apply squares these lambdas: log_spectral 0.1->0.01).
+  reconstruction:
+    log_spectral_skip_fft: true
+    lambda_pre_dc_kspace: 0.3
+    # Lambda_perceptual DEFAULTS TO 10.0 (loss.py schema) — it MUST be set explicitly or
+    # it silently dominates. Not read by THIS arm (the only reader,
+    # loss_builder.py:699, sits inside `if gan_config:` and this arm declares no
+    # losses.gan), but it is a landmine for the first critic added here.
+    lambda_perceptual: 0.1
+  physics:
+    lambda_snr_preserving: 0.0
+    lambda_bloch_residual: 0.0
+    lambda_physics_constraint: 0.0
+  image_losses:
+  - name: perceptual
+    # This IS the compute weight: the SSOT table (models/losses/weights.py) reads the
+    # domain lists and the computer resolves through it. The older "enable-gate only"
+    # note described the GAN-composite path, which this arm does not take.
+    weight: 0.1
+    enabled: true
+  kspace_losses:
+  - name: complex_l1
+    weight: 1.0
+    enabled: true
+  - name: log_spectral
+    weight: 0.1
+    enabled: true
+  - name: sobolev_kspace
+    weight: 0.05
+    enabled: true
+  - name: complex_spatial_gradient
+    weight: 1.0  # loss-SSOT 2026-07: was 0.2; the run actually used 1.0 (lambda_complex_spatial_gradient won). Materialized.
+    enabled: true
+  - name: sense_adjoint_l1
+    weight: 0.3
+    enabled: true
+  - name: null_space_content
+    # C5 fibre-aware term: supervises the UNOBSERVED k-space bins (the null
+    # space hard DC never touches). Declared here so the weight-table SSOT
+    # carries it; enabled:false resolves to weight 0.0, so this control arm
+    # is unchanged and attention_type stays the shootout's only axis. Flip
+    # enabled:true cohort-wide (all ten arms at once), never per-arm — no
+    # schema lambda exists for this name, so the static weight stays here.
+    weight: 0.25
+    enabled: false
+  complex_losses: []
+  policy:
+    output_domain: kspace
+reporting:
+  enabled: true
+  task: diffusion
+  method_name: 11_kspace_cold_diffusion
+  out_subdir: report
+  figures:
+  - fig_1_2_learning_curves
+  - fig_1_3_loss_decomposition
+  - gen_diffusion_diagnostics
+  - fig_1_15_computational_profile
+  tables:
+  - tab_2_1_main_results
+  metrics:
+  - psnr
+  - ssim
+  - lpips
+  - fid
+  - kid
+  fail_on_error: false
+run:
+  seed: 42

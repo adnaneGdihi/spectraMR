@@ -117,9 +117,7 @@ def training_env(simple_model, mock_fm_config):
 
 @pytest.fixture(autouse=True)
 def mock_resolve_service():
-    with patch(
-        "spectramr.infrastructure.di.di_container.resolve_service"
-    ) as mock_resolve:
+    with patch("spectramr.infrastructure.di.di_container.resolve_service") as mock_resolve:
         mock_resolve.return_value = MagicMock()
         yield mock_resolve
 
@@ -276,9 +274,7 @@ class TestTimeConditioningDispatch:
         strategy.env.models["generator"] = buggy
         strategy.env.generator = buggy
         with pytest.raises(TypeError, match="genuine in-forward bug"):
-            strategy._compute_losses_impl(
-                input_batch={"target": torch.randn(2, 1, 8, 8)}, epoch=0
-            )
+            strategy._compute_losses_impl(input_batch={"target": torch.randn(2, 1, 8, 8)}, epoch=0)
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +325,17 @@ def test_flow_matching_declares_the_interpolant_it_feeds() -> None:
     assert not torch.equal(tensors["model_input"], x1)
     assert extra["model_input_key"] == "model_input"
     assert in_kspace_keys == set(), "must be explicit, not None"
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: mse_loss(pred, u_t) regresses the velocity field, not the target.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert FlowMatchingStrategy.__dict__["folds_image_losses"] is False
+    assert FlowMatchingStrategy.__dict__["inline_losses"] == frozenset()

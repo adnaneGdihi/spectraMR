@@ -93,9 +93,7 @@ def test_mechanism_fires_equivariance_loss_trains_the_network():
     assert float(loss.detach()) > 0.0, "equivariance loss is zero — mechanism did not fire"
     net.zero_grad(set_to_none=True)
     loss.backward()
-    grad_sq = sum(
-        float(p.grad.pow(2).sum()) for p in net.parameters() if p.grad is not None
-    )
+    grad_sq = sum(float(p.grad.pow(2).sum()) for p in net.parameters() if p.grad is not None)
     assert grad_sq > 0.0, "EI loss produced no gradient on the recon network"
 
 
@@ -108,9 +106,7 @@ def test_branches_call_reconstruct_twice():
         calls["n"] += 1
         return reconstruct(kspace)
 
-    equivariant_imaging_branches(
-        counting_reconstruct, forward_op, DihedralGroup(), y, g_index=1
-    )
+    equivariant_imaging_branches(counting_reconstruct, forward_op, DihedralGroup(), y, g_index=1)
     assert calls["n"] == 2
 
 
@@ -131,3 +127,17 @@ def test_strategy_routes_equivariance_through_registered_loss():
     assert "EquivariantSSLReconLoss" in src
     # measurement-consistency anchor is present (prevents the trivial f≡const).
     assert "consistency" in src.lower()
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: the objective is self-supervised: no ground truth is used at all.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert EquivariantImagingStrategy.__dict__["folds_image_losses"] is False
+    assert EquivariantImagingStrategy.__dict__["inline_losses"] == frozenset()

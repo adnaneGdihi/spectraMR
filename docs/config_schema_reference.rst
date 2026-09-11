@@ -588,7 +588,7 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
 
    losses:
      policy:                       # how the objective is ASSEMBLED, not which terms
-       output_domain: image        # image | complex_image | kspace
+       output_domain: image        # image | complex_image | kspace | latent
        exclude_defaults: []        # e.g. ['mse'] drops the paradigm's implicit MSE
      image_losses:
        - name: l1
@@ -621,6 +621,12 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    * - ``kspace``
      - ``kspace_losses`` + ``complex_losses``
      - Image losses skipped
+   * - ``latent``
+     - ``latent_losses``
+     - Post-encoder losses. **No bridge exists into a latent** — the encoder that
+       would produce one is a learned map, not a transform — so this row is the
+       only one whose Active Lists column is exclusive. Declaring
+       ``latent_losses`` alongside a kspace/image output raises.
 
 **LossComponentConfig fields:**
 

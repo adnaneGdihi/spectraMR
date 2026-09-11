@@ -59,7 +59,12 @@ def test_r1_penalty_applied_once_not_cubed():
     c.device = torch.device("cpu")
     c.adversarial_loss_fn = None
     # Stand-in for the real R1 module, whose output already includes lambda_r1.
-    c.r1_regularizer = lambda disc, real: torch.tensor(2.0)
+    # ``**_`` is load-bearing, not decoration: the production call site forwards
+    # ``critic_cond=`` to the regularizer, and this double pinned the older
+    # two-positional-arg signature -- so it raised ``TypeError: got an
+    # unexpected keyword argument 'critic_cond'`` and had stopped testing the
+    # arithmetic it names. Absorbing the kwargs restores the assertion below.
+    c.r1_regularizer = lambda disc, real, **_: torch.tensor(2.0)
 
     out = c.compute_discriminator_loss(
         real=torch.randn(1, 1, 4, 4),

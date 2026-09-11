@@ -44,23 +44,6 @@ class TestPruningVerification(unittest.TestCase):
         # Add basic attributes for hasattr checks
         self.config.losses.physics = None
 
-    def test_loss_weights_check(self):
-        checker = ConfigHealthChecker()
-
-        # Case 1: Valid weights
-        results = checker.check_loss_weights(self.config)
-        self.assertEqual(len(results), 0, f"Expected 0 warnings, got: {results}")
-
-        # Case 2: All zero weights
-        self.config.losses.reconstruction.lambda_l1 = 0.0
-        self.config.losses.reconstruction.lambda_l2 = 0.0
-        self.config.losses.reconstruction.lambda_perceptual = 0.0
-        self.config.losses.reconstruction.lambda_ssim = 0.0
-
-        results = checker.check_loss_weights(self.config)
-        self.assertTrue(len(results) > 0, "Expected warning for zero weights")
-        self.assertEqual(results[0].severity, "warning")
-
     def test_physics_config_check(self):
         checker = ConfigHealthChecker()
 

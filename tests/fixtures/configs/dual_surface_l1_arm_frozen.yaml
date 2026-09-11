@@ -1,0 +1,577 @@
+# ============================================================================
+# Stage 2 of two-stage LDM training:
+#   freeze stage-1 AutoencoderKL, train the diffusion U-Net in its latent
+#   space conditioned on the ULF (64 mT) image to denoise paired HF (3 T).
+#
+# `vae_checkpoint_path` MUST point at the .pt file produced by stage 1.
+# When run via the campaign manifest this is auto-injected via the
+# stage_groups[*].experiments[*].checkpoint_from.inject_as field.
+#
+# AUDIT: `python -m spectramr.cli audit <this_file> --strict` prints a Spec Card
+# summarizing data shape (3D volume, image-domain, multi-contrast), the
+# annotated `latent_diffusion` model capabilities (image → image), the
+# `training.diffusion.timesteps` block the strategy reads at __init__,
+# and any declared adapters. See
+# docs/superpowers/specs/2026-05-05-experiment-spec-card-and-adapters-design.md
+# ============================================================================
+
+config_version: '1.0'
+
+# Imaging regime x task (CLAUDE.md standing migration). The cohort carried
+# config_version 6.1 since #484 but no workflow: block -- a half-migration, so
+# it bought no audit coverage (required axes, spatial rank, signal domain).
+#
+# mri_structural: 2-D magnitude brain slices over four anatomical contrasts
+# (T1w / FLAIR / T2w / ADC). Profile is LIVE, spatial_ranks {2,3}, no required
+# axes, signal_domains include "image" -- every condition this arm meets.
+#
+# task: super_resolution. NOT field_translation: despite the name,
+# Task.FIELD_TRANSLATION is supported only by mri_quantitative (which requires
+# an ECHO axis) and denotes B0 *field-map* translation -- see
+# core/metrics/b0_field_rmse.py. ULF->HF field-STRENGTH translation is
+# resolution/SNR recovery, which is what SUPER_RESOLUTION means here, and it is
+# in mri_structural.supported_tasks. It also matches direct_ulf_to_hf_sr, the
+# baseline this arm is scored against -- a shared task keeps the campaign delta
+# attributable (pitfall #17).
+workflow:
+  regime: mri_structural
+  # Probe (cohort review 2026-09-03): a copy passes the six check_workflow_* checks
+  # under this task and under every other structural task alike, so the task is the
+  # arm's own declaration; the checker does not pick it.
+  task: super_resolution
+
+metadata:
+  name: stage2_ldm_ulf_to_hf
+  description: >
+    Stage-2 LDM training. The AutoencoderKL is loaded from the stage-1
+    checkpoint and frozen. Only the diffusion U-Net + conditioning encoder
+    train. Conditioning is via concatenation of the ULF latent with the
+    noisy HF latent at every reverse step (SR3-style spatial conditioning).
+  status: needs_implementation
+  status_reason: data_starvation_few_shot_probe
+  hypothesis: >-
+    A conditional latent diffusion model trained in the frozen stage-1
+    AutoencoderKL latent space can translate 64 mT ULF brain images to
+    3 T HF appearance under SR3-style spatial + per-contrast conditioning.
+  # val_ssim, matching early_stopping.metric below. These MUST agree: the
+  # checkpoint this arm ships is the one selected on val_ssim, so labelling
+  # val_psnr as the headline made reporting rank on a metric that never chose
+  # a checkpoint — and directly contradicted the early_stopping rationale
+  # ("selecting an LDM on PSNR works against its value proposition").
+  # val_psnr is still computed and reported, just not the headline.
+  primary_metric: val_ssim
+  # ABLATION of the headline stage2_ldm_ulf_to_hf_sdvae arm: this arm trains
+  # the stage-1 AutoencoderKL FROM SCRATCH on 11 subjects (a thin latent prior)
+  # instead of using the frozen pretrained SD-VAE. It requires latent_scaling_
+  # factor (the from-scratch latent is not unit-variance) and a real stage-1
+  # checkpoint. The pretrained-VAE arm is the headline; this measures the cost
+  # of the data-starved from-scratch latent.
+  baseline: stage2_ldm_ulf_to_hf_sdvae
+  tags:
+    type: latent_diffusion
+    paradigm: image_translation
+    field_strength: ulf_to_hf
+    stage: 2
+    # The paired cohort is small: 11 subjects x 4 contrasts {T1w,FLAIR,T2w,ADC}
+    # ~= 44 paired records (was mis-counted as 3 contrasts before the T2w-pairing
+    # fix, 2026-07-08). The 54 64mT-only subjects are the held-out unpaired/test
+    # cohort (no HF target, inference-only). Train/val ARE subject-disjoint so
+    # there is no leakage, but 11 subjects is too small to demonstrate
+    # generalization. Report this strictly as a FEW-SHOT / OVERFIT FEASIBILITY
+    # PROBE, not as evidence the LDM recipe generalizes. The fix (expand the
+    # paired cohort) needs new data, not a config edit. (Finding
+    # data-starvation-supervised-ldm, 2026-06.)
+    note: >-
+      Few-shot feasibility probe only — interpret val_psnr as
+      overfit-to-11-subjects, not generalization; expanding the paired
+      ULF/HF cohort is a data task, deferred.
+
+model:
+  model_type: latent_diffusion
+  input_type: image
+  in_channels: 1
+  out_channels: 1
+  # Slice-mode 2D — must match stage1_vae_hf.yaml's spatial_dims. The
+  # AutoencoderKL submodules (ResnetBlock, AttnBlock, Downsample,
+  # Upsample) use ``nn.Conv2d`` hardcoded; running 3D crashes with the
+  # cluster's ``Given groups=1, weight of size [8, 8, 1, 1, 1], expected
+  # input[1, 64, 8, 16, 16] to have 8 channels, but got 64 channels``
+  # error (the depth dim leaks into the channel position when 5D
+  # tensors hit a 2D conv that's been reshaped to 3D by the runtime).
+  spatial_dims: 2
+  model_kwargs:
+    # ── Latent space (must match stage-1 exactly) ───────────────────────
+    latent_channels: 4
+    base_channels: 96
+    # ── Diffusion ─────────────────────────────────────────────────────
+    # NB: timesteps appears here AND in training.diffusion below. Keep in
+    # sync — model_kwargs.timesteps is consumed by LatentDiffusionGenerator's
+    # constructor; training.diffusion.timesteps is read by
+    # DiffusionTrainingStrategy at __init__. The Phase-0 audit check
+    # `paradigm_required_fields` blocks training when `training.diffusion`
+    # is missing entirely; mismatch detection is left for human review.
+    timesteps: 1000
+    beta_schedule: cosine
+    prediction_type: epsilon
+    # ── Conditioning ──────────────────────────────────────────────────
+    conditional_translation: true   # SR3-style spatial concat
+    conditioning_key: concat
+    use_contrast_guidance: true
+    # 4 = the PAIRED-TRAINING contrasts {T1w, FLAIR, T2w, ADC}. GROUND TRUTH
+    # (raw tree, 2026-07-08): the 3T scanner DOES acquire T2w
+    # (sub-XXXX_acq-highres_T2w.nii.gz for all 11 paired subjects), so T2w has a
+    # paired HF target and trains like the other three — the earlier "3T has no
+    # T2w → num_contrasts=3" was a stale-manifest artifact. PDw is genuinely
+    # absent. The held-out test split is now the 54 64mT-only subjects, not T2w.
+    # Keep in sync with data.multi_contrast.n_contrasts.
+    num_contrasts: 4
+    contrast_embed_dim: 128
+    # ── Latent scaling (Rombach et al.) ───────────────────────────────
+    # The from-scratch stage-1 VAE logged latent_std≈0.408, so the raw latent
+    # is far from unit variance. Standardize to ~N(0,1) before diffusion:
+    # s = 1/0.408 ≈ 2.45 (encode does z·s, decode divides by s). Without this
+    # the standardization is a dead identity (set_latent_statistics had no
+    # caller). Re-tune from stage-1's actual logged latent_std after training.
+    latent_scaling_factor: 2.45
+    # ── Stage-1 hand-off ──────────────────────────────────────────────
+    # vae_checkpoint_path is overwritten by the campaign at submission
+    # time. Standalone runs must point at a real stage-1 .pt themselves.
+    # NB: CheckpointDirector.save_best() writes 'checkpoint_best.pt'. Point at that
+    # CANONICAL name -- it is the one both writers actually produce.
+    # (Correction 2026-08-13: the old note here said the 'best.pt' alias "is
+    # published only by CheckpointService, which is not always in the chain". That
+    # is stale -- CheckpointDirector publishes the alias too, via
+    # `_publish_best_alias` at checkpoint_director.py:626/631. The conclusion is
+    # unchanged and this line still points at 'checkpoint_best.pt': the alias is a
+    # convenience copy, the canonical artifact is what stage 2 should bind to.)
+    # Smoke-audit E17 (2026-05-14).
+    # 2026-07-11: this pointed at experiments/outputs/stage1_vae_hf_pretrain/,
+    # a directory stage 1 never writes — stage1_vae_hf.yaml's output_dir is
+    # experiments/results/stage1_vae_hf. Combined with a loader that only looked
+    # for 'model_state_dict'/'state_dict' (CheckpointDirector writes 'generator'),
+    # the VAE silently stayed random-init and stage 2 trained in a random latent
+    # space (val_psnr≈6 dB). Both now raise instead of degrading.
+    vae_checkpoint_path: experiments/results/stage1_vae_hf/checkpoints/checkpoint_best.pt
+    freeze_vae: true
+
+data:
+  # Paired multi-contrast ULF/HF. The dataset enumerates per
+  # (subject, contrast) samples; ULF is the input, HF is the target.
+  # The diffusion U-Net consumes contrast_idx via use_contrast_guidance
+  # (see model.model_kwargs below) so the same LDM can generate every
+  # contrast and never confuses FLAIR with ADC.
+  dataset_type: nifti_paired
+  # Per-worker LRU over POST-TRANSFORM volumes. At the default (2) a shuffled
+  # loader misses on nearly every window and re-decodes a whole volume per item --
+  # the same GPU-starvation defect fixed for mrixfields in cce8456a9.
+  # NB the value is NOT "the whole corpus", as this comment claimed until
+  # 2026-08-13. The paired cohort is 11 subjects x 4 contrasts (T1w/FLAIR/T2w/ADC)
+  # ~= 44 records; "32" predates the T2w-pairing fix and was already wrong for the
+  # 3-contrast era (11 x 3 = 33). It is kept as a deliberate RAM cap rather than
+  # raised on a guess: the manifest is cluster-only (data/manifests is gitignored),
+  # so the exact resident-volume count cannot be verified from a checkout, and each
+  # cached volume is tens of MB x num_workers. Size it against the regenerated
+  # manifest on the cluster.
+  slice_cache_size: 32
+  modes:
+    train:
+      sampler:
+        type: full
+  test_split: 0.1
+  caching:
+    strategy: none
+  augmentation:
+    # Geometric-only: flip + in-plane rotation applied identically to the ULF
+    # input and HF target (TorchIO samples params once per Subject) → pairing
+    # preserved. NO intensity augmentation (would break the ULF↔HF mapping).
+    enabled: true
+    probability: 0.5
+    enable_flip: true
+    prob_flip: 0.5
+    flip_axes: [0, 1]
+    enable_rotation: true
+    prob_rotate: 0.3
+    rotation_range: [-10.0, 10.0]
+  multi_contrast:
+    enabled: true
+    n_contrasts: 4
+    embed_dim: 128
+    # Contrast ids MUST match the PAIRED-TRAINING contrasts. The paired manifest
+    # records are {T1w, FLAIR, T2w, ADC} — all four present at BOTH 64mT and 3T
+    # (verified against the raw tree 2026-07-08: every one of the 11 paired
+    # subjects has sub-XXXX_acq-highres_{T1w,T2w,FLAIR}.nii.gz + acq-highres_adc).
+    # PDw is genuinely absent. The map is contiguous over exactly the four paired
+    # contrasts so every conditioning slot gets gradient and none falls through the
+    # collation default to contrast_idx=0 (=T1w). (Finding contrast-guidance-four-
+    # paired, 2026-07-08; supersedes the earlier T2w-is-unpaired assumption.)
+    # NB: the cluster-side ulf_paired_v6.json is STALE (gitignored; not in the repo) (pre-2026-06-22 AND generated
+    # by the pre-fix generator that dropped T2w) — regenerate on the cluster
+    # (python scripts/preprocessing/preprocess_ulf_paired.py) to emit the T2w
+    # pairs and the 64mT-only test split.
+    contrast_map:
+      T1w: 0
+      FLAIR: 1
+      ADC: 2
+      T2w: 3
+    # Acquisition vectors (units: ms / degrees / T) — note B0 is set to
+    # the *target* field strength (3T), since the LDM generates HF.
+    acquisition_params:
+      - {name: T1w,   TE: 12.0,  TR: 600.0,  TI: -1.0,    FA: 70.0, B0: 3.0, contrast_type: spin_echo}
+      - {name: FLAIR, TE: 120.0, TR: 8000.0, TI: 2200.0,  FA: 90.0, B0: 3.0, contrast_type: inversion_recovery}
+      - {name: ADC,   TE: 90.0,  TR: 6000.0, TI: -1.0,    FA: 90.0, B0: 3.0, contrast_type: diffusion_weighted}
+      - {name: T2w,   TE: 100.0, TR: 4000.0, TI: -1.0,    FA: 90.0, B0: 3.0, contrast_type: spin_echo}
+
+  loader:
+    # 4 per rank x 8 ranks = global batch 32. Was 1, which left ~15 of each
+    # V100's 16 GiB unused: the models here are small (largest fp32 optimizer
+    # state in the cohort is 0.92 GiB), so batch size -- not memory -- was the
+    # binding constraint on GPU utilisation. Applied identically to all six arms
+    # so the slab-pair ablation and the direct-SR control stay matched.
+    #
+    # SHAPE PRECONDITION -- the likeliest way batch 4 fails, and it fails at step 1.
+    # Every arm in this cohort uses `modes.train.sampler.type: full`, so `patch_size`
+    # no longer crops (it is retained only for the collation depth-squeeze) and each
+    # sample arrives at its volume's NATIVE H x W. Batching 4 of them requires all 4
+    # to share a shape. Train/val should satisfy that -- the paired cohort is
+    # registered and resampled onto the shared 3T high-res grid -- but this could not
+    # be verified from a checkout (data/manifests is gitignored, cluster-only), and
+    # the sampling comment below explicitly notes "small (e.g. ADC) subjects". A
+    # collation/stack error on the first step is the tell; if it appears, either
+    # confirm the ADC volumes share the 3T grid or drop back to batch_size: 1 for
+    # the affected arm.
+    #
+    # NOT YET MEASURED: activation memory at batch 4. The dev box has no CUDA, so
+    # this was sized from parameter counts and headroom, not from a profile. Check
+    # torch.cuda.max_memory_allocated() on the first run before scaling further --
+    # stage2 is the arm to watch, its validation runs a 25-step DDIM loop per slice.
+    #
+    # The VALIDATION loader below is deliberately still batch_size: 1. It carries no
+    # gradient and so no science, but it is the heaviest memory path in the cohort;
+    # raise it once the training footprint is known.
+    batch_size: 4
+    num_workers: 4
+    # Non-persistent workers re-fork every epoch, which dominates on a short epoch.
+    # (The old note "32-record manifest = ~32-iter epoch" was wrong twice: the paired
+    # manifest is ~44 records, and under enable_slice_2d each record expands to one
+    # sample per slice/slab, so an epoch is records x windows, not records.)
+    persistent_workers: true
+    pin_memory: true
+  split:
+    validation_fraction: 0.1
+  processing:
+    normalization_type: minmax
+    rescale_range: [-1.0, 1.0]
+    data_range: 2.0
+  sampling:
+    # Full-slice training: every sample is a WHOLE 2D slice, not a random 128²
+    # patch. The `full` sampler makes DataPipelineDirector bypass the tio.Queue
+    # (no patch cropping, no patch-filter dropping small subjects). patch_size is
+    # retained only for collation depth-squeeze. See stage1_vae_hf for rationale.
+    patch_size: [128, 128, 1]
+    # Per-slice 2D sampling — MUST match stage1_vae_hf (the frozen VAE was trained
+    # on depth-1 [C,H,W,1] slices). WITHOUT this flag the loader emits the whole
+    # 3D volume [1,1,H,W,D] and the runtime collapses the D depth slices into the
+    # BATCH dim (e.g. 27×4×64×64 at H=W=512), i.e. an effective batch of 27 full
+    # slices through the VAE + diffusion U-Net → ~27× peak memory → the run died
+    # after ~4 steps with no CSV rows (2026-07-07). Slice-mode keeps batch=1 slice,
+    # bounds memory, and matches the encoder's training regime.
+    enable_slice_2d: true
+  pairing:
+    bidirectional_mode: ulf_to_hf
+  source:
+    root: databases/ulf_paired/preprocessed
+    # The _fixed variant has zero-depth records filtered out; the unfixed
+    # manifest causes ``5D target_batch has a zero-sized dim`` for thin
+    # volumes. Smoke-audit E16 (2026-05-14).
+    paired_manifest_path: data/manifests/ulf_paired_v6.json
+optimization:
+  # Diffusion trains in full fp32. This arm declared `use_amp: true`, which folds
+  # onto `optimization.precision.enabled` -- so it was training the
+  # noise-prediction objective under autocast. Replaced rather than
+  # supplemented: the schema raises when the legacy key and the canonical block
+  # disagree ("AMP is one decision"). Enforced by
+  # `check_diffusion_precision_policy`.
+  precision:
+    enabled: false
+    dtype: float32
+
+  # torch.compile is OFF and must STAY off: DeepCompile
+  # (parallel.deepspeed.compile) replaces it rather than layering with it.
+  # ModelBuilder.compile() runs at director step 1, BEFORE deepspeed.initialize,
+  # so a torch.compile'd module hands DeepCompile a graph in which the ZeRO
+  # collectives are already opaque calls -- the one thing DeepCompile exists to
+  # rewrite and schedule. Declaring both is a hard audit ERROR
+  # (check_deepcompile_supported), not a warning, so this explicit `false` is
+  # load-bearing documentation rather than a restatement of the default.
+  compile:
+    enabled: false
+  lr_scheduler_strategy: cosine
+  # ...which on its own built NO scheduler at all: the LR was constant for the
+  # whole run on every arm of this cohort.
+  #
+  # resolve_scheduler_spec returns early on `optimization.scheduler is None`
+  # (scheduler_resolution.py) and only consults lr_scheduler_strategy AFTER that
+  # return, so the flat key is unreachable unless the nested block also exists.
+  # The nested block below is what actually requests the scheduler; the flat key
+  # is kept because the resolver still reads it as the type fallback and the two
+  # must not disagree.
+  #
+  # `type` alone is deliberate: the resolver derives T_max from
+  # training.max_iterations, so the period stays consistent with the run length
+  # and with whatever step cadence the resolver assumes, rather than being
+  # hand-pinned here in units this file cannot verify.
+  scheduler:
+    type: cosine
+
+  optimizer:
+    type: adamw
+    # Raised 1.0e-4 -> 2.0e-4 with the batch-size change above. This is sqrt
+    # scaling of the 4x PER-RANK increase, and it is deliberately the conservative
+    # reading: measured against how these arms actually ran (global batch 1), the
+    # new global batch of 32 would imply sqrt(32) ~= 5.7e-4 instead. Starting low is
+    # the asymmetric-risk choice -- a low LR costs epochs, a high one destabilises a
+    # diffusion objective -- and raising it after the first run is a one-line edit.
+    learning_rate: 2.0e-4
+    weight_decay: 1.0e-5
+parallel:
+  # DeepSpeed ZeRO-1 + DeepCompile.
+  #
+  # NOTE this arm can no longer be started by `spectramr train`, and therefore not by
+  # `campaign submit` either: DeepSpeedStrategy.adopt calls `_require_process_group`,
+  # which RAISES rather than quietly running single-process ("the run would report
+  # success while training something the config did not ask for"). Launch with:
+  #
+  #   sbatch --nodes=1 --gres=gpu:ada:N \
+  #     --export=ALL,CONFIG=experiments/inprogress/ldm_two_stage_ulf_to_hf/stage2_ldm_ulf_to_hf.yaml \
+  #     scripts/training/train_distributed.sbatch
+  #
+  # This arm consumes stage 1's checkpoint. Outside the campaign nothing injects it,
+  # so `model.model_kwargs.vae_checkpoint_path` below must already point at the file
+  # stage 1 wrote -- it does, provided stage1_vae_hf ran with its own output_dir. If
+  # you relocated stage 1's output, pass the override through the launcher:
+  #   --export=ALL,CONFIG=...,OVERRIDES="-O model.model_kwargs.vae_checkpoint_path=<path>"
+  #
+  # `num_devices` / `num_nodes` are deliberately NOT declared: run_distributed_training
+  # overwrites both from WORLD_SIZE, because they are observed facts about the
+  # launcher rather than user declarations.
+  strategy: deepspeed
+  deepspeed:
+    # Must agree with `strategy` or the schema raises. Two switches for one
+    # mechanism is what let `strategy: none` + `enabled: true` shard SILENTLY while
+    # `strategy: fsdp` raised only after the whole environment had been built (#620).
+    enabled: true
+    # Stage 1 shards optimizer state only. Stages 2/3 add gradient and parameter
+    # sharding, which this cohort does not need -- these models fit. ZeRO is here to
+    # give DeepCompile collectives worth scheduling, not to buy memory.
+    #
+    # NB the frozen VAE contributes no optimizer state to shard (freeze_vae: true),
+    # so stage 1 sharding here applies to the denoising U-Net's state alone.
+    zero_stage: 1
+    compile:
+      # Renders the ds_config `compile.deepcompile` key AND triggers the
+      # engine.compile() call. Both halves or neither: a ds_config key on its own
+      # emits one log_dist_once line on rank 0 and then runs eagerly, which on a
+      # cluster is indistinguishable from silence -- a textbook pitfall-#16 facade.
+      enabled: true
+      # `z1` targets ZeRO stage 1/2, `z3` targets stage 3.
+      # `_deepcompile_passes_match_the_stage` raises on a mismatch, because
+      # compile_zero_optimization_stage dispatches on exactly these strings.
+      passes: [z1]
+
+losses:
+  # WHAT THIS ARM WAS ACTUALLY OPTIMIZING (and why it was an accident).
+  # The YAML declared `l1: weight 0.1`, but on the DIFFUSION path
+  # `image_losses[].weight` is only a GATE — LossBuilder strips it ("for logging
+  # only") and BaseLossComputer._get_loss_weight resolves the magnitude from
+  # `losses.reconstruction.lambda_l1`, whose SCHEMA DEFAULT is 10.0. So the L1 term
+  # ran at 10.0, i.e. 10x the diffusion MSE, and quietly dominated the objective.
+  #
+  # WHAT L1 IS APPLIED TO: this is a LATENT diffusion arm, and the strategy sets the
+  # loss target to `noise` for latent diffusion (diffusion.py: `_eafo_target = noise
+  # if is_latent_diffusion ...`). So both terms are on epsilon: MSE(eps_hat, eps) +
+  # L1(eps_hat, eps). That is legitimate (an L1 stabilizer on the noise prediction),
+  # but at 10x it is no longer the Rombach objective — it IS an L1-on-noise model.
+  # Restored to the declared intent: MSE is the objective, L1 a light stabilizer.
+  #
+  # NB `prediction_type: epsilon` is NOT read by DiffusionTrainingStrategy (zero
+  # occurrences); the latent branch simply targets noise. Correct here by
+  # coincidence rather than by wiring — issue filed.
+  #
+  # warmup_iterations defaults to 1000 and gates the spatial losses (incl. l1) to
+  # 0.0. There is nothing to stabilise first on an epsilon objective, and the
+  # discontinuity at iteration 1000 is pure noise in the loss curve — so it is 0.
+  # Weights are declared on BOTH surfaces and MUST AGREE (the incoming loss-weight
+  # SSOT raises on disagreement).
+  reconstruction:
+    warmup_iterations: 0
+    enable_l1: true
+    lambda_l1: 0.1
+  diffusion:
+    lambda_mse: 1.0
+  image_losses:
+    - name: diffusion_mse
+      weight: 1.0        # MUST equal losses.diffusion.lambda_mse
+      enabled: true
+    - name: l1
+      weight: 0.1        # MUST equal lambda_l1 above
+      enabled: true
+  kspace_losses: []
+  complex_losses: []
+
+  policy:
+    output_domain: image
+logging:
+  log_level: INFO
+
+  sinks:
+    dir: experiments/outputs/stage2_ldm_ulf_to_hf/logs
+  intervals:
+    log: 50
+  snapshots:
+    # Always emit debug snapshots (input_raw / input_prepared / target, +
+    # model_output_* where the strategy writes them) so the image-forensics
+    # contact sheets have real per-arm tensors to render. Schema-default is
+    # already True; pinned here so a default flip can't silently disable it.
+    enabled: true
+validation:
+
+  schedule:
+    interval_steps: 1000
+  loader:
+    batch_size: 1
+    # Was 4. The val loader is UNSHUFFLED, so that meant "the first 4 samples" = axial
+    # slices 0-3 of the first val record (one subject, one contrast, adjacent slices
+    # near the skull base) — see stage1_vae_hf for the full note. Grade the whole val
+    # split instead.
+    #
+    # COST: unlike stage 1, this arm's validation runs the FULL reverse diffusion loop
+    # (the latent-diffusion branch calls gen.sample()), so each val slice costs
+    # `sampler_steps` U-Net evaluations. That is why sampler_steps is pinned to 25
+    # below rather than left to default to 50.
+    num_batches: null
+    # num_samples: null => use ALL validation samples, which is what the
+    # num_validation_batches note above already claims this arm does.
+    #
+    # It was `4`. num_validation_batches and num_samples are read in that order by
+    # strided_validation_subset (data_pipeline_director.py): with the first null,
+    # the second becomes the operative cap, and the schema is explicit --
+    # "Number of validation samples (if None, use all)". So the arm replaced its
+    # val set with a 4-item Subset three lines after declaring it would grade the
+    # whole split, and every val metric -- including the val_ssim that drives
+    # early stopping and top-k checkpoint selection -- was a 4-slice average over
+    # well under 1% of the val split. All six cohort arms carried the same pair,
+    # so the campaign's headline comparison was decided by a 4-sample coin flip.
+    #
+    # If validation cost needs capping (this arm runs a full reverse chain per
+    # slice), declare it honestly as num_validation_batches: <N> and set it
+    # IDENTICALLY on all three translation arms so they stay comparable.
+    num_samples: null
+  scoring:
+    # Shared metric set — see stage1_vae_hf for why each entry is here and why
+    # `volume_consistency` and `hd95` are deliberately excluded.
+    compute:
+      - psnr
+      - ssim
+      - ms_ssim
+      - mae
+      - rmse
+      - lpips
+      - vif
+      - fsim
+      - haarpsi
+      - synthseg_dice
+      - tissue_dice
+      - brain_mask_dice
+      - tissue_volume_similarity
+      - tissue_hd95
+    # ssim: the metric early stopping selects on, so the report-case recorder and the
+    # metrics computer rank on the same quantity (cohort review 2026-09-03).
+    primary: ssim
+  sampling:
+    # Pinned, not defaulted. Absent this key the sampler falls through to
+    # training.diffusion.sampling_steps (50). 25 DDIM steps cuts the validation cost
+    # at negligible quality loss and keeps the val curve comparable across arms.
+    #
+    # NOT HONOURED BEFORE 2026-07-25. The strategy forwards this only under a
+    # parameter name the sampler's sample() exposes, and LatentDiffusionGenerator
+    # .sample() exposed none of them — so the value was dropped without a warning
+    # and every validation ran the FULL 1000-step chain (40x the declared NFE).
+    # The 2026-07-10 cluster runs (SLURM 7691033/7691043) were therefore evaluated
+    # at 1000 steps, not 25; their val curves are NOT NFE-comparable with runs
+    # launched after the fix. sample() now takes num_inference_steps and strides
+    # the chain with a DDIM step (pitfall #15).
+    steps: 25
+early_stopping:
+  enabled: true
+  # val_ssim, NOT val_psnr. PSNR is maximized by the posterior MEAN, so selecting on
+  # it rewards the blurriest checkpoint — which is exactly what a generative
+  # translation model is supposed to beat. Selecting an LDM on PSNR works against
+  # its entire value proposition. SSIM is structural, standard, and is applied
+  # identically on the other translation arms (the sdvae headline and the direct-SR
+  # baseline) so the comparison stays fair. Stage 1 keeps val_psnr — there,
+  # autoencoding fidelity genuinely IS the goal.
+  metric: val_ssim
+  patience: 30
+  mode: max
+
+checkpoint:
+  save_interval: 1000
+  save_top_k: 3
+  # Inert key restated to the truth -- checkpoints land at
+  # `<training.output_dir>/checkpoints` (train.py:603). See stage1_vae_hf.yaml.
+  save_dir: experiments/results/stage2_ldm_ulf_to_hf/checkpoints
+
+training:
+  strategy_class: spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy
+  task: reconstruction
+  training_mode: diffusion
+  device: cuda
+  epochs: 200
+  max_iterations: 200000
+  output_dir: experiments/results/stage2_ldm_ulf_to_hf
+  diffusion:
+    timesteps: 1000
+    noise_schedule: cosine
+    beta_start: 0.0001
+    beta_end: 0.02
+    prediction_type: epsilon
+
+physics:
+  data_consistency:
+    enabled: false      # latent-space LDM; DC is applied at inference
+
+reporting:
+  enabled: true
+  task: diffusion
+  method_name: stage2_ldm_ulf_to_hf
+  out_subdir: report
+  figures:
+    - fig_1_2_learning_curves
+    - fig_1_3_loss_decomposition
+    - gen_diffusion_diagnostics
+    - fig_1_15_computational_profile
+    - mri_a2_synthesis_c2c
+  tables:
+    - tab_2_1_main_results
+    - tab_2_4_dataset_descriptor
+  # Every name here must ALSO be in validation.metrics — reporting selects columns
+  # from what the run emitted, it never computes. Before 2026-07 this listed lpips /
+  # vif / fsim / haarpsi / rmse while validation emitted only psnr / ssim / mae, so
+  # those five columns were always empty (pitfall #18).
+  metrics:
+    - psnr
+    - ssim
+    - ms_ssim
+    - lpips
+    - vif
+    - fsim
+    - haarpsi
+    - rmse
+    - synthseg_dice
+    - tissue_dice
+    - brain_mask_dice
+    - tissue_volume_similarity
+    - tissue_hd95
+  fail_on_error: false
+run:
+  seed: 42

@@ -39,9 +39,20 @@ model:
   model_type: standard_unet
   in_channels: 1
   out_channels: 1
-  discriminator_component:      # <<< discriminator declared
-    discriminator_type: patch_gan_2d
-    in_channels: 1
+  # <<< discriminator declared. The spelling matters: `ModelComponentSchema` has
+  # exactly the fields {name, kwargs} with extra="ignore", so the earlier
+  # `discriminator_type: patch_gan_2d` / `in_channels: 1` were BOTH discarded and
+  # this component resolved to `name='' kwargs={}` -- an empty block that trips
+  # the check for the wrong reason, while advertising a discriminator the run
+  # never saw (#1933). `patch_gan_2d` is not in MODEL_REGISTRY either; `patch_gan`
+  # is (init_registry.py alias). Do not "simplify" this back, and do not delete
+  # the block to fix it: `discriminator_component:` with no children parses as
+  # None, `has_discriminator` goes False, and the fixture silently stops testing
+  # anything.
+  discriminator_component:
+    name: patch_gan
+    kwargs:
+      in_channels: 1
 
 optimization:
   learning_rate: 0.0001

@@ -25,6 +25,34 @@ from spectramr.infrastructure.validation.recommendations import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _drop_fake_registrations():
+    """Remove this module's ``__test_*`` registrations after every test.
+
+    ``_make_config`` registers into ``MODEL_REGISTRY``, which is PROCESS-GLOBAL
+    and which ``populate_model_registry()`` cannot repair -- the
+    ``_REGISTRY_POPULATED`` latch makes a second call a no-op, so a clear is
+    permanent for the session. Without this teardown the fakes outlive the
+    module and every later test file in the same process sees them.
+
+    That is not hypothetical: ``object`` has no ``forward``, so the honour
+    census in test_contrast_conditioned_sense_bridge.py raised
+    ``AttributeError`` on the leaked entry and three of its tests were red
+    whenever this file was collected first -- which ``pytest tests/unit/`` does,
+    since ``infrastructure`` sorts before ``models``. They passed in isolation,
+    so it read as flakiness. See #1961.
+    """
+    from spectramr.models.registry import MODEL_REGISTRY
+
+    before = {n for n in MODEL_REGISTRY if n.startswith("__test_")}
+    try:
+        yield
+    finally:
+        for name in [n for n in MODEL_REGISTRY if n.startswith("__test_")]:
+            if name not in before:
+                MODEL_REGISTRY.pop(name, None)
+
+
 class _NS:
     """Tiny attribute namespace stand-in for the audit's defensive getattr."""
 
@@ -49,7 +77,12 @@ def _make_config(
     embed_dim=None,
     bloch_grounded=False,
     model_type="cfg_unet",
-    supports_contrast=False,
+    # Three-state since #1916: True declares support, False is a positive
+    # claim that the model ignores the contrast id, and None means nobody
+    # said. ``model_supports`` answers False for the latter two alike, so the
+    # R003 polarity tests below are insensitive to that distinction; a test
+    # that needs it must pass None explicitly rather than rely on the default.
+    supports_contrast=None,
     model_kwargs=None,
     losses_output_domain="image",
     image_losses=(),
@@ -63,20 +96,34 @@ def _make_config(
     physics_kspace_enabled=False,
     task="reconstruction",
 ):
-    # Optionally register a fake model with capabilities.
-    from spectramr.models.capabilities import ModelCapabilities
-    from spectramr.models.registry import MODEL_REGISTRY
+    # Optionally register a fake model, THROUGH THE REAL PRODUCER.
+    #
+    # This used to hand-build the entry dict, and in doing so carried a
+    # top-level ``supports_contrast_conditioning`` beside a nested
+    # ``ModelCapabilities`` that had no such field -- reproducing inside the
+    # fixture the exact two-owner split #1916 deleted from production. The
+    # tests passed because fixture and reader agreed on the same wrong owner,
+    # so they could not have caught the split and did not.
+    #
+    # A fixture that builds its own entry cannot notice when the producer's
+    # shape changes. Going through ``register_model`` means it always has
+    # whatever shape production writes -- including the ``role`` key (#1932),
+    # which nothing here had to be told about.
+    #
+    # ``object`` is not an ``IDiscriminator``, so the default
+    # ``role="generator"`` is correct and the registration guard stays quiet.
+    # Re-registration across tests is fine: same class, non-empty caps.
+    from spectramr.models.registry import register_model
+
     if model_type and model_type.startswith("__test_"):
-        MODEL_REGISTRY[model_type] = {
-            "class": object,
-            "mode": training_mode,
-            "supports_contrast_conditioning": supports_contrast,
-            "capabilities": ModelCapabilities(
-                spatial_dims=(2, 3),
-                input_domain="image",
-                output_domain="image",
-            ),
-        }
+        register_model(
+            name=model_type,
+            training_mode=training_mode,
+            spatial_dims=(2, 3),
+            input_domain="image",
+            output_domain="image",
+            supports_contrast_conditioning=supports_contrast,
+        )(object)
 
     mc = _NS(
         enabled=multi_contrast_enabled,

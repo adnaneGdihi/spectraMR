@@ -46,24 +46,38 @@ class ModelRegistry:
         self._generators: dict[str, type[IGenerator]] = {}
         self._discriminators: dict[str, type[IDiscriminator]] = {}
 
-        # Sync with global registry
-        try:
-            import spectramr.models.registry as global_registry
+        # Sync with global registry, bucketing on the role each registration
+        # DECLARES rather than one guessed from its base classes.
+        #
+        # This used to read ``issubclass(cls, IDiscriminator)`` with an
+        # ``else: # Default to generator for backward compatibility`` tail.
+        # Only 10 of the framework's discriminators subclass that interface,
+        # so 9 more -- domain_discriminator, frequency_domain_discriminator,
+        # kan_discriminator, kspace_discriminator, ldm_latent_discriminator,
+        # ldm_multiscale_latent_discriminator, ldm_patch_latent_discriminator,
+        # stargan_v2_discriminator, wasserstein_discriminator -- fell through
+        # to the generator bucket, and ``create_discriminator`` then raised
+        # "Discriminator type '<x>' not registered" for each. A live build
+        # failure for any GAN arm naming one of them, produced by a
+        # classifier that could not report its own uncertainty (#1932).
+        #
+        # The import is NOT wrapped in try/except ImportError. The old bare
+        # ``except ImportError: pass`` left BOTH buckets empty and silent, so
+        # every create_generator and create_discriminator call reported its
+        # name as unregistered -- a failure indistinguishable from an empty
+        # registry (non-negotiable 3). spectramr.models.registry is a
+        # first-party module; if it cannot import, that is not a condition to
+        # degrade past.
+        import spectramr.models.registry as global_registry
 
-            global_models = global_registry.list_models()
-            for name, metadata in global_models.items():
-                cls = metadata.get("class")
-                if cls:
-                    # Categorize based on interface
-                    if issubclass(cls, IDiscriminator):
-                        self._discriminators[name] = cls
-                    elif issubclass(cls, IGenerator):
-                        self._generators[name] = cls
-                    else:
-                        # Default to generator for backward compatibility
-                        self._generators[name] = cls
-        except ImportError:
-            pass
+        for name, metadata in global_registry.list_models().items():
+            cls = metadata.get("class")
+            if cls is None:
+                continue
+            if metadata.get("role") == "discriminator":
+                self._discriminators[name] = cls
+            else:
+                self._generators[name] = cls
 
     def register_generator(self, name: str, generator_class: type[IGenerator]) -> None:
         """Register a generator class."""

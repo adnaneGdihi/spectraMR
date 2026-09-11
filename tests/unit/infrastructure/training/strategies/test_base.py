@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -385,3 +387,196 @@ class TestDeclaredMetricKeys:
             "the header builder does `expected_loss_keys.update(...)`; a str "
             "return would silently splat into single characters"
         )
+
+
+# ---------------------------------------------------------------------------
+# The declared-loss contract (#1918, #1919)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_SENSE_BRIDGE_ARM = (
+    _REPO_ROOT
+    / "experiments"
+    / "inprogress"
+    / "kspace_filling"
+    / "experiment_11_sense_bridge_critic.yaml"
+)
+
+
+def _strategy_for(arm_path):
+    """A real strategy carrying a real config and a recording logging service."""
+    from types import SimpleNamespace
+
+    from spectramr.config.settings import TrainingSettings
+
+    assert arm_path.exists(), f"missing experiment config: {arm_path}"
+    strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
+    strategy.config = TrainingSettings.from_yaml(str(arm_path))
+    strategy.logged = []
+    strategy.logging_service = SimpleNamespace(
+        log_info=lambda m: strategy.logged.append(("INFO", m)),
+        log_warning=lambda m: strategy.logged.append(("WARN", m)),
+    )
+    return strategy
+
+
+@pytest.fixture
+def sense_bridge_strategy():
+    return _strategy_for(_SENSE_BRIDGE_ARM)
+
+
+class TestDeclaredLossKeysAreDerived:
+    """The set the strategy must guarantee comes from the weight SSOT, and the
+    builder's own skip set decides what it is NOT responsible for."""
+
+    def test_the_domain_lists_are_seen(self, sense_bridge_strategy) -> None:
+        """The lists this replaced read `losses.reconstruction` only, so this
+        arm — which declares its objective in `kspace_losses`/`image_losses` —
+        produced an EMPTY set and guaranteed no CSV column at all."""
+        keys = sense_bridge_strategy._declared_loss_keys
+        assert {"complex_l1", "log_spectral", "sense_adjoint_l1", "hfen"} <= keys
+
+    def test_builder_owned_losses_are_not_this_strategys_job(self, sense_bridge_strategy) -> None:
+        """Subtracting the builder skip set is what stops a per-step phantom
+        warning: `pre_dc_kspace` is declared and active, but the builder owns
+        it and it reaches the CSV under a renamed key."""
+        from spectramr.infrastructure.training.builders.loss_builder import (
+            STRATEGY_MANAGED_LOSSES,
+        )
+        from spectramr.models.losses.reporting import active_loss_names
+
+        keys = sense_bridge_strategy._declared_loss_keys
+        assert not (keys & STRATEGY_MANAGED_LOSSES)
+        declared = active_loss_names(sense_bridge_strategy._weight_table)
+        assert "pre_dc_kspace" in declared, "fixture drift: arm no longer declares it"
+        assert "pre_dc_kspace" not in keys
+
+    def test_the_sets_are_cached_not_rebuilt_per_step(self, sense_bridge_strategy) -> None:
+        """Non-negotiable 9 — this is read on the per-step path."""
+        first = sense_bridge_strategy._declared_loss_keys
+        assert sense_bridge_strategy._declared_loss_keys is first
+        gated = sense_bridge_strategy._warmup_gated_loss_keys
+        assert sense_bridge_strategy._warmup_gated_loss_keys is gated
+
+    def test_they_survive_a_subclass_that_skips_setup(self) -> None:
+        """Lazy `getattr` caching, not attributes assigned in setup: ten
+        subclasses override `_setup_strategy_specific_components` without
+        calling `super()`, and a missing attribute here is an AttributeError
+        on the first training step."""
+        strategy = _strategy_for(_SENSE_BRIDGE_ARM)
+        assert not hasattr(strategy, "_declared_loss_key_cache")
+        assert strategy._declared_loss_keys  # must build on first touch
+
+
+class TestZeroFillAndReporting:
+    """Fill silently, warn only on an absence the warm-up gate cannot explain."""
+
+    @staticmethod
+    def _produced(strategy, *, drop=(), add=()):
+        keys = (set(strategy._declared_loss_keys) - set(drop)) | set(add)
+        return {k: torch.zeros(()) for k in keys} | {"g_total_loss": torch.zeros(())}
+
+    def test_a_gated_loss_absent_during_warmup_is_filled_without_warning(
+        self, sense_bridge_strategy
+    ) -> None:
+        """`adversarial` is declared active but its branch is skipped while the
+        gate holds. Warning here would emit one line per step for the whole
+        warm-up — 1000 per run, on 58 arms, every one of them false."""
+        gated = sense_bridge_strategy._warmup_gated_loss_keys
+        assert "adversarial" in gated, "fixture drift: adversarial is not gated"
+
+        losses = self._produced(sense_bridge_strategy, drop=gated)
+        filled = sense_bridge_strategy._ensure_declared_losses_present(losses, iteration=0)
+
+        assert filled == gated
+        assert all(k in losses for k in gated), "the CSV column must exist from step 0"
+        assert not [m for lvl, m in sense_bridge_strategy.logged if lvl == "WARN"]
+
+    def test_the_same_absence_after_warmup_is_reported(self, sense_bridge_strategy) -> None:
+        """Past the gate there is no excuse left, so it becomes a real finding."""
+        gated = sense_bridge_strategy._warmup_gated_loss_keys
+        losses = self._produced(sense_bridge_strategy, drop=gated)
+        warmup = sense_bridge_strategy._weight_table.warmup_iterations
+
+        sense_bridge_strategy._ensure_declared_losses_present(losses, iteration=warmup)
+        warnings_ = [m for lvl, m in sense_bridge_strategy.logged if lvl == "WARN"]
+        assert len(warnings_) == 1
+        assert "adversarial" in warnings_[0]
+
+    def test_an_unexplained_drop_is_reported_once_not_per_step(self, sense_bridge_strategy) -> None:
+        """Non-negotiable 9: the training loop runs this every step."""
+        for step in range(5):
+            losses = self._produced(sense_bridge_strategy, drop={"complex_l1"})
+            sense_bridge_strategy._ensure_declared_losses_present(losses, iteration=step)
+        warnings_ = [m for lvl, m in sense_bridge_strategy.logged if lvl == "WARN"]
+        assert len(warnings_) == 1, f"one warning per step: {warnings_}"
+        assert "complex_l1" in warnings_[0]
+
+    def test_a_new_defect_is_reported_even_after_an_earlier_one(
+        self, sense_bridge_strategy
+    ) -> None:
+        """Warn-once must key on the SET, or the second drop is swallowed."""
+        for drop in ({"complex_l1"}, {"complex_l1", "hfen"}):
+            losses = self._produced(sense_bridge_strategy, drop=drop)
+            sense_bridge_strategy._ensure_declared_losses_present(losses, iteration=5000)
+        warnings_ = [m for lvl, m in sense_bridge_strategy.logged if lvl == "WARN"]
+        assert len(warnings_) == 2
+        assert "hfen" in warnings_[1]
+
+    def test_nothing_is_filled_when_every_declared_loss_arrived(
+        self, sense_bridge_strategy
+    ) -> None:
+        losses = self._produced(sense_bridge_strategy)
+        before = dict(losses)
+        filled = sense_bridge_strategy._ensure_declared_losses_present(losses, iteration=0)
+        assert filled == frozenset()
+        assert losses.keys() == before.keys()
+        assert not sense_bridge_strategy.logged
+
+    def test_presence_is_tested_on_the_canonical_name(self, sense_bridge_strategy) -> None:
+        """An arm declaring `mse` resolves to `l2` in the table while a computer
+        may key either. Two `kspace_filling` arms do exactly this; a raw-string
+        compare fills a duplicate key and reports a phantom miss every step."""
+        from spectramr.models.losses.weights import canonical_loss_name
+
+        assert canonical_loss_name("mse") == "l2"
+        strategy = sense_bridge_strategy
+        strategy._declared_loss_key_cache = frozenset({"l2"})
+        strategy._warmup_gated_loss_key_cache = frozenset()
+
+        losses = {"mse": torch.zeros(())}
+        filled = strategy._ensure_declared_losses_present(losses, iteration=0)
+        assert filled == frozenset(), "the alias was already present under `mse`"
+        assert "l2" not in losses
+        assert not strategy.logged
+
+    def test_the_zero_matches_the_device_of_the_losses_it_joins(
+        self, sense_bridge_strategy
+    ) -> None:
+        """A CPU scalar landing in a CUDA loss dict forces a transfer on the
+        per-step logging path (non-negotiable 9).
+
+        The anchor is on ``meta`` deliberately.  A cpu anchor cannot fail this
+        assertion: the fill's own default IS cpu, so ``torch.as_tensor(0.0)``
+        -- the defect -- and ``torch.zeros((), device=device)`` -- the fix --
+        both land there and the test passes either way.  ``meta`` is a device
+        the defect has no way to reach, which is what makes the check real.
+        """
+        strategy = sense_bridge_strategy
+        strategy._declared_loss_key_cache = frozenset({"complex_l1"})
+        strategy._warmup_gated_loss_key_cache = frozenset()
+
+        anchor = torch.zeros((), device="meta")
+        assert anchor.device != torch.zeros(()).device, (
+            "meta must differ from the cpu default, or this test is vacuous"
+        )
+        losses = {"g_total_loss": anchor}
+        strategy._ensure_declared_losses_present(losses, iteration=9999)
+        assert losses["complex_l1"].device == anchor.device
+
+    def test_an_arm_declaring_nothing_fills_nothing(self, sense_bridge_strategy) -> None:
+        strategy = sense_bridge_strategy
+        strategy._declared_loss_key_cache = frozenset()
+        losses = {"g_total_loss": torch.zeros(())}
+        assert strategy._ensure_declared_losses_present(losses, iteration=0) == frozenset()
+        assert list(losses) == ["g_total_loss"]

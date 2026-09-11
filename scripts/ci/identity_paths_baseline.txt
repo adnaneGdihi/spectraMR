@@ -1,0 +1,17 @@
+# Arms whose identity paths collide with another arm's.
+#
+# `duplicate::<key>::<value>`          -- two or more arms resolve this value
+# `names-another-arm::<arm>::<k>::<v>` -- this arm's path names a different arm
+#
+# An entry here is tracked DEBT, not permission. Two arms sharing a results
+# directory overwrite each other's checkpoints and metrics, and the second run
+# silently inherits the first one's artifacts.
+#
+# EMPTY ON PURPOSE, and not a copy of the research tree's baseline. That one
+# records collisions among arms that are not published, so every row would name
+# a directory no reader of this repository can look at. A fresh tree also has no
+# inherited debt to grant: the gate here starts strict, and the first entry
+# added should be one someone decided to accept.
+#
+# Regenerate: python scripts/ci/check_identity_paths_unique.py experiments/inprogress \
+#               --update-baseline

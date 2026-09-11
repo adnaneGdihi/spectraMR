@@ -824,3 +824,118 @@ def test_the_job_prose_scan_reads_one_paragraph_and_not_the_page(
     observed on this page; the last three are how the detector goes blind.
     """
     assert _jobs_named_in(text) == expected
+
+
+# ---------------------------------------------------------------------------
+# Every `SKIP:` in a workflow names a hook that exists
+# ---------------------------------------------------------------------------
+#
+# pre-commit accepts a SKIP naming an id it has never heard of, in silence: no
+# warning, no non-zero exit, the hook simply runs. So a SKIP entry that outlives
+# the hook it names reads as protection on the page and is none in the run --
+# and the reverse, a hook renamed out from under a SKIP, turns a deliberately
+# excused gate back on where nobody expects it. Neither direction announces
+# itself. `.pre-commit-config.yaml` is the authority on which ids exist; this is
+# the only thing that asks it.
+
+_PRE_COMMIT_CONFIG = _REPO_ROOT / ".pre-commit-config.yaml"
+
+
+def _live_hook_ids(config_text: str) -> set[str]:
+    return {
+        str(hook["id"])
+        for repo in yaml.safe_load(config_text).get("repos", [])
+        for hook in repo.get("hooks", [])
+        if hook.get("id")
+    }
+
+
+def _skip_id_lists(node: Any) -> list[list[str]]:
+    """Every `SKIP:` value in a workflow document, split into ids.
+
+    Recursive rather than keyed on a fixed path: `env:` is legal at workflow, job
+    and step level, and a scan anchored to one of the three is blind to the other
+    two. Each entry is stripped, because `a, b` is two ids to pre-commit and the
+    naive split yields the id `" b"`, which matches no hook and would read as a
+    violation of exactly the rule this checks.
+    """
+    if isinstance(node, dict):
+        found: list[list[str]] = []
+        for key, value in node.items():
+            if key == "SKIP" and isinstance(value, str):
+                found.append([t.strip() for t in value.split(",") if t.strip()])
+            else:
+                found.extend(_skip_id_lists(value))
+        return found
+    if isinstance(node, list):
+        return [ids for item in node for ids in _skip_id_lists(item)]
+    return []
+
+
+def test_every_precommit_skip_names_a_hook_that_exists() -> None:
+    live = _live_hook_ids(_PRE_COMMIT_CONFIG.read_text(encoding="utf-8"))
+    assert len(live) >= 10, (
+        f"only {len(live)} hook id(s) parsed out of {_PRE_COMMIT_CONFIG.name}; the "
+        "config carries more than that, so the parse is wrong and a clean result "
+        "here means nothing"
+    )
+
+    declared = [
+        (path, ids)
+        for path in _workflow_paths()
+        for ids in _skip_id_lists(yaml.safe_load(path.read_text(encoding="utf-8")))
+    ]
+    assert declared, (
+        "no SKIP found in any workflow, in either directory. The overlay's "
+        "pr-required.yml carries one, so this scan has stopped reaching it and "
+        "passes over an empty set."
+    )
+
+    offenders = sorted(
+        f"{path.name}: {hook_id}" for path, ids in declared for hook_id in ids if hook_id not in live
+    )
+    assert not offenders, (
+        "a workflow SKIPs a pre-commit hook id that does not exist. pre-commit "
+        "accepts this silently, so the entry protects nothing while reading as "
+        "though it does:\n" + "\n".join(f"  {o}" for o in offenders)
+    )
+
+
+_SKIP_PLANTS: list[tuple[str, str, list[list[str]]]] = [
+    ("job-level env", "jobs:\n  a:\n    env:\n      SKIP: mypy\n", [["mypy"]]),
+    (
+        "step-level env",
+        "jobs:\n  a:\n    steps:\n      - env:\n          SKIP: mypy,codespell\n",
+        [["mypy", "codespell"]],
+    ),
+    (
+        "spaces after the commas",
+        "jobs:\n  a:\n    env:\n      SKIP: 'mypy, codespell'\n",
+        [["mypy", "codespell"]],
+    ),
+    ("no SKIP anywhere", "jobs:\n  a:\n    steps:\n      - run: true\n", []),
+    ("an empty SKIP", "jobs:\n  a:\n    env:\n      SKIP: ''\n", [[]]),
+]
+
+
+@pytest.mark.parametrize(
+    "shape,text,expected", _SKIP_PLANTS, ids=[p[0] for p in _SKIP_PLANTS]
+)
+def test_the_skip_scan_finds_every_shape_a_skip_can_take(
+    shape: str, text: str, expected: list[list[str]]
+) -> None:
+    """Planted (non-negotiable 15), one per shape rather than one per rule.
+
+    The last two are the shapes that make the scan report a clean tree for the
+    wrong reason: an empty result and a result the reader cannot tell from one.
+    """
+    assert _skip_id_lists(yaml.safe_load(text)) == expected, shape
+
+
+def test_the_skip_check_flags_a_dead_id() -> None:
+    """Red on the real failure: a SKIP that outlived its hook."""
+    live = _live_hook_ids(
+        "repos:\n  - repo: local\n    hooks:\n      - id: alive\n        entry: x\n"
+    )
+    ids = _skip_id_lists(yaml.safe_load("jobs:\n  a:\n    env:\n      SKIP: alive,retired\n"))
+    assert [i for group in ids for i in group if i not in live] == ["retired"]

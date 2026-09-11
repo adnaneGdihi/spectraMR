@@ -29,7 +29,7 @@ Registration (returned to the caller — do NOT edit strategy_factory.py here)::
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.nn.functional import l1_loss
@@ -48,6 +48,12 @@ class UniversalReconstructionStrategy(ReconstructionTrainingStrategy):
     can be instantiated through the standard ``ReconstructionTrainingStrategy``
     path without any new schema keys (``training_mode`` alone selects it).
     """
+
+    #: Loss ownership (issue #1918). Computes l1_loss(pred, target) inline -- image space, against the target --
+    #: and returns it as the whole objective. Declared so the fold skips it.
+    #: CAVEAT: the weight is hardcoded 1.0, not the declared lambda_l1.
+    inline_losses: ClassVar[frozenset[str]] = frozenset({"l1"})
+    folds_image_losses: ClassVar[bool] = False
 
     #: Acquisition-parameter layout the physics prompt expects.
     PROMPT_PARAM_ORDER = ("TR", "TE", "flip_angle", "field_strength_T")

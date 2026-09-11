@@ -716,11 +716,13 @@ arm at a larger corpus will not help.
 policy — ``multi_source``, ``ulf_source``, ``prior``, ``fixed_target`` — so each
 split keeps complete field groups and the pinned field is present in both.
 
-``No losses were built by LossBuilder. Training cannot proceed`` (ablation arms)
---------------------------------------------------------------------------------
+``No losses were built by LossBuilder`` (ablation arms)
+-------------------------------------------------------
 
 **Symptom**: an ablation arm (e.g. ``mrixfields_b*_ablate_*``) crashes at build
-with *"No losses were built by LossBuilder"*.
+with *"No losses were built by LossBuilder"*. The raise names the strategy it
+judged and both remedies; match on that leading phrase, not on the whole
+sentence.
 
 **Cause**: these strategies compute their objective **directly** (e.g.
 ``ScatteringBesovStrategy``); the declarative ``losses.image_losses`` list is only
@@ -734,6 +736,14 @@ under-specified).
 ablation (the strategy still computes the real, ablated objective — the
 placeholder only satisfies the build gate). Mirror the ``metadata.baseline``
 parent's ``losses`` block exactly.
+
+**The placeholder is not the only route, but it is the one this family needs.**
+``LossBuilder.validate()`` accepts an empty stack from a strategy that declares it
+owns its *whole* objective — ``inline_losses`` set **and** ``folds_image_losses =
+False``. ``ScatteringBesovStrategy`` declares ``folds_image_losses = True``: it does
+consume the builder's image list, so it is not exempt and the placeholder stands.
+A strategy that declares neither is never exempt — silence is not a claim of
+ownership (#1918).
 
 ``Paired-NIfTI VAE trains HF→ULF (degradation) instead of autoencoding HF``
 ---------------------------------------------------------------------------

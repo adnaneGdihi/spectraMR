@@ -83,7 +83,6 @@ def _annotate(model_type: str, **caps_kwargs):
         MODEL_REGISTRY[model_type] = {
             "class": object,
             "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(**caps_kwargs),
         }
     else:
@@ -150,7 +149,6 @@ class TestDataModelCompatibility:
             MODEL_REGISTRY.pop("__test_unannot")
         MODEL_REGISTRY["__test_unannot"] = {
             "class": object, "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),  # all None
         }
         try:
@@ -209,7 +207,6 @@ class TestTargetDomainMatchesRegisteredOutputDomain:
         MODEL_REGISTRY["__td_unannot"] = {
             "class": object,
             "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),  # output_domain None
         }
         try:
@@ -360,7 +357,6 @@ class TestModelLossOutputDomain:
         MODEL_REGISTRY.pop("__test_oo_unannot", None)
         MODEL_REGISTRY["__test_oo_unannot"] = {
             "class": object, "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),
         }
         try:

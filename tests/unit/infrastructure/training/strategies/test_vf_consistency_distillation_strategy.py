@@ -241,8 +241,7 @@ def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
         nonzero = delta_student[i].abs() > 1e-6
         ratios = (delta_teacher[i][nonzero] / delta_student[i][nonzero]).flatten()
         assert torch.allclose(ratios, ratios[0].expand_as(ratios), atol=1e-4), (
-            f"sample {i}: student and teacher must share one noise draw, "
-            "differing only in sigma"
+            f"sample {i}: student and teacher must share one noise draw, differing only in sigma"
         )
 
 
@@ -319,3 +318,17 @@ class TestForwardDispatchIsIntrospectedNotSwallowed:
 
         assert len(calls) == 1, f"resolved {len(calls)}x for a 4-step sample"
         assert out.shape == (2, 1, 16, 16)
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: the term is a distillation loss against the teacher, not the target.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is False
+    assert VFConsistencyDistillationStrategy.__dict__["inline_losses"] == frozenset()

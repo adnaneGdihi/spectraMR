@@ -15,6 +15,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.config.settings import TrainingSettings
 from spectramr.domain.workflows.declaration import (
     declared_regime,
@@ -53,6 +54,39 @@ _SHORT_EPOCH_ITERS = 50
 #: crosses repetitions at all -- so a mode added to the Literal is coherent
 #: unless it is this one.
 _INCOHERENT_NEX_TARGET_MODE = "complex_mean"
+
+#: The config paths that decide WHERE one arm's artifacts land. Every one is
+#: read on a production path -- ``bootstrap.py`` resolves the log sink and the
+#: metrics directory, and ``training.output_dir`` is read at hundreds of sites --
+#: which is what makes a disagreement between them a defect a run can act on.
+#:
+#: ``logging.identity.experiment`` looks like the seventh member and deliberately
+#: is not one. Nothing under ``src/`` consumes it: the only two mentions are a
+#: ``renames.py`` row and an entry in
+#: ``paired_arms_diff_paths.DEFAULT_DIFF_PATHS``, which is the allow-list of
+#: paths two paired arms may legitimately DIFFER on. Comparing a path that is
+#: written against a label that is never read would report a disagreement no run
+#: can act on. It is missing from ``KNOWN_UNCONSUMED`` only because that ledger
+#: matches a key's LEAF token and ``experiment`` is spelled all over ``src/``
+#: (#1925); the unread knob itself is filed separately, not enforced here.
+#:
+#: This tuple is the single owner (non-negotiable 17).
+#: ``scripts/ci/check_identity_paths_unique.py`` imports it rather than keeping a
+#: second copy, so the corpus-wide gate and the per-config check below can never
+#: drift about what counts as an identity path.
+IDENTITY_PATHS: tuple[str, ...] = (
+    "training.output_dir",
+    "checkpoint.checkpoint_dir",
+    "logging.sinks.dir",
+    "loss_logging.output_dir",
+    "loss_logging.csv_path",
+    "metrics.output_dir",
+)
+
+#: The results-root convention :meth:`check_output_dir_convention` enforces on
+#: ``training.output_dir``. ``cli/profile_paths.CONVENTION_PARTS`` already
+#: derives its copy from this module rather than becoming a second owner.
+RESULTS_PREFIX = "experiments/results/"
 
 #: Checks whose failure means the run CANNOT succeed, so the pipeline aborts
 #: before ``bootstrap.build_container`` instead of warning and continuing.
@@ -257,6 +291,142 @@ def _has_enabled_pre_model_adapter(adapters: Any) -> bool:
         if enabled:
             return True
     return False
+
+
+def _contrast_aware_critics(registry: dict[str, Any]) -> tuple[list[str], int]:
+    """Registered discriminator names, and which of them declare contrast support.
+
+    Returns ``(aware_names, total_names)``. There is no longer a ``None`` arm:
+    it existed to report an unimportable ``IDiscriminator`` as an *unknown*
+    denominator rather than a constant (non-negotiable 18), and reading the
+    declared role imports nothing, so the absence it guarded cannot occur.
+
+    This exists because the sentence it feeds used to be hard-coded as
+    "0 of 21". No registry has ever held 21: when that constant was written
+    ``MODEL_REGISTRY`` carried 14 discriminator *names* (``patch_gan`` and
+    ``patchgan_discriminator`` being two names for one class) and
+    ``ModelFactory``'s separate registry carried 13. So it was already wrong,
+    and it could not self-correct: the day a critic declares the flag, the
+    check stops firing on that arm, and the now-false sentence stays on every
+    *other* arm with nobody reading it.
+
+    That day has since arrived -- ``sense_bridge_patchgan_conditioned`` declares
+    the flag (#1931 half 2), moving the census off zero -- which is the whole
+    argument for recomputing rather than quoting. No number is repeated in this
+    docstring for the same reason; run the function.
+
+    A name counts as a critic if it was **registered** as one -- ``role=
+    "discriminator"`` on ``register_model``. That replaces an
+    ``IDiscriminator``-subclass-or-module-path union (#1916/#1932): the union
+    was a second resolver for "is this a critic", guessing from two unrelated
+    properties what registration can simply state, and this function then
+    disagreed with ``ModelRegistry``'s own bucketing about the denominator it
+    publishes. Measured at the swap: the union answered **15**, the declared
+    role answers **21**, and the union is a strict subset (0 names the role
+    misses), so this also satisfies the criterion the union was chosen for --
+    "none of them" asserted over the *widest* candidate set, not the narrowest.
+    The 6 it adds are critics no heuristic could see: they neither subclass
+    ``IDiscriminator`` nor ship from a ``discriminators`` module
+    (``ldm_*_latent_discriminator``, ``wasserstein_discriminator``,
+    ``domain_discriminator``, ``kan_discriminator``).
+
+    The count is over names, not classes, because names are what a YAML writes.
+    """
+    critics = [name for name, entry in registry.items() if entry.get("role") == "discriminator"]
+    # Read the NESTED capability, not a top-level key (#1916). ``register_model``
+    # no longer fans conditioning flags out to the entry dict -- there is one
+    # owner now -- so a ``registry[n].get(...)`` here would answer False for
+    # every critic and print "0 aware" forever, which is the precise silent
+    # zero this function was written to stop quoting. ``getattr`` on the
+    # capabilities object keeps a hand-built fake entry (no ``capabilities``
+    # key) answering False rather than raising.
+    aware = sorted(
+        n
+        for n in critics
+        if getattr(registry[n].get("capabilities"), "supports_contrast_conditioning", None)
+    )
+    return aware, len(critics)
+
+
+def _pins_materialised_agreement(losses: Any, site: str) -> bool:
+    """Read a ``LossWeightSpec.source`` segment as a field and ask the weight owner.
+
+    An unrecognised segment shape answers *yes*. The caller's only use of a
+    ``False`` is to authorise deleting the field, and a source format this cannot
+    parse is not evidence the deletion is safe (#9).
+    """
+    from spectramr.models.losses.weights import deleting_lambda_would_conflict
+
+    parts = site.split(".")
+    if len(parts) != 3 or parts[0] != "losses":
+        return True
+    return deleting_lambda_would_conflict(losses, parts[1], parts[2])
+
+
+def dual_surface_loss_declarations(losses: Any) -> list[tuple[str, float, list[str], list[str]]]:
+    """Loss weights written on the lambda surface *and* a domain list.
+
+    Sole owner of the pairing rule (non-negotiable 17): the audit check and
+    ``scripts/migrations/migrate_loss_lambdas_to_domain_lists.py`` both read it, so
+    the migration can never delete a field the audit would not have flagged. The
+    migration uses it as a *gate*, not as its candidate source -- it scans the YAML
+    text for candidates and drops every one this function does not report, because
+    the reverse direction is not safe: the canonicalization below means a pair this
+    function cannot represent at all (``losses.diffusion.lambda_mse`` resolves onto
+    ``l2``) would otherwise read as "nothing to keep".
+
+    Returns ``(canonical_name, weight, lambda_sites, list_sites)`` per duplicated
+    weight. Detection is the weight table's own provenance -- ``LossWeightSpec.source``
+    is ``"+"``-joined when a canonical loss was declared more than once -- so no
+    second reader of either surface is introduced.
+
+    Three exclusions, all deliberate:
+
+    * a ``source`` naming only lists (``image_losses`` + ``kspace_losses``) is a
+      different question, owned by ``check_loss_domain_consistency``;
+    * a lambda in ``REINTERPRETED_LAMBDA_SOURCES`` is not redundant. It is
+      read by a computer under a *different* meaning, so deleting it removes a
+      knob rather than a duplicate. That is a narrower set than
+      ``COMPUTER_RESOLVED_LAMBDA_SOURCES``, which also holds the lambdas a
+      computer reads straight off the table under the same meaning a list entry
+      gives them (``reconstruction.lambda_l1`` and three more) — those ARE
+      duplicates beside a list entry and belong in this report. ``losses.diffusion.lambda_mse`` is step 3 of
+      ``UnifiedDiffusionReconstructionLossComputer._resolve_diffusion_weight``
+      (the diffusion-term weight), while the table aliases ``lambda_mse`` ->
+      ``l2`` and so joins it to any image/k-space ``mse`` entry. One table key,
+      two knobs;
+    * a lambda that PINS the materialised view (``deleting_lambda_would_conflict``)
+      is not redundant either, for an unrelated reason: the written surface shows
+      a duplicate, but the value is what holds two sections' divergent schema
+      defaults equal, so removing it makes the two disagree. The two
+      exclusions overlap on ``lambda_l2`` today and are kept apart because they
+      would survive each other — rewiring the diffusion computer would retire the
+      second, and issue #421 would retire the third.
+    """
+    from spectramr.infrastructure.training.builders.loss_builder import (
+        REINTERPRETED_LAMBDA_SOURCES,
+    )
+    from spectramr.models.losses.weights import build_loss_weight_table
+
+    table = build_loss_weight_table(losses)
+    duplicated: list[tuple[str, float, list[str], list[str]]] = []
+    for spec in table.values():
+        # Deliberately NOT filtered on ``spec.enabled``: a list entry with
+        # ``enabled: false`` beside a positive lambda resolves to weight 0 with
+        # no disagreement raised, which is exactly the shape where the two
+        # surfaces are least obviously one term.
+        segments = spec.source.split("+")
+        lambda_sites = [
+            s
+            for s in segments
+            if ".lambda_" in s
+            and s not in REINTERPRETED_LAMBDA_SOURCES
+            and not _pins_materialised_agreement(losses, s)
+        ]
+        list_sites = [s for s in segments if "_losses[" in s]
+        if lambda_sites and list_sites:
+            duplicated.append((spec.name, spec.weight, lambda_sites, list_sites))
+    return sorted(duplicated)
 
 
 class ConfigHealthChecker:
@@ -879,57 +1049,88 @@ class ConfigHealthChecker:
             yaml_keys=["training.strategy_class"],
         )
 
-    def check_loss_weights(self, config: TrainingSettings) -> list[HealthCheckResult]:
-        """Warn if loss weights seem unusual."""
-        results = []
+    def check_loss_weight_declaration_ssot(
+        self, config: TrainingSettings
+    ) -> list[HealthCheckResult]:
+        """One loss weight, one declaration surface — the domain list is the SSOT.
 
-        # Check reconstruction lambdas if losses config exists
-        if hasattr(config, "losses") and config.losses and config.losses.reconstruction:
-            recon = config.losses.reconstruction
-            lambda_l1 = recon.lambda_l1
-            lambda_l2 = recon.lambda_l2
-            # Check other reconstruction losses too
-            lambda_perceptual = recon.lambda_perceptual
-            lambda_ssim = recon.lambda_ssim
+        A loss weight can be written two ways: on the *category* axis as
+        ``losses.<section>.lambda_<name>``, or on the *domain* axis as an entry in
+        ``losses.{image,kspace,complex,latent}_losses``. Since v6.0 the domain
+        lists are the declarative form, and only a list entry actually builds the
+        loss module and selects the FFT bridge (``output_domain`` x which list).
+        A lambda written beside a list entry changes nothing, so the pair is safe
+        to read and NOT symmetric to edit: moving the weight to the lambda
+        silently drops the term, and editing one of the two leaves the arm
+        declaring two different numbers for one objective.
 
-            # [FIX] Added complex-aware losses for k-space experiments
-            lambda_complex_l1 = getattr(recon, "lambda_complex_l1", 0.0)
-            lambda_complex_mse = getattr(recon, "lambda_complex_mse", 0.0)
+        ``build_loss_weight_table`` already refuses a pair that *disagrees*. This
+        check covers the pair that currently agrees — where the harm is not a
+        wrong number but the absence of a single owner (non-negotiable 17).
 
-            # K-space / physics-domain losses (valid for k-space experiments)
-            lambda_sobolev_kspace = getattr(recon, "lambda_sobolev_kspace", 0.0)
-            lambda_log_spectral = getattr(recon, "lambda_log_spectral", 0.0)
-            lambda_sense_adjoint_l1 = getattr(recon, "lambda_sense_adjoint_l1", 0.0)
-            lambda_kspace = getattr(recon, "lambda_kspace", 0.0)
-            lambda_frequency_domain = getattr(recon, "lambda_frequency_domain", 0.0)
+        The pairing rule itself lives in :func:`dual_surface_loss_declarations`,
+        which this check and the migration script share so that the script can
+        never delete a field the audit would not have flagged.
 
-            has_kspace_losses = (
-                lambda_sobolev_kspace > 0.0
-                or lambda_log_spectral > 0.0
-                or lambda_sense_adjoint_l1 > 0.0
-                or lambda_kspace > 0.0
-                or lambda_frequency_domain > 0.0
-            )
+        A name declared in **two lists** (``image_losses`` and ``kspace_losses``)
+        also produces a joined ``source``, and that is a different question owned
+        by ``check_loss_domain_consistency`` — so a pair is reported only when at
+        least one side is a ``lambda_`` and at least one side is a list entry.
+        One corpus arm has the list+list shape today
+        (``promoted/exp_promoted_mri_slam.yaml``), and it is deliberately not
+        flagged here.
+        """
+        results: list[HealthCheckResult] = []
 
-            # If all major reconstruction losses are 0, warn
-            # (skip if k-space/physics losses are active — those are valid alternatives)
-            if (
-                lambda_l1 == 0.0
-                and lambda_l2 == 0.0
-                and lambda_perceptual == 0.0
-                and lambda_ssim == 0.0
-                and lambda_complex_l1 == 0.0
-                and lambda_complex_mse == 0.0
-                and not has_kspace_losses
-            ):
-                results.append(
-                    HealthCheckResult(
-                        passed=False,
-                        check_name="loss_weights",
-                        message="All major reconstruction weights (L1, L2, Perceptual, SSIM) are 0.0!",
-                        severity="warning",
-                    )
+        losses = getattr(config, "losses", None)
+        if losses is None:
+            return results
+
+        try:
+            duplicated = dual_surface_loss_declarations(losses)
+        except Exception as exc:
+            results.append(
+                HealthCheckResult(
+                    passed=False,
+                    check_name="loss_weight_declaration_ssot",
+                    message=f"Loss weight table could not be built: {exc}",
+                    severity="error",
+                    yaml_keys=["losses"],
+                    fix_hint=(
+                        "Two surfaces declare the same loss at DIFFERENT weights. "
+                        "Keep the domain-list entry and delete the lambda_ field."
+                    ),
                 )
+            )
+            return results
+
+        if duplicated:
+            lines = [
+                f"  • '{name}' (weight={weight}) declared at {', '.join(lam)} AND {', '.join(lst)}"
+                for name, weight, lam, lst in sorted(duplicated)
+            ]
+            results.append(
+                HealthCheckResult(
+                    passed=False,
+                    check_name="loss_weight_declaration_ssot",
+                    message=(
+                        f"{len(duplicated)} loss weight(s) are declared on BOTH the "
+                        "lambda_ surface and a domain list. The domain list is the "
+                        "SSOT since v6.0 — the lambda beside it builds nothing and "
+                        "is free to drift:\n" + "\n".join(lines)
+                    ),
+                    severity="warning",
+                    category="duplication",
+                    yaml_keys=sorted(
+                        {s.rsplit(".", 1)[0] for _, _, lam, _ in duplicated for s in lam}
+                    ),
+                    fix_hint=(
+                        "Delete the lambda_ field and keep the domain-list entry. Do "
+                        "NOT do the reverse: only a list entry builds the loss module "
+                        "and selects the FFT bridge."
+                    ),
+                )
+            )
 
         return results
 
@@ -2052,6 +2253,16 @@ class ConfigHealthChecker:
             ("complex_image", "image_losses"),
             ("complex_image", "kspace_losses"),
         }
+        # DELIBERATELY NOT LOSS_LIST_DOMAINS (#1924). Every other "walk the
+        # declared lists" loop in this file is derived from that SSOT; this one is
+        # not, because it is not a walk -- it is the mirror of LossBuilder's bridge
+        # matrix above, and that matrix defines NO bridge into a latent: the encoder
+        # that would produce one is a learned map, not a transform (see
+        # LossConfigSchema.latent_losses). ``latent_losses`` is legal only with
+        # ``output_domain: latent``, a combination ``compat`` does not list, so
+        # adding it here would flag every correct latent arm as a domain mismatch.
+        # The schema validator owns that pairing instead. If a latent bridge is ever
+        # defined, add it to ``compat``/``bridged_combos`` FIRST, then to this loop.
         for attr_name in ("image_losses", "kspace_losses", "complex_losses"):
             entries = getattr(losses_cfg, attr_name, None) or []
             # F-LOSSDOMAIN-ENABLED / 2026-05-20 — only consider losses
@@ -2590,9 +2801,12 @@ class ConfigHealthChecker:
         if losses_cfg is None:
             return results
 
-        # Walk every declared loss across the three lists.
+        # Walk every declared loss across every declared list -- from
+        # LOSS_LIST_DOMAINS, not a hand-written tuple. This loop (and this
+        # comment, which said "the three lists") omitted ``latent_losses``, so a
+        # latent arm's losses were never checked for registration at all (#1924).
         all_names: list[tuple[str, str]] = []
-        for attr in ("image_losses", "kspace_losses", "complex_losses"):
+        for attr in LOSS_LIST_DOMAINS:
             for entry in getattr(losses_cfg, attr, None) or []:
                 # Skip explicitly-disabled losses.
                 if getattr(entry, "enabled", True) is False:
@@ -3017,12 +3231,13 @@ class ConfigHealthChecker:
                 message=f"Model {model_type!r} not in registry; skipped.",
                 severity="info",
             )
+        from spectramr.models.capabilities import CONTRACT_FIELDS
+
         caps = get_model_capabilities(model_type)
-        contract_fields = ("spatial_dims", "input_domain", "output_domain")
         if caps is None:
-            missing = list(contract_fields)
+            missing = list(CONTRACT_FIELDS)
         else:
-            missing = [f for f in contract_fields if getattr(caps, f, None) is None]
+            missing = [f for f in CONTRACT_FIELDS if getattr(caps, f, None) is None]
         if not missing:
             return HealthCheckResult(
                 passed=True,
@@ -3094,8 +3309,22 @@ class ConfigHealthChecker:
                 message=f"Model {model_type!r} not in registry; skipped.",
                 severity="info",
             )
-        if get_model_capabilities(model_type) is not None:
-            # Has at least one declared field → out of the default-deny bucket.
+        from spectramr.models.capabilities import CONTRACT_FIELDS
+
+        # Ask for a DIMENSION CONTRACT specifically, not merely "any declared
+        # capability field". This used to read
+        # ``get_model_capabilities(model_type) is not None``, which was a proxy
+        # -- correct only while ModelCapabilities held nothing but contract
+        # fields, and already at odds with this branch's own message. #1916
+        # moved the two conditioning flags onto the dataclass, and under the
+        # old proxy the 9 models that declare a conditioning flag and no
+        # dimension contract would have silently dropped out of this
+        # default-deny bucket. Same constant as ``model_contract_declared``
+        # (non-negotiable 17).
+        declared = get_model_capabilities(model_type)
+        if declared is not None and any(
+            getattr(declared, f, None) is not None for f in CONTRACT_FIELDS
+        ):
             return HealthCheckResult(
                 passed=True,
                 check_name="dangerous_data_requires_contract",
@@ -3757,14 +3986,45 @@ class ConfigHealthChecker:
         )
 
     def check_multi_contrast_model_support(self, config: TrainingSettings) -> HealthCheckResult:
-        """``data.multi_contrast.enabled`` requires a contrast-aware model.
+        """``data.multi_contrast.enabled`` requires contrast-aware *consumers*.
 
         Pattern C (per-sample FiLM conditioning) is opt-in via
-        ``data.multi_contrast.enabled: true``. The chosen ``model.model_type``
+        ``data.multi_contrast.enabled: true``. Every model the batch reaches
         must declare ``supports_contrast_conditioning=True`` on its
-        ``@register_model`` decorator — otherwise ``contrast_idx`` is emitted
-        on every batch and silently dropped by the model, exactly the silent
-        fallback this audit ladder exists to prevent.
+        ``@register_model`` decorator -- otherwise ``contrast_idx`` is emitted
+        on every batch and silently dropped, exactly the silent fallback this
+        audit ladder exists to prevent.
+
+        **Two consumers, not one.** Until 2026-09-07 this check read only
+        ``model.model_type``, so an arm passed while doing precisely what the
+        check forbids: ``experiment_11_sense_bridge_critic`` pairs a
+        contrast-aware generator (``kspace_cold_diffusion``, flag ``True``)
+        with a critic (``sense_bridge_patchgan``, flag ``False``) and audited
+        clean (#1931). The critic is resolved from
+        ``model.discriminator_component.name`` -- the same accessor
+        ``ModelBuilder.build_discriminator`` uses, and the only spelling the
+        corpus uses (23 arms; the legacy ``model.discriminator`` and
+        ``training.gan.discriminator`` layouts are used by 0 arms each and are
+        not declared schema fields, so ``extra="ignore"`` drops them anyway).
+
+        **Why the critic's unregistered branch FAILS where the generator's
+        defers.** An unknown ``model.model_type`` is deferred to
+        ``check_model_registry`` -- but that check reads
+        ``config.model.model_type`` only, and no check in this ladder
+        validates ``discriminator_component.name``. Deferring would defer to
+        nobody, and passing would infer support from absence (non-negotiable
+        18: absent is a state to report, never a state to infer). Measured
+        2026-09-07: ``MODEL_REGISTRY`` (which owns the capability flags) and
+        ``ModelFactory``'s ``ModelRegistry`` (which owns buildability) have
+        divergent membership in both directions, so absence here is genuinely
+        "unknown", not "unsupported" (#1932). 4 corpus arms name a critic absent
+        from ``MODEL_REGISTRY`` yet buildable (``patch_gan_discriminator`` x3,
+        ``patchgan`` x1); all 4 have ``multi_contrast`` off, so this branch
+        costs 0 arms today.
+
+        Both consumers are reported in **one** result. A chain of early
+        returns would surface the generator only, and the user would fix it,
+        re-run, and meet the critic on the second pass.
         """
         data = getattr(config, "data", None)
         mc = getattr(data, "multi_contrast", None) if data is not None else None
@@ -3816,45 +4076,103 @@ class ConfigHealthChecker:
                 severity="info",
             )
 
+        problems: list[str] = []
+        yaml_keys: list[str] = ["data.multi_contrast.enabled"]
+        hints: list[str] = []
+        notes: list[str] = []
+
+        # ---- consumer 1: the generator (``model.model_type``) ----
         if model_type not in MODEL_REGISTRY:
             # check_model_registry handles this case explicitly elsewhere.
-            return HealthCheckResult(
-                passed=True,
-                check_name="multi_contrast_model_support",
-                message=f"model_type={model_type!r} not in registry; deferred to check_model_registry.",
-                severity="info",
+            notes.append(
+                f"model_type={model_type!r} not in registry; deferred to check_model_registry"
             )
-
-        if model_supports(model_type, "supports_contrast_conditioning"):
-            return HealthCheckResult(
-                passed=True,
-                check_name="multi_contrast_model_support",
-                message=f"model_type={model_type!r} supports contrast conditioning.",
-                severity="info",
+        elif model_supports(model_type, "supports_contrast_conditioning"):
+            notes.append(f"model_type={model_type!r} supports contrast conditioning")
+        else:
+            compatible = list_models_with_capability("supports_contrast_conditioning")
+            problems.append(
+                f"model_type={model_type!r} does not declare supports_contrast_conditioning=True"
             )
-
-        compatible = list_models_with_capability("supports_contrast_conditioning")
-        return HealthCheckResult(
-            passed=False,
-            check_name="multi_contrast_model_support",
-            message=(
-                f"data.multi_contrast.enabled=True but model_type={model_type!r} "
-                f"does not declare supports_contrast_conditioning=True. "
-                f"contrast_idx will be silently dropped at the model boundary."
-            ),
-            severity="error",
-            category="silent_fallback",
-            yaml_keys=[
-                "data.multi_contrast.enabled",
-                "model.model_type",
-            ],
-            fix_hint=(
-                f"Either set data.multi_contrast.enabled=False, or pick one of: "
+            yaml_keys.append("model.model_type")
+            hints.append(
+                f"For the generator: either set data.multi_contrast.enabled=False, "
+                f"or pick one of: "
                 f"{compatible if compatible else '<no models declare this capability>'}. "
                 f"To add support to a new model, set "
                 f"@register_model(..., supports_contrast_conditioning=True) "
                 f"and accept a `contrast_idx` kwarg in its forward()."
+            )
+
+        # ---- consumer 2: the critic (``model.discriminator_component.name``) ----
+        # ``ModelComponentSchema.name`` defaults to ``""``, not ``None``, so an
+        # undeclared critic must be tested as falsy rather than ``is None``.
+        disc_component = getattr(model, "discriminator_component", None)
+        disc_name = getattr(disc_component, "name", None) if disc_component is not None else None
+        if not disc_name:
+            notes.append("no discriminator declared")
+        elif disc_name not in MODEL_REGISTRY:
+            # NOT deferred, and NOT passed -- see the docstring. Nothing else
+            # validates this key, so silence here would be manufactured.
+            problems.append(
+                f"discriminator_component.name={disc_name!r} is absent from "
+                f"MODEL_REGISTRY, so its contrast-conditioning capability "
+                f"cannot be established"
+            )
+            yaml_keys.append("model.discriminator_component.name")
+            hints.append(
+                f"For the critic: {disc_name!r} is not in MODEL_REGISTRY (it may still "
+                f"build -- ModelFactory keeps a separate registry -- but no capability "
+                f"flags are recorded for it, and no audit check validates this key -- #1932). "
+                f"Register it with @register_model(..., supports_contrast_conditioning=...) "
+                f"so the declaration is auditable, or set "
+                f"data.multi_contrast.enabled=False."
+            )
+        elif model_supports(disc_name, "supports_contrast_conditioning"):
+            notes.append(f"discriminator={disc_name!r} supports contrast conditioning")
+        else:
+            problems.append(
+                f"discriminator_component.name={disc_name!r} does not declare "
+                f"supports_contrast_conditioning=True"
+            )
+            yaml_keys.append("model.discriminator_component.name")
+            census = _contrast_aware_critics(MODEL_REGISTRY)
+            if census[0]:
+                available = f"contrast-aware discriminators available: {census[0]}"
+            else:
+                available = (
+                    f"no registered discriminator declares "
+                    f"supports_contrast_conditioning=True (0 of {census[1]} "
+                    f"discriminator names), so there is no drop-in replacement"
+                )
+            hints.append(
+                f"For the critic: {available} -- see #1931. Either set "
+                "data.multi_contrast.enabled=False, drop "
+                "model.discriminator_component, or teach the critic to consume "
+                "contrast_idx (accept the kwarg in discriminate()/forward(), then set "
+                "@register_model(..., supports_contrast_conditioning=True))."
+            )
+
+        if not problems:
+            return HealthCheckResult(
+                passed=True,
+                check_name="multi_contrast_model_support",
+                message="; ".join(notes) + ".",
+                severity="info",
+            )
+
+        return HealthCheckResult(
+            passed=False,
+            check_name="multi_contrast_model_support",
+            message=(
+                "data.multi_contrast.enabled=True but "
+                + "; ".join(problems)
+                + ". contrast_idx will be silently dropped at the model boundary."
             ),
+            severity="error",
+            category="silent_fallback",
+            yaml_keys=yaml_keys,
+            fix_hint=" ".join(hints),
         )
 
     def check_vendor_model_support(self, config: TrainingSettings) -> HealthCheckResult:
@@ -3974,12 +4292,26 @@ class ConfigHealthChecker:
                 "model.model_type",
             ],
             fix_hint=(
-                f"Either remove data.multi_contrast.vendor_map (and n_vendors), "
-                f"or pick one of: "
-                f"{compatible if compatible else '<no models declare this capability>'}. "
-                "To add support to a new model, set "
-                "@register_model(..., supports_vendor_conditioning=True) "
-                "and accept a `vendor_id` kwarg in its forward()."
+                (
+                    f"Either remove data.multi_contrast.vendor_map (and "
+                    f"n_vendors), or pick one of: {compatible}."
+                )
+                if compatible
+                else (
+                    "Vendor conditioning is NOT IMPLEMENTED anywhere in the "
+                    "framework yet -- this is a framework gap, not a wrong "
+                    "model choice, so no model_type will satisfy this check. "
+                    "Zero of the registered models declare "
+                    "supports_vendor_conditioning, no model's forward() or "
+                    "__init__ takes a vendor argument, and "
+                    "VendorPromptEmbedding "
+                    "(models/blocks/vendor_prompt_embedding.py) has zero "
+                    "instantiations. Remove data.multi_contrast.vendor_map "
+                    "(and n_vendors) to proceed. To BUILD the capability: "
+                    "wire VendorPromptEmbedding into a generator, accept a "
+                    "`vendor_id` kwarg in its forward(), and register it with "
+                    "@register_model(..., supports_vendor_conditioning=True)."
+                )
             ),
         )
 
@@ -7199,7 +7531,7 @@ class ConfigHealthChecker:
 
         declared: list[tuple[str, str]] = []  # (kind, name)
         losses_cfg = getattr(config, "losses", None)
-        for attr in ("image_losses", "kspace_losses", "complex_losses"):
+        for attr in LOSS_LIST_DOMAINS:
             for entry in getattr(losses_cfg, attr, None) or []:
                 if getattr(entry, "enabled", True) is False:
                     continue
@@ -8037,7 +8369,7 @@ class ConfigHealthChecker:
         declared: set[str] = set()
         losses_cfg = getattr(config, "losses", None)
         if losses_cfg is not None:
-            for attr in ("image_losses", "kspace_losses", "complex_losses"):
+            for attr in LOSS_LIST_DOMAINS:
                 for entry in getattr(losses_cfg, attr, None) or []:
                     if getattr(entry, "enabled", True) is False:
                         continue
@@ -10014,6 +10346,111 @@ class ConfigHealthChecker:
             check_name,
             (f"training.output_dir='{path}' follows the experiments/results/<name> convention."),
             "info",
+        )
+
+    def check_identity_paths_agree(
+        self,
+        config: TrainingSettings,
+    ) -> HealthCheckResult:
+        """Every identity path under ``experiments/results/`` names ONE experiment.
+
+        :meth:`check_output_dir_convention` is a *prefix* test: it accepts
+        ``experiments/results/<anything>`` and never asks whether ``<anything>``
+        is this arm's own name. That blind spot is not hypothetical. It is
+        recorded next door in :class:`spectramr.cli.profile_paths.ProfilePaths`,
+        where a profiling run wrote checkpoints, metrics and provenance on top
+        of the very arm it was measuring, and "the child's own config-health run
+        reported the injected path as on-convention", leaving a profiling run
+        and a real run indistinguishable after the fact.
+
+        This is deliberately a SIBLING check rather than a fourth clause inside
+        that one (non-negotiable 17): the prefix rule and the agreement rule
+        fail for different reasons, quote different keys, and want different
+        fix hints.
+
+        **What it can and cannot see.** A single config is all this checker may
+        read -- ``__init__`` takes no ``config_path`` by design -- so the
+        question it can answer is *internal* consistency: an arm whose
+        ``training.output_dir`` says ``foo`` while its checkpoints, logs and
+        metrics say ``bar`` splits its own artifacts across two trees. It cannot
+        see that two DIFFERENT arms name the same tree; that needs corpus
+        knowledge and is owned by ``scripts/ci/check_identity_paths_unique.py``.
+
+        **Scope.** Only values under ``experiments/results/`` are compared. A
+        path left CWD-relative is a different defect with its own issue: over
+        660 corpus arms, ``checkpoint.checkpoint_dir`` resolves on-convention
+        for 384, inherits the ``./checkpoints`` default for 201 and is declared
+        off-convention for 75 -- so 276 name no experiment at all there, and
+        227 resolve to the exact literal ``./checkpoints``. Folding that in
+        would fire on 42% of the corpus and get this check baselined and
+        ignored.
+
+        **What ``checkpoint.checkpoint_dir`` is, precisely.** It is not the
+        happy-path checkpoint destination, and this check does not claim it is.
+        ``CheckpointDirector`` -- the primary writer, at every save site in
+        :mod:`spectramr.pipelines.training_loop` -- derives its directory from
+        ``training.output_dir`` and never reads this key. The key is read by
+        ``CheckpointService``, which the loop reaches only from the
+        ``except Exception as director_err`` branch guarding the epoch save,
+        and by ``CheckpointService.__init__``, which ``mkdir``s it on every run
+        of every arm. So a disagreement here is a real split -- the directory
+        is created, and it is where a checkpoint lands the moment the director
+        raises -- but the bulk of a healthy run follows ``training.output_dir``.
+
+        Severity is ``warning``: the arm trains, so this is not fatal, but
+        ``audit`` is ``--strict`` and warnings exit 2 (non-negotiable 4).
+        """
+        check_name = "identity_paths_agree"
+        by_segment: dict[str, list[str]] = {}
+        for dotted in IDENTITY_PATHS:
+            value = self._resolve_dotted(config, tuple(dotted.split(".")))
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text.startswith(RESULTS_PREFIX):
+                continue
+            rest = text[len(RESULTS_PREFIX) :].strip("/")
+            if not rest:
+                continue
+            by_segment.setdefault(rest.split("/")[0], []).append(dotted)
+
+        if len(by_segment) < 2:
+            named = next(iter(by_segment), None)
+            return HealthCheckResult(
+                True,
+                check_name,
+                (
+                    f"every identity path under {RESULTS_PREFIX} names '{named}'."
+                    if named is not None
+                    else f"no identity path points under {RESULTS_PREFIX}."
+                ),
+                "info",
+            )
+
+        rendered = "; ".join(
+            f"'{segment}' <- {', '.join(sorted(keys))}"
+            for segment, keys in sorted(by_segment.items())
+        )
+        return HealthCheckResult(
+            False,
+            check_name,
+            (
+                f"this arm's identity paths name {len(by_segment)} different "
+                f"experiments, so its artifacts split across {len(by_segment)} "
+                f"trees under {RESULTS_PREFIX}: {rendered}. Whichever segment is "
+                f"wrong, part of this run lands in another arm's directory, "
+                f"where nothing distinguishes it from that arm's own outputs "
+                f"afterwards."
+            ),
+            "warning",
+            category="identity_paths_disagree",
+            yaml_keys=sorted(key for keys in by_segment.values() for key in keys),
+            fix_hint=(
+                f"Point every listed key at the same "
+                f"{RESULTS_PREFIX}<experiment_name>. If the split is deliberate, "
+                f"add a tests/ regression saying so -- no reader can tell it "
+                f"from a copy-paste that kept the template's name."
+            ),
         )
 
     def check_epochs_max_iterations_mutex(
@@ -12665,7 +13102,7 @@ class ConfigHealthChecker:
         declared: set[str] = set()
         losses_cfg = getattr(config, "losses", None)
         if losses_cfg is not None:
-            for attr in ("image_losses", "kspace_losses", "complex_losses"):
+            for attr in LOSS_LIST_DOMAINS:
                 for entry in getattr(losses_cfg, attr, None) or []:
                     name = getattr(entry, "name", None) or (
                         entry.get("name") if isinstance(entry, dict) else None
@@ -13201,7 +13638,7 @@ class ConfigHealthChecker:
         report.results.extend(self.check_domain_alignment(config))
 
         # Loss and physics checks
-        report.results.extend(self.check_loss_weights(config))
+        report.results.extend(self.check_loss_weight_declaration_ssot(config))
         report.results.extend(self.check_physics_config(config))
 
         # Tier-1 audit-ladder additions (errors)
@@ -13355,6 +13792,9 @@ class ConfigHealthChecker:
         # so smoke tooling can auto-discover mosaics + reports. See
         # TODO/audit/smoke_audit_20260516.md §F-OUT.
         report.results.append(self.check_output_dir_convention(config))
+        # #1929: the convention check above is a PREFIX test and cannot see an
+        # arm whose output_dir, checkpoints and logs name different experiments.
+        report.results.append(self.check_identity_paths_agree(config))
         report.results.append(self.check_epochs_max_iterations_mutex(config))
 
         # v6.1 — paradigm-expansion checks

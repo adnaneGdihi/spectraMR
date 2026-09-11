@@ -34,9 +34,7 @@ def _stub_base_init(monkeypatch):
     def _fake_init(self, *args, **kwargs):
         self.device = torch.device("cpu")
 
-    monkeypatch.setattr(
-        ReconstructionTrainingStrategy, "__init__", _fake_init, raising=True
-    )
+    monkeypatch.setattr(ReconstructionTrainingStrategy, "__init__", _fake_init, raising=True)
 
 
 class TestBlochImportFailureRaises:
@@ -50,16 +48,12 @@ class TestBlochImportFailureRaises:
 
         def _boom(name, *args, **kwargs):
             if name == target:
-                raise ImportError(
-                    "simulated missing BlochSignalSynthesisConsistencyLoss"
-                )
+                raise ImportError("simulated missing BlochSignalSynthesisConsistencyLoss")
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", _boom)
 
-        with pytest.raises(
-            RuntimeError, match="BlochConsistentDenoisingStrategy requires"
-        ):
+        with pytest.raises(RuntimeError, match="BlochConsistentDenoisingStrategy requires"):
             BlochConsistentDenoisingStrategy()
 
     def test_import_failure_chains_original_importerror(self, monkeypatch):
@@ -115,9 +109,7 @@ class TestComputeLossesCallSite:
         s._resolve_legacy_batch = lambda input_batch, kwargs: kwargs.get("batch", {})
         return s
 
-    def test_absent_bloch_loss_raises_rather_than_running_a_plain_denoiser(
-        self, monkeypatch
-    ):
+    def test_absent_bloch_loss_raises_rather_than_running_a_plain_denoiser(self, monkeypatch):
         """``self._bloch is None`` used to drop to the parent objective.
 
         That trained a plain denoiser under a Bloch-consistent arm name and
@@ -128,9 +120,7 @@ class TestComputeLossesCallSite:
         s = self._strategy_with_gen(monkeypatch, gen)
         s._bloch = None
         with pytest.raises(RuntimeError, match="defining objective"):
-            s._compute_losses_impl(
-                batch={"observed_contrasts": torch.randn(1, 2, 4, 4)}
-            )
+            s._compute_losses_impl(batch={"observed_contrasts": torch.randn(1, 2, 4, 4)})
 
     def test_non_dict_generator_output_fails_loud(self, monkeypatch):
         # A plain image denoiser returns a single tensor -> the forward-synthesis
@@ -139,9 +129,7 @@ class TestComputeLossesCallSite:
         gen = lambda x: torch.randn(1, 3, 4, 4)  # noqa: E731
         s = self._strategy_with_gen(monkeypatch, gen)
         with pytest.raises(NotImplementedError, match="parameter-map dict"):
-            s._compute_losses_impl(
-                batch={"observed_contrasts": torch.randn(1, 3, 4, 4)}
-            )
+            s._compute_losses_impl(batch={"observed_contrasts": torch.randn(1, 3, 4, 4)})
 
     def test_missing_acquisition_params_fails_loud(self, monkeypatch):
         gen = lambda x: {  # noqa: E731
@@ -151,9 +139,7 @@ class TestComputeLossesCallSite:
         }
         s = self._strategy_with_gen(monkeypatch, gen)
         with pytest.raises(ValueError, match="acquisition_params"):
-            s._compute_losses_impl(
-                batch={"observed_contrasts": torch.randn(1, 2, 4, 4)}
-            )
+            s._compute_losses_impl(batch={"observed_contrasts": torch.randn(1, 2, 4, 4)})
 
     def test_valid_param_maps_compute_finite_bloch_loss(self, monkeypatch):
         gen = lambda x: {  # noqa: E731
@@ -293,3 +279,17 @@ class TestObservedContrastsGuard:
         assert len(gen.calls) == 1
         assert gen.calls[0][0][0] is observed
         assert torch.isfinite(out["loss_total"])
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: its hook overrides the parent's without calling super() or the fold.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert BlochConsistentDenoisingStrategy.__dict__["folds_image_losses"] is False
+    assert BlochConsistentDenoisingStrategy.__dict__["inline_losses"] == frozenset()

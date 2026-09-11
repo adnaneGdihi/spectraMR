@@ -5,7 +5,7 @@ from __future__ import annotations
 import types
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.strategies.ulf_map_strategy import ulf_degrade
 from spectramr.infrastructure.training.strategies.ulf_redegrad_tta_strategy import (

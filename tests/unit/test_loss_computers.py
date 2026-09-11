@@ -199,9 +199,7 @@ class TestBaseLossComputer:
     def test_loss_computer_initialization(self):
         """Test that loss computer initializes without errors."""
         config = MockConfig()
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
 
         assert computer is not None
         assert computer.config == config
@@ -210,18 +208,16 @@ class TestBaseLossComputer:
     def test_loss_computer_requires_grad(self):
         """Test that loss computer sets requires_grad correctly."""
         config = MockConfig()
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
 
         # Loss computer should not have trainable parameters
         # (if it does, they should not require grad)
         for attr_name, attr_value in computer.__dict__.items():
             if isinstance(attr_value, nn.Module):
                 for param in attr_value.parameters():
-                    assert (
-                        not param.requires_grad
-                    ), "Loss computer should not have requires_grad=True parameters"
+                    assert not param.requires_grad, (
+                        "Loss computer should not have requires_grad=True parameters"
+                    )
 
     # ------------------------------------------------------------------
     # Silent-NaN-collapse guard (2026-05-21 Round 16, F29)
@@ -325,9 +321,7 @@ class TestUnifiedDiffusionLossComputer:
         """Setup for diffusion tests."""
         config = MockConfig()
         config.training.training_mode = "diffusion"
-        computer = UnifiedDiffusionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedDiffusionLossComputer(config=config, device=torch.device("cpu"))
 
         # Test data
         batch_size, channels, height, width = 2, 2, 32, 32
@@ -348,7 +342,7 @@ class TestUnifiedDiffusionLossComputer:
         # Check output structure
         assert isinstance(loss_output.total, torch.Tensor)
         assert loss_output.total.item() > 0, "Loss should be positive"
-        assert loss_output.total.requires_grad, "Loss should track gradients"
+        assert loss_output.total.grad_fn is not None, "Loss should track gradients"
         assert len(loss_output.components) > 0, "Should have loss components"
 
     def test_diffusion_no_backward_in_compute(self, setup):
@@ -393,9 +387,7 @@ class TestUnifiedReconstructionLossComputer:
         has no surviving term and lands right back on the same guard.
         """
         config = real_settings(lambda_l1=1.0, lambda_l2=0.5)
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
 
         batch_size, channels, height, width = 2, 2, 32, 32
         pred = torch.randn(batch_size, channels, height, width, requires_grad=True)
@@ -410,7 +402,7 @@ class TestUnifiedReconstructionLossComputer:
         loss_output = computer.compute(pred=pred, target=target, epoch=0)
 
         assert isinstance(loss_output.total, torch.Tensor)
-        assert loss_output.total.requires_grad, "Loss should track gradients"
+        assert loss_output.total.grad_fn is not None, "Loss should track gradients"
         assert loss_output.total.item() > 0, "Loss should be positive"
 
     def test_reconstruction_loss_components(self, setup):
@@ -479,9 +471,7 @@ class TestUnifiedReconstructionLossComputer:
         # still exercises the pre-warmup window the test is named for.
         config = real_settings(lambda_l1=10.0, lambda_l2=1.0)
 
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
 
         pred = torch.randn(2, 1, 16, 16, requires_grad=True)
         target = torch.randn(2, 1, 16, 16)
@@ -500,8 +490,7 @@ class TestUnifiedReconstructionLossComputer:
         # dict as well as the weight table.
         assert "l2" in out.components, (
             "Expected the dynamic loop to compute the LossBuilder-supplied "
-            "`mse` entry under its canonical key `l2`; got components="
-            + str(list(out.components))
+            "`mse` entry under its canonical key `l2`; got components=" + str(list(out.components))
         )
         assert out.components["l2"].item() > 0, (
             "MSE between random pred and target should be positive."
@@ -539,15 +528,16 @@ class TestUnifiedReconstructionLossComputer:
         config.losses.reconstruction.lambda_l1 = 0.0
         config.losses.reconstruction.lambda_l2 = 0.0
 
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
         pred = torch.randn(2, 1, 16, 16, requires_grad=True)
         target = torch.randn(2, 1, 16, 16)
 
         with pytest.raises(ValueError, match=r"silent loss failure|shape / channel"):
             computer.compute(
-                pred=pred, target=target, epoch=0, iteration=2000,
+                pred=pred,
+                target=target,
+                epoch=0,
+                iteration=2000,
                 losses_dict={"l2": _ShapeMismatchLoss()},
             )
 
@@ -570,15 +560,18 @@ class TestUnifiedReconstructionLossComputer:
         config.losses.reconstruction.lambda_l1 = 0.0
         config.losses.reconstruction.lambda_l2 = 0.0
 
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
         pred = torch.randn(2, 1, 16, 16, requires_grad=True)
         target = torch.randn(2, 1, 16, 16)
 
-        with pytest.raises(RuntimeError, match=r"empty.*disconnected zero|All declared losses failed"):
+        with pytest.raises(
+            RuntimeError, match=r"empty.*disconnected zero|All declared losses failed"
+        ):
             computer.compute(
-                pred=pred, target=target, epoch=0, iteration=2000,
+                pred=pred,
+                target=target,
+                epoch=0,
+                iteration=2000,
                 losses_dict={"aux": _RuntimeErrorLoss()},
             )
 
@@ -613,12 +606,10 @@ class TestUnifiedVAELossComputer:
         """Test VAE loss computation."""
         computer, pred, target, mu, logvar = setup
 
-        loss_output = computer.compute(
-            pred=pred, target=target, mu=mu, logvar=logvar, epoch=0
-        )
+        loss_output = computer.compute(pred=pred, target=target, mu=mu, logvar=logvar, epoch=0)
 
         assert isinstance(loss_output.total, torch.Tensor)
-        assert loss_output.total.requires_grad
+        assert loss_output.total.grad_fn is not None
         assert loss_output.total.item() > 0
 
 
@@ -658,12 +649,10 @@ class TestUnifiedVQVAELossComputer:
         """Test VQ-VAE loss computation."""
         computer, pred, target, z_q, z_e = setup
 
-        loss_output = computer.compute(
-            pred=pred, target=target, z_q=z_q, z_e=z_e, epoch=0
-        )
+        loss_output = computer.compute(pred=pred, target=target, z_q=z_q, z_e=z_e, epoch=0)
 
         assert isinstance(loss_output.total, torch.Tensor)
-        assert loss_output.total.requires_grad
+        assert loss_output.total.grad_fn is not None
         assert loss_output.total.item() > 0
 
 
@@ -689,9 +678,7 @@ class TestUnifiedGANLossComputer:
         computer = UnifiedGANLossComputer(config=None, device=torch.device("cpu"))
 
         batch_size, channels, height, width = 2, 2, 32, 32
-        gen_output = torch.randn(
-            batch_size, channels, height, width, requires_grad=True
-        )
+        gen_output = torch.randn(batch_size, channels, height, width, requires_grad=True)
         target = torch.randn(batch_size, channels, height, width)
         discriminator = SimpleDiscriminator(in_channels=channels)
 
@@ -709,7 +696,7 @@ class TestUnifiedGANLossComputer:
         )
 
         assert isinstance(loss_output.total, torch.Tensor)
-        assert loss_output.total.requires_grad
+        assert loss_output.total.grad_fn is not None
 
     def test_gan_discriminator_loss(self, setup):
         """Test GAN discriminator loss."""
@@ -723,7 +710,30 @@ class TestUnifiedGANLossComputer:
         )
 
         assert isinstance(loss_output.total, torch.Tensor)
-        assert loss_output.total.requires_grad
+
+        # This fixture builds the computer with ``config=None``, the sanctioned
+        # minimal stack, which sets ``adversarial_loss_fn = None``
+        # (``unified_gan.py:182``). ``compute_discriminator_loss`` gates its
+        # whole body on ``if self.adversarial_loss_fn`` (:677), so there is
+        # genuinely nothing to compute and ``components`` comes back empty.
+        #
+        # This assertion used to read ``assert loss_output.total.requires_grad``
+        # and it passed -- but not because of anything the computer did.
+        # ``LossOutput.__post_init__`` used to force ``requires_grad=True`` on
+        # EVERY LossOutput ever constructed, so the assertion was a tautology:
+        # no computer could have failed it. Deleting that repair (#1952) is what
+        # made this measurable, and what it measures is that the minimal stack
+        # has no discriminator objective at all.
+        assert loss_output.components == {}, (
+            "config=None configures no adversarial loss, so there is no "
+            "discriminator objective to stack"
+        )
+        assert loss_output.total.grad_fn is None
+        assert not loss_output.total.requires_grad, (
+            "a computer that produced nothing must SAY so; the old "
+            "__post_init__ repair dressed this up as a trainable leaf, and "
+            "backward() on it silently updated no discriminator weight"
+        )
 
 
 # ============================================================================
@@ -837,9 +847,7 @@ class TestIntegration:
         optimizer = torch.optim.Adam(generator.parameters(), lr=1e-4)
 
         # Create loss computer
-        computer = UnifiedReconstructionLossComputer(
-            config=config, device=torch.device("cpu")
-        )
+        computer = UnifiedReconstructionLossComputer(config=config, device=torch.device("cpu"))
 
         # Create dummy batch
         batch_size, channels, height, width = 2, 2, 32, 32
@@ -919,8 +927,7 @@ class TestIntegration:
 
         (
             d_loss_output.total.backward()
-            if d_loss_output.total.requires_grad
-            and d_loss_output.total.grad_fn is not None
+            if d_loss_output.total.requires_grad and d_loss_output.total.grad_fn is not None
             else None
         )
         assert any(p.grad is not None for p in discriminator.parameters())

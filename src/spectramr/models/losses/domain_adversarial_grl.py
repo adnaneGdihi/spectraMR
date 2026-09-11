@@ -1,7 +1,9 @@
-"""Gradient Reversal Layer & Domain-Adversarial Loss for Field Disentanglement.
+"""Domain-Adversarial Loss for Field Disentanglement.
 
 Forces an encoder to produce field-invariant latent representations by
-adversarially confusing a domain classifier via gradient negation.
+adversarially confusing a domain classifier via gradient negation. The reversal
+itself lives in :mod:`spectramr.models.blocks.domain_adaptation`, its canonical
+home (NN6); this module supplies the classifier and the loss built around it.
 
 Mathematical Foundation:
     L_GRL = min_{E_anat} max_{D_field} E[BCE(D_field(E_anat(x)), field_label)]
@@ -24,64 +26,10 @@ import logging
 import torch
 import torch.nn as nn
 
+from spectramr.models.blocks.domain_adaptation import GradientReversalLayer
 from spectramr.models.losses.registry import register_loss
 
 logger = logging.getLogger(__name__)
-
-
-class GradientReversalFunction(torch.autograd.Function):
-    """Autograd function that negates gradients during backward pass."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        return grad_output.neg() * ctx.alpha, None
-
-
-class GradientReversalLayer(nn.Module):
-    """Gradient Reversal Layer (GRL).
-
-    Acts as identity during forward pass. Negates gradients by factor
-    -α during backward pass. This forces upstream layers to produce
-    representations that maximally confuse a downstream classifier.
-
-    Args:
-        alpha: Gradient reversal strength. Typically annealed from 0 → 1
-            during training via ``set_alpha()``.
-    Mathematical Formulation:
-    .. math::
-
-        \\mathcal{O}_{GradientReversal}(x) = \begin{cases} x & \text{forward} \\ -\alpha \frac{\\partial L}{\\partial x} & \text{backward} \\end{cases}"""
-
-    def __init__(self, alpha: float = 1.0) -> None:
-        super().__init__()
-        self.alpha = alpha
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """forward method for GradientReversalLayer.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        return GradientReversalFunction.apply(x, self.alpha)
-
-    def set_alpha(self, alpha: float) -> None:
-        """Update reversal strength (for schedule annealing)."""
-        self.alpha = alpha
-
-    def extra_repr(self) -> str:
-        return f"alpha={self.alpha}"
 
 
 class FieldDomainClassifier(nn.Module):
@@ -231,6 +179,4 @@ class DomainAdversarialLoss(nn.Module):
 __all__ = [
     "DomainAdversarialLoss",
     "FieldDomainClassifier",
-    "GradientReversalFunction",
-    "GradientReversalLayer",
 ]

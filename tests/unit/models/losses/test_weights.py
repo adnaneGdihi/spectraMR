@@ -17,8 +17,12 @@ from spectramr.models.losses.registry import LossRegistry
 from spectramr.models.losses.weights import (
     LEGACY_WARMUP_LOSSES,
     WEIGHT_SEMANTICS_VERSION,
+    accessor_read_paths,
     build_loss_weight_table,
     canonical_loss_name,
+    deleting_lambda_would_conflict,
+    lambda_schema_default,
+    materialised_weight_conflicts,
     resolve_loss_weight,
 )
 
@@ -155,9 +159,7 @@ class TestResolution:
             ("codebook", 1.0),  # enable_codebook existed; the weight field did not
         ],
     )
-    def test_probed_terms_now_have_a_visible_schema_home(
-        self, loss: str, legacy_default: float
-    ):
+    def test_probed_terms_now_have_a_visible_schema_home(self, loss: str, legacy_default: float):
         """These are probed by the computers but had no `lambda_<n>` field, so they fell
         into the magic tables. Each now has a schema field carrying its legacy value —
         one visible, auditable home instead of three disagreeing ones (pitfall #15)."""
@@ -201,9 +203,7 @@ class TestResolution:
 
     def test_scheduled_override_beats_the_warmup_gate(self):
         """A curriculum rule must be able to enable a spatial term before warmup ends."""
-        cfg = LossConfigSchema(
-            reconstruction={"lambda_l1": 1.0, "warmup_iterations": 1000}
-        )
+        cfg = LossConfigSchema(reconstruction={"lambda_l1": 1.0, "warmup_iterations": 1000})
         table = build_loss_weight_table(cfg)
         assert resolve_loss_weight(table, "l1", iteration=0) == 0.0  # gated
         assert resolve_loss_weight(
@@ -221,17 +221,13 @@ class TestWarmupGate:
         assert table["l1"].warmup_gated is True
 
     def test_gate_zeroes_before_warmup_and_releases_after(self):
-        cfg = LossConfigSchema(
-            reconstruction={"lambda_l1": 3.0, "warmup_iterations": 100}
-        )
+        cfg = LossConfigSchema(reconstruction={"lambda_l1": 3.0, "warmup_iterations": 100})
         table = build_loss_weight_table(cfg)
         assert resolve_loss_weight(table, "l1", iteration=99) == 0.0
         assert resolve_loss_weight(table, "l1", iteration=100) == pytest.approx(3.0)
 
     def test_ungated_loss_is_never_zeroed(self):
-        cfg = LossConfigSchema(
-            reconstruction={"lambda_hfen": 3.0, "warmup_iterations": 100}
-        )
+        cfg = LossConfigSchema(reconstruction={"lambda_hfen": 3.0, "warmup_iterations": 100})
         table = build_loss_weight_table(cfg)
         assert resolve_loss_weight(table, "hfen", iteration=0) == pytest.approx(3.0)
 
@@ -261,9 +257,7 @@ class TestWarmupGate:
         assert resolve_loss_weight(table, "l1", iteration=0) == pytest.approx(3.0)
 
     def test_warmup_losses_is_stamped_into_provenance(self):
-        cfg = LossConfigSchema(
-            reconstruction={"lambda_hfen": 1.0, "warmup_losses": ["hfen"]}
-        )
+        cfg = LossConfigSchema(reconstruction={"lambda_hfen": 1.0, "warmup_losses": ["hfen"]})
         assert build_loss_weight_table(cfg).provenance()["warmup_losses"] == ["hfen"]
 
 
@@ -539,16 +533,335 @@ class TestLambdaSectionsAreAllReal:
 
     `_declared_lambdas` does `getattr(loss_config, section_name, None)` and skips a
     miss silently, so a stale entry is a no-op on every call with no diagnostic.
+
+    This class used to *park* ``"adversarial"`` as a known dead entry "pending a
+    history check". #1925 did the check and deleted it: ``git log -S'"adversarial",'``
+    on this file returns only the project rename, ``RENAMES`` carries no entry for it,
+    and the knob it would have named already exists as ``losses.gan.lambda_adv`` --
+    which is precisely why :data:`NAME_ALIASES` maps ``adv -> adversarial``. Wiring it
+    (the standing preference over deletion) would have created a *second* declaration
+    surface for one weight, the SSOT violation this module exists to end. So the
+    ledger entry becomes an invariant, and the silent skip becomes a raise.
     """
 
-    def test_adversarial_is_the_only_known_dead_entry(self):
+    def test_no_lambda_section_is_dead(self):
         from spectramr.models.losses.weights import LAMBDA_SECTIONS
 
         dead = [s for s in LAMBDA_SECTIONS if s not in LossConfigSchema.model_fields]
-        assert dead == ["adversarial"], (
-            "The set of dead LAMBDA_SECTIONS entries changed. `adversarial` is a "
-            "known, separately-tracked no-op kept pending a history check (it is "
-            "either stale or a section that was meant to exist -- prefer wiring "
-            "over deletion). A NEW dead entry means a section's lambdas are being "
-            "silently skipped by `_declared_lambdas`."
+        assert dead == [], (
+            f"{len(dead)} LAMBDA_SECTIONS name(s) match no LossConfigSchema block: "
+            f"{dead}. Their lambdas resolve to no schema default and appear in no "
+            "read-path export, silently. Remove the name or add the block."
         )
+
+    @pytest.mark.parametrize("caller", ["_lambda_sections", "accessor_read_paths"])
+    def test_a_dead_section_raises_rather_than_being_skipped(self, monkeypatch, caller):
+        """NN15 plant: the violation the old silent `continue` could not report.
+
+        Both entry points share one walk, so the plant is applied to each -- a raise
+        that only `_lambda_sections` performs would leave `accessor_read_paths`
+        publishing a short map with no diagnostic.
+        """
+        from spectramr.models.losses import weights as weights_mod
+
+        monkeypatch.setattr(
+            weights_mod,
+            "LAMBDA_SECTIONS",
+            (*weights_mod.LAMBDA_SECTIONS, "no_such_section"),
+        )
+        with pytest.raises(ConfigurationError, match="no_such_section"):
+            fn = getattr(weights_mod, caller)
+            list(fn()) if caller == "_lambda_sections" else fn()
+
+    def test_the_plant_changes_the_constant(self):
+        """A fixture that mutates nothing reads as a passing detector."""
+        from spectramr.models.losses.weights import LAMBDA_SECTIONS
+
+        assert "no_such_section" not in LAMBDA_SECTIONS
+
+
+class TestMaterialisedReading:
+    """``model_fields_set`` is what the author wrote; ``model_dump`` is what the
+    loader stamps. ``build_loss_weight_table`` reads the first, so a lambda that
+    agrees with another section only because it was written is invisible to it.
+
+    That blindness is not hypothetical: a lambda migration deleted
+    ``reconstruction.lambda_l2`` from two ``kspace_filling`` arms on the strength
+    of the written surface alone, and the cohort regression test went red.
+    """
+
+    def test_the_two_defaults_that_diverge(self):
+        """The collision behind issue #421, read off the schema rather than named."""
+        assert lambda_schema_default("reconstruction", "lambda_l2") == 0.0
+        assert lambda_schema_default("diffusion", "lambda_mse") == 1.0
+
+    def test_absent_answers_none_rather_than_zero(self):
+        """0.0 is a real weight, so it may not double as "no such field" (#9)."""
+        assert lambda_schema_default("no_such_section", "lambda_l2") is None
+        assert lambda_schema_default("reconstruction", "lambda_no_such_loss") is None
+
+    def test_written_agreement_is_not_a_conflict(self):
+        losses = LossConfigSchema(reconstruction={"lambda_l2": 1.0}, diffusion={"lambda_mse": 1.0})
+        assert materialised_weight_conflicts(losses) == {}
+        assert deleting_lambda_would_conflict(losses, "reconstruction", "lambda_l2")
+
+    def test_the_deletion_the_pin_prevents(self):
+        """The same block with the pin already gone — the state the migration made."""
+        losses = LossConfigSchema(reconstruction={}, diffusion={"lambda_mse": 1.0})
+        assert materialised_weight_conflicts(losses) == {"l2": {0.0, 1.0}}
+
+    def test_no_alias_partner_is_not_a_pin(self):
+        """Without a second section declaring ``l2`` the deletion moves nothing."""
+        losses = LossConfigSchema(reconstruction={"lambda_l2": 1.0})
+        assert materialised_weight_conflicts(losses) == {}
+        assert not deleting_lambda_would_conflict(losses, "reconstruction", "lambda_l2")
+
+    def test_a_lambda_at_its_own_default_is_not_a_pin(self):
+        """Same two sections, both at 0.0: nothing is being held together."""
+        losses = LossConfigSchema(reconstruction={"lambda_l2": 0.0}, diffusion={"lambda_mse": 0.0})
+        assert not deleting_lambda_would_conflict(losses, "reconstruction", "lambda_l2")
+
+
+# --------------------------------------------------------------------------------
+# The read-path export (#1925) — two oracles for one claim.
+# --------------------------------------------------------------------------------
+
+
+def _model_behind(annotation):
+    """The BaseModel behind ``X`` or ``X | None`` — **not** behind ``list[X]``.
+
+    A ``list[LossComponentConfig]`` field is configured as a whole (``image_losses:
+    [{...}]``); ``losses.image_losses.name`` is not a config path anyone writes. An
+    earlier version of this walk descended into the item model, which turned
+    ``losses.image_losses`` into an interior node that was never probed and made the
+    export look like it over-claimed four paths.
+    """
+    import types
+    import typing
+
+    from pydantic import BaseModel
+
+    origin = typing.get_origin(annotation)
+    if origin in (list, set, frozenset, tuple, dict):
+        # `list[LossComponentConfig].__args__` is `(LossComponentConfig,)`, so a naive
+        # `__args__` scan mistakes the ITEM model for a nested section and descends.
+        return None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    if origin in (types.UnionType, typing.Union):
+        for arg in typing.get_args(annotation):
+            found = _model_behind(arg)
+            if found is not None:
+                return found
+    return None
+
+
+def _leaf_fields():
+    """Every configurable leaf under ``LossConfigSchema``, as ``(path, FieldInfo)``.
+
+    Swept from the schema root rather than from ``LAMBDA_SECTIONS``: a universe built
+    from the same constant the export iterates could catch an over-claim but never an
+    under-claim, which is the half that matters.
+    """
+    leaves = []
+
+    def walk(cls, prefix, depth, stack):
+        assert depth <= 4, "schema deeper than expected; widen this walk deliberately"
+        for name, info in cls.model_fields.items():
+            sub = _model_behind(info.annotation)
+            if sub is not None and sub not in stack:
+                walk(sub, (*prefix, name), depth + 1, [*stack, sub])
+            else:
+                leaves.append(((*prefix, name), info))
+
+    walk(LossConfigSchema, (), 0, [LossConfigSchema])
+    return leaves
+
+
+def _bounds(info):
+    lo = hi = None
+    for meta in info.metadata:
+        for attr in ("ge", "gt"):
+            if getattr(meta, attr, None) is not None:
+                lo = float(getattr(meta, attr))
+        for attr in ("le", "lt"):
+            if getattr(meta, attr, None) is not None:
+                hi = float(getattr(meta, attr))
+    return lo, hi
+
+
+def _probe_values(info):
+    """Type-correct candidate values for one field.
+
+    Constraint-aware on purpose. ``background_suppression_threshold_ratio`` is
+    ``Le(5.0)`` and ``histogram_bins`` is ``Le(512)``: a fixed 5.9 / 1007 probe is
+    *rejected by pydantic*, and a sweep that treats a rejected probe as "the accessor
+    did not read it" fabricates a finding. Anything with no valid probe is reported
+    INCONCLUSIVE below rather than scored.
+    """
+    annotation, default = info.annotation, info.default
+    lo, hi = _bounds(info)
+    if annotation is bool:
+        return [not bool(default), bool(default)]
+    if annotation is int:
+        low, high = int(lo if lo is not None else 1), int(hi if hi is not None else 4096)
+        return [v for v in (137, 1007, low + 1, high - 1) if low <= v <= high and v != default]
+    if annotation is float:
+        low, high = (lo if lo is not None else 0.0), (hi if hi is not None else 1e4)
+        return [
+            v for v in (5.9, 2.9, 0.13, low + 0.7, high - 0.7) if low <= v <= high and v != default
+        ]
+    if annotation is str:
+        # "latent" is load-bearing: `latent_losses` validates ONLY against
+        # `output_domain="latent"` (a latent is produced by a learned encoder, so no
+        # bridge manufactures one from image or k-space). Without it that list field
+        # has no constructible probe at all.
+        return [v for v in ("mmd", "image", "hfen", "l1", "kspace", "latent") if v != default]
+    text = str(annotation)
+    if "list" in text or "List" in text or "set" in text or "tuple" in text:
+        return [[{"name": "hfen", "weight": 0.31, "enabled": True}], ["l1"], ["hfen"]]
+    return [5.9, True, ["l1"], "l1"]
+
+
+def _snapshot(table):
+    """Everything a caller can observe — specs AND the two table-level attributes.
+
+    ``warmup_iterations`` / ``warmup_losses`` live on the table object, not in the
+    specs, so a specs-only snapshot cannot see the two knobs
+    ``build_loss_weight_table`` reads by literal name and would score them unread.
+    """
+    return (
+        tuple(sorted((n, s.weight, s.enabled, s.source, s.warmup_gated) for n, s in table.items())),
+        table.warmup_iterations,
+        tuple(sorted(table.warmup_losses)),
+    )
+
+
+def _baseline(section, *, latent=False):
+    """A **non-empty** table to move.
+
+    ``build_loss_weight_table(LossConfigSchema())`` returns zero specs -- it keys on
+    ``model_fields_set`` -- and a probe cannot change a table with nothing in it. Every
+    verdict taken against an empty baseline is vacuous, so the caller asserts non-empty.
+    """
+    recon = _model_behind(LossConfigSchema.model_fields["reconstruction"].annotation)
+    base = {
+        "reconstruction": {f: 3.7 for f in recon.model_fields if f.startswith("lambda_")},
+        # Co-requisite, not decoration: a schema validator refuses any of the four
+        # declarative lists unless `losses.output_domain` is set, so a list probe on a
+        # baseline without it is REJECTED, not unread. It sits in the baseline rather
+        # than in the probe so the only thing that moves is the field under test.
+        "output_domain": "latent" if latent else "image",
+    }
+    owner = (
+        _model_behind(LossConfigSchema.model_fields[section].annotation)
+        if (section in LossConfigSchema.model_fields)
+        else None
+    )
+    if owner is not None and section != "reconstruction":
+        written = {f: 3.7 for f in owner.model_fields if f.startswith("lambda_")}
+        if written:
+            base[section] = written
+    return base
+
+
+class TestAccessorReadPathsAreTheExecutedReadSet:
+    """`accessor_read_paths()` is a *claim* about what the accessor touches.
+
+    The claim is load-bearing: `key_reachability` cannot see these reads (the field
+    names are built at runtime), so the consuming gate believes this map without
+    checking it. An over-claim marks a genuinely unread knob "consumed" -- the exact
+    defect class #1925 fixes, wearing the fix's own clothes.
+
+    So it is measured two ways that share no code. The static oracle walks
+    `LAMBDA_SECTIONS` / `LOSS_LISTS`; the executed oracle moves one field at a time
+    and watches the built table. NN17's "one owner" is only a real claim while these
+    two agree.
+    """
+
+    def test_the_static_export_equals_the_executed_read_set(self):
+        leaves = _leaf_fields()
+        lambdas = [p for p, _ in leaves if len(p) == 2 and p[1].startswith("lambda_")]
+        assert len(lambdas) == 106, (
+            f"expected 106 lambda_* leaves, walked {len(lambdas)}. A section typed "
+            "`X | None` has no `.model_fields`, so a permissive walk silently "
+            "enumerates zero and every verdict below becomes vacuous."
+        )
+
+        read, unread, inconclusive = set(), set(), set()
+        for path, info in leaves:
+            base = _baseline(path[0], latent=path[0] == "latent_losses")
+            baseline_table = build_loss_weight_table(LossConfigSchema(**base))
+            assert len(baseline_table) > 0, f"vacuous baseline for section {path[0]!r}"
+            before = _snapshot(baseline_table)
+
+            if len(path) == 1:
+                current = base.get(path[0])
+            else:
+                current = (
+                    base.get(path[0], {}).get(path[1])
+                    if isinstance(base.get(path[0]), dict)
+                    else None
+                )
+
+            moved, tried = False, 0
+            for value in _probe_values(info):
+                if value == current:
+                    continue  # a probe that writes the value already there moves nothing
+                probe = {k: (dict(v) if isinstance(v, dict) else v) for k, v in base.items()}
+                if len(path) == 1:
+                    probe[path[0]] = value
+                else:
+                    probe.setdefault(path[0], {})[path[1]] = value
+                try:
+                    config = LossConfigSchema(**probe)
+                except Exception:  # rejected by validation: not a verdict about reading
+                    continue
+                tried += 1
+                try:
+                    after = _snapshot(build_loss_weight_table(config))
+                except ConfigurationError:
+                    moved = True  # read-and-refuse is still a read
+                    break
+                if after != before:
+                    moved = True
+                    break
+
+            full = "losses." + ".".join(path)
+            (read if moved else inconclusive if tried == 0 else unread).add(full)
+
+        assert not inconclusive, (
+            f"{len(inconclusive)} field(s) had no probe value that validates, so "
+            "they were neither confirmed read nor confirmed unread. Add a "
+            "type-correct value to `_probe_values` -- do NOT let them fall into the "
+            f"unread bucket, which fabricates a finding:\n  " + "\n  ".join(sorted(inconclusive))
+        )
+
+        static = set(accessor_read_paths())
+        assert static - read == set(), (
+            "accessor_read_paths() claims path(s) that moving does not change -- an "
+            "OVER-claim marks an unread knob consumed:\n  " + "\n  ".join(sorted(static - read))
+        )
+        assert read - static == set(), (
+            "moving these path(s) changes the weight table but they are absent from "
+            "accessor_read_paths() -- an UNDER-claim leaves a real read invisible to "
+            "the reachability gate:\n  " + "\n  ".join(sorted(read - static))
+        )
+        assert len(read) == len(static) == 112
+
+    def test_paths_are_keyed_full_not_by_leaf(self):
+        """A leaf-keyed map would call 54 stage-scoped paths consumed.
+
+        `config_health_checker` hands `build_loss_weight_table` the **root**
+        `config.losses`; no call site passes a stage's `loss` block, so the same leaf
+        under `training.multi.stages.stage_config.loss.` is genuinely unread.
+        """
+        paths = accessor_read_paths()
+        assert "losses.physics.lambda_bloch_residual" in paths
+        assert "lambda_bloch_residual" not in paths
+        assert not any(p.startswith("training.") for p in paths)
+
+    def test_every_value_names_a_reader(self):
+        """The value is prose for a human triaging a verdict; it may not be empty."""
+        for path, reader in accessor_read_paths().items():
+            assert "build_loss_weight_table" in reader, path

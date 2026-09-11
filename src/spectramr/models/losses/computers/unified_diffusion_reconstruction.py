@@ -9,6 +9,7 @@ Handles diffusion-specific loss computation including:
 
 import inspect
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -424,6 +425,7 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
         epoch: int = 0,
         iteration: int = 0,
         losses_dict: dict[str, Any] | None = None,
+        critic_cond: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> LossOutput:
         """Compute diffusion training losses.
@@ -433,6 +435,17 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
             target: Target (noise/score/velocity)
             epoch: Current epoch
             iteration: Current iteration
+            critic_cond: Conditioning forwarded to the ``discriminator(pred)``
+                call in the adversarial branch below (#1931). ``None``/``{}``
+                reproduces the unconditioned call byte-for-byte.
+
+                **Declared explicitly, not read out of ``**kwargs``**, and that
+                is load-bearing: ``_call_safe_loss`` forwards this method's
+                ``**kwargs`` to every reconstruction loss whose signature has a
+                ``**kwargs`` of its own. A ``critic_cond`` riding in there would
+                reach an arbitrary loss as a stray keyword. Naming it in the
+                signature captures it here, so it can only ever reach the
+                critic.
             **kwargs: timesteps, context, etc.
 
         Returns:
@@ -508,7 +521,12 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                     "`losses.gan.gan_loss_type`, or set the adversarial weight "
                     "to 0 for a non-adversarial diffusion arm."
                 )
-            fake_pred = discriminator(pred)
+            # ``critic_cond`` conditions the G step's critic call exactly as the
+            # D step conditions its own (#1931). Both steps must score under the
+            # same conditioning: a critic trained with labels but queried
+            # without them is a different function, and the generator would be
+            # chasing a gradient from a critic it never faces.
+            fake_pred = discriminator(pred, **(critic_cond or {}))
             if hasattr(self.adversarial_loss_fn, "compute_generator_loss"):
                 g_adv = self.adversarial_loss_fn.compute_generator_loss(
                     fake_outputs_d=fake_pred,

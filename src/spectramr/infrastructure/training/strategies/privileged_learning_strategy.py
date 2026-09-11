@@ -50,23 +50,11 @@ from spectramr.infrastructure.physics.marker_estimators import (
     privileged_learning_loss,
 )
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.models.blocks.domain_adaptation import grad_reverse
 
 # ──────────────────────────────────────────────────────────────────────
-# Gradient-reversal layer (Ganin & Lempitsky 2015)
+# Domain discriminator, fed through the shared reversal (Ganin & Lempitsky 2015)
 # ──────────────────────────────────────────────────────────────────────
-
-
-class _GradientReversal(torch.autograd.Function):
-    """Forward-identity, backward-negated function."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, lambda_: float) -> torch.Tensor:
-        ctx.lambda_ = lambda_
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.lambda_ * grad_output, None
 
 
 def gradient_reversal(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
@@ -75,7 +63,7 @@ def gradient_reversal(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
     Used to make a feature extractor *adversarial* to a downstream
     classifier without splitting the model into two phases.
     """
-    return _GradientReversal.apply(x, float(lambda_))
+    return grad_reverse(x, float(lambda_))
 
 
 class DomainDiscriminator(nn.Module):

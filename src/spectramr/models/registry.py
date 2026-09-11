@@ -11,7 +11,7 @@ model does not implement — preventing the silent-fallback pitfall
 documented in CLAUDE.md.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.models.capabilities import Domain, ModelCapabilities
@@ -23,11 +23,21 @@ def register_model(
     name: str,
     training_mode: str,
     *,
-    supports_contrast_conditioning: bool = False,
-    supports_vendor_conditioning: bool = False,
+    role: "Literal['generator', 'discriminator']" = "generator",
     # Capability metadata (Phase 1 of experiment-spec-card design).
     # All default to None ("unannotated"); the audit skips checks for
     # unannotated fields so existing registrations stay green.
+    #
+    # The two conditioning flags below defaulted to ``False`` until #1916.
+    # ``None`` is the file's own stated convention and the distinction is
+    # real: ``False`` is a positive claim that the model ignores the id,
+    # ``None`` means nobody has said. Defaulting them to ``False`` would
+    # also give every one of the 586 registrations a non-None capability
+    # field, collapsing the "unannotated" sentinel that
+    # ``get_model_capabilities`` and the audit's default-deny bucket are
+    # both built on (measured: 407 models would flip).
+    supports_contrast_conditioning: bool | None = None,
+    supports_vendor_conditioning: bool | None = None,
     # Domain fields accept either a single Domain literal or a tuple
     # of literals for models that genuinely handle multiple domains.
     spatial_dims: tuple[int, ...] | None = None,
@@ -48,13 +58,51 @@ def register_model(
         name: Unique name of the model.
         training_mode: The training paradigm this model belongs to
             (e.g., 'gan', 'diffusion', 'reconstruction').
+        role: Whether this registration is a generator or a discriminator.
+            ``ModelFactory`` keeps a separate bucket for each, and this is
+            the declaration it buckets on. It used to *guess*, with
+            ``issubclass(cls, IDiscriminator)`` and a silent
+            "default to generator for backward compatibility" branch --
+            which put 9 discriminator classes that do not subclass the
+            interface into the generator bucket, so ``create_discriminator``
+            raised "Discriminator type '<x>' not registered" for every one
+            of them (#1932).
+
+            The default is deliberate, and is not the guess being removed.
+            There are ~600 registration sites; requiring all of them to
+            declare a role is a mechanical rewrite across the model tree,
+            while only the ~19 discriminators have anything to say. The
+            difference from the deleted code is that a default *states* the
+            role in source where it can be read and overridden, whereas the
+            guess *derived* it from an unrelated property at classification
+            time. To keep the default from going silently wrong,
+            registration raises when a class subclasses ``IDiscriminator``
+            but declares (or defaults to) ``role="generator"``.
         supports_contrast_conditioning: True if the model's ``forward``
             accepts a ``contrast_idx`` (or ``contrast_id``) tensor and
             uses it for FiLM-style conditioning. Set this on every
-            generator that participates in Pattern C (multi-contrast)
-            training. The Tier-1 audit ``check_multi_contrast_model_support``
-            uses this flag to fail loudly when YAML enables
-            ``data.multi_contrast`` against a model that ignores the id.
+            generator **and every discriminator** that participates in
+            Pattern C (multi-contrast) training. The Tier-1 audit
+            ``check_multi_contrast_model_support`` uses this flag to fail
+            loudly when YAML enables ``data.multi_contrast`` against a model
+            that ignores the id -- it reads the flag for the generator named
+            by ``model.model_type`` and for the critic named by
+            ``model.discriminator_component.name`` (#1931).
+
+            **The flag is load-bearing at runtime, not just in the audit.**
+            ``DiffusionTrainingStrategy._critic_conditioning`` reads it -- via
+            ``model_supports``, the same top-level reader the audit uses -- to
+            decide whether to send ``{timesteps, contrast_idx}`` to the critic
+            on both the D and the G step. It never introspects the critic's
+            signature, so declaring the flag on a class whose ``forward``
+            cannot accept those kwargs raises on step 1 rather than training a
+            run unconditioned. Declare it only where it is true.
+
+            No count is quoted here on purpose. The census is recomputed per
+            run (``config_health_checker._contrast_aware_critics``); a constant
+            in this docstring went stale the day the first critic declared the
+            flag, which is exactly what happened between the two halves of
+            #1931.
         spatial_dims: Tuple of spatial-dim ranks the model supports
             (e.g. ``(2,)``, ``(3,)``, ``(2, 3)``). When set, the audit
             blocks YAMLs whose data block declares a different rank
@@ -91,6 +139,8 @@ def register_model(
         accepts_complex=accepts_complex,
         expects_real_imag_interleaved=expects_real_imag_interleaved,
         requires_paired_data=requires_paired_data,
+        supports_contrast_conditioning=supports_contrast_conditioning,
+        supports_vendor_conditioning=supports_vendor_conditioning,
         output_field_units=output_field_units,
         trajectory_parametrization=trajectory_parametrization,
         workflows=workflows,
@@ -113,31 +163,89 @@ def register_model(
                     f"with {cls.__module__}.{cls.__qualname__} "
                     f"(mode={training_mode!r}). Rename one of the two registrations."
                 )
-            # Same class re-registration: refuse a capability DOWNGRADE. A
-            # bare second registration with all-None capabilities would
-            # silently replace the decorator's declared caps and disable the
-            # audit's data/model compatibility checks (the bloch_mamba_v2 scar).
+            # Same class re-registration: refuse a capability DOWNGRADE.
+            # A second registration that declares LESS than the first
+            # silently replaces the decorator's declared caps and disables
+            # the audit's data/model compatibility checks (the bloch_mamba_v2
+            # scar).
+            #
+            # This used to test ``capabilities == ModelCapabilities()`` --
+            # "the new registration declares nothing at all". That was a
+            # PROXY for a downgrade, and it held only while the dataclass
+            # carried nothing but contract fields: any field set made the
+            # caps non-empty, and every field was one you would be sorry to
+            # lose. #1916 adds two conditioning flags, which breaks the
+            # proxy in the worst direction -- ``register_model(name, mode,
+            # supports_contrast_conditioning=True)`` on an already-registered
+            # class is now non-empty, so the old condition waves through the
+            # single most plausible partial re-registration ("just add the
+            # flag") and drops spatial_dims / input_domain / output_domain to
+            # None in silence. Measured on this branch before the fix: the
+            # re-registration raised on origin/dev and overwrote here.
+            #
+            # So test the thing the comment always claimed to test -- a field
+            # going declared -> undeclared -- rather than a stand-in for it.
+            # Adding flags is still free; only dropping one raises.
             existing_caps = existing.get("capabilities")
-            if (
-                not override
-                and isinstance(existing_caps, ModelCapabilities)
-                and existing_caps != ModelCapabilities()
-                and capabilities == ModelCapabilities()
-            ):
+            if not override and isinstance(existing_caps, ModelCapabilities):
+                dropped = sorted(
+                    f
+                    for f in existing_caps.__dataclass_fields__
+                    if getattr(existing_caps, f) is not None
+                    and getattr(capabilities, f, None) is None
+                )
+                if dropped:
+                    raise ValueError(
+                        f"Refusing to re-register model '{name}' "
+                        f"({cls.__module__}.{cls.__qualname__}): it would DROP "
+                        f"already-declared capabilities {dropped}. The existing "
+                        f"registration declares {existing_caps}. Silently "
+                        f"un-declaring them disables the audit's compatibility "
+                        f"checks for this model. Re-state the dropped "
+                        f"capabilities in this registration, remove the "
+                        f"redundant registration, or pass override=True to force."
+                    )
+
+        # One owner for capability flags: the nested ``ModelCapabilities``.
+        # Until #1916 this literal ALSO fanned the two conditioning flags out
+        # to ad-hoc top-level keys, which is how one registry came to hold two
+        # disagreeing answers to the same question -- ``model_supports`` read
+        # the top level and returned False for all 18 models that declare
+        # ``accepts_complex`` nested, while ``get_model_capabilities`` read the
+        # nested half and returned None for all 27 that declared contrast
+        # support at the top. Zero overlap on every flag, no error either way
+        # (non-negotiable 17).
+        # A class that implements the discriminator interface but is filed as
+        # a generator is always a mistake, and a silent one: it lands in the
+        # generator bucket and ``create_discriminator`` then reports the name
+        # as "not registered". Refuse it at registration, where the fix is
+        # one keyword away -- same shape as the EMPTY-capabilities raise above.
+        if role == "generator":
+            # Imported here, not at module scope, to keep this module's import
+            # weight off torch (the interfaces package pulls it in). NOT
+            # wrapped in try/except: a swallowed ImportError would set the
+            # name to None and silently disable the very guard that exists to
+            # stop a silent misfiling -- the same non-negotiable 3 shape this
+            # change deletes from ModelRegistry. The interfaces package
+            # imports only abc/typing/torch and its own siblings, so there is
+            # no cycle back to this module; if it ever fails to import, that
+            # is a real breakage and must surface here.
+            from spectramr.models.interfaces import IDiscriminator
+
+            if isinstance(cls, type) and issubclass(cls, IDiscriminator):
                 raise ValueError(
-                    f"Refusing to re-register model '{name}' "
-                    f"({cls.__module__}.{cls.__qualname__}) with EMPTY "
-                    f"capabilities: it already declares {existing_caps}. A bare "
-                    f"re-registration would silently disable the audit's "
-                    f"compatibility checks for this model. Remove the redundant "
-                    f"registration, or pass override=True to force."
+                    f"Model '{name}' ({cls.__module__}.{cls.__qualname__}) "
+                    f"subclasses IDiscriminator but is registered with "
+                    f"role='generator' (the default). It would land in the "
+                    f"generator bucket and create_discriminator('{name}') "
+                    f"would report it as not registered. Pass "
+                    f"role='discriminator' to @register_model."
                 )
 
         MODEL_REGISTRY[name] = {
             "class": cls,
             "mode": training_mode,
-            "supports_contrast_conditioning": supports_contrast_conditioning,
-            "supports_vendor_conditioning": supports_vendor_conditioning,
+            "role": role,
             "capabilities": capabilities,
         }
         return cls
@@ -225,16 +333,63 @@ def get_model_mode(name: str) -> str:
     return MODEL_REGISTRY[name]["mode"]
 
 
-def model_supports(name: str, capability: str) -> bool:
-    """Return True if the registered model declares the given capability.
+def _boolean_capability_fields() -> frozenset[str]:
+    """The ``ModelCapabilities`` fields that are boolean flags.
 
-    Falls back to False for unknown capability flags so future flags
-    don't crash callers that haven't been updated yet.
+    Keyed on the annotation rather than on ``__dataclass_fields__`` wholesale,
+    because a truthiness read of a non-boolean field answers a question nobody
+    asked: ``spatial_dims=(2, 3)`` would make
+    ``model_supports(name, "spatial_dims")`` return True, which is neither
+    wrong-and-loud nor right.
     """
-    entry = MODEL_REGISTRY.get(name)
-    if entry is None:
+    return frozenset(
+        fname
+        for fname, f in ModelCapabilities.__dataclass_fields__.items()
+        if "bool" in str(f.type)
+    )
+
+
+def model_supports(name: str, capability: str) -> bool:
+    """Return True if the registered model declares the given boolean capability.
+
+    Reads the nested :class:`ModelCapabilities` -- the single owner of every
+    capability flag since #1916.
+
+    Raises on an unknown *capability*, and this replaces a documented silent
+    fallback. The old implementation was ``entry.get(capability, False)``
+    against a dict whose only keys were ``class``/``mode``/``capabilities``
+    plus two ad-hoc flags, so every nested flag name answered False without
+    erroring -- ``model_supports(m, "accepts_complex")`` was False for all 586
+    models while 18 genuinely declared it. A typo'd flag name was
+    indistinguishable from a model that does not have the capability, and both
+    read as a confident "no" (non-negotiable 3).
+
+    Returns False for an unknown *model*, which is deliberate and is not the
+    same fallback. A model name arriving here has already passed the registry
+    lookup that raises on an unknown name; the audit layer owns the loud
+    failure for a bad ``model_type``, and answering False keeps this helper
+    usable for "is this optional component present and capable?" probes.
+
+    Args:
+        name: Registered model name.
+        capability: A boolean field of :class:`ModelCapabilities`.
+
+    Raises:
+        ValueError: If ``capability`` is not a boolean capability field.
+    """
+    valid = _boolean_capability_fields()
+    if capability not in valid:
+        raise ValueError(
+            f"Unknown model capability {capability!r}. "
+            f"Valid boolean capabilities: {sorted(valid)}. "
+            f"Capability flags live on ModelCapabilities "
+            f"(spectramr/models/capabilities.py); declare new ones there and "
+            f"pass them through register_model()."
+        )
+    caps = get_model_capabilities(name)
+    if caps is None:
         return False
-    return bool(entry.get(capability, False))
+    return getattr(caps, capability) is True
 
 
 def get_model_capabilities(name: str) -> ModelCapabilities | None:
@@ -263,8 +418,18 @@ def list_models() -> dict[str, dict[str, Any]]:
 
 
 def list_models_with_capability(capability: str) -> list[str]:
-    """Return all registered model names that declare ``capability=True``."""
-    return [n for n, e in MODEL_REGISTRY.items() if e.get(capability, False)]
+    """Return all registered model names that declare ``capability=True``.
+
+    Reads the nested :class:`ModelCapabilities` through
+    :func:`model_supports`, so this list and that predicate cannot disagree.
+    Before #1916 they agreed only by accident: both read the ad-hoc top-level
+    keys, so both were blind to the same nested flags, and this function fed
+    the audit's "compatible models" fix hint -- which rendered
+    ``<no models declare this capability>`` for a capability 18 models declare.
+
+    Raises ValueError on an unknown capability, via :func:`model_supports`.
+    """
+    return [n for n in MODEL_REGISTRY if model_supports(n, capability)]
 
 
 # Note: Model discovery is handled in src/models/init_registry.py to avoid circular imports.

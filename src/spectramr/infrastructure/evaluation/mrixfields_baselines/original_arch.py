@@ -25,7 +25,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Validation helper (verbatim from source)

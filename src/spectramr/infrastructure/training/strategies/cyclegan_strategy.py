@@ -21,10 +21,8 @@ import logging
 from typing import Any
 
 import torch
-
-logger = logging.getLogger(__name__)
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
@@ -40,6 +38,8 @@ from spectramr.models.discriminators.patchgan_discriminator import (  # noqa: F4
 )
 from spectramr.models.generators.cycle_gan import ResNetGenerator  # noqa: F401
 from spectramr.models.registry import get_model_class
+
+logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------- #
 # Pure, testable loss math (no ``.item()`` / ``.cpu()`` / host syncs).

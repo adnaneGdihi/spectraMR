@@ -89,6 +89,20 @@ def declared_folds_image_losses(cls: type) -> bool | None:
     return None
 
 
+def declares_inline_objective(cls: type) -> bool:
+    """True when an EMPTY built loss stack is this strategy's declared design.
+
+    The two declarations answer this only together: a non-None ``inline_losses``
+    says the strategy has stated which terms it computes itself, and a False
+    ``folds_image_losses`` says it consumes none of the builder's modules. A
+    strategy asserting both owns its whole objective, so a builder that produced
+    nothing has not failed. Either reader returning None leaves the strategy
+    UNDECLARED and therefore not exempt -- silence is not a claim of ownership
+    (#1918), which is the distinction ``LossBuilder.validate()`` rests on.
+    """
+    return declared_inline_losses(cls) is not None and declared_folds_image_losses(cls) is False
+
+
 def unreachable_image_losses(
     names: Any,
     inline: frozenset[str],

@@ -344,13 +344,22 @@ class ConditionalBatchNormGenerator(nn.Module, IGenerator):
 
 
 # ---------------------------------------------------------------------------
-# 8. Domain Adversarial Generator — gradient reversal for domain-invariant features
+# 8. Domain Adversarial Generator — domain head present, reversal absent (#1959)
 # ---------------------------------------------------------------------------
 
 
 @register_model(name="domain_adversarial", training_mode="domain_adaptation")
 class DomainAdversarialGenerator(nn.Module, IGenerator):
-    """Feature extractor with gradient reversal layer for domain-adversarial training."""
+    """Reconstructor carrying a domain-classification head that ``forward`` never reads.
+
+    The DANN arrangement the name refers to puts a gradient-reversal layer between
+    ``feature_extractor`` and ``domain_classifier``, so that minimising the domain loss
+    strips domain information from the features upstream. Neither half is here:
+    ``forward`` returns the reconstruction alone, ``domain_classifier`` is never called,
+    and its parameters receive no gradient from any loss -- the model trains as a plain
+    reconstructor. #1959 tracks the wiring; the reversal itself lives in
+    :mod:`spectramr.models.blocks.domain_adaptation`.
+    """
 
     def __init__(
         self,

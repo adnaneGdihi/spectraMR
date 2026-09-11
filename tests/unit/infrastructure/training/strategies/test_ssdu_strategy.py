@@ -79,9 +79,7 @@ def test_noisier_injection_adds_complex_noise_on_acquired_only():
     y = torch.zeros(1, 1, 16, 16, dtype=torch.complex64)
     acq = torch.zeros(1, 1, 16, 16)
     acq[..., ::2] = 1.0
-    z = inject_noisier_kspace(
-        y, acq, noise_std=0.5, generator=torch.Generator().manual_seed(0)
-    )
+    z = inject_noisier_kspace(y, acq, noise_std=0.5, generator=torch.Generator().manual_seed(0))
     diff = z - y
     assert z.is_complex()
     # noise only on acquired support; unacquired entries stay exactly zero
@@ -100,3 +98,17 @@ def test_robust_ssdu_strategy_wires_noisier2noise():
     assert "inject_noisier_kspace" in src
     assert "noisier2noise" in src.lower()
     assert "robust_ssdu" in src
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: it iterates env.losses but its loop body skips every name without 'ssdu'.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert SSDUReconstructionStrategy.__dict__["folds_image_losses"] is False
+    assert SSDUReconstructionStrategy.__dict__["inline_losses"] == frozenset()

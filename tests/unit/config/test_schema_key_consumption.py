@@ -39,6 +39,7 @@ import pytest
 
 from spectramr.config.key_reachability import ReachabilityVerdict, is_key_reachable
 from spectramr.config.settings import TrainingSettings
+from spectramr.models.losses.weights import accessor_read_paths
 
 TOOLS = Path(__file__).resolve().parents[3] / "tools" / "audit"
 sys.path.insert(0, str(TOOLS))
@@ -463,9 +464,22 @@ def configured_keys() -> list[str]:
 
 @pytest.fixture(scope="module")
 def unreachable(configured_keys: list[str]) -> dict[str, ReachabilityVerdict]:
-    """Configured keys whose every read was positively shown unable to run."""
+    """Configured keys whose every read was positively shown unable to run.
+
+    The loss-weight accessor's read set is injected (#1925). ``is_key_reachable``
+    finds a read by its field name as a source *token*, and
+    ``build_loss_weight_table`` names none of the 112 paths it reads -- it builds
+    every name at runtime from ``LAMBDA_SECTIONS`` and ``model_fields_set``. 52 of
+    them therefore looked exactly like "nothing reads this". They are declared
+    beside the reader, checked against what the reader executes by
+    ``test_weights.py``, and passed in here because ``config/`` may not import
+    ``models/`` (NN5). This test file is the one place that legitimately sees both.
+    """
+    external_reads = accessor_read_paths()
     return {
-        key: verdict for key in configured_keys if not (verdict := is_key_reachable(key)).reachable
+        key: verdict
+        for key in configured_keys
+        if not (verdict := is_key_reachable(key, external_reads=external_reads)).reachable
     }
 
 
@@ -590,7 +604,7 @@ class TestReachabilityAwareConsumption:
 
     This is a **ratchet on findings, not a suppression list -- for keys not
     already tracked elsewhere.** ``test_no_new_unreachable_reads`` below also
-    exempts anything already in ``KNOWN_UNCONSUMED``: those 119 keys are
+    exempts anything already in ``KNOWN_UNCONSUMED``: those keys are
     pre-existing rg-tracked debt, and re-litigating each one here at the same
     time the rg gate above is measuring it would just double-count the same
     finding under two ratchets. That exemption is a **fixed, already-measured
@@ -679,6 +693,28 @@ class TestReachabilityAwareConsumption:
             # existing capability, unwired. Surfaced when the entry was pruned
             # from KNOWN_UNCONSUMED, where it had been masking a real read.
             "optimization.memory.safety_margin",
+            # The second loss accessor, not yet declared (#1925 covers only the
+            # first). The single token site, `loss_recommender.py:523`, is not
+            # even a read -- it is a keyword ARGUMENT constructing a
+            # `ReconstructionLossesConfig`, inside `LossRecommender`, a class
+            # nothing constructs. The real read is
+            # `LossConfigSchema.get_enabled_losses`, which builds the field name
+            # at runtime (`enable_field = f"enable_{loss_name}"` at loss.py:1735,
+            # :1745, :1761, :1773, :1794) and is live from `loss_builder.py:229`
+            # and `training_loop.py:1078`. Measured, not inferred: with
+            # `enable_l1` ON, moving `lambda_l1` moves the returned dict; with it
+            # OFF, nothing moves -- so the flag is read and it gates a weight.
+            #
+            # It is NOT in `accessor_read_paths()` on purpose. That export is
+            # derived from the two constants `build_loss_weight_table` iterates,
+            # so it cannot drift from its reader. `get_enabled_losses` has no
+            # such constant: its enable-field mapping is ~85 lines of inline
+            # `elif` literals inside a nested closure, and deriving a read set
+            # from it means hoisting that table out of a live loss resolver --
+            # a refactor of what trains, not of what audits. Declared here with
+            # its consumer cited instead; delete this entry when that accessor
+            # declares its own reads.
+            "losses.reconstruction.enable_l1",
         }
     )
 
@@ -732,11 +768,18 @@ class TestReachabilityAwareConsumption:
 
         Deleting an entry here is legitimate exactly when the key was WIRED.
         Say so in the commit message.
+
+        `losses.reconstruction.enable_l1` was ADDED by #1925 rather than
+        deleted, which the seal also makes visible. It is not a key being
+        quieted: it moved here from the gate's live red set once the first loss
+        accessor declared its reads, because its own reader -- the second
+        accessor -- still declares nothing. The entry cites that reader.
         """
         assert (
             frozenset(
                 {
                     "ema.stability_threshold",
+                    "losses.reconstruction.enable_l1",
                     "metrics.metric_interval",
                     "optimization.memory.safety_margin",
                 }

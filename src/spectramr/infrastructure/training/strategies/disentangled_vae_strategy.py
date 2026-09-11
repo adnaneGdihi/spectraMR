@@ -12,6 +12,7 @@ import torch
 
 from spectramr.infrastructure.physics.acquisition_registry import AcquisitionRegistry
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
@@ -329,8 +330,11 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
         self._loss_dict_reuse.clear()
         self._loss_dict_reuse.update(losses)
 
-        # Compute training metrics (PSNR, SSIM) on the translation task
-        current_step = kwargs.get("step", 0)
+        # Compute training metrics (PSNR, SSIM) on the translation task.
+        # Live iteration (loop_state seam): the loop passes ``iteration=``,
+        # never ``step=``, so ``kwargs.get("step", 0)`` was a constant 0 and
+        # the interval throttle fired on every batch (pitfall #16).
+        current_step = resolve_loop_iteration(self)
         train_metrics = self._compute_training_metrics(
             pred=synth_3T,
             target=img_3T,

@@ -294,11 +294,19 @@ jobs:
           # blocks a contributor for someone else's debt -- and a gate that cannot
           # be passed teaches the bypass habit rather than the fix habit.
           #
-          #   ruff, ruff-format  13,225 findings / 2,526 unformatted files at tree
-          #                      scope. Ruff is still enforced here, LINE-scoped,
-          #                      by lint_changed_lines.py in `lint-diff`, and
-          #                      tree-scoped but advisory in pr-advisory.yml's
-          #                      `lint-full`. One owner per scope (NN17).
+          #   ruff-changed-lines this hook IS lint_changed_lines.py, in --staged
+          #                      mode. `--from-ref/--to-ref` stages nothing, so it
+          #                      reads an empty index and passes vacuously -- the
+          #                      test-paired-with-source shape below, and a vacuous
+          #                      required check is worse than an absent one. The
+          #                      `lint-diff` job already runs the same script with
+          #                      both refs, which is the line-scoped owner; tree
+          #                      scope stays advisory in pr-advisory.yml's
+          #                      `lint-full`. One owner per scope (NN17). It
+          #                      replaced the whole-file `ruff`/`ruff-format` ids,
+          #                      which no longer exist -- and a SKIP naming a
+          #                      missing id is accepted in silence, so a stale
+          #                      entry here reads as protection and is none.
           #   mypy               5,986 errors in 969 files, from 325 checked --
           #                      it follows imports, so it reports errors in files
           #                      the PR never touched and a CLEAN changed file
@@ -323,7 +331,7 @@ jobs:
           # clean over the whole tree except the two whitespace fixers, which
           # flag 8 and 15 SHIPPED files respectively -- small, auto-fixable, and
           # visible to the contributor as a diff rather than as a rule.
-          SKIP: ruff,ruff-format,mypy,codespell,test-paired-with-source,witness-corpus
+          SKIP: ruff-changed-lines,mypy,codespell,test-paired-with-source,witness-corpus
         run: |
           pre-commit run --show-diff-on-failure --color=always \
             --from-ref "${BASE}" --to-ref "${HEAD}"

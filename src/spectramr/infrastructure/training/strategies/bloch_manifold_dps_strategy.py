@@ -25,7 +25,7 @@ import logging
 from typing import Any
 
 import torch
-import torch.nn.functional as F  # noqa: N812  (repo-wide convention)
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.kspace import KspaceMixin

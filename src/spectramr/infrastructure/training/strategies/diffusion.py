@@ -11,7 +11,7 @@ import inspect
 import logging
 import math
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,15 @@ from spectramr.models.capabilities import StrategyCapabilities
 from spectramr.models.losses.computers import UnifiedDiffusionLossComputer
 from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
     _call_safe_loss,
+)
+from spectramr.models.losses.critic_domain import (
+    DomainAdaptedCritic,
+    critic_accepts_complex,
+    critic_component_name,
+    critic_input_domain,
+    generator_output_domain,
+    resolve_conversion,
+    to_critic_input,
 )
 from spectramr.models.losses.kspace_physics_losses import FrequencyWeightedL1Loss
 from spectramr.models.losses.registry import create_loss
@@ -255,6 +264,25 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
     #: it built itself (``_zf_measurement``); the generic input-as-prediction
     #: baseline in ``ModelValidationMixin`` must not emit a second ``val_zf_*``.
     _owns_zero_filled_baseline = True
+
+    #: Loss ownership (issue #1918). This strategy computes NO image loss inline:
+    #: every ``losses.image_losses`` / ``kspace_losses`` / ``complex_losses`` entry
+    #: is built by ``LossBuilder`` into ``env.losses``, forwarded as ``losses_dict``
+    #: to ``UnifiedDiffusionLossComputer.compute`` (below, in ``_compute_losses_impl``),
+    #: folded into ``components`` by that computer's dynamic-component loop, and
+    #: weighted exactly once in ``_stack_components`` off the loss-weight SSOT.
+    #: The computer's own ``reconstruction`` slot is a FALLBACK that stands down when
+    #: the same term arrives via ``losses_dict`` (``_recon_fallback_name``), so a
+    #: declared ``complex_l1`` / ``l1`` is folded, never double-counted -- which is
+    #: why ``inline_losses`` is empty rather than carrying the fidelity term.
+    #:
+    #: Observed end-to-end on ``experiment_11_attention_none`` (2026-09-07), real
+    #: builder output through the real computer: all 6 declared entries land in
+    #: ``components``, finite, and ``sum(w * c) == total`` exactly --
+    #: ``hfen`` (an image loss under ``output_domain: kspace``) arrives as a
+    #: ``_BridgedLoss`` and contributes at its declared 0.3.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = True
 
     @staticmethod
     def _generator_accepts_time(gen: Any) -> bool:
@@ -458,78 +486,13 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         self.logs_validation_images_in_step = True
 
         # ===== LOG CONFIGURED LOSSES AT STARTUP =====
-        # This ensures users know exactly what losses will be tracked in CSV
-        if self.config and hasattr(self.config, "losses") and self.config.losses:
-            recon_cfg = self.config.losses.reconstruction
-            phys_cfg = (
-                self.config.losses.physics if hasattr(self.config.losses, "physics") else None
-            )
-
-            if recon_cfg:
-                loss_checks = [
-                    (
-                        "complex_l1",
-                        recon_cfg.enable_complex_l1,
-                        recon_cfg.lambda_complex_l1,
-                    ),
-                    (
-                        "log_spectral",
-                        recon_cfg.enable_log_spectral,
-                        recon_cfg.lambda_log_spectral,
-                    ),
-                    (
-                        "frequency_weighted_l1_kspace",
-                        recon_cfg.enable_frequency_weighted_l1_kspace,
-                        recon_cfg.lambda_frequency_weighted_l1_kspace,
-                    ),
-                    (
-                        "background_suppression",
-                        recon_cfg.enable_background_suppression,
-                        recon_cfg.lambda_background_suppression,
-                    ),
-                    (
-                        "rician_consistency",
-                        getattr(recon_cfg, "enable_rician_consistency", False),
-                        getattr(recon_cfg, "lambda_rician_consistency", 0.0),
-                    ),
-                    ("l1", recon_cfg.enable_l1, recon_cfg.lambda_l1),
-                    ("l2", recon_cfg.enable_l2, recon_cfg.lambda_l2),
-                    (
-                        "energy_conservation",
-                        recon_cfg.enable_energy_conservation,
-                        recon_cfg.lambda_energy_conservation,
-                    ),
-                    (
-                        "frequency_domain",
-                        recon_cfg.enable_frequency_domain,
-                        recon_cfg.lambda_frequency_domain,
-                    ),
-                    ("hfen", recon_cfg.enable_hfen, recon_cfg.lambda_hfen),
-                ]
-
-                if phys_cfg:
-                    loss_checks.append(
-                        (
-                            "complex_spatial_gradient",
-                            getattr(phys_cfg, "enable_complex_spatial_gradient", False),
-                            getattr(phys_cfg, "lambda_complex_spatial_gradient", 0.0),
-                        )
-                    )
-
-                enabled_losses = [
-                    (name, weight)
-                    for name, enabled, weight in loss_checks
-                    if enabled and weight > 0
-                ]
-                if enabled_losses:
-                    self.logging_service.log_info(
-                        f"[DiffusionStrategy] Configured Losses ({len(enabled_losses)}):"
-                    )
-                    for loss_name, weight in enabled_losses:
-                        self.logging_service.log_info(f"  ✓ {loss_name:35s} λ={weight:.4f}")
-                    self.logging_service.log_info(
-                        "[DiffusionStrategy] ALL NAMED LOSSES WILL BE IN RETURN DICT (as computed values or 0.0)"
-                    )
+        # Read the loss-weight SSOT, not ``enable_*``/``lambda_*`` pairs (#1918, #1919).
+        # The 11-entry list that stood here mirrored ONE schema block by hand, so it
+        # printed nothing for the 58 kspace_filling arms that declare their objective in
+        # ``losses.image_losses`` / ``losses.kspace_losses`` — the banner claimed no
+        # losses while seven trained. The formatter always emits a line, including for a
+        # genuinely empty arm: absent is a state to report, never to infer (NN18).
+        self._log_loss_objective("[DiffusionStrategy]")
 
     def _configured_estimation_method(self, default: str = "power_iter") -> str:
         """Resolve the sensitivity-estimation method for the runtime smaps fallback.
@@ -1450,8 +1413,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         epoch: int,
         iteration: int,
         batch_data: Any = None,
-    ) -> torch.Tensor:
-        """The generator sample the discriminator scores, in the critic's domain.
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        """The generator sample the discriminator scores, its conditioning, and its real.
 
         The D step used to call ``self.env.generator(input_batch)`` -- ONE
         positional argument, no timestep, no ``q_sample``. That is not the
@@ -1470,6 +1433,32 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         ``timesteps`` are drawn afresh: the critic must see the generator's
         output distribution across the schedule, not at one fixed t.
+
+        Returns ``(fake, critic_cond, real)``. ``critic_cond`` is the ``t`` and
+        ``contrast_idx`` THIS sample was drawn at, which both this method and
+        the loss path already computed and this method used to discard (#1931).
+        It must be returned rather than recomputed by the caller: ``t`` is
+        sampled here, so a caller drawing its own would label the sample with a
+        timestep it was not generated at.
+
+        The same payload conditions the REAL side of the D step. That is
+        correct for a label-style conditioning -- the critic must separate real
+        from fake *within* a condition, and giving the two sides different
+        labels would let it win by reading the label instead of the image. Note
+        this makes ``t`` a difficulty label on a clean-domain reconstruction,
+        NOT a shared corruption level: unlike Diffusion-GAN, the real sample is
+        not re-noised to ``t``.
+
+        ``real`` is the third return for the same reason ``critic_cond`` is the
+        second: this method PREPARES it and used to throw it away. The
+        preparation rebinds ``target_batch`` -- ``apply_kspace_normalization``
+        when the batch reaches the step unnormalized, the 5D->4D flatten, and
+        ``_extract_and_fix_output``'s complex/real alignment and channel
+        truncation. The caller's ``target_batch`` has been through none of
+        that, so scoring this ``fake`` against it hands the critic a pair that
+        differs by a transform rather than by realism -- silently, since both
+        keep the same shape and dtype. One owner for the pair (non-negotiable
+        17): whoever builds the fake also names the real it was built against.
         """
         (
             input_batch,
@@ -1509,7 +1498,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             contrast_idx=contrast_idx,
         )
         _eafo_target = noise if (is_latent_diffusion and noise is not None) else target_batch
-        fake, _ = self._extract_and_fix_output(
+        fake, aligned_target = self._extract_and_fix_output(
             predicted_output=predicted_output,
             target_batch=_eafo_target,
             scale=scale,
@@ -1517,35 +1506,277 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             is_cold_diffusion=is_cold_diffusion,
             mask=mask,
         )
-        return fake
+        # On the LDM path ``_extract_and_fix_output`` was handed ``noise``, so
+        # what it returns is an aligned NOISE tensor, not data. The critic's
+        # real is never noise -- fall back to the prepared ``target_batch``,
+        # which is still the rebound one, just without that method's alignment.
+        critic_real = (
+            target_batch if (is_latent_diffusion and noise is not None) else aligned_target
+        )
+        return fake, self._critic_conditioning(timesteps, contrast_idx), critic_real
 
     @staticmethod
     def _align_for_critic(
-        fake: torch.Tensor, real: torch.Tensor
+        fake: torch.Tensor,
+        real: torch.Tensor,
+        critic_takes_complex: bool = False,
+        *,
+        generator_domain: str | None = None,
+        critic_domain: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Put both critic inputs on one device and in one real-valued domain.
+        """Put both critic inputs on one device, in the critic's declared domain.
 
-        The GAN strategy's D step carries these two guards; the diffusion copy
-        was written without them. Both matter more here, not less: a diffusion
-        arm may well predict in k-space, and a real-valued conv critic fed a
-        complex tensor either raises or silently drops the imaginary half.
+        The GAN strategy's D step carries the device and realification guards;
+        the diffusion copy was written without them. Both matter more here, not
+        less: a diffusion arm may well predict in k-space, and a real-valued
+        conv critic fed a complex tensor either raises or silently drops the
+        imaginary half.
 
-        Complex tensors are stacked as (real, imag) on the channel axis -- the
-        same representation ``GANTrainingStrategy._train_discriminator_step``
-        uses, so a critic configured for one arm behaves identically in the
-        other. This is a REPRESENTATION change, not a domain change: it does not
-        IFFT k-space into image space. An arm whose generator predicts k-space
-        while its critic expects images must say so through the transform stack;
-        silently inserting an ``ifft2c`` here would be the kind of invisible
-        substitution non-negotiable 2 and pitfall #9 forbid.
+        **This method used to refuse the domain half of that job**, on the
+        grounds that inserting an ``ifft2c`` would be an invisible substitution.
+        That reasoning held only while the critic's domain was unknown -- a
+        transform chosen from a *suspicion* is exactly the silent substitution
+        non-negotiable 3 forbids. It no longer applies: the generator declares
+        ``losses.policy.output_domain`` and the critic declares ``input_domain``
+        on its own registration, so when the two differ the transform is
+        *stated by the configuration*, not guessed from tensor shape. That is
+        the same declared conversion ``mixins/kspace.py:45-105`` already
+        performs for model inputs. Undeclared on either side still converts
+        nothing -- 18 of 19 registered critics declare no domain, and their
+        behaviour is byte-identical.
+
+        Domain first, representation second: complex tensors are stacked as
+        (real, imag) on the channel axis -- the representation
+        ``GANTrainingStrategy._train_discriminator_step`` uses -- and doing that
+        before an FFT would transform a tensor whose channels no longer mean
+        real and imaginary parts.
+
+        ``critic_takes_complex`` is read off the critic's own registration
+        (``accepts_complex``) rather than guessed. It matters because
+        realification is applied to each side INDEPENDENTLY, and on this path
+        the two sides do not arrive alike: ``fake`` comes from the generator
+        already real and INTERLEAVED (``[R1,I1,R2,I2,...]``), while ``real`` is
+        ``target_batch``, which may still be complex and would be stacked as a
+        BLOCK (``[R1,R2,...,I1,I2,...]``). A critic fed that pair separates real
+        from fake on channel order alone. Rather than change the block
+        convention -- ``GANTrainingStrategy`` shares it, and 25 live GAN arms
+        depend on it -- a critic that declares it consumes complex is handed
+        both sides untouched and owns the conversion itself. Note the CONVERTED
+        path escapes that asymmetry for free: both sides pass through complex
+        and come out block.
+
+        The conversion itself lives in ``critic_domain.to_critic_input``, which
+        the G step calls through ``DomainAdaptedCritic`` -- one owner, because a
+        critic converted on the D step and not the G step would score images
+        while training and k-space while scoring the generator, which is worse
+        than converting on neither (non-negotiable 17).
+
+        **One ``generator_domain`` governs BOTH sides, and that is not an
+        oversight to be "fixed" by giving ``real`` a domain of its own.** The
+        reading that invites it -- ``real`` is data, so its domain is a *data*
+        fact and belongs to ``data.domain.output`` -- was true of the tensor
+        this parameter used to receive and is false of the one it receives now.
+        Since the caller was corrected to pass ``prepared_target``, ``real`` is
+        the tensor the reconstruction losses are computed against, and that
+        tensor is in ``losses.policy.output_domain`` **by construction**:
+        ``DifferentiableFourierBridge.forward`` (``physics_losses.py``) projects
+        ``k_pred`` AND ``k_target`` through the same ``_kspace_to_image``, so the
+        whole loss pipeline already requires prediction and target to share one
+        domain. Resolving ``real`` from a second field would be a second
+        resolver for a quantity that already has an owner -- both would compute
+        a plausible answer, both would have passing tests, and the divergence
+        would surface as a wrongly-transformed critic input rather than an error
+        (non-negotiable 17). ``test_align_for_critic_uses_one_domain_for_both``
+        pins this; it goes red if a second resolver is introduced here.
+
+        Args:
+            fake: the generator's output for this step.
+            real: the target the ``fake`` was prepared against -- the *prepared*
+                target, not the raw batch, and so in ``generator_domain`` by the
+                construction described above. Not an independently-resolved
+                domain: see the paragraph above before adding one.
+            critic_takes_complex: the critic's ``accepts_complex`` capability.
+            generator_domain: ``losses.policy.output_domain`` -- the domain of
+                BOTH ``fake`` and ``real``, for the reason stated above.
+            critic_domain: the critic's declared ``input_domain``, or None.
+
+        Returns:
+            ``(fake, real)`` on one device, in the critic's declared domain.
         """
         if fake.device != real.device:
             fake = fake.to(real.device)
-        if torch.is_complex(fake):
-            fake = torch.cat([fake.real, fake.imag], dim=1)
-        if torch.is_complex(real):
-            real = torch.cat([real.real, real.imag], dim=1)
-        return fake, real
+        return (
+            to_critic_input(
+                fake,
+                from_domain=generator_domain,
+                to_domain=critic_domain,
+                takes_complex=critic_takes_complex,
+            ),
+            to_critic_input(
+                real,
+                from_domain=generator_domain,
+                to_domain=critic_domain,
+                takes_complex=critic_takes_complex,
+            ),
+        )
+
+    @staticmethod
+    def _critic_component_name(config: Any) -> str | None:
+        """The registered name of this arm's critic, or ``None`` (#1931).
+
+        Thin delegate. The one owner moved to
+        ``models.losses.critic_domain.critic_component_name`` in #1921, because
+        ``models/losses/computers/unified_gan.py`` needs the same fact and may
+        not import ``infrastructure/`` (non-negotiable 5). This staticmethod
+        stays as the strategy-side spelling; it holds no logic of its own.
+
+        **The one owner of this resolution** (non-negotiable 17). Two callers
+        need the same fact -- ``_critic_accepts_complex`` (does it take complex
+        input) and ``_critic_conditioning`` (may it be sent t/contrast) -- and
+        they had drifted into two spellings: guarded direct access in one,
+        ``getattr(getattr(config, "model", None), "discriminator_component",
+        None)`` in the other.
+
+        The getattr spelling is not merely untidy. It answers ``None`` for a
+        field that was RENAMED exactly as for one legitimately absent, so a
+        schema drift silently reports "this arm has no critic" and the caller
+        degrades instead of raising -- non-negotiable 3's silent fallback, and
+        the defect ``2e765cc4b`` fixed on the other reader while this one kept
+        it. It is also the shape #368 banned and
+        ``test_diffusion_reads_config_directly_not_via_getattr_fallback`` pins.
+
+        ``model`` and ``discriminator_component`` are declared schema fields and
+        are read directly, so a rename raises ``AttributeError``. Only the two
+        states the schema really allows are absorbed: an arm with no model block
+        (``model is None``) and one with no critic configured
+        (``discriminator_component is None``, or a blank name).
+        """
+        return critic_component_name(config)
+
+    @staticmethod
+    def _critic_accepts_complex(config: Any) -> bool:
+        """Whether the configured critic declares ``accepts_complex``.
+
+        Reads the ``ModelCapabilities`` dataclass -- the single owner of every
+        capability flag since #1916 -- so either spelling is correct now. This
+        one is kept because it reads the owner directly rather than through a
+        helper.
+
+        This docstring used to FORBID ``model_supports``, and the ban was
+        right at the time: that helper looked the flag up with
+        ``entry.get(capability)`` at the *top level* of the registry entry,
+        where the nested flags were simply absent. The two readers shared no
+        models at all. Measured over 588 entries at the fix, nested vs
+        top-level: ``accepts_complex`` 20 vs 0, ``requires_paired_data``
+        71 vs 0, ``expects_real_imag_interleaved`` 11 vs 0,
+        ``supports_contrast_conditioning`` 0 vs 28 -- 130 disagreements, now
+        0. The top-level surface is deleted and
+        ``test_no_entry_carries_a_top_level_capability_key`` keeps it deleted.
+        """
+        return critic_accepts_complex(config)
+
+    def _critic_for_domain(self, critic: Any) -> Any:
+        """The critic, wrapped only if the G step must convert its input (#1920).
+
+        Returns the critic ITSELF whenever no conversion is required, which is
+        every arm that leaves either side undeclared and every arm whose two
+        declarations agree. That path is byte-identical to the behaviour before
+        this seam existed -- it matters, because it is the path all 58
+        kspace_filling arms take.
+
+        When the declarations differ, the wrapper applies exactly the transform
+        ``_align_for_critic`` applies on the D step, from the same owner. The
+        two must not diverge: a critic converted on one step and not the other
+        sees images while training and k-space while scoring the generator.
+
+        Args:
+            critic: ``discriminator_model``, possibly None.
+
+        Returns:
+            The critic, or a :class:`DomainAdaptedCritic` wrapping it.
+        """
+        if critic is None:
+            return None
+        config = self.env.config if self.env else self.config
+        generator_domain = generator_output_domain(config)
+        critic_domain = critic_input_domain(config)
+        if resolve_conversion(generator_domain, critic_domain) is None:
+            return critic
+        return DomainAdaptedCritic(
+            critic,
+            from_domain=generator_domain,
+            to_domain=critic_domain,
+            takes_complex=self._critic_accepts_complex(config),
+        )
+
+    def _critic_conditioning(
+        self,
+        timesteps: torch.Tensor | None,
+        contrast_idx: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """The conditioning payload for this arm's critic, or ``{}`` (#1931).
+
+        Gated on the REGISTRY, never on the critic object. The decision is
+        ``does the configured critic name declare
+        supports_contrast_conditioning`` -- read from the model registry by the
+        name in ``model.discriminator_component.name``, which is the same fact
+        the Tier-1 audit check reads when it decides whether a multi-contrast
+        arm may carry this critic. One owner, so audit and runtime cannot
+        disagree.
+
+        **Deliberately not ``_callable_accepts_kwarg`` or any other signature
+        probe.** Introspection-guarded forwarding is precisely the mechanism
+        that dropped ``contrast_idx`` at the generator seam and made #1931
+        necessary: it turns "this critic cannot take the payload" into silent
+        unconditioned training instead of an error. Gating on the declaration
+        makes the flag load-bearing at runtime -- a critic that declares it and
+        cannot accept the kwargs raises on step 1.
+
+        Returns ``{}`` for every critic that does not declare the flag, which
+        reproduces the unconditioned call byte-for-byte. That is the path all
+        but one arm in the corpus take.
+        """
+        config = self.env.config if self.env else self.config
+        name = self._critic_component_name(config)
+        if name is None:
+            return {}
+        # ``model_supports`` reads the nested ``ModelCapabilities`` dataclass,
+        # the one owner of every capability flag since #1916. This comment
+        # said the opposite until that fix -- the flag really did live only at
+        # the top level, and the nested reader answered None for all 28
+        # critics declaring it -- but that split is deleted, so the two
+        # spellings now return the same answer. Still the reader
+        # ``_contrast_aware_critics`` uses, so the audit and this gate cannot
+        # disagree about one critic.
+        from spectramr.models.registry import model_supports
+
+        if not model_supports(name, "supports_contrast_conditioning"):
+            return {}
+        # A declared-aware critic with nothing to condition ON is a
+        # configuration error, not a reason to score unconditioned: the arm
+        # asked for a conditioned critic and would otherwise train a whole run
+        # without saying the conditioning was missing (non-negotiable 3). Let
+        # the critic own the raise so there is exactly one message.
+        return {"timesteps": timesteps, "contrast_idx": contrast_idx}
+
+    def _wire_critic_smaps(self, discriminator: Any) -> None:
+        """Give a bridging critic the coil sensitivities of the current batch.
+
+        A PROVIDER, not a value. ``_current_smaps`` is populated inside
+        ``_prepare_diffusion_inputs``, which the D step reaches through
+        ``_fake_for_critic`` and the G step reaches inside the base closure --
+        i.e. *after* this wiring runs, on both paths. Pushing a tensor here
+        would hand the critic the previous step's maps, or none at all on the
+        first step; a callable resolved at forward time is correct in both
+        closures with one wiring point.
+
+        A critic that does not expose the seam is left alone, so this is a
+        no-op for every existing discriminator.
+        """
+        setter = getattr(discriminator, "set_smaps_provider", None)
+        if setter is None:
+            return
+        setter(self._select_batch_compatible_smaps)
 
     def train_step(
         self,
@@ -1583,6 +1814,13 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         # substitution non-negotiables 3 and 8 forbid.
         config = self.env.config if self.env else self.config
         num_d_updates = _resolve_disc_updates(config)
+        critic_takes_complex = self._critic_accepts_complex(config)
+        # Both halves of the #1920 seam, resolved once per step rather than per
+        # closure: the generator's declared output domain and the critic's
+        # declared input domain. Either being None means no conversion.
+        generator_domain = generator_output_domain(config)
+        critic_domain = critic_input_domain(config)
+        self._wire_critic_smaps(discriminator)
 
         if input_batch is None or target_batch is None:
             input_batch, target_batch = self._unpack_batch(batch)
@@ -1599,16 +1837,33 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                 if isinstance(discriminator, nn.Module):
                     discriminator.requires_grad_(True)
                 with torch.no_grad():
-                    fake = self._fake_for_critic(
+                    fake, critic_cond, prepared_target = self._fake_for_critic(
                         input_batch, target_batch, epoch, iteration, kwargs.get("batch_data")
                     )
-                fake, real = self._align_for_critic(fake, target_batch)
+                fake, real = self._align_for_critic(
+                    fake,
+                    # The target THIS fake was prepared against, not the raw
+                    # one this closure closed over: the preparation may have
+                    # normalized, flattened or re-aligned it, and scoring
+                    # across that gap is separable on scale alone.
+                    prepared_target,
+                    critic_takes_complex,
+                    generator_domain=generator_domain,
+                    critic_domain=critic_domain,
+                )
                 d_out = self._adversarial_loss_computer().compute_discriminator_loss(
                     real=real,
                     fake=fake,
                     discriminator=discriminator,
                     epoch=epoch,
                     iteration=iteration,
+                    # The t/contrast the fake was actually drawn at, carried out
+                    # of ``_fake_for_critic`` rather than re-derived (#1931).
+                    # ``discriminator`` here is the BARE module -- the D step
+                    # converts tensors, not the callable -- which is what keeps
+                    # R1's ``isinstance(discriminator, nn.Module)`` guard from
+                    # silently zeroing the penalty. See ``DomainAdaptedCritic``.
+                    critic_cond=critic_cond,
                 )
                 d_total = d_out.total if hasattr(d_out, "total") else d_out
                 with torch.no_grad():
@@ -1953,7 +2208,22 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             epoch=epoch,
             iteration=current_step,
             timesteps=timesteps,
-            discriminator=self.discriminator_model,
+            # The G step feeds the critic independently of the D step: the
+            # computer calls ``discriminator(pred)`` itself
+            # (unified_diffusion_reconstruction.py:511). Wrapping it here routes
+            # that call through the SAME converter the D step uses, so the
+            # critic cannot see one domain while training and another while
+            # scoring the generator (#1920). Built per step, never cached: the
+            # wrapper holds no tensors, and a cached one goes stale on any
+            # EMA/DDP swap of ``discriminator_model``.
+            discriminator=self._critic_for_domain(self.discriminator_model),
+            # Condition the G step's critic call exactly as the D step conditions
+            # its own (#1931). Built from THIS step's ``timesteps`` and
+            # ``contrast_idx`` -- both already in scope here; ``contrast_idx``
+            # was simply never passed on. A critic trained with labels but
+            # queried without them is a different function, so the generator
+            # would be chasing a gradient from a critic it never faces.
+            critic_cond=self._critic_conditioning(timesteps, contrast_idx),
             losses_dict=losses_dict if losses_dict else None,
             smaps=smaps,
             mask=mask,
@@ -2050,79 +2320,13 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         if "loss" not in self._loss_dict_reuse and "g_total_loss" in self._loss_dict_reuse:
             self._loss_dict_reuse["loss"] = self._loss_dict_reuse["g_total_loss"]
         # TODO: this is a dumb fix and should be handled more elegantly in the loss computer or training loop to ensure 'loss' key is always present if 'g_total_loss' is used.
-        # CRITICAL FIX: Ensure ALL configured losses are in the return dict
-        # CSV initialization expects these keys, so missing losses should be 0.0
-        # This prevents dynamic CSV column creation mid-training
-
-        # Track enabled and computed losses for logging
-        enabled_losses = []
-        computed_losses = []
-        missing_losses = []
-
-        if self.config and hasattr(self.config, "losses") and self.config.losses:
-            recon_cfg = self.config.losses.reconstruction
-            if recon_cfg:
-                # Define all possible loss keys with their config check
-                loss_checks = [
-                    (
-                        "complex_l1",
-                        recon_cfg.enable_complex_l1,
-                        recon_cfg.lambda_complex_l1,
-                    ),
-                    (
-                        "log_spectral",
-                        recon_cfg.enable_log_spectral,
-                        recon_cfg.lambda_log_spectral,
-                    ),
-                    (
-                        "frequency_weighted_l1_kspace",
-                        recon_cfg.enable_frequency_weighted_l1_kspace,
-                        recon_cfg.lambda_frequency_weighted_l1_kspace,
-                    ),
-                    (
-                        "background_suppression",
-                        recon_cfg.enable_background_suppression,
-                        recon_cfg.lambda_background_suppression,
-                    ),
-                    ("l1", recon_cfg.enable_l1, recon_cfg.lambda_l1),
-                    ("l2", recon_cfg.enable_l2, recon_cfg.lambda_l2),
-                    (
-                        "energy_conservation",
-                        recon_cfg.enable_energy_conservation,
-                        recon_cfg.lambda_energy_conservation,
-                    ),
-                    (
-                        "frequency_domain",
-                        recon_cfg.enable_frequency_domain,
-                        recon_cfg.lambda_frequency_domain,
-                    ),
-                    ("hfen", recon_cfg.enable_hfen, recon_cfg.lambda_hfen),
-                ]
-
-                # Process each configured loss
-                for loss_name, is_enabled, weight in loss_checks:
-                    if is_enabled and weight > 0:
-                        enabled_losses.append(loss_name)
-                        # Check if loss was computed
-                        if loss_name in self._loss_dict_reuse:
-                            computed_losses.append(loss_name)
-                        else:
-                            # Add missing configured losses as 0.0 (to ensure CSV columns exist)
-                            self._loss_dict_reuse[loss_name] = torch.as_tensor(0.0)
-                            missing_losses.append(loss_name)
-
-        # DEBUG: Log comprehensive loss status
-        if enabled_losses:
-            self.logging_service.log_debug(
-                f"[Train] Loss Configuration: {len(enabled_losses)} losses enabled"
-            )
-            self.logging_service.log_debug(
-                f"[Train]   ✓ Computed ({len(computed_losses)}): {computed_losses}"
-            )
-            if missing_losses:
-                self.logging_service.log_warning(
-                    f"[Train]   ⚠ Missing ({len(missing_losses)}): {missing_losses} [set to 0.0]"
-                )
+        # Every loss this arm DECLARED must reach the CSV row. The header is built
+        # once at startup and the row writer drops unknown keys (``extrasaction=
+        # "ignore"``), so a declared loss missing from the dict leaves a blank column
+        # for the whole run. The 9-entry list this replaced read only
+        # ``losses.reconstruction``, so it covered none of the domain-list arms
+        # (#1918, #1919); the owner is now :attr:`_declared_loss_keys`.
+        self._ensure_declared_losses_present(self._loss_dict_reuse, iteration=current_step)
 
         # Also log standard metrics from return dict
         loss_component_keys = [
@@ -2180,6 +2384,45 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                     )
 
         return self._loss_dict_reuse
+
+    @staticmethod
+    def _contrast_idx_from_batch(batch_data: Any, device: Any) -> torch.Tensor | None:
+        """Read ``contrast_idx`` off a batch of any shape, or ``None`` (#1931).
+
+        **The one owner of this extraction** (non-negotiable 17). There were
+        two, and both were wrong in the same way -- ``isinstance(batch_data,
+        dict)``. What ``training_loop`` actually hands down is a
+        :class:`~spectramr.data.batch_types.TrainingBatch`, a dataclass and not
+        a mapping, so neither guard ever matched: every multi-contrast diffusion
+        arm has been training UNCONDITIONED, generator included, with no error
+        and no log line. ``read_batch_field`` is this seam's declared answer to
+        exactly that pairing -- see its docstring, which names it as the single
+        most repeated defect here.
+
+        The ``Tensor``/``list``/``tuple`` ladder is kept rather than collapsed
+        into a bare assignment. ``read_batch_field``'s trailing ``getattr`` leg
+        serves shapes that are neither mapping nor batch, so a ``Mock`` batch
+        resolves ``contrast_idx`` to a ``Mock``; the ladder is what leaves those
+        as ``None`` instead of forwarding an attribute-generating stub into the
+        generator.
+
+        Args:
+            batch_data: The batch as the training loop delivered it -- a
+                ``TrainingBatch``, a dict, or any object with attributes.
+            device: Device to place the resolved index on, so the value is
+                usable by both the generator and the critic without a second
+                transfer.
+
+        Returns:
+            A long tensor of per-sample contrast ids, or ``None`` when the batch
+            genuinely carries none.
+        """
+        c_idx = read_batch_field(batch_data, "contrast_idx")
+        if isinstance(c_idx, torch.Tensor):
+            return c_idx.to(device)
+        if isinstance(c_idx, list | tuple):
+            return torch.tensor(c_idx, dtype=torch.long, device=device)
+        return None
 
     def _build_generator_kwargs(
         self,
@@ -2239,9 +2482,16 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                             target_batch.device
                         )
 
-        # Contrast conditioning: pass contrast_idx to generator
-        if batch_data is not None and isinstance(batch_data, dict) and "contrast_idx" in batch_data:
-            gen_kwargs["contrast_idx"] = batch_data["contrast_idx"]
+        # Contrast conditioning: pass contrast_idx to generator.
+        # ``_forward_through_model`` writes the same key on the train path, from
+        # the value ``_prepare_diffusion_inputs`` extracted; sharing one owner
+        # for the extraction makes the two writes identical by construction
+        # rather than by coincidence. This write is load-bearing on its own for
+        # the t=0 pre-DC probe, which builds generator kwargs without going
+        # through ``_prepare_diffusion_inputs`` at all.
+        contrast_idx = self._contrast_idx_from_batch(batch_data, target_batch.device)
+        if contrast_idx is not None:
+            gen_kwargs["contrast_idx"] = contrast_idx
 
         # SR3 conditioning (#16): thread the image-space input (ULF) as the
         # LDM's condition_image ONLY when the generator advertises conditional
@@ -3166,15 +3416,11 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         mask = None
         timesteps = None
 
-        # Extract contrast_idx for conditional generation
-        contrast_idx = None
-        if batch_data is not None and isinstance(batch_data, dict):
-            c_idx = batch_data.get("contrast_idx")
-            if c_idx is not None:
-                if isinstance(c_idx, torch.Tensor):
-                    contrast_idx = c_idx.to(target_batch.device)
-                elif isinstance(c_idx, list | tuple):
-                    contrast_idx = torch.tensor(c_idx, dtype=torch.long, device=target_batch.device)
+        # Contrast conditioning for BOTH the generator and (via
+        # ``_critic_conditioning``) the discriminator. One owner, one guard --
+        # see ``_contrast_idx_from_batch`` for why the ``isinstance(..., dict)``
+        # this replaces read every real batch as carrying no contrast.
+        contrast_idx = self._contrast_idx_from_batch(batch_data, target_batch.device)
 
         # Log batch info if needed
         should_log = current_step % self._cached_log_interval == 0
@@ -5560,19 +5806,26 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         try:
             gen_kwargs = {}
 
-            # Contrast conditioning: pass contrast_idx to generator during validation
-            if (
-                batch_data is not None
-                and isinstance(batch_data, dict)
-                and "contrast_idx" in batch_data
-            ):
-                # Ensure contrast_idx aligns with potentially flattened 5D targets
-                c_idx = batch_data["contrast_idx"]
-                if isinstance(c_idx, torch.Tensor):
-                    c_idx = c_idx.to(target_batch.device)
-                else:
-                    c_idx = torch.tensor(c_idx, dtype=torch.long, device=target_batch.device)
-
+            # Contrast conditioning: pass contrast_idx to the generator during
+            # validation too. Extraction goes through the ONE owner,
+            # ``_contrast_idx_from_batch`` (non-negotiable 17) -- this site used
+            # to re-derive it behind ``isinstance(batch_data, dict)``, the second
+            # resolver, with the same tensor/list ladder written out again.
+            #
+            # That guard could never match. ``select_validation_extra_fields``
+            # (pipelines/train.py) forwards ``val_batch`` as ``batch_data``, and
+            # ``val_batch`` is a :class:`~spectramr.data.batch_types.TrainingBatch`
+            # -- a dataclass, not a mapping, whose non-core fields live in
+            # ``.metadata`` and are reachable only through the mapping protocol.
+            # So a multi-contrast arm trained CONDITIONED (the train path was
+            # fixed in #1931 half 1) and validated UNCONDITIONED, with no error
+            # and no log line: the train/val mismatch of pitfall #18, scoring
+            # every epoch's checkpoint on a model the metrics never conditioned.
+            #
+            # The 5D alignment below is kept -- it is this site's own concern,
+            # not the owner's, because only validation flattens B*D.
+            c_idx = self._contrast_idx_from_batch(batch_data, target_batch.device)
+            if c_idx is not None:
                 # Expand shape if batch_size was flattened from 5D (B*D)
                 b = len(batch_data.get("input", target_batch))  # original batch size
                 b_flat = target_batch.shape[0]  # new batch size
@@ -6643,11 +6896,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         # (see m4raw_dataset.py, cross-contrast branch). May be absent for
         # single-contrast datasets and for older cached batches — the logger
         # treats ``None`` as "render the full stack".
-        _fed_start = None
-        if isinstance(batch_data, dict):
-            _fed_start = batch_data.get("federated_target_channel_start")
-        elif batch_data is not None:
-            _fed_start = getattr(batch_data, "federated_target_channel_start", None)
+        _fed_start = read_batch_field(batch_data, "federated_target_channel_start")
 
         # Per-case identity for `per_call_metrics.csv`. The cascade feeds that
         # sink once per (batch, rung), so without these columns a 45-batch x
@@ -7619,6 +7868,17 @@ class XDiffusionTrainingStrategy(BaseTrainingStrategy):
     #: budget in ``save_debug_snapshot`` is keyed on ``(run_dir, tag)`` -- so a
     #: borrowed name would also mean a borrowed allowance.
     snapshot_model_input_tag: str | None = "xdiffusion_step"
+
+    #: Loss ownership (issue #1918). Unlike its sibling this class does not use a
+    #: loss computer: ``_compute_losses_impl`` iterates ``self.env.losses`` directly
+    #: and accumulates ``weight * loss_val`` with the weight read from the same
+    #: loss-weight SSOT (``_get_loss_weight``). Every builder-produced entry --
+    #: which is every declared ``losses.*_losses`` entry -- therefore reaches the
+    #: objective, so the flag is True. Nothing is computed inline: the ``mse``
+    #: fallback fires only when ``env.losses`` is EMPTY, in which case there is no
+    #: declared entry for it to double-count.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = True
 
     def __init__(
         self,

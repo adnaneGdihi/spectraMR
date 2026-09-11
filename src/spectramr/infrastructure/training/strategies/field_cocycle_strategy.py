@@ -24,7 +24,7 @@ from typing import Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.gan import GANTrainingStrategy

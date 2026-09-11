@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -102,6 +102,11 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
     ``equivariant_imaging.robust_correction = true`` (the key is a promise, the
     knob must honour it — a contradiction raises rather than silently degrading).
     """
+
+    #: Loss ownership (issue #1918). Self-supervised equivariance/measurement-consistency objective -- no ground
+    #: truth is used, so no declared image loss can be or is computed.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(
         self,

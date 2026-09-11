@@ -19,7 +19,9 @@ at no training cost.
 The hypernetwork emits FiLM modulation :math:`(\gamma,\beta)` for the target's
 feature map -- a real, Lipschitz-analysable weight-generation seam (the existing
 ``field_film_modulation`` pattern). The acquisition vector matches the SSOT
-``ConditioningContext.acquisition`` layout.
+``ConditioningContext.acquisition`` layout. That is continuous acquisition
+physics, not the framework's discrete ``contrast_idx``, so this encoder does
+not declare ``supports_contrast_conditioning`` (#1938).
 """
 
 from __future__ import annotations
@@ -45,7 +47,6 @@ def _maybe_sn(layer: nn.Module, enabled: bool) -> nn.Module:
     spatial_dims=(2,),
     input_domain="image",
     output_domain="image",
-    supports_contrast_conditioning=True,
 )
 class LCAHEncoder(nn.Module):
     """Spectral-normalised acquisition hypernetwork encoder with a certificate.

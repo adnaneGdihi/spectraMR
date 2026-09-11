@@ -234,9 +234,7 @@ class _ValidationHarness(KspaceMixin):
         self.config = SimpleNamespace(
             model=SimpleNamespace(in_channels=1),
             data=SimpleNamespace(
-                processing=SimpleNamespace(
-                    enable_kspace_normalization=enable_kspace_normalization
-                )
+                processing=SimpleNamespace(enable_kspace_normalization=enable_kspace_normalization)
             ),
         )
         self.device = torch.device("cpu")
@@ -250,9 +248,7 @@ def test_per_subject_scale_expands_to_a_pre_flattened_batch():
     target_batch = torch.ones(36, 1, 8, 8)
     batch_data = {"kspace_scale": torch.tensor([224.36, 198.15])}
 
-    _, _, scale_factor = h._prepare_validation_data(
-        None, input_batch, target_batch, batch_data
-    )
+    _, _, scale_factor = h._prepare_validation_data(None, input_batch, target_batch, batch_data)
 
     assert scale_factor.shape == (36, 1, 1, 1)
     # The multiply that raised on the cluster.
@@ -325,3 +321,114 @@ def test_an_unalignable_scale_raises_instead_of_reaching_the_multiply():
 
     with pytest.raises(ValueError, match="kspace_scale"):
         h._prepare_validation_data(None, input_batch, input_batch.clone(), batch_data)
+
+
+# ---------------------------------------------------------------------------
+# #1917 -- the asymmetric-degradation write in ``generate_and_process_mask``
+#
+# ``expand_mask_to_channels`` widens [B, 1, H, W] -> [B, C, H, W] with
+# ``Tensor.expand``, i.e. a stride-0 broadcast view: all C channels alias one
+# row of memory. Ten of its eleven callers only multiply by the mask, so the
+# cheap view is the right contract and must stay. The eleventh writes into it,
+# and therefore owns the copy. These pin both halves of that split.
+# ---------------------------------------------------------------------------
+
+
+class _AsymMaskHarness(KspaceMixin):
+    """Carrier exposing only what ``generate_and_process_mask`` reads."""
+
+    def __init__(self, target_channels: int | None, out_channels: int) -> None:
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.training.utils.kspace_masks import (
+            KSpaceMaskGenerator,
+        )
+
+        self.device = torch.device("cpu")
+        self.config = SimpleNamespace(
+            data=SimpleNamespace(domain=SimpleNamespace(target_channels=target_channels)),
+            model=SimpleNamespace(out_channels=out_channels),
+        )
+        self.mask_generator = KSpaceMaskGenerator()
+
+
+def _run_mask(h: "_AsymMaskHarness", mask: torch.Tensor, c_total: int) -> torch.Tensor:
+    b, _, height, width = mask.shape
+    return h.generate_and_process_mask(
+        batch_size=b,
+        timesteps=torch.zeros(b, dtype=torch.long),
+        target_shape=(b, c_total, height, width),
+        current_step=0,
+        batch_data={"mask": mask},
+    )
+
+
+def test_asymmetric_write_survives_the_expanded_broadcast_view():
+    """Shape 1: a [B, 1, H, W] mask widened to C_total is a stride-0 view.
+
+    Before the fix this raised ``RuntimeError: ... more than one element of the
+    written-to tensor refers to a single memory location``. The TI-CCD split
+    (C_total=16, target_channels=8) is the shape the k-space cohort delivers.
+    """
+    h = _AsymMaskHarness(target_channels=8, out_channels=8)
+    mask = torch.zeros(2, 1, 8, 8)
+    mask[:, :, :, ::2] = 1.0
+
+    out = _run_mask(h, mask, c_total=16)
+
+    assert out.shape == (2, 16, 8, 8)
+    # Source half forced fully sampled, target half left at the sampled pattern.
+    assert bool(out[:, :8].eq(1.0).all())
+    assert torch.equal(out[:, 8:], mask.expand(-1, 8, -1, -1))
+
+
+def test_asymmetric_write_does_not_mutate_the_caller_s_batch():
+    """Shape 2: a mask that ALREADY has C_total channels is returned unchanged.
+
+    ``.to(device).float()`` is a no-op for an already-float tensor on the same
+    device, so without the copy the write reached through into
+    ``batch_data["mask"]`` and pinned the source channels to 1.0 for every later
+    consumer of that batch. That failure is silent -- no exception, wrong data.
+    """
+    h = _AsymMaskHarness(target_channels=8, out_channels=8)
+    mask = torch.zeros(2, 16, 8, 8)
+    before = mask.clone()
+
+    out = _run_mask(h, mask, c_total=16)
+
+    assert bool(out[:, :8].eq(1.0).all())
+    assert torch.equal(mask, before), "generate_and_process_mask mutated its input"
+
+
+def test_asymmetric_write_survives_on_the_legacy_equal_split_branch():
+    """Shape 3: ``target_channels=None`` falls to the C_total // 2 branch.
+
+    That branch carries the same in-place write, so it needs the same copy; a
+    fix applied to only the first branch would leave it crashing.
+    """
+    h = _AsymMaskHarness(target_channels=None, out_channels=4)
+    mask = torch.zeros(2, 1, 8, 8)
+    mask[:, :, :, ::2] = 1.0
+
+    out = _run_mask(h, mask, c_total=16)
+
+    assert out.shape == (2, 16, 8, 8)
+    assert bool(out[:, :8].eq(1.0).all())
+
+
+def test_expand_mask_to_channels_still_returns_a_cheap_broadcast_view():
+    """The producer must NOT be "fixed" by making its result contiguous.
+
+    Ten of the eleven callers only multiply by the mask, inside the training
+    loop. Materialising C copies there to spare the single mutating caller a
+    ``clone()`` would be a needless per-step allocation (non-negotiable 9).
+    This pins the cheap contract so that trade-off has to be made deliberately.
+    """
+    from spectramr.infrastructure.training.utils.kspace_masks import (
+        KSpaceMaskGenerator,
+    )
+
+    widened = KSpaceMaskGenerator().expand_mask_to_channels(torch.zeros(2, 1, 8, 8), 16)
+
+    assert widened.shape == (2, 16, 8, 8)
+    assert widened.stride()[1] == 0, "channel dim must still alias, not be copied"

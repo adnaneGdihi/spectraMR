@@ -7,8 +7,10 @@ prevents the gate from collapsing onto one expert. Following Shazeer
 *et al.* [1] the routing gradient is propagated through the top-1 gate
 probability via a straight-through scaling.
 
-For multi-contrast MRI each expert can specialise on a contrast; the
-``supports_contrast_conditioning`` flag advertises that capability.
+The router reads the latent and ``forward`` takes only the image, so any
+per-contrast specialisation is emergent -- the model is never told which
+contrast it is seeing. It therefore does not declare
+``supports_contrast_conditioning`` (#1938).
 
 Reference:
     [1] N. Shazeer *et al.*, "Outrageously large neural networks: the
@@ -54,7 +56,6 @@ class _ExpertDecoder(nn.Module):
     spatial_dims=(2,),
     input_domain="image",
     output_domain="image",
-    supports_contrast_conditioning=True,
     accepts_complex=False,
     requires_paired_data=False,
 )
