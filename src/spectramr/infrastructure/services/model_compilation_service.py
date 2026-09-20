@@ -5,10 +5,12 @@
     ``IModelCompilationService`` DI registration was deliberately removed
     (see ``bootstrap.py``: "register back if a consumer appears") and no
     training consumer exists (review 2026-07-01). The LIVE ``torch.compile``
-    path is ``ModelBuilder.compile()``
-    (``infrastructure/training/builders/model_builder.py``), gated by the
-    ``optimization.compile.enabled`` YAML knobs. Constructing
-    ``ModelCompilationService`` emits a ``DeprecationWarning``.
+    path is ``apply_compile``
+    (``infrastructure/training/builders/compile_apply.py``), invoked by the
+    director at the point ``builders/compile_placement`` names for the arm's
+    parallel strategy and gated by the ``optimization.compile.enabled`` YAML
+    knobs. Constructing ``ModelCompilationService`` emits a
+    ``DeprecationWarning``.
 
 Provides PyTorch 2.0+ torch.compile support for training optimization.
 Implements IModelCompilationService interface with error handling and statistics.
@@ -43,8 +45,9 @@ class ModelCompilationService(IModelCompilationService):
         """
         warnings.warn(
             "ModelCompilationService is dormant (removed from DI; no training-"
-            "path consumer). Use ModelBuilder.compile() via the "
-            "optimization.compile.enabled YAML knob instead.",
+            "path consumer). The live path is builders/compile_apply.apply_compile, "
+            "placed per parallel strategy by builders/compile_placement and driven by "
+            "the optimization.compile.enabled YAML knob.",
             DeprecationWarning,
             stacklevel=2,
         )

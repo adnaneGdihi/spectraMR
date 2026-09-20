@@ -329,6 +329,41 @@ class ValidationSamplingConfigSchema(BaseModel):
         ),
     )
 
+    reveal_attribution: bool = Field(
+        default=False,
+        description=(
+            "Attribute the reconstruction error to the reverse step that wrote "
+            "each coefficient, and emit one `val_band_*` column per reveal band "
+            "(`models/diffusion/reveal_attribution.py`). The freeze loops write "
+            "every unobserved coefficient exactly once, so the final k-space "
+            "partitions by writing step; each band reports its complex gain, "
+            "whose MODULUS is amplitude shrinkage and whose ARGUMENT is the "
+            "systematic phase error that displaces the band along the "
+            "phase-encode axis. An ORACLE diagnostic -- it reads the target, so "
+            "it measures and never steers. Needs `enable_multistep_cold` (a "
+            "single forward has no reveal schedule to partition by) and a "
+            "line-structured mask; a point pattern or non-Cartesian trajectory "
+            "RAISES rather than reporting a band that is not one."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reveal_attribution_needs_the_multistep_sampler(self) -> "ValidationSamplingConfigSchema":
+        """The partition is over reveal steps, which a single forward does not have.
+
+        Refused at load rather than emitting empty columns: an all-``nan``
+        `val_band_*` block reads as "the bands are unmeasurable", not as "the
+        arm asked for a diagnostic that cannot apply to it".
+        """
+        if self.reveal_attribution and not self.enable_multistep_cold:
+            raise ValueError(
+                "validation.sampling.reveal_attribution partitions the reconstruction "
+                "by the reverse step that wrote each coefficient, which exists only "
+                "under the multi-step cold sampler: set enable_multistep_cold: true, "
+                "or leave reveal_attribution at false."
+            )
+        return self
+
     @model_validator(mode="after")
     def _ensemble_needs_the_multistep_sampler(self) -> "ValidationSamplingConfigSchema":
         """N > 1 without the multi-step sampler would be N identical forwards.

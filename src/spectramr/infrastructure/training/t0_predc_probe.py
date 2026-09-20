@@ -22,8 +22,8 @@ the proposal at every acquired bin, so every post-DC loss is a constant w.r.t.
 the weights and ``losses.reconstruction.lambda_pre_dc_kspace`` carries the whole
 signal. This module makes that one learning signal visible.
 
-Two constraints the callers must respect
-----------------------------------------
+Three constraints the callers must respect
+------------------------------------------
 **The emitted key set must be rank-invariant and unconditional.**
 ``pipelines/train.py:_all_reduce_val_metrics`` packs ``sorted(val_accum.keys())``
 into a tensor and all-reduces it *positionally*. A key set that differs between
@@ -38,6 +38,15 @@ stashes S-maps and, when no kwarg is supplied, *falls back to whatever is
 already stashed* (see its docstring). A probe that omits them inherits whatever
 the last sampler step left behind -- correct today only by accident of call
 order, and stale the moment the cascade is reordered or disabled.
+
+**The forward is chunked, and every per-row kwarg chunks with it.** This batch
+is the 5D->4D depth flatten -- 36 rows for an 18-slice volume at B=2 -- and at
+t=0 the revealed mask is all-ones, so it is the densest input of the whole
+sweep, evaluated after the cascade has already filled the card. Splitting ``x``
+alone would not be enough either: ``complex_unet`` truncates a longer
+``contrast_emb`` to match ``t_emb`` rather than raising (#2055), so a full-batch
+``contrast_idx`` beside a one-row ``x`` conditions every chunk on row 0's
+contrast and still returns a number.
 
 Scoring is deliberately NOT done here. The strategy owns one metrics seam
 (``_compute_validation_metrics``); this module hands it a tensor and renames
@@ -59,6 +68,7 @@ __all__ = [
     "generator_exposes_pre_dc",
     "rename_to_probe_namespace",
     "run_t0_predc_probe",
+    "slice_row_kwargs",
     "t0_predc_key",
 ]
 
@@ -130,6 +140,31 @@ def build_t0_timesteps(batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.zeros(batch_size, dtype=torch.long, device=device)
 
 
+def slice_row_kwargs(
+    forward_kwargs: Mapping[str, Any], *, batch_size: int, start: int, stop: int
+) -> dict[str, Any]:
+    """Take rows ``[start:stop)`` of every per-row entry; pass the rest through.
+
+    Per-row means a tensor whose leading dimension is the *unchunked* batch:
+    ``contrast_idx`` ``(B,)``, ``smaps`` ``(B, C, H, W)``, ``mask``,
+    ``kspace_measured``. Anything else -- a scalar, a flag, a broadcastable
+    ``(1, ...)`` map -- reaches every chunk untouched.
+
+    A chunked ``x`` beside full-batch kwargs is not a shape error the model
+    reports: ``complex_unet`` truncates the longer of ``contrast_emb`` /
+    ``t_emb`` to the shorter (#2055), so every chunk would be conditioned on
+    row 0's contrast and still score.
+    """
+    return {
+        key: (
+            value[start:stop]
+            if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == batch_size
+            else value
+        )
+        for key, value in forward_kwargs.items()
+    }
+
+
 def forward_pre_dc(
     generator: Any,
     x: torch.Tensor,
@@ -184,11 +219,20 @@ def run_t0_predc_probe(
     model_input: torch.Tensor,
     forward_kwargs: Mapping[str, Any],
     score: Callable[[torch.Tensor, torch.Tensor], Mapping[str, float]],
+    chunk_size: int,
 ) -> dict[str, float]:
     """Measure the terminal rung pre-DC and return probe-namespaced metrics.
 
     ``score`` is the caller's single metrics seam, invoked as
-    ``score(prediction, timesteps)``. Scoring is not reimplemented here.
+    ``score(prediction, timesteps)`` on the reassembled full-batch prediction.
+    Scoring is not reimplemented here.
+
+    ``chunk_size`` is rows per forward -- ``validation.loader.chunk_size``, the
+    knob every other validation forward already honours. It is a required
+    keyword so that omitting it is a ``TypeError`` rather than a silent
+    full-batch pass, which is the shape that OOMs. Non-positive values clamp to
+    1, matching the multi-step sampler's ``max(1, int(...))``; the schema pins
+    the field at ``ge=1``, so neither clamp is reachable from config.
 
     Returns an empty dict -- on every rank alike -- when the generator does not
     expose a pre-DC proposal.
@@ -196,11 +240,28 @@ def run_t0_predc_probe(
     if not generator_exposes_pre_dc(generator):
         return {}
 
-    timesteps = build_t0_timesteps(int(model_input.shape[0]), model_input.device)
+    batch_size = int(model_input.shape[0])
+    timesteps = build_t0_timesteps(batch_size, model_input.device)
+    rows = max(1, int(chunk_size))
     with torch.no_grad():
-        x_pre_dc = forward_pre_dc(
-            generator, model_input, timesteps=timesteps, forward_kwargs=forward_kwargs
-        )
+        parts = [
+            forward_pre_dc(
+                generator,
+                model_input[start : start + rows],
+                timesteps=timesteps[start : start + rows],
+                forward_kwargs=slice_row_kwargs(
+                    forward_kwargs,
+                    batch_size=batch_size,
+                    start=start,
+                    stop=start + rows,
+                ),
+            )
+            for start in range(0, batch_size, rows)
+        ]
+        # `cat` on a one-element list still copies, and the whole point here is
+        # to not hold a second full-batch tensor.
+        x_pre_dc = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        del parts
         metrics = score(x_pre_dc, timesteps)
     del x_pre_dc
     return rename_to_probe_namespace(metrics)

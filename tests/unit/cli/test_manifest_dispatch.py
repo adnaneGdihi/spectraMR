@@ -9,13 +9,17 @@ quoting.
 
 from __future__ import annotations
 
+import argparse
+import sys
 from pathlib import Path
 
 import pytest
 
 import spectramr.cli.manifest_dispatch as md
 from spectramr.cli.manifest_dispatch import (
+    _override_keys,
     compute_iter_cap_overrides,
+    read_overrides_file,
     resolve_manifest_config,
 )
 
@@ -442,3 +446,517 @@ def test_output_base_flag_parsed_by_main(tmp_path, monkeypatch) -> None:
     )
     assert rc == 0
     assert seen.get("output_base") == "/camp/dir"
+
+
+# --- launch verb: the array's 36/45 failure ----------------------------------
+#
+# Array 8589967 (2026-09-12) lost 36 of 45 tasks because the dispatcher spelled
+# `spectramr train` for every arm. `train` never calls `setup_distributed`, so
+# each kspace_filling arm -- all 60 declare `parallel.strategy: deepspeed` --
+# paid for the audit and the model build and then raised out of
+# `_require_process_group` at Stage B. The framework was right to refuse; the
+# dispatcher simply did not know the second verb.
+
+
+def _cfg_with_strategy(tmp_path: Path, strategy: str | None) -> Path:
+    """An arm whose `parallel:` block is spelled exactly as *strategy* asks.
+
+    `None` writes a NULL `parallel:` key rather than omitting it -- the shape
+    that reads as a dict everywhere except where it is `None`, and the one that
+    broke the old bash grep.
+    """
+    body = "training:\n  max_iterations: 5\n"
+    if strategy is None:
+        body += "parallel:\n"
+    else:
+        body += f"parallel:\n  strategy: {strategy}\n"
+    cfg = tmp_path / f"arm_{strategy or 'null'}.yaml"
+    cfg.write_text(body)
+    return cfg
+
+
+def test_declared_strategy_is_read_from_the_yaml(tmp_path: Path) -> None:
+    assert md.read_parallel_strategy(_cfg_with_strategy(tmp_path, "deepspeed")) == "deepspeed"
+    assert md.read_parallel_strategy(_cfg_with_strategy(tmp_path, "ddp")) == "ddp"
+
+
+@pytest.mark.parametrize("body", ["training:\n  max_iterations: 5\n", "parallel:\n", "{}\n", ""])
+def test_absent_or_null_parallel_block_reads_as_the_schema_default(
+    tmp_path: Path, body: str
+) -> None:
+    """`none` is what the schema itself defaults to, so the raw read and the
+    loaded config agree -- an arm with no `parallel:` block is not distributed."""
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text(body)
+    assert md.read_parallel_strategy(cfg) == "none"
+
+
+def test_process_group_predicate_comes_from_the_strategy_registry() -> None:
+    """`dp` is the case a hardcoded name list gets wrong in the expensive
+    direction.
+
+    `nn.DataParallel` is genuinely single-process, so the tempting
+    `strategy != "none"` shorthand would launch it under torchrun for no reason.
+    The registry answers per plugin, via `requires_process_group`, which is why
+    this is a query and not a literal set here (non-negotiable 17).
+    """
+    assert md.requires_process_group("deepspeed") is True
+    assert md.requires_process_group("ddp") is True
+    assert md.requires_process_group("fsdp") is True
+    assert md.requires_process_group("dp") is False
+    assert md.requires_process_group("none") is False
+
+
+def test_single_process_arm_keeps_the_train_verb() -> None:
+    argv = md.build_launch_argv("a.yaml", [], False, distributed=False)
+    assert argv[1:] == ["-m", "spectramr.cli", "train", "--config", "a.yaml"]
+    assert "torch.distributed.run" not in argv
+
+
+def test_process_group_arm_gets_torchrun_and_the_distributed_verb() -> None:
+    """The exact defect: a deepspeed arm must not reach the `train` verb."""
+    argv = md.build_launch_argv("a.yaml", [], False, distributed=True, nproc_per_node=4)
+    assert argv[1:3] == ["-m", "torch.distributed.run"]
+    assert "--nproc_per_node=4" in argv
+    assert "train-distributed" in argv
+    assert "train" not in argv, "the single-process verb must not survive"
+
+
+def test_the_rendezvous_is_static_on_loopback() -> None:
+    """`--standalone` selects the c10d DYNAMIC backend, whose store server
+    resolves `socket.gethostname()` whatever endpoint it is given.
+
+    On a host whose own name is not in /etc/hosts that hangs for the full 300 s
+    store timeout and dies with `DistNetworkError: client socket has timed out
+    … trying to connect to (<hostname>, <port>)`, naming neither the cause nor
+    the fix — observed on this machine with both `--standalone` and an explicit
+    `--rdzv_endpoint=127.0.0.1:0`, so the endpoint is not the lever, the backend
+    is. A single-node launch needs loopback and nothing else.
+    """
+    argv = md.build_launch_argv("a.yaml", [], False, distributed=True, master_port=29511)
+    assert "--standalone" not in argv
+    assert "--master_addr=127.0.0.1" in argv
+    assert "--master_port=29511" in argv
+    assert "--nnodes=1" in argv
+
+
+def test_rendezvous_port_is_derived_from_the_per_task_job_id() -> None:
+    """`SLURM_JOB_ID` differs per array task; `SLURM_ARRAY_JOB_ID` is the shared
+    one. Deriving from the shared id would have two tasks on one node — which
+    happens: 31 and 35 of array 8589967 both ran on compute-2-5 — fight over a
+    single socket.
+    """
+    a = md.resolve_rendezvous_port({"SLURM_JOB_ID": "8590053"})
+    b = md.resolve_rendezvous_port({"SLURM_JOB_ID": "8590054"})
+    assert a != b
+    assert 20000 <= a < 40000 and 20000 <= b < 40000
+
+
+def test_rendezvous_port_falls_back_when_there_is_no_scheduler() -> None:
+    """A local run has no SLURM_JOB_ID; asking the OS beats a fixed constant."""
+    port = md.resolve_rendezvous_port({})
+    assert 1024 < port < 65536
+
+
+def test_the_launcher_is_the_venvs_own_interpreter() -> None:
+    """`sys.executable -m torch.distributed.run`, never a bare `torchrun`.
+
+    A `torchrun` found on PATH can belong to a different interpreter than the
+    one the .sbatch activated -- the same shadowing failure the FreeSurfer
+    LD_LIBRARY_PATH scrub exists for, arriving by a different route.
+    """
+    argv = md.build_launch_argv("a.yaml", [], False, distributed=True)
+    assert argv[0] == sys.executable
+    assert "torchrun" not in argv
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_resume_and_overrides_are_spelled_the_same_for_both_verbs(distributed: bool) -> None:
+    """`train-distributed` takes the same `--resume` / `--override` flags, so a
+    smoke cap or a campaign output route must not be lost by taking one branch."""
+    argv = md.build_launch_argv(
+        "a.yaml",
+        ["--override", "training.max_iterations=7"],
+        True,
+        distributed=distributed,
+    )
+    assert argv[-4:] == [
+        "--resume",
+        "if-present",
+        "--override",
+        "training.max_iterations=7",
+    ]
+
+
+@pytest.mark.unit
+def test_the_dispatcher_never_spells_resume_auto() -> None:
+    """`auto` raises when the checkpoint dir is empty, and a requeued array task
+    re-runs this identical command — so the first attempt of every chain would
+    fail outright. `if-present` is the only spelling a chain can carry."""
+    for distributed in (False, True):
+        argv = md.build_launch_argv("a.yaml", [], True, distributed=distributed)
+        assert "auto" not in argv, argv
+        assert "if-present" in argv
+
+
+def test_dispatch_launches_a_deepspeed_arm_under_torchrun(tmp_path, monkeypatch) -> None:
+    """End to end through `_dispatch`, which is where the verb was hardcoded."""
+    cfg = _cfg_with_strategy(tmp_path, "deepspeed")
+    man = tmp_path / "m.txt"
+    man.write_text(str(cfg) + "\n")
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        nproc_per_node=2,
+    )
+    assert rc == 0
+    launch = " ".join(fake.calls[-1])
+    assert "torch.distributed.run" in launch
+    assert "--nproc_per_node=2" in launch
+    assert "train-distributed" in launch
+
+
+def test_dispatch_keeps_train_for_an_arm_that_declares_no_parallelism(
+    tmp_path, monkeypatch
+) -> None:
+    """Anti-vacuity for the test above: the fix must not send everything to
+    torchrun, which would be a slower, differently-seeded run for every arm in
+    the corpus that never asked for one."""
+    cfg = _cfg_with_strategy(tmp_path, None)
+    man = tmp_path / "m.txt"
+    man.write_text(str(cfg) + "\n")
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+    )
+    launch = fake.calls[-1]
+    assert "train" in launch
+    assert "torch.distributed.run" not in " ".join(launch)
+
+
+def test_nproc_per_node_flag_reaches_dispatch(tmp_path, monkeypatch) -> None:
+    """The .sbatch passes the derived GPU count through this flag; a name change
+    that argparse accepts but `_dispatch` ignores would silently run one rank."""
+    man, _ = _real_cfg(tmp_path)
+    seen = {}
+    monkeypatch.setattr(md, "_dispatch", lambda **kw: seen.update(kw) or 0)
+    assert md.main(["--manifest", str(man), "--index", "0", "--dry-run", "--nproc-per-node", "8"]) == 0
+    assert seen.get("nproc_per_node") == 8
+
+
+# ---------------------------------------------------------------------------
+# --overrides-file: a frozen key=value list applied to every array task.
+# ---------------------------------------------------------------------------
+
+
+class TestOverridesFile:
+    """The passthrough exists because `sbatch --export` splits on commas."""
+
+    def test_reads_key_value_lines(self, tmp_path):
+        f = tmp_path / "ov.txt"
+        f.write_text("training.max_iterations=2\nvalidation.loader.num_batches=2\n")
+        assert read_overrides_file(f) == [
+            "--override",
+            "training.max_iterations=2",
+            "--override",
+            "validation.loader.num_batches=2",
+        ]
+
+    def test_comma_in_value_survives(self, tmp_path):
+        """The shape an --export-borne knob would truncate."""
+        f = tmp_path / "ov.txt"
+        f.write_text("data.transforms=[a,b,c]\n")
+        assert read_overrides_file(f) == ["--override", "data.transforms=[a,b,c]"]
+
+    def test_blank_and_comment_lines_skipped(self, tmp_path):
+        f = tmp_path / "ov.txt"
+        f.write_text("# a note\n\ntraining.max_iterations=2\n\n")
+        assert read_overrides_file(f) == ["--override", "training.max_iterations=2"]
+
+    @pytest.mark.parametrize("bad", ["training.max_iterations", "=2", "   =  3"])
+    def test_malformed_line_raises_rather_than_dropping(self, tmp_path, bad):
+        """A silently-skipped override is indistinguishable from one applied."""
+        f = tmp_path / "ov.txt"
+        f.write_text(f"{bad}\n")
+        with pytest.raises(ValueError, match="must be 'key=value'"):
+            read_overrides_file(f)
+
+    def test_error_names_the_line_number(self, tmp_path):
+        f = tmp_path / "ov.txt"
+        f.write_text("training.max_iterations=2\nbroken\n")
+        with pytest.raises(ValueError, match=r":2:"):
+            read_overrides_file(f)
+
+    def test_override_keys_extracts_dotted_keys(self):
+        args = ["--override", "a.b=1", "--override", "c.d=2"]
+        assert _override_keys(args) == ["a.b", "c.d"]
+
+
+class TestOverridesFileCapCollision:
+    """A key the TRAIN_ITERS cap already set is refused, not resolved."""
+
+    def _cfg(self, tmp_path):
+        cfg = tmp_path / "arm.yaml"
+        cfg.write_text("training:\n  max_iterations: 70000\n")
+        man = tmp_path / "manifest.txt"
+        man.write_text(f"{cfg}\n")
+        return man
+
+    def test_collision_with_cap_exits_2(self, tmp_path, capsys):
+        ov = tmp_path / "ov.txt"
+        ov.write_text("training.max_iterations=2\n")
+        rc = md._dispatch(
+            manifest=str(self._cfg(tmp_path)),
+            index=0,
+            train_iters=50,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path),
+            dry_run=True,
+            overrides_file=str(ov),
+        )
+        assert rc == 2
+        assert "already set" in capsys.readouterr().err
+
+    def test_non_colliding_key_is_appended(self, tmp_path, capsys):
+        ov = tmp_path / "ov.txt"
+        ov.write_text("validation.loader.num_batches=2\n")
+        rc = md._dispatch(
+            manifest=str(self._cfg(tmp_path)),
+            index=0,
+            train_iters=50,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path),
+            dry_run=True,
+            overrides_file=str(ov),
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "validation.loader.num_batches=2" in out
+        assert "training.max_iterations=50" in out  # the cap still applies
+
+    def test_no_cap_means_no_collision_possible(self, tmp_path, capsys):
+        ov = tmp_path / "ov.txt"
+        ov.write_text("training.max_iterations=2\n")
+        rc = md._dispatch(
+            manifest=str(self._cfg(tmp_path)),
+            index=0,
+            train_iters=None,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path),
+            dry_run=True,
+            overrides_file=str(ov),
+        )
+        assert rc == 0
+        assert "training.max_iterations=2" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# --verb / --verb-args-file: the array runs a named pipeline, not only `train`.
+#
+# The submit wrapper's command form (`… spectramr <verb> <yamls> <flags>`) ends
+# here: the verb reaches every task through TASK_VERB and the trailing flags
+# through a frozen file. Two things must hold whatever the verb — the config is
+# still injected per task, and a verb that cannot spell a knob this submission
+# carries is refused ONCE rather than by argparse on every task.
+# ---------------------------------------------------------------------------
+
+
+class TestVerbSelection:
+    def test_the_named_verb_reaches_the_launch(self) -> None:
+        argv = md.build_launch_argv("a.yaml", [], False, distributed=False, verb="infer")
+        assert argv[3] == "infer"
+        assert argv[4:6] == ["--config", "a.yaml"]
+
+    def test_verb_args_land_after_the_overrides(self) -> None:
+        """Last wins in argparse, so the submitter's own flags must come last:
+        anything they spell has to beat what the dispatcher added."""
+        argv = md.build_launch_argv(
+            "a.yaml",
+            ["--override", "training.max_iterations=5"],
+            True,
+            distributed=False,
+            verb_args=["--seed", "7"],
+        )
+        assert argv[-2:] == ["--seed", "7"]
+        assert argv.index("--override") < argv.index("--seed")
+
+    def test_the_process_group_upgrade_is_train_only(self) -> None:
+        """`parallel.strategy` describes how the arm TRAINS. Pairing the
+        torchrun upgrade with another verb would launch `train-distributed` for
+        a submission that asked for inference, so it is a caller bug, not a
+        default to resolve."""
+        with pytest.raises(ValueError, match="train-only"):
+            md.build_launch_argv("a.yaml", [], False, distributed=True, verb="infer")
+
+    def test_a_deepspeed_arm_under_a_non_train_verb_runs_single_process(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        cfg = _cfg_with_strategy(tmp_path, "deepspeed")
+        man = tmp_path / "m.txt"
+        man.write_text(str(cfg) + "\n")
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        rc = md._dispatch(
+            manifest=str(man),
+            index=0,
+            train_iters=None,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path / "d"),
+            dry_run=False,
+            verb="infer",
+        )
+        assert rc == 0
+        launch = " ".join(fake.calls[-1])
+        assert "torch.distributed.run" not in launch
+        assert "train-distributed" not in launch
+        assert " infer --config " in launch
+
+    def test_verb_and_args_flags_reach_dispatch(self, tmp_path, monkeypatch) -> None:
+        man, _ = _real_cfg(tmp_path)
+        seen: dict = {}
+        monkeypatch.setattr(md, "_dispatch", lambda **kw: seen.update(kw) or 0)
+        assert (
+            md.main(
+                [
+                    "--manifest",
+                    str(man),
+                    "--index",
+                    "0",
+                    "--dry-run",
+                    "--verb",
+                    "infer",
+                    "--verb-args-file",
+                    "/tmp/verb_args.txt",
+                ]
+            )
+            == 0
+        )
+        assert seen.get("verb") == "infer"
+        assert seen.get("verb_args_file") == "/tmp/verb_args.txt"
+
+    def test_dispatch_forwards_the_frozen_args_to_the_launch(
+        self, tmp_path, capsys
+    ) -> None:
+        cfg = tmp_path / "arm.yaml"
+        cfg.write_text("training:\n  max_iterations: 5\n")
+        man = tmp_path / "m.txt"
+        man.write_text(str(cfg) + "\n")
+        args = tmp_path / "verb_args.txt"
+        args.write_text("--debug\n--device\ncuda\n")
+        rc = md._dispatch(
+            manifest=str(man),
+            index=0,
+            train_iters=None,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path / "d"),
+            dry_run=True,
+            verb_args_file=str(args),
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.rstrip().endswith("--debug --device cuda")
+
+
+class TestVerbArgsFile:
+    def test_one_argv_element_per_line_keeps_its_spaces(self, tmp_path) -> None:
+        """The wrapper freezes one element per line precisely so a value with a
+        space in it survives; splitting here would undo that."""
+        f = tmp_path / "a.txt"
+        f.write_text("--note\nrun 3 of 4\n")
+        assert md.read_verb_args_file(f) == ["--note", "run 3 of 4"]
+
+    def test_blank_lines_and_comments_are_dropped(self, tmp_path) -> None:
+        f = tmp_path / "a.txt"
+        f.write_text("# why\n\n--debug\n")
+        assert md.read_verb_args_file(f) == ["--debug"]
+
+
+class TestVerbPlanValidation:
+    def test_train_is_accepted_with_every_knob(self) -> None:
+        assert md.validate_verb_plan("train", resume=True, overrides=True) is None
+
+    def test_a_verb_whose_config_is_not_a_flag_is_refused(self) -> None:
+        """`audit` takes its config POSITIONALLY, so the `--config <path>` this
+        array injects is an argparse error on every task."""
+        error = md.validate_verb_plan("audit", resume=False, overrides=False)
+        assert error is not None
+        assert "--config" in error
+        assert "train" in error  # names what can be dispatched instead
+
+    def test_predict_is_refused_and_points_at_infer(self) -> None:
+        error = md.validate_verb_plan("predict", resume=False, overrides=False)
+        assert error is not None and "infer" in error
+
+    def test_overrides_need_a_verb_that_spells_override(self) -> None:
+        assert md.validate_verb_plan("infer", resume=False, overrides=True) is not None
+        assert md.validate_verb_plan("infer", resume=False, overrides=False) is None
+
+    def test_resume_needs_a_verb_that_spells_resume(self) -> None:
+        assert md.validate_verb_plan("infer", resume=True, overrides=False) is not None
+
+    def test_the_option_set_comes_from_the_real_parser(self) -> None:
+        """Anti-vacuity for the two checks above: the answers are the parser's,
+        so a flag added to (or dropped from) a verb changes them without anyone
+        editing a table here."""
+        from spectramr.cli.app import build_parser
+
+        for verb in ("train", "infer"):
+            parser_opts = {
+                opt
+                for action in build_parser()._actions
+                if isinstance(action, argparse._SubParsersAction)
+                for a in action.choices[verb]._actions
+                for opt in a.option_strings
+            }
+            assert md.verb_option_strings(verb) == parser_opts
+        assert md.verb_option_strings("no-such-verb") == frozenset()
+
+    def test_an_impossible_plan_is_refused_before_the_manifest_is_read(
+        self, tmp_path
+    ) -> None:
+        """The refusal is identical on every task, so it must not cost a
+        manifest read, an audit or a queue slot to discover."""
+        rc = md._dispatch(
+            manifest=str(tmp_path / "does-not-exist.txt"),
+            index=0,
+            train_iters=None,
+            resume=False,
+            no_audit=True,
+            dispatch_dir=str(tmp_path / "d"),
+            dry_run=True,
+            verb="audit",
+        )
+        assert rc == 2
+
+    def test_check_plan_needs_no_manifest(self, capsys) -> None:
+        assert md.main(["--check-plan", "--verb", "train"]) == 0
+        assert "plan accepted" in capsys.readouterr().out
+
+    def test_check_plan_reports_the_refusal(self, capsys) -> None:
+        assert md.main(["--check-plan", "--verb", "infer", "--resume"]) == 2
+        assert "--resume" in capsys.readouterr().err
+
+    def test_dispatching_still_requires_a_manifest(self) -> None:
+        """--check-plan relaxed the requiredness; a real dispatch must not have
+        become a run with no arms."""
+        with pytest.raises(SystemExit):
+            md.main(["--verb", "train"])

@@ -187,6 +187,7 @@ class TrainingStrategyFactory:
         "multi": "spectramr.infrastructure.training.strategies.pipeline_strategy.MultiTrainingStrategy",
         # Aliases for training_mode values used in experiment YAMLs
         "cold_diffusion": "spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy.GraphColdDiffusionStrategy",
+        "upstream_process": "spectramr.infrastructure.training.strategies.upstream_process_strategy.UpstreamProcessStrategy",
         "kspace_cold_diffusion": "spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy.GraphColdDiffusionStrategy",
         "hybrid": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "mesh": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",

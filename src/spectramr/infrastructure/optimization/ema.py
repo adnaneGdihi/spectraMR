@@ -4,6 +4,41 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.core.module_utils import strip_wrapper_prefixes
+
+
+class EMAKeyMismatchError(RuntimeError):
+    """The shadow and the live model share no state-dict keys.
+
+    Raised rather than skipped because the blend loop is key-matched: a shadow
+    whose keys are all absent from the live model blends **nothing**, every
+    step, without raising. Every observable stays healthy — ``num_updates``
+    increments, the decay ramp advances, the checkpoint writes an
+    ``ema_state`` — and the only symptom is that EMA and non-EMA numbers
+    coincide, which reads as "EMA did not help on this arm" (#2172).
+
+    The cause is always a wrapper asymmetry: the shadow is deep-copied from the
+    bare module at build time, while the live model handed to :meth:`update`
+    has since been wrapped by ``DistributedDataParallel`` / ``FSDP`` /
+    ``DeepSpeedEngine`` / ``torch.compile``, each of which prefixes every key.
+    Unwrap with ``spectramr.core.module_utils.unwrap_model`` before calling.
+    """
+
+
+class EMAWeightRestoreError(RuntimeError):
+    """Validation's EMA swap could not put the training weights back.
+
+    The swap overwrites the live generator in place and restores it afterwards
+    from a clone. A tensor whose *shape* changed during the validation forward
+    (a rebuilt ``channel_adapter``) can no longer accept its saved value, so
+    that entry is dropped from the restore and the generator keeps the EMA
+    value for it — permanently, and silently under ``strict=False``.
+
+    Training would then continue from a blend of trained and shadow weights.
+    That is unrecoverable rather than merely wrong, so it is raised rather than
+    logged.
+    """
+
 
 class ModelEma(nn.Module):
     """
@@ -166,8 +201,15 @@ class ModelEma(nn.Module):
             # call rather than cached, so a ``load_state_dict(assign=True)`` or
             # module rebuild can never leave us blending a stale tensor.
             buckets: dict[Any, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+            # Counted here rather than by intersecting the two key sets, so the
+            # guard below costs one host-side int increment per tensor instead
+            # of building a set every step (non-negotiable 9). Counting also
+            # keeps the check live: a cached first-call result would miss a
+            # model that gains a wrapper mid-run.
+            matched = 0
             for k, ema_v in esd.items():
                 if k in msd:
+                    matched += 1
                     model_v = msd[k]
                     # Reconcile device: a memory-saving CPU-EMA / GPU-model config
                     # (or the reverse) would otherwise raise a device-mismatch in
@@ -187,6 +229,15 @@ class ModelEma(nn.Module):
                         # Mixed dtypes cannot share a foreach bucket; keep the
                         # per-tensor blend, which upcasts as it always did.
                         ema_v.mul_(decay).add_(model_v, alpha=1.0 - decay)
+            if esd and matched == 0:
+                raise EMAKeyMismatchError(
+                    f"EMA shadow and live model share no state-dict keys, so this "
+                    f"update would blend 0 of {len(esd)} tensors and raise nothing. "
+                    f"Shadow key example: {next(iter(esd), '<empty>')!r}; live key "
+                    f"example: {next(iter(msd), '<empty>')!r}. The live model is "
+                    f"wrapped and the shadow is not — unwrap it with "
+                    f"spectramr.core.module_utils.unwrap_model before calling update()."
+                )
             # ``lerp_(a, b, w) == (1 - w) * a + w * b``, so ``w = 1 - decay``
             # reproduces ``mul_(decay).add_(live, alpha=1 - decay)``. It is one
             # fused op rather than two, so results may differ in the last ulp --
@@ -209,6 +260,37 @@ class ModelEma(nn.Module):
         sd = super().state_dict(*args, **kwargs)
         sd[self._NUM_UPDATES_KEY] = torch.tensor(int(self.num_updates), dtype=torch.long)
         return sd
+
+    def shadow_state_dict(self) -> dict[str, Any]:
+        """Bare shadow weights **plus** the warmup counter — the checkpoint form.
+
+        The two halves of :meth:`state_dict` / :meth:`load_state_dict` were both
+        being bypassed: the checkpoint director called
+        ``unwrap_model(ema).state_dict()``, and ``unwrap_model`` peels this
+        object's ``.module``, so ``nn.Module.state_dict`` ran on the inner module
+        and the counter this class exists to persist was dropped on every save —
+        restarting the decay ramp at 0 on every resume, which is precisely what
+        the override's docstring says must not happen.
+
+        Weight keys stay **bare**, matching what is already on disk, so existing
+        checkpoints keep loading and no migration is needed.
+        """
+        sd: dict[str, Any] = dict(self.module.state_dict())
+        sd[self._NUM_UPDATES_KEY] = torch.tensor(int(self.num_updates), dtype=torch.long)
+        return sd
+
+    def load_shadow_state_dict(self, state_dict: Any, strict: bool = True) -> Any:
+        """Inverse of :meth:`shadow_state_dict`, tolerant of pre-fix checkpoints.
+
+        A checkpoint written before the counter was persisted simply has no
+        counter key, and ``num_updates`` keeps its current value rather than
+        being invented.
+        """
+        sd = dict(state_dict)
+        counter = sd.pop(self._NUM_UPDATES_KEY, None)
+        if counter is not None:
+            self.num_updates = int(counter)
+        return self.module.load_state_dict(strip_wrapper_prefixes(sd), strict=strict)
 
     def load_state_dict(self, state_dict: Any, strict: bool = True, assign: bool = False) -> Any:
         """Restore the warmup counter, tolerating pre-fix checkpoints.

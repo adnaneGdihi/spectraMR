@@ -15,7 +15,7 @@ For **data_consistency(x, k, mask, weight)** (the function wrapper):
     dominate but are not exact (blend is (k + λ·k_meas)/(1 + λ)).
   - weight=0.0: output ≡ input  (no DC applied).
 
-For **DataConsistencyLayer** (noise-augmented):
+For **NoiseSimulatingDataConsistency** (noise-augmented):
   - With noise_lvl=0.0: ``output[mask==1]`` must equal
     ``measured_kspace[mask==1]`` in k-space after the fft2c pass
     (the layer enforces ``kspace_consistent = (1-mask)*k_pred + mask*k_meas``).
@@ -35,7 +35,7 @@ import pytest
 import torch
 
 from spectramr.infrastructure.physics.data_consistency import (
-    DataConsistencyLayer,
+    NoiseSimulatingDataConsistency,
     HardDataConsistency,
     SoftDataConsistency,
     data_consistency,
@@ -245,14 +245,14 @@ def test_data_consistency_weight_zero_passthrough(mask_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. DataConsistencyLayer (noise-augmented): noise_lvl=0 hard DC
+# 5. NoiseSimulatingDataConsistency (noise-augmented): noise_lvl=0 hard DC
 # ---------------------------------------------------------------------------
 
 @pytest.mark.physics
 @pytest.mark.adjoint
 @pytest.mark.parametrize("mask_name", _MASK_IDS)
 def test_data_consistency_layer_no_noise_preserves_measured(mask_name: str) -> None:
-    """DataConsistencyLayer with noise_lvl=0 enforces k_meas at mask==1.
+    """NoiseSimulatingDataConsistency with noise_lvl=0 enforces k_meas at mask==1.
 
     The layer computes:
         kspace_consistent = (1 - mask) * k_pred + mask * k_meas
@@ -263,7 +263,7 @@ def test_data_consistency_layer_no_noise_preserves_measured(mask_name: str) -> N
     x_img_pred = _rand_complex_img(seed=90)
     k_measured = fft2c(_rand_complex_img(seed=100))
 
-    layer = DataConsistencyLayer(noise_lvl=0.0)
+    layer = NoiseSimulatingDataConsistency(noise_lvl=0.0)
     layer.eval()
 
     # Layer expects: predicted_img, measured_kspace, mask
@@ -278,6 +278,6 @@ def test_data_consistency_layer_no_noise_preserves_measured(mask_name: str) -> N
         err = (k_out_sq[mask_bool] - k_meas_sq[mask_bool]).abs().max().item()
         tol = tol_for(torch.complex64) * 200
         assert err < tol, (
-            f"DataConsistencyLayer [{mask_name}]: measured k-space not preserved.\n"
+            f"NoiseSimulatingDataConsistency [{mask_name}]: measured k-space not preserved.\n"
             f"  max_err={err:.3e}  tol={tol:.3e}"
         )

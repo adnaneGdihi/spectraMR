@@ -78,6 +78,32 @@ CompileMode = Literal[
     "max-autotune-no-cudagraphs",
 ]
 
+#: Which built models compilation applies to -- the keys ``ModelBuilder`` writes
+#: (``model_builder.py``: generator, discriminator, encoder, decoder). Closed, so
+#: a misspelling raises at load instead of quietly selecting nothing.
+#:
+#: The name is chosen against two collisions rather than for brevity.
+#: ``models`` sits one letter and one nesting level from the retired
+#: ``optimization.compile_model``, which ``RENAMES`` still folds -- exactly the
+#: confusion that mapping exists to remove. ``targets`` is worse: ``target_`` in
+#: this codebase means the ground truth (``target_domain``, ``target_mode``,
+#: ``target_rate``), and ``modules`` is taken by ``peft.target_modules``.
+CompileTarget = Literal["generator", "discriminator", "encoder", "decoder"]
+
+#: Compile knobs that do nothing at all under ``enabled: false`` -- they select
+#: which models are compiled, or bound the compilation, so with no compilation
+#: they are inert (pitfall 15). Deliberately excludes ``mode``/``backend``/
+#: ``fullgraph``/``dynamic``: those describe HOW compilation would run and are
+#: declared beside ``enabled: false`` on 89 ``inprogress`` arms as a
+#: ready-to-switch-on block.
+_INERT_UNDER_DISABLED_COMPILE: tuple[str, ...] = (
+    "regional",
+    "allow_complex",
+    "apply_to",
+    "recompile_limit",
+    "fail_on_recompile_limit",
+)
+
 #: Shared by every sub-block below. ``forbid`` because a new block has no legacy
 #: corpus to protect: a typo inside ``precision:`` has never worked, so there is
 #: nothing to break by rejecting it.
@@ -364,10 +390,12 @@ class PrecisionConfigSchema(BaseModel):
 class CompileConfigSchema(BaseModel):
     """``torch.compile`` settings.
 
-    Read by ``ModelBuilder.compile()``, wired at
-    ``infrastructure/training/builders/director.py`` step 1. Compilation failure
-    RAISES: when you asked for a compiled model, silently training an eager one
-    is a lie about what ran. ``enabled: false`` is how you ask for eager.
+    Read by ``builders/compile_apply.apply_compile``, which the director
+    invokes at the point ``builders/compile_placement`` names for the arm's
+    parallel strategy -- not at a fixed step, because one placement was wrong
+    for every strategy but the single-device one. Compilation failure RAISES:
+    when you asked for a compiled model, silently training an eager one is a
+    lie about what ran. ``enabled: false`` is how you ask for eager.
     """
 
     model_config = dict(_SUBBLOCK)
@@ -387,6 +415,152 @@ class CompileConfigSchema(BaseModel):
         description="Compile the full graph (requires no dynamic shapes).",
     )
     dynamic: bool = Field(default=True, description="Allow dynamic shapes.")
+    regional: bool = Field(
+        default=False,
+        description="Compile each child of a uniform nn.ModuleList separately "
+        "instead of the whole model, so the compiler cache is hit n-1 times "
+        "rather than missed once. Cuts cold start on block-stacked models; "
+        "raises if the model exposes no qualifying block list.",
+    )
+    allow_complex: bool = Field(
+        default=False,
+        description="Permit compilation on a complex/k-space arm. Only "
+        "meaningful with regional: the physics SSOT is fenced out of every "
+        "dynamo graph, so the compiled regions provably hold no complex "
+        "tensors. Default false keeps check_compile_with_complex_model an "
+        "error, which is what it is for every arm today.",
+    )
+    apply_to: list[CompileTarget] | None = Field(
+        default=None,
+        description="Which built models to compile. None (the default) means all "
+        "of them, which is what shipped. A GAN can name only its generator: the "
+        "discriminator is discarded at inference, and under regional an arm whose "
+        "discriminator exposes no uniform block list is refused entirely.",
+    )
+    recompile_limit: int | None = Field(
+        default=None,
+        description="Per-frame recompilation budget (torch._dynamo.config."
+        "recompile_limit; torch's default is 8). None leaves torch's value alone.",
+    )
+    fail_on_recompile_limit: bool = Field(
+        default=True,
+        description="Raise when a frame exhausts its recompilation budget instead "
+        "of falling back to eager. Torch defaults this OFF, so a run can exceed "
+        "the budget and execute eager while reporting a compiled configuration -- "
+        "the same lie this block already refuses at build time.",
+    )
+
+    @model_validator(mode="after")
+    def _knobs_require_enabled(self) -> "CompileConfigSchema":
+        """A compile knob declared under ``enabled: false`` never runs.
+
+        Advertising a knob that nothing reads is indistinguishable, from the
+        outside, from one that works (pitfall #15), so the declaration is
+        refused rather than ignored.
+        """
+        if self.enabled:
+            return self
+        # Compared against each field's DEFAULT rather than truthiness, because
+        # `fail_on_recompile_limit` defaults True and a truthiness test would
+        # call it "set" on every eager arm in the corpus.
+        #
+        # Scoped to the knobs that select or bound the WORK, not the ones that
+        # describe how it would be done. `mode`/`backend`/`fullgraph`/`dynamic`
+        # sit beside `enabled: false` on 89 inprogress arms -- a "here is the
+        # configuration if you switch it on" convention -- and rejecting those
+        # would be a corpus-wide break for no safety gained.
+        fields = type(self).model_fields
+        inert = [
+            name
+            for name in _INERT_UNDER_DISABLED_COMPILE
+            if getattr(self, name) != fields[name].default
+        ]
+        if inert:
+            raise ValueError(
+                f"optimization.compile.{inert[0]} is set but compile.enabled is false, "
+                "so it would never be read. Enable compilation or drop the knob."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _complex_opt_out_requires_regional(self) -> "CompileConfigSchema":
+        """``allow_complex`` is only honest when the fences are actually used.
+
+        The opt-out rests on the physics SSOT being fenced out of every graph so
+        the compiled regions hold no complex tensors. Compiling the whole model
+        instead would re-admit them, and Inductor does not fail on a complex op
+        -- it falls back to an eager kernel and warns once per process, which is
+        the false-throughput claim this whole check exists to prevent.
+        """
+        if self.allow_complex and not self.regional:
+            raise ValueError(
+                "optimization.compile.allow_complex requires regional: true. Whole-model "
+                "compilation puts the complex regions back in the graph, where Inductor "
+                "silently falls back to eager -- the arm would report a compiled run it "
+                "did not have."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _fullgraph_excludes_the_complex_opt_out(self) -> "CompileConfigSchema":
+        """``fullgraph`` and the fences are a guaranteed crash together.
+
+        The fences are ``torch._dynamo.disable``, which forces a graph break;
+        under ``fullgraph=True`` a graph break raises ``Unsupported``. Rejecting
+        the pair at load time costs 100 ms instead of failing at the first
+        forward pass on a cluster node.
+        """
+        if self.allow_complex and self.fullgraph:
+            raise ValueError(
+                "optimization.compile.allow_complex cannot be combined with "
+                "fullgraph: true. The complex opt-out fences the physics ops out of "
+                "the graph with torch._dynamo.disable, and a graph break under "
+                "fullgraph raises."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _apply_to_is_not_an_empty_selection(self) -> "CompileConfigSchema":
+        """``apply_to: []`` is ``enabled: false`` spelled so nobody notices.
+
+        Omit the key for "all models"; the empty list can only mean "compile
+        nothing", which the switch above already says plainly.
+        """
+        if self.apply_to is not None and not self.apply_to:
+            raise ValueError(
+                "optimization.compile.apply_to is an empty list, which would compile "
+                "nothing while the arm reports compilation enabled. Omit the key to "
+                "compile every model, or set compile.enabled: false."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _a_declared_budget_is_enforced(self) -> "CompileConfigSchema":
+        """A recompilation budget you decline to enforce is not a budget.
+
+        Exceeding it without ``fail_on_recompile_limit`` drops the frame to
+        eager and carries on, so the arm would run eager having explicitly
+        declared how much recompilation it would tolerate -- the silent-fallback
+        shape this block exists to refuse (non-negotiable 3).
+        """
+        if self.recompile_limit is not None and not self.fail_on_recompile_limit:
+            raise ValueError(
+                "optimization.compile.recompile_limit is set with "
+                "fail_on_recompile_limit: false, so exceeding the budget would "
+                "silently fall back to eager and the run would report a compiled "
+                "configuration it did not execute. Declare one or the other."
+            )
+        return self
+
+    @field_validator("recompile_limit")
+    @classmethod
+    def _recompile_limit_is_positive(cls, value: int | None) -> int | None:
+        """Zero or negative would disable compilation by a side door."""
+        if value is not None and value < 1:
+            raise ValueError(
+                f"optimization.compile.recompile_limit must be >= 1, got {value}."
+            )
+        return value
 
     @field_validator("backend")
     @classmethod

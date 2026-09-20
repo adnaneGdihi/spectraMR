@@ -48,7 +48,7 @@ class WorkflowProfile:
 
     The two fields are not interchangeable, and which one a regime uses is a fact
     about the physics rather than a style choice: an ``OperatorRegistry`` entry
-    *promises* ``adjoint()``, and generic callers (``DataConsistencyLayer``,
+    *promises* ``adjoint()``, and generic callers (``OperatorProjectionDataConsistency``,
     ``FISTAMBIRSolver``, ``NullSpaceProjection``) consume that promise assuming
     ``<Ax, y> = <x, A'y>``. A nonlinear map has no adjoint, so it goes in
     ``signal_model`` — registering it as an operator with a fabricated adjoint

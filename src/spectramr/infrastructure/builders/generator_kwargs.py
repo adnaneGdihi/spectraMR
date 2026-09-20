@@ -140,6 +140,19 @@ def resolve_generator_kwargs(
     if hasattr(config, "undersampling") and "acceleration_config" in contract.accepted:
         kwargs["acceleration_config"] = config.undersampling
 
+    # 3a-bis. training.diffusion.sampler. The generator resolved this only from
+    #     model_kwargs, which nothing wrote, so the declared value never left
+    #     the config and every arm fell through to the `cold_mri` literal. The
+    #     value is injected here and validated by the generator that consumes
+    #     it -- a model that never reads `sampler` must not be refused for a
+    #     name its own reverse loop would never look up.
+    _diffusion = getattr(getattr(config, "training", None), "diffusion", None)
+    _declared_sampler = getattr(_diffusion, "sampler", None) if _diffusion else None
+    if _declared_sampler and "sampler" not in kwargs and (
+        "sampler" in contract.accepted or contract.accepts_var_kwargs
+    ):
+        kwargs["sampler"] = str(_declared_sampler)
+
     # 3b. data.processing.enable_log_scaling. The magnitude ceilings in the
     #     cold-diffusion path enforce a PHYSICAL ratio, so they must know
     #     whether the k-space they bound is log1p-compressed; without this a

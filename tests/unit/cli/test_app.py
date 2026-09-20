@@ -753,3 +753,81 @@ def test_bulk_audit_builds_the_same_report_as_the_single_arm_audit(tmp_path, mon
     args = argparse.Namespace(config=tmp_path, json=False, strict=True, exclude=None, probe=False)
     app._audit_bulk(args)
     assert seen == [str(arm)]
+
+
+# ------------------------------------------------------------- --val-batches
+
+
+class TestValBatchesFlag:
+    """``--val-batches`` on the two verbs that run a training-time validation.
+
+    The flag is sugar for an override, and the lowering happens once in
+    ``_dispatch_training`` -- so these assert the *observable* result (what lands
+    in ``args.override``), not that a helper was called.
+    """
+
+    @pytest.mark.parametrize("verb", ["train", "sanity_check"])
+    def test_both_training_verbs_accept_it(self, verb):
+        args = build_parser().parse_args(
+            [verb, "--config", "c.yaml", "--val-batches", "2"]
+        )
+        assert args.val_batches == 2
+
+    @pytest.mark.parametrize("verb", ["train", "sanity_check"])
+    def test_it_defaults_to_none_so_a_plain_run_is_unchanged(self, verb):
+        args = build_parser().parse_args([verb, "--config", "c.yaml"])
+        assert args.val_batches is None
+
+    def _dispatch(self, monkeypatch, argv):
+        """Parse ``argv`` and run the dispatcher with the bootstrap stubbed out."""
+        import spectramr.main as _main
+
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            _main, "train_command", lambda a: seen.update(override=a.override)
+        )
+        monkeypatch.setattr(
+            _main, "sanity_check_command", lambda a: seen.update(override=a.override)
+        )
+        args = build_parser().parse_args(argv)
+        args.func(args)
+        return seen["override"]
+
+    @pytest.mark.parametrize(
+        ("verb", "flag"), [("train", "--val-batches"), ("sanity_check", "--val-batches")]
+    )
+    def test_dispatch_lowers_it_onto_the_key_the_framework_reads(
+        self, monkeypatch, verb, flag
+    ):
+        overrides = self._dispatch(
+            monkeypatch, [verb, "--config", "c.yaml", flag, "3"]
+        )
+        assert overrides == ["validation.loader.num_batches=3"]
+
+    def test_it_composes_with_an_unrelated_override(self, monkeypatch):
+        overrides = self._dispatch(
+            monkeypatch,
+            ["train", "--config", "c.yaml", "-O", "training.max_iterations=5",
+             "--val-batches", "1"],
+        )
+        assert overrides == [
+            "training.max_iterations=5",
+            "validation.loader.num_batches=1",
+        ]
+
+    def test_without_the_flag_no_override_is_invented(self, monkeypatch):
+        assert self._dispatch(monkeypatch, ["train", "--config", "c.yaml"]) is None
+
+    def test_conflicting_with_an_explicit_override_raises(self, monkeypatch):
+        with pytest.raises(ValueError, match=r"conflicts with the override"):
+            self._dispatch(
+                monkeypatch,
+                ["train", "--config", "c.yaml",
+                 "-O", "validation.loader.num_batches=9", "--val-batches", "1"],
+            )
+
+    def test_the_override_it_emits_survives_the_real_loader(self):
+        """The lowering is only worth anything if `apply_overrides` accepts it."""
+        settings = TrainingSettings(**_minimal_config())
+        updated = apply_overrides(settings, ["validation.loader.num_batches=2"])
+        assert updated.validation.loader.num_batches == 2

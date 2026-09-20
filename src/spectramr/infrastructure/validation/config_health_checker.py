@@ -3709,6 +3709,110 @@ class ConfigHealthChecker:
             for base in strategy_cls.__mro__
         )
 
+    def check_reveal_attribution_preconditions(
+        self, config: TrainingSettings
+    ) -> HealthCheckResult:
+        """``reveal_attribution`` needs a reverse mode, a mask family and a domain.
+
+        The schema validator can only see inside ``validation.sampling``, so it
+        catches the sampler requirement and nothing else. The other three live in
+        ``model`` and ``undersampling`` — different top-level blocks — and this
+        layer is the one that may read all of them at once.
+
+        Without this the arm audits clean, trains, and raises at its FIRST
+        validation. That is not a quiet gap either: every failure mode here is
+        architecture-determined rather than data-dependent, so every batch
+        raises, ``val_count`` reaches 0, and the F36 guard turns it into a
+        run-level error hours in (pitfall 9 — reject at load instead).
+        """
+        name = "reveal_attribution_preconditions"
+        sampling = getattr(getattr(config, "validation", None), "sampling", None)
+        if not bool(getattr(sampling, "reveal_attribution", False)):
+            return HealthCheckResult(
+                passed=True,
+                check_name=name,
+                message="validation.sampling.reveal_attribution is off.",
+                severity="info",
+            )
+
+        from spectramr.models.diffusion.reveal_attribution import (
+            DIRECTION_DEPENDENT_ACCELERATION_TYPES,
+            NON_LINE_ACCELERATION_TYPES,
+            PARTITIONED_REVERSE_MODES,
+        )
+
+        problems: list[str] = []
+
+        # 1. The reverse mode must write each coefficient once and freeze it.
+        kwargs = getattr(getattr(config, "model", None), "model_kwargs", None) or {}
+        mode = str(kwargs.get("reverse_sampling_mode", "additive"))
+        if mode not in PARTITIONED_REVERSE_MODES:
+            problems.append(
+                f"model.model_kwargs.reverse_sampling_mode={mode!r} rewrites "
+                "coefficients across steps, so no step 'wrote' a given bin "
+                f"(need one of {sorted(PARTITIONED_REVERSE_MODES)}). Note "
+                "'additive' is the constructor default, so an arm that omits the "
+                "key gets it."
+            )
+
+        # 2. The mask must be a band of lines. `resolve_line_axis` is the
+        #    authority and decides from the plane, but it cannot run until
+        #    validation; the family name is what is knowable now.
+        accel = getattr(config, "undersampling", None)
+        accel_type = str(getattr(accel, "acceleration_type", "") or "").lower()
+        direction = getattr(accel, "mask_direction", None)
+        if accel_type in NON_LINE_ACCELERATION_TYPES:
+            problems.append(
+                f"undersampling.acceleration_type={accel_type!r} is a point "
+                "pattern or non-Cartesian trajectory; it partitions by reveal "
+                "step but has no band of lines to attribute error to."
+            )
+        elif accel_type in DIRECTION_DEPENDENT_ACCELERATION_TYPES and not direction:
+            problems.append(
+                f"undersampling.acceleration_type={accel_type!r} is line-structured "
+                "only when undersampling.mask_direction names the axis; it is unset."
+            )
+
+        # 3. The band selector is a k-space mask, so the prediction must be
+        #    k-space. Same resolver the visualization path uses.
+        try:
+            from spectramr.infrastructure.training.utils.domain_inference import (
+                needs_ifft_for_visualization,
+            )
+
+            predicts_kspace, _ = needs_ifft_for_visualization(config)
+        except Exception:  # pragma: no cover - resolver failure is its own check
+            predicts_kspace = True
+        if not predicts_kspace:
+            problems.append(
+                "the model predicts in image space; a k-space band mask cannot "
+                "select its coefficients."
+            )
+
+        if problems:
+            joined = "\n  - ".join(problems)
+            return HealthCheckResult(
+                passed=False,
+                check_name=name,
+                message=(
+                    "validation.sampling.reveal_attribution: true, but this arm "
+                    f"cannot produce a reveal partition:\n  - {joined}\n"
+                    "Set reveal_attribution: false, or change the declaration(s) "
+                    "above. Left as-is the run trains and then fails at its first "
+                    "validation."
+                ),
+                severity="error",
+            )
+        return HealthCheckResult(
+            passed=True,
+            check_name=name,
+            message=(
+                f"reveal_attribution: true with reverse_sampling_mode={mode!r}, "
+                f"acceleration_type={accel_type or '<unset>'!r}, k-space prediction."
+            ),
+            severity="info",
+        )
+
     def check_acceleration_present(self, config: TrainingSettings) -> HealthCheckResult:
         """k-space datasets must declare an ``acceleration:`` block (no silent 1× fallback)."""
         data = getattr(config, "data", None)
@@ -5677,6 +5781,110 @@ class ConfigHealthChecker:
             ),
         )
 
+    def check_metric_transforms_agree(self, config: TrainingSettings) -> HealthCheckResult:
+        """``train_<m>`` and ``val_<m>`` must measure the same thing to be compared.
+
+        The training-metric path reads ``metrics.transform`` and the validation
+        path reads ``validation.scoring.output_transform``. When they differ the
+        two numbers share a name stem and measure different quantities -- on 69
+        cohort arms, ``ifft_sense_adjoint`` in normalised log-compressed units
+        against ``ifft_magnitude`` in denormalised physical ones -- so the gap
+        between them is a pipeline artefact that reads as a generalisation gap.
+
+        Advisory: making them agree changes every reported ``train_`` metric on
+        every affected arm, which is an owner decision rather than a repair.
+        """
+        check_name = "metric_transforms_agree"
+        train_t = getattr(getattr(config, "metrics", None), "transform", None)
+        scoring = getattr(getattr(config, "validation", None), "scoring", None)
+        val_t = getattr(scoring, "output_transform", None) if scoring else None
+        if train_t is None or val_t is None or str(train_t) == str(val_t):
+            return HealthCheckResult(
+                passed=True,
+                check_name=check_name,
+                message=(
+                    f"training and validation metrics share one transform "
+                    f"({train_t!r})."
+                    if train_t is not None
+                    else "no metric transform declared on either path."
+                ),
+                severity="info",
+            )
+        return HealthCheckResult(
+            passed=True,
+            check_name=check_name,
+            message=(
+                f"metrics.transform={train_t!r} but "
+                f"validation.scoring.output_transform={val_t!r}, so train_<m> and "
+                f"val_<m> are different measurements under one name. Their "
+                f"difference is a pipeline artefact, not a generalisation gap."
+            ),
+            severity="info",
+            category="metrics",
+            yaml_keys=["metrics.transform", "validation.scoring.output_transform"],
+            fix_hint=(
+                "Declare the same transform on both paths, or read the two "
+                "series separately and never as a train/val gap."
+            ),
+        )
+
+    def check_kspace_scale_domain_is_declared(
+        self, config: TrainingSettings
+    ) -> HealthCheckResult:
+        """An undeclared scale domain is a silent choice of normalisation.
+
+        ``KSpaceNormalizationSpec._read_declared_knobs`` already refuses a
+        ``processing`` block that omits this knob, with a message naming #572.
+        That refusal is unreachable in production: training hands it
+        ``config.data`` and inference hands it ``config.model_dump()``, and
+        pydantic has filled the default in both, so the only caller it can fire
+        on is a raw YAML mapping that nothing passes. The check therefore has to
+        ask the question here, where ``model_fields_set`` still records whether
+        the author typed it.
+
+        Advisory rather than blocking: 109 of the 185 configs that enable
+        normalisation omit it, so raising would be a corpus migration. The
+        polarity matches the workflow block -- absent is advisory, wrong is
+        hard.
+        """
+        check_name = "kspace_scale_domain_is_declared"
+        processing = getattr(getattr(config, "data", None), "processing", None)
+        if processing is None or not getattr(processing, "enable_kspace_normalization", False):
+            return HealthCheckResult(
+                passed=True,
+                check_name=check_name,
+                message="k-space normalization is off; the scale domain does not apply.",
+                severity="info",
+            )
+        declared = getattr(processing, "model_fields_set", set())
+        resolved = getattr(processing, "kspace_scale_domain", None)
+        if "kspace_scale_domain" in declared:
+            return HealthCheckResult(
+                passed=True,
+                check_name=check_name,
+                message=f"data.processing.kspace_scale_domain declared as {resolved!r}.",
+                severity="info",
+            )
+        return HealthCheckResult(
+            passed=True,
+            check_name=check_name,
+            message=(
+                f"data.processing enables k-space normalization but declares no "
+                f"kspace_scale_domain, so it resolves to the schema default "
+                f"{resolved!r}. 'image' is the Parseval-compliant choice when "
+                f"losses and metrics are graded in the image domain; an arm that "
+                f"takes the default while its siblings declare 'image' is scored "
+                f"on differently normalised predictions."
+            ),
+            severity="info",
+            category="schema",
+            yaml_keys=["data.processing.kspace_scale_domain"],
+            fix_hint=(
+                "Declare data.processing.kspace_scale_domain explicitly. Match "
+                "the arm's declared metadata.baseline."
+            ),
+        )
+
     def check_dc_knobs_inert_by_method(self, config: TrainingSettings) -> HealthCheckResult:
         """DC knobs this arm declares that its resolved ``dc_method`` cannot read.
 
@@ -6184,6 +6392,7 @@ class ConfigHealthChecker:
 
         try:
             from spectramr.infrastructure.validation.inert_knobs import (
+                declared_knobs_out_of_scope,
                 find_inert_declared_knobs,
             )
             from spectramr.models.init_registry import populate_model_registry
@@ -6214,13 +6423,28 @@ class ConfigHealthChecker:
             )
 
         inert = find_inert_declared_knobs(str(model_type), declared, cls)
+        out_of_scope = declared_knobs_out_of_scope(declared, cls)
         if not inert:
+            # State the scope, not just the verdict. This detector enumerates
+            # named __init__ parameters only, so a key absorbed by **kwargs is
+            # never a candidate -- 85.8 % of this corpus's declared keys on the
+            # kspace_filling cohort. "All N are read" over that population reads
+            # as a clean bill of health for knobs nothing looked at.
+            measured = len(declared) - len(out_of_scope)
+            scope = (
+                f" {len(out_of_scope)} further key(s) are absorbed by **kwargs "
+                f"and are NOT measured by this check; the package-wide reader "
+                f"census (check_model_kwargs_are_read) is what covers those."
+                if out_of_scope
+                else ""
+            )
             return HealthCheckResult(
                 passed=True,
                 check_name=check_name,
                 message=(
-                    f"all {len(declared)} declared model_kwargs are read by "
-                    f"{cls.__name__} (or allowlisted as deliberate)."
+                    f"{measured} of {len(declared)} declared model_kwargs are in "
+                    f"scope here and all are read by {cls.__name__} (or "
+                    f"allowlisted as deliberate).{scope}"
                 ),
                 severity="info",
             )
@@ -6526,7 +6750,7 @@ class ConfigHealthChecker:
         )
 
     def check_metric_names_are_registered(self, config: TrainingSettings) -> HealthCheckResult:
-        """Every name in ``metrics.compute`` must resolve in ``MetricsRegistry``.
+        """Every declared metric name must resolve in ``MetricsRegistry``.
 
         This is what makes the list safe to prefer over the 86 ``compute_*``
         flags. A flag could name a metric that does not exist and simply do
@@ -6539,14 +6763,34 @@ class ConfigHealthChecker:
         mistake is a startup error instead of a silently-missing measurement
         (pitfall #18: the arm grades on a metric the run never computes).
 
-        Skips when the list is empty, i.e. for every arm still on the flags.
+        Skips when both lists are empty, i.e. for every arm still on the flags.
+
+        **Two surfaces, not one.** ``metrics.compute`` configures the TRAINING
+        metrics computer; ``validation.scoring.compute`` configures the
+        VALIDATION one (``mixins/metrics_mixin.py`` prefers it when non-empty),
+        and they are routinely different lists on the same arm. This check read
+        only the first until 2026-09-16, so a typo on the surface that grades an
+        arm's headline numbers was not an error -- it was a column that never
+        appeared. That is the same shape as #2116, one layer up: the name is
+        accepted, nothing computes it, and the run reports success.
         """
-        declared = getattr(getattr(config, "metrics", None), "compute", None)
+        metrics_compute = getattr(getattr(config, "metrics", None), "compute", None) or []
+        scoring = getattr(getattr(config, "validation", None), "scoring", None)
+        scoring_compute = getattr(scoring, "compute", None) or []
+        #: ``(surface, name)`` so the error names the key the reader has to edit.
+        declared_by_surface = [
+            *(("metrics.compute", n) for n in metrics_compute),
+            *(("validation.scoring.compute", n) for n in scoring_compute),
+        ]
+        declared = [n for _, n in declared_by_surface]
         if not declared:
             return HealthCheckResult(
                 passed=True,
                 check_name="metric_names_are_registered",
-                message="metrics.compute not used; arm is on the compute_* flags.",
+                message=(
+                    "metrics.compute / validation.scoring.compute not used; "
+                    "arm is on the compute_* flags."
+                ),
                 severity="info",
             )
         try:
@@ -6560,25 +6804,30 @@ class ConfigHealthChecker:
             )
         known = {k.lower() for k in getattr(MetricsRegistry, "_metrics", {})}
         known |= {k.lower() for k in getattr(MetricsRegistry, "_aliases", {})}
-        unknown = [n for n in declared if str(n).lower() not in known]
+        unknown = [(s_, n) for s_, n in declared_by_surface if str(n).lower() not in known]
         if not unknown:
+            surfaces = sorted({s_ for s_, _ in declared_by_surface})
             return HealthCheckResult(
                 passed=True,
                 check_name="metric_names_are_registered",
-                message=f"all {len(declared)} declared metric(s) are registered.",
+                message=(
+                    f"all {len(declared)} declared metric(s) are registered "
+                    f"({', '.join(surfaces)})."
+                ),
                 severity="info",
             )
+        offending = sorted({s_ for s_, _ in unknown})
         return HealthCheckResult(
             passed=False,
             check_name="metric_names_are_registered",
             message=(
-                f"metrics.compute names {len(unknown)} unregistered metric(s): "
-                f"{unknown}. The run would report success while never computing "
-                "them."
+                f"{len(unknown)} unregistered metric(s): "
+                f"{[f'{s_}: {n}' for s_, n in unknown]}. The run would report "
+                "success while never computing them."
             ),
             severity="error",
             category="metrics_misconfiguration",
-            yaml_keys=["metrics.compute"],
+            yaml_keys=offending,
             fix_hint=(
                 "Use a registered name (or a registered alias). "
                 f"{len(known)} names are available; `MetricsRegistry.list_available()` "
@@ -8467,36 +8716,132 @@ class ConfigHealthChecker:
         self,
         config: TrainingSettings,
     ) -> HealthCheckResult:
-        """``torch.compile`` + FSDP/DeepSpeed is fragile, and wraps in the wrong order.
+        """Whether this strategy can be compiled at all, and where.
 
-        ``ModelBuilder.compile()`` runs BEFORE the sharding wrap, so the result is
-        ``FSDP(torch.compile(m))`` -- the reverse of PyTorch's recommended
-        ``torch.compile(FSDP(m))``. Warning, not error: the combination does work
-        for some models, and compilation failure now raises loudly rather than
-        degrading silently, so the downside is a crash rather than a wrong number.
+        The premise this check was written against is retired. It reported a
+        warning for ``fsdp``/``deepspeed`` because ``ModelBuilder.compile()`` ran
+        before the wrap, giving ``FSDP(torch.compile(m))``; compilation is now
+        placed per strategy, so that ordering is fixed rather than warned about.
+
+        It also missed ``ddp`` and ``dp`` entirely, which meant the one
+        combination with a measurable cost -- ``DDP(compile(m))`` forfeits
+        DDPOptimizer, and with it the allreduce/backward overlap -- passed
+        review in silence.
+
+        The table in ``builders/compile_placement`` is the single owner of the
+        decision; this reads it so the audit and the runtime cannot disagree
+        about which combinations are legal. Only a refusal errors: those are
+        measured crashes, knowable statically, and they should not cost a GPU
+        allocation to discover.
         """
         check_name = "compile_with_sharded_strategy"
         optimization = getattr(config, "optimization", None)
         parallel = getattr(config, "parallel", None)
+        from spectramr.infrastructure.training.builders.compile_placement import (
+            resolve_compile_placement,
+        )
+
         strategy = getattr(parallel, "strategy", "none") if parallel else "none"
-        if not getattr(optimization.compile, "enabled", False):
-            return HealthCheckResult(True, check_name, "compile_model is off; n/a.", "info")
-        if strategy not in ("fsdp", "deepspeed"):
+        # getattr on the block, not attribute access: `optimization` is None on
+        # partial configs and this used to raise AttributeError out of a health
+        # check, which is the one thing a health check must never do.
+        compile_cfg = getattr(optimization, "compile", None)
+        if not getattr(compile_cfg, "enabled", False):
             return HealthCheckResult(
-                True, check_name, f"strategy={strategy!r} is not sharded; n/a.", "info"
+                True, check_name, "optimization.compile.enabled is off; n/a.", "info"
             )
+
+        zero_stage = getattr(getattr(parallel, "deepspeed", None), "zero_stage", None)
+        try:
+            placement = resolve_compile_placement(strategy, zero_stage=zero_stage)
+        except ValueError as exc:  # a strategy with no declared placement
+            return HealthCheckResult(
+                False,
+                check_name,
+                str(exc),
+                "error",
+                category="compile_with_sharded_strategy",
+                yaml_keys=["optimization.compile.enabled", "parallel.strategy"],
+            )
+
+        if placement.refused:
+            return HealthCheckResult(
+                False,
+                check_name,
+                placement.refusal,
+                "error",
+                category="compile_with_sharded_strategy",
+                yaml_keys=[
+                    "optimization.compile.enabled",
+                    "parallel.strategy",
+                    "parallel.deepspeed.zero_stage",
+                ],
+                fix_hint=(
+                    "Set optimization.compile.enabled: false and use DeepCompile instead: "
+                    "parallel.deepspeed.compile.enabled: true with passes: [z3] at "
+                    "zero_stage 3, or [z1] at stage 1/2. Dropping to a lower zero_stage "
+                    "does NOT make torch.compile the right tool here -- every sharded "
+                    "stage has a DeepCompile pass."
+                ),
+            )
+        # The one combination the table knows is broken and the optimizer
+        # cannot diagnose. Where the strategy must wrap before the optimizer
+        # exists (fsdp, deepspeed), compilation lands first, so
+        # `_resolve_param_groups` matches its keys against `_orig_mod.<name>`
+        # and raises blaming the key rather than the wrapper (#2174). Knowable
+        # from the YAML alone, so it costs an audit rather than a GPU
+        # allocation and a confusing traceback.
+        param_groups = getattr(
+            getattr(getattr(config, "optimization", None), "optimizer", None),
+            "param_groups",
+            None,
+        )
+        if placement.optimizer_sees_wrapper and param_groups:
+            return HealthCheckResult(
+                False,
+                check_name,
+                f"optimization.compile.enabled=true with parallel.strategy={strategy!r} places "
+                f"compilation at {placement.stage!r}, which is BEFORE the optimizer is built -- "
+                f"so the optimizer introspects a compiled module whose parameters are named "
+                f"'_orig_mod.<...>'. optimizer.param_groups keys "
+                f"({sorted(param_groups)}) are matched against those names and a key that "
+                f"matches nothing raises, blaming the key rather than the wrapper (#2174).",
+                "error",
+                category="compile_with_sharded_strategy",
+                yaml_keys=[
+                    "optimization.compile.enabled",
+                    "parallel.strategy",
+                    "optimization.optimizer.param_groups",
+                ],
+                fix_hint=(
+                    "Drop optimization.optimizer.param_groups for this arm, or run it on a "
+                    "strategy that compiles after the optimizer exists (none, ddp), or set "
+                    "optimization.compile.enabled: false."
+                ),
+            )
+        if placement.advisory:
+            return HealthCheckResult(
+                True,
+                check_name,
+                placement.advisory,
+                "info",
+                category="compile_with_sharded_strategy",
+                yaml_keys=["optimization.compile.enabled", "parallel.strategy"],
+                always_report=True,
+            )
+        # The resolved SELECTION, not just the placement: `apply_to` decides
+        # which models are compiled at all, and an arm that meant to compile its
+        # generator and named nothing gets every model instead.
+        selection = getattr(compile_cfg, "apply_to", None)
+        applies_to = ", ".join(selection) if selection else "every model"
         return HealthCheckResult(
-            False,
+            True,
             check_name,
-            f"optimization.compile.enabled=true with parallel.strategy={strategy!r}. "
-            "The model is compiled before it is wrapped, giving "
-            "FSDP(torch.compile(m)) -- the reverse of the recommended "
-            "torch.compile(FSDP(m)) -- and the combination is known-fragile.",
-            "warning",
+            f"compile is placed at {placement.stage!r} for strategy={strategy!r}, "
+            f"applied to {applies_to}.",
+            "info",
             category="compile_with_sharded_strategy",
-            yaml_keys=["optimization.compile.enabled", "parallel.strategy"],
-            fix_hint="Set compile_model: false for this arm, or verify the "
-            "combination on a short run before committing GPU time.",
+            always_report=True,
         )
 
     def check_deepspeed_extra_installed(
@@ -9138,6 +9483,103 @@ class ConfigHealthChecker:
             ),
         )
 
+    def check_bf16_requires_ampere(
+        self,
+        config: TrainingSettings,
+    ) -> HealthCheckResult:
+        """bf16 below sm_80 is emulated, and torch reports that as supported.
+
+        ``torch.cuda.is_bf16_supported()`` defaults to ``including_emulation=True``
+        and answers **True** on a V100, because that branch only checks a bf16
+        tensor can be created. The target clusters are sm_70. So a gate written
+        against the obvious probe would confirm bf16 on exactly the hardware it
+        needed to reject; this reads the compute capability instead.
+
+        **Severity is deliberate.** ``audit`` is ``--strict`` and warnings exit 2
+        (non-negotiable 4), while the audit legitimately runs on a login node
+        whose GPU differs from the compute node's, or which has none. So an
+        *unverifiable* answer must not gate: it reports at ``info`` with
+        ``always_report`` and names the env var that makes it decidable. Only a
+        capability this machine could actually read produces an error. The
+        runtime gate in ``mixed_precision.assert_amp_dtype_supported`` is the
+        enforcer, and it cannot be fooled by where the audit ran.
+        """
+        from spectramr.core.device_capabilities import (
+            TARGET_CAPABILITY_ENV,
+            probe_device_capabilities,
+        )
+        from spectramr.infrastructure.training.mixed_precision import (
+            resolve_amp_precision,
+        )
+
+        check_name = "bf16_requires_ampere"
+        optimization = getattr(config, "optimization", None)
+        precision = getattr(optimization, "precision", None)
+        try:
+            enabled, resolved = resolve_amp_precision(
+                bool(getattr(precision, "enabled", False)),
+                getattr(precision, "dtype", None),
+            )
+        except ValueError:  # the schema owns the vocabulary; it already raised
+            return HealthCheckResult(True, check_name, "AMP dtype is invalid; n/a.", "info")
+
+        parallel = getattr(config, "parallel", None)
+        fsdp = getattr(parallel, "fsdp", None)
+        fsdp_bf16 = bool(getattr(fsdp, "enabled", False)) and (
+            getattr(fsdp, "mixed_precision", None) == "bf16"
+        )
+        # FSDP's sub-block defaults to bf16, so most sharded arms never declared
+        # it -- but the policy still applies, and only when sharding is on.
+        if not ((enabled and resolved == "bf16") or fsdp_bf16):
+            return HealthCheckResult(
+                True, check_name, "bf16 is not the resolved AMP dtype; n/a.", "info"
+            )
+
+        caps = probe_device_capabilities()
+        declared_by = (
+            "optimization.precision.dtype" if enabled and resolved == "bf16"
+            else "parallel.fsdp.mixed_precision"
+        )
+        keys = ["optimization.precision.dtype", "parallel.fsdp.mixed_precision"]
+
+        if caps.device_type != "cuda" or "capability" in caps.incomplete:
+            return HealthCheckResult(
+                True,
+                check_name,
+                f"bf16 declared ({declared_by}), but this machine cannot report a CUDA "
+                f"compute capability (device_type={caps.device_type!r}, source={caps.source}). "
+                f"Native bf16 needs sm_80+ and the run RAISES below that, so this is "
+                f"unverified rather than passed. Declare the target with "
+                f"{TARGET_CAPABILITY_ENV}=<major>.<minor> to decide it here.",
+                "info",
+                category="bf16_capability",
+                yaml_keys=keys,
+                always_report=True,
+            )
+        if caps.native_bf16:
+            return HealthCheckResult(
+                True,
+                check_name,
+                f"bf16 on sm_{caps.capability_str} (native).",
+                "info",
+            )
+        return HealthCheckResult(
+            False,
+            check_name,
+            f"bf16 declared ({declared_by}) on a device with compute capability "
+            f"{caps.capability_str} (source={caps.source}), which has no native bf16 -- "
+            f"torch would emulate it, slower than fp16 and numerically unlike the "
+            f"declaration. Supported here: {list(caps.amp_dtypes)}.",
+            "error",
+            category="bf16_capability",
+            yaml_keys=keys,
+            fix_hint=(
+                "Use optimization.precision.dtype: float32 for complex/k-space arms "
+                "(fp16 autocast is a no-op there), or float16 otherwise. Ampere or "
+                "newer is what bf16 needs."
+            ),
+        )
+
     @staticmethod
     def _complex_arm_signals(config: TrainingSettings) -> list[str]:
         """Signals that this arm carries genuine ``complex64`` tensors.
@@ -9247,22 +9689,66 @@ class ConfigHealthChecker:
         check_name = "compile_with_complex_model"
 
         compile_cfg = getattr(getattr(config, "optimization", None), "compile", None)
-        if not bool(getattr(compile_cfg, "enabled", False)):
-            return HealthCheckResult(True, check_name, "torch.compile is not enabled; n/a.", "info")
+        torch_compile = bool(getattr(compile_cfg, "enabled", False))
+
+        # DeepCompile counts. It compiles the ENGINE graph rather than the
+        # module, but it hands that graph to the same code generator --
+        # `deepspeed/compile/backend.py` calls `torch._inductor.compile`, and the
+        # CUDA accelerator's `get_compile_backend()` is "inductor" -- so the
+        # complex-op fallback is identical.
+        #
+        # This gate used to read `optimization.compile.enabled` alone, which made
+        # it structurally unable to fire on a DeepCompile arm: the two are
+        # mutually exclusive (`check_deepcompile_supported`), so a DeepCompile
+        # arm has torch.compile OFF by construction and the check returned "n/a".
+        # Live for the kspace_filling cohort, where 70 of 73 arms are DeepSpeed
+        # ZeRO-2 with complex k-space signals.
+        deepspeed_cfg = getattr(getattr(config, "parallel", None), "deepspeed", None)
+        deep_compile = bool(
+            getattr(getattr(deepspeed_cfg, "compile", None), "enabled", False)
+        )
+
+        if not (torch_compile or deep_compile):
+            return HealthCheckResult(
+                True, check_name, "no compilation is enabled; n/a.", "info"
+            )
+        compiler = "optimization.compile" if torch_compile else "DeepCompile"
 
         signals = self._complex_arm_signals(config)
         if not signals:
             return HealthCheckResult(
                 True,
                 check_name,
-                "Real-valued arm; torch.compile is fine.",
+                f"Real-valued arm; {compiler} is fine.",
                 "info",
+            )
+
+        if bool(getattr(compile_cfg, "allow_complex", False)):
+            # The opt-out the docstring above anticipated. It is only reachable
+            # WITH `regional` -- the schema refuses the pair otherwise -- because
+            # it rests on the physics SSOT being fenced out of every graph
+            # (`core.compile_fences`), so the compiled regions provably hold no
+            # complex tensors. Measured on a real-backbone/complex-physics model:
+            # unfenced 1 graph / 19 ops with the complex ops inside, fenced
+            # 2 graphs / 9 ops with them excluded.
+            return HealthCheckResult(
+                True,
+                check_name,
+                "optimization.compile.allow_complex is set on a complex/k-space arm "
+                f"(signals: {', '.join(signals)}). The physics ops are fenced out of "
+                "the compiled graph, so only the real-valued regions compile -- at the "
+                "cost of one graph break per fence. Confirm the arm is actually faster "
+                "than eager before relying on it.",
+                "info",
+                category="compile_with_complex_model",
+                yaml_keys=["optimization.compile.allow_complex"],
+                always_report=True,
             )
 
         return HealthCheckResult(
             False,
             check_name,
-            "optimization.compile.enabled=true on a complex/k-space arm "
+            f"{compiler} is enabled on a complex/k-space arm "
             f"(signals: {', '.join(signals)}). Torchinductor cannot generate "
             "code for complex operators -- it does not fail, it falls back to "
             "eager and warns once, so the run would report a compiled "
@@ -9270,11 +9756,29 @@ class ConfigHealthChecker:
             "possibly slower than eager throughout.",
             "error",
             category="compile_with_complex_model",
-            yaml_keys=["optimization.compile.enabled", "model.target_domain"],
+            yaml_keys=[
+                "optimization.compile.enabled",
+                "parallel.deepspeed.compile.enabled",
+                "model.target_domain",
+            ],
             fix_hint=(
-                "Set optimization.compile.enabled: false. Complex arms get their "
-                "throughput from bfloat16 AMP, optimizer.fused and ZeRO instead "
-                "-- see docs/training_throughput.rst."
+                (
+                    "Set optimization.compile.enabled: false. To compile the "
+                    "real-valued majority anyway, set compile.regional: true and "
+                    "compile.allow_complex: true, which fences the physics ops out "
+                    "of the graph."
+                    if torch_compile
+                    else
+                    # No regional opt-out here, and that is not an omission:
+                    # DeepCompile compiles the whole engine graph, so there is no
+                    # per-region boundary for the fences to sit on.
+                    "Set parallel.deepspeed.compile.enabled: false. DeepCompile has "
+                    "no regional mode -- it compiles the whole engine graph, so the "
+                    "physics fences that make optimization.compile.allow_complex "
+                    "honest have nowhere to apply."
+                )
+                + " Complex arms get their throughput from bfloat16 AMP, "
+                "optimizer.fused and ZeRO instead -- see docs/training_throughput.rst."
             ),
         )
 
@@ -9351,10 +9855,13 @@ class ConfigHealthChecker:
                 f"mamba_ssm is importable for Mamba model_type={model_type!r}.",
                 "info",
             )
+        # `make install-mamba`, not the bare pip line: upstream downloads a
+        # prebuilt wheel whose gencode list has no sm_70, so the import this check
+        # tests would succeed while a V100 dies at the first kernel launch.
         install_hint = (
-            "Install the official kernel: `pip install -e '.[mamba]' "
-            "--no-build-isolation` (needs CUDA + nvcc); verify with "
-            "`python -c 'import mamba_ssm'`."
+            "Install the official kernel: `make install-mamba` (needs CUDA + nvcc); "
+            "verify with `python scripts/install_mamba_extra.py --verify-only`, which "
+            "checks the built architectures and not just that `import mamba_ssm` works."
         )
         if mamba_block._mamba_fallback_allowed():
             return HealthCheckResult(
@@ -13668,6 +14175,7 @@ class ConfigHealthChecker:
         report.results.append(self.check_hilbert_square_pow_two(config))
         report.results.append(self.check_pde_synthetic_datasets(config))
         report.results.append(self.check_acceleration_present(config))
+        report.results.append(self.check_reveal_attribution_preconditions(config))
         report.results.append(self.check_acs_within_center_band(config))
         report.results.extend(self.check_nr_metrics_research_mode(config))
         report.results.append(self.check_val_batch_size(config))
@@ -13686,6 +14194,8 @@ class ConfigHealthChecker:
         report.results.append(self.check_declared_keys_are_not_discarded(config))
         report.results.append(self.check_component_kwargs_reach_constructor(config))
         report.results.append(self.check_declared_model_kwargs_are_read(config))
+        report.results.append(self.check_kspace_scale_domain_is_declared(config))
+        report.results.append(self.check_metric_transforms_agree(config))
         # `check_config_version_is_canonical` was deleted here along with the
         # fold it read. It searched the ledger for a `config_version`
         # VALUE_CHANGED_ON_FINALIZE record, and `_bind_config_version` was the
@@ -13759,6 +14269,7 @@ class ConfigHealthChecker:
         # Inductor cannot codegen complex operators. It does not fail -- it
         # falls back to eager and warns once, so a compiled complex arm reports
         # throughput that belongs to a different configuration (pitfall #16).
+        report.results.append(self.check_bf16_requires_ampere(config))
         report.results.append(self.check_compile_with_complex_model(config))
         report.results.append(self.check_deepspeed_topology_coherent(config))
         # The world-size axis of the same question: a stage that owns the state

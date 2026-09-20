@@ -69,12 +69,30 @@ warnings.filterwarnings(
     message=r"builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__",
     category=DeprecationWarning,
 )
-# Silence the pair of ``torch.jit.{script,interface} is deprecated``
-# notices that fire on torch>=2.13 import — also third-party.
+# Silence the ``torch.jit.{script,script_method,interface} is deprecated``
+# notices third-party code triggers on import.
+#
+# Keyed on the MESSAGE and on the base ``Warning`` class rather than a concrete
+# category, because the category has already moved once and nothing said so:
+# torch 2.13 raises this text as ``DeprecationWarning`` (``_script.py:1490``)
+# and torch 2.14 raises it as ``FutureWarning`` (``:1491``), so the
+# category-keyed filter this replaces matched until the version bump and then
+# silently stopped. The message is the stable identifier here; a filter that
+# fails to match is indistinguishable from one that is absent.
 warnings.filterwarnings(
     "ignore",
-    message=r"`?torch\.jit\.(script|interface)`? is deprecated",
-    category=DeprecationWarning,
+    message=r"`?torch\.jit\.(script|script_method|interface)`? is deprecated",
+    category=Warning,
+)
+# POT's ``ot.datasets`` carries an unescaped ``\d`` in a docstring. The COMPILER
+# reports that, so it fires only while the module is compiled from source — on a
+# node with a cold ``__pycache__``, and on every task of any job that disables
+# the bytecode cache. Filtering our own invalid escapes is not a risk this takes
+# on: ruff's W605 owns those, and it is enforced on every added line.
+warnings.filterwarnings(
+    "ignore",
+    message=r"invalid escape sequence",
+    category=SyntaxWarning,
 )
 
 __version__ = "0.1.3.dev1"

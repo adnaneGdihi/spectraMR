@@ -12,6 +12,7 @@ Reference: Bansal et al., "Cold Diffusion: Inverting Arbitrary Image Transforms"
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from typing import TYPE_CHECKING, Any
@@ -34,7 +35,24 @@ from spectramr.infrastructure.physics.data_consistency import VALID_DC_METHODS
 #                    Lets a learned/soft DC DENOISE the measured lines (low-field
 #                    super-resolution) while the magnitude clamp still bounds output.
 #                    ``replace_freeze`` (above) is left byte-identical for existing arms.
-VALID_REVERSE_MODES: frozenset[str] = frozenset({"additive", "replace_freeze", "replace_freeze_dc"})
+VALID_REVERSE_MODES: frozenset[str] = frozenset(
+    {"additive", "replace_freeze", "replace_freeze_dc", "replace_freeze_dc_t0"}
+)
+
+#: Reverse modes whose reveal at step ``i`` keys off ``mask(schedule[i])`` -- the
+#: rung the model is CALLED at -- rather than ``mask(schedule[i+1])``.
+#:
+#: The default keying makes the step at ``t`` write what the NEXT rung would
+#: reveal, so on a ladder whose ``mask(0)`` is all-ones the step labelled ``t=1``
+#: writes every remaining coefficient and the scheduled ``t=0`` step is inert and
+#: skipped -- the decisive write is made by a call whose time embedding says
+#: ``t=1`` (#2067). Under this keying the rung and the write agree, and the
+#: terminal call happens at ``t=0``.
+#:
+#: A separate mode value rather than a change to the existing ones: 60 corpus
+#: arms declare ``replace_freeze_dc`` and their published reconstructions were
+#: produced under the old convention.
+CURRENT_STEP_KEYED_REVERSE_MODES: frozenset[str] = frozenset({"replace_freeze_dc_t0"})
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +170,43 @@ def paired_magnitude(x: Tensor, eps: float = 1e-8) -> Tensor:
     return torch.sqrt(re * re + im * im)
 
 
+def paired_complex(x: Tensor) -> Tensor:
+    """Complex view of k-space held as interleaved real/imag channels.
+
+    Same ``[Re0, Im0, Re1, Im1, ...]`` convention and the same refusal on an odd
+    channel count as :func:`paired_magnitude`, which is the reference for both;
+    ``paired_complex(x).abs()`` and ``paired_magnitude(x)`` agree by
+    construction and a unit test pins that. Kept separate rather than folded
+    into one helper because the magnitude path runs inside the reverse loop and
+    must not allocate a complex tensor it would immediately discard.
+
+    Phase-sensitive diagnostics need the argument, not just the modulus, so they
+    cannot be served by ``paired_magnitude``.
+
+    Args:
+        x: ``[..., C, H, W]``. Complex dtype is returned unchanged; real dtype
+            is read as ``C // 2`` interleaved pairs.
+
+    Returns:
+        ``[..., C // 2, H, W]`` complex for real input, ``x`` for complex input.
+
+    Raises:
+        ValueError: fewer than 3 dims, or an odd channel count on a real tensor.
+    """
+    if torch.is_complex(x):
+        return x
+    if x.dim() < 3:
+        raise ValueError(f"paired_complex expects at least [C, H, W], got {tuple(x.shape)}.")
+    c = x.shape[-3]
+    if c % 2 != 0:
+        raise ValueError(
+            "paired_complex: interleaved Re/Im layout requires an even channel "
+            f"count but got {tuple(x.shape)} (C={c}). A real-stacked complex "
+            "k-space tensor always has C = 2 * n_coils."
+        )
+    return torch.complex(x[..., 0::2, :, :], x[..., 1::2, :, :])
+
+
 def clamp_to_magnitude_ceiling(x: Tensor, ceiling: Tensor, eps: float = 1e-8) -> Tensor:
     """Genuinely phase-preserving magnitude clamp (radial, not box).
 
@@ -218,6 +273,28 @@ def apply_ceiling_ratio(reference: Tensor, ratio: float, log_scaled: bool) -> Te
     return torch.log1p(ratio * torch.expm1(reference))
 
 
+@functools.lru_cache(maxsize=32)
+def _radial_band_partition(
+    h: int, w: int, num_bands: int, eps: float, device: torch.device
+) -> Tensor:
+    """``[H, W]`` radial band index — a function of shape alone.
+
+    Depends on nothing per-call: not the measurement's values, not the batch,
+    not which bins are observed. A training run and a validation trajectory
+    both call ``band_local_magnitude_ceiling`` with the SAME ``(h, w,
+    num_bands, device)`` on every step, so this is the compile-time constant
+    to cache rather than rebuild on the accelerated-run hot path
+    (non-negotiable 9, issue #536's follow-on). ``lru_cache`` needs every
+    argument hashable, which is why this takes the plain scalars rather than
+    the ``measurement`` tensor.
+    """
+    yy = torch.arange(h, device=device, dtype=torch.float32) - (h - 1) / 2.0
+    xx = torch.arange(w, device=device, dtype=torch.float32) - (w - 1) / 2.0
+    radius = torch.sqrt(yy[:, None] ** 2 + xx[None, :] ** 2)
+    radius = radius / radius.max().clamp_min(eps)
+    return (radius * num_bands).long().clamp_(0, num_bands - 1)  # [H, W]
+
+
 def band_local_magnitude_ceiling(
     measurement: Tensor,
     ratio: float,
@@ -270,27 +347,27 @@ def band_local_magnitude_ceiling(
     # channel axis anyway, so the returned [B, 1, H, W] shape is unchanged.
     mag = paired_magnitude(measurement)
     h, w = mag.shape[-2], mag.shape[-1]
-    # Radial index from the k-space centre (matching fft2c's centred convention).
-    yy = torch.arange(h, device=mag.device, dtype=torch.float32) - (h - 1) / 2.0
-    xx = torch.arange(w, device=mag.device, dtype=torch.float32) - (w - 1) / 2.0
-    radius = torch.sqrt(yy[:, None] ** 2 + xx[None, :] ** 2)
-    radius = radius / radius.max().clamp_min(eps)
-    band = (radius * num_bands).long().clamp_(0, num_bands - 1)  # [H, W]
+    # Radial index from the k-space centre (matching fft2c's centred convention);
+    # cached on shape alone, see ``_radial_band_partition``.
+    band = _radial_band_partition(h, w, num_bands, eps, mag.device)
 
     # Per-sample, per-band max over the OBSERVED support (nonzero measurement).
+    # One ``scatter_reduce`` over the whole partition rather than a per-band
+    # Python loop: a per-band ``bool(...)`` test or boolean-mask gather is a
+    # device->host synchronization on the training hot path (non-negotiable
+    # 9) for a reduction whose SHAPE never depends on this call's data (issue
+    # #536 follow-on). A band with no observed entry keeps ``ceilings``' zero
+    # initialisation (``include_self=True``), so an empty band needs no
+    # emptiness test at all.
     per_pixel = mag.amax(dim=1, keepdim=True) if mag.dim() >= 4 else mag.unsqueeze(1)
     flat = per_pixel.flatten(2)  # [B, 1, H*W]
     band_flat = band.flatten()  # [H*W]
     batch = flat.shape[0]
-    ceilings = flat.new_zeros((batch, 1, num_bands))
-    for b in range(num_bands):
-        sel = band_flat == b
-        if not bool(sel.any()):
-            continue
-        vals = flat[..., sel]
-        observed = vals > eps
-        # amax over observed entries only; 0 when the band was never sampled.
-        ceilings[..., b] = (vals * observed).amax(dim=-1)
+    observed_vals = flat * (flat > eps)
+    index = band_flat.view(1, 1, -1).expand(batch, 1, -1)
+    ceilings = flat.new_zeros((batch, 1, num_bands)).scatter_reduce(
+        dim=-1, index=index, src=observed_vals, reduce="amax", include_self=True
+    )
 
     # Monotone non-increasing envelope: an unsampled band inherits the nearest
     # inner band's ceiling rather than collapsing to zero (which would forbid ANY
@@ -368,9 +445,42 @@ def resolve_undersampling_kwargs(
     accel = _as_mapping(acceleration_config)
     over = dict(overrides or {})
 
-    schedule_kwargs: dict[str, Any] = dict(
-        accel.get("schedule_kwargs") or over.get("schedule_kwargs") or {"density_power": 1.6}
-    )
+    nested_schedule_kwargs = accel.get("schedule_kwargs") or over.get("schedule_kwargs")
+    schedule_kwargs: dict[str, Any] = dict(nested_schedule_kwargs or {"density_power": 1.6})
+
+    # ``AccelerationConfigSchema.density_power`` (default 2.0, "Power for
+    # variable density sampling") is a real, audit-advertised schema field, but
+    # the schema carries no ``schedule_kwargs`` mapping at all, so the read
+    # above could never see a declaration made through it: every arm silently
+    # ran the literal 1.6 above regardless of what it declared (pitfall 15). A
+    # schema DUMP always carries a value for ``density_power`` (the default
+    # fills in), so truthiness alone cannot tell "declared" from "unset" --
+    # ``model_fields_set`` is this repo's own idiom for that distinction
+    # (``models/losses/weights.py``, ``config/overrides.py``); a schema default
+    # is not a declaration, and the 63 ``density_nested`` cohort arms that never
+    # mention this knob must keep computing the same 1.6 they do today.
+    declared_fields = getattr(acceleration_config, "model_fields_set", frozenset())
+    if "density_power" in declared_fields:
+        schema_density_power = accel["density_power"]
+        # Look up the nested spelling only in what was ACTUALLY provided --
+        # ``schedule_kwargs`` above may hold the ``{"density_power": 1.6}``
+        # fallback rather than a real declaration, and comparing against that
+        # literal would raise a false NN17 conflict for every arm that never
+        # touched the nested spelling at all.
+        nested_density_power = (
+            nested_schedule_kwargs.get("density_power")
+            if nested_schedule_kwargs is not None
+            else None
+        )
+        if nested_density_power is not None and nested_density_power != schema_density_power:
+            raise ValueError(
+                "undersampling.density_power is declared twice with different "
+                f"values: the schema field says {schema_density_power!r}, "
+                "model.model_kwargs.schedule_kwargs.density_power says "
+                f"{nested_density_power!r}. Declare it in one place (NN17)."
+            )
+        schedule_kwargs["density_power"] = schema_density_power
+
     # Without this the step schedule falls back to [1.0, max_acceleration], so
     # R(0)=1 is fully sampled and t=0 degenerates to the identity.
     accel_range = accel.get("acceleration_range")
@@ -853,6 +963,34 @@ class KSpaceUndersamplingProcess(nn.Module):
             "actually reachable (issue #534)."
         )
 
+    def mask_at(self, t: int, image_shape: tuple[int, int]) -> Tensor:
+        """The validation-path kept-set at one timestep, as a boolean ``[H, W]``.
+
+        The fixed-seed generator, never ``q_sample`` — the same path
+        :meth:`describe_ladder` and :meth:`_cascade_masks` take, so a caller
+        reasoning about the reverse trajectory sees the cascade validation
+        actually reverse-samples (``enable_dynamic_mask`` randomisation applies
+        to training draws only). Single-timestep primitive so a consumer that
+        needs a handful of rungs does not rebuild the whole ladder.
+        """
+        h, w = image_shape
+        # `device=` is load-bearing, not tidiness. The memoised cascade in
+        # `generate_batch_masks` is gated on BOTH the timestep tensor and the
+        # generator being off-CPU (kspace_masks.py: "a host-side table would
+        # need the index moved back, reintroducing this very sync"), so a bare
+        # `torch.tensor([t])` lands on CPU and misses the table every call --
+        # rebuilding the mask instead of indexing one. The attribution path
+        # calls this once per scheduled step, per rung, per batch, and the
+        # cache's own note records a Scalene profile charging 24.24% of a run
+        # to the host copy it exists to avoid.
+        mask = self.mask_generator.generate_batch_masks(
+            batch_size=1,
+            timesteps=torch.tensor([int(t)], device=self.mask_generator.device),
+            image_shape=(h, w),
+            pattern=self.mask_type,
+        )
+        return mask[0, 0].bool()
+
     def _cascade_masks(self, image_shape: tuple[int, int], *, raw: bool = False):
         """Yield ``(t, kept)`` boolean masks along the fixed-seed cascade.
 
@@ -877,13 +1015,7 @@ class KSpaceUndersamplingProcess(nn.Module):
             if raw:
                 accelerator.enforce_nested = False
             for t in range(self.num_timesteps):
-                mask = self.mask_generator.generate_batch_masks(
-                    batch_size=1,
-                    timesteps=torch.tensor([t]),
-                    image_shape=(h, w),
-                    pattern=self.mask_type,
-                )
-                yield t, mask[0, 0].bool()
+                yield t, self.mask_at(t, (h, w))
         finally:
             accelerator.enforce_nested = original_enforce
 
@@ -1496,6 +1628,55 @@ class PhysicsInformedColdDiffusion(nn.Module):
                 center_fraction=center_fraction,
             )
 
+        # The t=0-terminal keying only delivers its terminal call when the
+        # schedule actually reaches 0. On a ladder whose floor is 1 the mode
+        # would run, report success, and call the model at t=1 exactly like the
+        # convention it exists to replace -- an inert knob, not an error
+        # (pitfall 15). The floor is 0 when base_acceleration > 1 or when
+        # `undersampling.train_identity_rung` opens the identity rung.
+        if self.reverse_mode in CURRENT_STEP_KEYED_REVERSE_MODES:
+            _floor = self.process.min_meaningful_timestep()
+            if _floor != 0:
+                raise ValueError(
+                    f"reverse_sampling_mode={self.reverse_mode!r} keys its reveal off the "
+                    f"rung it is called at so that the terminal step runs at t=0, but this "
+                    f"process floors the schedule at t={_floor}, so the terminal call would "
+                    "land there and the mode would behave exactly like 'replace_freeze_dc'. "
+                    "Set undersampling.train_identity_rung: true (base_acceleration == 1), "
+                    "or use base_acceleration > 1."
+                )
+
+        # What the last reverse call actually ran, declared here so a caller can
+        # read the attributes without first having sampled. ``last_terminal_step``
+        # is the LOWEST timestep the model was called at, which is not the tail of
+        # the schedule: under ``dc_method='hard'`` a step whose reveal is empty is
+        # skipped, and on a ladder whose ``mask(0)`` is all-ones that is always the
+        # t=0 step, so the terminal rung is scheduled and never evaluated (#2067).
+        # Reported rather than inferred -- the previous two were computed and
+        # discarded, which is how the skip stayed invisible.
+        self.last_effective_steps: int = 0
+        self.last_skipped_steps: int = 0
+        self.last_terminal_step: int | None = None
+        self.last_schedule: list[int] = []
+
+    @property
+    def reverse_stats(self) -> dict[str, Any]:
+        """What the last :meth:`sample` call ran, for the validation record.
+
+        ``reverse_mode`` rides along because a consumer reasoning about WHICH
+        step wrote a coefficient needs to know whether steps write once and
+        freeze. Reading it off the sampler object would work and is what a
+        caller reached for first; carrying it here keeps one transport for "what
+        the last sample call did" instead of two.
+        """
+        return {
+            "effective_steps": self.last_effective_steps,
+            "skipped_steps": self.last_skipped_steps,
+            "terminal_timestep_called": self.last_terminal_step,
+            "schedule": list(self.last_schedule),
+            "reverse_mode": str(self.reverse_mode),
+        }
+
     def _reseed_sampler_generator(self, seed_offset: int = 0) -> None:
         """Drop the noise generator so the next draw starts a fresh stream.
 
@@ -1566,23 +1747,26 @@ class PhysicsInformedColdDiffusion(nn.Module):
         if self.dc_method == "hard":
             # Replace predicted values with measurements where we have data
             x_0_pred = x_0_pred * (1.0 - mask) + measurement * mask
-        elif self.dc_method in ("soft", "noise_adjusted"):
-            # Soft DC: x = x - λ * (x - y) * mask (noise_adjusted maps to soft,
-            # matching the model-internal builder's SoftDataConsistency branch).
-            residual = (x_0_pred - measurement) * mask
-            x_0_pred = x_0_pred - self.dc_weight * residual
         else:
-            # Learned DC (adaptive / kan_adaptive / target_aware_fsdc): reuse the
-            # model's trained ``dc_layer`` — the SAME operator it trained with —
-            # exactly as the schedule reuses ``model.kspace_process``. x_0_pred is
-            # k-space here, so ``is_kspace_domain=True`` skips the internal FFT.
+            # soft / noise_adjusted / adaptive / kan_adaptive / target_aware_fsdc
+            # / noise_adaptive: reuse the model's trained ``dc_layer`` — the SAME
+            # operator it trained with — exactly as the schedule reuses
+            # ``model.kspace_process``. x_0_pred is k-space here, so
+            # ``is_kspace_domain=True`` skips the internal FFT.
+            #
+            # ``SoftDataConsistency`` (the layer 'soft'/'noise_adjusted' build)
+            # is a proximal blend ``(k_pred + lam*y)/(1+lam)`` where ``dc_weight``
+            # feeds ``lam`` — a trust temperature, not a blend fraction
+            # (``infrastructure/physics/dc_settings.py`` is the SSOT for that
+            # reading). Delegating to the layer is what makes ``lam`` a live,
+            # optimizer-moved parameter here rather than a fixed coefficient.
             dc_layer = getattr(self.model, "dc_layer", None)
             if dc_layer is None:
                 raise ValueError(
                     f"dc_method={self.dc_method!r} needs the model's learned "
                     "dc_layer to delegate to, but the model exposes no "
                     "'dc_layer'. Either build the generator with this dc_method "
-                    "(so it constructs the layer) or use 'hard'/'soft'."
+                    "(so it constructs the layer) or use 'hard'."
                 )
             x_0_pred = dc_layer(x_0_pred, measurement, mask, is_kspace_domain=True)
 
@@ -1641,8 +1825,9 @@ class PhysicsInformedColdDiffusion(nn.Module):
         #   * ``t_prev = t - 1`` while ``sample`` walks a STRIDED schedule, so each
         #     step reveals one level's worth and whole bands between scheduled levels
         #     are never revealed.
-        # Prefer ``reverse_sampling_mode: replace_freeze`` for new arms; all 58
-        # kspace_filling arms already set it (39 replace_freeze, 19 replace_freeze_dc).
+        # Prefer a freeze mode for new arms; all 60 corpus arms that enable the
+        # multi-step sampler declare ``replace_freeze_dc`` (measured 2026-09-13 --
+        # re-measure rather than quoting this).
         x_t_minus_1 = x_t + recovered_lines
 
         return x_t_minus_1
@@ -1730,12 +1915,17 @@ class PhysicsInformedColdDiffusion(nn.Module):
         # Ensure unique and strictly decreasing
         timestep_schedule = sorted(set(timestep_schedule), reverse=True)
 
+        # Published for the validation record: the reveal partition is defined
+        # by this schedule, and re-deriving it downstream would be a second
+        # owner of it (non-negotiable 17).
+        self.last_schedule = list(timestep_schedule)
+
         if self.reverse_mode == "replace_freeze":
             return self._sample_replace_freeze(
                 measurement, mask, timestep_schedule, return_trajectory
             )
 
-        if self.reverse_mode == "replace_freeze_dc":
+        if self.reverse_mode in ("replace_freeze_dc", "replace_freeze_dc_t0"):
             return self._sample_replace_freeze_dc(
                 measurement, mask, timestep_schedule, return_trajectory
             )
@@ -1747,6 +1937,12 @@ class PhysicsInformedColdDiffusion(nn.Module):
 
             if return_trajectory:
                 trajectory.append(x.clone())
+
+        # The additive loop skips nothing, so every scheduled step is a model
+        # call and the tail of the schedule is the terminal one.
+        self.last_effective_steps = len(timestep_schedule)
+        self.last_skipped_steps = 0
+        self.last_terminal_step = timestep_schedule[-1] if timestep_schedule else None
 
         if return_trajectory:
             return x, trajectory
@@ -1803,6 +1999,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
         trajectory = [x.clone()] if return_trajectory else None
 
         skipped = 0
+        terminal: int | None = None
         for i, t_idx in enumerate(timestep_schedule):
             # Skip provably-inert steps (issue #535). This variant hard-pins the
             # observed support unconditionally, so a step that reveals nothing
@@ -1817,6 +2014,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
                 continue
 
             t = torch.full((B,), t_idx, device=device, dtype=torch.long)
+            terminal = t_idx
             x0 = self.model(x, t)
             if isinstance(x0, tuple):
                 x0 = x0[0]
@@ -1848,14 +2046,13 @@ class PhysicsInformedColdDiffusion(nn.Module):
             # see docs/experiment_11_kspace_cold_diffusion.rst). The revealed lines
             # carry the model's own (full-target-supervised) prediction, never the
             # measurement, so this does not leak ground truth.
-            if i + 1 < n:
-                next_t = timestep_schedule[i + 1]
-                _, mask_next = self.process.q_sample(
-                    x0, torch.full((B,), next_t, device=device, dtype=torch.long)
-                )
-                reveal = torch.clamp(mask_next.float() * (1.0 - committed), 0.0, 1.0)
-            else:
-                reveal = torch.clamp(1.0 - committed, 0.0, 1.0)
+            # Observed lines are already inside ``committed`` here, so the
+            # owner is called with an empty observed support -- the same
+            # arguments ``_step_reveals_anything`` is given above, which is what
+            # keeps the skip gate and the write from disagreeing.
+            reveal = self._reveal_support(
+                i, timestep_schedule, committed, torch.zeros_like(committed), x0, B, device
+            )
             x = x * (1.0 - reveal) + x0 * reveal
             committed = torch.clamp(committed + reveal, max=1.0)
 
@@ -1872,6 +2069,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
             )
         self.last_effective_steps = n - skipped
         self.last_skipped_steps = skipped
+        self.last_terminal_step = terminal
 
         if return_trajectory:
             return x, trajectory
@@ -1931,39 +2129,69 @@ class PhysicsInformedColdDiffusion(nn.Module):
         already covers every ``mask_next``, so the answer is False for most of the
         trajectory (issue #535).
         """
+        return bool(
+            self._reveal_support(i, timestep_schedule, committed, obs, x, batch, device).any()
+        )
+
+    def _reveal_support(
+        self,
+        i: int,
+        timestep_schedule: list[int],
+        committed: Tensor,
+        obs: Tensor,
+        x: Tensor,
+        batch: int,
+        device: torch.device,
+    ) -> Tensor:
+        """Which coefficients reverse step ``i`` writes.
+
+        The single owner of the reveal arithmetic: the loop writes what this
+        returns and ``_step_reveals_anything`` skips when it is empty, so the
+        skip gate and the write cannot disagree about a step (non-negotiable
+        17). They were two copies of the expression, which is the shape #2067
+        is about at the level above.
+
+        The terminal step always takes every remaining unobserved coefficient:
+        the reconstruction target is fully sampled, and keying it off a mask
+        would leave whatever that mask excludes permanently zero.
+        """
         n = len(timestep_schedule)
         if i + 1 >= n:
-            return bool(((1.0 - committed) * (1.0 - obs)).any())
-        next_t = timestep_schedule[i + 1]
-        _, mask_next = self.process.q_sample(
-            x, torch.full((batch,), next_t, device=device, dtype=torch.long)
+            return (1.0 - committed) * (1.0 - obs)
+        key_t = (
+            timestep_schedule[i]
+            if self.reverse_mode in CURRENT_STEP_KEYED_REVERSE_MODES
+            else timestep_schedule[i + 1]
         )
-        reveal = mask_next.float() * (1.0 - committed) * (1.0 - obs)
-        return bool(reveal.any())
+        _, key_mask = self.process.q_sample(
+            x, torch.full((batch,), key_t, device=device, dtype=torch.long)
+        )
+        return torch.clamp(key_mask.float() * (1.0 - committed) * (1.0 - obs), 0.0, 1.0)
 
     def _apply_observed_dc(self, x0: Tensor, measurement: Tensor, obs: Tensor) -> Tensor:
         """Data consistency on the OBSERVED support, per ``self.dc_method``.
 
-        Mirrors the additive ``p_sample`` DC branching but restricted to the
-        observed support ``obs`` (unobserved lines are owned by the reveal path,
-        left as the raw prediction). ``hard`` reproduces the measurement pin;
-        ``soft``/``noise_adjusted`` blend; the learned methods (``adaptive`` /
-        ``kan_adaptive`` / ``target_aware_fsdc`` / ``noise_adaptive``) delegate to
-        the model's trained ``dc_layer`` so the SAME operator used at training is
-        applied at sampling.
+        Mirrors the ``p_sample`` DC branching but restricted to the observed
+        support ``obs`` (unobserved lines are owned by the reveal path, left as
+        the raw prediction). ``hard`` reproduces the measurement pin; every other
+        method (``soft`` / ``noise_adjusted`` / ``adaptive`` / ``kan_adaptive`` /
+        ``target_aware_fsdc`` / ``noise_adaptive``) delegates to the model's
+        trained ``dc_layer`` so the SAME operator used at training — including a
+        learned ``lambda_param`` for soft DC — is applied at sampling.
+        ``dc_weight`` feeds that layer's ``lam`` (a trust temperature, not a
+        blend fraction; ``dc_settings.py`` is the SSOT for that reading), so
+        delegating rather than recomputing the blend here is what keeps a
+        live, optimizer-moved ``lam`` in effect at sampling too.
         """
         if self.dc_method == "hard":
             return x0 * (1.0 - obs) + measurement * obs
-        if self.dc_method in ("soft", "noise_adjusted"):
-            residual = (x0 - measurement) * obs
-            return x0 - self.dc_weight * residual
         dc_layer = getattr(self.model, "dc_layer", None)
         if dc_layer is None:
             raise ValueError(
                 f"dc_method={self.dc_method!r} needs the model's learned dc_layer "
                 "to delegate to in replace_freeze_dc mode, but the model exposes "
                 "no 'dc_layer'. Build the generator with this dc_method or use "
-                "'hard'/'soft'."
+                "'hard'."
             )
         dc_out = dc_layer(x0, measurement, obs, is_kspace_domain=True)
         # Confine the DC layer's changes to the observed support; the reveal path
@@ -2023,6 +2251,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
         trajectory = [x.clone()] if return_trajectory else None
 
         skipped = 0
+        terminal: int | None = None
         for i, t_idx in enumerate(timestep_schedule):
             # Skip provably-inert steps (issue #535). When a step reveals nothing
             # AND dc_method is hard, its whole effect is
@@ -2041,6 +2270,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
                 continue
 
             t = torch.full((B,), t_idx, device=device, dtype=torch.long)
+            terminal = t_idx
             x0 = self.model(x, t)
             if isinstance(x0, tuple):
                 x0 = x0[0]
@@ -2072,14 +2302,9 @@ class PhysicsInformedColdDiffusion(nn.Module):
             # docs/experiment_11_kspace_cold_diffusion.rst). Filled with the
             # model's own (full-target-supervised) prediction, never the
             # measurement, so no ground-truth leak.
-            if i + 1 < n:
-                next_t = timestep_schedule[i + 1]
-                _, mask_next = self.process.q_sample(
-                    x0, torch.full((B,), next_t, device=device, dtype=torch.long)
-                )
-                reveal = torch.clamp(mask_next.float() * (1.0 - committed) * (1.0 - obs), 0.0, 1.0)
-            else:
-                reveal = torch.clamp((1.0 - committed) * (1.0 - obs), 0.0, 1.0)
+            reveal = self._reveal_support(
+                i, timestep_schedule, committed, obs, x0, B, device
+            )
             # Observed support (re-blended each step) + freshly revealed lines.
             own = torch.clamp(reveal + obs, 0.0, 1.0)
             x = x * (1.0 - own) + x0 * own
@@ -2098,6 +2323,7 @@ class PhysicsInformedColdDiffusion(nn.Module):
             )
         self.last_effective_steps = n - skipped
         self.last_skipped_steps = skipped
+        self.last_terminal_step = terminal
 
         if return_trajectory:
             return x, trajectory
@@ -2109,6 +2335,7 @@ __all__ = [
     "KSpaceUndersamplingProcess",
     "PhysicsInformedColdDiffusion",
     "inject_reverse_step_noise",
+    "paired_complex",
     "resolve_undersampling_kwargs",
     "validate_sampler_determinism",
 ]

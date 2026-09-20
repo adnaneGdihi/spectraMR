@@ -362,7 +362,7 @@ def main() -> None:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint (path or 'auto')",
+        help="Resume from checkpoint (path, 'auto', or 'if-present')",
     )
     parser.add_argument(
         "--backend",

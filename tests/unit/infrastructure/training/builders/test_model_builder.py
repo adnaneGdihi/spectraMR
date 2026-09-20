@@ -253,99 +253,25 @@ def test_load_init_checkpoint_raises_on_zero_overlap(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ModelBuilder.compile — failure must RAISE, never degrade to eager
+# ModelBuilder no longer compiles.
 #
-# The old body wrapped everything in a blanket ``except Exception`` that logged
-# a warning and continued. Combined with the then-unvalidated compile_mode /
-# compile_backend, a single typo produced a full-length run that reported
-# success while executing eager — the arm was simply slower than its own
-# provenance claimed (#619 F1+F2). This method had ZERO test coverage.
+# `compile()` was deleted, not deprecated. Compilation is placed per parallel
+# strategy now (`builders/compile_placement.py`) and applied by the director at
+# the point that table names -- step 1 was the wrong point for every strategy
+# but DeepSpeed. The behaviour the old tests pinned, failure RAISES and never
+# degrades to eager (#619 F2), moved with the code to `test_compile_apply.py`.
 # ---------------------------------------------------------------------------
 
 
-def _compile_builder(**compile_opts) -> ModelBuilder:
-    """Phase 8: the five `compile_*` scalars are one `compile:` sub-block."""
-    opts = {
-        "enabled": True,
-        "mode": "default",
-        "backend": "inductor",
-        "fullgraph": False,
-        "dynamic": True,
-    }
-    opts.update(compile_opts)
-    mb = _builder_with_config(
-        SimpleNamespace(optimization=SimpleNamespace(compile=SimpleNamespace(**opts)))
-    )
-    mb._models = {"generator": torch.nn.Conv2d(2, 2, 3)}
-    return mb
+def test_model_builder_no_longer_exposes_compile() -> None:
+    """Guards against a second compile owner reappearing here.
 
-
-def test_compile_is_a_noop_when_disabled() -> None:
-    """``compile.enabled: false`` is the supported way to ask for eager."""
-    mb = _compile_builder(enabled=False)
-    original = mb._models["generator"]
-    assert mb.compile() is mb
-    assert mb._models["generator"] is original
-
-
-def test_compile_wraps_the_model_when_enabled() -> None:
-    mb = _compile_builder()
-    mb.compile()
-    wrapped = mb._models["generator"]
-    assert wrapped is not None
-    # torch.compile is lazy, so the observable effect at build time is the
-    # wrapper object itself, not a traced graph.
-    assert hasattr(wrapped, "_orig_mod")
-
-
-def test_compile_raises_instead_of_falling_back_to_eager() -> None:
-    """A backend that cannot compile must abort the run, not quietly eager it.
-
-    Uses a backend name that passes schema validation is impossible here (the
-    schema closes the vocabulary), so the failure is injected at the torch layer
-    to exercise the builder's own policy rather than the validator's.
+    Two call sites for one decision is how the placement came to be fixed at
+    step 1 in the first place (non-negotiable 17).
     """
-    mb = _compile_builder()
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("backend exploded")
-
-    original_compile = torch.compile
-    torch.compile = _boom
-    try:
-        with pytest.raises(RuntimeError, match="Refusing to fall back to eager"):
-            mb.compile()
-    finally:
-        torch.compile = original_compile
+    assert not hasattr(ModelBuilder, "compile")
 
 
-def test_compile_error_names_the_model_and_the_settings() -> None:
-    """The message has to be actionable: which model, which mode/backend."""
-    mb = _compile_builder(mode="max-autotune")
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("kaboom")
-
-    original_compile = torch.compile
-    torch.compile = _boom
-    try:
-        with pytest.raises(RuntimeError) as excinfo:
-            mb.compile()
-    finally:
-        torch.compile = original_compile
-
-    message = str(excinfo.value)
-    assert "generator" in message
-    assert "max-autotune" in message
-    assert "compile.enabled: false" in message
-
-
-def test_compile_raises_when_torch_compile_is_unavailable(monkeypatch) -> None:
-    """PyTorch < 2.0 previously logged a warning and skipped."""
-    mb = _compile_builder()
-    monkeypatch.delattr(torch, "compile", raising=False)
-    with pytest.raises(RuntimeError, match=r"torch\.compile is unavailable"):
-        mb.compile()
 
 
 class TestFsdpIsNotWrappedTwice:

@@ -34,6 +34,8 @@ _CACHE_VARS = (
     "TORCH_METRICS_CACHE",
     "XDG_CACHE_HOME",
     "CUDA_CACHE_CONFIG",
+    "CUDA_CACHE_PATH",
+    "TORCHINDUCTOR_CACHE_DIR",
     "TRITON_CACHE_DIR",
 )
 
@@ -289,3 +291,87 @@ class TestConfigureCacheEnvironment:
             assert getattr(env_ssot, attr, None) == var, (
                 f"{var} is not registered in core.env under the name {attr!r}"
             )
+
+
+class TestCompileArtifactsFollowTheRoot:
+    """Compiled artifacts are files, and they must land on the managed disk.
+
+    Triton kernels, Inductor's generated modules and the PTX JIT cache are all
+    written during a run. On a cluster the default locations are the wrong ones
+    twice over: node-local ``/tmp`` is invisible to the next job (so every job
+    recompiles) and often small, while ``$HOME`` is frequently NFS.
+    """
+
+    @pytest.fixture
+    def clean_cache_env(self, monkeypatch: pytest.MonkeyPatch):
+        for var in (*_VARS, *_CACHE_VARS):
+            monkeypatch.delenv(var, raising=False)
+        return monkeypatch
+
+    def test_inductor_is_pinned_not_inherited_through_tmpdir(
+        self, clean_cache_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The planted violation.
+
+        Inductor derives its default from ``tempfile.gettempdir()``, which
+        *looks* like it follows ``TMPDIR``. But ``gettempdir`` memoizes on first
+        call: touch it before this function runs and the redirect is inert,
+        while the env var still reads correctly. Drop
+        ``TORCHINDUCTOR_CACHE_DIR`` from the layout and this turns red.
+        """
+        import os
+        import tempfile
+
+        tempfile.tempdir = None
+        tempfile.gettempdir()  # freeze it at the system default, as an early import would
+        assert tempfile.gettempdir() != str(tmp_path)
+
+        configure_cache_environment(tmp_path)
+
+        try:
+            assert os.environ["TORCHINDUCTOR_CACHE_DIR"].startswith(str(tmp_path))
+            torch_inductor = pytest.importorskip(
+                "torch._inductor.runtime.cache_dir_utils"
+            )
+            assert torch_inductor.cache_dir().startswith(str(tmp_path)), (
+                "Inductor resolved outside the cache root -- the TMPDIR coupling "
+                "does not survive a memoized tempdir"
+            )
+        finally:
+            tempfile.tempdir = None
+
+    def test_the_ptx_cache_uses_the_nvidia_documented_spelling(
+        self, clean_cache_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``CUDA_CACHE_PATH`` is the variable the driver reads;
+        ``CUDA_CACHE_CONFIG`` beside it is not one of NVIDIA's three (#2178).
+        Without this the cache stays in ``~/.nv/ComputeCache``."""
+        import os
+
+        configure_cache_environment(tmp_path)
+        assert os.environ["CUDA_CACHE_PATH"].startswith(str(tmp_path))
+
+    def test_every_compile_artifact_path_is_a_real_directory(
+        self, clean_cache_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Created eagerly, so a denied path fails here naming the variable --
+        not later, inside a third-party compile step."""
+        configure_cache_environment(tmp_path)
+        import os
+
+        for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH"):
+            assert Path(os.environ[var]).is_dir(), f"{var} was not created"
+
+    def test_the_artifact_paths_do_not_collide(
+        self, clean_cache_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Three compilers writing into one directory would make the caches
+        impossible to size, clear or diagnose separately."""
+        import os
+
+        configure_cache_environment(tmp_path)
+        paths = {
+            os.environ[var]
+            for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR")
+        }
+        assert len(paths) == 2

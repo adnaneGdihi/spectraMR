@@ -316,3 +316,69 @@ class TestResolveStateDict:
                 self._keys(),
                 source="run42/best.pt",
             )
+
+
+class TestMidPathWrapperSegments:
+    """Regional compilation wraps a ModuleList child, not the root.
+
+    That puts the marker mid-path -- ``blocks.0._orig_mod.conv.weight`` -- which
+    a leading-only strip leaves in the checkpoint. Every inference path builds a
+    bare model and loads with ``strict=True``, so the key fails there; under
+    ``strict=False`` it matches nothing, loads nothing, and reports success.
+    """
+
+    def test_a_mid_path_orig_mod_is_stripped(self) -> None:
+        assert strip_wrapper_prefixes({"blocks.0._orig_mod.conv.weight": 1}) == {
+            "blocks.0.conv.weight": 1
+        }
+
+    def test_a_mid_path_fsdp_segment_is_stripped(self) -> None:
+        assert strip_wrapper_prefixes({"layers.2._fsdp_wrapped_module.w": 1}) == {
+            "layers.2.w": 1
+        }
+
+    def test_a_real_submodule_named_module_survives(self) -> None:
+        """``module`` is an ordinary attribute name, unlike the synthetic
+        underscore-prefixed wrappers, so it is only stripped while it leads."""
+        assert strip_wrapper_prefixes({"encoder.module.weight": 1}) == {
+            "encoder.module.weight": 1
+        }
+
+    def test_a_leading_module_is_still_stripped(self) -> None:
+        assert strip_wrapper_prefixes({"module.encoder.weight": 1}) == {
+            "encoder.weight": 1
+        }
+
+    def test_a_regionally_compiled_state_dict_loads_bare(self) -> None:
+        """The property that matters end to end."""
+
+        class Blk(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = nn.Conv2d(2, 2, 3)
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList([Blk() for _ in range(2)])
+
+        model = Net()
+        model.blocks[0] = torch.compile(model.blocks[0])
+        Net().load_state_dict(strip_wrapper_prefixes(model.state_dict()), strict=True)
+
+    @pytest.mark.parametrize(
+        "order",
+        [
+            {"module.w": 1, "w": 2},
+            {"w": 2, "module.w": 1},
+        ],
+        ids=["wrapped-first", "bare-first"],
+    )
+    def test_a_collision_raises_in_either_order(self, order) -> None:
+        """The guard used to ask "was THIS key transformed" rather than "did two
+        keys land on one name", so it fired in one order and silently kept the
+        last value in the other -- and a state dict's order is just
+        module-traversal order.
+        """
+        with pytest.raises(ValueError, match="collides"):
+            strip_wrapper_prefixes(order)

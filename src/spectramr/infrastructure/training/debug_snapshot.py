@@ -609,6 +609,70 @@ def _resolve_deferred_extra(
     return resolved
 
 
+#: Snapshot roots this PROCESS has already scanned for another run's leftovers.
+#: The scan is one directory listing, and it only has an answer to give once.
+_MARKED_ROOTS: set[str] = set()
+
+#: Which ``<tag>_step_<n>`` directories THIS run wrote, per snapshot root.
+_WRITTEN_DIRS: dict[str, list[str]] = {}
+
+
+def _mark_run(snap_root: Path, snap_dir: Path) -> None:
+    """Record which run owns which snapshot directories, and warn about the rest.
+
+    A run directory is reused across runs and a snapshot directory is named
+    ``<tag>_step_<n>`` -- no run in it. So a shorter run overwrites the early
+    steps IN PLACE and leaves the later ones untouched, and the result reads as
+    one coherent set: ``experiment_11_attention_none`` came back from the
+    2026-09-16 smoke run holding steps 1-2 from that run beside steps 3-8 and
+    ``model_output_dc`` steps 500-4000 from 2026-09-14, with nothing on disk
+    saying so. Directory mtimes do not tell them apart either -- rewriting a
+    file in place leaves the directory's own mtime alone.
+
+    ``RUN.json`` is that missing statement: it names the run that owns the
+    listed directories, so anything in the root and not in the list is a
+    leftover. Instrumentation, so a failure to write it warns rather than
+    killing the run it was only describing.
+    """
+    identity = run_identity()
+    marker = snap_root / "RUN.json"
+    key = str(snap_root)
+
+    if key not in _MARKED_ROOTS:
+        _MARKED_ROOTS.add(key)
+        try:
+            previous = json.loads(marker.read_text()) if marker.is_file() else {}
+        except (OSError, ValueError):
+            previous = {}
+        stale = sorted(
+            d.name
+            for d in snap_root.iterdir()
+            if d.is_dir() and d.name != snap_dir.name
+        )
+        if stale and previous.get("run_id") != identity.get("run_id"):
+            logger.warning(
+                "[debug-snapshot] %s already holds %d snapshot director%s from an "
+                "earlier run (%s). This run rewrites only the steps it reaches, so "
+                "the rest stay as that run left them -- read RUN.json for the ones "
+                "this run owns: %s",
+                snap_root,
+                len(stale),
+                "y" if len(stale) == 1 else "ies",
+                previous.get("run_id") or "run id not recorded",
+                ", ".join(stale[:6]) + (" ..." if len(stale) > 6 else ""),
+            )
+
+    written = _WRITTEN_DIRS.setdefault(key, [])
+    if snap_dir.name not in written:
+        written.append(snap_dir.name)
+    try:
+        marker.write_text(
+            json.dumps({**identity, "directories": sorted(written)}, indent=2, default=str)
+        )
+    except OSError as exc:
+        logger.warning("[debug-snapshot] could not write %s: %s", marker, exc)
+
+
 def save_debug_snapshot(
     *,
     run_dir: str | Path,
@@ -779,6 +843,7 @@ def save_debug_snapshot(
     snap_root = Path(run_dir) / "debug_snapshots"
     snap_dir = snap_root / f"{tag}_step_{step:06d}"
     snap_dir.mkdir(parents=True, exist_ok=True)
+    _mark_run(snap_root, snap_dir)
 
     if in_kspace_keys is None:
         in_kspace_keys = {

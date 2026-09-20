@@ -612,10 +612,16 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                     # Compute loss with filtered kwargs (e.g., passing 'smaps')
                     loss_val = _call_safe_loss(loss_fn, pred_for_loss, target_for_loss, **kwargs)
 
-                    # Log after successful computation
-                    logger.debug(
-                        f"[Loss {loss_name}] OK: loss_val={loss_val.item() if isinstance(loss_val, torch.Tensor) else loss_val}"
-                    )
+                    # Guarded, not lazy-formatted: the f-string evaluated
+                    # ``.item()`` before handing the message to a logger that
+                    # discards it, so every dynamic component paid a
+                    # device->host sync on every step at any log level.
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[Loss %s] OK: loss_val=%s",
+                            loss_name,
+                            loss_val.item() if isinstance(loss_val, torch.Tensor) else loss_val,
+                        )
                     if isinstance(loss_val, torch.Tensor):
                         # Store the RAW component. Weighting is applied exactly
                         # ONCE downstream in ``_stack_components`` (base.py:285-289)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import json
 import pytest
 import torch
 import torch.nn as nn
@@ -1593,7 +1594,8 @@ class TestSeedRankOffsetOrdering:
         )
         assert offset_call < resume, (
             "the rank-offset re-seed moved AFTER stage 9 — resume restores "
-            "per-rank RNG state (checkpoint_service._restore_rng_state) and a "
+            "the saved RNG state (core.rng_state, applied by "
+            "CheckpointDirector.load_from) and a "
             "later re-seed throws the resumed stream away."
         )
 
@@ -2612,3 +2614,141 @@ def test_the_run_summary_author_is_none_when_the_arm_declares_none(tmp_path) -> 
         provenance=None,
     )
     assert json.loads((tmp_path / "run_summary.json").read_text())["author"] is None
+
+
+# ---------------------------------------------------------------------------
+# `--resume`: two discovery spellings, and the difference is load-bearing.
+#
+# `auto` raises when the checkpoint directory is empty. That is right when you
+# meant to continue a specific run, and fatal for a WALL-CLOCK CHAIN, where
+# every link runs the identical command and link 1 has nothing to resume from.
+# Softening `auto` to cover both would have deleted the only spelling that can
+# still tell you your checkpoints went missing, so `if-present` is a second
+# value rather than a change to the first.
+# ---------------------------------------------------------------------------
+
+
+class TestResumeDiscoveryModes:
+    @staticmethod
+    def _source() -> str:
+        import inspect
+
+        from spectramr.pipelines import train
+
+        return inspect.getsource(train.run_training_pipeline)
+
+    def test_both_spellings_are_registered(self) -> None:
+        from spectramr.pipelines.train import _RESUME_DISCOVERY_MODES
+
+        assert set(_RESUME_DISCOVERY_MODES) == {"auto", "if-present"}
+
+    def test_auto_still_raises_on_an_empty_directory(self) -> None:
+        """The regression that would make this feature cost more than it gave:
+        a silent fresh start when you asked to continue a run."""
+        src = self._source()
+        raise_at = src.index("No checkpoint found in {checkpoint_dir} for auto-resume")
+        guard = src[max(0, raise_at - 300) : raise_at]
+        assert '_resume_mode == "auto"' in guard, (
+            "the strict spelling lost its raise -- `auto` on an empty directory "
+            "now starts fresh, which is indistinguishable from resuming"
+        )
+
+    def test_an_unknown_spelling_raises_rather_than_being_read_as_a_path(self) -> None:
+        """`--resume if_present` (underscore) must not be treated as a filename
+        that happens not to exist yet (non-negotiable 3)."""
+        src = self._source()
+        assert "neither an existing checkpoint" in src
+        assert "elif not Path(_resume_mode).exists():" in src
+
+    def test_the_decision_is_stamped(self) -> None:
+        """provenance.json is written at stage 8, before this decision exists,
+        so the resume gets its own record (non-negotiable 8)."""
+        src = self._source()
+        assert "_stamp_resume_record(run_dir, _resume_record" in src
+        for outcome in ('"outcome": "fresh"', '"outcome": "restored"'):
+            assert outcome in src
+
+    def test_the_record_appends_so_a_chain_is_readable(self, tmp_path) -> None:
+        """One entry per link; the sequence of start_iteration values is what
+        shows the chain advanced rather than restarting."""
+        from spectramr.pipelines.train import _stamp_resume_record
+
+        _stamp_resume_record(tmp_path, {"outcome": "fresh", "start_iteration": 0})
+        _stamp_resume_record(tmp_path, {"outcome": "restored", "start_iteration": 5000})
+        _stamp_resume_record(tmp_path, {"outcome": "restored", "start_iteration": 9500})
+
+        history = json.loads((tmp_path / "resume_history.json").read_text())
+        assert [e["start_iteration"] for e in history] == [0, 5000, 9500]
+        assert all(e["recorded_at"] for e in history)
+
+    def test_stamping_never_takes_down_a_run(self, tmp_path) -> None:
+        """A provenance hiccup must not cost a job that is ready to train."""
+        from spectramr.pipelines.train import _stamp_resume_record
+
+        _stamp_resume_record(tmp_path / "does" / "not" / "exist", {"outcome": "fresh"})
+
+
+class TestAYieldedRunDoesNotClaimCompletion:
+    """A yielded run is mid-training, and the artifacts a finished run emits
+    would describe a model that does not exist yet. Worse, they run INSIDE the
+    save margin: a report long enough to reach the wall takes the launcher down
+    with it, before the requeue is ever issued."""
+
+    @staticmethod
+    def _source() -> str:
+        import inspect
+
+        from spectramr.pipelines import train
+
+        return inspect.getsource(train.run_training_pipeline)
+
+    def test_reporting_is_skipped(self) -> None:
+        src = self._source()
+        assert 'if result.get("wall_clock_yield"):' in src
+        gate = src.index('if result.get("wall_clock_yield"):')
+        assert "_maybe_run_reporting" in src[gate : gate + 900]
+
+    def test_the_marker_is_written_before_the_epilogue(self) -> None:
+        """If Slurm kills the job during the epilogue, the marker must already
+        be on disk — otherwise the run yielded and nothing ever requeues it."""
+        src = self._source()
+        assert src.index("_write_yield_marker(run_dir, result") < src.index("_emit_run_summary(")
+
+
+# ---------------------------------------------------------------------------
+# Async CUDA faults must say that their own traceback is misdirection
+#
+# One case per shape the classifier has to separate: each async fault it claims
+# to recognise, a synchronous CUDA error it must NOT claim, and a plain Python
+# error (non-negotiable 15).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA error: misaligned address",
+        "CUDA error: an illegal memory access was encountered",
+        "CUDA error: unspecified launch failure",
+        "CUDA error: device-side assert triggered",
+    ],
+)
+def test_async_cuda_faults_name_the_serialising_flag(message: str) -> None:
+    """The operator gets CUDA_LAUNCH_BLOCKING=1 at the point of failure."""
+    hint = train_mod._async_cuda_fault_hint(RuntimeError(message))
+    assert hint is not None
+    assert "CUDA_LAUNCH_BLOCKING=1" in hint
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"),
+        RuntimeError("Expected all tensors to be on the same device"),
+        ValueError("mask channel count 3 does not divide 8"),
+    ],
+    ids=["oom", "device-mismatch", "plain-python"],
+)
+def test_synchronous_failures_get_no_async_hint(exc: Exception) -> None:
+    """A failure whose frame IS the culprit must not be labelled misdirection."""
+    assert train_mod._async_cuda_fault_hint(exc) is None

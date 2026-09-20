@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from spectramr.config.schemas.base import ParallelismConfigSchema
+from spectramr.config.schemas.optimization import ParamGroupOverrideSchema
 from spectramr.infrastructure.validation.config_health_checker import ConfigHealthChecker
 from tests.utils.config_block_stub import block_stub
 
@@ -196,14 +197,76 @@ class TestLionLearningRateScale:
 
 
 class TestCompileWithShardedStrategy:
+    @pytest.mark.parametrize("zero_stage", [1, 2, 3])
+    def test_compile_on_a_sharded_deepspeed_arm_is_an_error(self, zero_stage: int) -> None:
+        """Planted, and it covers the corpus: 84 of 85 DeepSpeed arms sit at a
+        stage DeepCompile has a pass for (z2 alone is 76).
+
+        `torch.compile` compiles the bare module before `deepspeed.initialize`,
+        so the ZeRO collectives stay opaque to it -- the communication the arm
+        shards for is exactly what goes unoptimised. The audit says so rather
+        than letting the weaker option be the silent default.
+        """
+        result = _checker().check_compile_with_sharded_strategy(
+            _config(strategy="deepspeed", compile_model=True, zero_stage=zero_stage)
+        )
+        assert not result.passed
+        assert result.severity == "error"
+        assert "DeepCompile" in result.message
+        assert result.fix_hint
+
     @pytest.mark.parametrize("strategy", ["fsdp", "deepspeed"])
-    def test_compile_plus_sharding_warns(self, strategy: str) -> None:
-        """ModelBuilder.compile() runs BEFORE the sharding wrap, giving
-        FSDP(torch.compile(m)) -- the reverse of the recommended order."""
+    def test_compile_plus_sharding_no_longer_warns(self, strategy: str) -> None:
+        """The premise is retired.
+
+        This warned because compilation ran before the wrap, giving
+        ``FSDP(torch.compile(m))``. Placement is now per strategy, so the
+        ordering is fixed rather than warned about -- and a warning that names a
+        condition the code no longer produces is worse than none, because
+        ``audit`` is --strict and it would redden a correct arm.
+        """
         result = _checker().check_compile_with_sharded_strategy(
             _config(strategy=strategy, compile_model=True)
         )
-        assert not result.passed and result.severity == "warning"
+        assert result.passed
+        assert result.severity == "info"
+        assert result.always_report, "the placement should still be legible"
+
+    def test_zero3_with_compile_is_an_error(self) -> None:
+        """Measured crash, knowable statically -- it must not cost an allocation
+        to discover."""
+        result = _checker().check_compile_with_sharded_strategy(
+            _config(strategy="deepspeed", compile_model=True, zero_stage=3)
+        )
+        assert not result.passed
+        assert result.severity == "error"
+        assert "_in_forward" in result.message
+
+    def test_ddp_with_compile_is_covered_now(self) -> None:
+        """``ddp`` and ``dp`` were not checked at all, so ``DDP(compile(m))`` --
+        the one combination with a measurable cost -- passed in silence."""
+        result = _checker().check_compile_with_sharded_strategy(
+            _config(strategy="ddp", compile_model=True)
+        )
+        assert result.passed
+        assert result.always_report
+
+    def test_a_none_optimization_block_does_not_raise(self) -> None:
+        """This read ``optimization.compile`` by attribute access and raised
+        AttributeError out of a health check on a partial config."""
+        from types import SimpleNamespace
+
+        result = _checker().check_compile_with_sharded_strategy(
+            SimpleNamespace(optimization=None, parallel=None)
+        )
+        assert result.passed
+
+    def test_the_fix_hint_does_not_name_a_retired_key(self) -> None:
+        """It said ``compile_model: false``, which the schema fold retired."""
+        result = _checker().check_compile_with_sharded_strategy(
+            _config(strategy="deepspeed", compile_model=True, zero_stage=3)
+        )
+        assert result.fix_hint and "compile_model" not in result.fix_hint
 
     def test_compile_without_sharding_is_fine(self) -> None:
         assert (
@@ -214,6 +277,14 @@ class TestCompileWithShardedStrategy:
             .passed
         )
 
+    def test_the_report_names_the_resolved_selection(self) -> None:
+        """An arm that meant to compile its generator and named nothing gets
+        every model instead, and nothing in the report would have said so."""
+        result = _checker().check_compile_with_sharded_strategy(
+            _config(strategy="ddp", compile_model=True)
+        )
+        assert "every model" in result.message
+
     def test_sharding_without_compile_is_fine(self) -> None:
         assert (
             _checker()
@@ -222,6 +293,58 @@ class TestCompileWithShardedStrategy:
             )
             .passed
         )
+
+    @staticmethod
+    def _with_param_groups(strategy: str, *, compile_model: bool = True, **kwargs):
+        """A config declaring `optimizer.param_groups`.
+
+        Rebuilt through `model_copy` because both blocks are frozen
+        (non-negotiable 1) -- the real schema, so the check reads what a real
+        arm produces rather than a shape invented for the test.
+        """
+        config = _config(strategy=strategy, compile_model=compile_model, **kwargs)
+        optimizer = config.optimization.optimizer.model_copy(
+            update={"param_groups": {"encoder": ParamGroupOverrideSchema(learning_rate=1e-5)}}
+        )
+        config.optimization = config.optimization.model_copy(update={"optimizer": optimizer})
+        return config
+
+    @pytest.mark.parametrize("strategy", ["fsdp", "deepspeed"])
+    def test_param_groups_under_a_wrapper_seeing_placement_is_an_error(
+        self, strategy: str
+    ) -> None:
+        """Planted: #2174, made reachable by the placement change.
+
+        fsdp and deepspeed must wrap before the optimizer exists, so
+        compilation lands first and `_resolve_param_groups` matches its keys
+        against `_orig_mod.<name>`. A key that matches nothing raises, blaming
+        the key. `CompilePlacement.optimizer_sees_wrapper` is what makes this
+        knowable from the YAML -- before this it was set and read by nothing.
+        """
+        result = _checker().check_compile_with_sharded_strategy(
+            self._with_param_groups(strategy)
+        )
+        assert not result.passed
+        assert result.severity == "error"
+        assert "#2174" in result.message
+        assert "encoder" in result.message
+
+    @pytest.mark.parametrize("strategy", ["none", "ddp"])
+    def test_param_groups_is_fine_where_the_optimizer_sees_a_bare_module(
+        self, strategy: str
+    ) -> None:
+        """The other half of the table. `none` and `ddp` compile AFTER the
+        optimizer is built, so the hazard does not exist there and flagging it
+        would redden correct arms under --strict."""
+        assert _checker().check_compile_with_sharded_strategy(
+            self._with_param_groups(strategy)
+        ).passed
+
+    def test_param_groups_without_compile_is_fine(self) -> None:
+        """The hazard is compilation, not param_groups."""
+        assert _checker().check_compile_with_sharded_strategy(
+            self._with_param_groups("fsdp", compile_model=False)
+        ).passed
 
 
 class TestDeepSpeedTopologyCoherent:
@@ -334,6 +457,7 @@ class TestEveryCheckIsActuallyWired:
         "check_optimizer_registered",
         "check_lion_learning_rate_scale",
         "check_compile_with_sharded_strategy",
+        "check_bf16_requires_ampere",
     )
 
     @pytest.mark.parametrize("name", ADDED)
@@ -731,3 +855,211 @@ class TestComplexIsAboutDtypeNotArithmetic:
         from spectramr.infrastructure.physics.fft_ops import fft2c
 
         assert fft2c(torch.randn(1, 1, 8, 8, dtype=torch.complex64)).is_complex()
+
+
+class TestComplexArmOptOut:
+    """`allow_complex` relaxes the complex-arm error, and nothing else does.
+
+    Inductor cannot codegen complex ops -- it falls back to eager and warns once
+    per process -- so compiling a complex arm reports a configuration it did not
+    execute. The opt-out is honest only because the physics SSOT is fenced out
+    of every graph, which the schema enforces by refusing `allow_complex`
+    without `regional`.
+    """
+
+    @staticmethod
+    def _complex_config(enabled=True, allow_complex=False):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            optimization=SimpleNamespace(
+                compile=SimpleNamespace(enabled=enabled, allow_complex=allow_complex)
+            ),
+            model=SimpleNamespace(target_domain="kspace"),
+            physics=SimpleNamespace(kspace=SimpleNamespace(enable_kspace_recon=True)),
+        )
+
+    def test_a_complex_arm_is_still_an_error_by_default(self) -> None:
+        """Unchanged for all 234 complex arms -- the default is `forbid`."""
+        result = _checker().check_compile_with_complex_model(self._complex_config())
+        assert not result.passed
+        assert result.severity == "error"
+
+    def test_the_opt_out_downgrades_it(self) -> None:
+        result = _checker().check_compile_with_complex_model(
+            self._complex_config(allow_complex=True)
+        )
+        assert result.passed
+        assert result.severity == "info"
+        assert result.always_report, "an opt-out must stay visible in the log"
+
+    def test_the_opt_out_message_names_the_cost(self) -> None:
+        """A graph break per fence is not free, and the arm should be measured
+        rather than assumed faster."""
+        result = _checker().check_compile_with_complex_model(
+            self._complex_config(allow_complex=True)
+        )
+        assert "graph break" in result.message
+
+    def test_compile_off_is_still_not_applicable(self) -> None:
+        assert _checker().check_compile_with_complex_model(
+            self._complex_config(enabled=False)
+        ).passed
+
+    def test_the_fix_hint_points_at_the_opt_out(self) -> None:
+        result = _checker().check_compile_with_complex_model(self._complex_config())
+        assert "allow_complex" in (result.fix_hint or "")
+
+
+class TestBf16RequiresAmpere:
+    """bf16 below sm_80 is emulated, and torch reports that as supported.
+
+    The capability is injected via the probe seam rather than read off the test
+    machine, so these assert the policy rather than the runner's hardware.
+    """
+
+    @staticmethod
+    def _with_capability(monkeypatch, capability, device_type="cuda"):
+        from spectramr.core import device_capabilities as dc
+
+        caps = dc.build_capabilities(
+            device_type, capability, triton=True, source="test-injected"
+        )
+        monkeypatch.setattr(dc, "probe_device_capabilities", lambda *a, **k: caps)
+        return caps
+
+    def test_bf16_on_pre_ampere_is_an_error(self, monkeypatch):
+        self._with_capability(monkeypatch, (7, 0))
+        result = _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="bfloat16")
+        )
+        assert result.passed is False
+        assert result.severity == "error"
+        assert result.category == "bf16_capability"
+
+    def test_bf16_on_ampere_passes(self, monkeypatch):
+        self._with_capability(monkeypatch, (8, 9))
+        result = _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="bfloat16")
+        )
+        assert result.passed is True
+        assert result.severity == "info"
+
+    def test_an_unverifiable_capability_does_not_gate_the_audit(self, monkeypatch):
+        """Load-bearing. ``audit`` is ``--strict`` and warnings exit 2
+        (non-negotiable 4), while the audit legitimately runs on a login node
+        whose GPU differs from the compute node's. A check that cannot tell
+        must report, not fail -- otherwise it is unsatisfiable, and an
+        unsatisfiable check teaches everyone to merge red."""
+        self._with_capability(monkeypatch, None)
+        result = _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="bfloat16")
+        )
+        assert result.passed is True
+        assert result.severity == "info"
+        assert result.always_report is True
+        assert "SPECTRAMR_TARGET_COMPUTE_CAPABILITY" in result.message
+
+    def test_fp16_is_not_applicable(self, monkeypatch):
+        self._with_capability(monkeypatch, (7, 0))
+        assert _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="float16")
+        ).passed
+
+    def test_amp_off_is_not_applicable(self, monkeypatch):
+        """A dtype under ``enabled: false`` never runs."""
+        self._with_capability(monkeypatch, (7, 0))
+        assert _checker().check_bf16_requires_ampere(
+            _config(use_amp=False, amp_dtype="bfloat16")
+        ).passed
+
+    def test_float32_disables_amp_and_is_not_applicable(self, monkeypatch):
+        """``resolve_amp_precision`` treats float32 as AMP-off; the check must
+        read it through that resolver rather than the raw key."""
+        self._with_capability(monkeypatch, (7, 0))
+        assert _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="float32")
+        ).passed
+
+    def test_the_error_names_what_is_supported_instead(self, monkeypatch):
+        self._with_capability(monkeypatch, (7, 0))
+        result = _checker().check_bf16_requires_ampere(
+            _config(use_amp=True, amp_dtype="bfloat16")
+        )
+        assert "float16" in result.message
+        assert result.fix_hint and "float32" in result.fix_hint
+
+
+class TestTheComplexGuardCoversDeepCompile:
+    """DeepCompile reaches the same code generator, so it reaches the same wall.
+
+    `deepspeed/compile/backend.py` calls `torch._inductor.compile`, and the CUDA
+    accelerator's `get_compile_backend()` is "inductor". Inductor cannot codegen
+    complex operators: it falls back to eager per op and warns once per process.
+
+    The gate read `optimization.compile.enabled` alone, which made it
+    STRUCTURALLY unable to fire here -- the two compilers are mutually exclusive
+    (`check_deepcompile_supported`), so a DeepCompile arm has torch.compile off
+    by construction and the check returned "n/a". Live for kspace_filling, where
+    70 of 73 arms are DeepSpeed ZeRO-2 with complex k-space signals.
+    """
+
+    @staticmethod
+    def _config(*, deepcompile: bool, complex_arm: bool = True):
+        ds = {"enabled": True, "zero_stage": 2}
+        if deepcompile:
+            ds["compile"] = {"enabled": True, "passes": ["z1"]}
+        return SimpleNamespace(
+            parallel=ParallelismConfigSchema(strategy="deepspeed", deepspeed=ds),
+            optimization=SimpleNamespace(
+                compile=SimpleNamespace(enabled=False, allow_complex=False)
+            ),
+            model=SimpleNamespace(target_domain="kspace" if complex_arm else "image"),
+            physics=SimpleNamespace(
+                kspace=SimpleNamespace(enable_kspace_recon=complex_arm)
+            ),
+        )
+
+    def test_deepcompile_on_a_complex_arm_is_an_error(self) -> None:
+        """Planted: this is the whole finding."""
+        result = _checker().check_compile_with_complex_model(
+            self._config(deepcompile=True)
+        )
+        assert not result.passed
+        assert result.severity == "error"
+        assert "DeepCompile" in result.message
+
+    def test_the_fix_hint_names_the_deepspeed_key_not_the_torch_one(self) -> None:
+        """A hint naming `optimization.compile.enabled: false` would be inert --
+        it is already false on every DeepCompile arm."""
+        hint = _checker().check_compile_with_complex_model(
+            self._config(deepcompile=True)
+        ).fix_hint
+        assert "parallel.deepspeed.compile.enabled: false" in hint
+
+    def test_the_hint_does_not_offer_a_regional_opt_out(self) -> None:
+        """`allow_complex` rests on per-region fences. DeepCompile compiles the
+        whole engine graph, so there is no boundary for them to sit on -- and
+        offering an escape that cannot work is worse than offering none.
+        """
+        hint = _checker().check_compile_with_complex_model(
+            self._config(deepcompile=True)
+        ).fix_hint
+        assert "allow_complex: true" not in hint
+        assert "no regional mode" in hint
+
+    def test_deepcompile_on_a_real_valued_arm_is_fine(self) -> None:
+        """The guard is about complex dtype, not about DeepCompile."""
+        result = _checker().check_compile_with_complex_model(
+            self._config(deepcompile=True, complex_arm=False)
+        )
+        assert result.passed
+
+    def test_neither_compiler_is_still_not_applicable(self) -> None:
+        """Planted against the obvious over-correction: the 70 uncompiled
+        kspace_filling arms must not start reporting a compile finding."""
+        result = _checker().check_compile_with_complex_model(
+            self._config(deepcompile=False)
+        )
+        assert result.passed
+        assert result.severity == "info"

@@ -46,6 +46,7 @@ what it produced.
    audit_ladder_user_guide
    accelerated_run_contract
    distributed_training
+   non_cartesian_reconstruction
    training_throughput
 
 .. toctree::

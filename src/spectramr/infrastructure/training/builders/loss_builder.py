@@ -924,6 +924,21 @@ class LossBuilder(Builder):
             # ``recon_config`` is consequently no longer read for any weight in
             # this method; it is kept in the signature only because three test
             # modules call the method positionally.
+            # The last two raw readers, and the same defect as ``lambda_l1``
+            # above wearing an enable flag. ``get_enabled_losses`` pairs
+            # ``lambda_gp`` with ``enable_gradient_penalty`` and
+            # ``feature_matching`` with ``enable_feature_matching``; this builder
+            # -- the surface that actually CONSTRUCTS the term -- read the weight
+            # and ignored the flag, so ``enable_gradient_penalty: false`` bought a
+            # penalty at the schema default of 10.0. That is what killed
+            # ``experiment_11_sense_bridge_critic`` on 2026-09-16: the penalty's
+            # ``autograd.grad`` double-backward is not reducible under DeepSpeed
+            # ZeRO-2 and the run died in ``reduce_ipg_grads``, for a term the arm
+            # had switched off in writing (non-negotiables 8 and 17).
+            lambda_gp = gan_config.lambda_gp if gan_config.enable_gradient_penalty else 0.0
+            lambda_feat_match = (
+                gan_config.feature_matching if gan_config.enable_feature_matching else 0.0
+            )
             gan_loss = create_loss(
                 "gan_composite",
                 adv_strategy=adv_strategy,
@@ -931,8 +946,8 @@ class LossBuilder(Builder):
                 lambda_l1=self._declared_weight("l1"),
                 lambda_perceptual=lambda_perceptual,
                 lambda_adv=gan_config.lambda_adv,
-                lambda_feat_match=gan_config.feature_matching,
-                lambda_gp=gan_config.lambda_gp,
+                lambda_feat_match=lambda_feat_match,
+                lambda_gp=lambda_gp,
                 lambda_ssim=self._declared_weight("ssim"),
                 lambda_ms_ssim=self._declared_weight("ms_ssim"),
                 lambda_lpips=self._declared_weight("lpips"),

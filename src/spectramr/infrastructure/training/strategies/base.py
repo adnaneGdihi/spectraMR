@@ -51,7 +51,6 @@ from spectramr.infrastructure.training.strategies.mixins.utils import (  # noqa:
     pick_present,
 )
 from spectramr.infrastructure.training.strategies.mixins.validation import ValidationMixin
-from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
 from spectramr.infrastructure.training.utils.transform_ops import (
     ComplexTensorHandler,
     FFTTransformer,
@@ -549,7 +548,6 @@ class BaseTrainingStrategy(
             fft_transformer=FFTTransformer(device=self.device),
             complex_handler=ComplexTensorHandler(),
             loss_fn=losses,
-            mask_generator=KSpaceMaskGenerator(device=self.device),
         )
 
         self._g_losses_pool: dict[str, torch.Tensor] = {}

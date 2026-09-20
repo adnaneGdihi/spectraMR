@@ -16,6 +16,8 @@ from torch import nn
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
+from spectramr.core.module_utils import unwrap_model
+
 from .interfaces import ITrainingState
 
 # from spectramr.shared.utils.ema import ExponentialMovingAverage
@@ -320,7 +322,11 @@ class TrainingState(ITrainingState):
         ``ModelEma.num_updates``.
         """
         if self.ema is not None:
-            self.ema.update(self.generator)
+            # Unwrap for the same reason training_loop does: the shadow carries
+            # bare keys, and a DDP/FSDP/DeepSpeed/compile wrapper prefixes every
+            # key on the live model, which makes the key-matched blend a no-op
+            # (#2172).
+            self.ema.update(unwrap_model(self.generator))
 
     def apply_ema_for_inference(self) -> nn.Module:
         """Apply EMA parameters for inference."""
@@ -332,9 +338,15 @@ class TrainingState(ITrainingState):
         return self.generator
 
     def get_ema_state_dict(self) -> dict[str, Any] | None:
-        """Get EMA state for saving."""
+        """Get EMA state for saving.
+
+        Delegates to ``ModelEma.shadow_state_dict`` so this spelling and the
+        checkpoint director's produce the same bytes — bare weight keys plus the
+        warmup counter. It previously called ``state_dict()``, which emits
+        ``module.``-prefixed keys, a third and divergent on-disk shape.
+        """
         if self.ema is not None:
-            return self.ema.state_dict()
+            return self.ema.shadow_state_dict()
         return None
 
     def load_ema_state_dict(self, state_dict: dict[str, Any]) -> None:

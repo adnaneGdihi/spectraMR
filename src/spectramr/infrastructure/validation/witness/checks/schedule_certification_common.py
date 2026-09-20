@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.physics.bounded_cache import BoundedLRUCache
 from spectramr.infrastructure.validation.witness.registry import (
     Severity,
     Stage,
@@ -22,6 +23,15 @@ from spectramr.infrastructure.validation.witness.registry import (
 
 _CATEGORY = "schedule_certification"
 _DEFAULT_MATRIX = (256, 256)
+
+#: One ``KSpaceUndersamplingProcess`` per distinct construction, shared by the
+#: three witnesses that ask for one. Each build materialises a mask generator
+#: whose accelerator logs ``Creating Accelerator`` at INFO, so an un-memoised
+#: helper printed the same line once per call and made a single-owner run look
+#: like it had several. Bounded because a corpus sweep audits many configs;
+#: keyed on the resolved kwargs, so two arms that resolve alike legitimately
+#: share one process.
+_PROCESS_MEMO: BoundedLRUCache[tuple[Any, ...], Any] = BoundedLRUCache()
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +83,19 @@ def build_process_from_config(doc: dict) -> Any | None:
 
     accel = _undersampling(doc)
     resolved = resolve_undersampling_kwargs(AccelerationConfigSchema(**accel))
-    return KSpaceUndersamplingProcess(num_timesteps=_timesteps(doc), **resolved)
+    timesteps = _timesteps(doc)
+
+    # Shared rather than rebuilt. The witnesses only read the process -- the two
+    # that touch ``enforce_nested`` restore it in a ``finally`` -- so one
+    # instance answers all three, and the accelerator is constructed once.
+    key = (timesteps, tuple(sorted((k, repr(v)) for k, v in resolved.items())))
+    cached = _PROCESS_MEMO.get(key)
+    if cached is not None:
+        return cached
+
+    process = KSpaceUndersamplingProcess(num_timesteps=timesteps, **resolved)
+    _PROCESS_MEMO[key] = process
+    return process
 
 
 def synthetic_spectral_prior(image_shape: tuple[int, int]) -> torch.Tensor:

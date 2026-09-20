@@ -207,3 +207,147 @@ def test_package_import_is_torch_free():
         "importing spectramr now pulls torch — the disclaimer gate must read "
         "os.environ directly, not through spectramr.core.env"
     )
+
+
+# ---------------------------------------------------------------------------
+# Third-party warning filters registered at package import
+# ---------------------------------------------------------------------------
+#
+# `spectramr/__init__.py` registers these at the package-init seam rather than in
+# `main.py`, because `import spectramr.<anything>` runs first and a filter
+# installed later is a filter that never sees the import-time warning.
+
+#: The literal text torch emits, copied from a cluster job log (8590891, torch
+#: 2.14.0+cu126) rather than retyped — a regex that matches a paraphrase and not
+#: the real string is the whole failure mode under test.
+_TORCH_JIT_MESSAGES = (
+    "`torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.",
+    "`torch.jit.interface` is deprecated. Please use `torch.compile` instead.",
+)
+
+_OLD_FILTER_CATEGORY = DeprecationWarning
+_CURRENT_FILTER = {
+    "message": r"`?torch\.jit\.(script|script_method|interface)`? is deprecated",
+    "category": Warning,
+}
+
+
+def _swallowed(filter_kwargs: dict, message: str, category: type[Warning]) -> bool:
+    """True when a filter built from *filter_kwargs* suppresses this warning.
+
+    Each call gets its own `catch_warnings` context with a cleared filter list,
+    so the filters the real package import already installed cannot make an
+    assertion pass for the wrong reason.
+    """
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.resetwarnings()
+        warnings.simplefilter("always")
+        warnings.filterwarnings("ignore", **filter_kwargs)
+        warnings.warn(message, category, stacklevel=1)
+    return not seen
+
+
+@pytest.mark.parametrize("message", _TORCH_JIT_MESSAGES)
+@pytest.mark.parametrize("category", [DeprecationWarning, FutureWarning])
+def test_torch_jit_notice_is_swallowed_under_either_category(
+    message: str, category: type[Warning]
+) -> None:
+    """torch has raised this same text under both categories.
+
+    2.13 uses DeprecationWarning (`torch/jit/_script.py:1490`), 2.14 uses
+    FutureWarning (`:1491`). Keying the filter on the base `Warning` class covers
+    both and survives the next re-categorisation; the message is what identifies
+    the notice.
+    """
+    assert _swallowed(_CURRENT_FILTER, message, category)
+
+
+@pytest.mark.parametrize("message", _TORCH_JIT_MESSAGES)
+def test_the_previous_category_keyed_filter_let_futurewarning_through(
+    message: str,
+) -> None:
+    """The planted violation (non-negotiable 15).
+
+    Without this, the test above would have been green against the filter it
+    replaces: `category=DeprecationWarning` matched fine on torch 2.13 and
+    stopped matching at the 2.14 bump, with nothing to report the change. Every
+    job log since carried two lines this filter claimed to remove.
+    """
+    old = {"message": _CURRENT_FILTER["message"], "category": _OLD_FILTER_CATEGORY}
+    assert _swallowed(old, message, DeprecationWarning), "old filter never worked at all"
+    assert not _swallowed(old, message, FutureWarning), (
+        "the old category-keyed filter is being credited with a suppression it "
+        "did not perform — this test no longer demonstrates the regression"
+    )
+
+
+def test_the_filter_is_registered_by_importing_the_package() -> None:
+    """Registering it is half the job; the package must actually install it.
+
+    Asserted against the live `warnings.filters` rather than by re-reading the
+    source, so deleting the `filterwarnings` call fails here (pitfall 16).
+
+    In a SUBPROCESS, because pytest replaces the process filter list from
+    `pyproject.toml`'s `filterwarnings` for the duration of each test — an
+    in-process assertion here reports pytest's configuration, not the package's,
+    and would have failed against correct code.
+    """
+    import subprocess
+
+    probe = (
+        "import warnings, spectramr\n"
+        # 'torch' and 'jit' as separate substrings, NOT 'torch.jit': the
+        # compiled pattern escapes the dots, so the literal spelling never
+        # matches and the probe would report the filter missing when it is there.
+        "hits = [f for f in warnings.filters "
+        "if f[0] == 'ignore' and f[1] is not None "
+        "and 'torch' in f[1].pattern and 'jit' in f[1].pattern]\n"
+        "print(len(hits), hits[0][2].__name__ if hits else '')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, env={**os.environ}
+    )
+    assert result.returncode == 0, result.stderr
+    count, category = result.stdout.split()
+    assert count == "1", f"expected exactly one torch.jit filter, got {count}"
+    assert category == "Warning", (
+        f"the torch.jit filter is keyed on {category}, not the base Warning class; "
+        "torch has already moved this notice between DeprecationWarning and "
+        "FutureWarning once"
+    )
+
+
+def test_third_party_invalid_escape_is_swallowed() -> None:
+    """POT's `ot.datasets` docstring emits this while being COMPILED.
+
+    So it fires on a cold `__pycache__` — and on every task of a job that
+    disables the bytecode cache, which is how it reached the array logs.
+    """
+    assert _swallowed(
+        {"message": r"invalid escape sequence", "category": SyntaxWarning},
+        "invalid escape sequence '\\d'",
+        SyntaxWarning,
+    )
+
+
+def test_our_own_invalid_escapes_are_still_caught_by_lint(tmp_path) -> None:
+    """Anti-vacuity for the filter above.
+
+    That filter silences `invalid escape sequence` repo-wide, which is only
+    acceptable because something else still owns OURS. Ruff's W605 does, on
+    every added line (non-negotiable 24). If W605 is ever switched off, the
+    runtime filter turns into a way to hide a real defect.
+    """
+    import subprocess
+
+    offender = tmp_path / "offender.py"
+    offender.write_text('x = "\\d"\n')
+    result = subprocess.run(
+        ["ruff", "check", str(offender), "--output-format=concise"],
+        capture_output=True,
+        text=True,
+    )
+    assert "W605" in result.stdout, (
+        "ruff no longer flags our own invalid escape sequences, so the runtime "
+        f"SyntaxWarning filter is now hiding them: {result.stdout!r}"
+    )

@@ -16,10 +16,9 @@ import torch
 from torch import nn
 
 from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
+from spectramr.core.rng_state import RNG_STATE_SAFE_GLOBALS, capture_rng_state
 from spectramr.infrastructure.services.checkpoint_service import (
-    RNG_STATE_SAFE_GLOBALS,
     CheckpointService,
-    _capture_rng_state,
     discover_best_checkpoint,
 )
 
@@ -284,7 +283,7 @@ def test_discover_best_checkpoint_none_when_empty(tmp_path):
 
 @pytest.mark.unit
 def test_rng_state_needs_exactly_the_declared_safe_globals(tmp_path):
-    """The allowlist is a claim about what ``_capture_rng_state`` pickles.
+    """The allowlist is a claim about what ``capture_rng_state`` pickles.
 
     Stated as a bidirectional pin: without the four entries a plain
     ``torch.load`` refuses the payload, and *with* them the weights-only
@@ -293,7 +292,7 @@ def test_rng_state_needs_exactly_the_declared_safe_globals(tmp_path):
     breaks one half.
     """
     path = tmp_path / "rng.pth"
-    torch.save({"rng_state": _capture_rng_state()}, path)
+    torch.save({"rng_state": capture_rng_state()}, path)
 
     with pytest.raises(Exception, match=r"[Ww]eights only"):
         torch.load(path, map_location="cpu")
@@ -335,3 +334,109 @@ def test_saved_checkpoint_loads_without_the_unsafe_fallback(tmp_path, caplog):
     # so the service did not quietly widen what every other caller unpickles.
     with pytest.raises(Exception, match=r"[Ww]eights only"):
         torch.load(file_path, map_location="cpu")
+
+
+# ---------------------------------------------------------------------------
+# Auto-resume discovery: the finder must see what the WRITER produced.
+#
+# `find_latest_checkpoint` globbed `.{self.format}` only. The writer on the
+# production training path is `CheckpointDirector.save()`, which spells `.pt`
+# unconditionally, while no corpus arm declares `checkpoint.format` -- so the
+# schema default `safetensors` made the glob miss every file a real run had
+# just written, `--resume auto` raised "No checkpoint found", and the chained
+# job died instead of resuming.
+#
+# The tests that were green over this planted `.safetensors` names by hand,
+# which is the reader's assumption rather than either writer's output. These
+# plant the writer's, and the last one re-derives the suffix from the director's
+# own source so the pair cannot silently drift apart again (non-negotiable 15).
+# ---------------------------------------------------------------------------
+
+
+def _director_checkpoint_suffix() -> str:
+    """The suffix ``CheckpointDirector.save()`` actually writes, read off it."""
+    import inspect
+    import re
+
+    from spectramr.infrastructure.builders.directors.checkpoint_director import (
+        CheckpointDirector,
+    )
+
+    src = inspect.getsource(CheckpointDirector.save)
+    suffixes = set(re.findall(r'f"checkpoint_epoch_\{[^"]*\}\.(\w+)"', src))
+    assert suffixes, "could not read the director's checkpoint filename"
+    assert len(suffixes) == 1, f"director now writes several suffixes: {suffixes}"
+    return suffixes.pop()
+
+
+@pytest.mark.unit
+def test_auto_resume_finds_a_director_written_checkpoint(tmp_path):
+    """The default-format service must resolve the director's ``.pt`` files.
+
+    This is the exact shape a 120 h production arm leaves behind: the config
+    declares no ``format``, so the service defaults to safetensors, and every
+    file in the directory came from the director.
+    """
+    service = _make_service(tmp_path, "safetensors")
+    for name in (
+        "checkpoint_epoch_0001_step_005000.pt",
+        "checkpoint_epoch_0002_step_010000.pt",
+    ):
+        (tmp_path / name).write_bytes(b"x")
+
+    latest = service.find_latest_checkpoint(str(tmp_path))
+
+    assert latest is not None, (
+        "auto-resume found nothing in a directory full of checkpoints -- the "
+        "finder is globbing the declared format while the director writes .pt"
+    )
+    assert "step_010000" in latest
+
+
+@pytest.mark.unit
+def test_auto_resume_orders_by_step_across_mixed_suffixes(tmp_path):
+    """Both writers may have run; the newest STATE wins, not the newest suffix."""
+    service = _make_service(tmp_path, "safetensors")
+    (tmp_path / "checkpoint_step_9000.safetensors").write_bytes(b"x")
+    (tmp_path / "checkpoint_epoch_0002_step_010000.pt").write_bytes(b"x")
+
+    assert "step_010000" in service.find_latest_checkpoint(str(tmp_path))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("alias", ["checkpoint_last", "checkpoint_best"])
+def test_auto_resume_falls_back_to_a_pt_alias(tmp_path, alias):
+    """``checkpoint_best.pt`` is what the director publishes; it must be seen."""
+    service = _make_service(tmp_path, "safetensors")
+    (tmp_path / f"{alias}.pt").write_bytes(b"x")
+
+    assert service.find_latest_checkpoint(str(tmp_path)) is not None
+
+
+@pytest.mark.unit
+def test_last_alias_outranks_best_alias(tmp_path):
+    """``last`` is the resume point; ``best`` is an evaluation artifact."""
+    service = _make_service(tmp_path, "safetensors")
+    (tmp_path / "checkpoint_best.pt").write_bytes(b"x")
+    (tmp_path / "checkpoint_last.pt").write_bytes(b"x")
+
+    assert "checkpoint_last" in service.find_latest_checkpoint(str(tmp_path))
+
+
+@pytest.mark.unit
+def test_finder_covers_the_suffix_the_director_writes(tmp_path):
+    """Anti-drift: re-derive the director's suffix rather than hardcoding it."""
+    suffix = _director_checkpoint_suffix()
+    service = _make_service(tmp_path, "safetensors")
+    (tmp_path / f"checkpoint_epoch_0001_step_000100.{suffix}").write_bytes(b"x")
+
+    assert service.find_latest_checkpoint(str(tmp_path)) is not None, (
+        f"the director writes .{suffix} but find_latest_checkpoint does not "
+        "glob it -- auto-resume is dead on every arm again"
+    )
+
+
+@pytest.mark.unit
+def test_empty_directory_still_reports_nothing(tmp_path):
+    """Widening the glob must not invent a checkpoint where there is none."""
+    assert _make_service(tmp_path, "safetensors").find_latest_checkpoint(str(tmp_path)) is None

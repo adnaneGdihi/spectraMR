@@ -548,6 +548,48 @@ def effective_batch_size(config: Any) -> dict[str, Any]:
     }
 
 
+#: Fallback for a compile block that is not a pydantic model. Deliberately not
+#: the source of truth -- see :func:`compile_provenance`.
+_COMPILE_KEYS_WITHOUT_A_SCHEMA = ("enabled", "mode", "backend", "fullgraph", "dynamic")
+
+
+def compile_provenance(config: Any, applied: Any = None) -> dict[str, Any]:
+    """What compilation was *declared* and what the build *actually did*.
+
+    Two independent facts, and the config can only speak to the first. Whether
+    the model ended up wrapped, and at which point in the build, depends on the
+    parallel strategy -- ``DDP(compile(m))`` and ``compile(DDP(m))`` are
+    different runs with identical YAML, and the second is the one that engages
+    DDPOptimizer. A record assembled from the config alone reads the same
+    either way.
+
+    ``applied`` is the per-model record the director produced
+    (``TrainingEnvironment.compile``); ``{}`` means the arm asked for eager,
+    and ``None`` means the build never got far enough to say, which goes in
+    ``incomplete`` rather than being flattened into "not compiled".
+
+    Args:
+        config: the frozen settings.
+        applied: name -> {stage, mode, backend, wrapped, ...}, or None.
+    """
+    compile_cfg = getattr(getattr(config, "optimization", None), "compile", None)
+    # Read off the schema rather than a list kept here. A hand-written list is a
+    # second declaration of the block's contents, and the one that is never
+    # updated: `regional` and `allow_complex` were added to the schema, read and
+    # validated, and left out of the record -- two thirds of non-negotiable 8,
+    # where the missing third is what makes a finished run explicable.
+    # The tuple survives only for a stub or partial config with no schema.
+    fields = getattr(type(compile_cfg), "model_fields", None)
+    keys = tuple(fields) if fields else _COMPILE_KEYS_WITHOUT_A_SCHEMA
+    declared = {key: getattr(compile_cfg, key, None) for key in keys}
+    record: dict[str, Any] = {"declared": declared}
+    if applied is None:
+        record["incomplete"] = ["applied"]
+    else:
+        record["applied"] = {name: dict(entry) for name, entry in dict(applied).items()}
+    return record
+
+
 def parallel_provenance(config: Any) -> dict[str, Any]:
     """What parallelism was *declared* and what the process group *actually is*.
 
@@ -814,6 +856,18 @@ def collect_run_provenance(
         record["metric_aggregation"] = aggregation_provenance()
     except Exception:  # provenance never BLOCKS training; surfaced, not swallowed.
         _logger.debug("metric aggregation provenance capture failed", exc_info=True)
+    # Resolved device CAPABILITIES, distinct from ``torch_runtime``'s hardware
+    # inventory above: that lists what is visible, this records what the run
+    # concluded about it (native bf16, Triton, the compile backend) and where
+    # that conclusion came from. Without it "bf16 was declared" and "bf16 was
+    # runnable here" are indistinguishable after the fact -- and on a V100 they
+    # differ, because torch reports emulated bf16 as supported.
+    try:
+        from spectramr.core.device_capabilities import probe_device_capabilities
+
+        record["device_capabilities"] = probe_device_capabilities(device).to_dict()
+    except Exception:
+        _logger.debug("device capability provenance capture failed", exc_info=True)
     # Out-of-tree plugin sources (pitfall #15c — an advertised knob's resolved
     # value is stamped into provenance so a run is traceable to the exact
     # SPECTRAMR_PLUGINS / entry-point / config plugin code it pulled in).
@@ -1367,6 +1421,7 @@ def log_provenance(prov: dict[str, Any], logger: logging.Logger | None = None) -
 
 __all__ = [
     "collect_run_provenance",
+    "compile_provenance",
     "config_fingerprint",
     "count_parameters",
     "cpu_resources",

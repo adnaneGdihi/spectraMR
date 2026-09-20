@@ -1135,18 +1135,19 @@ class KANGatedDualDomainAttention(nn.Module):
         g1 = torch.sigmoid(self.gate_img(z)).view(B, 1, 1, 1)
         g2 = torch.sigmoid(self.gate_kspace(z)).view(B, 1, 1, 1)
         g3 = torch.sigmoid(self.gate_cross(z)).view(B, 1, 1, 1)
-        # Branch-zeroing ablations (after gate computation so telemetry still
-        # records what the gate would have produced).
+        # Telemetry records what the gate PRODUCED, which is read before the
+        # ablation zeroes it: a disabled branch's applied gate is 0.0 by
+        # construction and says nothing, while the value the gate wanted is
+        # what makes the ablation readable.
+        with torch.no_grad():
+            self._last_gates.copy_(torch.stack([g1.mean(), g2.mean(), g3.mean()]).detach())
+
         if "image" in self.disable_branches:
             g1 = torch.zeros_like(g1)
         if "kspace" in self.disable_branches:
             g2 = torch.zeros_like(g2)
         if "cross" in self.disable_branches:
             g3 = torch.zeros_like(g3)
-
-        # Telemetry only — detached.
-        with torch.no_grad():
-            self._last_gates.copy_(torch.stack([g1.mean(), g2.mean(), g3.mean()]).detach())
 
         # Optional S-map conditioning: FiLM-modulate the k-space branch
         # output by a projection of the per-channel coil-sensitivity

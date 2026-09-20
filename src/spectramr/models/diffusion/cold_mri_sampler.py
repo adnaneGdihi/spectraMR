@@ -19,6 +19,8 @@ and forwards ``sample`` calls to it. The pattern mirrors
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -180,6 +182,16 @@ class ColdMRISampler(nn.Module):
             start_timestep=start_timestep,
             seed_offset=seed_offset,
         )
+
+    @property
+    def reverse_stats(self) -> dict[str, Any]:
+        """What the wrapped reverse loop ran on the last :meth:`sample` call.
+
+        Delegated rather than recomputed: this wrapper owns no schedule, and a
+        second derivation of "how many steps ran" would be a second owner of the
+        answer (non-negotiable 17).
+        """
+        return self._diffusion.reverse_stats
 
 
 __all__ = ["ColdMRISampler"]

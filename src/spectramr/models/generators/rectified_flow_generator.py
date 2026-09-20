@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -272,7 +272,7 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
         )
 
         # Physics: Data Consistency
-        self.dc_layer = DataConsistencyLayer()
+        self.dc_layer = NoiseSimulatingDataConsistency()
 
     def forward(
         self,

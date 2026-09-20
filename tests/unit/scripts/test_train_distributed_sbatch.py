@@ -33,8 +33,18 @@ The same guess lived in two sibling submitters, spelled differently -- both
 ``NPROC="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS:-1}}"``, both feeding the same
 ``torchrun --nproc_per_node``. They are covered here by shape guards over
 ``RANK_DERIVING_SCRIPTS`` rather than a second execution harness: the construct
-is identical and the refusal is proven behaviourally once, against the launcher
-that actually has the interesting three-source precedence.
+is identical and the refusal is proven behaviourally once, against the
+derivation itself.
+
+The derivation now lives in ``scripts/common/gpu_count.sh`` and is *sourced* by
+the two launchers that fork ranks -- ``train_distributed.sbatch`` and, since the
+array dispatcher learned to launch process-group arms,
+``dispatch_experiments.sbatch``. Copying it into the second launcher would have
+been a second owner of a rule that has already cost one silent single-rank run
+(non-negotiable 17), so the behaviour tests below execute the HELPER and the
+shape guards accept either spelling: a launcher may derive the count inline, or
+delegate to the helper, and :func:`_rank_count_is_guarded` requires the fatal to
+be reachable in whichever case it chose.
 
 Scope note: this covers the derivation only. Whether Slurm's count matches the
 GPUs the job can actually open is the cluster's business, not the script's.
@@ -55,6 +65,7 @@ from tests.utils.repo_scripts import require_repo_file
 
 REPO = Path(__file__).resolve().parents[3]
 _SBATCH_REL = "scripts/training/train_distributed.sbatch"
+_DISPATCH_REL = "scripts/training/dispatch_experiments.sbatch"
 
 #: Every launcher that derives a rank count from the environment and hands it to
 #: ``torchrun --nproc_per_node``. All three carried the same ``:-1`` guess; the
@@ -67,9 +78,16 @@ _SBATCH_REL = "scripts/training/train_distributed.sbatch"
 #: MOVED still fails loudly in every other tree.
 RANK_DERIVING_SCRIPTS = [
     _SBATCH_REL,
+    _DISPATCH_REL,
     "scripts/training/submit_exp11_fpk_ablation.sbatch",
     "scripts/training/submit_exp11_ema_warmup_ablation.sbatch",
 ]
+
+#: The shared derivation and its entry point. A launcher that sources this and
+#: calls the function inherits its refusal; one that spells the derivation
+#: itself must carry its own.
+_HELPER_REL = "scripts/common/gpu_count.sh"
+_HELPER_FN = "derive_gpus_per_node"
 
 _BEGIN = "# --- gpu-count-derivation"
 _END = "# --- end gpu-count-derivation"
@@ -95,14 +113,16 @@ def script() -> str:
 
 
 @pytest.fixture(scope="module")
-def block(script: str) -> str:
-    """The committed derivation, sliced out between its sentinels.
+def block() -> str:
+    """The committed derivation, sliced out of the HELPER between its sentinels.
 
-    Extraction is asserted non-empty in its own test below -- a silently empty
-    slice would make every behaviour test pass against nothing, which is the
-    same shape of bug this file exists to catch.
+    Read from ``scripts/common/gpu_count.sh`` rather than from either launcher:
+    that file is the one owner, so executing it is what proves the behaviour for
+    every launcher that sources it. Extraction is asserted non-empty in its own
+    test below -- a silently empty slice would make every behaviour test pass
+    against nothing, which is the same shape of bug this file exists to catch.
     """
-    lines = script.splitlines()
+    lines = require_repo_file(_HELPER_REL).read_text().splitlines()
     start = next(i for i, ln in enumerate(lines) if ln.startswith(_BEGIN))
     end = next(i for i, ln in enumerate(lines) if ln.startswith(_END))
     return "\n".join(lines[start + 1 : end])
@@ -139,32 +159,138 @@ def test_no_launcher_defaults_its_rank_count_to_one(path: str) -> None:
     )
 
 
-@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: Path(p).stem)
-def test_every_launcher_refuses_rather_than_guesses(path: str) -> None:
-    """Removing the ``:-1`` is only half a fix if what replaced it carries on.
+def _rank_count_is_guarded(text: str) -> str | None:
+    """``None`` when *text* refuses an underivable rank count; else why not.
 
-    The fatal path must sit BETWEEN the derivation and the ``torchrun`` that
-    consumes it. A bare ``"exit 1" in script`` looked equivalent and was
-    vacuous: both ablation submitters already carried an unrelated ``exit 1``
-    (a missing-CONFIG guard) before this fix, so that assertion passed on the
-    buggy versions. Anchoring it to the interval is what makes it a test.
+    Two spellings are legitimate, and both are judged here rather than in two
+    tests so that a launcher switching from one to the other cannot fall between
+    them:
+
+    * **delegated** — sources ``scripts/common/gpu_count.sh`` and calls
+      ``derive_gpus_per_node``, inheriting the refusal the behaviour tests below
+      execute directly. Sourcing without calling is the interesting failure:
+      ``GPUS_PER_NODE`` is then simply unset, which is the guess this whole file
+      exists to forbid, wearing a ``source`` line as camouflage.
+    * **inline** — derives the count itself, in which case an ``exit 1`` must sit
+      BETWEEN the derivation and the ``torchrun`` that consumes it. A bare
+      ``"exit 1" in script`` looked equivalent and was vacuous: both ablation
+      submitters already carried an unrelated ``exit 1`` (a missing-CONFIG
+      guard) before the fix, so that assertion passed on the buggy versions.
+
+    Returns a reason rather than asserting, so the planted violations below can
+    check that each shape is rejected for the right reason.
     """
-    lines = _executable_lines(require_repo_file(path).read_text()).splitlines()
+    lines = _executable_lines(text).splitlines()
+
+    called = next((i for i, ln in enumerate(lines) if _HELPER_FN in ln and "(" not in ln), None)
+    if called is not None:
+        # Both launchers source through a variable (`source "${GPU_COUNT_HELPER}"`),
+        # so the helper PATH and the `source` that consumes it land on different
+        # lines. Requiring the literal path on the source line itself would reject
+        # both correct launchers -- and, worse, would push the next one toward
+        # inlining the path just to satisfy a test.
+        named = next((i for i, ln in enumerate(lines) if "gpu_count.sh" in ln), None)
+        if named is None:
+            return f"calls {_HELPER_FN} without sourcing {_HELPER_REL}"
+        sourced = next(
+            (i for i, ln in enumerate(lines[named:], named) if re.match(r"\s*(source|\.)\s", ln)),
+            None,
+        )
+        if sourced is None:
+            return f"calls {_HELPER_FN} and names {_HELPER_REL} but never sources it"
+        if sourced > called:
+            return f"calls {_HELPER_FN} at line ~{called} before sourcing it at ~{sourced}"
+        return None
 
     derived = next(
         (i for i, ln in enumerate(lines) if re.match(r"\s*(NPROC|GPUS_PER_NODE)=", ln)),
         None,
     )
-    assert derived is not None, f"{path.name}: no rank-count derivation found"
+    if derived is None:
+        return "no rank-count derivation and no call to the shared helper"
     used = next((i for i, ln in enumerate(lines[derived:], derived) if "torchrun" in ln), None)
-    assert used is not None, f"{path.name}: derivation never reaches a torchrun"
+    if used is None:
+        return "derivation never reaches a torchrun"
+    if not [ln for ln in lines[derived:used] if "exit 1" in ln]:
+        return (
+            f"derives its rank count at line ~{derived} and hands it to torchrun "
+            f"at ~{used} with no fatal check in between"
+        )
+    return None
 
-    guarded = [ln for ln in lines[derived:used] if "exit 1" in ln]
-    assert guarded, (
-        f"{path.name} derives its rank count at line ~{derived} and hands it to "
-        f"torchrun at ~{used} with no fatal check in between: an undeterminable "
-        "count reaches --nproc_per_node instead of stopping the job"
+
+@pytest.mark.parametrize("path", RANK_DERIVING_SCRIPTS, ids=lambda p: Path(p).stem)
+def test_every_launcher_refuses_rather_than_guesses(path: str) -> None:
+    """Removing the ``:-1`` is only half a fix if what replaced it carries on."""
+    reason = _rank_count_is_guarded(require_repo_file(path).read_text())
+    assert reason is None, f"{Path(path).name}: {reason}"
+
+
+@pytest.mark.parametrize(
+    ("planted", "expected"),
+    [
+        pytest.param(
+            "source scripts/common/gpu_count.sh\ntorchrun --nproc_per_node=1\n",
+            "no rank-count derivation",
+            id="sources-but-never-calls",
+        ),
+        pytest.param(
+            f"{_HELPER_FN}\ntorchrun --nproc_per_node=1\n",
+            "without sourcing",
+            id="calls-but-never-sources",
+        ),
+        pytest.param(
+            f'H="scripts/common/gpu_count.sh"\n{_HELPER_FN}\ntorchrun --nproc_per_node=1\n',
+            "never sources it",
+            id="names-the-helper-but-never-sources-it",
+        ),
+        pytest.param(
+            f'{_HELPER_FN}\nH="scripts/common/gpu_count.sh"\nsource "$H"\n',
+            "before sourcing it",
+            id="calls-before-sourcing",
+        ),
+        pytest.param(
+            "source scripts/common/gpu_count.sh\n",
+            "no rank-count derivation",
+            id="sources-only-no-consumer",
+        ),
+        pytest.param(
+            'GPUS_PER_NODE="${SLURM_GPUS_ON_NODE}"\ntorchrun --nproc_per_node=1\n',
+            "no fatal check in between",
+            id="inline-derivation-with-no-fatal",
+        ),
+        pytest.param(
+            'GPUS_PER_NODE=2\n# exit 1 lives only in a comment\ntorchrun --nproc=1\n',
+            "no fatal check in between",
+            id="fatal-only-in-a-comment",
+        ),
+    ],
+)
+def test_the_guard_rejects_each_unguarded_shape(planted: str, expected: str) -> None:
+    """A gate is only a gate for the violation shape it has been watched to fail
+    on (non-negotiable 15).
+
+    Each case is a launcher that would reach ``--nproc_per_node`` with a count
+    nothing vouched for. ``sources-but-never-calls`` is the one the extraction
+    itself introduced: before the derivation moved into a function, the mere
+    presence of the code WAS the call.
+    """
+    reason = _rank_count_is_guarded(planted)
+    assert reason is not None, f"guard passed a launcher that guesses: {planted!r}"
+    assert expected in reason, reason
+
+
+def test_the_guard_accepts_both_legitimate_shapes() -> None:
+    """Anti-vacuity for the rejections above: the guard must not simply fail
+    everything it is shown."""
+    delegated = f"source scripts/common/gpu_count.sh\n{_HELPER_FN}\ntorchrun --nproc_per_node=1\n"
+    inline = (
+        'GPUS_PER_NODE="${SLURM_GPUS_ON_NODE}"\n'
+        'if [[ -z "${GPUS_PER_NODE}" ]]; then exit 1; fi\n'
+        "torchrun --nproc_per_node=1\n"
     )
+    assert _rank_count_is_guarded(delegated) is None
+    assert _rank_count_is_guarded(inline) is None
 
 
 def test_the_derivation_block_is_extractable(block: str) -> None:
@@ -216,8 +342,17 @@ _BASH = shutil.which("bash") or "/bin/bash"
 
 
 def _run(block: str, env: dict[str, str], path: str = _BASE_PATH):
-    """Execute the extracted block under the script's own shell options."""
-    body = f'set -euo pipefail\n{block}\necho "RESULT=${{GPUS_PER_NODE}}"'
+    """Execute the extracted block under the launchers' own shell options.
+
+    The block now *defines* ``derive_gpus_per_node`` rather than running inline,
+    so the harness calls it -- exactly as both launchers do after sourcing the
+    helper. Without the call every assertion below would run against a shell
+    that defined a function and did nothing.
+    """
+    body = (
+        f"set -euo pipefail\n{block}\n{_HELPER_FN}\n"
+        'echo "RESULT=${GPUS_PER_NODE}"'
+    )
     return subprocess.run(
         [_BASH, "-c", body],
         capture_output=True,
@@ -295,6 +430,34 @@ def test_the_explicit_override_wins(block: str) -> None:
     """The documented escape hatch must beat both Slurm variables."""
     resolved = _resolved(block, {"GPUS_PER_NODE": "3", "SLURM_GPUS_ON_NODE": "8"})
     assert resolved == "3"
+
+
+def test_a_job_total_is_divided_by_the_node_count(block: str) -> None:
+    """`--gpus=N` populates only SLURM_GPUS, and that is a JOB total.
+
+    On a 2-node allocation SLURM_GPUS=8 means 4 per node, so handing it to
+    --nproc_per_node undivided over-forks by the node count. The framework's own
+    idle-device guard splits these into ALLOC_GPU_ENV_PER_NODE vs _JOB for the
+    same reason -- and it is the guard this must agree with, because it REFUSES
+    a launch whose grant exceeds the ranks started.
+    """
+    assert _resolved(block, {"SLURM_GPUS": "8", "SLURM_NNODES": "2"}) == "4"
+
+
+def test_a_single_node_job_total_is_the_per_node_count(block: str) -> None:
+    """The array dispatcher's own case: `--gpus=1` with `--nodes=1`.
+
+    This source was missing, so an allocation that populated only SLURM_GPUS
+    fell through to the nvidia-smi fallback -- the node's PHYSICAL device count,
+    which can EXCEED the grant, i.e. the one path in this derivation that can
+    over-fork rather than under-fork.
+    """
+    assert _resolved(block, {"SLURM_GPUS": "1"}) == "1"
+
+
+def test_the_per_node_sources_still_win_over_the_job_total(block: str) -> None:
+    """Anti-vacuity: a per-node count must not be overridden by a job total."""
+    assert _resolved(block, {"SLURM_GPUS_ON_NODE": "2", "SLURM_GPUS": "8"}) == "2"
 
 
 def test_visible_devices_are_counted_when_slurm_is_silent(block: str, tmp_path: Path) -> None:

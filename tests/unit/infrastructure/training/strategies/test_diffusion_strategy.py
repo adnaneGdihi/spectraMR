@@ -308,17 +308,44 @@ class TestDiffusionStrategyComponents:
         strategy = DiffusionTrainingStrategy(env=training_env)
         assert hasattr(strategy, "loss_computer")
 
-    def test_mask_generator_initialization(self, mock_diffusion_config, training_env):
-        """Test k-space mask generator initialization."""
+    def test_mask_generator_is_taken_from_the_models_process(
+        self, mock_diffusion_config, training_env
+    ):
+        """The strategy borrows; it no longer builds a second generator (#2056).
+
+        The generator carries the process in production -- every ``model_type``
+        the guard matches resolves to ``KSpaceColdDiffusionGenerator``, which
+        builds one unconditionally -- so attaching one here is what makes this
+        fixture the shape the strategy actually meets.
+        """
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
         mock_diffusion_config.training_mode = "kspace_cold_diffusion"
-        # Also need model type to reflect this for _is_cold_diffusion logic
         training_env.model_type = "kspace_cold_diffusion"
         mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+        process = KSpaceUndersamplingProcess(num_timesteps=28)
+        training_env.generator.kspace_process = process
 
         strategy = DiffusionTrainingStrategy(env=training_env)
 
-        # Should have mask generator for k-space variants
-        assert hasattr(strategy, "mask_generator")
+        assert strategy.mask_generator is process.mask_generator
+
+    def test_a_model_without_a_process_fails_setup_rather_than_masking_wrong(
+        self, mock_diffusion_config, training_env
+    ):
+        """Anti-vacuity for the test above, and non-negotiable 3.
+
+        Declaring cold diffusion while the generator cannot degrade k-space is
+        a mis-wiring. Building a strategy-side generator instead -- what this
+        path did until #2056 -- produced masks from a second resolution of the
+        same block that nothing compared against.
+        """
+        mock_diffusion_config.training_mode = "kspace_cold_diffusion"
+        training_env.model_type = "kspace_cold_diffusion"
+        mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+
+        with pytest.raises(ValueError, match="kspace_process"):
+            DiffusionTrainingStrategy(env=training_env)
 
 
 class TestDiffusionStrategyConfiguration:
@@ -463,10 +490,15 @@ class TestDiffusionStrategyIntegration:
         training_env.model_type = "diffusion"
         strategy1 = DiffusionTrainingStrategy(env=training_env)
 
-        # Test k-space cold diffusion
+        # Test k-space cold diffusion. The generator carries the undersampling
+        # process because every real one does, and the strategy takes its mask
+        # generator from there rather than building a second (#2056).
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
         mock_diffusion_config.training_mode = "kspace_cold_diffusion"
         training_env.model_type = "kspace_cold_diffusion"
         mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+        training_env.generator.kspace_process = KSpaceUndersamplingProcess(num_timesteps=1000)
         strategy2 = DiffusionTrainingStrategy(env=training_env)
 
         # Both should be initialized

@@ -25,6 +25,7 @@ from spectramr.cli.profile_command import (
     program_path,
     require_scalene,
 )
+from spectramr.cli.val_batches import VAL_BATCHES_OVERRIDE_KEY
 
 
 def _ns(**over) -> argparse.Namespace:
@@ -239,7 +240,7 @@ def test_val_batches_appends_an_override_without_losing_the_output_redirect():
     child = _child_argv(argv)
     overrides = [child[i + 1] for i, tok in enumerate(child) if tok == "--override"]
     assert "training.output_dir=experiments/results/exp_11" in overrides
-    assert "validation.loader.num_batches=4" in overrides
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}=4" in overrides
 
 
 def test_no_val_batches_adds_no_override():
@@ -257,7 +258,7 @@ def test_val_batches_targets_a_key_the_framework_actually_reads():
         build_scalene_command(_ns(val_batches=2), child_run_dir=Path("r"), outfile=Path("p.json"))
     )
     assert not any("validation.enabled" in tok for tok in child)
-    assert "validation.loader.num_batches=2" in child
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}=2" in child
 
 
 # --------------------------------------------------------------------------

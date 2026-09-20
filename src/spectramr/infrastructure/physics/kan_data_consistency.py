@@ -24,6 +24,7 @@ from torch import nn
 
 from spectramr.models.blocks.kan_layer import KANLayer
 
+from .dc_mask import align_dc_mask
 from .fft_ops import _to_complex, fft2c, ifft2c
 from .implementations.fft_operator import MultiCoilFFTOperator
 
@@ -199,10 +200,7 @@ class KANAdaptiveDataConsistency(nn.Module):
 
         k_new = (1.0 - lambda_map) * k_pred + lambda_map * measured_kspace
 
-        mask_real = mask.real if torch.is_complex(mask) else mask
-        if mask_real.ndim == 4 and mask_real.shape[1] > k_pred.shape[1]:
-            mask_real = mask_real[:, : k_pred.shape[1], ...]
-        k_out = torch.where(mask_real.bool(), k_new, k_pred)
+        k_out = torch.where(align_dc_mask(mask, k_pred.shape[-3]).bool(), k_new, k_pred)
 
         # Convert back to output domain.
         if is_kspace_domain:

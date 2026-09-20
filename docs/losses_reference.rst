@@ -140,6 +140,31 @@ Planted violations for both live in
 ``tests/unit/infrastructure/validation/test_config_health_checker_loss_ssot_2026_09.py``
 and ``tests/unit/infrastructure/training/builders/test_loss_builder_unmigrated_guard_2026_09.py``.
 
+The GAN block's ``enable_`` flags gate their weights
+----------------------------------------------------
+
+``losses.gan`` pairs each weight with an enable flag —
+``enable_gradient_penalty``/``lambda_gp``,
+``enable_feature_matching``/``feature_matching``,
+``enable_adversarial``/``lambda_adv``. ``get_enabled_losses`` has always honoured
+the pairing; ``LossBuilder``, the surface that actually **constructs**
+``gan_composite``, read the weights raw and ignored the flags, so
+``enable_gradient_penalty: false`` still bought a penalty at the schema default
+of **10.0** (17 ``inprogress/`` arms were paying one they never asked for).
+
+It is the same defect ``lambda_l1`` had (#1949) wearing an enable flag, and the
+cost is not only a wrong number: ``experiment_11_sense_bridge_critic`` declares
+``enable_gradient_penalty: false`` beside ``parallel.strategy: deepspeed`` /
+``zero_stage: 2``, and the penalty's ``autograd.grad`` double-backward is not
+reducible under ZeRO-2 — the 2026-09-16 run died in
+``stage_1_and_2.py::reduce_ipg_grads`` with ``IndexError: list index out of
+range``, for a term the arm had switched off in writing.
+
+A flag left at its default therefore now means what it says: no penalty, no
+feature-matching term. Arms that want either must declare the flag as well as
+the weight. Planted violations:
+``tests/unit/infrastructure/training/builders/test_loss_builder_gan_enable_flags.py``.
+
 Two exemptions from the pairing rule
 -------------------------------------
 

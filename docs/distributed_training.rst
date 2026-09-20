@@ -56,6 +56,28 @@ Launching
    # ddp, fsdp, deepspeed
    torchrun --nproc_per_node=4 -m spectramr.cli train-distributed --config <arm>.yaml
 
+On SLURM, two wrappers in the research tree's ``scripts/training`` directory do
+this, and the distribution does not carry them: each states one site's
+allocation account and mail domain as data rather than taking them as
+parameters. One stands up the allocation and the rendezvous for **one arm**
+(single- or multi-node); the other fans a whole cohort out as an array, one task
+per YAML, reading each arm's ``parallel.strategy`` and picking the verb for it —
+see :ref:`array-dispatch-parallelism`. Neither needs to be told which arms are
+distributed.
+
+That pick belongs to ``train``. An array submitted for another pipeline
+(``… spectramr infer <yamls>``) runs every arm single-process, because
+``parallel.strategy`` states how the arm *trains*; inference under it is the
+declaration honoured, not a downgrade.
+
+.. note::
+
+   Launching a process-group arm with plain ``spectramr train`` is not a
+   degraded run, it is a refused one: the strategy raises out of
+   ``_require_process_group`` after the environment is built. That is by
+   design, and it is what the array dispatcher used to walk into — 36 of the
+   45 tasks in job array 8589967 (2026-09-12), one per ``kspace_filling`` arm.
+
 The launcher does **not** rewrite ``parallel.strategy``. Forcing it to ``"ddp"``
 on every distributed launch would make ``fsdp`` and ``deepspeed`` unreachable
 from this entry point, overwriting the declaration before dispatch ever saw it.
@@ -84,11 +106,17 @@ only thing that noticed was the cluster's own ``jobstats``, after the fact::
 
    This job did not use 3 of the 4 allocated GPUs.
 
-Derive the rank count rather than typing it::
+Derive the rank count rather than typing it — and prefer the committed
+derivation over a hand-rolled one, because it is what the refusal above is
+measured against::
 
-   GPUS="$(nvidia-smi -L | grep -c '^GPU ')"     # or: ${SLURM_GPUS_ON_NODE:?}
-   torchrun --standalone --nproc_per_node="$GPUS" \
+   source scripts/common/gpu_count.sh
+   derive_gpus_per_node        # sets GPUS_PER_NODE, or exits 1 rather than guessing
+   torchrun --nnodes=1 --nproc_per_node="$GPUS_PER_NODE" \
        -m spectramr.cli train-distributed --config <arm>.yaml
+
+Both SLURM launchers source that file, so a derivation that disagrees with the
+guard cannot be introduced in one of them alone (non-negotiable 17).
 
 Note that ``--gpus=N`` populates only ``SLURM_GPUS``, which is a **job total**;
 ``SLURM_GPUS_ON_NODE`` and ``SLURM_GPUS_PER_NODE`` are per node. The check reads
@@ -357,6 +385,182 @@ for complex+fp16 because there is no ``complex16``. DeepSpeed casts weights to
 half from *inside* the engine, where that guard cannot see it. The audit makes
 this an error; use ``bfloat16``.
 
+Compilation is placed per strategy
+----------------------------------
+
+``torch.compile`` used to be applied at one fixed point -- director step 1,
+before every wrap -- which is the right point for exactly one strategy. Where it
+goes now is a property of the backend:
+
+=====================  =============  =============================================
+``strategy``           compiled at    why
+=====================  =============  =============================================
+``none``               after Stage B  last, and after the optimizer is built
+``ddp``                after Stage B  dynamo must SEE the DDP wrapper to engage
+                                      DDPOptimizer
+``dp``                 after Stage B  allowed, advised against: DataParallel
+                                      re-replicates every forward
+``fsdp``               after Stage A  ``torch.compile(FSDP(m))``, the
+                                      recommended order
+``deepspeed`` z0/1/2   after Stage A  ``initialize()`` must receive an
+                                      already-compiled module
+``deepspeed`` z3       **refused**    measured crash; use DeepCompile instead
+=====================  =============  =============================================
+
+The measurements behind each row are in
+:mod:`spectramr.infrastructure.training.builders.compile_placement`. Two are
+worth repeating here.
+
+**DDP.** ``torch/_dynamo/backends/distributed.py`` states that DDPOptimizer
+"applies when dynamo compiles models wrapped in DistributedDataParallel". It
+splits the graph at gradient-allreduce bucket boundaries so communication
+overlaps with backward compute. The old order, ``DDP(torch.compile(m))``, hides
+the wrapper from dynamo and forfeits that overlap entirely -- and the audit did
+not cover ``ddp`` at all, so the combination passed review in silence.
+
+**ZeRO-3.** Handing ``deepspeed.initialize`` an already-compiled module raises
+``AttributeError: 'dict' object has no attribute '_in_forward'``, and calling
+``engine.compile()`` afterwards raises inside dynamo. Both are refused at config
+load rather than after the environment is built. DeepCompile
+(``parallel.deepspeed.compile.enabled``) is the supported route for ZeRO-3; it
+is torch.compile with the ZeRO collectives inserted as graph passes, which is
+why it can do what pre-compiling cannot.
+
+One consequence is worth knowing. For ``fsdp`` and ``deepspeed`` the wrap must
+precede the optimizer, so the optimizer introspects a wrapped module -- which
+breaks ``optimization.optimizer.param_groups``, whose keys are matched against
+``named_parameters()`` prefixes. The placement records this as
+``optimizer_sees_wrapper``; ``none``/``ddp``/``dp`` are clear of it because they
+compile after the optimizer exists.
+
+Regional compilation, and the complex opt-out
+---------------------------------------------
+
+Full compilation hands Inductor one large problem and pays the whole cost at
+cold start. A model built from *n* copies of one block class is mostly the same
+problem *n* times, so ``optimization.compile.regional`` compiles each child of a
+uniform ``nn.ModuleList`` separately and hits the compiler cache after the
+first. The parent is left uncompiled on purpose; wrapping the root as well would
+reinstate the cost this avoids. If a model exposes no qualifying block list it
+**raises** rather than quietly compiling the whole thing, because an arm that
+asked for regional and silently got whole-model would be reporting a
+configuration it did not run.
+
+**Most models here do not qualify, and that is the expected outcome.** Of 877
+model files, 187 mention ``nn.ModuleList`` but only 31 build one from a
+``range`` comprehension -- the shape the detector matches -- while 319 stack
+their blocks in ``nn.Sequential``, which it never matches by construction. Read
+``regional`` as an opt-in for the minority that fits rather than a switch worth
+trying on an arbitrary arm.
+
+**A GAN needs ``apply_to``.** ``regional`` refuses an arm whose models do not
+all expose a qualifying block list, and a patch critic is a plain
+``nn.Sequential`` -- so without a selection the whole arm is refused on account
+of a model that is discarded at inference anyway::
+
+    optimization:
+      compile:
+        enabled: true
+        regional: true
+        apply_to: [generator]
+
+``apply_to`` is a closed vocabulary (``generator``, ``discriminator``,
+``encoder``, ``decoder``), so a misspelling raises at config load; naming a
+model this arm does not build raises at build time. Omit it to compile
+everything, which is what shipped.
+
+**Only the outermost qualifying list is compiled.** Where a stage is itself a
+stack of blocks, compiling on a parent-before-child walk descends into the
+``OptimizedModule`` it has just created and compiles the inner blocks as well:
+measured on a two-stage model whose stages each hold three layers, that is 8
+compilations where 2 were intended, and every key doubly wrapped
+(``stages.0._orig_mod.layers.0._orig_mod.conv.weight``). Nesting
+``torch.compile`` that way destroys exactly the cache reuse the feature exists
+for, so the walk stops descending once it has claimed a list.
+
+Regional compilation changes the checkpoint keys. Wrapping a child rather than
+the root puts the marker mid-path -- ``blocks.0._orig_mod.conv.weight`` -- and a
+leading-prefix strip leaves it there. ``core.module_utils`` drops the synthetic
+wrapper segments at any depth now. ``module`` is deliberately excluded from that:
+it is an ordinary attribute name, so ``encoder.module.weight`` must survive, and
+it is stripped only while it leads.
+
+The complex opt-out
+~~~~~~~~~~~~~~~~~~~
+
+Inductor cannot generate code for complex operators. It does not fail on one --
+``torch/_inductor/lowering.py`` routes it to an eager fallback and warns **once
+per process** through ``@functools.cache``, which on a cluster is
+indistinguishable from silence. So ``check_compile_with_complex_model`` is an
+error for all 234 complex arms, and stays one by default.
+
+``optimization.compile.allow_complex`` relaxes it, and is accepted **only**
+alongside ``regional``. The opt-out rests on the physics SSOT being fenced out of
+every dynamo graph with ``core.compile_fences.dynamo_disable``, so the compiled
+regions provably contain no complex tensors rather than hopefully so. Measured
+with ``torch._dynamo.explain`` on a real-valued backbone around a complex
+``fft2c``/``ifft2c`` round trip:
+
+==========  ========  ========  =======================================
+variant     graphs    ops       what is in the graph
+==========  ========  ========  =======================================
+unfenced    1         19        the complex ops, where Inductor falls
+                                back to eager per op
+fenced      2         9         only the real-valued regions
+==========  ========  ========  =======================================
+
+The break reason is reported as *"Skip calling ``torch.compiler.disable()``d
+function"*, which is the fence working as intended.
+
+**One graph break per fence is not free**, and these numbers show the mechanism
+works, not that it is faster. Whether the trade pays on a given arm is an
+empirical question for that arm. ``allow_complex`` is also refused together with
+``fullgraph``: a graph break under ``fullgraph`` raises, so the pair is a
+guaranteed crash and is rejected at config load rather than at the first forward
+pass.
+
+**The fence is applied at import and unconditionally**, so every arm pays it
+whether or not it compiles -- ``fft2c``/``ifft2c`` have around 480 call sites
+across ``src/``. ``torch._dynamo.disable`` wraps the function, and that wrapper
+costs something in eager mode too. Measured on this machine (T500), one
+``fft2c`` call:
+
+============================  ==========  ==========  ===============
+shape                         bare        fenced      delta
+============================  ==========  ==========  ===============
+GPU 8x1x320x320               1608.6 us   1610.0 us   +1.4 us (+0.1%)
+CPU 1x1x64x64                 53.4 us     59.6 us     +6.1 us (+11.4%)
+============================  ==========  ==========  ===============
+
+The overhead is a fixed per-call cost, so it is invisible against a realistic
+transform and material only where the transform itself is trivial. Training runs
+on the accelerator (non-negotiable 9b), so the first row is the one that governs
+-- but the cost is real, unconditional, and stated here rather than assumed away.
+
+Recompilation is a budget, and exhausting it used to be silent
+--------------------------------------------------------------
+
+Dynamo recompiles a frame when its guards fail -- a new shape, a new dtype. Each
+frame has a budget (``torch._dynamo.config.recompile_limit``, 8 by default), and
+on exhaustion torch **drops that frame to eager and carries on**:
+``fail_on_recompile_limit_hit`` is ``False`` upstream. The run then reports a
+compiled configuration while executing something else, which is the same lie
+``apply_compile`` already refuses at build time (#619 F2) arriving later in the
+run instead.
+
+MRI is where this bites. Slice and coil counts vary between volumes, and
+``dynamic: true`` is this block's default, so guard failures are expected rather
+than exceptional.
+
+``optimization.compile.fail_on_recompile_limit`` therefore defaults to **true**,
+inverting torch's default: exhausting the budget raises. ``recompile_limit``
+raises the budget when an arm legitimately needs more shapes. Declaring a budget
+with ``fail_on_recompile_limit: false`` is refused at config load -- a budget you
+decline to enforce is not a budget.
+
+This is a real behaviour change for an arm that is silently degrading today: it
+will start raising. That is the point, and the message names the two knobs.
+
 Checkpoints
 -----------
 
@@ -376,6 +580,43 @@ DeepSpeed writes a sharded tag *directory*. With
 single-file ``checkpoint_best.pt``, so ``discover_best_checkpoint``, campaign
 evaluation and ``spectramr infer`` keep working without understanding ZeRO shards.
 Turning it off makes the run resume-only, and the audit warns.
+
+EMA under a wrapper
+-------------------
+
+The same renaming bites at *runtime*, not just at save/load. ``ModelEma`` holds a
+shadow deep-copied from the **bare** module at ``build_ema()`` time, while the
+live generator handed to ``update()`` has since been wrapped at Stage A/B. The
+blend is key-matched::
+
+    for k, ema_v in esd.items():
+        if k in msd:
+
+so a shadow whose keys are all absent from the live model blends **nothing** —
+and raises nothing. ``num_updates`` still increments, the decay ramp still
+advances, and a checkpoint is still written, so every observable stays healthy
+while the shadow holds its random initialisation forever. Measured against a real
+DeepSpeed engine: shadow ``0.weight`` against engine ``module.0.weight``, overlap
+zero, on 75 arms (#2172).
+
+Three consequences worth knowing:
+
+* **Callers unwrap.** ``ema.update(unwrap_model(generator))`` at every site. A
+  total key mismatch now raises ``EMAKeyMismatchError`` rather than being
+  skipped; a *partial* overlap still blends, because a rebuilt
+  ``channel_adapter`` legitimately leaves keys unmatched.
+* **The checkpoint form is** :meth:`~spectramr.infrastructure.optimization.ema.ModelEma.shadow_state_dict`.
+  ``unwrap_model(ema)`` peels ``ModelEma``'s own ``.module``, which bypasses the
+  ``state_dict`` override that persists the warmup counter — so the decay ramp
+  restarted at 0 on every resume. Weight keys are bare either way, so existing
+  checkpoints load unchanged.
+* **Validation swaps in place.** It does not forward the EMA module; it copies
+  the shadow weights into the live generator, forwards the generator, and copies
+  the originals back. That swap is held in one context manager
+  (:mod:`spectramr.infrastructure.optimization.ema_swap`) so the mutation cannot
+  outlive its own restore, and a restore that cannot put a tensor back — its
+  shape changed mid-forward — raises rather than leaving training on a blend of
+  trained and shadow weights.
 
 Reading a consolidated checkpoint back
 --------------------------------------

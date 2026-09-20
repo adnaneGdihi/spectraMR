@@ -12,6 +12,7 @@ import logging
 import torch
 from torch import nn
 
+from spectramr.infrastructure.physics.dc_mask import align_dc_mask
 from spectramr.infrastructure.physics.dc_settings import SUPPORTED_NOISE_TYPES
 
 from .fft_ops import _to_complex, fft2c, ifft2c
@@ -69,7 +70,7 @@ def _validate_noise_type(noise_type: str, owner: str) -> str:
     return resolved
 
 
-class DataConsistencyLayer(nn.Module):
+class NoiseSimulatingDataConsistency(nn.Module):
     r"""
     Physics-Informed Data Consistency Layer with Realistic Noise Simulation.
     """
@@ -110,7 +111,7 @@ class DataConsistencyLayer(nn.Module):
         Returns:
             Any: Description.
 
-        forward method for DataConsistencyLayer.
+        forward method for NoiseSimulatingDataConsistency.
 
         Executes PyTorch tensor operations.
 
@@ -292,22 +293,20 @@ class AdaptiveDataConsistency(nn.Module):
             imag = measured_kspace[:, 1::2, ...]
             measured_kspace = torch.complex(real, imag)
 
-        # Estimate spatially-varying noise weight from measured data
+        # Estimate spatially-varying noise weight from measured data. The mask is
+        # aligned against the MEASURED channel count here and against the PREDICTED
+        # one below, because a SENSE forward can leave the two different.
         mag = torch.abs(measured_kspace) + 1e-8
         k_mag = torch.log(mag)
         if mask is not None:
-            k_mag = k_mag * mask.real
+            k_mag = k_mag * align_dc_mask(mask, measured_kspace.shape[-3])
         if k_mag.shape[1] > 1:
             k_mag = k_mag.mean(dim=1, keepdim=True)
 
         lambda_map = self.noise_estimator(k_mag)
         k_new = (1.0 - lambda_map) * k_pred + lambda_map * measured_kspace
 
-        mask_real = mask.real if torch.is_complex(mask) else mask
-        if mask_real.ndim == 4 and mask_real.shape[1] > k_pred.shape[1]:
-            mask_real = mask_real[:, : k_pred.shape[1], ...]
-
-        k_out = torch.where(mask_real.bool(), k_new, k_pred)
+        k_out = torch.where(align_dc_mask(mask, k_pred.shape[-3]).bool(), k_new, k_pred)
 
         # Convert back to output domain
         if is_kspace_domain:
@@ -509,7 +508,7 @@ class HardDataConsistency(nn.Module):
         # ``noise_type`` used to be accepted here and then dropped on the floor:
         # the parameter arrived, was documented, and was never stored, so an
         # unsupported value degraded silently to Gaussian (#1445, #1525,
-        # pitfall #9). Validated the way ``DataConsistencyLayer`` already does,
+        # pitfall #9). Validated the way ``NoiseSimulatingDataConsistency`` already does,
         # so the three implementations of this parameter share one policy (NN17).
         self.noise_type = _validate_noise_type(noise_type, type(self).__name__)
 
@@ -843,9 +842,7 @@ class NoiseAdaptiveDataConsistency(nn.Module):
                 sigma2 = power.new_tensor(float(noise_sigma) ** 2).view(1, 1, 1, 1)
             sigma2 = sigma2.clamp_min(self.eps)
         else:
-            obs = mask.real if torch.is_complex(mask) else mask
-            if obs.shape[1] > 1:
-                obs = obs[:, :1, ...]
+            obs = align_dc_mask(mask, 1)
             sigma2 = self._estimate_sigma2(power, obs)
 
         beta = torch.nn.functional.softplus(self.beta)
@@ -905,10 +902,7 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         lambda_map = self._compute_lambda(measured_kspace, mask, noise_sigma)
         k_new = (1.0 - lambda_map) * k_pred + lambda_map * measured_kspace
 
-        mask_real = mask.real if torch.is_complex(mask) else mask
-        if mask_real.ndim == 4 and mask_real.shape[1] > k_pred.shape[1]:
-            mask_real = mask_real[:, : k_pred.shape[1], ...]
-        k_out = torch.where(mask_real.bool(), k_new, k_pred)
+        k_out = torch.where(align_dc_mask(mask, k_pred.shape[-3]).bool(), k_new, k_pred)
 
         if is_kspace_domain:
             if is_complex_input:
@@ -1142,7 +1136,9 @@ class TargetAwareFSDC(nn.Module):
         # Ensure mask is broadcastable  [B, 1, H, W]
         if mask.dim() < kspace_pred.dim():
             mask = mask.unsqueeze(1)
-        mask_f = mask.float()
+        # The source/target split slices the channel axis, so a mask holding one
+        # channel per interleaved Re/Im half no longer lines up with either side.
+        mask_f = align_dc_mask(mask, 1).float()
 
         # ── 0. Determine reference / target split ────────────────────
         C_target = min(self.target_channels, C_total)

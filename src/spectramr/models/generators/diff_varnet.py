@@ -17,10 +17,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditioning
-from spectramr.infrastructure.physics.data_consistency_layer import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.registry import register_model
@@ -94,7 +96,7 @@ class ComplexUnrolledBlock(nn.Module):
         self.activation = nn.LeakyReLU(0.2, inplace=True)
 
         # Data Consistency
-        self.dc = DataConsistencyLayer()
+        self.dc = MaskedReplacementDataConsistency()
 
     def forward(
         self,
@@ -157,7 +159,7 @@ class ComplexUnrolledBlock(nn.Module):
     accepts_complex=True,
     expects_real_imag_interleaved=True,
 )
-class DiffVarNet(nn.Module, IGenerator):
+class DiffVarNet(GradCheckpointingMixin, nn.Module, IGenerator):
     """
     Diff-VarNet Backbone.
 
@@ -233,6 +235,7 @@ class DiffVarNet(nn.Module, IGenerator):
         )
 
         # No final convolution, usually output of iterations is the result.
+
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """get_output_shape.
@@ -337,8 +340,13 @@ class DiffVarNet(nn.Module, IGenerator):
         # 2. Iterative Unrolling
         curr_x = x
 
+        ckpt = self._checkpointing_active()
         for block in self.blocks:
-            curr_x = block(curr_x, emb, measured_kspace, mask)
+            curr_x = (
+                checkpoint(block, curr_x, emb, measured_kspace, mask, use_reentrant=False)
+                if ckpt
+                else block(curr_x, emb, measured_kspace, mask)
+            )
 
         # [FIX] Restore 5D shape if input was volumetric
         if _was_5d:

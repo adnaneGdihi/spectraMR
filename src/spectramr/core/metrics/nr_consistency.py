@@ -23,6 +23,7 @@ Metrics
 - **aoqv** — Acquisition-Order Quadratic Variation (↓)
 - **eta_null** — Invented Null Energy, trust functional T2 (↓, no-reference)
 - **fabrication_excess** — Fabrication Excess :math:`\mathcal{H}_T` (↓, full-reference)
+- **null_band_energy_deficit** — unfilled fraction of the unacquired band (↓, full-reference)
 """
 
 from __future__ import annotations
@@ -842,6 +843,107 @@ class FabricationExcess:
             return NAN
 
 
+# ---------------------------------------------------------------------------
+# null_band_energy_deficit — how much of the unacquired band was left empty
+# ---------------------------------------------------------------------------
+@register_metric(
+    "null_band_energy_deficit",
+    aliases=["null_fill_deficit"],
+    requires_reference=True,
+    needs=("mask",),
+    direction="lower",
+)
+class NullBandEnergyDeficit:
+    r"""Unfilled fraction of the unacquired band's energy (↓, full-reference).
+
+    .. math::
+
+        \mathcal{D} = \max\!\left(0,\; 1 -
+        \frac{\lVert(\mathbf{1}-\mathbf{M})\odot\mathbf{F}\hat{\mathbf{x}}\rVert_2}
+             {\lVert(\mathbf{1}-\mathbf{M})\odot\mathbf{F}\mathbf{x}\rVert_2}\right)
+        \in [0,1]
+
+    A zero-filled reconstruction leaves the unacquired band empty and scores
+    **1.0**; one carrying the truth's null-band energy scores **0.0**. It is the
+    direct answer to "how much of what was missing did the model actually put
+    back?", and it is the one direction the rest of the battery cannot see: a
+    reconstruction whose null band is uniformly attenuated keeps ``ndcr`` at the
+    noise floor (hard DC pins the acquired lines), keeps ``nse_hall`` near 1
+    (all of its error *is* in the null band, whatever its size), and moves
+    ``eta_null`` only in proportion — none of them reports the deficit itself.
+
+    **Why the bare ratio is not what is registered.** The underlying quantity is
+    two-sided: below 1 is blur, above 1 is fabrication. ``direction`` admits only
+    ``"higher"``/``"lower"``, so a two-sided value registered under either label
+    would be read backwards by ``metric_higher_is_better`` and by every consumer
+    that resolves through it (``keep_best_n``, early stopping, the leaderboard).
+    Clamping at 0 makes the registered value monotone and honest, and the
+    fabrication direction keeps its existing single owner in
+    :class:`FabricationExcess` (non-negotiable 17) — read the two together.
+
+    **Scope.** Like ``eta_null`` this uses the *Fourier* sampling operator, so on
+    multi-coil SENSE data it is a dominant-subspace approximation (see
+    :class:`NullSpaceEnergyHallucination` for the size of that bias). Both the
+    reconstruction and any baseline it is compared against cross the identical
+    code, so the bias largely cancels in a ``zf_delta``.
+
+    Returns ``nan`` when ``mask`` or the reference is absent, on a shape
+    mismatch, or when the target's null band is empty (a fully-sampled
+    measurement has nothing to fill — a measurement-independent constant is not
+    a score, pitfall #9).
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        self.eps = eps
+
+    @property
+    def name(self) -> str:
+        return "null_band_energy_deficit"
+
+    @property
+    def higher_is_better(self) -> bool:
+        return False
+
+    def __call__(
+        self,
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> float:
+        ctx = resolve_context(context, kwargs)
+        if target is None or not ctx.has("mask"):
+            return NAN
+        try:
+            from spectramr.infrastructure.physics.fft_ops import fft2c
+
+            pred = _single_channel_complex(prediction)
+            tgt = _single_channel_complex(target)
+            if pred.shape != tgt.shape:
+                return NAN
+            m = ctx.mask
+            assert m is not None
+            if torch.is_complex(m):
+                m = m.real
+            k_pred = fft2c(pred)
+            m = m.to(dtype=torch.float32, device=k_pred.device)
+            if m.dim() == 2:
+                m = m[None, None]
+            elif m.dim() == 3:
+                m = m[:, None]
+            null = 1.0 - m
+            target_null = _norm(null * fft2c(tgt))
+            # A fully-sampled mask leaves nothing to fill, so the ratio is 0/0.
+            # Report it as absent rather than as a perfect or a total deficit.
+            if float(target_null) <= self.eps:
+                return NAN
+            ratio = _norm(null * k_pred) / target_null
+            return float((1.0 - ratio).clamp(0.0, 1.0).detach())
+        except Exception:
+            return NAN
+
+
 __all__ = [
     "AcquisitionOrderQuadraticVariation",
     "CoilSubspaceOrthogonalEnergy",
@@ -849,6 +951,7 @@ __all__ = [
     "ForwardModelRoundTripStability",
     "InventedNullEnergy",
     "NormalisedDataConsistencyResidual",
+    "NullBandEnergyDeficit",
     "NullSpaceEnergyHallucination",
     "PseudoReplicaPartitionSNR",
 ]

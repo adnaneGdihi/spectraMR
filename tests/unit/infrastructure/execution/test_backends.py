@@ -318,3 +318,72 @@ def test_container_no_launch_env_when_not_launched(backend_cls):
         SpectraMRInvocation(verb="train", config="x.yaml"), ResourceSpec(gpus=0)
     )
     assert not any(c.startswith("SPECTRAMR_LAUNCH_") for c in cmd)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock chaining directives.
+#
+# `render_directives` is the SSOT the committed `.sbatch` headers are
+# REGENERATED from, so adding these by hand to a header is the drift
+# `test_header_matches_render_directives_ssot` exists to catch. Both default to
+# emitting nothing, which is what keeps every existing caller -- and the
+# campaign golden -- byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def _lines(**spec_kwargs) -> list[str]:
+    from spectramr.infrastructure.execution.backends import ResourceSpec, SlurmBackend
+
+    block = SlurmBackend().render_directives(
+        ResourceSpec(account="acct", **spec_kwargs), job_name="j"
+    )
+    return [ln for ln in block.splitlines() if ln.startswith("#SBATCH")]
+
+
+@pytest.mark.unit
+def test_neither_directive_is_emitted_by_default(monkeypatch):
+    """Byte-identical for every caller that does not ask -- the same contract
+    `array` already keeps."""
+    monkeypatch.delenv("SPECTRAMR_SLURM_PARTITION", raising=False)
+    lines = _lines()
+
+    assert not [ln for ln in lines if "requeue" in ln or "open-mode" in ln]
+
+
+@pytest.mark.unit
+def test_requeue_is_emitted_when_asked(monkeypatch):
+    """Slurm refuses `scontrol requeue` outright without it, so a wall-clock
+    chain silently stops after one link."""
+    monkeypatch.delenv("SPECTRAMR_SLURM_PARTITION", raising=False)
+
+    assert "#SBATCH --requeue" in _lines(requeue=True)
+
+
+@pytest.mark.unit
+def test_open_mode_is_emitted_when_asked(monkeypatch):
+    """Without append, the requeued task truncates its predecessor's .out --
+    destroying the record of why the previous link stopped."""
+    monkeypatch.delenv("SPECTRAMR_SLURM_PARTITION", raising=False)
+
+    assert "#SBATCH --open-mode=append" in _lines(open_mode="append")
+
+
+@pytest.mark.unit
+def test_the_two_sit_after_partition_and_before_the_mail_lines(monkeypatch):
+    """Position is the invariant, not just presence: the committed headers are
+    regenerated from this order and compared line by line."""
+    from spectramr.infrastructure.execution.backends import ResourceSpec, SlurmBackend
+
+    monkeypatch.delenv("SPECTRAMR_SLURM_PARTITION", raising=False)
+    block = SlurmBackend().render_directives(
+        ResourceSpec(account="acct", partition="batch", requeue=True, open_mode="append"),
+        job_name="j",
+        mail_type="END,FAIL",
+        mail_user="u",
+    )
+    lines = [ln for ln in block.splitlines() if ln.startswith("#SBATCH")]
+    idx = {ln.split("=")[0]: i for i, ln in enumerate(lines)}
+
+    assert idx["#SBATCH --partition"] < idx["#SBATCH --requeue"]
+    assert idx["#SBATCH --requeue"] < idx["#SBATCH --open-mode"]
+    assert idx["#SBATCH --open-mode"] < idx["#SBATCH --mail-type"]

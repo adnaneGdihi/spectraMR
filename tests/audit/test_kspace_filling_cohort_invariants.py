@@ -180,13 +180,33 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _COHORT_ROOT = _REPO_ROOT / "experiments" / "inprogress" / "kspace_filling"
 
 
-def _discover_arms() -> list[Path]:
-    """In-scope cold-diffusion arms: top-level + the two attention sub-cohorts."""
+#: Sub-directories held OUT of the cohort contract, each for a stated reason.
+#: Everything else under the cohort root is in scope on creation -- the list
+#: names exclusions rather than inclusions, because a literal inclusion tuple
+#: silently drops every sub-cohort added after it was written (#2113).
+#:
+#: Ablations are excluded by THREE separate mechanisms, which is confusing
+#: enough to be worth naming rather than tidying: this dict excludes the
+#: ``ablations/`` directory, the ``"ablation" not in p.name`` filter below
+#: excludes top-level files whose NAME says ablation, and
+#: ``ablations_kan_dual_domain/`` is deliberately INCLUDED because its arms are
+#: conformed cohort members despite the name. Collapsing the three would change
+#: which arms are checked.
+_EXCLUDED_SUBDIRS: dict[str, str] = {
+    "ablations": "single-knob ablations deliberately vary a pinned invariant",
+}
+
+
+def _discover_arms(root: Path | None = None) -> list[Path]:
+    """Every cold-diffusion arm under the cohort root, minus stated exclusions."""
+    cohort_root = _COHORT_ROOT if root is None else root
     arms: list[Path] = [
-        p for p in tracked_yamls(_COHORT_ROOT, recursive=False) if "ablation" not in p.name
+        p for p in tracked_yamls(cohort_root, recursive=False) if "ablation" not in p.name
     ]
-    for sub in ("attention_shootout", "attention_enhancements"):
-        arms.extend(tracked_yamls((_COHORT_ROOT / sub), recursive=False))
+    for sub in sorted(d for d in cohort_root.iterdir() if d.is_dir()):
+        if sub.name in _EXCLUDED_SUBDIRS:
+            continue
+        arms.extend(tracked_yamls(sub, recursive=False))
     return sorted(arms)
 
 
@@ -529,8 +549,19 @@ def test_i_acceleration_spread_matches_base(settings: TrainingSettings, arm_path
             )
         if tir is True:
             pre_dc = getattr(settings.losses.reconstruction, "lambda_pre_dc_kspace", None)
-            assert pre_dc, (
-                f"#16: train_identity_rung is on but lambda_pre_dc_kspace={pre_dc!r}. "
+            # A non-Cartesian arm cannot use `pre_dc_kspace`: it weights its L1
+            # by the complement of a CARTESIAN sampling indicator, and an
+            # off-grid acquisition measures no Cartesian bin. Its sample-domain
+            # twin carries the identity rung instead, and does so for the same
+            # reason -- the gridded state is not sample-consistent at any rung,
+            # so the term still has a gradient where every post-DC loss is flat.
+            sample_dc = any(
+                entry.name == "nufft_sample_consistency" and entry.enabled and entry.weight
+                for entry in settings.losses.kspace_losses
+            )
+            assert pre_dc or sample_dc, (
+                f"#16: train_identity_rung is on but lambda_pre_dc_kspace={pre_dc!r} "
+                f"and no enabled nufft_sample_consistency. "
                 "At t=0 every bin is acquired, so hard DC replaces the network's proposal "
                 "everywhere and every post-DC loss is a constant with zero gradient; the "
                 "pre-DC k-space term is the rung's ONLY gradient path. Without it the rung "
@@ -624,13 +655,21 @@ def test_i3_ladder_uniform_within_each_sub_cohort() -> None:
         )
         groups.setdefault(arm.parent.name, {}).setdefault(key, []).append(arm.name)
 
-    # coverage: prove the scan actually reached both attention sub-cohorts at
-    # full strength, so this cannot pass by grouping nothing.
-    for sub_cohort in ("attention_shootout", "attention_enhancements"):
+    # coverage: prove the scan reached every sub-cohort at full strength, so
+    # this cannot pass by grouping nothing. The expected count is read off disk
+    # rather than written here -- a literal goes stale the next time an arm is
+    # added, and then reports the addition as the defect (it read 10 after
+    # attention_shootout reached 12).
+    on_disk: dict[str, int] = {}
+    for arm in _ARMS:
+        if arm.parent != _COHORT_ROOT:
+            on_disk[arm.parent.name] = on_disk.get(arm.parent.name, 0) + 1
+    for sub_cohort, expected in sorted(on_disk.items()):
         assert sub_cohort in groups, f"{sub_cohort}/ not reached by the ladder scan"
-        assert sum(len(v) for v in groups[sub_cohort].values()) == 10, (
-            f"{sub_cohort}/ contributed "
-            f"{sum(len(v) for v in groups[sub_cohort].values())} arms, expected 10"
+        seen = sum(len(v) for v in groups[sub_cohort].values())
+        assert seen == expected, (
+            f"{sub_cohort}/ contributed {seen} arms to the ladder scan but holds "
+            f"{expected} on disk"
         )
     _assert_single_valued(groups, "mask ladders")
 
@@ -682,6 +721,37 @@ def _planted(tmp_path: Path, **dotted: Any) -> TrainingSettings:
         got = _attr(node, leaf)
         assert got == value, f"plant {path}={value!r} did not survive load (got {got!r})"
     return settings
+
+
+_NC_PLANT_REL = (
+    "experiments/inprogress/kspace_filling/nc_graph/experiment_43_nc_control_gridded.yaml"
+)
+
+
+def test_plant_a_non_cartesian_identity_rung_with_no_fidelity_is_red(tmp_path: Path) -> None:
+    """Widening #16 to accept the sample-domain twin must not accept NEITHER term.
+
+    A non-Cartesian arm cannot declare ``lambda_pre_dc_kspace`` -- the weight is
+    a Cartesian sampling indicator -- so the check now also accepts an enabled
+    ``nufft_sample_consistency``. Disabling that one leaves the identity rung
+    with no gradient at all, which is exactly the shape #16 exists to catch.
+    """
+    base = require_repo_file(_NC_PLANT_REL)
+    raw = yaml.safe_load(base.read_text())
+    for entry in raw["losses"]["kspace_losses"]:
+        if entry["name"] == "nufft_sample_consistency":
+            entry["enabled"] = False
+            break
+    else:
+        pytest.fail("nufft_sample_consistency is gone from the arm; this plant watches nothing")
+    out = tmp_path / base.name
+    out.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    settings = TrainingSettings.from_yaml(str(out))
+    assert not any(
+        e.name == "nufft_sample_consistency" and e.enabled for e in settings.losses.kspace_losses
+    ), "the plant did not survive config load"
+    with pytest.raises(AssertionError, match="#16"):
+        test_i_acceleration_spread_matches_base(settings, base)
 
 
 def test_plant_curriculum_ladder_opening_past_the_budget_is_red(tmp_path: Path) -> None:
@@ -1331,3 +1401,64 @@ def test_every_exempted_arm_exists() -> None:
     present = {p.name for p in tracked_yamls(_COHORT_ROOT)}
     missing = sorted((set(_CROSS_CONTRAST_ARMS) | set(_INERT_LADDER_ARMS)) - present)
     assert not missing, f"exemption names an arm that no longer exists: {missing}"
+
+
+# --------------------------------------------------------------------------
+# Coverage of the discovery itself (#2113)
+# --------------------------------------------------------------------------
+
+
+def test_discovery_reaches_a_sub_cohort_it_was_never_told_about(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Planted violation for the inclusion-list shape (non-negotiable 15).
+
+    ``_discover_arms`` used to enumerate ``("attention_shootout",
+    "attention_enhancements")`` by name, so a sub-cohort created afterwards was
+    outside every contract check from the moment it existed, and nothing
+    reported the omission. Twenty-one arms were in that state.
+
+    A literal-tuple implementation passes every other test in this file and
+    fails only this one, which is the point: the arms it cannot see are the
+    arms it cannot fail on.
+    """
+    import tests.audit.test_kspace_filling_cohort_invariants as module
+
+    (tmp_path / "top_level_arm.yaml").write_text("metadata: {}\n")
+    (tmp_path / "brand_new_cohort").mkdir()
+    (tmp_path / "brand_new_cohort" / "newcomer.yaml").write_text("metadata: {}\n")
+    (tmp_path / "ablations").mkdir()
+    (tmp_path / "ablations" / "excluded.yaml").write_text("metadata: {}\n")
+
+    # The real helper asks git what is tracked; a tmp tree is not. Swap in a
+    # plain glob so this exercises the ENUMERATION, which is what was wrong.
+    monkeypatch.setattr(
+        module,
+        "tracked_yamls",
+        lambda d, pattern="*.yaml", *, recursive=True: sorted(Path(d).glob(pattern)),
+    )
+    found = {p.name for p in module._discover_arms(tmp_path)}
+
+    assert "newcomer.yaml" in found, (
+        "a sub-cohort the discovery was never told about escaped the sweep; "
+        "the enumeration is an inclusion list again"
+    )
+    assert "top_level_arm.yaml" in found
+    assert "excluded.yaml" not in found, "ablations/ must stay excluded"
+
+
+def test_every_sub_cohort_on_disk_is_covered_or_excluded_with_a_reason() -> None:
+    """No directory under the cohort root may be silently out of scope."""
+    covered = {p.parent.name for p in _ARMS if p.parent != _COHORT_ROOT}
+    on_disk = {
+        d.name
+        for d in _COHORT_ROOT.iterdir()
+        if d.is_dir() and not d.name.startswith("_") and any(d.glob("*.yaml"))
+    }
+    unaccounted = on_disk - covered - set(_EXCLUDED_SUBDIRS)
+    assert not unaccounted, (
+        f"{sorted(unaccounted)} hold arms but are neither swept nor listed in "
+        f"_EXCLUDED_SUBDIRS with a reason"
+    )
+    for name, reason in _EXCLUDED_SUBDIRS.items():
+        assert reason.strip(), f"{name} is excluded without a stated reason"

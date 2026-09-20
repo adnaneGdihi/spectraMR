@@ -12,11 +12,17 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+import torch
 import torch.nn as nn
+
+from spectramr.infrastructure.builders.directors import (
+    checkpoint_director as checkpoint_director_module,
+)
 
 from spectramr.infrastructure.builders.context import BuilderContext
 
@@ -634,3 +640,124 @@ def test_director_publishes_checkpoints_through_the_atomic_writer():
     assert "atomic_save_torch(checkpoint_data, checkpoint_path)" in source
     assert "torch.save(checkpoint_data, checkpoint_path)" not in source
 
+
+
+# ---------------------------------------------------------------------------
+# RNG round-trip (#2071 follow-up)
+#
+# The director is the writer the training loop actually uses; CheckpointService
+# is only its exception fallback. So a resume replays the interrupted run's
+# stochastic stream only if THIS pair carries it -- which it did not, while the
+# service captured it and nobody called the service (non-negotiable 16).
+# ---------------------------------------------------------------------------
+
+
+def _rng_pipeline() -> SimpleNamespace:
+    generator = nn.Linear(4, 4)
+    return SimpleNamespace(
+        generator=generator,
+        discriminator=None,
+        optimizer_g=torch.optim.SGD(generator.parameters(), lr=0.1),
+        optimizer_d=None,
+        scheduler_g=None,
+        scheduler_d=None,
+        scaler=None,
+        device=torch.device("cpu"),
+    )
+
+
+def _save_rng_checkpoint(tmp_path) -> Path:
+    return (
+        CheckpointDirector(MagicMock())
+        .with_checkpoint_dir(str(tmp_path / "checkpoints"))
+        .with_pipeline(_rng_pipeline())
+        .with_epoch(1)
+        .with_global_step(40_000)
+        .validate()
+        .save()
+    )
+
+
+def _draws(n: int = 4) -> list[float]:
+    return [float(torch.rand(1).item()) for _ in range(n)]
+
+
+def test_save_carries_rng_state(tmp_path) -> None:
+    """Without this key the resumed run cannot replay anything."""
+    blob = torch.load(_save_rng_checkpoint(tmp_path), map_location="cpu", weights_only=False)
+
+    assert "rng_state" in blob
+    assert {"torch", "numpy", "python"} <= set(blob["rng_state"])
+
+
+def test_resume_replays_the_interrupted_runs_stream(tmp_path) -> None:
+    """The reassurance property, end to end on the production writer/reader.
+
+    The draws after the restore must be the draws that would have followed the
+    save, not merely draws from a correctly-seeded generator.
+    """
+    torch.manual_seed(1234)
+    path = _save_rng_checkpoint(tmp_path)
+    would_have_drawn = _draws()
+
+    # A requeued job is a fresh process whose stream is wherever seeding left
+    # it -- deliberately NOT where the interrupted one stopped.
+    torch.manual_seed(9999)
+
+    loaded = (
+        CheckpointDirector(MagicMock())
+        .with_checkpoint_dir(str(tmp_path / "checkpoints"))
+        .with_pipeline(_rng_pipeline())
+    )
+    assert loaded.load_from(str(path)) is True
+
+    assert _draws() == would_have_drawn
+
+
+def test_non_main_rank_keeps_its_own_stream(tmp_path) -> None:
+    """A shared restore would divide augmentation diversity by the world size.
+
+    The file carries rank 0's streams only, so every rank restoring it draws an
+    identical sequence -- which is what train.py's rank-offset seeding exists to
+    prevent.
+    """
+    torch.manual_seed(1234)
+    path = _save_rng_checkpoint(tmp_path)
+    rank0_would_draw = _draws()
+
+    # Built before the measured window: initialising a module draws from the
+    # very stream under test, so constructing it inside would consume the
+    # numbers the assertion is about.
+    loaded = (
+        CheckpointDirector(MagicMock())
+        .with_checkpoint_dir(str(tmp_path / "checkpoints"))
+        .with_pipeline(_rng_pipeline())
+    )
+
+    torch.manual_seed(9999)
+    expected_own = _draws()
+
+    torch.manual_seed(9999)
+    with patch.object(
+        checkpoint_director_module.RankUtility, "is_main_rank", return_value=False
+    ):
+        assert loaded.load_from(str(path)) is True
+
+    drawn = _draws()
+    assert drawn == expected_own
+    assert drawn != rank0_would_draw
+
+
+def test_checkpoint_without_rng_state_still_loads(tmp_path) -> None:
+    """Every checkpoint on the cluster today predates this key."""
+    path = _save_rng_checkpoint(tmp_path)
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    del blob["rng_state"]
+    torch.save(blob, path)
+
+    loaded = (
+        CheckpointDirector(MagicMock())
+        .with_checkpoint_dir(str(tmp_path / "checkpoints"))
+        .with_pipeline(_rng_pipeline())
+    )
+    assert loaded.load_from(str(path)) is True

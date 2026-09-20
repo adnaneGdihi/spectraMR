@@ -282,11 +282,22 @@ def _out_channels(config: Any) -> int:
 def build_probe_model(config: Any, device: str) -> torch.nn.Module:
     """Instantiate the arm's generator on ``device`` (direct, non-wrapper path).
 
-    Self-contained: uses the model registry + signature-filtered constructor,
-    matching ``synthetic_forward_probe``'s direct-build path. Diffusion wrapper
-    models (a top-level ``denoising_model`` dict) are not supported here and
-    raise loudly rather than mis-building.
+    Constructor kwargs come from :func:`resolve_full_generator_kwargs`, the one
+    owner ``ModelBuilder`` and ``audit --probe`` resolve through: a probe that
+    builds a *different* model measures a model nothing trains. A second
+    derivation here omitted ``kspace_log_scaled`` (#1281), so every arm
+    declaring ``output_kspace_clip_ratio`` raised at construction and the probe
+    skipped 12 of 12 arms in its own cohort (#2122).
+
+    That SSOT withholds ``input_type`` / ``output_type`` (``SKIP_MODEL_FIELDS``),
+    which strict sub-configs raise on.
+
+    Diffusion wrapper models (a top-level ``denoising_model`` dict) raise here
+    rather than mis-building.
     """
+    from spectramr.infrastructure.builders.generator_kwargs import (
+        resolve_full_generator_kwargs,
+    )
     from spectramr.models.init_registry import populate_model_registry
     from spectramr.models.registry import get_model_class
 
@@ -300,12 +311,12 @@ def build_probe_model(config: Any, device: str) -> torch.nn.Module:
         )
     cls = get_model_class(m.model_type)
 
-    ctor: dict[str, Any] = {}
-    for top in ("spatial_dims", "input_type", "output_type", "output_activation"):
-        v = getattr(m, top, None)
-        if v is not None:
-            ctor.setdefault(top, v)
-    ctor.update(model_kwargs)  # model_kwargs wins on collisions
+    # ``device`` is forwarded so step 3d injects the probe's own device into the
+    # one generator that names it, rather than leaving the constructor to
+    # resolve one (non-negotiable 9b).
+    ctor: dict[str, Any] = dict(
+        resolve_full_generator_kwargs(config, model_cls=cls, device=device).kwargs
+    )
 
     sig = inspect.signature(cls.__init__)
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())

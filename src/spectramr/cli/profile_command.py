@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from spectramr.cli.profile_phases import PHASE_MARKERS
+from spectramr.cli.val_batches import val_batches_override
 
 #: Verbs this command can profile. An allowlist, because Scalene must be able to
 #: see the work: it profiles the process it launches and *not* that process's
@@ -179,7 +180,7 @@ def build_scalene_command(
     # with the output redirect above rather than replacing it. Guarded upstream:
     # `profile_cli` raises for a target that runs no validation loop.
     if args.val_batches is not None:
-        child += ["--override", f"validation.loader.num_batches={args.val_batches}"]
+        child += ["--override", val_batches_override(args.val_batches)]
     child += list(args.extra or [])
 
     return [

@@ -195,7 +195,7 @@ def test_infer_protocol_runs_on_a_canonical_envelope(
     as ``D01#1`` proposes.
     """
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
-    from spectramr.infrastructure.services.checkpoint_service import _capture_rng_state
+    from spectramr.core.rng_state import capture_rng_state
 
     ckpt = _write_checkpoint(
         tmp_path,
@@ -206,7 +206,7 @@ def test_infer_protocol_runs_on_a_canonical_envelope(
             # The half that made the first version of this test vacuous: the
             # real writer stamps rng_state unconditionally, and its numpy
             # entry is what a plain ``torch.load`` refuses on torch >= 2.6.
-            "rng_state": _capture_rng_state(),
+            "rng_state": capture_rng_state(),
         },
     )
     assert infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path))) == 0

@@ -86,6 +86,7 @@ from . import (
     hyperelastic_jacobian_loss,  # NEW: Jacobian det(J)=1 for tissue incompressibility
     infonce_critic,  # noqa: F401
     joint_multi_contrast_sparsity_loss,  # Multi-contrast: Bilgic 2011 coupled gradient sparsity
+    jacobian_anatomy_loss,  # noqa: F401 — NC cohort folding / volume-distortion guard
     kl_divergence,
     koopman_linearity_loss,  # koopman_fmri (DMD linearity residual)
     kspace_consistency_tta_loss,  # noqa: F401
@@ -105,6 +106,7 @@ from . import (
     ncchi_consistency_loss,  # noqa: F401
     nll_bits_per_dim,  # Phase 3: bits-per-dim NLL for normalising flows
     noise2noise_loss,  # Losses guide §26 — Noise2Noise paired-noisy supervision
+    nufft_sample_consistency_loss,  # noqa: F401  # Non-Cartesian sample-domain DC
     null_space_loss,  # Cold-diffusion C5: fibre-aware null-space content supervision
     ood_gated_reconstruction_loss,  # Multi-contrast: OOD-gated refinement (§7)
     optimal_transport_losses,  # Phase 5 canonical-home migration (sinkhorn/dynamic_ot/kidot)

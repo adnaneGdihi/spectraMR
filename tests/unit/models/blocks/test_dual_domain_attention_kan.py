@@ -841,3 +841,27 @@ class TestFeatureDomainContract:
             out = block(x)
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
+
+
+def test_gate_telemetry_records_the_produced_gate_not_the_ablated_zero():
+    """A disabled branch's applied gate is 0.0 by construction and says nothing.
+
+    The telemetry copy sat after the branch-zeroing while its own comment
+    promised the opposite, so every ``disable_branches`` ablation logged 0.0 for
+    exactly the gate whose behaviour the ablation exists to study.
+    """
+    import torch as _t
+
+    from spectramr.models.blocks.dual_domain_attention_kan import (
+        KANGatedDualDomainAttention,
+    )
+
+    _t.manual_seed(0)
+    block = KANGatedDualDomainAttention(
+        8, feature_domain="kspace", disable_branches={"image"}
+    ).eval()
+    with _t.no_grad():
+        block(_t.randn(1, 8, 16, 16))
+    assert float(block._last_gates[0]) > 1e-3, (
+        "the image gate reports the ablation's zero, not what the gate produced"
+    )

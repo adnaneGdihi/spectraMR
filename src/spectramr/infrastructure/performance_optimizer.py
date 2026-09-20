@@ -482,14 +482,16 @@ def get_performance_optimizer(
 
     .. deprecated:: 2026-07-01
         Dormant module — see the module docstring. The live torch.compile
-        path is ``ModelBuilder.compile()`` (``optimization.compile.enabled``).
+        path is ``builders/compile_apply.apply_compile``
+        (``optimization.compile.enabled``).
     """
     import warnings
 
     warnings.warn(
         "spectramr.infrastructure.performance_optimizer is dormant (no training-"
-        "path consumer). Use ModelBuilder.compile() via the "
-        "optimization.compile.enabled YAML knob instead.",
+        "path consumer). The live path is builders/compile_apply.apply_compile, "
+        "placed per parallel strategy by builders/compile_placement and driven by "
+        "the optimization.compile.enabled YAML knob.",
         DeprecationWarning,
         stacklevel=2,
     )

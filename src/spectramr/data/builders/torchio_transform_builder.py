@@ -1038,6 +1038,18 @@ class TorchIOTransformBuilder:
             # Option A: SENSE coil combination using sensitivity maps
             transforms.append(CoilCombineTransform(method="sense"))
             logger.debug("[COIL] CoilCombineTransform (SENSE): (C,H,W,D) complex -> (2,H,W,D) real")
+        elif config.coil_processing_mode == "rss_per_channel":
+            # Shen 2024's own combination: RSS reduced once per real/imaginary
+            # channel, so the result keeps two (non-negative) channels instead of
+            # the single magnitude ``rss_image`` returns. The three prior-method
+            # arms need 2 channels and none of the three papers takes multi-coil
+            # input, so this is the combination their pipelines assume happened
+            # upstream.
+            transforms.append(CoilCombineTransform(method="rss_per_channel"))
+            logger.debug(
+                "[COIL] CoilCombineTransform (rss_per_channel): (C,H,W,D) complex -> "
+                "(2,H,W,D) real k-space"
+            )
         elif config.coil_processing_mode == "rss_image":
             # IFFT → RSS → image-domain magnitude (1 channel, real).
             # Distinct from ``"rss"`` (which round-trips through FFT and
@@ -1064,7 +1076,7 @@ class TorchIOTransformBuilder:
             # the wrong coil layout.
             raise ValueError(
                 f"[COIL] Unknown coil_processing_mode: {config.coil_processing_mode!r}. "
-                "Valid values: 'sense', 'rss', 'magnitude', 'rss_image', "
+                "Valid values: 'sense', 'rss', 'magnitude', 'rss_per_channel', 'rss_image', "
                 "'compressed_sensing' (with num_virtual_coils), or 'none'. "
                 "Add the new mode to the dispatch in "
                 "src/data/builders/torchio_transform_builder.py if "
@@ -1358,6 +1370,12 @@ class TorchIOTransformBuilder:
             # Option A: SENSE coil combination using sensitivity maps
             transforms.append(CoilCombineTransform(method="sense"))
             logger.debug("[COIL] CoilCombineTransform (SENSE): (C,H,W,D) complex -> (2,H,W,D) real")
+        elif config.coil_processing_mode == "rss_per_channel":
+            transforms.append(CoilCombineTransform(method="rss_per_channel"))
+            logger.debug(
+                "[COIL] CoilCombineTransform (rss_per_channel): (C,H,W,D) complex -> "
+                "(2,H,W,D) real k-space"
+            )
         elif config.coil_processing_mode == "rss_image":
             transforms.append(CoilCombineTransform(method="rss_image"))
             logger.debug(
@@ -1374,7 +1392,7 @@ class TorchIOTransformBuilder:
             # training-side branch above for the canonical list).
             raise ValueError(
                 f"[COIL] Unknown coil_processing_mode: {config.coil_processing_mode!r}. "
-                "Valid: 'sense', 'rss', 'magnitude', 'rss_image', "
+                "Valid: 'sense', 'rss', 'magnitude', 'rss_per_channel', 'rss_image', "
                 "'compressed_sensing', 'none'."
             )
 

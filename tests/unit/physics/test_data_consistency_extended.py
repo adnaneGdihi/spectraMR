@@ -2,7 +2,7 @@
 
 Existing tests for SimpleDataConsistency live in test_physics_modules.py —
 we EXTEND coverage here for:
-  - DataConsistencyLayer (3-argument form: pred, measured, mask)
+  - NoiseSimulatingDataConsistency (3-argument form: pred, measured, mask)
   - HardDataConsistency
   - SoftDataConsistency
   - TargetAwareFSDC
@@ -47,7 +47,7 @@ def _mask(b: int, h: int, w: int, accel: int = 4) -> torch.Tensor:
 def test_canary_data_consistency_imports():
     """All exported symbols import cleanly."""
     from spectramr.infrastructure.physics.data_consistency import (
-        DataConsistencyLayer,
+        NoiseSimulatingDataConsistency,
         AdaptiveDataConsistency,
         HardDataConsistency,
         SoftDataConsistency,
@@ -58,7 +58,7 @@ def test_canary_data_consistency_imports():
         data_consistency,
     )
     assert all([
-        DataConsistencyLayer, AdaptiveDataConsistency, HardDataConsistency,
+        NoiseSimulatingDataConsistency, AdaptiveDataConsistency, HardDataConsistency,
         SoftDataConsistency, SimpleDataConsistency, ConformalDataConsistency,
         TargetAwareFSDC, dc_passthrough_center_patch, data_consistency,
     ])
@@ -66,9 +66,9 @@ def test_canary_data_consistency_imports():
 
 @pytest.mark.physics
 def test_canary_data_consistency_layer_forward():
-    """DataConsistencyLayer forward pass with complex inputs."""
-    from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
-    dc = DataConsistencyLayer()
+    """NoiseSimulatingDataConsistency forward pass with complex inputs."""
+    from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
+    dc = NoiseSimulatingDataConsistency()
     b, c, h, w = 1, 1, 16, 16
     pred = _img(b, c, h, w, complex_=True)
     meas = _img(b, c, h, w, complex_=True, seed=1)
@@ -248,8 +248,8 @@ def test_data_consistency_function():
 @pytest.mark.physics
 def test_data_consistency_edge_all_zero_mask():
     """With all-zero mask the output should not be modified by measurements."""
-    from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
-    dc = DataConsistencyLayer(train_noise_level=0.0, eval_noise_level=0.0)
+    from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
+    dc = NoiseSimulatingDataConsistency(train_noise_level=0.0, eval_noise_level=0.0)
     dc.eval()
     b, c, h, w = 1, 1, 16, 16
     pred = _img(b, c, h, w, complex_=True)
@@ -263,8 +263,8 @@ def test_data_consistency_edge_all_zero_mask():
 @pytest.mark.physics
 def test_data_consistency_edge_complex_input_preserved():
     """Complex input produces complex output."""
-    from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
-    dc = DataConsistencyLayer()
+    from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
+    dc = NoiseSimulatingDataConsistency()
     b, c, h, w = 1, 1, 16, 16
     pred = _img(b, c, h, w, complex_=True)
     meas = _img(b, c, h, w, complex_=True, seed=9)

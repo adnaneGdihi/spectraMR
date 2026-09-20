@@ -146,6 +146,9 @@ Common commands
    spectramr train -c <arm>.yaml --device cpu --seed 7 --dry-run
    spectramr train -c <arm>.yaml -O optimization.optimizer.learning_rate=1e-4
 
+   # Cap validation for a smoke run (see "Capping validation" below)
+   spectramr train -c <arm>.yaml --val-batches 1
+
    # Overfit a single batch (collapse-vs-bug diagnostic)
    spectramr sanity_check -c <arm>.yaml
 
@@ -161,6 +164,45 @@ Common commands
    # '*ablation*' so it catches BOTH ablations/ subdirs and *ablation* filenames.
    spectramr audit experiments/inprogress/<cohort> --exclude '*ablation*'
    spectramr audit experiments/inprogress/<cohort> --exclude '*ablation*' --exclude '*baseline*'
+
+Capping validation (``--val-batches``)
+--------------------------------------
+
+A full validation pass walks every volume in the validation split, which is what
+a real run wants and what makes a smoke run slow: the training side is already
+capped at a handful of iterations while validation still grades the whole split.
+
+``--val-batches N`` caps it, on ``train`` and ``sanity_check``:
+
+.. code-block:: bash
+
+   spectramr train -c <arm>.yaml --val-batches 1        # grade one batch
+   spectramr sanity_check -c <arm>.yaml --val-batches 2
+
+The flag is sugar for ``-O validation.loader.num_batches=N`` and is resolved in
+:func:`spectramr.cli.val_batches.resolve_val_batches_overrides`, so it goes
+through the config SSOT rather than a second code path. Passing it *and* an
+explicit ``-O`` for the same key raises rather than letting one silently win.
+
+Two things are worth knowing about what the cap buys:
+
+* **It saves the decode, not just the progress bar.**
+  :mod:`spectramr.infrastructure.builders.directors.data_pipeline_director`
+  strides the validation dataset down to the capped budget when the loader is
+  built, so the volumes outside the budget are never read;
+  :mod:`spectramr.pipelines.train` caps the loop as well, which is what covers a
+  dataset that has no ``__len__``.
+* **The kept samples are spread across the split**, endpoint-inclusive, rather
+  than taken from the front. Validation splits are commonly ordered by slice
+  position, so a head-truncated cap grades a run almost entirely on background
+  slices. ``--val-batches 1`` is therefore not necessarily the first sample.
+
+On a volume-backed arm the direct validation loader emits one volume per batch,
+so ``N`` is also the number of volumes graded.
+
+``--val-batches`` caps validation; it cannot switch it off. ``validation.enabled``
+is declared by many arms and read by none (issue #673), so a value below 1 is
+refused rather than quietly meaning "no cap".
 
 Generating reports (``report``)
 -------------------------------

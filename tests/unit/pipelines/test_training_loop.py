@@ -3239,3 +3239,197 @@ class TestSchedulerLrCallSiteIsPinned:
     def test_the_warn_once_set_is_actually_populated(self):
         """Without the `.add`, the guard stays true and the warning fires per row."""
         assert "csv_empty_lr_warned.add" in _attribute_calls(_training_loop_source())
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock yield: stopping in time to write a checkpoint.
+#
+# A production arm gets 120h per job and needs more. What was missing was never
+# resume -- the checkpoint has carried every piece of state all along -- it was
+# STOPPING IN TIME TO WRITE ONE. These pin the four places the yield has to
+# touch, each of which is independently satisfiable while the feature is dead:
+# a decision nobody acts on, a save that never fires, a loop that never leaves,
+# an epilogue that overwrites the yield's own checkpoint with a completed one.
+#
+# Source-level for the same reason as the loop_state and divergence-guard tests
+# above: a full loop OOM-kills a dev box. The DECISION itself is executed in
+# tests/unit/core/test_wall_clock.py.
+# ---------------------------------------------------------------------------
+
+
+def _loop_source() -> str:
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    return inspect.getsource(training_loop_mod._execute_training_loop)
+
+
+def test_wall_clock_budget_is_resolved_before_the_loop():
+    """A malformed or already-expired budget must fail at startup, not after
+    hours of GPU — and re-reading the environment per step is a syscall in the
+    hot path (non-negotiable 9)."""
+    src = _loop_source()
+    loop_at = src.index("for iteration in pbar:")
+    before, inside = src[:loop_at], src[loop_at:]
+
+    assert "wall_clock_budget = resolve_wall_clock_budget()" in before
+    assert "resolve_wall_clock_budget()" not in inside
+
+
+def test_the_wall_clock_check_has_its_own_capped_cadence():
+    """NOT the logging cadence, which is what this rode first.
+
+    65 corpus arms declare `logging.intervals.log: 5000`; at ~1s a step that
+    inspects the deadline every ~83 min against a 900s margin, so the job is
+    killed before the check fires -- on exactly the long-running arms the yield
+    exists for. A `time.monotonic` read is a vDSO call, not a device sync, so
+    non-negotiable 9 never bore on how often it happens.
+    """
+    src = _loop_source()
+    loop_at = src.index("for iteration in pbar:")
+    before, inside = src[:loop_at], src[loop_at:]
+
+    assert "_wall_clock_every = resolve_check_interval(log_interval)" in before
+    assert "iteration % _wall_clock_every == 0" in inside
+    assert "resolve_check_interval" not in inside, "cadence recomputed per step"
+
+    # The logging gate must stay the only `if` whose test mentions the log
+    # cadence: TestEveryRunYieldsAnInterpretableCurve locates and executes it by
+    # exactly that property, and a second match errors all nine of its tests.
+    tree = ast.parse(textwrap.dedent(src))
+    matching = [
+        ast.unparse(n.test)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "iteration % log_interval" in ast.unparse(n.test)
+    ]
+    assert len(matching) == 1, matching
+
+    # The decision is broadcast: ranks disagreeing by one iteration deadlock,
+    # one entering the collective checkpoint save while the others step.
+    check = src.index("iteration % _wall_clock_every == 0")
+    assert "RankUtility.broadcast_object" in src[check : check + 600], (
+        "the yield decision is per-rank -- under DDP the ranks will disagree "
+        "and the collective save will hang"
+    )
+
+
+def test_a_budget_that_cannot_be_honoured_is_refused():
+    """`checkpoint.enabled: false` plus a budget yields, saves nothing, requeues
+    and repeats forever. Same family as the already-inside-the-margin refusal."""
+    src = _loop_source()
+
+    assert "A wall-clock budget is declared but checkpointing is off" in src
+    guard_at = src.index("A wall-clock budget is declared but checkpointing is off")
+    assert "raise RuntimeError(" in src[max(0, guard_at - 200) : guard_at]
+    # It must sit above the loop -- refusing at iteration 40k is not a refusal.
+    assert guard_at < src.index("for iteration in pbar:")
+
+
+def test_the_certification_hook_is_skipped_on_a_yield():
+    """A certificate from a half-trained reconstructor describes a model that
+    will not exist by the end of the chain -- and it runs inside the save
+    margin, eating the time reserved for getting out cleanly."""
+    src = _loop_source()
+
+    assert "if not is_sanity_check and not wall_clock_yield:" in src
+
+
+def test_the_yield_forces_a_checkpoint_and_then_leaves():
+    """A yield without the save it exists to make room for is just a crash."""
+    src = _loop_source()
+
+    assert "iteration % checkpoint_interval == 0 or wall_clock_yield" in src
+    assert "if wall_clock_yield:\n            break" in src
+    # The save must come first, or the break drops the very state it yielded for.
+    assert src.index("or wall_clock_yield") < src.index("if wall_clock_yield:\n            break")
+
+
+def test_the_completion_epilogue_is_skipped_on_a_yield():
+    """The final save stamps `global_step=max_iterations` unconditionally, so on
+    a yield at 40k of 200k it asserts the run finished — and the next link of
+    the chain resumes at 200k and trains nothing."""
+    src = _loop_source()
+
+    final_at = src.index("# Final checkpoint on completion")
+    guard = src[final_at : final_at + 900]
+    assert "not wall_clock_yield" in guard
+
+    restore_at = src.index('getattr(config.early_stopping, "restore_best_weights", False)')
+    assert "not wall_clock_yield" in src[restore_at : restore_at + 400], (
+        "a yielded run is mid-training; swapping in best weights hands the next "
+        "link a model that is not where the loop left off"
+    )
+
+
+def test_the_result_distinguishes_yielded_from_completed():
+    """`success: True` alone would let a caller archive a half-trained run."""
+    src = _loop_source()
+
+    assert '"wall_clock_yield": wall_clock_yield,' in src
+    assert '"resume_from_iteration": iteration if wall_clock_yield else None,' in src
+
+
+def test_validation_is_gated_on_the_yield_and_on_the_budget():
+    """Validation is the longest thing in the loop body and the wall-clock check
+    cannot interrupt it -- the check runs BETWEEN iterations, validation is
+    inside one. A deadline landing mid-pass kills the job with no checkpoint, no
+    marker and no requeue, so the chain stops looking like an ordinary TIMEOUT.
+
+    `experiment_11_attention_none.yaml:506` records one validation event at 6.4 h
+    and validation at 41% of the run's wall clock, so this is the dominant
+    exposure rather than a corner.
+    """
+    src = _loop_source()
+
+    # Gate on the EXECUTION line. Gating `time_for_eval` at its first assignment
+    # is bypassed: the epoch-boundary branch re-sets it to True afterwards.
+    assert (
+        'if pipeline.data_loaders.get("val") and time_for_eval and not wall_clock_yield:'
+        in src
+    )
+    first_assign = src.index("time_for_eval = iteration % eval_interval == 0")
+    epoch_reassign = src.index("            time_for_eval = True")
+    execution = src.index('if pipeline.data_loaders.get("val") and time_for_eval and not')
+    assert first_assign < epoch_reassign < execution, (
+        "the gate moved above the epoch-boundary re-assignment, where it is a no-op"
+    )
+
+    # And the budget check, which is what covers a deadline arriving mid-pass.
+    assert "VALIDATION_SAFETY_FACTOR" in src
+    assert "_last_val_seconds" in src
+
+
+def test_the_budget_check_is_rank_uniform_and_broadcast():
+    """A rank that skipped validation while another ran it would arrive at the
+    collective checkpoint save an iteration apart and deadlock."""
+    src = _loop_source()
+
+    gate = src.index("if wall_clock_budget is not None and time_for_eval and not wall_clock_yield:")
+    window = src[gate : gate + 900]
+
+    # Entry depends only on values every rank computes identically; the
+    # rank-local duration is read INSIDE, by rank 0, and the verdict broadcast.
+    assert "RankUtility.broadcast_object(_fits)" in window
+    assert "if is_main_process:" in window
+    assert "_last_val_seconds" not in src[gate : gate + src[gate:].index("if is_main_process:")], (
+        "the rank-local duration is read in the entry condition -- ranks can "
+        "disagree about whether to enter the collective"
+    )
+
+
+def test_the_validation_duration_is_measured_not_assumed():
+    """There was no validation timing in the loop; the budget check needs one."""
+    src = _loop_source()
+
+    assert "_val_started = time.monotonic() if time_for_eval else None" in src
+    assert "_last_val_seconds = time.monotonic() - _val_started" in src
+    # Only on eval iterations -- not a clock read every step.
+    assert "time.monotonic() if time_for_eval else None" in src
+
+
+def test_a_skipped_validation_says_so():
+    """A validation event that vanishes without a line is an unexplained gap in
+    the arm's record."""
+    src = _loop_source()
+
+    assert "elif time_for_eval and wall_clock_yield and logging_service:" in src
+    assert "Skipping validation at iteration" in src

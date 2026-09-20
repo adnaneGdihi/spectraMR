@@ -337,6 +337,32 @@ class CBAMSpatialAttention(nn.Module):
         return self.sigmoid(out) * x
 
 
+def orthogonal_random_features(
+    num_heads: int, num_features: int, head_dim: int, generator: torch.Generator
+) -> torch.Tensor:
+    """Performer ORF draw: ``[num_heads, num_features, head_dim]``.
+
+    Blockwise ``QR`` gives mutually orthogonal directions, then each row is
+    rescaled to a chi_d norm so the marginal stays ``N(0, I_d)`` and the softmax
+    kernel estimate remains unbiased -- only its variance drops. Measured over 8
+    seeds on a 1/f k-space feature map at L = 4096: relative error against exact
+    softmax attention 0.1185 -> 0.0992 mean, 0.0154 -> 0.0109 std.
+    """
+    blocks: list[torch.Tensor] = []
+    remaining = num_features
+    while remaining > 0:
+        take = min(remaining, head_dim)
+        gaussian = torch.randn(num_heads, head_dim, head_dim, generator=generator)
+        q, _ = torch.linalg.qr(gaussian)
+        blocks.append(q.transpose(-2, -1)[:, :take])
+        remaining -= take
+    directions = torch.cat(blocks, dim=1)
+    chi_norms = torch.randn(num_heads, num_features, head_dim, generator=generator).norm(
+        dim=-1, keepdim=True
+    )
+    return directions * chi_norms
+
+
 class KernelizedAttention(nn.Module):
     """FAVOR+ kernelized attention (Performer; Choromanski et al., 2021), O(L).
 
@@ -346,16 +372,24 @@ class KernelizedAttention(nn.Module):
     ``D^{-1} phi(Q) (phi(K)^T V)``, where ``D^{-1}`` replaces the softmax
     denominator.
 
-    History (issue #405): the previous implementation used sign-indefinite
-    cos/sin random Fourier features and computed the numerator only, so its
-    gain scaled with sequence length -- the exp_11 energy probe measured
-    ``worst_rho ~ 3.6e3`` (2200x the sibling arms) on full-resolution k-space.
-    The block is now residual with a zero-initialized output projection
-    (identity at init, rho = 1.0), matching the LinearAttention /
-    WindowAttention family convention.
+    Two details are what make that estimate usable on k-space rather than merely
+    correct in expectation (issue #405). The ``LayerNorm`` is per TOKEN, because
+    k-space dynamic range is spatial: without it the DC bin drives
+    ``|q.k/sqrt(d)|`` to ~5e3 and a 256-feature Monte-Carlo estimate of ``exp()``
+    carries ~100 % relative error against the softmax attention it approximates.
+    The features are orthogonal (Performer ORF), which cuts the residual variance
+    rather than the bias. Measured against exact softmax on a 1/f k-space feature
+    map at L = 4096: 0.998 as shipped, 0.121 with the norm, 0.099 with both.
     """
 
-    def __init__(self, channels: int, num_heads: int = 8, num_features: int = 256):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        num_features: int = 256,
+        zero_init_output: bool = True,
+        feature_seed: int = 0,
+    ):
         """__init__.
 
         Args:
@@ -364,6 +398,14 @@ class KernelizedAttention(nn.Module):
             num_heads (int): Attention heads.
             num_features (int): Total random features ``m`` (must be even; the
                 two halves are antithetic ``+/- w`` pairs).
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee -- see the note at the
+                initialiser below.
+            feature_seed (int): Seeds the random-feature draw from a LOCAL
+                generator, so every rank of a distributed run builds the same
+                features by construction rather than by trusting buffer
+                broadcast.
         """
         super().__init__()
         if num_features % 2 != 0:
@@ -373,18 +415,32 @@ class KernelizedAttention(nn.Module):
         self.num_features = num_features
         self.head_dim = channels // num_heads
 
+        # Per-TOKEN pre-norm, the axis LinearAttention's InstanceNorm2d does not
+        # cover: k-space dynamic range is spatial (the DC bin dwarfs the periphery),
+        # so a per-channel norm leaves the logits at |q.k/sqrt(d)| ~ 5e3, far outside
+        # the range a 256-feature Monte-Carlo estimate of exp() can represent.
+        self.norm = nn.LayerNorm(channels)
         self.q_proj = nn.Linear(channels, channels)
         self.k_proj = nn.Linear(channels, channels)
         self.v_proj = nn.Linear(channels, channels)
         self.out_proj = nn.Linear(channels, channels)
-        # Identity at init: the residual carries the signal until training
-        # grows the attention gain (energy-probe rho = 1.0 at init).
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
 
-        # Gaussian directions; forward mirrors them into antithetic +/- pairs.
+        # Orthogonal directions; forward mirrors them into antithetic +/- pairs.
         self.register_buffer(
-            "rand_features", torch.randn(num_heads, num_features // 2, self.head_dim)
+            "rand_features",
+            orthogonal_random_features(
+                num_heads,
+                num_features // 2,
+                self.head_dim,
+                torch.Generator().manual_seed(int(feature_seed)),
+            ),
         )
 
     def _favor_plus_features(self, x: torch.Tensor, stabilizer: str = "none") -> torch.Tensor:
@@ -438,7 +494,7 @@ class KernelizedAttention(nn.Module):
         batch, channels, height, width = x.shape
         seq_len = height * width
 
-        x_flat = x.view(batch, channels, seq_len).transpose(1, 2)  # [B, L, C]
+        x_flat = self.norm(x.view(batch, channels, seq_len).transpose(1, 2))  # [B, L, C]
         q = self.q_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -455,13 +511,22 @@ class WindowAttention(nn.Module):
     Replaces the broken 'SparseAttention'.
     """
 
-    def __init__(self, channels: int, window_size: int = 8, num_heads: int = 8):
+    def __init__(
+        self,
+        channels: int,
+        window_size: int = 8,
+        num_heads: int = 8,
+        zero_init_output: bool = True,
+    ):
         """__init__.
 
         Args:
             channels (int): Description.
             window_size (int): Description.
             num_heads (int): Description.
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee.
         """
         super().__init__()
         self.window_size = window_size
@@ -470,10 +535,13 @@ class WindowAttention(nn.Module):
         # identical 1/sqrt(head_dim) default internally.
         self.qkv = nn.Linear(channels, channels * 3)
         self.proj = nn.Linear(channels, channels)
-        # Identity at init: zero output projection => forward(x) == x, so the
-        # residual family starts at energy gain rho = 1.0 (exp_11 probe).
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input: [B, C, H, W]
@@ -592,10 +660,13 @@ class ChannelAttention(nn.Module):
         """
         avg_out = self.fc(self.avg_pool(x))
 
-        # Manual max pooling for Inductor compatibility
-        # Reshape to [B, C, H*W], compute max across spatial dims, reshape back to [B, C, 1, 1]
+        # Manual max pooling for Inductor compatibility. ``reshape``, not
+        # ``view``: ``view`` refuses a permuted or strided input outright rather
+        # than copying, so any caller that hands this block a non-contiguous
+        # feature map fails here instead of pooling it. Same tensor when the
+        # input is already contiguous, which is the common case.
         B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1)  # [B, C, H*W]
+        x_flat = x.reshape(B, C, -1)  # [B, C, H*W]
         max_pooled = x_flat.max(dim=-1, keepdim=True)[0]  # [B, C, 1]
         max_pooled = max_pooled.unsqueeze(-1)  # [B, C, 1, 1]
         max_out = self.fc(max_pooled)
@@ -612,13 +683,22 @@ class LinearAttention(nn.Module):
     where phi(x) = elu(x) + 1 is the feature map.
     """
 
-    def __init__(self, channels: int, num_heads: int = 4, norm_type: str = "instance"):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        norm_type: str = "instance",
+        zero_init_output: bool = True,
+    ):
         """__init__.
 
         Args:
             channels (int): Description.
             num_heads (int): Description.
             norm_type (str): Description.
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee.
         """
         super().__init__()
 
@@ -640,10 +720,13 @@ class LinearAttention(nn.Module):
 
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj = nn.Conv2d(channels, channels, 1)
-        # Identity at init: zero output projection => forward(x) == x, so the
-        # residual family starts at energy gain rho = 1.0 (exp_11 probe).
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """forward.
@@ -760,36 +843,50 @@ class IdentityAtInitAttention(nn.Module):
         """
         super().__init__()
         self.inner = inner
-        self.takes_t_emb = self._accepts_t_emb(inner)
+        self.takes_t_emb = self._accepts(inner, "t_emb")
+        self.takes_mask = self._accepts(inner, "mask")
         # Scalar, not per-channel: the point is a single interpretable "how much of
         # this block is switched on" knob that the energy probe can read directly.
         self.gamma = nn.Parameter(torch.zeros(1))
 
     @staticmethod
-    def _accepts_t_emb(inner: nn.Module) -> bool:
-        """True when ``inner.forward`` takes a second positional argument."""
+    def _accepts(inner: nn.Module, name: str) -> bool:
+        """True when ``inner.forward`` declares a parameter called ``name``.
+
+        By NAME, not by positional arity: with two optional extras in play, arity
+        cannot tell ``forward(x, t_emb)`` from ``forward(x, mask)``, and would hand
+        a block expecting the mask the timestep embedding instead.
+        """
         import inspect
 
         try:
-            params = list(inspect.signature(inner.forward).parameters.values())
+            params = inspect.signature(inner.forward).parameters
         except (TypeError, ValueError):
             return False
-        positional = [
-            prm for prm in params if prm.kind in (prm.POSITIONAL_ONLY, prm.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(positional) >= 2
+        return name in params
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Identity-at-init residual around ``inner``.
 
         Args:
             x: Feature map ``[B, C, H, W]`` in the caller's feature domain.
             t_emb: Timestep embedding, forwarded only when ``inner`` accepts it.
+            mask: Acquisition mask, forwarded only when ``inner`` accepts it.
 
         Returns:
             ``x + gamma * (inner(x) - x)``, identical to ``x`` at initialisation.
         """
-        out = self.inner(x, t_emb) if self.takes_t_emb else self.inner(x)
+        extra: dict[str, torch.Tensor | None] = {}
+        if self.takes_t_emb:
+            extra["t_emb"] = t_emb
+        if self.takes_mask:
+            extra["mask"] = mask
+        out = self.inner(x, **extra)
         if out.shape != x.shape:
             raise ValueError(
                 f"{type(self.inner).__name__} changed the feature shape from "

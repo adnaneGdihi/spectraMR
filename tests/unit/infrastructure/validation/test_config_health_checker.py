@@ -1898,20 +1898,21 @@ class TestMetricNamesAreRegistered:
     a list entry naming one must be a startup error."""
 
     @staticmethod
-    def _settings(metrics: dict[str, Any]) -> Any:
+    def _settings(metrics: dict[str, Any], scoring_compute: list[str] | None = None) -> Any:
         from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
         from spectramr.config.settings import TrainingSettings
 
-        return TrainingSettings.settings_from_dict(
-            {
-                "config_version": CANONICAL_CONFIG_VERSION,
-                "model": {"model_type": "unet"},
-                "data": {"dataset_type": "image"},
-                "optimization": {},
-                "logging": {},
-                "metrics": metrics,
-            }
-        )
+        raw: dict[str, Any] = {
+            "config_version": CANONICAL_CONFIG_VERSION,
+            "model": {"model_type": "unet"},
+            "data": {"dataset_type": "image"},
+            "optimization": {},
+            "logging": {},
+            "metrics": metrics,
+        }
+        if scoring_compute is not None:
+            raw["validation"] = {"scoring": {"compute": scoring_compute}}
+        return TrainingSettings.settings_from_dict(raw)
 
     def test_a_flagless_registered_metric_is_accepted(self) -> None:
         """``brisque`` and ``auroc`` are registered with no ``compute_*`` flag,
@@ -1948,6 +1949,53 @@ class TestMetricNamesAreRegistered:
 
         src = inspect.getsource(ConfigHealthChecker.run_all_checks)
         assert "check_metric_names_are_registered" in src
+
+    def test_the_validation_scoring_surface_is_checked_too(self) -> None:
+        """PLANTED: a typo on the surface that actually grades the arm.
+
+        ``metrics.compute`` configures the TRAINING computer;
+        ``validation.scoring.compute`` configures the VALIDATION one, and the
+        mixin prefers the latter when non-empty. This check read only the first
+        until 2026-09-16, so an unregistered name here was not an error -- it was
+        a column that never appeared, on the surface carrying the arm's headline
+        numbers. Narrowing the check back to ``metrics.compute`` turns this red.
+        """
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute": ["psnr"]}, scoring_compute=["psnr", "fabrication_excesss"])
+        )
+        assert not r.passed
+        assert "fabrication_excesss" in r.message
+        assert r.severity == "error"
+        # The error has to name the key the reader must edit: pointing at
+        # metrics.compute for a validation.scoring.compute typo sends them to a
+        # list the name is not in.
+        assert r.yaml_keys == ["validation.scoring.compute"], r.yaml_keys
+
+    def test_the_registered_null_band_names_pass_on_both_surfaces(self) -> None:
+        """The cohort's instrumentation must be accepted, not merely unrejected."""
+        names = [
+            "ndcr",
+            "fabrication_excess",
+            "null_band_energy_deficit",
+            "nse_hall",
+            "eta_null",
+            "power_spectrum_consistency",
+        ]
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute": ["psnr"]}, scoring_compute=["psnr", *names])
+        )
+        assert r.passed, r.message
+        assert "validation.scoring.compute" in r.message
+
+    def test_both_surfaces_empty_is_skipped_not_passed_on_a_technicality(self) -> None:
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute_psnr": True}, scoring_compute=[])
+        )
+        assert r.passed and r.severity == "info"
+        assert "not used" in r.message
+        # Both surfaces named, so a reader of the skip knows which two lists were
+        # looked at -- the old message named only one and the other went unread.
+        assert "validation.scoring.compute" in r.message
 
 
 class TestDeclaredKeysAreNotDiscarded:
@@ -4056,3 +4104,102 @@ class TestNoAllZeroReconstructionWeightWarning:
             "so a config-layer re-base false-positives on all 34. The invariant "
             "belongs with the strategy-side declaration work (#1918)."
         )
+
+
+# ---------------------------------------------------------------------------
+# reveal_attribution's preconditions live in three different top-level blocks.
+#
+# The schema validator sees only inside `validation.sampling`, so it catches the
+# sampler requirement and nothing else. Reverse mode is in `model`, the mask
+# family in `undersampling`, the domain in `model` again -- and this layer is
+# the one that may read all of them at once. Without it the arm audits clean,
+# trains, and raises at its FIRST validation; and because every failure here is
+# architecture-determined rather than data-dependent, EVERY batch raises,
+# `val_count` reaches 0, and the F36 guard escalates it to a run-level error.
+# ---------------------------------------------------------------------------
+
+
+class TestRevealAttributionPreconditions:
+    @staticmethod
+    def _cfg(
+        *,
+        reveal: bool = True,
+        mode: str | None = "replace_freeze_dc",
+        accel_type: str = "density_nested",
+        direction: str | None = "phase",
+        target_domain: str = "kspace",
+    ) -> Any:
+        kwargs: dict[str, Any] = {}
+        if mode is not None:
+            kwargs["reverse_sampling_mode"] = mode
+        # `model_type` and `data.dataset_type` are what `infer_output_domain`
+        # reads; a stub without them resolves to image and fires the domain
+        # branch on every case, which is how this helper first hid its own bug.
+        return SimpleNamespace(
+            validation=SimpleNamespace(sampling=SimpleNamespace(reveal_attribution=reveal)),
+            model=SimpleNamespace(
+                model_kwargs=kwargs,
+                model_type="kspace_cold_diffusion",
+                input_type="kspace",
+                target_domain=target_domain,
+            ),
+            data=SimpleNamespace(dataset_type="kspace"),
+            undersampling=SimpleNamespace(
+                acceleration_type=accel_type, mask_direction=direction
+            ),
+        )
+
+    def _run(self, cfg):
+        return ConfigHealthChecker().check_reveal_attribution_preconditions(cfg)
+
+    def test_off_is_not_this_check_s_business(self):
+        assert self._run(self._cfg(reveal=False)).passed
+
+    def test_a_well_formed_arm_passes(self):
+        assert self._run(self._cfg()).passed
+
+    def test_additive_is_refused(self):
+        """It rewrites the whole plane every step, so no step wrote a given bin."""
+        result = self._run(self._cfg(mode="additive"))
+        assert not result.passed
+        assert "reverse_sampling_mode" in result.message
+
+    def test_an_omitted_mode_is_refused_because_the_default_is_additive(self):
+        """The trap: an arm that says nothing gets the mode that cannot partition."""
+        result = self._run(self._cfg(mode=None))
+        assert not result.passed
+        assert "constructor default" in result.message
+
+    @pytest.mark.parametrize(
+        "family", ["poisson_disk", "variable_density_2d_gaussian", "radial", "spiral"]
+    )
+    def test_a_point_pattern_or_trajectory_is_refused(self, family):
+        result = self._run(self._cfg(accel_type=family))
+        assert not result.passed
+        assert "band of lines" in result.message
+
+    def test_a_direction_dependent_family_needs_its_direction(self):
+        """`density_nested` is line-structured only once mask_direction is set."""
+        assert self._run(self._cfg(direction=None)).passed is False
+        assert self._run(self._cfg(direction="phase")).passed is True
+
+    def test_an_image_domain_arm_is_refused(self):
+        """The band selector is a k-space line mask; on an image-domain arm it
+        would select image PIXELS and return a plausible number."""
+        result = self._run(self._cfg(target_domain="image"))
+        assert not result.passed
+        assert "image space" in result.message
+
+    def test_every_problem_is_reported_not_just_the_first(self):
+        """An arm with three wrong declarations should learn all three at once."""
+        result = self._run(self._cfg(mode="additive", accel_type="poisson_disk"))
+        assert not result.passed
+        assert "reverse_sampling_mode" in result.message
+        assert "band of lines" in result.message
+
+    def test_the_check_is_registered_in_run_all_checks(self):
+        """A check nobody calls is the non-negotiable-16 facade."""
+        import inspect
+
+        src = inspect.getsource(ConfigHealthChecker.run_all_checks)
+        assert "check_reveal_attribution_preconditions" in src

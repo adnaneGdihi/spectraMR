@@ -979,6 +979,28 @@ scripts/coverage/print_per_layer.py
 scripts/coverage/missing_test_files.py
 scripts/maintenance/prove_reachable.py
 scripts/verify/verify_dependencies.py
+#
+# `make install-mamba`. This one is not optional: README.md, getting_started.rst,
+# troubleshooting.rst and environment_variables.rst all ship and all cite it as THE
+# way to install the mamba extra, and the bare pip line it replaces builds a kernel
+# with no sm_70 that reports success. Dropping the file would leave the public tree
+# documenting a command it does not carry, and check_docs_paths_exist.py -- which
+# also ships -- red on it.
+scripts/install_mamba_extra.py
+
+# Three cluster helpers the shipped pages already instruct a reader to use: two
+# SLURM derivations distributed_training.rst and environment_variables.rst name,
+# and the checkpoint reader running_pipelines.rst points at. Each is the single
+# owner of a rule the shipped package is measured against -- the idle-device
+# guard refuses a launch whose grant exceeds its ranks, and core/wall_clock.py
+# reads the deadline the second one exports -- so a reader left to hand-roll it
+# gets a correct launch rejected on the node. All three are site-neutral, and
+# each un-skips a test that already ships against an absent subject. The two
+# launchers that source them stay out: they carry one site's account and mail
+# domain as data, which is why the pages naming them are reworded instead.
+scripts/common/gpu_count.sh
+scripts/common/wall_clock.sh
+scripts/verification/inspect_checkpoint.py
 
 # The only shipped way to build the v3 JSON manifests the exemplar arms name in
 # data.index_path. Without it those arms are resolvable but not runnable, and

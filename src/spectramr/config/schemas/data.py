@@ -3134,9 +3134,19 @@ class CoilsConfigSchema(BaseModel):
 
     model_config = _DATA_SUBBLOCK
 
-    processing_mode: Literal["none", "flatten", "svd", "magnitude", "rss", "rss_image"] = Field(
+    processing_mode: Literal[
+        "none", "flatten", "svd", "magnitude", "rss", "rss_per_channel", "rss_image"
+    ] = Field(
         default="none",
-        description="How to handle multi-coil data: 'none' keeps original, 'flatten' splits real/imag per coil, 'svd' compresses to virtual coils, 'magnitude' gives real-only RSS in source domain, 'rss' returns 2-ch real/imag of the RSS-combined k-space (applies IFFT-RSS-FFT for k-space inputs), 'rss_image' returns 1-ch RSS magnitude image (applies IFFT then RSS for k-space inputs; identity for image inputs)",
+        description=(
+            "How to handle multi-coil data: 'none' keeps original, 'flatten' splits "
+            "real/imag per coil, 'svd' compresses to virtual coils, 'rss_per_channel' "
+            "returns 2-ch real/imag of the k-space of an image whose real and imaginary "
+            "channels were each RSS-reduced over coils (Shen 2024's combination), "
+            "'rss_image' returns 1-ch RSS magnitude image (applies IFFT then RSS for "
+            "k-space inputs; identity for image inputs). 'rss' and 'magnitude' declare "
+            "that the source is ALREADY combined and mount no transform -- see #2093."
+        ),
     )
 
     num_virtual_coils: int = Field(

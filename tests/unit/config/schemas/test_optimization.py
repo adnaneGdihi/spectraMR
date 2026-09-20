@@ -20,7 +20,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from spectramr.config.schemas.optimization import OptimizationConfigSchema
+from spectramr.config.schemas.optimization import (
+    CompileConfigSchema,
+    OptimizationConfigSchema,
+)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -583,3 +586,155 @@ class TestUnwiredKnobStaysVisible:
         under `optimizer:` would imply it works (pitfall #15/#16)."""
         assert "num_steps" in OptimizationConfigSchema.model_fields
         assert OptimizationConfigSchema().num_steps is None
+
+
+class TestRegionalAndComplexOptOut:
+    """The two knobs regional compilation adds, and why each validator exists."""
+
+    def test_defaults_preserve_every_existing_arm(self):
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        cfg = CompileConfigSchema()
+        assert cfg.regional is False
+        assert cfg.allow_complex is False
+
+    def test_regional_is_accepted_with_compile_on(self):
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        assert CompileConfigSchema(enabled=True, regional=True).regional is True
+
+    @pytest.mark.parametrize("knob", ["regional", "allow_complex"])
+    def test_a_knob_under_disabled_compile_raises(self, knob):
+        """Planted: a knob declared against a disabled mechanism never runs, and
+        is indistinguishable from the outside from one that works (pitfall 15)."""
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        with pytest.raises(ValidationError, match="never be read"):
+            CompileConfigSchema(enabled=False, **{knob: True})
+
+    def test_allow_complex_without_regional_raises(self):
+        """Planted: the opt-out rests on the physics ops being fenced out of the
+        graph. Whole-model compilation puts them back, where Inductor silently
+        falls back to eager -- the false-throughput claim the check prevents."""
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        with pytest.raises(ValidationError, match="requires regional"):
+            CompileConfigSchema(enabled=True, allow_complex=True)
+
+    def test_allow_complex_with_fullgraph_raises(self):
+        """Planted: the fences are torch._dynamo.disable, which forces a graph
+        break, and a graph break under fullgraph raises. Rejecting the pair at
+        load time costs 100ms instead of failing at the first forward pass."""
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        with pytest.raises(ValidationError, match="cannot be combined with"):
+            CompileConfigSchema(
+                enabled=True, regional=True, allow_complex=True, fullgraph=True
+            )
+
+    def test_the_legal_combination_is_accepted(self):
+        from spectramr.config.schemas.optimization import CompileConfigSchema
+
+        cfg = CompileConfigSchema(enabled=True, regional=True, allow_complex=True)
+        assert cfg.allow_complex and cfg.regional and not cfg.fullgraph
+
+
+# --------------------------------------------------------------------------- #
+# compile.apply_to — which models compilation touches
+#
+# Before this existed, `regional` was unusable by every GAN arm: it refuses an
+# arm whose models do not all expose a uniform block list, and a patch critic is
+# a plain nn.Sequential. The knob is what makes "compile the generator only" a
+# thing the config can say.
+# --------------------------------------------------------------------------- #
+def _compile(**kwargs) -> CompileConfigSchema:
+    return CompileConfigSchema(**kwargs)
+
+
+def test_apply_to_defaults_to_every_model() -> None:
+    """None, not a list of all four -- the default must keep meaning "all" if a
+    fifth model is ever built."""
+    assert _compile().apply_to is None
+
+
+def test_apply_to_accepts_the_built_model_names() -> None:
+    assert _compile(enabled=True, apply_to=["generator", "discriminator"]).apply_to == [
+        "generator",
+        "discriminator",
+    ]
+
+
+def test_an_unknown_model_name_is_rejected_at_load() -> None:
+    """Planted: a closed vocabulary, so a misspelling raises here rather than
+    selecting nothing at build time (non-negotiable 3)."""
+    with pytest.raises(ValidationError):
+        _compile(enabled=True, apply_to=["critic"])
+
+
+def test_an_empty_selection_is_rejected() -> None:
+    """Planted: `apply_to: []` is `enabled: false` spelled so nobody notices."""
+    with pytest.raises(ValidationError, match="empty list"):
+        _compile(enabled=True, apply_to=[])
+
+
+# --------------------------------------------------------------------------- #
+# compile.recompile_limit / fail_on_recompile_limit
+#
+# torch drops a frame to eager once it exhausts its recompilation budget, and
+# `fail_on_recompile_limit_hit` is OFF by default -- so a run can stop being
+# compiled partway through and still report a compiled configuration.
+# --------------------------------------------------------------------------- #
+def test_failing_on_the_recompile_limit_is_the_default() -> None:
+    """Torch defaults this off. This block's whole policy is that a run must not
+    report a configuration it stopped executing, so the default is inverted."""
+    assert _compile().fail_on_recompile_limit is True
+
+
+def test_recompile_limit_defaults_to_torchs_own() -> None:
+    """None, not 8: hard-coding torch's default here would silently pin it
+    across a version bump that changed it."""
+    assert _compile().recompile_limit is None
+
+
+def test_a_declared_budget_must_be_enforced() -> None:
+    """Planted: declaring how much recompilation you tolerate and then declining
+    to act on it means exceeding it drops to eager in silence."""
+    with pytest.raises(ValidationError, match="fail_on_recompile_limit"):
+        _compile(enabled=True, recompile_limit=16, fail_on_recompile_limit=False)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_budget_is_rejected(value: int) -> None:
+    """Zero would disable compilation by a side door."""
+    with pytest.raises(ValidationError, match="recompile_limit"):
+        _compile(enabled=True, recompile_limit=value)
+
+
+# --------------------------------------------------------------------------- #
+# Inert knobs under `enabled: false`
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"apply_to": ["generator"]},
+        {"recompile_limit": 16},
+        {"regional": True},
+        {"fail_on_recompile_limit": False},
+    ],
+    ids=["apply_to", "recompile_limit", "regional", "fail_on_recompile_limit"],
+)
+def test_a_knob_under_disabled_compilation_is_rejected(kwargs) -> None:
+    """An advertised knob nothing reads is indistinguishable from one that works
+    (pitfall 15)."""
+    with pytest.raises(ValidationError, match="enabled is false"):
+        _compile(enabled=False, **kwargs)
+
+
+def test_plain_eager_is_still_valid() -> None:
+    """Planted against the obvious way to get the above wrong: the inert-knob
+    check compares against each field's DEFAULT, not truthiness. A truthiness
+    test would call `fail_on_recompile_limit=True` "set" and reject every eager
+    arm in the corpus.
+    """
+    assert CompileConfigSchema().enabled is False
+    assert CompileConfigSchema(enabled=False).fail_on_recompile_limit is True

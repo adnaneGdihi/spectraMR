@@ -482,7 +482,7 @@ class NullSpaceProjection(nn.Module):
         return self.A.normal(x)
 
 
-class DataConsistencyLayer(nn.Module):
+class MultiCoilDataConsistency(nn.Module):
     """Data consistency layer for iterative reconstruction.
 
     Enforces that reconstruction is consistent with acquired k-space:
@@ -531,7 +531,7 @@ class DataConsistencyLayer(nn.Module):
         Returns:
             Data-consistent reconstruction (batch, 1, H, W) complex
 
-        forward method for DataConsistencyLayer.
+        forward method for MultiCoilDataConsistency.
 
         Executes PyTorch tensor operations.
 
@@ -665,7 +665,7 @@ def create_cartesian_mask(
 
 
 __all__ = [
-    "DataConsistencyLayer",
+    "MultiCoilDataConsistency",
     "MultiCoilForwardOperator",
     "NullSpaceProjection",
     "create_cartesian_mask",

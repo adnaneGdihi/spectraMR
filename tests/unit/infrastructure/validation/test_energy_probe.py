@@ -498,3 +498,85 @@ def test_hooks_capture_both_effective_and_raw_gain() -> None:
     # gamma = 0, so the effective gain is exactly 1 while the raw block attenuates.
     assert records["attention"][0].rho == pytest.approx(1.0, abs=1e-6)
     assert records["attention.inner"][0].rho < 1.0
+
+
+# ── #2122: the probe resolves kwargs through the one owner ────────────────────
+class _CeilingGen(nn.Module):
+    """Stands in for ``kspace_cold_diffusion``'s magnitude-ceiling contract.
+
+    Reproduces the guard that made the probe skip 12 of 12 arms in its own
+    cohort: a declared ``output_kspace_clip_ratio`` cannot be bounded without
+    knowing which domain it bounds (#1281), so the constructor refuses rather
+    than assuming one. The refusal is correct; the probe was on the wrong side
+    of it because it re-derived the kwargs instead of asking the SSOT.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        output_kspace_clip_ratio: float | None = None,
+        kspace_log_scaled: bool | None = None,
+        acceleration_config: object | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__()
+        if output_kspace_clip_ratio is not None and kspace_log_scaled is None:
+            raise ValueError(
+                "output_kspace_clip_ratio is set but kspace_log_scaled was never "
+                "supplied, so the magnitude ceiling cannot be built in the right domain."
+            )
+        self.kspace_log_scaled = kspace_log_scaled
+        self.acceleration_config = acceleration_config
+        self.seen_kwargs = kwargs
+        self.body = nn.Identity()
+
+
+def _ceiling_arm(*, log_scaled: bool = True) -> SimpleNamespace:
+    """A config shaped like the arms that could not be probed."""
+    # Routed through the stub's flat->canonical map, not assigned after the
+    # fact: every sub-block is frozen=True (non-negotiable 1).
+    data = DataConfigStub(patch_size=[8, 8], batch_size=1, log_scaling=log_scaled)
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            model_type="_ceiling_probe_stub",
+            in_channels=2,
+            out_channels=2,
+            model_kwargs={"output_kspace_clip_ratio": 1.3},
+        ),
+        data=data,
+        undersampling=SimpleNamespace(base_acceleration=1.0, max_acceleration=32.0),
+    )
+
+
+@pytest.fixture
+def _registered_ceiling_gen(monkeypatch):
+    """Route ``get_model_class`` to the stub without touching the real registry."""
+    import spectramr.models.registry as registry
+
+    monkeypatch.setattr(registry, "get_model_class", lambda name: _CeilingGen)
+    return _CeilingGen
+
+
+def test_build_probe_model_injects_the_log_scaling_ssot(_registered_ceiling_gen):
+    """The arm that could not be built is built, and carries the injected flag.
+
+    Reverting ``build_probe_model`` to its own kwargs derivation turns this red
+    with the constructor's own ValueError -- which is exactly the message the
+    cohort sweep printed 12 times before exiting (#2122).
+    """
+    model = ep.build_probe_model(_ceiling_arm(log_scaled=True), "cpu")
+    assert model.kspace_log_scaled is True
+
+
+def test_build_probe_model_reads_the_data_block_not_a_default(_registered_ceiling_gen):
+    """``False`` is forwarded as ``False``, never elided into "unset"."""
+    model = ep.build_probe_model(_ceiling_arm(log_scaled=False), "cpu")
+    assert model.kspace_log_scaled is False
+
+
+def test_build_probe_model_injects_the_acceleration_config(_registered_ceiling_gen):
+    """Step 3a is part of the same resolution and must not be re-dropped."""
+    config = _ceiling_arm()
+    model = ep.build_probe_model(config, "cpu")
+    assert model.acceleration_config is config.undersampling

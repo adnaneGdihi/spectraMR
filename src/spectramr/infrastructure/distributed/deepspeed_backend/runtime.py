@@ -160,7 +160,7 @@ def _activate_deepcompile(engine: Any, config: dict[str, Any]) -> None:
     Raises rather than warns on failure. Compilation is the arm's performance
     claim; a run that silently falls back to eager is reporting throughput
     numbers that belong to a different configuration -- the same reasoning that
-    made ``ModelBuilder.compile()`` stop swallowing its exceptions.
+    made the torch.compile path stop swallowing its exceptions.
     """
     if not config.get("compile", {}).get("deepcompile"):
         return

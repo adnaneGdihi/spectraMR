@@ -301,3 +301,198 @@ class TestPhaseSafeDualAttentionReductionIsLive:
 
         with pytest.raises(ValueError, match="reduction must be >= 1"):
             PhaseSafeDualAttention(in_channels=8, num_heads=1, reduction=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The saddle the #471 wrapper created (completes #471)
+#
+# IdentityAtInitAttention and the three blocks' own zero-init output projection
+# are two mechanisms for ONE invariant. Composed, y = x + g*(P*a + b) with
+# g == P == b == 0, so dy/dg = P*a + b = 0 and dy/dP = g*a^T = 0: every gradient
+# into the block is exactly zero and stays there. Measured on the real dispatch
+# before the fix: after 50 AdamW steps gamma was still 0.000000 and the block was
+# a bit-exact identity, i.e. the self / kernelized / sparse arms were the
+# attention_none control. ChannelAttention escapes because inner(x) - x != 0,
+# which is why the pre-existing wrapper test -- written against exactly that
+# class -- stayed green (non-negotiable 15: a gate is only a gate for the
+# violation shape you have watched it fail on).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SADDLE_PRONE = [LinearAttention, KernelizedAttention, WindowAttention]
+
+
+@pytest.mark.parametrize("cls", _SADDLE_PRONE)
+def test_zero_init_output_is_opt_out_not_mandatory(cls) -> None:
+    """``zero_init_output=False`` must leave a block that is NOT the identity."""
+    torch.manual_seed(0)
+    attn = cls(32, zero_init_output=False)
+    x = _kspace_feature(C=32, H=16, W=16)
+
+    with torch.no_grad():
+        assert not torch.allclose(attn(x), x), "opting out must leave a live block"
+
+
+@pytest.mark.parametrize("cls", _SADDLE_PRONE)
+@pytest.mark.parametrize("zero_init_output", [True, False])
+def test_wrapped_block_escapes_zero_only_without_the_second_mechanism(
+    cls, zero_init_output: bool
+) -> None:
+    """Planted violation: ``zero_init_output=True`` under the wrapper is the saddle.
+
+    Two backward passes, not one. At ``gamma == 0`` the inner gradients are zero
+    by construction on the FIRST backward whatever the inner block is, so a
+    single-backward assertion cannot tell the saddle from a healthy block.
+    """
+    from spectramr.models.blocks.attention import IdentityAtInitAttention
+
+    torch.manual_seed(0)
+    wrapped = IdentityAtInitAttention(cls(32, zero_init_output=zero_init_output))
+    opt = torch.optim.AdamW(wrapped.parameters(), lr=1e-2)
+    target = torch.randn(2, 32, 16, 16)
+
+    def step() -> None:
+        opt.zero_grad(set_to_none=True)
+        ((wrapped(_kspace_feature(C=32, H=16, W=16)) - target) ** 2).mean().backward()
+        opt.step()
+
+    step()
+    gamma_grad = wrapped.gamma.grad.abs().item()
+    step()
+    inner_grad = max(
+        0.0 if p.grad is None else p.grad.abs().max().item()
+        for p in wrapped.inner.parameters()
+    )
+
+    if zero_init_output:
+        # The planted violation: this is the state the dispatch used to build.
+        assert gamma_grad == 0.0 and inner_grad == 0.0
+        assert wrapped.gamma.item() == 0.0
+    else:
+        assert gamma_grad > 0.0, "gamma must receive gradient on the first backward"
+        assert inner_grad > 0.0, "inner parameters must train once gamma leaves zero"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The FAVOR+ estimate has to be usable on k-space, not merely unbiased (#405)
+#
+# #405 restored the D^-1 normalizer, which fixed the gain. It did not make the
+# estimate track softmax attention: k-space dynamic range is SPATIAL, so the DC
+# bin drives the logits to ~5e3 and the 256-feature Monte-Carlo estimate of
+# exp() is uncorrelated with what it approximates. LinearAttention carries an
+# InstanceNorm2d pre-norm and this block carried none -- an asymmetry inside a
+# family the shootout reads as differing only in kernel.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _favor_relative_error(attn: KernelizedAttention, x: torch.Tensor, *, prenorm: bool) -> float:
+    """||FAVOR+(q,k,v) - softmax(q,k,v)|| / ||softmax(q,k,v)|| on the block's own seam."""
+    import math
+
+    b, c, h, w = x.shape
+    seq = h * w
+    flat = x.view(b, c, seq).transpose(1, 2)
+    flat = attn.norm(flat) if prenorm else flat
+    nh, hd = attn.num_heads, attn.head_dim
+    q, k, v = (
+        proj(flat).view(b, seq, nh, hd).transpose(1, 2)
+        for proj in (attn.q_proj, attn.k_proj, attn.v_proj)
+    )
+    with torch.no_grad():
+        approx = attn._favor_attention(q, k, v)
+        exact = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(hd), dim=-1) @ v
+    return ((approx - exact).norm() / exact.norm()).item()
+
+
+def test_favor_plus_tracks_softmax_attention_on_kspace_features() -> None:
+    """Planted violation included: bypassing the pre-norm must blow the same bound."""
+    for seed in range(4):
+        attn = KernelizedAttention(64, num_heads=8, num_features=256, feature_seed=seed).eval()
+        x = _kspace_feature(seed=seed, C=64, H=64, W=64)
+
+        assert _favor_relative_error(attn, x, prenorm=True) < 0.25
+        # Without the per-token norm the estimate is uncorrelated with its target.
+        assert _favor_relative_error(attn, x, prenorm=False) > 0.5
+
+
+def test_random_features_are_orthogonal_within_each_block() -> None:
+    """ORF is the variance half of the fix; plain ``randn`` would pass nothing here."""
+    from spectramr.models.blocks.attention import orthogonal_random_features
+
+    w = orthogonal_random_features(2, 8, 8, torch.Generator().manual_seed(0))
+    directions = torch.nn.functional.normalize(w, dim=-1)
+    gram = directions @ directions.transpose(-2, -1)
+    off_diagonal = gram - torch.eye(8).expand_as(gram)
+    assert off_diagonal.abs().max().item() < 1e-5
+
+
+def test_feature_draw_is_seeded_locally_not_from_global_rng() -> None:
+    """Every rank must build identical features by construction, not by broadcast."""
+    first = KernelizedAttention(64, feature_seed=7)
+    torch.manual_seed(999)
+    second = KernelizedAttention(64, feature_seed=7)
+    assert torch.equal(first.rand_features, second.rand_features)
+    assert not torch.equal(
+        first.rand_features, KernelizedAttention(64, feature_seed=8).rand_features
+    )
+
+
+def test_extras_are_routed_by_name_so_a_mask_block_is_not_handed_t_emb() -> None:
+    """The planted violation for the arity -> name change.
+
+    Positional arity says "this block takes a second argument" and stops there,
+    so ``forward(x, mask)`` and ``forward(x, t_emb)`` are indistinguishable under
+    it and the wrapper would pass whichever it happened to hold. Both stubs below
+    have arity 2; only name-based detection routes them differently.
+    """
+    from spectramr.models.blocks.attention import IdentityAtInitAttention
+
+    received: dict[str, torch.Tensor | None] = {}
+
+    class _WantsMask(nn.Module):
+        def forward(self, x, mask=None):
+            received["mask"] = mask
+            return x * 2.0
+
+    class _WantsTEmb(nn.Module):
+        def forward(self, x, t_emb=None):
+            received["t_emb"] = t_emb
+            return x * 2.0
+
+    x = torch.randn(1, 4, 4, 4)
+    t_emb, mask = torch.full((1, 8), 7.0), torch.ones(1, 1, 4, 4)
+
+    mask_block = IdentityAtInitAttention(_WantsMask())
+    assert (mask_block.takes_mask, mask_block.takes_t_emb) == (True, False)
+    mask_block(x, t_emb, mask=mask)
+    assert torch.equal(received["mask"], mask), "the mask block was handed t_emb"
+
+    t_block = IdentityAtInitAttention(_WantsTEmb())
+    assert (t_block.takes_mask, t_block.takes_t_emb) == (False, True)
+    t_block(x, t_emb, mask=mask)
+    assert torch.equal(received["t_emb"], t_emb)
+
+
+# ---------------------------------------------------------------------------
+# ChannelAttention accepts the feature maps the encoder actually hands it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda b: b, id="contiguous"),
+        pytest.param(lambda b: b.permute(0, 1, 3, 2), id="permuted"),
+        pytest.param(lambda b: b[:, :, ::2, ::2], id="strided-spatial"),
+        pytest.param(lambda b: b[1:3], id="batch-slice"),
+    ],
+)
+def test_channel_attention_handles_non_contiguous_feature_maps(make) -> None:
+    """``view`` refused any of these outright; the pooling needs a copy, not a view."""
+    from spectramr.models.blocks.attention import ChannelAttention
+
+    base = torch.randn(4, 32, 16, 16)
+    x = make(base)
+    out = ChannelAttention(32)(x)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()

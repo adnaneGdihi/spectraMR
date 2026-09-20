@@ -112,6 +112,107 @@ REVIVED = {arm for arm, w in BASELINE.items() if all(v == 0.0 for v in w.values(
 #: Every entry cites the commit that made the change and where the decision is
 #: recorded, so the set cannot be used to wave a genuine regression through.
 SUPERSEDED: dict[str, str] = {
+    "experiments/inprogress/kspace_filling/baseline_cdiffmr.yaml": (
+        "617a0b489 -- the three prior-method arms were re-read against their own papers. "
+        "The frozen 10.0 is this repository's lambda table, not the published weight: "
+        "CDiffMR's option file declares `lossfn_type: l1, lossfn_weight: 1.0`, Shen's "
+        "`KspaceDiffusion` takes `loss_type='l1'` at unit weight, and FDB's objective is "
+        "MSE on x_0 (`utils/fdb.py:318`), so its term changes family as well as weight. "
+        "TODO/backlog_baseline_replication_experiment_11.md records the sources."
+    ),
+    "experiments/inprogress/kspace_filling/baseline_fdb.yaml": (
+        "617a0b489 -- the three prior-method arms were re-read against their own papers. "
+        "The frozen 10.0 is this repository's lambda table, not the published weight: "
+        "CDiffMR's option file declares `lossfn_type: l1, lossfn_weight: 1.0`, Shen's "
+        "`KspaceDiffusion` takes `loss_type='l1'` at unit weight, and FDB's objective is "
+        "MSE on x_0 (`utils/fdb.py:318`), so its term changes family as well as weight. "
+        "TODO/backlog_baseline_replication_experiment_11.md records the sources."
+    ),
+    "experiments/inprogress/kspace_filling/baseline_shen2024.yaml": (
+        "617a0b489 -- the three prior-method arms were re-read against their own papers. "
+        "The frozen 10.0 is this repository's lambda table, not the published weight: "
+        "CDiffMR's option file declares `lossfn_type: l1, lossfn_weight: 1.0`, Shen's "
+        "`KspaceDiffusion` takes `loss_type='l1'` at unit weight, and FDB's objective is "
+        "MSE on x_0 (`utils/fdb.py:318`), so its term changes family as well as weight. "
+        "TODO/backlog_baseline_replication_experiment_11.md records the sources."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11a_swin_diff_rec.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11a_swin_diff_rec_standardized.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11b_diff_varnet.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11c_swin_diff_rec_kan.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11d_diff_varnet_kan.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11e_nafnet.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
+    "experiments/inprogress/exp_11_variant/experiment_11f_mamba_cold_diffusion.yaml": (
+        "451e37b54 -- the exp_11_variant backbone shootout was regenerated from "
+        "attention_shootout/experiment_11_attention_none so the cohort reads against "
+        "one control. Five of its arms could not build a model at all (the generator "
+        "refuses force_pure_kspace on an image-domain-DC backbone, and attention_type "
+        "on a backbone with no attention seam), so the objective the materializer "
+        "froze -- image_losses: [mse @ 1.0] alone -- is the objective of a run that "
+        "never happened. The arms now carry the control's five k-space terms plus "
+        "hfen and pre_dc_kspace. experiments/inprogress/exp_11_variant/README.md "
+        "records the cohort contract."
+    ),
     "experiments/inprogress/mrixfields2026/task3/b34_ablate_euclidean.yaml": (
         "c8c2a7579 -- FisherRaoGeodesicStrategy is inline-loss: it reads "
         "training.fisher_rao_geodesic.lambda_l1 (=1.0) as its sole authority and never "

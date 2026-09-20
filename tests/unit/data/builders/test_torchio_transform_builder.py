@@ -1126,3 +1126,44 @@ def _fold_copies(source: str) -> list[int]:
         if pattern.search(code):
             hits.append(lineno)
     return hits
+
+
+# ── #2093: the coil mode the three prior-method arms need ─────────────────────
+
+
+class TestCoilModeDispatchForPriorMethodArms:
+    """``rss_per_channel`` mounts a combine; ``rss`` deliberately still does not.
+
+    CDiffMR, FDB and Shen 2024 are all single-coil methods whose networks take
+    two channels, so 4-coil M4Raw has to be reduced before the model sees it.
+    ``rss`` cannot do that job: it has always declared "the source is already
+    combined" and mounted nothing, and seven arms rely on that reading. The
+    second test is what stops this change from quietly altering them.
+    """
+
+    @staticmethod
+    def _cfg(mode: str):
+        return TorchIOTransformConfig(patch_size=(16, 16, 1), coil_processing_mode=mode)
+
+    @staticmethod
+    def _combine_transforms(pipeline):
+        from spectramr.data.transforms.kspace_coil_transforms import CoilCombineTransform
+
+        return [t for t in pipeline.transforms if isinstance(t, CoilCombineTransform)]
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_rss_per_channel_mounts_the_combine(self, which):
+        mounted = self._combine_transforms(_builder(which)(self._cfg("rss_per_channel")))
+
+        assert len(mounted) == 1
+        assert mounted[0].method == "rss_per_channel"
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_rss_still_mounts_nothing(self, which):
+        """The planted red. Giving ``rss`` a transform would change 7 arms in place."""
+        assert self._combine_transforms(_builder(which)(self._cfg("rss"))) == []
+
+    def test_an_unknown_mode_still_raises(self):
+        """Widening the dispatch must not widen it to everything (pitfall #9)."""
+        with pytest.raises(ValueError, match="Unknown coil_processing_mode"):
+            TorchIOTransformBuilder.build_train_transforms(self._cfg("rss_per_coil"))

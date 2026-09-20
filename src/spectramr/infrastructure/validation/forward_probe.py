@@ -907,7 +907,7 @@ def synthetic_forward_probe(
         #
         # That fabrication is invisible on most arms because the generator's own
         # DC path narrows a too-wide measurement before use -- but a backbone
-        # with an INTERNAL ``DataConsistencyLayer`` receives the kwarg verbatim
+        # with an INTERNAL ``MaskedReplacementDataConsistency`` receives the kwarg verbatim
         # and has no such narrowing. ``swin_diff_rec`` then died on
         # ``k_guessed=[2,4,H,W]`` vs ``measured=[2,8,H,W]`` (complex channels;
         # 4 == out_channels/2, 8 == in_channels), failing a healthy arm on a

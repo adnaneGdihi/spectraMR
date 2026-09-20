@@ -63,6 +63,7 @@ from spectramr.models.blocks.attention import (
 )
 from spectramr.models.blocks.attention_domains import (
     ATTENTION_DOMAIN_SUPPORT,
+    complex_to_interleaved,
     validate_feature_domain,
 )
 from spectramr.models.blocks.dual_domain import DualDomainBlock
@@ -70,6 +71,17 @@ from spectramr.models.blocks.dual_domain_attention import DualDomainAttention
 from spectramr.models.blocks.dual_domain_attention_kan import (
     KANGatedDualDomainAttention,
     WaveletFreqAttentionBlock,
+)
+from spectramr.models.blocks.hermitian_null_space_attention import (
+    HermitianNullSpaceAttention,
+)
+from spectramr.models.blocks.null_space_attention import NullSpaceDualDomainAttention
+from spectramr.models.blocks.radial_band_gain import DEFAULT_MAX_LOG_GAIN, RadialBandGain
+from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
+from spectramr.models.generators.backbone_builders import (
+    BackboneBuildContext,
+    build_backbone,
+    registered_backbone_names,
 )
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.complex_conv import ComplexConv2d
@@ -124,6 +136,25 @@ def model_expects_smaps_concat(model: object, *, default: bool = False) -> bool:
 #: while ``__init__`` answers differently -- a divergence that surfaces as a
 #: wrong *number* rather than an error (CLAUDE.md #17).
 DEFAULT_BACKBONE_TYPE = "unet"
+
+#: The spellings the ``if/elif`` chain in ``FourierBridgeNetwork.__init__``
+#: handles itself. Everything else falls through to ``backbone_builders``.
+_CHAIN_BACKBONE_TYPES: tuple[str, ...] = (
+    "complex_unet",
+    "diff_varnet",
+    "diff_varnet_kan",
+    "mamba_unet",
+    "nafnet",
+    "restormer",
+    "swin_diff_rec",
+    "swin_diff_rec_kan",
+    "swin_transformer",
+    "swinir",
+    "unet",
+    "vision_mamba",
+    "vision_transformer",
+    "vit",
+)
 DEFAULT_CONDITION_WITH_SMAPS = True
 
 
@@ -137,7 +168,7 @@ def resolve_expects_smaps_concat(*, backbone_type: str, condition_with_smaps: bo
 
     It IS a conjunction, and that is the whole point: ``condition_with_smaps``
     is the arm's *declaration*, but an internal-DC backbone is built at ``1x``
-    regardless, because its per-cascade ``DataConsistencyLayer`` compares
+    regardless, because its per-cascade ``MaskedReplacementDataConsistency`` compares
     against a channel-preserved measurement. Reading either half alone gives
     the wrong answer for one of the two arm families.
     """
@@ -627,16 +658,33 @@ class KSpaceDownsampleBlock(nn.Module):
         # path (ImageColdDiffusionUNet), which never uses these blocks.
         # Unsupported attention_type values still fail loud in the dispatch
         # ``else`` below. See docs/smoke_audit_20260523_fixes.rst.
+        # ``zero_init_output=False``: IdentityAtInitAttention below is the ONE owner
+        # of identity-at-init here, and stacking the block's own zero-init under it
+        # freezes every parameter at an exact saddle (issue #471, non-negotiable 17).
         if attention_type == "self":
-            self.attention = LinearAttention(out_channels, norm_type="instance")
+            self.attention = LinearAttention(
+                out_channels, norm_type="instance", zero_init_output=False
+            )
         elif attention_type == "kernelized":
-            self.attention = KernelizedAttention(out_channels)
+            self.attention = KernelizedAttention(out_channels, zero_init_output=False)
         elif attention_type == "sparse":
-            self.attention = SparseAttention(out_channels)
+            self.attention = SparseAttention(out_channels, zero_init_output=False)
         elif attention_type == "channel":
             self.attention = ChannelAttention(out_channels)
         elif attention_type == "dual_domain":
             self.attention = DualDomainAttention(out_channels, feature_domain=self.feature_domain)
+        elif attention_type == "null_space_dual_domain":
+            self.attention = NullSpaceDualDomainAttention(
+                out_channels,
+                num_heads=int(self._kan_dual_domain_kwargs.get("num_heads", 4)),
+                feature_domain=self.feature_domain,
+            )
+        elif attention_type == "hermitian_null_space":
+            self.attention = HermitianNullSpaceAttention(
+                out_channels,
+                num_features=int(self._kan_dual_domain_kwargs.get("num_features", 32)),
+                feature_domain=self.feature_domain,
+            )
         elif attention_type == "kan_dual_domain":
             kan_kw = dict(self._kan_dual_domain_kwargs)
             kan_kw.setdefault("num_heads", 4)
@@ -684,7 +732,10 @@ class KSpaceDownsampleBlock(nn.Module):
             self.attention = IdentityAtInitAttention(self.attention)
 
     def forward(
-        self, x: torch.Tensor, t_emb: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """forward.
 
@@ -722,12 +773,12 @@ class KSpaceDownsampleBlock(nn.Module):
         x = self.unet_block(x, t_emb)
         skip = x  # Save for skip connection
 
-        # IdentityAtInitAttention forwards t_emb only to blocks whose signature
-        # accepts it (detected once at construction). The old isinstance check
-        # against a hardcoded class tuple would silently drop t_emb -- blinding the
-        # timestep conditioning -- for any new time-conditioned block.
+        # IdentityAtInitAttention forwards t_emb and mask only to blocks whose
+        # signature declares them, by NAME (detected once at construction). The
+        # isinstance check this replaced would silently drop t_emb for any new
+        # time-conditioned block, and positional arity cannot tell the two apart.
         if not isinstance(self.attention, nn.Identity):
-            x = self.attention(x, t_emb)
+            x = self.attention(x, t_emb, mask=mask)
 
         x = self.downsample(x)
         return x, skip
@@ -825,12 +876,17 @@ class KSpaceUpsampleBlock(nn.Module):
         # (line ~806 concatenation comment), so all attention types forward
         # cleanly. Unsupported values still fail loud in the dispatch
         # ``else`` below. See docs/smoke_audit_20260523_fixes.rst.
+        # ``zero_init_output=False``: IdentityAtInitAttention below is the ONE owner
+        # of identity-at-init here, and stacking the block's own zero-init under it
+        # freezes every parameter at an exact saddle (issue #471, non-negotiable 17).
         if attention_type == "self":
-            self.attention = LinearAttention(out_channels, norm_type="instance")
+            self.attention = LinearAttention(
+                out_channels, norm_type="instance", zero_init_output=False
+            )
         elif attention_type == "kernelized":
-            self.attention = KernelizedAttention(out_channels)
+            self.attention = KernelizedAttention(out_channels, zero_init_output=False)
         elif attention_type == "sparse":
-            self.attention = SparseAttention(out_channels)
+            self.attention = SparseAttention(out_channels, zero_init_output=False)
         elif attention_type == "channel":
             self.attention = ChannelAttention(out_channels)
         elif attention_type == "spatial":
@@ -839,6 +895,18 @@ class KSpaceUpsampleBlock(nn.Module):
             )  # Standardize on 7x7 CBAM for spatial consistency
         elif attention_type == "dual_domain":
             self.attention = DualDomainAttention(out_channels, feature_domain=self.feature_domain)
+        elif attention_type == "null_space_dual_domain":
+            self.attention = NullSpaceDualDomainAttention(
+                out_channels,
+                num_heads=int(self._kan_dual_domain_kwargs.get("num_heads", 4)),
+                feature_domain=self.feature_domain,
+            )
+        elif attention_type == "hermitian_null_space":
+            self.attention = HermitianNullSpaceAttention(
+                out_channels,
+                num_features=int(self._kan_dual_domain_kwargs.get("num_features", 32)),
+                feature_domain=self.feature_domain,
+            )
         elif attention_type == "kan_dual_domain":
             kan_kw = dict(self._kan_dual_domain_kwargs)
             kan_kw.setdefault("num_heads", 4)
@@ -886,7 +954,11 @@ class KSpaceUpsampleBlock(nn.Module):
             self.attention = IdentityAtInitAttention(self.attention)
 
     def forward(
-        self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        skip: torch.Tensor,
+        t_emb: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """forward.
 
@@ -915,12 +987,10 @@ class KSpaceUpsampleBlock(nn.Module):
         x = self.kspace_pad(x, target_shape=skip.shape[-2:])
         x = self.upsample_conv(x)
 
-        # IdentityAtInitAttention forwards t_emb only to blocks whose signature
-        # accepts it (detected once at construction). The old isinstance check
-        # against a hardcoded class tuple would silently drop t_emb -- blinding the
-        # timestep conditioning -- for any new time-conditioned block.
+        # IdentityAtInitAttention forwards t_emb and mask only to blocks whose
+        # signature declares them, by NAME (detected once at construction).
         if not isinstance(self.attention, nn.Identity):
-            x = self.attention(x, t_emb)
+            x = self.attention(x, t_emb, mask=mask)
 
         # Concatenate skip connection
         # Both x and skip are Interleaved [R1, I1, R2, I2, ...]
@@ -968,6 +1038,7 @@ class FourierBridgeNetwork(nn.Module):
         config: UNetConfig,
         backbone_type: str = "unet",
         force_pure_kspace: bool = False,
+        time_embedding_dim: int = 256,
         **backbone_kwargs,
     ):
         """__init__.
@@ -1003,6 +1074,10 @@ class FourierBridgeNetwork(nn.Module):
             "mamba_unet",
             "vision_mamba",
             "complex_unet",
+            # The registry trunks all take ``timesteps``; a backbone that did not
+            # would simply never see the key, which is the facade this set exists
+            # to prevent.
+            *registered_backbone_names(),
         }
 
         # Select backbone architecture
@@ -1012,19 +1087,13 @@ class FourierBridgeNetwork(nn.Module):
             k: v for k, v in backbone_kwargs.items() if k not in common_filtered_keys
         }
 
-        # ``kspace_feature_norm`` is a complex_unet-only inter-layer-norm knob
-        # (ComplexUNet pops + validates the value). Pop it here so it never leaks
-        # to a backbone that would silently swallow it, and re-inject only for
-        # complex_unet; a non-"none" value on any other backbone is a
-        # misconfiguration, so raise rather than no-op (pitfall #15).
-        _kspace_norm = base_clean_kwargs.pop("kspace_feature_norm", "none")
-        if backbone_type == "complex_unet":
-            base_clean_kwargs["kspace_feature_norm"] = _kspace_norm
-        elif str(_kspace_norm).lower() != "none":
-            raise ValueError(
-                f"kspace_feature_norm={_kspace_norm!r} applies only to "
-                f"backbone_type='complex_unet', not {backbone_type!r}."
-            )
+        # ``kspace_feature_norm`` and the radial-band-token knobs are gated by
+        # KSpaceColdDiffusionGenerator._gate_complex_unet_knobs, which is the one
+        # owner: it runs before EITHER backbone branch, where a gate sited here
+        # missed the PureKSpaceUNet one entirely. A direct caller of this class
+        # is a Python caller, not a config, and carries its own kwargs.
+        if backbone_type != "complex_unet":
+            base_clean_kwargs.pop("kspace_feature_norm", None)
 
         # Standardize image_size from kwargs if present
         img_size = (
@@ -1228,17 +1297,34 @@ class FourierBridgeNetwork(nn.Module):
                 in_channels=config.in_channels,
                 out_channels=config.out_channels,
                 features=config.features,
-                time_embedding_dim=256,  # Default for now, should be config driven
+                time_embedding_dim=time_embedding_dim,
                 img_size=img_size,
                 padding_mode=padding_mode,
                 feature_domain=self.feature_domain,
                 **base_clean_kwargs,
             )
         else:
-            raise ValueError(
-                f"Unknown backbone_type '{backbone_type}'. "
-                f"Supported types: unet, complex_unet, swin_diff_rec, diff_varnet, swin_diff_rec_kan, diff_varnet_kan, "
-                f"nafnet, vision_mamba, mamba_unet, vision_transformer, vit, swin_transformer, restormer, swinir."
+            # Anything the chain above does not name is a registered builder or
+            # nothing. Replacing the old hand-written "Supported types:" string
+            # with a derived one also fixes a list that had already drifted off
+            # the branches beside it.
+            self.backbone = build_backbone(
+                backbone_type,
+                BackboneBuildContext(
+                    in_channels=config.in_channels,
+                    out_channels=config.out_channels,
+                    features=tuple(config.features),
+                    img_size=tuple(img_size) if isinstance(img_size, (tuple, list))
+                    else (img_size, img_size),
+                    feature_domain=self.feature_domain,
+                    # The contrast embedding is built at ``time_embedding_dim``
+                    # while a transformer backbone runs at its own ``dim``, and
+                    # the backbones gated conditioning on those two being equal
+                    # -- structurally false, so the FiLM silently never fired.
+                    contrast_emb_dim=time_embedding_dim,
+                    kwargs=dict(base_clean_kwargs),
+                ),
+                also_supported=_CHAIN_BACKBONE_TYPES,
             )
 
         # ✅ Create channel adapter for flexible input handling
@@ -1565,12 +1651,18 @@ class FourierBridgeNetwork(nn.Module):
                 ifft2c(kspace_complex) if self.force_pure_kspace else image_space_complex
             )
             if torch.is_complex(spatial_complex):
-                guidance = torch.cat([spatial_complex.real, spatial_complex.imag], dim=1)
+                # Interleaved [R1,I1,R2,I2,...], the layout this module and
+                # ``PhaseSafeDualAttention`` (which reads ``0::2``/``1::2``)
+                # both use. A blocked [Re...,Im...] stack truncates to the value
+                # width by keeping every real part and dropping every imaginary
+                # one, which halves the guidance without changing a shape.
+                guidance = complex_to_interleaved(spatial_complex)
             else:
                 guidance = spatial_complex
 
             # The query projection expects the same stacked-channel count as the
-            # value tensor (``image_output``).
+            # value tensor (``image_output``); truncation now drops whole
+            # complex pairs rather than splitting real from imaginary.
             if guidance.shape[1] < image_output.shape[1]:
                 pad_size = image_output.shape[1] - guidance.shape[1]
                 guidance = F.pad(guidance, (0, 0, 0, 0, 0, pad_size), mode="replicate")
@@ -1848,6 +1940,11 @@ class PureKSpaceUNet(nn.Module):
 
 from spectramr.infrastructure.physics.sense import SENSESubspaceProjector
 
+#: Data-consistency methods that pin CARTESIAN bins, and so have no correct
+#: reading under an off-grid acquisition.
+GRID_DC_METHODS: frozenset[str] = frozenset(
+    {"hard", "soft", "noise_adaptive", "target_aware_fsdc", "kan_adaptive"}
+)
 
 @register_model(
     name="kspace_cold_diffusion",
@@ -1896,7 +1993,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
     # error. A property of the class is the same on every rank by construction.
     exposes_pre_dc = True
 
-    # Unrolled backbones whose internal ``DataConsistencyLayer`` keys against the
+    # Unrolled backbones whose internal ``MaskedReplacementDataConsistency`` keys against the
     # (un-doubled) measured k-space at EVERY cascade and preserve channel count
     # end-to-end — they have NO final projection to ``out_channels`` (unlike
     # ``swin_diff_rec``, whose ``final_conv`` reduces to ``out_channels`` BEFORE
@@ -1919,7 +2016,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
     # ``force_pure_kspace: true`` reach the swin backbones unchecked.
     _INTERNAL_DC_BACKBONES: frozenset[str] = frozenset({"diff_varnet", "diff_varnet_kan"})
 
-    #: Backbones whose internal ``DataConsistencyLayer`` consumes an
+    #: Backbones whose internal ``MaskedReplacementDataConsistency`` consumes an
     #: IMAGE-domain tensor and FFTs it itself
     #: (``physics/data_consistency_layer.py`` step 1). Membership is the DOMAIN
     #: invariant and is a SUPERSET of :attr:`_INTERNAL_DC_BACKBONES`, which
@@ -1948,6 +2045,33 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             "diff_varnet",
             "diff_varnet_kan",
             "nafnet",
+            # Audited 2026-09-17, the measurement the guard below was waiting
+            # for: sweeping attention_type over the whole registered vocabulary
+            # leaves the parameter count of each of these EXACTLY unchanged
+            # (restormer 2.378M, swinir 39.089M, vit 0.118M, swin_transformer
+            # 0.059M at base_channels=32) while a bogus name still raises.
+            # ``dual_domain`` is the one that looks alive -- it constructs 11
+            # extra submodules -- and they carry zero parameters between them.
+            "restormer",
+            "swinir",
+            "vision_transformer",
+            "vit",
+            "swin_transformer",
+            # mamba_unet.py contains zero references to ``attention_type`` and
+            # absorbs it through ``**kwargs`` -- the same static evidence that
+            # admitted diff_varnet and nafnet. It cannot be construction-swept
+            # without the ``.[mamba]`` extra, so this listing rests on the source,
+            # not on a parameter count.
+            "vision_mamba",
+            "mamba_unet",
+            # The four registry trunks are attention end to end, but none of them
+            # implements THIS framework's pluggable block-attention seam, so an
+            # arm naming one here would advertise a block it does not build.
+            "dit",
+            "uvit",
+            "u_vit",
+            "hat",
+            "diffit",
         }
     )
 
@@ -2101,7 +2225,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
 
         # [PHYSICS ORCHESTRATION] The diffusion process handles restoration sampling
         # Consolidate on KSpaceUndersamplingProcess (explicit physics)
-        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+        from spectramr.models.diffusion.forward_process_registry import (
+            build_forward_process,
+        )
 
         # Cross-contrast prior support: when the model is fed a paired
         # k-space tensor like ``[T1 || T2]``, declaring
@@ -2121,12 +2247,46 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # device-resident table instead of a per-step host sync (#1508). The
         # module's own parameters are placed by ``GeneratorBuilder.build``'s
         # ``.to(device)``, which is a separate concern and unchanged.
-        self.kspace_process = KSpaceUndersamplingProcess(
+        # The acquisition model is the arm's choice, not this class's: a radial
+        # arm degrades by dropping spokes off the grid, a Cartesian one by
+        # dropping bins on it. Resolved through the registry so an unknown name
+        # raises at build rather than silently acquiring Cartesian (pitfall 9).
+        process_type = str(kwargs.get("kspace_process_type", "cartesian_mask"))
+        extra_process_kwargs = {
+            key: kwargs[key]
+            for key in ("num_spokes", "samples_per_spoke", "density_compensation")
+            if key in kwargs
+        }
+        if extra_process_kwargs and process_type == "cartesian_mask":
+            raise ValueError(
+                f"{sorted(extra_process_kwargs)} are non-Cartesian acquisition "
+                f"knobs and kspace_process_type is 'cartesian_mask', which reads "
+                f"none of them. Declare kspace_process_type explicitly or drop "
+                f"the knobs (non-negotiable 8)."
+            )
+        if process_type != "cartesian_mask":
+            # The trajectory is built for one matrix size and the process raises
+            # on a mismatch at the first forward. Take the size from the arm
+            # rather than defaulting, so the failure is a config error at build.
+            declared = kwargs.get("im_size") or kwargs.get("img_size") or kwargs.get("image_size")
+            if declared is None:
+                raise ValueError(
+                    f"kspace_process_type={process_type!r} builds an off-grid "
+                    f"trajectory and needs the matrix size; declare im_size in "
+                    f"model.model_kwargs."
+                )
+            if isinstance(declared, int):
+                declared = (declared, declared)
+            extra_process_kwargs["im_size"] = tuple(declared)
+        self.kspace_process = build_forward_process(
+            process_type,
             num_timesteps=num_timesteps,
             prior_channel_range=prior_channel_range,
             device=device,
             **process_kwargs,
+            **extra_process_kwargs,
         )
+        self.kspace_process_type = process_type
         # Store DC method + sampler name for sample() use. Per
         # TODO/audit/11_diffusion_samplers_vae.md F1, ``_sampler_name``
         # was previously read but never written, so the YAML knob
@@ -2136,11 +2296,35 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # choice. Validation against ``SamplerRegistry.list_available()``
         # happens at sample-call time via ``get_sampler``.
         self._dc_method = kwargs.get("dc_method", "hard")
+        # A grid DC layer pins bins it believes were measured. Under an off-grid
+        # acquisition every Cartesian bin is interpolated, so `hard` would pin
+        # gridded values as data, and with an empty support it degrades to a
+        # silent no-op instead -- a run that trains with no data consistency and
+        # reports success. Fail at build (pitfall 9).
+        if process_type != "cartesian_mask" and self._dc_method in GRID_DC_METHODS:
+            raise ValueError(
+                f"dc_method={self._dc_method!r} is a grid-domain data-consistency "
+                f"method and kspace_process_type={process_type!r} acquires off-grid "
+                f"samples, where no Cartesian bin is a measurement. Declare a "
+                f"sample-domain consistency term on this arm instead."
+            )
         self._dc_weight = float(kwargs.get("dc_weight", 1.0))
         self._sampling_steps = int(kwargs.get("sampling_steps", 50))
         self._sampler_name = str(
             kwargs.get("sampler") or kwargs.get("inference_sampler") or "cold_mri"
         )
+        # Validated at BUILD by the module that actually looks the name up, so
+        # an arm naming a sampler this reverse loop cannot resolve fails now
+        # rather than mid-validation (pitfall 15).
+        from spectramr.models.diffusion.samplers.registry import list_available
+
+        _known = list_available()
+        if _known and self._sampler_name not in _known:
+            raise ValueError(
+                f"Unknown sampler {self._sampler_name!r}. Registered: "
+                f"{sorted(_known)}. Declaring an unregistered name used to run "
+                f"`cold_mri` silently."
+            )
         # Reverse-process variant for the cold_mri sampler. Validate at BUILD
         # (pitfall #15) so an illegal YAML value fails now, not mid-validation;
         # the resolved value is stamped into provenance via model_kwargs.
@@ -2189,6 +2373,12 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         self._sampler_seed = None if _sampler_seed is None else int(_sampler_seed)
         self._selection_rule = str(kwargs.get("selection_rule", "fixed"))
         validate_sampler_determinism(self._sampler_sigma, self._selection_rule)
+
+        # Set by :meth:`sample` from the per-call sampler before it is discarded.
+        # ``None`` means no reverse sampling has run on this generator yet, or
+        # the resolved sampler keeps no such record -- distinguishable from a
+        # sampler that ran zero steps, which reports zeros.
+        self._last_reverse_stats: dict[str, Any] | None = None
 
         # [SCALE CONTROL — Phase-1 divergence guard] Optional phase-preserving
         # bound on the model's OUTPUT k-space magnitude, ``ratio x max|measured|``
@@ -2292,6 +2482,15 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         backbone_type = kwargs.pop("backbone_type", DEFAULT_BACKBONE_TYPE)
         self.backbone_type = backbone_type
 
+        # [COMPLEX_UNET-ONLY KNOBS] One owner for "which backbone may carry these".
+        # It sits HERE, not in FourierBridgeNetwork, because the
+        # ``force_pure_kspace and backbone_type == 'unet'`` branch below builds
+        # PureKSpaceUNet directly and never constructs the bridge -- so the gate
+        # that lived there was bypassed, and an arm declaring
+        # ``kspace_feature_norm: rms`` on that branch got zero ComplexRMSNorm
+        # modules with nothing reporting it.
+        self._gate_complex_unet_knobs(kwargs, backbone_type, force_pure_kspace)
+
         # F-SPADE (2026-05-24 smoke_audit_20260524): fail loud on a silent
         # SPADE fallback. ``SPADEBlock`` / ``SPADEEncoder``
         # (models/blocks/spade.py) have NO consumer in any
@@ -2336,7 +2535,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         )
         # Internal-DC backbones (diff_varnet / diff_varnet_kan) must receive an
         # input width equal to the measured k-space (== in_channels) because
-        # their per-cascade DataConsistencyLayer compares the channel-preserved
+        # their per-cascade MaskedReplacementDataConsistency compares the channel-preserved
         # prediction against the un-doubled measured k-space. Skip the S-map
         # channel-doubling for them.
         # See KSpaceColdDiffusionGenerator._INTERNAL_DC_BACKBONES.
@@ -2392,13 +2591,13 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         )
 
         # Domain guard for the internal-DC backbones. ``DiffVarNet`` unrolls
-        # ``x_{k+1} = DC(x_k + CNN(x_k))`` and its ``DataConsistencyLayer`` takes
+        # ``x_{k+1} = DC(x_k + CNN(x_k))`` and its ``MaskedReplacementDataConsistency`` takes
         # an IMAGE and FFTs it internally (physics/data_consistency_layer.py:44).
         # ``force_pure_kspace=true`` tells FourierBridgeNetwork to skip the entry
         # ``ifft2c``, so the backbone would receive k-space and the DC layer would
         # transform it a SECOND time -- data consistency enforced in the wrong
         # domain, silently. Verified live: with kspace_measured + mask supplied,
-        # all 5 DataConsistencyLayer instances fire (forward-hook count), so this
+        # all 5 MaskedReplacementDataConsistency instances fire (forward-hook count), so this
         # is a live path and not a dormant branch.
         #
         # The bridge is the single owner of domain conversion (canonical homes),
@@ -2413,7 +2612,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         if force_pure_kspace and backbone_type in self._IMAGE_DOMAIN_DC_BACKBONES:
             raise ValueError(
                 f"backbone_type={backbone_type!r} performs data consistency "
-                "internally on IMAGE-domain tensors (its DataConsistencyLayer "
+                "internally on IMAGE-domain tensors (its MaskedReplacementDataConsistency "
                 "FFTs its own input), so force_pure_kspace=true would hand it "
                 "k-space and cause a second forward transform -- DC applied in "
                 "the wrong domain. Set model_kwargs.force_pure_kspace: false so "
@@ -2447,6 +2646,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 in_channels=backbone_in_channels,
                 out_channels=out_channels,
                 features=features,
+                time_embedding_dim=time_embedding_dim,
                 num_bottleneck_reflect_pad_layers=num_bottleneck_reflect_pad_layers,
             )
         else:
@@ -2485,9 +2685,11 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             # and dropped, the most misleading of the possible behaviours.
             # diff_varnet and nafnet build no attention module whatsoever.
             #
-            # Deliberately NOT listed: restormer / swinir / vit /
-            # swin_transformer / the mamba variants. Those were not audited, and
-            # an over-broad guard would break configs on an untested assumption.
+            # Still NOT listed: vision_mamba / mamba_unet. They need the
+            # ``.[mamba]`` extra to construct at all, so the sweep that admitted
+            # the five backbones above could not be run on them, and a guard on
+            # an unmeasured backbone is the same untested assumption in the
+            # other direction.
             if backbone_type in self._SEAMLESS_ATTENTION_BACKBONES and attention_type != "none":
                 raise ValueError(
                     f"backbone_type={backbone_type!r} has no attention seam: it never "
@@ -2502,6 +2704,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 unet_config,
                 backbone_type=backbone_type,
                 force_pure_kspace=force_pure_kspace,
+                time_embedding_dim=time_embedding_dim,
                 attention_type=attention_type,  # ✅ Pass attention_type explicitly for Phase 5
                 **kwargs,
             )
@@ -2617,6 +2820,32 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # training. Specifying a patch size > 0 routes that region
         # around the CNN entirely. ``None`` / size 0 disables.
         # See docs/validation_image_audit.rst for the diagnosis.
+        # [RADIAL BAND GAIN] Opt-in phase-exact per-annulus magnitude correction,
+        # applied to the model's own k-space output before it is captured as
+        # ``x_pre_dc``. Off unless an arm declares a band count, and identity at
+        # initialisation when on, so the control's numbers are reproducible with
+        # the mechanism built. The measured deficit it targets is the decoder's
+        # 2^-(up_steps) radial attenuation (#2117), which no attention type can
+        # correct because every one of them is gain-bounded.
+        band_cfg = kwargs.get("radial_band_gain_bands")
+        if band_cfg is None or int(band_cfg) == 0:
+            self.radial_band_gain = None
+        else:
+            bands = int(band_cfg)
+            if bands < 2:
+                raise ValueError(
+                    "radial_band_gain_bands must be 0 (disabled) or >= 2, got "
+                    f"{bands}. One annulus is a global scalar wearing a band's "
+                    "name, and nothing downstream would distinguish the two."
+                )
+            self.radial_band_gain = RadialBandGain(
+                n_bands=bands,
+                time_embed_dim=int(kwargs.get("radial_band_gain_time_embed_dim", 0) or 0),
+                max_log_gain=float(
+                    kwargs.get("radial_band_gain_max_log", DEFAULT_MAX_LOG_GAIN)
+                ),
+            )
+
         passthrough_cfg = kwargs.get("dc_passthrough_center_size")
         if passthrough_cfg is None or passthrough_cfg == 0:
             self._dc_passthrough_size: tuple[int, int] | None = None
@@ -2926,6 +3155,86 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # ``KANGatedDualDomainAttention._pull_smap_feats_from_context``).
         self._current_smap_feats = None
 
+    def set_current_mask(self, mask: torch.Tensor | None) -> None:
+        """Stash the acquisition mask for attention blocks that consume it.
+
+        The same out-of-band route ``set_current_smaps`` takes, and for the same
+        reason: the reverse sampler re-enters ``forward(x_t, t)`` with the bare
+        k-space state and no kwargs, so a mask threaded only through the forward
+        signature reaches the training path and nothing else. ``forward`` refreshes
+        this from an explicit ``mask`` kwarg and falls back to it otherwise, so a
+        null-space block sees the same support at every reverse step.
+        """
+        self._current_mask = mask
+
+    def set_current_contrast_idx(self, contrast_idx: torch.Tensor | None) -> None:
+        """Stash the contrast id so every reverse step is conditioned on it.
+
+        The third tensor that must survive the reverse loop, for the reason the
+        two above it do: ``sample()`` drives ``forward(x_t, t)`` with no kwargs,
+        so a contrast id threaded only through the forward signature reaches
+        training and nothing else. Without this the cold multistep validation
+        path grades an unconditioned model while training conditions every step.
+        """
+        self._current_contrast_idx = contrast_idx
+
+    def _gate_complex_unet_knobs(
+        self, kwargs: dict, backbone_type: str, force_pure_kspace: bool
+    ) -> None:
+        """Refuse a complex_unet-only knob on a backbone that cannot consume it.
+
+        Both families are popped and re-injected rather than merely checked: a key
+        left in ``kwargs`` reaches ``build_backbone`` and every other backbone's
+        ``**kwargs``, where it is swallowed without a word. Each key is popped with
+        a literal string, never a loop, because ``check_model_kwargs_are_read``
+        harvests those literals as its vocabulary.
+        """
+        feature_norm = kwargs.pop("kspace_feature_norm", "none")
+        bands = kwargs.pop("radial_band_tokens_bands", 0)
+        token_dim = kwargs.pop("radial_band_tokens_dim", None)
+        token_max_log = kwargs.pop("radial_band_tokens_max_log", None)
+        if "radial_band_tokens_rungs" in kwargs:
+            raise ValueError(
+                "radial_band_tokens_rungs is derived from the process's timestep count, "
+                "not declared. Remove it; model_kwargs.timesteps already owns that fact."
+            )
+        unknown = sorted(k for k in kwargs if k.startswith("radial_band_tokens"))
+        if unknown:
+            raise ValueError(
+                f"Unrecognised radial band token knob(s) {unknown}. This constructor "
+                "absorbs **kwargs, so a misspelled knob runs as the control in silence."
+            )
+
+        is_complex_unet = backbone_type == "complex_unet"
+        if not is_complex_unet:
+            if str(feature_norm).lower() != "none":
+                raise ValueError(
+                    f"kspace_feature_norm={feature_norm!r} applies only to "
+                    f"backbone_type='complex_unet', not {backbone_type!r}."
+                )
+            if bands:
+                raise ValueError(
+                    f"radial_band_tokens_bands={bands} applies only to "
+                    f"backbone_type='complex_unet', not {backbone_type!r}: no other "
+                    "backbone exposes a per-up-step seam for it."
+                )
+            return
+
+        kwargs["kspace_feature_norm"] = feature_norm
+        if not bands:
+            return
+        if not force_pure_kspace:
+            raise ValueError(
+                "radial_band_tokens_bands needs force_pure_kspace: true -- the annuli are "
+                "k-space annuli, and without it the decoder's feature maps are images."
+            )
+        kwargs["radial_band_tokens_bands"] = int(bands)
+        kwargs["radial_band_tokens_rungs"] = int(self.num_timesteps)
+        if token_dim is not None:
+            kwargs["radial_band_tokens_dim"] = int(token_dim)
+        if token_max_log is not None:
+            kwargs["radial_band_tokens_max_log"] = float(token_max_log)
+
     def _bind_attention_blocks_to_self(self) -> None:
         """Set ``_parent_generator`` on every KAN attention block.
 
@@ -3203,6 +3512,23 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         else:
             smaps = getattr(self, "_current_smaps", None)
 
+        # Same precedence for the acquisition mask, and for the same reason: the
+        # reverse loop re-enters with only (x, t), so an unconditional write here
+        # would blank the mask at reverse step 1 and leave a null-space attention
+        # block raising for the rest of the trajectory.
+        if kwargs.get("mask") is not None:
+            self.set_current_mask(kwargs["mask"])
+        elif getattr(self, "_current_mask", None) is not None:
+            kwargs["mask"] = self._current_mask
+
+        # And the contrast id, on the same precedence. `forward` pops it below
+        # and silently skips the embedding when it is None, so a drop here is
+        # invisible: the run trains conditioned and validates unconditioned.
+        if kwargs.get("contrast_idx") is not None:
+            self.set_current_contrast_idx(kwargs["contrast_idx"])
+        elif getattr(self, "_current_contrast_idx", None) is not None:
+            kwargs["contrast_idx"] = self._current_contrast_idx
+
         # Handle TorchIO 5D tensors (B, C, H, W, D) - process each slice
         original_shape = x.shape
         is_5d = x.dim() == 5
@@ -3435,6 +3761,23 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # HF itself instead of leaning on the soft-DC-injected (always-sampled)
         # ACS centre. See DiffusionTrainingStrategy._add_pre_dc_fidelity +
         # losses.reconstruction.lambda_pre_dc_kspace (default 0.0 -> unused).
+        # The gain is part of the model's own prediction, so it runs BEFORE the
+        # pre-DC capture: an arm supervising ``lambda_pre_dc_kspace`` must score
+        # what the model actually emits, not the output one stage earlier.
+        if self.radial_band_gain is not None:
+            # The gain's timestep conditioning was declared by the class and never
+            # passed, so it ran as a per-annulus scalar whatever the arm asked for.
+            # The embedding comes from the canonical owner rather than a tenth
+            # private sinusoid; this call site has no t_emb of its own.
+            gain_embedding = None
+            if self.radial_band_gain.time_embed_dim:
+                gain_embedding = sinusoidal_timestep_embedding(
+                    timesteps,
+                    self.radial_band_gain.time_embed_dim,
+                    max_timesteps=float(self.num_timesteps),
+                )
+            x_out = self.radial_band_gain(x_out, gain_embedding)
+
         x_pre_dc = x_out
 
         # Both mechanisms below read `kspace_measured` and both used to skip in
@@ -3473,35 +3816,48 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 acs_mask = None
 
                 # 4. Final Projection
-                if x_out.shape == measured_kspace.shape:
-                    # [PHYSICS] x_out is already in k-space (from FourierBridgeNetwork)
-                    # Tell DC layer to skip FFT/IFFT and work directly in k-space
-                    try:
-                        x_out = self.dc_layer(
-                            x_out,
-                            measured_kspace,
-                            mask,
-                            acs_mask=acs_mask,
-                            is_kspace_domain=True,
-                        )
-                    except TypeError:
-                        # Fallback for DC layers that don't support acs_mask or is_kspace_domain
-                        try:
-                            x_out = self.dc_layer(
-                                x_out,
-                                measured_kspace,
-                                mask,
-                                is_kspace_domain=True,
-                            )
-                        except TypeError:
-                            # Final fallback for very old DC layers
-                            x_out = self.dc_layer(x_out, measured_kspace, mask)
+                #
+                # The domain is a property of this class, not of the shapes in
+                # front of it: ``FourierBridgeNetwork`` returns k-space on BOTH
+                # branches -- ``force_pure_kspace`` only decides whether the exit
+                # ``fft2c`` is skipped because the features already are k-space.
+                # So ``is_kspace_domain=True`` is unconditional, and a shape
+                # mismatch is a misalignment to report rather than a domain to
+                # infer (#2147).
+                if x_out.shape != measured_kspace.shape:
+                    raise ValueError(
+                        "[KSpaceColdDiffusionGenerator] data consistency is declared "
+                        f"(dc_method={self.dc_method!r}) but the prediction "
+                        f"{tuple(x_out.shape)} and the measurement "
+                        f"{tuple(measured_kspace.shape)} do not align, so the layer "
+                        "cannot be applied. This used to skip DC in silence, which "
+                        "trains an arm without the physics it declared. The known "
+                        "trigger is a genuine 5-D volume: x_out is restored to "
+                        "[B, C, H, W, D] above while kspace_measured stays flattened "
+                        "to [B*D, C, H, W]. Flatten the measurement the same way, or "
+                        "set use_dc: false if this arm is meant to run without DC."
+                    )
+                # Called once, unguarded. Every dc_method this generator can build
+                # accepts both kwargs, so a `except TypeError` fallback could only
+                # ever be entered by a TypeError raised INSIDE a layer's forward --
+                # and its retry drops `is_kspace_domain`, whose default is False on
+                # 6 of the 7. Measured on [1,2,16,16]: the flagged and unflagged
+                # results differ by 0.42 (soft), 0.71 (adaptive), 1.00
+                # (noise_adaptive), 1.27 (hard, the cohort's method) and 0.62
+                # (kan_adaptive) relative max.
+                x_out = self.dc_layer(
+                    x_out,
+                    measured_kspace,
+                    mask,
+                    acs_mask=acs_mask,
+                    is_kspace_domain=True,
+                )
 
-                    if not hasattr(self, "_dc_notified") or not self._dc_notified:
-                        logger.info(
-                            f"🧲 [DC VERIFY] Applied DC: x_out={x_out.shape}, measured={measured_kspace.shape}, mask={mask.shape}"
-                        )
-                        self._dc_notified = True
+                if not hasattr(self, "_dc_notified") or not self._dc_notified:
+                    logger.info(
+                        f"🧲 [DC VERIFY] Applied DC: x_out={x_out.shape}, measured={measured_kspace.shape}, mask={mask.shape}"
+                    )
+                    self._dc_notified = True
 
         # [DC PASSTHROUGH] Deterministic centre-patch skip-connect, run
         # AFTER the (possibly learned) data-consistency layer. This is
@@ -3781,6 +4137,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         _smaps_arg = kwargs.pop("smaps", None)
         if _smaps_arg is None:
             _smaps_arg = kwargs.pop("sensitivity_maps", None)
+        _contrast_arg = kwargs.pop("contrast_idx", None)
         # Ensure 4D shape if 5D with singleton depth (consistency with forward)
         while measurement.dim() > 5 or (measurement.dim() == 5 and measurement.shape[-1] == 1):
             if measurement.shape[-1] == 1:
@@ -3893,12 +4250,41 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     )
 
             _prev_smaps = getattr(self, "_current_smaps", None)
+            _prev_mask = getattr(self, "_current_mask", None)
+            _prev_contrast = getattr(self, "_current_contrast_idx", None)
             if _smaps_arg is not None:
                 self.set_current_smaps(_smaps_arg)
+            if _contrast_arg is not None:
+                self.set_current_contrast_idx(_contrast_arg)
+            self.set_current_mask(mask)
             try:
-                return sampler.sample(measurement, mask, **_sample_kwargs)
+                out = sampler.sample(measurement, mask, **_sample_kwargs)
+                # The sampler is built per call and discarded, so what its
+                # reverse loop actually RAN has to be read off before it goes.
+                # Samplers other than cold_mri expose no such record; absent is
+                # stamped as absent, never inferred (CLAUDE.md #18).
+                self._last_reverse_stats = getattr(sampler, "reverse_stats", None)
+                return out
             finally:
                 self.set_current_smaps(_prev_smaps)
+                self.set_current_mask(_prev_mask)
+                self.set_current_contrast_idx(_prev_contrast)
+
+    @property
+    def last_reverse_stats(self) -> dict[str, Any] | None:
+        """What the last :meth:`sample` call's reverse loop ran, or ``None``.
+
+        ``terminal_timestep_called`` is the lowest timestep the model was
+        actually invoked at. It is NOT the tail of the schedule: an inert step
+        is skipped, and on a ladder whose ``mask(0)`` is all-ones the t=0 step is
+        always inert, so the rung that IS R=1 is scheduled and never evaluated
+        (#2067). This reflects the LAST ``sample`` call, which under chunked
+        validation is the last chunk and under a validation ensemble the last
+        member. Both replay the same schedule -- chunks split the batch, members
+        differ only in the C6 noise stream -- so the three numbers agree across
+        them and the record is not order-dependent.
+        """
+        return self._last_reverse_stats
 
     @property
     def sampler_sigma(self) -> float:

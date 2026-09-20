@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Iterable
 from itertools import cycle
 from pathlib import Path
@@ -38,11 +39,18 @@ from spectramr.config.overrides import applied_override_paths
 from spectramr.core.cascading_validation import aggregate_cascade_rows
 from spectramr.core.metrics.flag_map import schema_flag_to_metric
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
+from spectramr.core.module_utils import unwrap_model
 from spectramr.core.topology import resolve_run_topology
 from spectramr.data.batch_types import BatchAdapter, TrainingBatch
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.builders.directors import CheckpointDirector
+from spectramr.core.wall_clock import (
+    VALIDATION_SAFETY_FACTOR,
+    resolve_check_interval,
+    resolve_wall_clock_budget,
+)
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
+from spectramr.infrastructure.optimization.ema import EMAKeyMismatchError
 from spectramr.infrastructure.training.strategies.lifecycle import (
     StrategyLifecycleDriver,
 )
@@ -1569,6 +1577,23 @@ def _execute_training_loop(
     # gate compares against it on every step.
     first_iteration = start_iteration + 1
     pbar = tqdm(range(first_iteration, max_iterations + 1), desc="Training")
+
+    # Wall-clock budget, resolved BEFORE the first step so a malformed or
+    # already-expired one fails at startup rather than after hours of GPU.
+    wall_clock_budget = resolve_wall_clock_budget()
+    wall_clock_yield = False
+    # Its OWN cadence, capped independently of `log_interval`: 65 corpus arms
+    # declare `logging.intervals.log: 5000`, which at ~1s a step would inspect
+    # the deadline every ~83 min against a 900s margin -- the job dies before
+    # the check fires, on exactly the long arms this is for. Reading the clock
+    # is a vDSO call, not a device sync, so non-negotiable 9 does not bear on
+    # how often it happens.
+    _wall_clock_every = resolve_check_interval(log_interval)
+    # Duration of the most recent validation pass, used to decide whether the
+    # next one fits before the wall. None until one has been measured; the
+    # first pass therefore runs unguarded, which is safe because it happens
+    # early in the run, far from any deadline.
+    _last_val_seconds: float | None = None
     if start_iteration > 0 and logging_service:
         logging_service.log_info(f"[Resume] Training resumes from iteration {start_iteration + 1}")
 
@@ -1639,6 +1664,24 @@ def _execute_training_loop(
     # FIX #4: Direct config access for checkpoint settings (no fallbacks)
     checkpoint_enabled = config.checkpoint.enabled
     checkpoint_interval = config.checkpoint.save_interval
+
+    if wall_clock_budget:
+        # A yield that cannot save is just a crash with extra steps, and it
+        # would requeue forever making no progress.
+        if not (checkpoint_enabled and checkpoint_service):
+            raise RuntimeError(
+                "A wall-clock budget is declared but checkpointing is off "
+                f"(checkpoint.enabled={checkpoint_enabled}). The run would yield "
+                "at the wall, save nothing, requeue, and repeat forever. Enable "
+                "checkpointing, or set NO_WALL_CLOCK=1 to train to the wall."
+            )
+        if logging_service:
+            logging_service.log_info(
+                f"[WallClock] Yielding in "
+                f"{wall_clock_budget.seconds_remaining() / 3600:.2f}h "
+                f"({wall_clock_budget.margin_s:.0f}s reserved for the final save; "
+                f"checked every {_wall_clock_every} steps)."
+            )
 
     # Initialize epoch *before* the loop so the post-loop final-checkpoint
     # block has a defined value even when the loop body never runs (e.g.
@@ -1849,7 +1892,17 @@ def _execute_training_loop(
                 # loop (frozen config → invariant).
                 if ema_should_update(iteration, _ema_update_freq, _ema_warmup):
                     try:
-                        pipeline.ema.update(pipeline.generator)
+                        # Unwrap: the shadow was deep-copied from the bare module
+                        # at build time, while this generator may since have been
+                        # wrapped by DDP / FSDP / DeepSpeed / torch.compile. The
+                        # blend is key-matched, so a prefixed live model blends
+                        # nothing and raises nothing (#2172).
+                        pipeline.ema.update(unwrap_model(pipeline.generator))
+                    except EMAKeyMismatchError:
+                        # Never demote this one to a warning: it means EMA has
+                        # been inert, which is the failure the guard exists to
+                        # surface.
+                        raise
                     except Exception as ema_err:
                         logger.warning(f"Failed to update EMA model weights: {ema_err}")
 
@@ -1951,6 +2004,29 @@ def _execute_training_loop(
         # is not a hot-path cost; a smaller `log_interval` would be.
         is_first_iteration = iteration == first_iteration
         is_last_iteration = iteration == max_iterations
+
+        # Rank 0 decides and BROADCASTS -- ranks that disagreed by one iteration
+        # would deadlock, one entering the collective checkpoint save while the
+        # others ran another step. The cadence is `_wall_clock_every`, resolved
+        # above; it is deliberately not the logging gate's.
+        if wall_clock_budget is not None and iteration % _wall_clock_every == 0:
+            wall_clock_yield = bool(
+                RankUtility.broadcast_object(
+                    wall_clock_budget.expired() if is_main_process else None
+                )
+            )
+            if wall_clock_yield:
+                logger.info(
+                    f"[WallClock] Allocation ends in "
+                    f"{wall_clock_budget.deadline - time.time():.0f}s; yielding at "
+                    f"iteration {iteration} of {max_iterations} after a final save."
+                )
+                if logging_service:
+                    logging_service.log_info(
+                        f"[WallClock] Yielding at iteration {iteration}/{max_iterations}; "
+                        "resume with the same command to continue."
+                    )
+
         if iteration % log_interval == 0 or is_first_iteration or is_last_iteration:
             # THE converter. `get_last_metrics` returns on-device tensors (#707)
             # precisely so this gate is the only host transfer, and this comment
@@ -2152,8 +2228,50 @@ def _execute_training_loop(
         ):
             time_for_eval = True
 
+        # Will this validation finish before the wall?
+        #
+        # The wall-clock check ~200 lines above runs BETWEEN iterations, and
+        # validation is inside one, so a deadline landing mid-pass cannot be
+        # acted on: the job is killed with no checkpoint, no marker and no
+        # requeue, and the chain stops looking like an ordinary TIMEOUT. That is
+        # not a corner -- `experiment_11_attention_none` records one validation
+        # event at 6.4h and validation at 41% of its wall clock.
+        #
+        # Entry is gated only on values every rank computes identically, and the
+        # decision is broadcast, because a rank that skipped while another
+        # validated would deadlock on the collective save below.
+        if wall_clock_budget is not None and time_for_eval and not wall_clock_yield:
+            _fits = None
+            if is_main_process:
+                _fits = bool(
+                    _last_val_seconds
+                    and wall_clock_budget.seconds_remaining()
+                    < _last_val_seconds * VALIDATION_SAFETY_FACTOR
+                )
+            if bool(RankUtility.broadcast_object(_fits)):
+                wall_clock_yield = True
+                logger.info(
+                    f"[WallClock] Skipping validation at iteration {iteration}: the "
+                    f"last pass took {_last_val_seconds:.0f}s and only "
+                    f"{wall_clock_budget.seconds_remaining():.0f}s remain before the "
+                    "save margin. Yielding instead."
+                )
+                if logging_service:
+                    logging_service.log_info(
+                        f"[WallClock] Validation skipped at iteration {iteration} "
+                        "(would not finish before the wall); yielding."
+                    )
+
         # Execute Validation
-        if pipeline.data_loaders.get("val") and time_for_eval:
+        #
+        # `not wall_clock_yield`: a validation event that starts after the yield
+        # decision eats the margin reserved for writing the checkpoint. The gate
+        # is on the EXECUTION, not on `time_for_eval` -- the epoch-boundary
+        # branch above re-sets that flag after the interval branch computes it.
+        _val_started = time.monotonic() if time_for_eval else None
+        _validation_ran = False
+        if pipeline.data_loaders.get("val") and time_for_eval and not wall_clock_yield:
+            _validation_ran = True
             pipeline.models.get("generator").eval()
             # Schedule-free optimizers keep an averaged sequence separate from
             # the iterate the gradient is taken at. Validating without swapping
@@ -2426,6 +2544,16 @@ def _execute_training_loop(
                 logging_service.log_warning(
                     f"[Pipeline] Skipping validation at iter {iteration}: No 'val' dataloader found in pipeline."
                 )
+        elif time_for_eval and wall_clock_yield and logging_service:
+            # Said out loud: a validation event that vanishes without a line is
+            # an unexplained gap in the arm's record.
+            logging_service.log_warning(
+                f"[WallClock] Validation at iter {iteration} skipped -- the run is "
+                "yielding at the wall clock and resumes from the checkpoint below."
+            )
+
+        if _validation_ran and _val_started is not None:
+            _last_val_seconds = time.monotonic() - _val_started
 
         # Strategy lifecycle: close the epoch that just COMPLETED (``epoch - 1``
         # at this point -- see StrategyLifecycleDriver's module docstring for why
@@ -2446,7 +2574,9 @@ def _execute_training_loop(
         if (
             checkpoint_enabled
             and checkpoint_service
-            and iteration % checkpoint_interval == 0
+            # `or wall_clock_yield`: the yield is worthless without the save it
+            # exists to make room for.
+            and (iteration % checkpoint_interval == 0 or wall_clock_yield)
             # rank 0 writes the shared checkpoint; collective strategies need all.
             and may_checkpoint
         ):
@@ -2540,6 +2670,9 @@ def _execute_training_loop(
                 if logging_service:
                     logging_service.log_warning(f"Checkpoint save failed at iter {iteration}: {e}")
 
+        if wall_clock_yield:
+            break
+
     # DDP: only rank 0 wrote best.pt (and thus holds its path); broadcast it so
     # EVERY rank restores the SAME best weights below, keeping the final model
     # identical across ranks (otherwise non-main ranks would keep their latest
@@ -2555,6 +2688,9 @@ def _execute_training_loop(
         config.early_stopping
         and getattr(config.early_stopping, "restore_best_weights", False)
         and best_checkpoint_path
+        # A yielded run is mid-training: swapping in best weights here would
+        # hand the next chain link a model that is not where the loop left off.
+        and not wall_clock_yield
     ):
         try:
             # with_parallel_runtime is what makes this symmetric with the WRITER
@@ -2576,7 +2712,13 @@ def _execute_training_loop(
 
     # Final checkpoint on completion (rank 0 writes the shared output dir;
     # FSDP/DeepSpeed need every rank here or the gather deadlocks).
-    if checkpoint_enabled and checkpoint_service and may_checkpoint:
+    #
+    # `not wall_clock_yield` is load-bearing rather than an optimisation: this
+    # save stamps `global_step=max_iterations` unconditionally, so on a yield at
+    # iteration 40k of 200k it would assert the run had finished and the next
+    # link of the chain would resume at 200k and train nothing. The yield wrote
+    # its own correctly-stamped checkpoint inside the loop.
+    if checkpoint_enabled and checkpoint_service and may_checkpoint and not wall_clock_yield:
         try:
             # =====================================================================
             # PHASE 3 TASK 3: Final Checkpoint via Director
@@ -2694,7 +2836,12 @@ def _execute_training_loop(
     # Post-training certification hook: conformal / calibration strategies
     # compute their certificate (coverage_at_alpha, exchangeability p-value)
     # AFTER the reconstructor is trained. No-op for every other strategy.
-    if not is_sanity_check:
+    #
+    # `not wall_clock_yield`: a certificate computed from a half-trained
+    # reconstructor is a certificate for a model that will not exist by the end
+    # of the chain -- and this runs inside the save margin, so on a yield it
+    # eats the time reserved for getting out cleanly.
+    if not is_sanity_check and not wall_clock_yield:
         _maybe_run_calibration(strategy, pipeline, output_paths, logging_service)
 
     # Sanity-check verdict: a green "success" is only honest if the model
@@ -2724,6 +2871,11 @@ def _execute_training_loop(
 
     return {
         "success": True,
+        # A yielded run succeeded at what it was asked to do and is NOT finished.
+        # Callers that treat `success` as "training is done" would archive a run
+        # that is half-trained, so the distinction is a key, not a log line.
+        "wall_clock_yield": wall_clock_yield,
+        "resume_from_iteration": iteration if wall_clock_yield else None,
         "final_loss": losses_history.get("g_total_loss", 0.0),
         "training_time": "N/A",  # overwritten by run_training_pipeline with real wall-clock
         "iterations_completed": max(0, iteration - start_iteration + 1),

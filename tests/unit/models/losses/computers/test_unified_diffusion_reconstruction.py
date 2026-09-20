@@ -391,3 +391,33 @@ def test_empty_components_error_names_the_schedule_when_a_term_was_zeroed():
     target = torch.zeros(1, 1, 4, 4)
     with pytest.raises(RuntimeError, match="loss_schedule"):
         comp.compute(pred=pred, target=target, iteration=5000)
+
+
+# ── no device->host sync on a discarded log message (non-negotiable 9) ───────
+def test_the_debug_log_does_not_sync_when_debug_is_off():
+    """An f-string evaluates ``.item()`` before the logger decides to discard it.
+
+    The message was built eagerly for every dynamic loss component on every
+    training step, so each one paid a device->host synchronisation at any log
+    level. The sync is now behind ``isEnabledFor``, which is what makes it cost
+    nothing when DEBUG is off.
+    """
+    import inspect
+
+    from spectramr.models.losses.computers import unified_diffusion_reconstruction as mod
+
+    src = inspect.getsource(mod.UnifiedDiffusionLossComputer.compute)
+    assert "logger.isEnabledFor(logging.DEBUG)" in src, "the sync is unguarded again"
+    assert 'f"[Loss {loss_name}] OK: loss_val={loss_val.item()' not in src, (
+        "the eager f-string is back; it syncs before the logger discards it"
+    )
+
+
+def test_the_guarded_log_still_reports_when_debug_is_on():
+    """Guards the check above from passing because the log was simply deleted."""
+    import inspect
+
+    from spectramr.models.losses.computers import unified_diffusion_reconstruction as mod
+
+    src = inspect.getsource(mod.UnifiedDiffusionLossComputer.compute)
+    assert '"[Loss %s] OK: loss_val=%s"' in src, "the debug message was dropped, not deferred"

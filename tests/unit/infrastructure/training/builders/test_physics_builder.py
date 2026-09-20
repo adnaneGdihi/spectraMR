@@ -1,109 +1,40 @@
-"""`PhysicsBuilder` reads the schedule length from the canonical path.
+"""`PhysicsBuilder` builds the physics operators the training path resolves.
 
 Paired with ``src/spectramr/infrastructure/training/builders/physics_builder.py``.
 
-``build_mask_generator`` used to have a second branch reading
-``training.num_timesteps`` — a path no schema has ever carried, so it could not
-fire even when the canonical block was absent. These tests pin the surviving
-read against a REAL ``TrainingSettings`` rather than a namespace stub: a stub
-that carries the knob flat is a shape no real config produces, which is exactly
-how the equivalent dead read in ``forward_probe`` stayed green.
+``build_mask_generator`` was removed in #2056. It built a third
+``KSpaceMaskGenerator`` into ``env.physics["mask_generator"]`` on every run --
+one nothing read, from the same ``undersampling:`` block the model and the
+strategy already resolve. The tests it carried pinned the shared allowlist
+(``mask_seed`` -> ``seed``, unread defaults not forwarded), and that shape now
+lives at its one owner, ``accelerator_kwargs_from_config``, in
+``tests/unit/models/diffusion/test_kspace_process.py``.
 """
 
 from __future__ import annotations
 
-import pytest
-
-from spectramr.config.schemas.training.base import UnspecifiedParams
 from spectramr.infrastructure.training.builders.physics_builder import PhysicsBuilder
 from tests.utils.minimal_settings import minimal_settings_for
 
 
-def _settings_with_timesteps(n: int | None):
-    """A real ``TrainingSettings``, optionally carrying a diffusion block.
+def test_the_builder_no_longer_owns_a_mask_generator() -> None:
+    """The deletion is the assertion (#2056, non-negotiable 17).
 
-    ``gan`` is used because it is the only ``minimal_settings_for`` key that
-    still loads — the other 47 resolve to fixtures the loader refuses on
-    ``config_version: 6.0`` (see the tracking issue). It carries no diffusion
-    block of its own, which makes it a clean base for both cases here.
+    Re-adding the step would restore a generator with no readers and a third
+    accelerator per run, and nothing else in the suite would notice: the copy
+    was invisible precisely because it agreed with the other two.
     """
-    settings = minimal_settings_for("gan")
-    if n is None:
-        return settings
-    training = settings.training.model_copy(update={"diffusion": UnspecifiedParams(timesteps=n)})
-    return settings.model_copy(update={"training": training})
+    assert not hasattr(PhysicsBuilder, "build_mask_generator")
 
-
-def _mask_generator(settings):
-    builder = PhysicsBuilder(settings, "cpu").build_mask_generator()
-    return builder._components.get("mask_generator")
-
-
-def test_canonical_timesteps_reaches_the_mask_generator() -> None:
-    generator = _mask_generator(_settings_with_timesteps(42))
-    assert generator is not None, "mask generator was not built at all"
-    assert generator.num_timesteps == 42
-
-
-def test_absent_diffusion_block_falls_back_to_the_documented_default() -> None:
-    """Anti-vacuity: if the builder always produced 1000 the test above would
-    still pass on a broken read, so pin the no-block case separately."""
-    generator = _mask_generator(_settings_with_timesteps(None))
-    assert generator is not None, "mask generator was not built at all"
-    assert generator.num_timesteps == 1000
-
-
-@pytest.mark.parametrize("declared", [8, 250, 1000])
-def test_the_value_is_carried_through_rather_than_defaulted(declared: int) -> None:
-    """A read that silently defaulted would pass only for `declared == 1000`."""
-    assert _mask_generator(_settings_with_timesteps(declared)).num_timesteps == declared
-
-
-def _settings_with_undersampling():
-    """A real ``TrainingSettings`` carrying the exp_11 acceleration block."""
-    from spectramr.config.schemas.acceleration import AccelerationConfigSchema
-
-    settings = _settings_with_timesteps(28)
-    return settings.model_copy(
-        update={
-            "undersampling": AccelerationConfigSchema(
-                acceleration_type="density_nested",
-                base_acceleration=2.0,
-                max_acceleration=32.0,
-                center_fraction=0.08,
-                min_center_fraction=0.02,
-                mask_direction="phase",
-                schedule_type="step",
-                mask_seed=42,
-                enforce_nested=True,
-            )
-        }
+    components = (
+        PhysicsBuilder(minimal_settings_for("gan"), "cpu")
+        .build_fft_transformer()
+        .build_data_consistency()
+        .build_coil_sensitivity()
+        .validate()
+        .build()
     )
-
-
-def test_declared_acceleration_reaches_the_accelerator_intact() -> None:
-    """``build_mask_generator`` used to splat the whole ``model_dump()``.
-
-    Every schema field rode into the accelerator constructor — defaults for
-    knobs it does not read included — while ``mask_seed`` was never translated
-    to ``seed``. Constructing the accelerator is the assertion: the kwarg gate
-    raises on any name outside the registered vocabulary.
-    """
-    generator = _mask_generator(_settings_with_undersampling())
-    assert generator is not None
-    accelerator = generator._get_accelerator(None)
-    assert accelerator is not None
-    assert accelerator.seed == 42, "mask_seed must arrive as the accelerator's seed"
-
-
-def test_unread_schema_defaults_are_not_forwarded() -> None:
-    """Names the accelerator does not read must not be in the kwargs at all."""
-    generator = _mask_generator(_settings_with_undersampling())
-    kwargs = generator._accelerator_kwargs
-    for junk in ("mixed_precision", "use_compile", "acceleration_type", "mask_seed"):
-        assert junk not in kwargs, f"{junk} would reach the accelerator"
-    assert kwargs["max_acceleration"] == 32.0
-    assert kwargs["min_center_fraction"] == 0.02
+    assert "mask_generator" not in components
 
 
 def test_build_coil_sensitivity_is_an_honest_no_op():

@@ -41,6 +41,8 @@ class AttentionType(Enum):
     WAVELET_FREQ = "wavelet_freq"
     KERNELIZED = "kernelized"
     SPARSE = "sparse"
+    NULL_SPACE_DUAL_DOMAIN = "null_space_dual_domain"
+    HERMITIAN_NULL_SPACE = "hermitian_null_space"
 
 
 class NormalizationType(Enum):

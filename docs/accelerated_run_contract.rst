@@ -256,6 +256,51 @@ construction in test fixtures — the live DI path always passes a concrete,
 contract-resolved device. They are latent, not load-bearing; tightening them is
 a follow-up, not a prerequisite.
 
+Device capabilities
+===================
+
+Resolving *which* device a run lands on is only half the question; the other
+half is what that device can do. ``spectramr.core.device_capabilities`` answers
+it, and ``compute_device`` stays the owner of the first half.
+
+The capability that matters today is **native bfloat16**, and it carries a trap
+worth stating plainly. ``torch.cuda.is_bf16_supported()`` takes
+``including_emulation=True`` by default, and that branch only checks a bf16
+tensor can be *created*. Measured on an sm_75 card::
+
+    torch.cuda.is_bf16_supported()                           # -> True
+    torch.cuda.is_bf16_supported(including_emulation=False)  # -> False
+
+The target clusters are V100s (sm_70) — which is why torch is pinned to the
+cu126 lane at all, since it is the last one shipping ``sm_70`` kernels. A gate
+written against the default probe would therefore *confirm* bf16 on exactly the
+hardware it needed to reject, and leave a paper trail saying the configuration
+was checked. The test is the compute capability instead: native bf16 needs
+``sm_80`` or later.
+
+Below that, torch still runs bf16 by emulating it — slower than fp16 and
+numerically unlike the declaration. So it raises rather than downgrading;
+an automatic downgrade to fp16 would be worse still, because
+``get_autocast_context`` turns fp16 into a ``nullcontext`` for complex arms and
+would quietly produce fp32 on the arms this framework cares most about.
+
+The gate has two halves, and the split is deliberate:
+
+``mixed_precision.assert_amp_dtype_supported``
+    The enforcer. Runs where the device is real, and raises.
+
+``ConfigHealthChecker.check_bf16_requires_ampere``
+    The early warning. ``audit`` is ``--strict`` and warnings exit 2, while the
+    audit legitimately runs on a login node whose GPU differs from the compute
+    node's — so an *unverifiable* answer reports at ``info`` and never gates.
+    Only a capability this machine could actually read produces an error. Set
+    ``SPECTRAMR_TARGET_COMPUTE_CAPABILITY`` to make it decidable there.
+
+Every resolved capability is stamped into run provenance under
+``device_capabilities``, alongside the ``source`` it came from — distinct from
+``torch_runtime``'s hardware *inventory*, which lists what was visible rather
+than what the run concluded.
+
 API
 ===
 

@@ -1604,6 +1604,22 @@ class TestMambaSsmAuditHook:
         assert res.passed is False
         assert res.severity == "warning"
 
+    def test_fix_hint_names_the_arch_aware_installer(self, monkeypatch) -> None:
+        """The bare pip line installs a wheel with no ``sm_70``, so it must not be the hint.
+
+        This check gates on importability alone, and an architecture-mismatched
+        wheel imports cleanly — so the remediation has to point at the installer
+        that verifies the built architectures, or the audit sends a V100 user to
+        the command that produced the broken install.
+        """
+        monkeypatch.setattr(self._mb, "_mamba_ssm_importable", lambda: False)
+        monkeypatch.setattr(self._mb, "_mamba_fallback_allowed", lambda: False)
+        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(_make_config("ct_mamba"))
+        assert res.fix_hint is not None
+        assert "install-mamba" in res.fix_hint
+        assert "--verify-only" in res.fix_hint
+        assert "pip install -e '.[mamba]'" not in res.fix_hint
+
     def test_mamba_model_passes_when_kernel_available(self, monkeypatch) -> None:
         monkeypatch.setattr(self._mb, "_mamba_ssm_importable", lambda: True)
         res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(

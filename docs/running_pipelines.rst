@@ -125,6 +125,41 @@ zero if the model, losses, and gradients are wired correctly. A sanity check tha
 key. Overrides are re-validated against the schema, so an illegal value still
 fails loudly.
 
+.. _what-a-resume-restores:
+
+**What a resume restores.** A checkpoint written by ``CheckpointDirector`` — the
+writer every periodic and wall-clock-yield save uses — carries the generator and
+discriminator, both optimizers, both LR schedulers, the AMP scaler, the EMA
+shadow weights, the step/epoch counters, the **global** torch / CUDA / numpy /
+python RNG streams, and every strategy-owned module or parameter (SFC heads,
+learnable DC lambdas, and the like, discovered by walking the strategy rather
+than from a hand-kept list). A component that constructs its own
+``torch.Generator`` is outside that snapshot and has to seed itself
+deterministically, which the ones in the tree do. The
+k-space curriculum needs no separate entry: its difficulty is a pure function of
+the restored ``global_step``, so a resumed link continues at the rung it left
+rather than restarting at the easiest one.
+
+Two things no checkpoint carries, and both are silent:
+
+* **the dataloader's within-epoch position** — the epoch is recomputed from
+  ``global_step``, but the sampler restarts at that epoch's beginning, so a
+  resume mid-epoch replays samples it has already seen;
+* **the config** — nothing compares the resumed configuration against the saved
+  one, so an edited YAML resumes without comment.
+
+Under DDP the file holds rank 0's RNG streams, since only rank 0 reaches the
+save. Rank 0 replays; the other ranks continue on the rank-offset streams they
+were seeded with, which is what keeps their augmentations from collapsing onto
+one sequence.
+
+Read the groups off a real artifact rather than trusting the list above:
+
+.. code-block:: bash
+
+   python scripts/verification/inspect_checkpoint.py \
+       --checkpoint experiments/results/<arm>/checkpoints/checkpoint_epoch_0003_step_040000.pt
+
 **5. Figures and tables.** ``report`` — runs the same reporting pipeline the
 end-of-training hook uses, against an existing output directory. Idempotent: the
 output is identical whether training triggered it or you invoke it by hand.

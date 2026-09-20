@@ -120,6 +120,8 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 from spectramr import bootstrap
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.metrics.output_sanity import measure_output_sanity
+from spectramr.core.module_utils import unwrap_model  # noqa: E402
+from spectramr.core.wall_clock import resolve_yield_marker_path  # noqa: E402
 from spectramr.data.batch_types import BatchAdapter, TrainingBatch
 from spectramr.domain.interfaces.service_interfaces import (
     ICheckpointService,
@@ -129,6 +131,9 @@ from spectramr.domain.interfaces.service_interfaces import (
 )
 from spectramr.infrastructure.builders.directors import CheckpointDirector
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
+from spectramr.infrastructure.optimization.ema_swap import (  # noqa: E402
+    ema_weights_swapped_in,
+)
 
 # Re-exported from the infrastructure layer (its canonical home) so existing call
 # sites — and the loss-schedule controller, which cannot import leftward from
@@ -324,6 +329,62 @@ def select_validation_extra_fields(val_batch: Any, vs_params: Any) -> dict[str, 
         if _fk in vs_params and _fk in val_batch:
             out[_fk] = val_batch.get(_fk)
     return out
+
+
+#: Checkpoint-discovery spellings accepted by ``--resume``. Anything else must
+#: be an existing file; a value that is neither raises rather than being read as
+#: a path that happens not to exist yet (non-negotiable 3).
+_RESUME_DISCOVERY_MODES = frozenset({"auto", "if-present"})
+
+
+def _stamp_resume_record(run_dir: Path, record: dict[str, Any], logger_: Any = None) -> None:
+    """Record what the resume actually did, beside ``provenance.json``.
+
+    Appends rather than overwrites: a 120 h wall-clock chain produces one entry
+    per link, and the sequence of ``start_iteration`` values is what shows the
+    chain advanced instead of restarting. Fail-open — a stamp must never take
+    down a run that is otherwise ready to train.
+    """
+    try:
+        target = Path(run_dir) / "resume_history.json"
+        history = []
+        if target.exists():
+            loaded = json.loads(target.read_text())
+            history = loaded if isinstance(loaded, list) else [loaded]
+        record = {**record, "recorded_at": datetime.now().isoformat(timespec="seconds")}
+        history.append(record)
+        target.write_text(json.dumps(history, indent=2))
+        if logger_ is not None:
+            logger_.log_info(f"[Resume] Stamped {record['outcome']} -> {target}")
+    except Exception:  # pragma: no cover - a stamp never blocks training
+        logger.debug("resume record stamp failed", exc_info=True)
+
+
+def _write_yield_marker(run_dir: Path, result: dict[str, Any], logger_: Any = None) -> None:
+    """Tell the launcher this run stopped early and wants requeueing.
+
+    A file rather than an exit code, because a process-group arm yields inside a
+    ``torch.distributed.run`` worker whose status the launcher collapses. WHERE
+    the file goes is the launcher's decision, not ours — see
+    :func:`~spectramr.core.wall_clock.resolve_yield_marker_path`.
+    """
+    try:
+        target = resolve_yield_marker_path(run_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "resume_from_iteration": result.get("resume_from_iteration"),
+                    "iterations_completed": result.get("iterations_completed"),
+                    "yielded_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+            )
+        )
+        if logger_ is not None:
+            logger_.log_info(f"[WallClock] Wrote yield marker: {target}")
+    except Exception:  # pragma: no cover - a marker never blocks teardown
+        logger.debug("yield marker write failed", exc_info=True)
 
 
 def _determinism_from_config(config: Any) -> bool:
@@ -786,6 +847,20 @@ def run_training_pipeline(
                         **_plugin_record,
                     }
 
+                # Resolved compilation, for the same reason as the two above:
+                # the config says compile.enabled, only the build knows WHERE
+                # the wrap landed and whether it landed at all. `DDP(compile(m))`
+                # and `compile(DDP(m))` produce identical YAML and different
+                # runs, and the director was assembling this record and
+                # dropping it.
+                from spectramr.infrastructure.logging.provenance import (
+                    compile_provenance,
+                )
+
+                provenance["compile"] = compile_provenance(
+                    config, getattr(pipeline, "compile", None)
+                )
+
             if provenance:
                 # ``generator`` gates the PARAMETER COUNT only. It used to gate
                 # this whole block, so the in-process ``env=`` entry above (the
@@ -906,6 +981,13 @@ def run_training_pipeline(
         "log_dir": str(run_dir / "logs"),
     }
 
+    # Clear any yield marker from the PREVIOUS link of this chain before the
+    # run starts. A stale marker requeues a run that has already finished.
+    try:
+        resolve_yield_marker_path(run_dir).unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - a read-only dir fails louder below
+        logger.debug("could not clear the wall-clock yield marker", exc_info=True)
+
     # Ensure output directories exist
     try:
         (run_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -1020,8 +1102,11 @@ def run_training_pipeline(
     # Placement is pinned on both sides. It must land AFTER stage 7, so every
     # module (generator, discriminator, strategy-owned heads) is already built
     # from the shared seed; and BEFORE stage 9, because checkpoint resume restores
-    # saved per-rank RNG state (`checkpoint_service.py::_restore_rng_state`) and a
-    # re-seed after that would throw the resumed stream away.
+    # the saved RNG state (`core/rng_state.py`, applied by
+    # `CheckpointDirector.load_from` on rank 0) and a re-seed after that would
+    # throw the resumed stream away. Rank 0 only: the checkpoint carries one
+    # process's streams, so the offset below is what keeps the other ranks
+    # drawing different augmentations after a resume.
     #
     # DataLoader workers inherit this for free: `core/worker_seeding.py::seed_worker`
     # derives from `torch.initial_seed()`, which is now rank-offset. Same
@@ -1039,47 +1124,96 @@ def run_training_pipeline(
         set_global_seed(seed, deterministic=_determinism_from_config(config), rank=_data_rank)
 
     # 9. Resume from Checkpoint (if requested)
+    #
+    # `auto` RAISES on an empty directory; `if-present` starts fresh instead.
+    # The chain spelling has to be the second one: every link of a wall-clock
+    # chain runs the identical command, so link 1 has nothing to resume from
+    # while links 2..N do — and softening `auto` would delete the only spelling
+    # that can still tell you your checkpoints went missing.
     start_iteration = 0
+    _resume_record: dict[str, Any] = {}
     if resume_path:
         try:
-            _resume_path = resume_path
-            if _resume_path == "auto":
-                # Auto-discover latest checkpoint from output dir
+            _resume_mode = str(resume_path).strip()
+            _resume_path: str | None = _resume_mode
+
+            if _resume_mode in _RESUME_DISCOVERY_MODES:
                 checkpoint_dir = str(Path(output_dir) / "checkpoints")
                 latest = checkpoint_service.find_latest_checkpoint(checkpoint_dir)
-                if latest is None:
+                if latest is None and _resume_mode == "auto":
                     raise FileNotFoundError(
-                        f"No checkpoint found in {checkpoint_dir} for auto-resume."
+                        f"No checkpoint found in {checkpoint_dir} for auto-resume. "
+                        "Use --resume if-present to start fresh when the directory "
+                        "is empty (the wall-clock chain spelling)."
                     )
-                _resume_path = str(latest)
-                logging_service.log_info(
-                    f"[Resume] Auto-discovered latest checkpoint: {_resume_path}"
+                _resume_path = str(latest) if latest else None
+            elif not Path(_resume_mode).exists():
+                # A typo resolves to neither a mode nor a file, and must raise
+                # rather than be read as a path (non-negotiable 3).
+                raise ValueError(
+                    f"--resume {_resume_mode!r} is neither an existing checkpoint "
+                    f"nor a known discovery mode "
+                    f"({', '.join(sorted(_RESUME_DISCOVERY_MODES))})."
                 )
 
-            # Use CheckpointDirector to restore all state. with_strategy lets the
-            # director also restore strategy-OWNED learnable modules/params (sfc
-            # heads, spin_sde diffusion param, ...) that live on the strategy, not
-            # on the generator — see section R design doc.
-            # with_parallel_runtime is what selects the checkpoint adapter, and
-            # a resume needs it for two distinct reasons. Loudly: a sharded
-            # strategy's best checkpoint holds no generic payload at all, so
-            # resuming from one without the adapter raises. Quietly, and worse:
-            # a PERIODIC checkpoint does carry the generic envelope, so the
-            # weights restore and the resume reports success -- while the ZeRO
-            # optimizer partitions in the tag directory beside it are never
-            # read, silently restarting a resumed run on a zeroed optimizer.
-            # `getattr(..., None)` mirrors training_loop.py's own resolution and
-            # keeps every single-process arm on DefaultCheckpointAdapter.
-            resume_director = CheckpointDirector(config)
-            resume_director.with_checkpoint_dir(
-                str(Path(output_dir) / "checkpoints")
-            ).with_pipeline(pipeline).with_strategy(strategy).with_parallel_runtime(
-                getattr(pipeline, "parallel", None)
-            )
-            success = resume_director.load_from(_resume_path)
+            if _resume_path is None:
+                logging_service.log_info(
+                    f"[Resume] No checkpoint under {output_dir}/checkpoints; "
+                    f"--resume {_resume_mode} starts this run FRESH at iteration 0."
+                )
+                _resume_record = {
+                    "declared": _resume_mode,
+                    "resolved_checkpoint": None,
+                    "outcome": "fresh",
+                    "start_iteration": 0,
+                }
+            else:
+                if _resume_mode in _RESUME_DISCOVERY_MODES:
+                    logging_service.log_info(
+                        f"[Resume] Discovered latest checkpoint: {_resume_path}"
+                    )
 
-            if success:
+                # with_strategy lets the director also restore strategy-OWNED
+                # learnable modules/params (sfc heads, spin_sde diffusion param,
+                # ...) that live on the strategy, not on the generator — see
+                # section R design doc.
+                #
+                # with_parallel_runtime is what selects the checkpoint adapter,
+                # and a resume needs it for two distinct reasons. Loudly: a
+                # sharded strategy's best checkpoint holds no generic payload at
+                # all, so resuming from one without the adapter raises. Quietly,
+                # and worse: a PERIODIC checkpoint does carry the generic
+                # envelope, so the weights restore and the resume reports success
+                # -- while the ZeRO optimizer partitions in the tag directory
+                # beside it are never read, silently restarting a resumed run on
+                # a zeroed optimizer.
+                #
+                # `getattr(..., None)` mirrors training_loop.py's own resolution
+                # and keeps every single-process arm on DefaultCheckpointAdapter.
+                resume_director = CheckpointDirector(config)
+                resume_director.with_checkpoint_dir(
+                    str(Path(output_dir) / "checkpoints")
+                ).with_pipeline(pipeline).with_strategy(strategy).with_parallel_runtime(
+                    getattr(pipeline, "parallel", None)
+                )
+
+                if not resume_director.load_from(_resume_path):
+                    logging_service.log_error(
+                        f"[Resume] Failed to load checkpoint: {_resume_path}"
+                    )
+                    return {
+                        "error": f"Failed to load checkpoint: {_resume_path}",
+                        "success": False,
+                    }
+
                 start_iteration = resume_director._global_step
+                _resume_record = {
+                    "declared": _resume_mode,
+                    "resolved_checkpoint": _resume_path,
+                    "outcome": "restored",
+                    "start_iteration": start_iteration,
+                    "epoch": resume_director._epoch,
+                }
                 logging_service.log_info(
                     f"[Resume] Restored from checkpoint: "
                     f"epoch={resume_director._epoch}, step={start_iteration}"
@@ -1090,16 +1224,20 @@ def run_training_pipeline(
                         f"step={resume_director._counter_state.get('current_step')}, "
                         f"epoch={resume_director._counter_state.get('current_epoch')}"
                     )
-            else:
-                logging_service.log_error(f"[Resume] Failed to load checkpoint: {_resume_path}")
-                return {
-                    "error": f"Failed to load checkpoint: {_resume_path}",
-                    "success": False,
-                }
         except Exception as e:
             logging_service.log_error(f"[Resume] Checkpoint load error: {e}")
             logger.error("Resume checkpoint load failed", exc_info=True)
             return {"error": f"Resume failed: {e}", "success": False}
+
+    # A resume is a fact about the run that provenance.json cannot carry: it is
+    # written at stage 8, before this decision exists. Stamped here so a reader
+    # can tell a fresh link of a chain from a restored one (non-negotiable 8).
+    # Rank-gated: the stamper is a read-modify-write on one shared path, so an
+    # ungated call has every rank appending — four entries per link on a 4-rank
+    # arm, or a torn read that fails open and records nothing. The process-group
+    # arms are the ones that chain, so this is the production path.
+    if _resume_record and _is_rank_zero:
+        _stamp_resume_record(run_dir, _resume_record, logger_=logging_service)
 
     # 9b. TensorBoard — the run's single writer.
     #
@@ -1161,6 +1299,8 @@ def run_training_pipeline(
             result["duration_sec"] = round(duration_sec, 2)
             if isinstance(iters, int) and iters > 0 and duration_sec > 0:
                 result["iterations_per_sec"] = round(iters / duration_sec, 3)
+            if result.get("wall_clock_yield") and _is_rank_zero:
+                _write_yield_marker(run_dir, result, logger_=logging_service)
 
         # ONE writer (#1685), and every write below it too. The sinks write
         # fixed, rank-independent paths (`report_cases/case_*.npz`,
@@ -1235,7 +1375,21 @@ def run_training_pipeline(
 
             # End-of-training reporting hook (per TODO/report_step).
             # Soft-fails by default so it cannot break a long run's wrap-up.
-            _maybe_run_reporting(config, run_dir=Path(paths["run_output_dir"]), logger_=logger)
+            #
+            # Skipped on a wall-clock yield for two reasons. It would draw the
+            # figure set of a FINISHED experiment from a model that is midway
+            # through one; and it runs inside the save margin, so a report long
+            # enough to reach the wall takes the launcher down with it before
+            # the requeue is ever issued.
+            if result.get("wall_clock_yield"):
+                logger.info(
+                    "[WallClock] Skipping end-of-training reporting: this run "
+                    "yielded and is not finished."
+                )
+            else:
+                _maybe_run_reporting(
+                    config, run_dir=Path(paths["run_output_dir"]), logger_=logger
+                )
 
         return result
 
@@ -1243,12 +1397,55 @@ def run_training_pipeline(
         import traceback
 
         error_msg = f"Critical Training Error: {e}\n{traceback.format_exc()}"
+        hint = _async_cuda_fault_hint(e)
+        if hint:
+            error_msg = f"{error_msg}\n{hint}"
         logging_service.log_error(error_msg)
         logger.error(error_msg, exc_info=True)
         if tb_writer:
             _write_hparams(tb_writer, config)
             tb_writer.close()
         return {"error": str(e), "success": False}
+
+
+#: CUDA faults the driver reports on a LATER synchronisation than the launch that
+#: caused them. The traceback then names whichever op happened to sync, so the
+#: frame is evidence of nothing. ``device-side assert`` is included because its
+#: own message already says to set the variable; the rest never say so.
+_ASYNC_CUDA_FAULTS = (
+    "misaligned address",
+    "an illegal memory access",
+    "unspecified launch failure",
+    "device-side assert triggered",
+)
+
+
+def _async_cuda_fault_hint(exc: BaseException) -> str | None:
+    """Say that the traceback of an async CUDA fault points at the wrong frame.
+
+    Three ``kspace_cold_diffusion`` arms died with ``CUDA error: misaligned
+    address`` on the 2026-09-17 dispatch, all three blaming the same
+    ``ChannelAttention`` line -- which is simply where the next synchronisation
+    landed. Re-running unchanged reproduces the same useless frame, so the
+    operator needs the serialising flag named at the point of failure rather
+    than in a doc they have no reason to open.
+    """
+    text = str(exc)
+    if "CUDA error:" not in text and "AcceleratorError" not in type(exc).__name__:
+        return None
+    if not any(fault in text for fault in _ASYNC_CUDA_FAULTS):
+        return None
+    return (
+        "[async CUDA fault] The traceback above names the operation that "
+        "SYNCHRONISED, not the kernel that faulted -- CUDA reports these "
+        "asynchronously, so the frame is not the culprit and re-running "
+        "unchanged reproduces the same misdirection. Re-run this arm with "
+        "CUDA_LAUNCH_BLOCKING=1 to serialise launches and get a traceback that "
+        "names the real kernel. If it then lands somewhere else each time, "
+        "suspect the node: `cudnn.benchmark` re-autotunes per process, so the "
+        "algorithm selection -- and any alignment requirement it carries -- "
+        "varies run to run on identical config."
+    )
 
 
 def _format_duration(seconds: float) -> str:
@@ -2088,62 +2285,24 @@ def _run_validation(
     if _empty_cache_before_val and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # [FIX] Swap in EMA weights for validation if available.
-    # CRITICAL: state_dict() returns *references* to live parameter tensors.
-    # The subsequent load_state_dict(compatible_state) calls
-    # `param.data.copy_(input)` in-place, which would overwrite the
-    # tensors that `original_state_dict` points to — silently destroying
-    # the saved training weights and making the post-validation restore
-    # a no-op. We must `.detach().clone()` to capture independent copies.
-    original_state_dict = None
     ema_active = getattr(pipeline, "ema", None) is not None
-    if ema_active:
-        logger.info("[VAL] Temporarily replacing generator weights with EMA shadow parameters...")
-        # Clone to CPU: avoids holding a third full copy of model weights
-        # in VRAM during validation (EMA already holds a shadow copy).
-        # load_state_dict() handles the CPU→GPU copy on restore.
-        original_state_dict = {
-            k: v.detach().cpu().clone() for k, v in pipeline.generator.state_dict().items()
-        }
-        # Filter EMA state dict to match current model shapes
-        # (channel_adapter may have been dynamically rebuilt during training)
-        ema_state = pipeline.ema.module.state_dict()
-        model_state = pipeline.generator.state_dict()
-        compatible_state = {}
-        for k, v in ema_state.items():
-            if k in model_state and model_state[k].shape == v.shape:
-                compatible_state[k] = v
-            elif k in model_state:
-                logger.warning(
-                    f"[VAL] EMA shape mismatch for '{k}': EMA={v.shape} vs model={model_state[k].shape}. Keeping model weights."
-                )
-        pipeline.generator.load_state_dict(compatible_state, strict=False)
+    # Unwrap once: the EMA shadow carries BARE keys (it is a deepcopy of the
+    # module taken before any parallel wrap), so intersecting it against a
+    # wrapped generator's ``module.``/``_orig_mod.``-prefixed keys yields the
+    # empty dict -- which ``load_state_dict(..., strict=False)`` accepts in
+    # silence, leaving validation to grade the LIVE weights (#2172).
+    ema_target = unwrap_model(pipeline.generator) if ema_active else pipeline.generator
 
     import contextlib
 
     @contextlib.contextmanager
     def _ema_swap_context():
-        try:
+        """Delegate to the swap SSOT, or do nothing when this arm has no EMA."""
+        if not ema_active:
             yield
-        finally:
-            if ema_active and original_state_dict is not None:
-                # Filter by shape compatibility before restoring — strict=False
-                # only ignores missing/unexpected keys, NOT shape mismatches.
-                # The channel_adapter may have been dynamically rebuilt during
-                # validation forward passes, changing its shape from what was
-                # captured in original_state_dict.
-                current_state = pipeline.generator.state_dict()
-                compatible_restore = {}
-                for k, v in original_state_dict.items():
-                    if k in current_state and current_state[k].shape == v.shape:
-                        compatible_restore[k] = v
-                    elif k in current_state:
-                        logger.warning(
-                            f"[VAL] Shape mismatch restoring '{k}': "
-                            f"saved={v.shape} vs current={current_state[k].shape}. Skipping."
-                        )
-                pipeline.generator.load_state_dict(compatible_restore, strict=False)
-                logger.info("[VAL] Restored generator weights from EMA parameters.")
+            return
+        with ema_weights_swapped_in(ema_target, pipeline.ema.module):
+            yield
 
     # Resolve a per-call validation cap. The two schema fields below were
     # silent orphans (declared in `validation.py` but never consumed) — a
@@ -2189,7 +2348,7 @@ def _run_validation(
         ):
             if _max_val_batches is not None and i >= _max_val_batches:
                 logger.info(
-                    "[VAL] Stopping after %d batches (validation.num_validation_batches cap)",
+                    "[VAL] Stopping after %d batches (validation.loader.num_batches cap)",
                     i,
                 )
                 break

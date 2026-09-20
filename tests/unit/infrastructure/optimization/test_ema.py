@@ -366,3 +366,157 @@ def test_mixed_dtype_pair_falls_back_and_still_blends():
     ema.update(live)
     assert ema.module.conv.weight.dtype is torch.float32
     assert not torch.equal(before, ema.module.conv.weight)
+
+
+# ---------------------------------------------------------------------------
+# Wrapper invariance (#2172).
+#
+# The blend loop is key-matched, so a shadow whose keys are all absent from the
+# live model blends NOTHING and raises nothing. Measured against a real
+# DeepSpeed engine: shadow "0.weight" vs engine "module.0.weight", overlap 0,
+# on 75 production arms. These tests plant that exact shape.
+#
+# Note what the pre-existing tests above could not catch: they call
+# ``ema.state_dict()`` directly, while the checkpoint director called
+# ``unwrap_model(ema).state_dict()`` -- which peels ModelEma's own ``.module``
+# and so never runs the override. The tests and the production path were
+# exercising different code (non-negotiable 15).
+# ---------------------------------------------------------------------------
+
+
+class _PrefixWrapper(nn.Module):
+    """Stands in for DDP / DeepSpeedEngine: registers the model under ``.module``.
+
+    That is the whole mechanism -- every state-dict key gains a ``module.``
+    prefix -- so a fake reproduces it exactly and needs no GPU or process group.
+    """
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+
+def test_update_raises_when_the_live_model_is_wrapped():
+    """Zero key overlap must raise, not silently blend nothing."""
+    from spectramr.infrastructure.optimization.ema import EMAKeyMismatchError
+
+    model = nn.Linear(4, 4)
+    ema = ModelEma(model, decay=0.99, warmup=True)
+
+    with pytest.raises(EMAKeyMismatchError, match="share no state-dict keys"):
+        ema.update(_PrefixWrapper(model))
+
+
+def test_the_raise_names_both_key_spellings():
+    """The message has to be actionable -- the shape is invisible otherwise."""
+    from spectramr.infrastructure.optimization.ema import EMAKeyMismatchError
+
+    model = nn.Linear(4, 4)
+    ema = ModelEma(model, decay=0.99)
+    with pytest.raises(EMAKeyMismatchError) as excinfo:
+        ema.update(_PrefixWrapper(model))
+    message = str(excinfo.value)
+    assert "weight" in message and "module.weight" in message
+    assert "unwrap_model" in message
+
+
+def test_unwrapping_the_live_model_restores_blending():
+    """The prescribed fix actually works on the wrapper that broke it."""
+    from spectramr.core.module_utils import unwrap_model
+
+    model = nn.Linear(4, 4)
+    ema = ModelEma(model, decay=0.5, warmup=False)
+    before = ema.module.weight.detach().clone()
+    with torch.no_grad():
+        model.weight.add_(1.0)
+
+    ema.update(unwrap_model(_PrefixWrapper(model)))
+
+    assert not torch.allclose(before, ema.module.weight)
+
+
+def test_a_partial_key_overlap_still_blends():
+    """Only TOTAL mismatch is a wiring bug.
+
+    A rebuilt ``channel_adapter`` legitimately leaves some shadow keys
+    unmatched, and that path must keep working rather than start raising.
+    """
+    model = nn.Linear(4, 4)
+    ema = ModelEma(model, decay=0.5, warmup=False)
+    before = ema.module.weight.detach().clone()
+    with torch.no_grad():
+        model.weight.add_(1.0)
+
+    partial = {"weight": model.state_dict()["weight"]}
+    ema.update(_StateDictOnly(partial))
+
+    assert not torch.allclose(before, ema.module.weight)
+
+
+class _StateDictOnly(nn.Module):
+    """A stand-in exposing a caller-chosen ``state_dict`` and nothing else."""
+
+    def __init__(self, sd: dict) -> None:
+        super().__init__()
+        self._sd = sd
+
+    def state_dict(self, *args, **kwargs):  # type: ignore[override]
+        return self._sd
+
+
+# ---------------------------------------------------------------------------
+# The checkpoint form: bare weight keys PLUS the warmup counter.
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_state_dict_has_bare_keys_and_the_counter():
+    """Weight keys stay bare (the on-disk contract); the counter rides along."""
+    ema = ModelEma(nn.Linear(4, 4), decay=0.99)
+    ema.num_updates = 777
+    sd = ema.shadow_state_dict()
+
+    assert ModelEma._NUM_UPDATES_KEY in sd
+    weight_keys = [k for k in sd if k != ModelEma._NUM_UPDATES_KEY]
+    assert weight_keys and not any(k.startswith("module.") for k in weight_keys)
+
+
+def test_shadow_state_dict_roundtrip_restores_the_ramp_position():
+    """A resume must continue the decay ramp, not restart it at 0."""
+    ema = ModelEma(nn.Linear(4, 4), decay=0.99, warmup=True)
+    ema.num_updates = 777
+
+    restored = ModelEma(nn.Linear(4, 4), decay=0.99, warmup=True)
+    restored.load_shadow_state_dict(ema.shadow_state_dict())
+
+    assert restored.num_updates == 777
+    assert torch.allclose(restored.module.weight, ema.module.weight)
+
+
+def test_load_shadow_state_dict_accepts_a_pre_fix_checkpoint():
+    """Checkpoints written before the counter existed still load."""
+    ema = ModelEma(nn.Linear(4, 4), decay=0.99)
+    legacy = dict(ema.module.state_dict())  # bare, no counter -- the old format
+    assert ModelEma._NUM_UPDATES_KEY not in legacy
+
+    restored = ModelEma(nn.Linear(4, 4), decay=0.99)
+    restored.num_updates = 5
+    restored.load_shadow_state_dict(legacy)
+
+    assert restored.num_updates == 5  # left alone, never invented
+
+
+def test_unwrapping_before_state_dict_drops_the_counter():
+    """Pins WHY shadow_state_dict exists, so the old spelling cannot return.
+
+    ``unwrap_model`` peels ModelEma's ``.module``, so ``state_dict()`` runs on
+    the inner module and the override that injects the counter never fires.
+    That is the shape the checkpoint director shipped: every resume restarted
+    the decay ramp at 0.
+    """
+    from spectramr.core.module_utils import unwrap_model
+
+    ema = ModelEma(nn.Linear(4, 4), decay=0.99)
+    ema.num_updates = 1234
+
+    assert ModelEma._NUM_UPDATES_KEY not in unwrap_model(ema).state_dict()
+    assert ModelEma._NUM_UPDATES_KEY in ema.shadow_state_dict()

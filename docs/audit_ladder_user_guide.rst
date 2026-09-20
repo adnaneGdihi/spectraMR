@@ -148,7 +148,9 @@ or features. Under ``--strict`` every warning is promoted to an error.
 
    **``--strict`` is the parser default; ``--no-strict`` is the opt-out.** A
    warning therefore exits 2, not 1. Per-arm opt-out belongs in the config
-   (``synthetic_forward_probe_skip``), which is the reviewable place for it —
+   (``synthetic_forward_probe_skip`` for the Tier-2 probe,
+   ``metadata.audit_waivers`` for a Tier-0/1 warning — see
+   :ref:`audit_waivers`), which is the reviewable place for it —
    ``--no-strict`` exists for interactive triage, not for gates.
 
 Errors (always block)
@@ -573,6 +575,52 @@ Why this matters: 14 of last run's "passed" arms had OOM during
 validation, 11 had silently-omitted losses, 9 had early-stopping
 metrics that never matched. They look green in the summary table.
 Under ``--strict`` they go red, where they belong.
+
+.. _audit_waivers:
+
+Acknowledging a warning that has no fix
+=======================================
+
+``--strict`` is the right posture for a warning somebody can act on. It is the
+wrong posture for one whose fix does not exist, and an unsatisfiable gate is not
+a gate: it teaches everyone to reach for ``--allow-warnings``, which then hides
+the warnings that *did* have a fix.
+
+The 2026-09-16 dispatch is the worked example. Neither
+``experiment_11_kspace_cold_diffusion_radial`` nor ``_spiral`` ever launched —
+the dispatcher read the audit's exit 2 and skipped train — because
+``schedule.nesting_leakfree`` fires on every non-Cartesian cascade, and the
+witness's own fix hint (``undersampling.enforce_nested: true``) **raises** on
+those families: the cumulative intersection keeps 3.5 % of k-space at ``t=1``
+where radial's own draw kept 50 %, which ``sampling.py`` refuses as below
+``nested_tolerance``.
+
+So the arm acknowledges the finding by name, in its own YAML:
+
+.. code-block:: yaml
+
+   metadata:
+     audit_waivers:
+     - check: schedule.nesting_leakfree
+       justification: >
+         RadialKSpaceAccelerator redraws its spoke set per level, so the cascade
+         cannot nest (#1573) and enforce_nested raises here. The leak is the
+         geometry this arm exists to measure.
+
+The finding is still printed in full, prefixed ``WAIVED`` and carrying the
+justification; only its contribution to the exit code is cleared. Name the check
+exactly as the audit prints it — a ``health:`` prefix may be omitted.
+
+What a waiver cannot do:
+
+* **It cannot clear an error.** A waiver aimed at one leaves the error failing
+  and reports the misuse. "Warnings are not OK" stays true for everything an arm
+  could fix.
+* **It cannot be silent.** A waiver with no ``justification`` is an error: the
+  acknowledgement *is* the text.
+* **It cannot outlive its reason.** A waiver that matched no reported finding —
+  a typo, a retired check, or a finding since fixed — is itself a warning, so a
+  stale acknowledgement surfaces the day it stops being true.
 
 Audit before you train
 ======================

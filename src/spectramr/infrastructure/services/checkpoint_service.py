@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import random
 import shutil
 import tempfile
 import threading
@@ -16,6 +15,11 @@ from torch import nn
 
 from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
 from spectramr.core.module_utils import strip_wrapper_prefixes, unwrap_model
+from spectramr.core.rng_state import (
+    RNG_STATE_SAFE_GLOBALS,
+    capture_rng_state,
+    restore_rng_state,
+)
 from spectramr.domain.interfaces.checkpoint_service_interface import ICheckpointService
 from spectramr.infrastructure.services.iteration_counter_service import (
     IterationCounterService,
@@ -93,58 +97,6 @@ def discover_best_checkpoint(checkpoints_dir: Path | str) -> Path | None:
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
     return None
-
-
-# The exact set of globals ``_capture_rng_state`` puts on the wire.
-#
-# ``np.random.get_state()`` returns a tuple carrying a ``uint32`` ndarray, so
-# unpickling it needs ``numpy._core.multiarray._reconstruct``, ``np.ndarray``,
-# ``np.dtype`` and the concrete dtype class. None of those are in torch's
-# default weights-only allowlist, so from torch 2.6 on — where
-# ``torch.load(weights_only=True)`` became the default — *every* checkpoint
-# this service writes is refused by a plain ``torch.load(path)``. The four
-# entries below are data-only reconstructors, so allowlisting them keeps the
-# weights-only guarantee (no arbitrary global is executed) while letting our
-# own envelope through. Readers should wrap their load in
-# ``torch.serialization.safe_globals(RNG_STATE_SAFE_GLOBALS)`` rather than
-# registering them process-globally, which would leak across callers.
-RNG_STATE_SAFE_GLOBALS: list[Any] = [
-    np._core.multiarray._reconstruct,
-    np.ndarray,
-    np.dtype,
-    type(np.dtype(np.uint32)),
-]
-
-
-def _capture_rng_state() -> dict[str, Any]:
-    """Snapshot every RNG that influences training stochasticity.
-
-    Saving these alongside model + optimizer state is required for a
-    bit-identical resume. Without them, dropout / augmentation / diffusion
-    noise sequences diverge after restoring a checkpoint, even with all
-    seeds and ``cudnn.deterministic = True``.
-    """
-    state: dict[str, Any] = {
-        "torch": torch.get_rng_state(),
-        "numpy": np.random.get_state(),
-        "python": random.getstate(),
-    }
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    return state
-
-
-def _restore_rng_state(state: dict[str, Any]) -> None:
-    """Reverse of ``_capture_rng_state``. Tolerates partial state for
-    forward-compat with older checkpoints that pre-date this field."""
-    if "torch" in state:
-        torch.set_rng_state(state["torch"])
-    if "numpy" in state:
-        np.random.set_state(state["numpy"])
-    if "python" in state:
-        random.setstate(state["python"])
-    if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 @dataclass
@@ -348,7 +300,7 @@ class CheckpointService(ICheckpointService):
             # RNG state — without this, resuming training diverges on every
             # stochastic op (dropout, augmentation, diffusion noise sampling).
             # See findings booklet 2026-05-05 T-1.
-            "rng_state": _capture_rng_state(),
+            "rng_state": capture_rng_state(),
         }
 
         # Sub-phase 2.9: record transform signature (sha256 hex) when the
@@ -563,8 +515,6 @@ class CheckpointService(ICheckpointService):
         """Helper to flatten an optimizer state dict into save_dict."""
         import json
 
-        import numpy as np
-
         # Save param_groups as metadata
         if "param_groups" in opt_state:
             try:
@@ -754,9 +704,16 @@ class CheckpointService(ICheckpointService):
                 if ema_model and "ema_state_dict" in state:
                     # ModelEma holds its shadow under `.module`, so an EMA state
                     # dict was ALWAYS prefixed even on a single-GPU eager run.
-                    unwrap_model(ema_model).load_state_dict(
-                        strip_wrapper_prefixes(state["ema_state_dict"]), strict=strict
-                    )
+                    # Prefer ModelEma's own loader, which also restores the
+                    # warmup counter; unwrapping first peels past the override
+                    # and silently restarts the decay ramp at 0 (#2172). The
+                    # attribute check is for callers that pass a bare module.
+                    if hasattr(ema_model, "load_shadow_state_dict"):
+                        ema_model.load_shadow_state_dict(state["ema_state_dict"], strict=strict)
+                    else:
+                        unwrap_model(ema_model).load_state_dict(
+                            strip_wrapper_prefixes(state["ema_state_dict"]), strict=strict
+                        )
                     logger.info("Restored EMA shadow weights perfectly")
 
                 # Load optimizer state if requested
@@ -793,7 +750,7 @@ class CheckpointService(ICheckpointService):
                 # Restore RNG state for deterministic resume across all
                 # stochastic ops. See findings booklet 2026-05-05 T-1.
                 if "rng_state" in state and state["rng_state"] is not None:
-                    _restore_rng_state(state["rng_state"])
+                    restore_rng_state(state["rng_state"])
                     logger.info("Restored RNG state (torch + cuda + numpy + python)")
 
                 logger.info(f"Loaded checkpoint from {file_path}")
@@ -1010,16 +967,28 @@ class CheckpointService(ICheckpointService):
             Path to latest checkpoint or None if none found
         """
         dir_path = Path(checkpoint_dir)
-        checkpoints = list(dir_path.glob(f"checkpoint_epoch_*.{self.format}"))
-        checkpoints.extend(dir_path.glob(f"checkpoint_step_*.{self.format}"))
+        # Both suffixes, always. `self.format` describes what THIS service
+        # writes, but the writer on the production training path is
+        # `CheckpointDirector.save()`, which spells `.pt` unconditionally — so
+        # globbing the declared format alone returned None against every
+        # checkpoint a real run had just produced, and `--resume auto` then
+        # raised "No checkpoint found" on an arm whose directory was full of
+        # them (#2070). Ordering below is by step, not by suffix, so
+        # a mixed directory resolves to the newest state either writer saved.
+        suffixes = dict.fromkeys((self.format, "pt"))
+        checkpoints: list[Path] = []
+        for suffix in suffixes:
+            checkpoints.extend(dir_path.glob(f"checkpoint_epoch_*.{suffix}"))
+            checkpoints.extend(dir_path.glob(f"checkpoint_step_*.{suffix}"))
         if not checkpoints:
-            # Try best/last checkpoints
-            best = dir_path / f"checkpoint_best.{self.format}"
-            last = dir_path / f"checkpoint_last.{self.format}"
-            if last.exists():
-                return str(last)
-            elif best.exists():
-                return str(best)
+            for suffix in suffixes:
+                last = dir_path / f"checkpoint_last.{suffix}"
+                if last.exists():
+                    return str(last)
+            for suffix in suffixes:
+                best = dir_path / f"checkpoint_best.{suffix}"
+                if best.exists():
+                    return str(best)
             return None
 
         def extract_step(path: Path) -> int:

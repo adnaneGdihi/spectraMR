@@ -208,3 +208,31 @@ class TestValidationEnsembleKnobs:
         )
         assert cfg.sampling.ensemble_samples == 4
         assert cfg.sampling.coverage_k == 1.5
+
+
+class TestRevealAttributionKnob:
+    """``validation.sampling.reveal_attribution`` (#2067 follow-up).
+
+    Planted refusal first: the knob partitions the reconstruction by reverse
+    step, which a single deterministic forward does not have. Accepting it there
+    would emit an all-``nan`` ``val_band_*`` block, which reads as "the bands are
+    unmeasurable" rather than "this arm cannot run the diagnostic".
+    """
+
+    def test_default_is_off_so_existing_arms_are_unchanged(self) -> None:
+        assert ValidationConfigSchema().sampling.reveal_attribution is False
+
+    def test_attribution_without_the_multistep_sampler_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="enable_multistep_cold"):
+            ValidationConfigSchema(sampling={"reveal_attribution": True})
+
+    def test_attribution_loads_with_the_multistep_sampler(self) -> None:
+        sampling = ValidationConfigSchema(
+            sampling={"enable_multistep_cold": True, "reveal_attribution": True}
+        ).sampling
+        assert sampling.reveal_attribution is True
+
+    def test_the_multistep_sampler_alone_does_not_enable_attribution(self) -> None:
+        """Opt-in: the oracle reads the target, so it is never implied."""
+        sampling = ValidationConfigSchema(sampling={"enable_multistep_cold": True}).sampling
+        assert sampling.reveal_attribution is False

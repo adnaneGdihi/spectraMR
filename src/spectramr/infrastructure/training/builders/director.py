@@ -19,6 +19,8 @@ from spectramr.infrastructure.distributed.strategy_registry import (
     resolve_parallel_strategy,
 )
 
+from .compile_apply import CompileRecord, apply_compile, compile_is_enabled
+from .compile_placement import resolve_compile_placement
 from .data_builder import DataBuilder
 from .environment import TrainingEnvironment
 from .infrastructure_builder import InfrastructureBuilder
@@ -74,6 +76,20 @@ class TrainingEnvironmentDirector:
         logger.info("[Parallel] strategy=%s", plugin.name)
         return plugin, ctx
 
+    def _resolve_compile_placement(self):
+        """Where compilation goes for this arm's declared strategy.
+
+        Reads ``parallel.strategy`` and, for DeepSpeed, ``zero_stage`` -- the
+        placement depends on the stage, so it cannot be a class attribute on the
+        plugin.
+        """
+        parallel = getattr(self._config, "parallel", None)
+        deepspeed = getattr(parallel, "deepspeed", None)
+        return resolve_compile_placement(
+            getattr(parallel, "strategy", None),
+            zero_stage=getattr(deepspeed, "zero_stage", None),
+        )
+
     def build_environment(self) -> TrainingEnvironment:
         """Build complete training environment in correct order.
 
@@ -88,6 +104,18 @@ class TrainingEnvironmentDirector:
         """
         logger.info("Building training environment...")
 
+        # Resolved FIRST so a refused combination fails here rather than after
+        # the models, optimizers and dataloaders have been built on a cluster
+        # node. The placement is a fact about the strategy, not a knob -- see
+        # compile_placement for the measurements behind each row.
+        placement = self._resolve_compile_placement()
+        wants_compile = compile_is_enabled(self._config)
+        if wants_compile and placement.refused:
+            raise RuntimeError(placement.refusal)
+        if wants_compile and placement.advisory:
+            logger.warning(placement.advisory)
+        compile_record = CompileRecord()
+
         # 1. Models (must come first - needed by optimizers)
         logger.info("Step 1/6: Building models...")
         model_builder = (
@@ -96,8 +124,12 @@ class TrainingEnvironmentDirector:
             .build_discriminator()
             .build_encoder_decoder()
             .validate()
-            .compile()  # [NEW] Apply torch.compile if enabled
-            .build_ema()  # [FIX] Initialize EMA tracker after compilation validation
+            # No .compile() here. Compilation is placed per strategy now
+            # (compile_placement); at this point the wraps have not happened,
+            # which is the wrong point for every strategy but DeepSpeed.
+            # It also means build_ema deep-copies the BARE model, so the
+            # shadow tracks weights rather than an OptimizedModule.
+            .build_ema()
         )
         models = model_builder.build()
         ema_model = model_builder.ema
@@ -114,6 +146,14 @@ class TrainingEnvironmentDirector:
         parallel_plugin, parallel_ctx = self._resolve_parallel()
         if parallel_plugin is not None:
             models = parallel_plugin.prepare_models(models, parallel_ctx)
+
+        # FSDP compiles here -- torch.compile(FSDP(m)), the recommended order --
+        # and DeepSpeed compiles here because initialize() must receive an
+        # already-compiled module (Stage A is a no-op for it).
+        if placement.stage == "after_stage_a":
+            models, compile_record = apply_compile(
+                models, self._config, stage="after_stage_a", device=self._device
+            )
 
         # 2. Optimization (depends on models)
         logger.info("Step 2/6: Building optimization components...")
@@ -148,6 +188,16 @@ class TrainingEnvironmentDirector:
                 provenance=result.provenance,
             )
 
+        # Compile last for the strategies that wrap late. For ddp this is what
+        # lets dynamo see the wrapper and engage DDPOptimizer, which splits the
+        # graph at allreduce bucket boundaries; for the single-device path it
+        # additionally keeps the optimizer, built above, looking at a bare
+        # module (#2174).
+        if placement.stage == "after_stage_b":
+            models, compile_record = apply_compile(
+                models, self._config, stage="after_stage_b", device=self._device
+            )
+
         # 3. Losses (independent)
         logger.info("Step 3/6: Building loss functions...")
         losses = (
@@ -166,7 +216,6 @@ class TrainingEnvironmentDirector:
         physics = (
             PhysicsBuilder(self._config, self._device)
             .build_fft_transformer()
-            .build_mask_generator()
             .build_data_consistency()
             .build_coil_sensitivity()
             .validate()
@@ -206,6 +255,7 @@ class TrainingEnvironmentDirector:
             physics=physics,
             data_loaders=data_loaders,
             parallel=parallel_runtime,
+            compile=compile_record,
             metrics=metrics,
             scaler=scaler,
             device=self._device,

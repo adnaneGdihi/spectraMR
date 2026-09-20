@@ -13,7 +13,6 @@ from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
 from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.utils.data_adapters import TorchIOAdapter
-from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
 from spectramr.infrastructure.training.utils.transform_ops import FFTTransformer
 
 from .utils import _get_config_value, pick_present
@@ -119,36 +118,16 @@ class KspaceMixin:
             and "kspace_cold_diffusion" in str(self.config.model.model_type).lower()
         )
 
-    def setup_kspace_components(self: "BaseTrainingStrategy", num_timesteps: int = 1000) -> None:
-        """Initialize K-Space specific components (Mask Generator, Data Consistency)."""
+    def setup_kspace_components(self: "BaseTrainingStrategy") -> None:
+        """Initialize K-Space specific components (Mask Generator, Data Consistency).
+
+        Took a ``num_timesteps`` argument until the mask generator moved to the
+        model (#2056). The process was built from the same
+        ``training.diffusion.timesteps``, so the parameter became a second way
+        to state one value and nothing read it (non-negotiable 8).
+        """
         if not self._is_cold_diffusion():
             return
-
-        # Function-local: the edge infrastructure -> models is legal, but
-        # ``spectramr.infrastructure.training.__init__`` eagerly imports
-        # ``.strategies``, so a module-level import here closes a cycle through
-        # this very module. ``physics_builder`` imports the same helper the same
-        # way, for the same reason.
-        from spectramr.models.diffusion.kspace_process import (
-            accelerator_kwargs_from_config,
-        )
-
-        # Extract acceleration configuration.
-        #
-        # This used to dump the whole frozen schema and remove exactly one key
-        # (``acceleration_type``), which is a denylist over ``model_dump()``:
-        # every field the schema defines rides along, defaults included. Once
-        # ``_reject_unknown_accelerator_kwargs`` landed, the first validation
-        # step raised a TypeError naming seventeen unread names, and before that
-        # gate existed the same kwargs were silently discarded — including
-        # ``mask_seed``, which this path never translated to the accelerator's
-        # ``seed``. That is issue #1059's failure mode: ``seed=None`` falls back
-        # to the global RNG, each call draws a fresh permutation instead of
-        # truncating one fixed ranking, and the cascade stops being nested.
-        # ``accelerator_kwargs_from_config`` is the same allowlist
-        # ``KSpaceUndersamplingProcess`` uses, so the two paths build the same
-        # accelerator from the same YAML.
-        accel_config = self.config.undersampling
 
         generator = self.env.generator
         if hasattr(generator, "dc_layer") and generator.dc_layer is not None:
@@ -171,28 +150,37 @@ class KspaceMixin:
                     "🧲 Data Consistency: Enabled in config but NOT found in model. Skipping strategy-side DC."
                 )
 
-        # Mask Generator. An absent ``undersampling:`` block keeps the historical
-        # "linear, no kwargs" generator rather than materialising the resolver's
-        # full default ladder, which would silently give a config that declares
-        # no acceleration a 32x one.
-        if accel_config is None:
-            pattern, accelerator_kwargs = "linear", {}
-        else:
-            pattern, accelerator_kwargs = accelerator_kwargs_from_config(accel_config)
+        # The mask generator is BORROWED from the model, never rebuilt (#2056).
+        # Both sides resolved the same ``undersampling:`` block through the same
+        # allowlist, so the two instances agreed on every accelerator kwarg --
+        # which is why the duplication survived: it showed only as
+        # ``Creating Accelerator`` logged twice per run. What a strategy-owned
+        # copy can never share is the knobs the ACCELERATOR does not carry:
+        # ``accelerator_kwargs_from_config`` drops ``enable_dynamic_mask`` by
+        # design, because the per-sample seed jitter lives in
+        # ``KSpaceUndersamplingProcess.q_sample``. One object, and
+        # ``self.training`` decides whether the pattern jitters.
+        unwrapped = generator.module if hasattr(generator, "module") else generator
+        process = getattr(unwrapped, "kspace_process", None)
+        if process is None:
+            raise ValueError(
+                f"{self.config.model.model_type!r} routes through the cold-diffusion "
+                f"setup, but its generator {type(unwrapped).__name__} exposes no "
+                f"'kspace_process' to take the mask generator from. Building a second "
+                f"one here is what #2056 removed: it would resolve the same "
+                f"'undersampling:' block through a second code path nothing compares "
+                f"against, and would miss every knob the accelerator does not carry."
+            )
+        self.mask_generator = process.mask_generator
 
-        if pattern == "multi_mask":
-            if hasattr(self, "logging_service"):
-                self.logging_service.log_warning(
-                    "Using 'multi_mask' pattern - ensure KSpaceMaskGenerator supports it",
-                    model_type=self.config.model.model_type,
-                )
+        pattern = self.mask_generator.default_pattern
+        accelerator_kwargs = self.mask_generator._accelerator_kwargs
 
-        self.mask_generator = KSpaceMaskGenerator(
-            num_timesteps=num_timesteps,
-            device=self.device,
-            default_pattern=pattern,
-            accelerator_kwargs=accelerator_kwargs,
-        )
+        if pattern == "multi_mask" and hasattr(self, "logging_service"):
+            self.logging_service.log_warning(
+                "Using 'multi_mask' pattern - ensure KSpaceMaskGenerator supports it",
+                model_type=self.config.model.model_type,
+            )
 
         if hasattr(self, "logging_service"):
             # ``density_power`` is flattened into the kwargs, not nested under a

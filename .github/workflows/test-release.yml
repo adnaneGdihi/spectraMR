@@ -38,6 +38,14 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      runner:
+        description: >-
+          Where the self-hosted jobs run. `thor` queues until the maintainer's
+          runner is listening; `hosted` runs them on ubuntu-latest instead.
+        type: choice
+        options: [thor, hosted]
+        default: thor
 
 # No `release: types: [published]`. It could not fire on the path it was written
 # for: the GitHub Release here is published BY a workflow using GITHUB_TOKEN, and
@@ -76,7 +84,14 @@ jobs:
     # explicit: whether thor exposes a GPU is NOT verified from here. Without
     # CUDA the `gpu`-marked tests still skip silently (conftest.py), so a green
     # run is not evidence they executed.
-    runs-on: [self-hosted, Linux, ARM64]
+    #
+    # thor is offline unless the maintainer starts it, and GitHub has no failover
+    # between runner pools, so the `runner` dispatch input (or RELEASE_RUNNER=hosted
+    # for a tag push) moves this job to ubuntu-latest by choice. Budget that run:
+    # a hosted job has 4 cores and a 360-minute ceiling, which clamps the
+    # `timeout-minutes` below rather than honouring it, and gudhi installs on
+    # x86_64, so the topology tests run there instead of skipping.
+    runs-on: ${{ (inputs.runner == 'hosted' || vars.RELEASE_RUNNER == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
     # Left at the original budget on purpose. No run of this lane has ever
     # executed a test, so there is no measurement to size it from; resize once a
     # completed run reports a real duration.
@@ -115,8 +130,9 @@ jobs:
     # ONE job at a time: a `v*` tag push enqueues four jobs onto it (this lane's
     # `suite` and `mutation`, 480 min budget each, plus release.yml's `build` and
     # `github-release`) and they drain serially, not in parallel. Only `pypi`
-    # runs elsewhere. Budget the tag accordingly.
-    runs-on: [self-hosted, Linux, ARM64]
+    # runs elsewhere. Budget the tag accordingly. The hosted fallback (see
+    # `suite`) applies here too, under the same 360-minute ceiling.
+    runs-on: ${{ (inputs.runner == 'hosted' || vars.RELEASE_RUNNER == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
     timeout-minutes: 480
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0

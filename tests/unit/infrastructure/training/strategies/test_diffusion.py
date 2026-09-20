@@ -1153,6 +1153,58 @@ def test_a_well_scaled_prediction_measures_quiet() -> None:
 
 
 @pytest.mark.unit
+def test_a_uniformly_attenuated_prediction_is_invisible_to_the_peak_statistics() -> None:
+    """PLANTED: the experiment_11_attention_none failure shape, R=32.
+
+    Both incumbent numbers are driven by the PEAK, so neither can see a deficit
+    spread over the whole image. Measured on that arm's own saved validation case
+    (``report_cases/case_2.npz``, 2026-09-16): a reconstruction carrying 0.295 of
+    the target's energy reported ``pred_target_scale_ratio`` 1.075 and
+    ``pred_above_target_fraction`` ~0 -- both squarely in band, on a 70000-iteration
+    run whose images are visibly zero-filled.
+
+    This test pins the MISS as well as the catch. Without the first two asserts a
+    later simplification could drop the energy statistics and leave the gate blind
+    again with nothing turning red.
+    """
+    torch.manual_seed(0)
+    target = torch.rand(2, 1, 32, 32) * _EXPERIMENT_11_TARGET_PEAK
+    # A low-passed copy at ~55% amplitude, with one hot pixel so the peak agrees:
+    # exactly the shape hard DC produces when the null band is under-filled.
+    pred = target * 0.55
+    pred[0, 0, 0, 0] = target.max() * 1.05
+
+    scale = DiffusionTrainingStrategy._measure_prediction_scale(pred, target)
+
+    # The miss: the incumbents read healthy.
+    assert scale["pred_target_scale_ratio"] == pytest.approx(1.05, abs=1e-3)
+    assert scale["pred_above_target_fraction"] < DiffusionTrainingStrategy._PRED_SCALE_WARN_FRACTION
+
+    # The catch: energy and the least-squares gain both name the deficit, and
+    # the gain names its SIZE -- the factor a single scalar would recover.
+    assert scale["pred_target_energy_ratio"] < 0.35
+    assert scale["pred_target_optimal_gain"] > 1.7
+
+
+@pytest.mark.unit
+def test_an_honestly_scaled_prediction_reads_one_on_both_energy_statistics() -> None:
+    """The anchor: identical tensors give ratio 1.0 and gain 1.0."""
+    target = torch.linspace(0.5, 4.0, 64).reshape(1, 1, 8, 8)
+
+    scale = DiffusionTrainingStrategy._measure_prediction_scale(target.clone(), target)
+
+    assert scale["pred_target_energy_ratio"] == pytest.approx(1.0, abs=1e-5)
+    assert scale["pred_target_optimal_gain"] == pytest.approx(1.0, abs=1e-5)
+
+    # A globally scaled prediction: energy goes as the square, the gain is the
+    # exact factor that undoes it. This is what makes the gain readable as
+    # "the reconstruction is under-scaled by 2x" rather than as an index.
+    half = DiffusionTrainingStrategy._measure_prediction_scale(target * 0.5, target)
+    assert half["pred_target_energy_ratio"] == pytest.approx(0.25, abs=1e-5)
+    assert half["pred_target_optimal_gain"] == pytest.approx(2.0, abs=1e-5)
+
+
+@pytest.mark.unit
 def test_prediction_scale_is_measured_on_magnitude_for_complex_tensors() -> None:
     """Complex predictions are compared in the domain the render path sees.
 
@@ -2537,6 +2589,90 @@ def _reference_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     return float(metric(pred, target, data_range=data_range))
 
 
+class TestMeasurementAwareMetricsReachTheProductionPath:
+    """Observed firing end to end, not inferred from the wiring (non-negotiable 16).
+
+    Three separate defects kept these columns out of every run (2026-09-16): the
+    declared tuple named two of five, ``only=`` intersected against
+    ``validation.scoring.compute`` rather than the ``metrics.compute`` the seam's
+    comment named, and the context-free write-back overwrote the result with its
+    own NaN. The unit tests in ``test_diffusion_measurement_metrics.py`` pin each
+    mechanism; this one drives ``_compute_validation_metrics`` itself, because
+    that is where all three met.
+    """
+
+    @staticmethod
+    def _mock(names: list[str], mask: torch.Tensor | None):
+        measurement = torch.rand(2, 2, 8, 8)
+        mock = _zf_mock(measurement=measurement, metrics=names)
+        # The real seam, bound to the mock host: a MagicMock would stub it out
+        # and the test would observe nothing while claiming to observe firing.
+        mock._measurement_aware_metrics = (
+            lambda p, t_, m_, c, mk=None: DiffusionTrainingStrategy._measurement_aware_metrics(
+                mock, p, t_, m_, c, mk
+            )
+        )
+        mock._MEASUREMENT_AWARE_METRICS = DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS
+        mock._select_batch_compatible_smaps = lambda batch: None  # single-coil surrogate
+        mock._rung_mask = mask
+        return mock
+
+    def test_the_columns_are_finite_when_the_arm_asks_for_them(self) -> None:
+        torch.manual_seed(0)
+        wanted = list(DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", *wanted], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        for name in wanted:
+            assert f"val_{name}" in out, f"val_{name} never reached the metrics dict"
+            assert math.isfinite(out[f"val_{name}"]), (
+                f"val_{name} is NaN -- the context-free pass won the write-back, "
+                f"which is the defect merge_metric_passes exists to stop"
+            )
+
+    def test_the_baseline_crosses_the_same_seam_and_mints_a_delta(self) -> None:
+        """``val_zf_delta_fabrication_excess`` is the number the cohort reports.
+
+        The raw value carries a coil-subspace bias the delta cancels, so the seam
+        has to score the zero-filled baseline too -- not only the prediction.
+        """
+        torch.manual_seed(0)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", "fabrication_excess"], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        assert math.isfinite(out["val_fabrication_excess"])
+        assert math.isfinite(out["val_zf_fabrication_excess"])
+        assert out["val_zf_delta_fabrication_excess"] == pytest.approx(
+            out["val_fabrication_excess"] - out["val_zf_fabrication_excess"], rel=1e-6
+        )
+
+    def test_an_arm_that_does_not_ask_gets_no_columns_at_all(self) -> None:
+        """PLANTED: the shipped cohort config. Silence, not NaN -- which is why
+        a cohort review that read the code did not catch it."""
+        torch.manual_seed(0)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", "mse"], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        assert "val_psnr" in out
+        for name in DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS:
+            assert f"val_{name}" not in out
+
+
 class TestZeroFilledBaselineIsEmittedAndComparable:
     def test_the_baseline_keys_are_emitted_through_the_production_path(self) -> None:
         """Observed firing, not inferred from the wiring (non-negotiable 16)."""
@@ -3441,3 +3577,59 @@ class TestFillSetMatchesTheCsvHeader:
             f"fill set writes keys the header lacks (dropped, then reported "
             f"missing every step): {sorted(declared - header)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Non-Cartesian sample-domain fidelity: the measurement's route to the losses
+# ---------------------------------------------------------------------------
+# ``q_sample`` grids the off-grid samples away, so the fidelity term cannot
+# recover them from ``pred``/``target``. These pin the out-of-band route --
+# ``SimpleNamespace`` rather than ``MagicMock`` throughout, because a mock
+# auto-creates ``kspace_process.last_sample_measurement`` as a truthy child and
+# every assertion below would pass against a generator that publishes nothing.
+
+
+def test_sample_measurement_is_none_on_a_cartesian_arm() -> None:
+    """The grid process has no sample axis, and absent is the correct answer."""
+    strategy = SimpleNamespace(generator_model=SimpleNamespace(kspace_process=None))
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is None
+
+
+def test_sample_measurement_reads_the_process_stash() -> None:
+    """The strategy reads the measurement the forward process published."""
+    measurement = object()
+    strategy = SimpleNamespace(
+        generator_model=SimpleNamespace(
+            kspace_process=SimpleNamespace(last_sample_measurement=measurement)
+        )
+    )
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is measurement
+
+
+def test_sample_measurement_unwraps_the_ddp_wrapper() -> None:
+    """A DDP-wrapped generator hides the process one attribute deeper."""
+    measurement = object()
+    inner = SimpleNamespace(
+        kspace_process=SimpleNamespace(last_sample_measurement=measurement)
+    )
+    strategy = SimpleNamespace(generator_model=SimpleNamespace(module=inner))
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is measurement
+
+
+def test_the_loss_computer_call_forwards_the_measurement() -> None:
+    """PLANTED VIOLATION: a stash nothing forwards is the facade shape.
+
+    The helper above can be correct while the measurement never reaches a loss.
+    Read the real call site rather than trusting that it was edited.
+    """
+    source = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
+    call = next(
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compute"
+    )
+    assert "sample_measurement" in {kw.arg for kw in call.keywords}, (
+        "the loss computer call must forward the rung measurement"
+    )

@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from spectramr.infrastructure.physics.forward_operator import (
-    DataConsistencyLayer,
+    MultiCoilDataConsistency,
     MultiCoilForwardOperator,
 )
 from spectramr.models.interfaces.models import IGenerator
@@ -175,7 +175,7 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         # Uses shared forward operator for all steps
         self.dc_layers = nn.ModuleList(
             [
-                DataConsistencyLayer(self.forward_operator, mode="soft", lambda_dc=lambda_dc)
+                MultiCoilDataConsistency(self.forward_operator, mode="soft", lambda_dc=lambda_dc)
                 for _ in range(num_unrolls)
             ],
         )
@@ -383,7 +383,7 @@ class VariationalNetworkGenerator(nn.Module, IGenerator):
         )
 
         # Data consistency operator
-        self.dc_operator = DataConsistencyLayer(self.forward_operator, mode="soft", lambda_dc=1.0)
+        self.dc_operator = MultiCoilDataConsistency(self.forward_operator, mode="soft", lambda_dc=1.0)
 
         # Output activation (configurable, defaults to None for k-space data)
         if output_activation is None or output_activation.lower() == "none":

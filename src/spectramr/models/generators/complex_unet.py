@@ -7,6 +7,7 @@ and complex-aware activations (ModReLU).
 Designed for pure k-space processing where phase preservation is critical.
 """
 
+import logging
 from typing import Any
 
 import torch
@@ -16,6 +17,10 @@ from torch.utils.checkpoint import checkpoint
 
 from spectramr.models.blocks.attention import CrossContrastOLMPA
 from spectramr.models.blocks.attention_domains import validate_feature_domain
+from spectramr.models.blocks.radial_band_tokens import (
+    DEFAULT_MAX_LOG_SCALE,
+    RadialBandTokens,
+)
 from spectramr.models.generators.kspace_cold_diffusion_generator import (
     KSpaceDownsampleBlock,
     KSpaceUNetBlock,
@@ -24,6 +29,8 @@ from spectramr.models.generators.kspace_cold_diffusion_generator import (
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.layers.complex_norm import ComplexRMSNorm
 from spectramr.models.registry import register_model
+
+logger = logging.getLogger(__name__)
 
 # Advertised values for the ``kspace_feature_norm`` model_kwarg. Validated at
 # build (pitfall #15): an unknown value RAISES rather than silently no-op'ing.
@@ -134,6 +141,9 @@ class ComplexUNet(nn.Module):
         self.features = features
         self.time_embedding_dim = time_embedding_dim
         self.feature_domain = validate_feature_domain(feature_domain)
+        # Rate-limits the "no max_timesteps" warning in forward() to once per
+        # instance rather than once per step.
+        self._warned_no_max_timesteps = False
 
         # Inter-layer scale control. The pure-k-space backbone has no normalization
         # (spatial BN/GN flatten the 1/f spectrum), so activation magnitude drifts
@@ -280,6 +290,79 @@ class ComplexUNet(nn.Module):
         # forward must stay allocation-identical to the pre-checkpointing one.
         self.grad_checkpointing = False
 
+        # [RADIAL BAND TOKENS] Opt-in per-annulus, per-rung conditioning read at
+        # every up-step, where the radial attenuation is introduced (#2117).
+        # Built LAST: a module constructed earlier consumes RNG draws and shifts
+        # every later init, so the arm would stop being bit-identical to its
+        # control for a reason unrelated to the mechanism. Literal pop keys, never
+        # a loop -- check_model_kwargs_are_read harvests those literals.
+        bands = int(kwargs.pop("radial_band_tokens_bands", 0) or 0)
+        rungs = kwargs.pop("radial_band_tokens_rungs", None)
+        token_dim = int(kwargs.pop("radial_band_tokens_dim", 64))
+        max_log = float(kwargs.pop("radial_band_tokens_max_log", DEFAULT_MAX_LOG_SCALE))
+        self.radial_band_tokens = self._build_band_tokens(
+            bands, rungs, token_dim, max_log, features, kwargs
+        )
+
+    def _build_band_tokens(
+        self,
+        bands: int,
+        rungs: Any,
+        token_dim: int,
+        max_log: float,
+        features: tuple[int, ...],
+        leftover_kwargs: dict[str, Any],
+    ) -> RadialBandTokens | None:
+        """The block, or ``None``, refusing a knob in its namespace it cannot read.
+
+        This constructor ends in ``**kwargs``, so a misspelled knob is otherwise
+        absorbed and the arm runs as its control silently: the advertised-options
+        audit skips a signature carrying ``**kwargs``, and the inert-knob scan
+        sees declared parameters only.
+        """
+        unknown = sorted(k for k in leftover_kwargs if k.startswith("radial_band_tokens"))
+        if unknown:
+            raise ValueError(
+                f"ComplexUNet: unrecognised radial band token knob(s) {unknown}. A knob in "
+                "this namespace that nothing reads is indistinguishable from one that works."
+            )
+        if not bands:
+            return None
+        if self.feature_domain != "kspace":
+            raise ValueError(
+                "ComplexUNet: radial_band_tokens_bands needs feature_domain='kspace'; a "
+                f"radial annulus is not defined on {self.feature_domain!r} feature maps."
+            )
+        if rungs is None:
+            raise ValueError(
+                "ComplexUNet: radial_band_tokens_bands was declared without a rung count. "
+                "The generator derives it from num_timesteps; a direct caller must pass "
+                "radial_band_tokens_rungs so the bank cannot disagree with the process."
+            )
+        return RadialBandTokens(
+            level_channels=tuple(reversed(features)),
+            n_bands=bands,
+            n_rungs=int(rungs),
+            token_dim=token_dim,
+            max_log_scale=max_log,
+        )
+
+    def _up_step(
+        self,
+        level: int,
+        trunk: torch.Tensor,
+        skip: torch.Tensor,
+        emb: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        rung: torch.Tensor,
+        full_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """One up-step, band tokens applied AFTER the stage norm -- before it,
+        ``ComplexRMSNorm``'s per-sample scalar divides the contribution back out.
+        """
+        out = self.norm_ups[level](self.ups[level](trunk, skip, emb, mask))
+        return self.radial_band_tokens(out, rung, level=level, full_size=full_size)
+
     def _make_stage_norm(self, complex_channels: int) -> nn.Module:
         """ComplexRMSNorm for ``kspace_feature_norm='rms'``, else identity."""
         if self.kspace_feature_norm == "rms":
@@ -351,19 +434,43 @@ class ComplexUNet(nn.Module):
         """
         t_emb = None
         if timesteps is not None:
-            # ✅ CRITICAL FIX: Normalize timesteps to roughly [0, 1] range before sinusoidal embedding.
-            # In diffusion models with t ~ U(0, 1000), large max values destroy high-frequency sinusoidal
-            # components causing Identity Collapse (zero gradients across time batches).
-            if timesteps.max() > 1.0:
-                # Default max timesteps is typically 1000 in this framework
-                max_t = kwargs.get("max_timesteps", 1000.0)
-                timesteps_scaled = timesteps.float() / max_t
-            else:
-                timesteps_scaled = timesteps.float()
+            # Normalise per-sample by the declared horizon, never by what else
+            # shares the batch: gating the division on the batch maximum
+            # embedded the reverse sampler's uniform t=1 as 1.0, the code for
+            # the LAST rung, while the same t=1 scaled correctly in training
+            # whenever a larger t happened to share its batch.
+            max_t = kwargs.get("max_timesteps")
+            if max_t is None:
+                # Direct and probe construction never supplied a horizon, so
+                # the legacy 1000-step ceiling stands in -- applied
+                # unconditionally, and logged once rather than assumed silently,
+                # because an undeclared horizon is the failure this guards.
+                if not self._warned_no_max_timesteps:
+                    logger.warning(
+                        "[ComplexUNet] No max_timesteps supplied; assuming the "
+                        "legacy 1000-step ceiling (suppressing further "
+                        "occurrences for this instance). Pass "
+                        "max_timesteps=<diffusion horizon> to condition on the "
+                        "arm's actual schedule."
+                    )
+                    self._warned_no_max_timesteps = True
+                max_t = 1000.0
+            elif max_t <= 0:
+                raise ValueError(
+                    f"ComplexUNet received max_timesteps={max_t!r}; it must be "
+                    "a positive diffusion horizon, not a value to guess around."
+                )
+            timesteps_scaled = timesteps.float() / float(max_t)
 
             # [STABILIZATION FIX] Use proper sinusoidal embeddings
             t_sin = self._get_sinusoidal_embedding(timesteps_scaled, self.time_embedding_dim)
             t_emb = self.time_mlp(t_sin)
+
+        # The acquisition mask reaches the attention blocks as a forward argument
+        # rather than module state, so a block that consumes it is unit-testable in
+        # isolation. It is the FULL-resolution mask: each block center-crops it onto
+        # its own grid, matching the KSpaceCrop the encoder downsamples with.
+        mask = kwargs.get("mask")
 
         contrast_emb = kwargs.get("contrast_emb")
         combined_emb = t_emb
@@ -384,9 +491,9 @@ class ComplexUNet(nn.Module):
         current = x_start
         for idx, down_block in enumerate(self.downs):
             if ckpt:
-                current, skip = checkpoint(down_block, current, t_emb, use_reentrant=False)
+                current, skip = checkpoint(down_block, current, t_emb, mask, use_reentrant=False)
             else:
-                current, skip = down_block(current, t_emb)
+                current, skip = down_block(current, t_emb, mask)
             current = self.norm_downs[idx](current)
             skips.append(skip)
 
@@ -415,12 +522,32 @@ class ComplexUNet(nn.Module):
             current = torch.cat([source_feat, target_feat], dim=1)
 
         # Decoder
+        if self.radial_band_tokens is not None and timesteps is None:
+            raise ValueError(
+                "ComplexUNet: the radial band tokens are rung-indexed, but this forward "
+                "received no timesteps. A bank silently defaulted to rung 0 is a global "
+                "embedding that still reports as wired."
+            )
+        full_size = (x.shape[-2], x.shape[-1])
         for i, up_block in enumerate(self.ups):
             skip = skips[-(i + 1)]
+            if self.radial_band_tokens is not None:
+                # One checkpointed unit so the per-level scale tensor is
+                # recomputed, not retained; widened only when the block is built,
+                # so an arm without it keeps the boundary its tests measured.
+                args = (i, current, skip, combined_emb, mask, timesteps, full_size)
+                current = (
+                    checkpoint(self._up_step, *args, use_reentrant=False)
+                    if ckpt
+                    else self._up_step(*args)
+                )
+                continue
             if ckpt:
-                block_out = checkpoint(up_block, current, skip, combined_emb, use_reentrant=False)
+                block_out = checkpoint(
+                    up_block, current, skip, combined_emb, mask, use_reentrant=False
+                )
             else:
-                block_out = up_block(current, skip, combined_emb)
+                block_out = up_block(current, skip, combined_emb, mask)
             current = self.norm_ups[i](block_out)
 
         # Final Output

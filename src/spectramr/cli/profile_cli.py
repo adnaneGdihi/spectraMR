@@ -48,6 +48,8 @@ from spectramr.cli.profile_paths import (
 )
 from spectramr.cli.profile_preflight import run_preflight
 
+from spectramr.cli.val_batches import VAL_BATCHES_OVERRIDE_KEY
+
 logger = logging.getLogger(__name__)
 
 #: Targets whose child is redirected with ``--override`` AND that actually run a
@@ -270,7 +272,7 @@ def attach_subparsers(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         metavar="N",
         help="Cap the validation loop at N batches for this run (--val-batches 8 "
-        "applies -O validation.loader.num_batches=8), so a slow validation pass "
+        f"applies -O {VAL_BATCHES_OVERRIDE_KEY}=8), so a slow validation pass "
         "does not dominate a profile aimed at training. Note validation.enabled "
         "is NOT read by the framework (issue #673), so it cannot be used to skip "
         "validation outright.",

@@ -1144,6 +1144,100 @@ payload (``upstream_certificates`` key).  ``render_markdown`` and
 ``write_certificate_table(badge_payload, out_dir)`` writes both files.
 
 
+Diffusion-Transformer Backbones (k-space adapted)
+=================================================
+
+Four ``backbone_type`` values reachable from the k-space cold-diffusion stack:
+``dit``, ``uvit`` (alias ``u_vit``), ``hat`` and ``diffit``. Unlike the rest of
+this page they are *backbones*, not whole models — ``backbone_type`` selects the
+entire learnable network inside ``KSpaceColdDiffusionGenerator``, whose other
+children (``kspace_process``, ``dc_layer``, ``sense_projector``) hold no
+parameters at all.
+
+.. code-block:: yaml
+
+   model:
+     model_type: kspace_cold_diffusion
+     in_channels: 8            # 4 coils, interleaved real/imag
+     out_channels: 8
+     model_kwargs:
+       backbone_type: dit
+       base_channels: 384      # the trunk's embedding width
+       patch_size: 8
+       depth: 12
+       heads: 6                # omit and it is derived from base_channels
+       force_pure_kspace: true
+       attention_type: none    # required — see below
+
+Both domains, one stem
+----------------------
+
+These architectures were published on natural images: one tensor, one domain, a
+patch is a picture. MRI arrives k-space-native, and a patch of k-space is a
+frequency band whose neighbours share no spatial locality — so a stem that
+patch-embeds whichever tensor it is handed means two different things depending
+on ``force_pure_kspace``, with nothing recording which.
+
+``DomainStem`` (``models/generators/diffusion_transformer_stem.py``) is the
+single owner of that difference for all four. It embeds **both** views of the
+field — deriving the second through ``ifft2c``/``fft2c`` from the declared
+domain — and sums them, with a separate projection per view because a k-space
+patch is dominated by its distance from the centre and an image patch by local
+structure. ``DomainHead`` returns the prediction in the domain the caller passed
+in. ``feature_domain`` is therefore derived from ``force_pure_kspace`` and
+load-bearing, not recorded and ignored.
+
+The trunks that consume those tokens are the published architectures.
+
+What distinguishes each
+-----------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 30 58
+
+   * - Name
+     - Mechanism
+     - Notes
+   * - ``dit``
+     - adaLN-Zero conditioning
+     - Patch tokens, plain pre-norm transformer. Zero-initialised gates make
+       every block the identity at init.
+   * - ``uvit``
+     - Long skip connections
+     - Encoder-half outputs concatenated onto the decoder half and projected
+       back down. Time rides as a token, not through adaLN. **Depth must be
+       odd** so the halves pair around one middle block.
+   * - ``hat``
+     - Window attention + conv channel attention
+     - Never patchifies — full resolution throughout, which suits k-space where
+       a patch stride discards the outer frequencies. ``window_size`` must tile
+       the field. ``cab_weight`` is a small correction, not an equal partner.
+   * - ``diffit``
+     - Time-dependent self-attention
+     - The timestep enters q, k and v additively rather than gating the block
+       output, so *what* a token attends to changes with the step. Paired with
+       ``dit``, which differs only in that mechanism.
+
+Two consequences worth knowing before declaring one
+---------------------------------------------------
+
+**They have no pluggable attention seam.** They are attention end to end, but
+none implements this framework's ``attention_type`` block dispatch — only
+``complex_unet`` does. Declaring anything but ``attention_type: none`` therefore
+**raises at build**, rather than being validated and dropped.
+
+**The output head is not zero-initialised**, though DiT's published one is. A
+forward whose output does not move when its input does is the DC-blob facade the
+Tier-2 probe rejects, and the probe cannot tell that apart from "untrained". The
+block-level adaLN-Zero gates — where the paper's stability argument actually
+lives — are kept.
+
+New backbones register in ``models/generators/backbone_builders.py`` rather than
+extending the generator's ``if/elif`` chain, which is already a baselined
+dispatch offender.
+
+
 References
 ==========
 
@@ -1191,3 +1285,15 @@ References
 
 15. Kirkpatrick, J., et al. "Overcoming Catastrophic Forgetting in Neural
     Networks." PNAS, 2017. (Continual Learning, EWC)
+
+16. Peebles, W. and Xie, S. "Scalable Diffusion Models with Transformers
+    (DiT)." ICCV, 2023.
+
+17. Bao, F., et al. "All are Worth Words: A ViT Backbone for Diffusion
+    Models (U-ViT)." CVPR, 2023.
+
+18. Chen, X., et al. "Activating More Pixels in Image Super-Resolution
+    Transformer (HAT)." CVPR, 2023.
+
+19. Hatamizadeh, A., et al. "DiffiT: Diffusion Vision Transformers for
+    Image Generation." ECCV, 2024.

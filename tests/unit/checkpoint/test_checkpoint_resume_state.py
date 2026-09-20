@@ -377,3 +377,91 @@ class TestCheckpointStartIteration:
         assert load_director._counter_state is not None
         assert load_director._counter_state["current_step"] == 5000
         assert load_director._counter_state["current_epoch"] == 10
+
+
+class TestCheckpointPersistsEmaWarmupCounter:
+    """The saved ``ema_state`` must carry the warmup counter (#2172).
+
+    ``ModelEma.state_dict`` is overridden to inject ``_ema_num_updates`` so a
+    requeue continues the decay ramp instead of restarting it. The director used
+    to save ``unwrap_model(ema).state_dict()``, and ``unwrap_model`` peels
+    ModelEma's own ``.module`` -- so the override never ran and the counter was
+    dropped on every save. Nothing failed; the ramp just silently restarted at 0
+    on each resume, which on the kspace_filling arms means a resumed run has
+    different EMA semantics from an uninterrupted one.
+
+    This pins the spelling against that regression: revert the director to the
+    unwrapped form and this turns red.
+    """
+
+    @staticmethod
+    def _director_with_ema(pipeline: _FakePipeline, ckpt_dir: str, num_updates: int):
+        from spectramr.infrastructure.builders.directors.checkpoint_director import (
+            CheckpointDirector,
+        )
+        from spectramr.infrastructure.optimization.ema import ModelEma
+
+        ema = ModelEma(pipeline.generator, decay=0.99, warmup=True)
+        ema.num_updates = num_updates
+        pipeline.ema = ema
+
+        director = CheckpointDirector.__new__(CheckpointDirector)
+        director._config = MagicMock()
+        director._checkpoint_dir = Path(ckpt_dir)
+        director._pipeline = pipeline
+        director._epoch = 1
+        director._global_step = 100
+        director._metrics = {}
+        director._scaler = None
+        director._counter_state = None
+        director._checkpoint_path = None
+        director._product = None
+        director._is_validated = True
+        return director
+
+    def test_saved_ema_state_carries_the_counter(
+        self, pipeline: _FakePipeline, tmp_checkpoint_dir: str
+    ) -> None:
+        from spectramr.infrastructure.optimization.ema import ModelEma
+
+        director = self._director_with_ema(pipeline, tmp_checkpoint_dir, num_updates=4321)
+        checkpoint = torch.load(
+            director.save(), map_location="cpu", weights_only=False
+        )
+
+        assert checkpoint["ema_state"] is not None
+        assert checkpoint["ema_state"][ModelEma._NUM_UPDATES_KEY] == 4321
+
+    def test_saved_ema_weight_keys_stay_bare(
+        self, pipeline: _FakePipeline, tmp_checkpoint_dir: str
+    ) -> None:
+        """The on-disk weight-key contract is unchanged, so old checkpoints load."""
+        from spectramr.infrastructure.optimization.ema import ModelEma
+
+        director = self._director_with_ema(pipeline, tmp_checkpoint_dir, num_updates=1)
+        ema_state = torch.load(
+            director.save(), map_location="cpu", weights_only=False
+        )["ema_state"]
+
+        weight_keys = [k for k in ema_state if k != ModelEma._NUM_UPDATES_KEY]
+        assert weight_keys
+        assert not any(
+            k.startswith(("module.", "_orig_mod.", "_fsdp_wrapped_module."))
+            for k in weight_keys
+        )
+
+    def test_counter_survives_a_save_load_roundtrip(
+        self, pipeline: _FakePipeline, tmp_checkpoint_dir: str
+    ) -> None:
+        """The half that matters: a resume continues the ramp."""
+        from spectramr.infrastructure.optimization.ema import ModelEma
+
+        director = self._director_with_ema(pipeline, tmp_checkpoint_dir, num_updates=999)
+        ema_state = torch.load(
+            director.save(), map_location="cpu", weights_only=False
+        )["ema_state"]
+
+        restored = ModelEma(_SimpleGenerator(), decay=0.99, warmup=True)
+        restored.load_shadow_state_dict(ema_state)
+
+        assert restored.num_updates == 999

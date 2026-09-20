@@ -52,7 +52,12 @@ wheels/
 share/python-wheels/
 *.egg-info/
 database/
-.claude
+# Claude Code agent config. The tracked halves are the rule set and the skills;
+# everything else under .claude/ is per-machine state. Without the negations
+# `git add` drops a new rule file silently -- see .claude/rules/README.md.
+.claude/*
+!.claude/rules/
+!.claude/skills/
 .installed.cfg
 *.egg
 MANIFEST

@@ -216,6 +216,14 @@ Non-negotiable 9b: heavy pipelines run on an accelerator or raise. These are the
      - ``auto``
      - Device preference consumed by ``env_resolver`` (``auto`` by default).
        Read by ``src/spectramr/infrastructure/config/env_resolver.py`` (+1 more)
+   * - ``SPECTRAMR_TARGET_COMPUTE_CAPABILITY``
+     - *unset*
+     - Compute capability of the machine the run will land on, ``"<major>.<minor>"``
+       (``"7.0"`` for a V100). Read **only** when no device is visible to probe --
+       ``spectramr audit`` on a login node -- so the bf16 gate can decide there
+       instead of reporting "cannot tell". A live probe always wins; a malformed
+       value raises.
+       Read by ``src/spectramr/core/device_capabilities.py``
    * - ``SPECTRAMR_NO_GPU_PROBE``
      - *unset*
      - Skips the ``nvidia-smi`` probe in the container entrypoint. Read by shell, not Python.
@@ -268,6 +276,17 @@ Framework behaviour and the CLI
      - *unset*
      - Makes a missing execution-ledger stamp fatal. Off by default so a stamping hiccup never kills GPU work; on for CI and cluster audits.
        Read by ``src/spectramr/core/execution_ledger.py``
+   * - ``SPECTRAMR_WALL_CLOCK_DEADLINE``
+     - *unset*
+     - Absolute unix epoch second at which this job's allocation ends. Training stops and saves a margin ahead of it so a requeued task resumes rather than losing everything since the last periodic checkpoint.
+       Exported by ``scripts/common/wall_clock.sh``; read by ``src/spectramr/core/wall_clock.py``. Unset means "no wall" — train to ``max_iterations``. A non-numeric value raises.
+   * - ``SPECTRAMR_WALL_CLOCK_MARGIN_S``
+     - ``900``
+     - Seconds reserved before that deadline for the final checkpoint write. The deadline is inspected every ``min(logging.intervals.log, 100)`` steps, so the margin must cover that many steps plus the write. A non-positive value raises, as does an allocation whose remaining time is already inside the margin.
+   * - ``SPECTRAMR_WALL_CLOCK_MARKER``
+     - *unset*
+     - Absolute path the run writes when it yields at the wall clock. The **launcher** chooses it and the run obeys, so the side that reads it back cannot look somewhere the side that wrote it never went.
+       Unset falls back to ``<training.output_dir>/WALL_CLOCK_YIELD``.
    * - ``SPECTRAMR_DIMENSION_CONTRACT``
      - ``observe``
      - Dimension-contract mode, one of the valid modes; defaults to ``observe``. An unrecognized value raises.
@@ -322,6 +341,17 @@ Most of these the framework **sets for you** — see `Variables the framework wr
      - ``<cache root>/cuda_cache``
      - CUDA JIT cache dir; written under the cache root.
        Read by ``src/spectramr/accelerator.py`` (+3 more)
+   * - ``CUDA_CACHE_PATH``
+     - ``<cache root>/cuda_cache``
+     - PTX JIT cache dir, and the **NVIDIA-documented** spelling — unlike
+       ``CUDA_CACHE_CONFIG`` above it, which is not one of the driver's three
+       (see issue #2178). Without it the cache stays in ``~/.nv/ComputeCache``.
+       Read by ``src/spectramr/infrastructure/config/env_resolver.py``
+   * - ``TORCHINDUCTOR_CACHE_DIR``
+     - ``<cache root>/inductor_cache``
+     - Where Inductor writes its generated modules and compiled kernels. Pinned
+       explicitly rather than inherited — see `Why Inductor is pinned`_.
+       Read by ``src/spectramr/infrastructure/config/env_resolver.py``
    * - ``TORCH_HOME``
      - ``<cache root>/torch_cache``
      - Torch hub cache; written under the resolved cache root.
@@ -356,9 +386,9 @@ The cache block has exactly two knobs
 -------------------------------------
 
 ``configure_cache_environment`` (:file:`infrastructure/config/env_resolver.py`)
-hangs six variables off one resolved root. Five are **assigned**; only
-``TRITON_CACHE_DIR`` is ``setdefault``-ed. So of the six, exactly two respond to
-anything you export:
+hangs eight variables off one resolved root. Seven are **assigned**; only
+``TRITON_CACHE_DIR`` is ``setdefault``-ed. So of the eight, exactly two respond
+to anything you export:
 
 .. list-table::
    :header-rows: 1
@@ -369,21 +399,46 @@ anything you export:
      - Why
    * - ``SPECTRAMR_CACHE_ROOT``
      - **yes**
-     - Read first when the root is resolved; moves all six at once.
+     - Read first when the root is resolved; moves all eight at once.
    * - ``TRITON_CACHE_DIR``
      - **yes**
      - The one ``setdefault``. DeepSpeed's own startup warning asks operators to
        point Triton at a non-NFS path, so an explicit export is treated as an
        informed decision and kept.
    * - ``TMPDIR``, ``TORCH_HOME``, ``TORCH_METRICS_CACHE``, ``XDG_CACHE_HOME``,
-       ``CUDA_CACHE_CONFIG``
+       ``CUDA_CACHE_CONFIG``, ``CUDA_CACHE_PATH``, ``TORCHINDUCTOR_CACHE_DIR``
      - no
      - Assigned from the root, overwriting whatever you exported. Deliberate: a
        site profile setting ``XDG_CACHE_HOME="$HOME/.cache"`` would otherwise put
        torch's JIT extension build root back inside ``$HOME``, which is the
        failure this block exists to prevent.
 
-Every one of the six is created eagerly, so an unwritable path fails here rather
+.. _Why Inductor is pinned:
+
+Why Inductor is pinned rather than inherited
+--------------------------------------------
+
+``torch.compile`` writes real files — Inductor's generated Python modules and
+the Triton kernels they load. On a cluster the default locations are wrong
+twice over: node-local ``/tmp`` is invisible to the next job, so every job
+recompiles from cold, and it is often small.
+
+Inductor's own default is ``tempfile.gettempdir()`` plus
+``torchinductor_<user>``, which *looks* like it already follows ``TMPDIR``. It
+does, but only if nothing has called ``gettempdir()`` first — that function
+memoizes, and an early import that touches it freezes the answer at ``/tmp``
+for the rest of the process. The environment variable then reads correctly
+while the artifacts go somewhere else, which is the most expensive shape a
+misconfiguration can take.
+
+So ``TORCHINDUCTOR_CACHE_DIR`` is assigned directly. A coupling that silently
+stops holding is not coverage.
+
+``TORCH_EXTENSIONS_DIR`` needs no entry: torch resolves its JIT build root
+through ``torch._appdirs.user_cache_dir``, which follows ``XDG_CACHE_HOME``,
+and that *is* assigned here. This is the path DeepSpeed's JIT-built ops use.
+
+Every one of the eight is created eagerly, so an unwritable path fails here rather
 than inside ``import deepspeed`` (which writes to Triton's cache and to torch's
 extension directory while the module is still executing). Since the failure is
 also the operator's only instruction, it names the knob:
@@ -454,6 +509,48 @@ Set by ``torchrun`` or by the in-process launcher; read by the distributed pipel
      - ``29500``
      - Rendezvous port; ``setdefault`` to ``29500``.
        Read by ``tests/unit/pipelines/test_train.py`` (+1 more)
+
+Build-time variables for the compiled extras
+--------------------------------------------
+
+These are set by :file:`scripts/install_mamba_extra.py` and read by the upstream
+build backends, not by anything under :file:`src/`. They are listed because the
+script writes them and because two of the three are the difference between a
+kernel that runs on the cluster and one that does not — see
+:ref:`mamba-arch-list`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 20 48
+
+   * - Variable
+     - Set to
+     - Effect
+
+   * - ``MAMBA_FORCE_BUILD``
+     - ``TRUE``
+     - Compiles ``mamba-ssm`` from source instead of downloading a prebuilt
+       wheel. Without it no compile flag below has any effect.
+   * - ``CAUSAL_CONV1D_FORCE_BUILD``
+     - ``TRUE``
+     - The same, for ``causal-conv1d``. Both packages ship their own
+       ``CachedWheelsCommand``, so both need their own variable.
+   * - ``NVCC_APPEND_FLAGS``
+     - ``-gencode`` pairs
+     - Read by the **nvcc driver itself**, so a package's hardcoded gencode list
+       cannot suppress it. This is the only lever that adds ``sm_70``. A value
+       already in the environment is preserved, not replaced.
+   * - ``TORCH_CUDA_ARCH_LIST``
+     - e.g. ``7.0;8.9``
+     - **Inert for mamba-ssm and causal-conv1d** — ``torch.utils.cpp_extension``
+       drops the flags it derives from this variable once a package passes an
+       ``arch=`` flag of its own. Exported anyway for anything else
+       torch-extension-built in the same environment, DeepSpeed's lazily
+       JIT-compiled ops among them.
+   * - ``MAX_JOBS``
+     - ``min(nproc, 8)``
+     - Parallel compile jobs. Each nvcc job peaks at several GB, so lower it
+       (``--jobs``) if the build is OOM-killed on a shared login node.
 
 Variables the framework writes
 ------------------------------

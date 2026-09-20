@@ -26,6 +26,8 @@ marking it off would remove a dependency ARM64 installs perfectly well.
 
 from __future__ import annotations
 
+import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -70,6 +72,16 @@ UNAVAILABLE_ON_AARCH64 = {"gudhi", "scalene"}
 
 ARM64_LABELS = {"self-hosted", "linux", "arm64"}
 
+# A `runs-on` may be an expression: the release lane's hosted fallback is
+# `${{ cond && 'ubuntu-latest' || fromJSON('["self-hosted", ...]') }}`. The label
+# test has to read through that, or a self-hosted job behind an expression is
+# invisible to every assertion in this module -- the fork-PR one included. Every
+# fromJSON array literal and every remaining quoted scalar is a candidate label
+# set, and a job counts as ARM64 if ANY candidate reaches the runner, because any
+# of them can be the one chosen at run time.
+_FROMJSON_RE = re.compile(r"fromJSON\(\s*'(\[[^']*\])'\s*\)")
+_QUOTED_RE = re.compile(r"'([^']*)'")
+
 
 def _workflow_files() -> list[Path]:
     """Every workflow in both scan roots -- one owner for discovery.
@@ -99,11 +111,40 @@ def _label(path: Path) -> str:
     return str(path.relative_to(_REPO))
 
 
+def _candidate_label_sets(runs_on: object) -> list[set[str]]:
+    """Every label set a ``runs-on`` value can resolve to."""
+    if isinstance(runs_on, list):
+        return [{str(x).lower() for x in runs_on}]
+    text = str(runs_on)
+    if "${{" not in text:
+        return [{text.lower()}]
+    sets = [{str(x).lower() for x in json.loads(m)} for m in _FROMJSON_RE.findall(text)]
+    sets += [{q.lower()} for q in _QUOTED_RE.findall(_FROMJSON_RE.sub("", text))]
+    return sets
+
+
 def _is_arm64(job: dict) -> bool:
-    """One owner for the label test -- both call sites below resolve through it."""
+    """One owner for the label test -- every call site below resolves through it."""
+    return any(labels >= ARM64_LABELS for labels in _candidate_label_sets(job.get("runs-on")))
+
+
+def _offers_hosted_fallback(job: dict) -> bool:
+    """A self-hosted job must be movable to a hosted runner without an edit."""
     runs_on = job.get("runs-on")
-    labels = runs_on if isinstance(runs_on, list) else [runs_on]
-    return {str(x).lower() for x in labels} >= ARM64_LABELS
+    if not isinstance(runs_on, str) or "${{" not in runs_on:
+        return False
+    candidates = _candidate_label_sets(runs_on)
+    return "inputs.runner" in runs_on and any(c == {"ubuntu-latest"} for c in candidates)
+
+
+def _fork_reachable_arm64_jobs(doc: dict) -> list[str]:
+    """ARM64 job names in a workflow that any fork pull request can trigger."""
+    # PyYAML reads the bare key `on` as the boolean True (YAML 1.1).
+    triggers = doc.get(True, doc.get("on")) or {}
+    names = set(triggers) if isinstance(triggers, dict) else {triggers}
+    if not names & {"pull_request", "pull_request_target"}:
+        return []
+    return [name for name, job in (doc.get("jobs") or {}).items() if _is_arm64(job)]
 
 
 def _arm64_jobs() -> list[tuple[str, str, dict]]:
@@ -248,16 +289,78 @@ def test_no_arm64_job_is_reachable_from_a_fork_pull_request() -> None:
     carrying either trigger must not contain an ARM64 self-hosted job.
     """
     for path in _workflow_files():
-        doc = yaml.safe_load(path.read_text()) or {}
-        # PyYAML reads the bare key `on` as the boolean True (YAML 1.1).
-        triggers = doc.get(True, doc.get("on")) or {}
-        names = set(triggers) if isinstance(triggers, dict) else {triggers}
-        risky = names & {"pull_request", "pull_request_target"}
-        if not risky:
-            continue
-        arm_jobs = [name for name, job in (doc.get("jobs") or {}).items() if _is_arm64(job)]
+        arm_jobs = _fork_reachable_arm64_jobs(yaml.safe_load(path.read_text()) or {})
         assert not arm_jobs, (
-            f"{_label(path)} has {sorted(risky)} AND self-hosted ARM64 job(s) "
-            f"{arm_jobs}. On a public repo that executes fork-authored code on "
+            f"{_label(path)} has a pull_request-family trigger AND self-hosted ARM64 "
+            f"job(s) {arm_jobs}. On a public repo that executes fork-authored code on "
             "the maintainer's machine. Keep PR lanes on hosted runners."
         )
+
+
+_EXPR_WITH_THOR_FALLBACK = (
+    "${{ inputs.runner == 'hosted' && 'ubuntu-latest' "
+    "|| fromJSON('[\"self-hosted\", \"Linux\", \"ARM64\"]') }}"
+)
+
+
+@pytest.mark.parametrize(
+    ("runs_on", "expected"),
+    [
+        (["self-hosted", "Linux", "ARM64"], True),
+        ("ubuntu-latest", False),
+        (_EXPR_WITH_THOR_FALLBACK, True),
+        ("${{ vars.CUDA_RUNNER_LABEL }}", False),
+        ("${{ inputs.runner == 'hosted' && 'ubuntu-latest' || 'ubuntu-22.04' }}", False),
+        ("${{ fromJSON('[\"self-hosted\", \"Linux\", \"X64\"]') }}", False),
+    ],
+)
+def test_label_test_reads_through_runs_on_expressions(runs_on: object, expected: bool) -> None:
+    """Planted shapes: the label test must see the runner behind an expression.
+
+    Before this, an expression-valued ``runs-on`` was stringified and compared
+    as one label, so a self-hosted job behind a fallback expression evaded
+    every check in this module.
+    """
+    assert _is_arm64({"runs-on": runs_on}) is expected
+
+
+def test_fork_pr_check_sees_an_arm64_job_behind_an_expression() -> None:
+    """The fork-PR gate must go red on the expression shape, not only the list."""
+    doc = {
+        "on": {"pull_request": None},
+        "jobs": {"suite": {"runs-on": _EXPR_WITH_THOR_FALLBACK}},
+    }
+    assert _fork_reachable_arm64_jobs(doc) == ["suite"]
+    doc["jobs"]["suite"]["runs-on"] = "ubuntu-latest"
+    assert _fork_reachable_arm64_jobs(doc) == []
+
+
+def test_every_arm64_job_offers_the_hosted_fallback() -> None:
+    """thor is offline unless started, and GitHub has no failover between pools.
+
+    A job pinned to the label triple alone queues for 24 h and is cancelled.
+    Every ARM64 job therefore carries the `runner` dispatch input's hosted
+    branch in its expression, so a person can move it without editing YAML.
+    """
+    pinned = [
+        f"{workflow}:{name}"
+        for workflow, name, job in _arm64_jobs()
+        if not _offers_hosted_fallback(job)
+    ]
+    assert not pinned, (
+        f"{pinned} target [self-hosted, Linux, ARM64] with no hosted fallback. "
+        "Use the runs-on expression release.yml's build job carries."
+    )
+
+
+@pytest.mark.parametrize(
+    ("runs_on", "expected"),
+    [
+        (_EXPR_WITH_THOR_FALLBACK, True),
+        (["self-hosted", "Linux", "ARM64"], False),
+        ("${{ vars.RELEASE_RUNNER == 'hosted' && 'ubuntu-latest' || fromJSON('[\"self-hosted\", \"Linux\", \"ARM64\"]') }}", False),
+    ],
+)
+def test_fallback_detector_planted_shapes(runs_on: object, expected: bool) -> None:
+    """A literal triple, or an expression a dispatch cannot steer, is pinned."""
+    assert _offers_hosted_fallback({"runs-on": runs_on}) is expected

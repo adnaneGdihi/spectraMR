@@ -1,4 +1,4 @@
-.PHONY: format test test-all cov-unit cov-full test-coverage test-missing clean train predict eda eda-dry-run help install-topology env-show check-deps check-deps-imports test-precommit test-pr test-nightly test-release test-release-suite test-mutation diagnostics diagnostics-fast skill-health reachable dev-health gate
+.PHONY: format test test-all cov-unit cov-full test-coverage test-missing clean train predict eda eda-dry-run help install-topology install-mamba env-show check-deps check-deps-imports test-precommit test-pr test-nightly test-release test-release-suite test-mutation diagnostics diagnostics-fast skill-health reachable dev-health gate
 
 # -----------------------------------------------------------------------------
 # Environment-variable loading.
@@ -32,6 +32,7 @@ help:
 	@echo "make clean       - Remove pycache and temp files"
 	@echo "make train       - Train with default config (override: CONFIG=path/to.yaml; loads .env if present)"
 	@echo "make env-show    - Print every framework env var + its current value"
+	@echo "make install-mamba      - Build the mamba CUDA kernels for Volta+Ada (ARCH_LIST=7.0;8.9)"
 	@echo "make check-deps         - Verify declared deps are installed & version-correct (EXTRAS=mri,viz)"
 	@echo "make check-deps-imports - As above, plus import each (catches installed-but-unimportable)"
 	@echo "make eda-dry-run - Dataset EDA: cards + coverage only (no voxel load)"
@@ -325,6 +326,14 @@ diagnostics-fast:
 # rather than pointing back at this command.
 install-topology:
 	pip install -e ".[topology]"
+
+# The `mamba` extra, built for the archs the clusters actually run. NOT the bare
+# `pip install -e '.[mamba]'`: upstream downloads a prebuilt wheel whose gencode
+# list has no sm_70, so a V100 dies at the first kernel launch while the install
+# reports success. The script forces a source build, appends the gencode flags
+# through nvcc itself, and reads the arch list back off the built .so.
+install-mamba:
+	@$(PYTHON) scripts/install_mamba_extra.py $(if $(ARCH_LIST),--arch-list "$(ARCH_LIST)",)
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 

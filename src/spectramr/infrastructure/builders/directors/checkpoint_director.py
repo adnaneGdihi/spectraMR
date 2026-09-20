@@ -16,11 +16,13 @@ import torch
 
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.module_utils import strip_wrapper_prefixes, unwrap_model
+from spectramr.core.rng_state import capture_rng_state, restore_rng_state
 from spectramr.infrastructure.builders.context import (
     BuilderContext,
     accepts_builder_context,
 )
 from spectramr.infrastructure.builders.core import DirectorBuilder
+from spectramr.infrastructure.distributed.distributed_training import RankUtility
 from spectramr.shared.utils.safe_io import atomic_save_torch
 
 if TYPE_CHECKING:  # annotation only — no runtime import, so no cycle
@@ -458,7 +460,11 @@ class CheckpointDirector(DirectorBuilder[Path | CheckpointState]):
             scaler_state=(scaler.state_dict() if (scaler := self._resolve_scaler()) else None),
             counter_state=self._counter_state,
             ema_state=(
-                unwrap_model(self._pipeline.ema).state_dict()
+                # NOT unwrap_model(...).state_dict(): unwrap peels ModelEma's
+                # own ``.module``, so the override that injects the warmup
+                # counter never runs and every resume restarts the decay ramp
+                # at 0. Weight keys are identical either way (#2172).
+                self._pipeline.ema.shadow_state_dict()
                 if hasattr(self._pipeline, "ema") and self._pipeline.ema is not None
                 else None
             ),
@@ -522,6 +528,19 @@ class CheckpointDirector(DirectorBuilder[Path | CheckpointState]):
             # Strategy-owned learnable state (sfc heads, spin_sde diffusion param,
             # ib_vf critics, ...) — see with_strategy / section R design doc.
             self._maybe_add_strategy_state(checkpoint_data)
+
+            # The stochastic half of the run. Without it a requeued 120 h chain
+            # restores the right weights at the right iteration and then draws a
+            # DIFFERENT sequence of diffusion timesteps, masks and dropout from
+            # the one the interrupted job would have drawn — a divergence that
+            # trains and reports success. `CheckpointService` has captured this
+            # since 2026-05 but is only this class's exception fallback, so on
+            # every normal save it was never called (non-negotiable 16).
+            #
+            # No collective here: under plain DDP `may_checkpoint` lets ONLY
+            # rank 0 into this method, so gathering the other ranks' streams
+            # would hang the job. Rank 0's is what is replayed.
+            checkpoint_data["rng_state"] = capture_rng_state()
 
             # Strategy-native artifact first (DeepSpeed's sharded tag directory).
             # COLLECTIVE: every rank must call it, which is why the training loop
@@ -809,9 +828,9 @@ class CheckpointDirector(DirectorBuilder[Path | CheckpointState]):
                 and hasattr(self._pipeline, "ema")
                 and self._pipeline.ema is not None
             ):
-                unwrap_model(self._pipeline.ema).load_state_dict(
-                    strip_wrapper_prefixes(checkpoint_data["ema_state"])
-                )
+                # Restores the warmup counter as well as the weights; strips
+                # prefixes internally, so pre-fix checkpoints still load.
+                self._pipeline.ema.load_shadow_state_dict(checkpoint_data["ema_state"])
                 logger.info("Restored EMA shadow weights securely via director")
 
             # Load scheduler states (optional, gated by the advertised
@@ -844,6 +863,24 @@ class CheckpointDirector(DirectorBuilder[Path | CheckpointState]):
             ):
                 strategy.load_strategy_state_dict(checkpoint_data["strategy_state"])
                 logger.info("Restored strategy-owned state from checkpoint")
+
+            # Counterpart to the capture in `save`. Rank-gated: the file holds
+            # ONE process's streams (rank 0's, the only rank that reaches the
+            # save under plain DDP), so restoring it on every rank would give
+            # them all an identical augmentation sequence and quietly divide the
+            # run's stochastic diversity by the world size — the exact outcome
+            # train.py's rank-offset seeding exists to prevent. Non-main ranks
+            # keep the rank-distinct stream they were seeded with.
+            rng_state = checkpoint_data.get("rng_state")
+            if rng_state and RankUtility.is_main_rank():
+                restore_rng_state(rng_state)
+                logger.info("Restored RNG state (torch + cuda + numpy + python)")
+            elif rng_state:
+                logger.info(
+                    "[RNG] rank %d keeps its own stream; the checkpoint carries "
+                    "rank 0's only, so this rank continues rather than replays.",
+                    RankUtility.get_rank(),
+                )
 
             # Extract epoch, step, metrics, and counter state
             self._epoch = checkpoint_data.get("epoch", 0)

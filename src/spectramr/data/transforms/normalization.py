@@ -576,6 +576,12 @@ def _read_declared_knobs(
             value = getattr(processing, name, None)
         if not declared:
             raise AttributeError(
+                # Reachable only from a RAW mapping. Training passes
+                # ``config.data`` and inference ``config.model_dump()``, and
+                # pydantic has filled the default in both, so nothing in
+                # production reaches this branch. The question is asked where it
+                # can still be answered, by
+                # ``ConfigHealthChecker.check_kspace_scale_domain_is_declared``.
                 f"data.processing exists but declares no {name!r}. This is a "
                 "k-space normalization knob every training and inference path "
                 "resolves through KSpaceNormalizationSpec (issue #572); if it "

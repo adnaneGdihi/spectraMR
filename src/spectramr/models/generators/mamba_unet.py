@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 from spectramr.infrastructure.physics.fft_ops import _to_complex, ifft2c
 from spectramr.models.blocks.mamba_block import MambaBlock
 from spectramr.models.registry import register_model
@@ -89,7 +89,7 @@ class MambaReconstruction(nn.Module):
         )
 
         # Physics: Operates in K-Space
-        self.dc_layer = DataConsistencyLayer()
+        self.dc_layer = NoiseSimulatingDataConsistency()
 
     def forward(self, masked_kspace, mask):
         """

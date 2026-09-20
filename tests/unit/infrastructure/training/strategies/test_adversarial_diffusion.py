@@ -517,6 +517,15 @@ def test_the_sense_bridge_critic_fires_with_smaps_inside_both_closures():
             super().__init__()
             self.conv = nn.Conv2d(16, 8, 3, padding=1)
 
+            # A cold-diffusion generator owns the undersampling process and the strategy
+            # takes its mask generator from it (#2056), so this stub -- which declares that
+            # model_type to reach the smaps branch -- carries one too. It is parameterless,
+            # and the horizon matches the schedule default because the cascade refuses a
+            # timestep past its own end.
+            from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+            self.kspace_process = KSpaceUndersamplingProcess(num_timesteps=1000)
+
         def forward(self, x, *args, **kwargs):
             return self.conv(x)
 
@@ -735,6 +744,15 @@ class _CoilGen(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.conv = nn.Conv2d(16, 8, 3, padding=1)
+
+        # A cold-diffusion generator owns the undersampling process and the strategy
+        # takes its mask generator from it (#2056), so this stub -- which declares that
+        # model_type to reach the smaps branch -- carries one too. It is parameterless,
+        # and the horizon matches the schedule default because the cascade refuses a
+        # timestep past its own end.
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+        self.kspace_process = KSpaceUndersamplingProcess(num_timesteps=1000)
 
     def forward(self, x, *args, **kwargs):
         return self.conv(x)

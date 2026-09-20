@@ -937,7 +937,7 @@ class TestDynamicMaskWiring:
 
 
 class TestInternalDCBackboneSmapChannels:
-    """Regression: unrolled backbones with an internal ``DataConsistencyLayer``
+    """Regression: unrolled backbones with an internal ``MaskedReplacementDataConsistency``
     (``diff_varnet`` / ``diff_varnet_kan``) must NOT have their input channels
     doubled for S-map conditioning.
 
@@ -980,7 +980,7 @@ class TestInternalDCBackboneSmapChannels:
             backbone_type=backbone_type,
             # force_pure_kspace is incidental to what this class asserts (S-map
             # channel arithmetic). It was True; the internal-DC backbones now
-            # reject that pairing, because their DataConsistencyLayer takes an
+            # reject that pairing, because their MaskedReplacementDataConsistency takes an
             # IMAGE and FFTs it, so skipping the bridge's entry ifft2c applied DC
             # in the wrong domain. False is the correct pairing and leaves the
             # channel-doubling behaviour under test unchanged. complex_unet (the
@@ -1398,6 +1398,43 @@ class TestKSpaceFeatureNormPlumbing:
                 kspace_feature_norm="rms",
             )
 
+    def test_the_pure_kspace_branch_is_gated_too(self):
+        """The branch the gate used to miss entirely.
+
+        ``force_pure_kspace`` + ``backbone_type: 'unet'`` builds PureKSpaceUNet
+        **directly** and never constructs FourierBridgeNetwork, where the gate
+        used to live -- so this arm built without a word and materialised zero
+        ``ComplexRMSNorm`` modules while declaring the knob. Planted here because
+        no arm in the corpus exercises the combination, which is why it survived.
+        """
+        with pytest.raises(ValueError, match="complex_unet"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                use_complex_conv=True,
+                attention_type="none",
+                force_pure_kspace=True,
+                backbone_type="unet",
+                kspace_feature_norm="rms",
+            )
+
+    def test_the_declared_time_embedding_width_reaches_the_backbone(self):
+        """It was hardcoded to 256 at the bridge, so a declared value was inert."""
+        model = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            use_complex_conv=True,
+            attention_type="none",
+            force_pure_kspace=True,
+            backbone_type="complex_unet",
+            time_embedding_dim=64,
+        )
+        assert model.backbone.backbone.time_embedding_dim == 64
+
 
 def test_both_block_dispatches_wrap_attention_identity_at_init() -> None:
     """Down AND up blocks must wrap (issue #471).
@@ -1599,9 +1636,39 @@ class TestAttentionDefaultIsBackboneAware:
 # arm could advertise attention it never ran (pitfall #16 facade) — measured on
 # swin_diff_rec, every legal value produced a byte-identical 26.40M-parameter
 # model while a bogus value still raised.
+#
+# The five restoration/ViT backbones joined the set on 2026-09-17, on the sweep
+# the guard's comment had been waiting for: every registered attention_type
+# leaves each of their parameter counts exactly unchanged, and ``dual_domain``
+# -- the only one that builds extra submodules -- adds eleven carrying zero
+# parameters between them. vision_mamba is still absent because it cannot be
+# constructed without the ``.[mamba]`` extra, so it was never measured.
 # ---------------------------------------------------------------------------
 
-_SEAMLESS = ["swin_diff_rec", "swin_diff_rec_kan", "diff_varnet", "diff_varnet_kan", "nafnet"]
+_SEAMLESS = [
+    "swin_diff_rec",
+    "swin_diff_rec_kan",
+    "diff_varnet",
+    "diff_varnet_kan",
+    "nafnet",
+    "restormer",
+    "swinir",
+    "vision_transformer",
+    "vit",
+    "swin_transformer",
+    "vision_mamba",
+    "mamba_unet",
+    "dit",
+    "uvit",
+    "u_vit",
+    "hat",
+    "diffit",
+]
+
+#: Names in ``_SEAMLESS`` that cannot be CONSTRUCTED in this environment, so the
+#: build-side cases below skip them while the raise-side cases still run: the
+#: mamba pair needs the ``.[mamba]`` extra (deliberately outside ``[dev]``).
+_SEAMLESS_UNBUILDABLE = {"vision_mamba", "mamba_unet"}
 
 
 @pytest.mark.parametrize("backbone", _SEAMLESS)
@@ -1625,6 +1692,8 @@ def test_seamless_backbone_rejects_non_none_attention(backbone, attention):
 def test_seamless_backbone_accepts_none_attention(backbone):
     """``attention_type='none'`` is the honest declaration and must still build.
     Guarding must not make these backbones unreachable."""
+    if backbone in _SEAMLESS_UNBUILDABLE:
+        pytest.skip(f"{backbone} needs the .[mamba] extra to construct")
     model = KSpaceColdDiffusionGenerator(
         in_channels=2,
         out_channels=2,
@@ -1653,6 +1722,8 @@ def test_seamless_backbone_unspecified_attention_resolves_to_none(backbone):
     otherwise the library default ('self') would make every config that simply
     omits the knob unconstructible, which is the exact regression the unet
     branch of this resolution was written to prevent."""
+    if backbone in _SEAMLESS_UNBUILDABLE:
+        pytest.skip(f"{backbone} needs the .[mamba] extra to construct")
     model = KSpaceColdDiffusionGenerator(
         in_channels=2,
         out_channels=2,
@@ -1665,7 +1736,7 @@ def test_seamless_backbone_unspecified_attention_resolves_to_none(backbone):
 
 @pytest.mark.parametrize("backbone", ["diff_varnet", "diff_varnet_kan"])
 def test_internal_dc_backbone_rejects_force_pure_kspace(backbone):
-    """DiffVarNet's DataConsistencyLayer takes an IMAGE and FFTs it internally.
+    """DiffVarNet's MaskedReplacementDataConsistency takes an IMAGE and FFTs it internally.
     ``force_pure_kspace=true`` makes FourierBridgeNetwork skip the entry ifft2c,
     so the backbone would receive k-space and DC would transform it a second
     time — data consistency enforced in the wrong domain, silently. Verified
@@ -2054,7 +2125,7 @@ class TestForcePureKSpaceDomainGuard:
 
     ``FourierBridgeNetwork`` skips the entry ``ifft2c`` under the flag, so the
     inner backbone receives k-space. A backbone that then runs its own
-    ``DataConsistencyLayer`` FFTs that k-space a SECOND time and enforces data
+    ``MaskedReplacementDataConsistency`` FFTs that k-space a SECOND time and enforces data
     consistency in the wrong domain. There is no shape error, so nothing
     surfaces at runtime -- the arm trains and reports metrics.
 
@@ -2580,3 +2651,397 @@ class TestSamplerDeterminismKnobs:
 
         with pytest.raises(ValueError, match="seed_offset"):
             self._build().sample(measurement, mask=mask, seed_offset=1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Every attention_type the dispatch builds must be able to LEAVE its identity.
+#
+# The #471 wrapper made all eight blocks start at rho = 1.000; three of them
+# (self / kernelized / sparse) already zero-initialised their own output
+# projection, and the product of the two mechanisms is a fixed point with zero
+# gradient everywhere. This test drives the production dispatch rather than a
+# hand-composed wrapper, because that composition is what the arms build.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One case per attention_type the dispatch can build, not a sample: the saddle was
+# a property of the COMPOSITION, so a type is only covered once it has been watched
+# training off its own initialisation (non-negotiable 15).
+_DISPATCH_ATTENTION_TYPES = [
+    "self",
+    "kernelized",
+    "sparse",
+    "channel",
+    "dual_domain",
+    "wavelet_freq",
+    "kan_dual_domain",
+    "null_space_dual_domain",
+]
+
+
+@pytest.mark.parametrize("attention_type", _DISPATCH_ATTENTION_TYPES)
+def test_dispatch_attention_trains_off_its_identity_init(attention_type: str) -> None:
+    """gamma must move on backward 1 and the inner block must train on backward 2."""
+    from spectramr.models.generators.kspace_cold_diffusion_generator import (
+        KSpaceDownsampleBlock,
+    )
+
+    torch.manual_seed(0)
+    block = KSpaceDownsampleBlock(
+        64,
+        64,
+        attention_type=attention_type,
+        use_complex_conv=True,
+        time_embedding_dim=256,
+        feature_domain="kspace",
+    )
+    attention = block.attention
+    opt = torch.optim.AdamW(block.parameters(), lr=1e-2)
+    target = torch.randn(1, 64, 16, 16)
+
+    acquisition = torch.zeros(1, 1, 32, 32)
+    acquisition[..., ::4] = 1.0
+    acquisition[..., 14:18] = 1.0
+
+    def step() -> None:
+        opt.zero_grad(set_to_none=True)
+        out, _ = block(torch.randn(1, 64, 32, 32), torch.randn(1, 256), acquisition)
+        ((out - target) ** 2).mean().backward()
+        opt.step()
+
+    step()
+    assert attention.gamma.grad.abs().item() > 0.0, (
+        f"attention_type={attention_type!r} gives gamma no gradient: the arm is "
+        "bit-identical to attention_none for the whole run"
+    )
+    step()
+    inner_grad = max(
+        0.0 if p.grad is None else p.grad.abs().max().item()
+        for p in attention.inner.parameters()
+    )
+    assert inner_grad > 0.0, (
+        f"attention_type={attention_type!r} never delivers gradient to its own "
+        "parameters, so the mechanism the arm varies is never learned"
+    )
+
+
+def test_dispatch_opts_the_three_blocks_out_of_their_own_zero_init() -> None:
+    """The election itself (non-negotiable 17), not just its effect.
+
+    Asserting only "gamma trains" would stay green if someone restored the
+    second mechanism and compensated elsewhere; this pins which owner won.
+    """
+    from spectramr.models.generators.kspace_cold_diffusion_generator import (
+        KSpaceDownsampleBlock,
+        KSpaceUpsampleBlock,
+    )
+
+    for attention_type, proj_attr in [
+        ("self", "proj"),
+        ("kernelized", "out_proj"),
+        ("sparse", "proj"),
+    ]:
+        for builder, args in [(KSpaceDownsampleBlock, (64, 64)), (KSpaceUpsampleBlock, (64, 64))]:
+            block = builder(
+                *args,
+                attention_type=attention_type,
+                use_complex_conv=True,
+                time_embedding_dim=256,
+                feature_domain="kspace",
+            )
+            proj = getattr(block.attention.inner, proj_attr)
+            assert proj.weight.abs().sum().item() > 0.0, (
+                f"{builder.__name__}/{attention_type}: the block still zero-inits its "
+                "own output projection under IdentityAtInitAttention"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# null_space_dual_domain is REACHED and FED, not merely registered (#16)
+#
+# The block raises without a mask, and the reverse sampler re-enters
+# ``forward(x_t, t)`` with no kwargs at all -- the same hole the S-map stash was
+# opened for. Registering the type and threading the training forward would
+# still leave every validation event dead, so both paths are observed here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _null_space_generator(size: int = 32):
+    from spectramr.models.generators.kspace_cold_diffusion_generator import (
+        KSpaceColdDiffusionGenerator,
+    )
+
+    torch.manual_seed(0)
+    return KSpaceColdDiffusionGenerator(
+        in_channels=8,
+        out_channels=8,
+        base_channels=16,
+        num_res_blocks=4,
+        attention_type="null_space_dual_domain",
+        backbone_type="complex_unet",
+        force_pure_kspace=True,
+        use_complex_conv=True,
+        activation="complex",
+        time_embedding_dim=64,
+        timesteps=8,
+        sampling_steps=8,
+        dc_method="hard",
+        reverse_sampling_mode="replace_freeze_dc",
+        kspace_log_scaled=False,
+        base_acceleration=1.0,
+        max_acceleration=8.0,
+    ).eval()
+
+
+def _spy_on_null_space_blocks(generator) -> list:
+    """Record the (feature grid, mask) every null-space block is called with."""
+    from spectramr.models.blocks.null_space_attention import NullSpaceDualDomainAttention
+
+    calls: list = []
+    for module in generator.modules():
+        if isinstance(module, NullSpaceDualDomainAttention):
+            module.register_forward_pre_hook(
+                lambda mod, args, kwargs, sink=calls: sink.append(
+                    (tuple(args[0].shape[-2:]), kwargs.get("mask"))
+                ),
+                with_kwargs=True,
+            )
+    return calls
+
+
+def _acquisition(size: int):
+    mask = torch.zeros(1, 1, size, size)
+    mask[..., ::4] = 1.0
+    mask[..., size // 2 - 2 : size // 2 + 2] = 1.0
+    return mask, torch.randn(1, 4, size, size, dtype=torch.complex64)
+
+
+def test_null_space_blocks_are_built_and_fed_on_the_training_forward() -> None:
+    size = 32
+    generator = _null_space_generator(size)
+    calls = _spy_on_null_space_blocks(generator)
+    mask, smaps = _acquisition(size)
+    x = torch.randn(1, 8, size, size)
+
+    with torch.no_grad():
+        generator(
+            x,
+            timesteps=torch.full((1,), 3, dtype=torch.long),
+            mask=mask,
+            kspace_measured=x * mask,
+            smaps=smaps,
+        )
+
+    assert calls, "no null-space block ran: the dispatch built something else"
+    assert all(m is not None for _, m in calls), "a block ran without its mask"
+    # The encoder downsamples by center-cropping k-space, so the blocks must see
+    # more than one grid while the mask stays full-resolution for all of them.
+    assert len({grid for grid, _ in calls}) > 1
+    assert {tuple(m.shape[-2:]) for _, m in calls} == {(size, size)}
+
+
+def test_the_reverse_sampler_still_feeds_the_mask_and_restores_the_stash() -> None:
+    """The bare ``(x, t)`` re-entry is where a forward-signature-only route dies."""
+    size = 32
+    generator = _null_space_generator(size)
+    calls = _spy_on_null_space_blocks(generator)
+    mask, smaps = _acquisition(size)
+    generator.set_current_smaps(smaps)
+
+    with torch.no_grad():
+        generator.sample(torch.randn(1, 8, size, size) * mask, mask=mask, inference_timesteps=3)
+
+    assert calls, "no null-space block ran during reverse sampling"
+    assert all(m is not None for _, m in calls), "a reverse step ran without the mask"
+    assert generator._current_mask is None, "sample() must restore the previous stash"
+
+
+#: The smallest arm that builds the ``complex_unet`` decoder these two classes
+#: exercise. Module level rather than a class attribute so the two share one.
+_BAND_BASE = {
+    "in_channels": 4,
+    "out_channels": 4,
+    "base_channels": 8,
+    "num_layers": 2,
+    "use_complex_conv": True,
+    "attention_type": "none",
+    "force_pure_kspace": True,
+    "backbone_type": "complex_unet",
+    "condition_with_smaps": False,
+    "use_dc": False,
+    "kspace_log_scaled": False,
+    "num_timesteps": 29,
+}
+
+
+class TestRadialBandTokensPlumbing:
+    """The token bank reaches the decoder, and refuses a backbone without the seam.
+
+    The reverse sampler calls ``model(x, t)`` bare, which is what leaves the
+    generator's own DC layer inert at validation. This mechanism is rung-indexed
+    rather than mask-indexed precisely so that call still carries what it needs,
+    and that is asserted here rather than argued.
+    """
+
+    def _generator(self, **extra):
+        torch.manual_seed(0)
+        return KSpaceColdDiffusionGenerator(**_BAND_BASE, **extra).eval()
+
+    def _tokens(self, model):
+        return model.backbone.backbone.radial_band_tokens
+
+    def test_the_knob_is_off_by_default(self):
+        assert self._tokens(self._generator()) is None
+
+    def test_the_rung_count_is_derived_from_the_process_not_declared(self):
+        """One owner: ``model_kwargs.timesteps`` already states how many rungs exist."""
+        assert self._tokens(self._generator(radial_band_tokens_bands=8)).n_rungs == 29
+
+    def test_declaring_the_rung_count_raises(self):
+        with pytest.raises(ValueError, match="derived from the process"):
+            self._generator(radial_band_tokens_bands=8, radial_band_tokens_rungs=29)
+
+    def test_a_misspelled_knob_raises_at_the_generator(self):
+        """Planted: ``**kwargs`` plus no OPTION_SCHEMA means nothing else sees it."""
+        with pytest.raises(ValueError, match="Unrecognised radial band token"):
+            self._generator(radial_band_tokens_bnads=8)
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"backbone_type": "unet", "attention_type": "none"},
+            {"force_pure_kspace": False},
+        ],
+    )
+    def test_a_backbone_without_the_seam_raises(self, extra):
+        with pytest.raises(ValueError, match="radial_band_tokens_bands"):
+            torch.manual_seed(0)
+            KSpaceColdDiffusionGenerator(**{**_BAND_BASE, **extra}, radial_band_tokens_bands=8)
+
+    def test_it_fires_on_the_bare_reverse_loop_call(self):
+        """``model(x, t)`` with no kwargs is where the reported numbers come from."""
+        model = self._generator(radial_band_tokens_bands=8)
+        fired: list[int] = []
+        self._tokens(model).register_forward_hook(lambda m, i, o: fired.append(int(i[1][0])))
+        with torch.no_grad():
+            model(torch.randn(1, 4, 32, 32), torch.full((1,), 22, dtype=torch.long))
+        assert len(fired) == len(model.backbone.backbone.ups)
+        assert set(fired) == {22}, "the rung must be the timestep the sampler passed"
+
+    def test_an_armed_arm_reproduces_its_control_at_initialisation(self):
+        x, t = torch.randn(1, 4, 32, 32), torch.tensor([7])
+        with torch.no_grad():
+            control = self._generator()(x, t)
+            armed = self._generator(radial_band_tokens_bands=8)(x, t)
+        assert torch.equal(control, armed)
+
+
+class TestRadialBandGainTimestepConditioning:
+    """The gain's timestep half was declared by the class and never passed.
+
+    ``RadialBandGain`` accepts ``time_embed_dim`` and ``band_gains`` consumes a
+    ``time_embedding``, but the generator built it with neither, so the advertised
+    ``[annulus x timestep]`` conditioning ran as ``[annulus]`` whatever an arm
+    asked for.
+    """
+
+    def _generator(self, **extra):
+        torch.manual_seed(0)
+        return KSpaceColdDiffusionGenerator(**_BAND_BASE, **extra).eval()
+
+    def test_the_width_is_zero_unless_an_arm_declares_it(self):
+        """No existing arm moves: absent still means the per-annulus scalar."""
+        assert self._generator(radial_band_gain_bands=8).radial_band_gain.time_embed_dim == 0
+
+    def test_declaring_the_width_builds_a_time_conditioned_gain(self):
+        model = self._generator(radial_band_gain_bands=8, radial_band_gain_time_embed_dim=32)
+        assert model.radial_band_gain.time_embed_dim == 32
+
+    def test_the_embedding_actually_reaches_band_gains(self):
+        """Observed at the seam: the class already raises on a missing embedding,
+        so the thing worth asserting is that one arrives at all."""
+        model = self._generator(radial_band_gain_bands=8, radial_band_gain_time_embed_dim=32)
+        seen: list[bool] = []
+        inner = model.radial_band_gain.band_gains
+
+        def spy(kspace, time_embedding=None):
+            seen.append(time_embedding is not None and time_embedding.shape[-1] == 32)
+            return inner(kspace, time_embedding)
+
+        model.radial_band_gain.band_gains = spy
+        with torch.no_grad():
+            model(torch.randn(1, 4, 32, 32), torch.tensor([3]))
+        assert seen == [True]
+
+    def test_a_time_conditioned_gain_still_reproduces_its_control_at_init(self):
+        """``gamma`` is still zero, so the A/B stays attributable."""
+        x, t = torch.randn(1, 4, 32, 32), torch.tensor([3])
+        with torch.no_grad():
+            control = self._generator()(x, t)
+            gained = self._generator(radial_band_gain_bands=8, radial_band_gain_time_embed_dim=32)(
+                x, t
+            )
+        assert torch.allclose(control, gained, atol=1e-6)
+
+
+# ── the phase-safe attention query must carry both halves ────────────────────
+class TestPhaseSafeGuidanceLayout:
+    """The bridge's guidance is interleaved, like everything else it feeds.
+
+    It was built as a BLOCKED ``[Re...,Im...]`` stack while
+    ``PhaseSafeDualAttention`` reads ``0::2``/``1::2``. With S-map conditioning
+    the stack is twice the value width, so the truncation to the value's channel
+    count kept exactly the real parts and dropped every imaginary one — the
+    query was ``Re(ifft2c(x))`` and nothing else, with no shape error to show
+    for it. All nine ``attention_type: dual_domain`` arms take this path.
+    """
+
+    @staticmethod
+    def _query_on_the_control_arm():
+        import contextlib
+
+        import torch as _t
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.training.builders.model_builder import ModelBuilder
+
+        arm = "experiments/inprogress/kspace_filling/experiment_11_kspace_cold_diffusion.yaml"
+        cfg = TrainingSettings.from_yaml(arm)
+        _t.manual_seed(0)
+        gen = ModelBuilder(config=cfg, device="cpu").build_generator().validate().build()
+        gen = gen["generator"].eval()
+        attention = getattr(gen.backbone, "phase_safe_attention", None)
+        assert attention is not None, "the dual_domain arm lost its bridge attention"
+        captured: dict[str, object] = {}
+        attention.register_forward_pre_hook(
+            lambda m, i: captured.update(q=i[1].detach().clone())
+        )
+        channels = cfg.model.in_channels
+        # The post-backbone DC guard fires later; the query is already captured.
+        with _t.no_grad(), contextlib.suppress(Exception):
+            gen(
+                _t.randn(1, channels, 64, 64),
+                _t.zeros(1, dtype=_t.long),
+                sensitivity_maps=_t.randn(1, max(channels // 2, 1), 64, 64, dtype=_t.complex64),
+            )
+        assert "q" in captured, "the attention never fired"
+        return captured["q"]
+
+    def test_the_query_carries_the_imaginary_half(self):
+        query = self._query_on_the_control_arm()
+        assert float(query[:, 1::2].abs().sum()) > 1.0, (
+            "the odd (imaginary) channels are empty; the guidance is blocked again"
+        )
+
+    def test_the_query_still_carries_the_real_half(self):
+        """Guards the check above from passing on a query that lost the real part."""
+        query = self._query_on_the_control_arm()
+        assert float(query[:, 0::2].abs().sum()) > 1.0
+
+    def test_the_guidance_is_built_with_the_layout_ssot(self):
+        import inspect
+
+        from spectramr.models.generators import kspace_cold_diffusion_generator as mod
+
+        src = inspect.getsource(mod.FourierBridgeNetwork.forward)
+        assert "complex_to_interleaved(spatial_complex)" in src
+        assert "torch.cat([spatial_complex.real, spatial_complex.imag], dim=1)" not in src

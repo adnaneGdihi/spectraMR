@@ -136,6 +136,16 @@ dependencies = [
   # a DIFFERENT INDEX to happen at all -- a mismatched version alone cannot
   # resolve.
   "torchvision>=0.23",
+  # Error monitoring for the PUBLISHED package, which is instrumented through it
+  # -- so it has to be there on a plain `pip install spectramr`, not behind an
+  # extra nobody selects.
+  #
+  # It is the one entry in this list with no importer under src/ yet, which
+  # otherwise reads as a mistake: the dependency lands ahead of `sentry_sdk.init`
+  # on purpose, so wiring that up later is a code change rather than a dependency
+  # bump pushed at everyone already installed. Until that wiring exists, nothing
+  # in this package sends anything anywhere.
+  "sentry-sdk>=2.69.1",
 ]
 
 # =============================================================================
@@ -341,8 +351,20 @@ schedulefree = ["schedulefree>=1.4"]
 # (the Gated-Conv+GRU fallback is NOT an SSM and is opt-in via
 # SPECTRAMR_ALLOW_MAMBA_FALLBACK for CPU/CI wiring tests only).
 # EXCLUDED FROM `all`: their setup.py imports torch, so they need torch ALREADY
-# installed plus a CUDA toolchain (nvcc):
-#     pip install -e '.[mamba]' --no-build-isolation
+# installed plus a CUDA toolchain (nvcc).
+#
+# INSTALL THROUGH THE SCRIPT, NOT BY HAND:
+#     make install-mamba            # scripts/install_mamba_extra.py
+# The bare `pip install -e '.[mamba]' --no-build-isolation` builds a kernel that
+# cannot run on a V100 and exits 0. Three separate reasons, none of them the one
+# you would reach for: both packages DOWNLOAD a prebuilt wheel unless
+# MAMBA_FORCE_BUILD / CAUSAL_CONV1D_FORCE_BUILD are set, so normally nothing
+# compiles; their hardcoded -gencode list is sm_75/80/87 (+90 at CUDA 11.8, +100/120
+# at 12.8, +103/110/121 at 13.0) and carries sm_70 at NO toolkit version; and
+# TORCH_CUDA_ARCH_LIST is inert here, because torch drops its own arch flags as soon
+# as a package passes an `arch=` flag of its own. The script appends the gencode
+# pairs via NVCC_APPEND_FLAGS (read by nvcc itself), defaults to 7.0;8.9 for the
+# clusters' Volta and Ada nodes, and verifies with `cuobjdump --list-elf`.
 mamba = [
   "mamba-ssm>=2.2",
   "causal-conv1d>=1.4",
@@ -393,6 +415,12 @@ deepspeed = ["deepspeed>=0.15"]
 # `import xformers` alone, so the backend then advertises itself as AVAILABLE
 # and each call throws and falls back to SDPA -- see issue 1620. Install this
 # group matched to the torch actually present, or not at all.
+#
+# NOT extendable to Volta the way `mamba` is. flash-attn 2.8.3's cc_flag floor is
+# `compute_80` (read 2026-09-14), and FlashAttention-2 needs Ampere-or-newer
+# intrinsics, so no gencode makes it run on a V100 -- it builds for the Ada half of
+# the clusters only, where upstream's sm_80 cubin already executes (X.y runs on X.z
+# for z >= y). A Volta arm gets the SDPA path, which is the documented fallback.
 attention = [
   "flash-attn>=2.6",
   "xformers>=0.0.28",
@@ -537,7 +565,7 @@ profile = [
 # The documented follow-up steps, each installed ALONE so it cannot renegotiate
 # the environment `all` just established:
 #     pip install -e '.[all]'
-#     pip install -e '.[mamba]' --no-build-isolation   # on a node with nvcc
+#     make install-mamba                               # on a node with nvcc
 #     pip install -e '.[registration]'                 # only if you need ANTs
 all = [
   "spectramr[mri,diffusion,viz,hpo,iqa,eval,quality,topology,encoders,dynamics,sigpy,graph,symbolic,ray,schedulefree,bnb,deepspeed,test,qa,docs,profile]",

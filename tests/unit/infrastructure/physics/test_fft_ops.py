@@ -528,3 +528,42 @@ class TestOneDimensionalHelpers:
             "ifft2_uncentered_last2",
         }
         assert names <= set(get_fft_ops())
+
+
+class TestTheDynamoFence:
+    """`fft2c`/`ifft2c` are fenced out of every compiled graph.
+
+    Inductor cannot generate code for complex operators: it routes each one to
+    an eager fallback and warns **once per process**, which on a cluster is
+    indistinguishable from silence. Fencing the SSOT is what lets an arm declare
+    `compile.allow_complex` honestly -- the compiled regions provably hold no
+    complex tensors rather than hopefully so.
+
+    The fence is applied at import and unconditionally, so it is paid by every
+    arm including the ones that never compile. Measured on this machine's GPU at
+    8x1x320x320: +1.4 us/call, +0.1%.
+    """
+
+    @pytest.mark.parametrize("fn", [fft2c, ifft2c], ids=["fft2c", "ifft2c"])
+    def test_the_fence_is_applied(self, fn):
+        """`torch._dynamo.disable` wraps with functools.wraps, so a fenced
+        function carries `__wrapped__` and an unfenced one does not."""
+        assert hasattr(fn, "__wrapped__"), f"{fn.__name__} is not fenced"
+
+    @pytest.mark.parametrize("fn", [fft2c, ifft2c], ids=["fft2c", "ifft2c"])
+    def test_the_fence_preserves_the_identity(self, fn):
+        """A fence that swapped the function out would be a correctness bug, not
+        a performance one -- which is why `dynamo_disable` checks `__name__`
+        rather than `callable()` before returning the wrapper."""
+        assert fn.__name__ == fn.__wrapped__.__name__
+
+    def test_the_fence_does_not_change_the_numbers(self):
+        """The centering and `norm="ortho"` contract is what this module is for
+        (non-negotiable 2); a decorator must not perturb it."""
+        x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+        assert torch.allclose(fft2c(x), fft2c.__wrapped__(x))
+        assert torch.allclose(ifft2c(x), ifft2c.__wrapped__(x))
+
+    def test_round_trip_survives_the_fence(self):
+        x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+        assert torch.allclose(ifft2c(fft2c(x)), x, atol=1e-5)

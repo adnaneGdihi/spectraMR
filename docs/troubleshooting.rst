@@ -255,6 +255,38 @@ token budget (a benign attention approximation) over the patch size (a data
 crop) for k-space memory relief.
 
 
+CUDA Device Faults
+==================
+
+``CUDA error: misaligned address`` (and its siblings)
+------------------------------------------------------
+
+**The traceback names the wrong line.** CUDA reports a misaligned address, an
+illegal memory access, an unspecified launch failure and a device-side assert
+*asynchronously*: the driver surfaces the fault at whichever later operation
+happens to synchronise, so the frame Python shows you is the op that waited, not
+the kernel that faulted. Three ``kspace_cold_diffusion`` arms died this way on
+the 2026-09-17 dispatch, all three blaming the same ``ChannelAttention`` line.
+
+``run_training_pipeline`` now says so at the point of failure
+(``_async_cuda_fault_hint``). The remedy it names is the only one that works:
+
+.. code-block:: bash
+
+   CUDA_LAUNCH_BLOCKING=1 spectramr train --config <arm>.yaml
+
+That serialises every launch, so the next traceback names the real kernel — at a
+large throughput cost, which is why it is a debugging flag and not a default.
+
+**If the blamed frame moves between runs, suspect the selection, not the code.**
+``cudnn.benchmark`` re-autotunes on every process start, so the convolution
+algorithm — and any alignment requirement it carries — is chosen fresh each run.
+An arm with a byte-identical config can therefore fault on one node and pass on
+the next, which is what distinguishes this from a shape bug. Pin the selection
+with ``determinism: true`` on the arm to make the outcome repeatable before
+concluding anything about the model.
+
+
 Distributed (DDP) validation metrics are summed across ranks
 =============================================================
 
@@ -531,11 +563,22 @@ if ``SPECTRAMR_ALLOW_MAMBA_FALLBACK`` is set (the run would be a non-SSM GRU).
 
 .. code-block:: bash
 
-   pip install -e '.[mamba]' --no-build-isolation   # mamba-ssm + causal-conv1d
-   python -c "import mamba_ssm"                       # verify the kernel imports
+   make install-mamba                                   # mamba-ssm + causal-conv1d
+   python -c "import mamba_ssm"                          # the kernel imports
+   python scripts/install_mamba_extra.py --verify-only   # ...and carries this GPU's arch
 
 The error message distinguishes *not installed* from *installed-but-kernel-broken*
-(CUDA/PyTorch version mismatch — rebuild with ``--no-build-isolation``).
+(CUDA/PyTorch version mismatch — rebuild through the script).
+
+.. warning::
+
+   ``import mamba_ssm`` succeeding does **not** mean the kernel can run here. A
+   wheel built for the wrong architectures imports cleanly and then raises
+   ``cudaErrorNoKernelImageForDevice`` at the first selective-scan launch — and
+   upstream's prebuilt wheels carry no ``sm_70``, so that is the default outcome
+   on a V100. ``--verify-only`` reads the arch list off the installed ``.so``,
+   which is the only check that distinguishes the two; see
+   :ref:`mamba-arch-list` for why the bare pip line produces this.
 
 **Opt-in GRU fallback (CPU/CI wiring only).** ``SPECTRAMR_ALLOW_MAMBA_FALLBACK=1``
 re-enables the GRU approximation with a loud warning, for shape/wiring tests on

@@ -69,6 +69,22 @@ WRAPPER_ATTRS: tuple[str, ...] = (
 #: The state-dict key prefixes the wrappers in :data:`WRAPPER_ATTRS` introduce.
 WRAPPER_PREFIXES: tuple[str, ...] = tuple(f"{attr}." for attr in WRAPPER_ATTRS)
 
+#: Wrapper attributes safe to strip at ANY depth, not just leading.
+#:
+#: Regional compilation wraps individual children of an ``nn.ModuleList``,
+#: which puts the marker mid-path -- ``blocks.0._orig_mod.conv.weight``. A
+#: leading-only strip leaves that in the checkpoint, where every inference
+#: path builds a bare model and loads with ``strict=True``.
+#:
+#: ``module`` is deliberately NOT here. It is an ordinary attribute name a
+#: model may legitimately use for a real submodule (``encoder.module.weight``),
+#: so stripping it mid-path would delete a user's own structure. The three
+#: below are framework-synthesised and underscore-prefixed; no model names a
+#: submodule ``_orig_mod``.
+_DEPTH_SAFE_WRAPPER_ATTRS: frozenset[str] = frozenset(
+    {"_orig_mod", "_fsdp_wrapped_module", "_checkpoint_wrapped_module"}
+)
+
 #: Depth cap for the unwrap walk. Four wrappers is the realistic maximum
 #: (compile + FSDP + checkpointing + DDP); the cap exists so a module that
 #: exposes a self-referential ``.module`` cannot spin forever.
@@ -106,12 +122,49 @@ def is_wrapped(model: Any) -> bool:
     return unwrap_model(model) is not model
 
 
+def _strip_key(key: str) -> str:
+    """Drop synthetic wrapper segments at any depth, then leading ``module.``.
+
+    Two rules because the names carry different risk. The underscore-prefixed
+    wrappers cannot collide with a real attribute, so they go wherever they
+    appear. ``module`` can, so it is only removed while it leads -- which is the
+    only position DDP, DataParallel and ModelEma ever put it in.
+    """
+    name = ".".join(
+        part for part in key.split(".") if part not in _DEPTH_SAFE_WRAPPER_ATTRS
+    )
+    while True:
+        for prefix in WRAPPER_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+        else:
+            return name
+
+
 def strip_wrapper_prefixes(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove every leading wrapper prefix from a state dict's keys.
+    """Remove every wrapper segment from a state dict's keys, at any depth.
 
     For reading checkpoints written before the save sites unwrapped — including
     the doubly-prefixed ``module._orig_mod.conv.weight`` a compiled-then-EMA'd
     model produced.
+
+    **Two rules, because the names carry different risk.** Regional compilation
+    wraps individual children of an ``nn.ModuleList``, putting the marker in the
+    *middle* of the path::
+
+        blocks.0._orig_mod.conv.weight
+
+    A leading-only strip leaves that in the checkpoint, and every inference path
+    builds a bare model and loads with ``strict=True`` — or under
+    ``strict=False`` matches nothing, loads nothing, and reports success. So the
+    synthetic wrappers (:data:`_DEPTH_SAFE_WRAPPER_ATTRS`) are dropped wherever
+    they appear.
+
+    ``module`` is not, because it is an ordinary attribute name: a model may own
+    a real submodule called ``module``, and ``encoder.module.weight`` must
+    survive. It is removed only while it leads, which is the only position DDP,
+    DataParallel and ModelEma ever put it in.
 
     Returns a plain ``dict`` (never the input object) so callers cannot mutate a
     live module's state dict by accident.
@@ -122,24 +175,23 @@ def strip_wrapper_prefixes(state_dict: Mapping[str, Any]) -> dict[str, Any]:
             silently keeping whichever came last would load a hybrid of the two.
     """
     stripped: dict[str, Any] = {}
+    # Keyed by stripped name -> the original key it came from, so a collision is
+    # detected whichever order the two arrive in. The previous guard compared
+    # `key != name`, which asked "was THIS key transformed" rather than "did two
+    # keys land on one name": `{"module.w", "w"}` raised in one order and
+    # silently kept the last value in the other, and a state dict's order is
+    # just module-traversal order.
+    sources: dict[str, str] = {}
     for key, value in state_dict.items():
-        name = key
-        # Loop: a compiled model inside EMA yields "module._orig_mod.<...>".
-        changed = True
-        while changed:
-            changed = False
-            for prefix in WRAPPER_PREFIXES:
-                if name.startswith(prefix):
-                    name = name[len(prefix) :]
-                    changed = True
-                    break
-        if name in stripped and key != name:
+        name = _strip_key(key)
+        if name in sources:
             raise ValueError(
                 f"stripping wrapper prefixes collides {key!r} onto {name!r}, "
-                "which is already present. The checkpoint holds two distinct "
-                "modules under names that differ only by a wrapper prefix; "
-                "load them separately rather than merging them."
+                f"already claimed by {sources[name]!r}. The checkpoint holds two "
+                "distinct modules under names that differ only by a wrapper "
+                "segment; load them separately rather than merging them."
             )
+        sources[name] = key
         stripped[name] = value
     return stripped
 

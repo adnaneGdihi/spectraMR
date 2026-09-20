@@ -90,6 +90,13 @@ class TrainingEnvironment:
     #: needs a sharding-correct gradient clip), and what to stamp into provenance.
     parallel: Any | None = None
 
+    #: What compilation actually did, per model: the stage it ran at and the
+    #: resolved mode/backend. Empty when the arm asked for eager. Declared vs
+    #: applied is the distinction that matters -- the config says what was
+    #: asked for, this says what happened, and `DDP(compile(m))` and
+    #: `compile(DDP(m))` are indistinguishable without it.
+    compile: Any | None = None
+
     @classmethod
     def from_components(
         cls,

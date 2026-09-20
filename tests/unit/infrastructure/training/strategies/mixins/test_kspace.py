@@ -12,6 +12,7 @@ forward FFT reflects the signal (``F{F{img}} = img(-x)``) -> the model's
 tests pin the passthrough so no double-FFT can recur.
 """
 
+import pytest
 import torch
 
 from spectramr.infrastructure.training.strategies.mixins.kspace import KspaceMixin
@@ -95,26 +96,22 @@ def test_image_input_to_kspace_model_still_transforms():
 # ---------------------------------------------------------------------------
 
 
-class _StubGenerator:
-    dc_layer = None
-
-
 class _StubEnv:
-    generator = _StubGenerator()
+    def __init__(self, generator) -> None:
+        self.generator = generator
 
 
 class _AccelHarness(KspaceMixin):
     """Carrier exposing only what ``setup_kspace_components`` reads."""
 
-    def __init__(self, undersampling) -> None:
+    def __init__(self, generator) -> None:
         from types import SimpleNamespace
 
         self.config = SimpleNamespace(
-            undersampling=undersampling,
             physics=None,
             model=SimpleNamespace(model_type="kspace_cold_diffusion"),
         )
-        self.env = _StubEnv()
+        self.env = _StubEnv(generator)
         self.device = torch.device("cpu")
 
     def _is_cold_diffusion(self) -> bool:
@@ -139,35 +136,117 @@ def _exp11_acceleration():
     )
 
 
+def _model_with_process(undersampling=None, *, timesteps: int = 28):
+    """A stand-in for ``KSpaceColdDiffusionGenerator``, built the same way.
+
+    The constructor resolves ``undersampling:`` through
+    ``resolve_undersampling_kwargs`` and hands the result to
+    ``KSpaceUndersamplingProcess``; reproducing exactly that here is what makes
+    the borrow assertions below statements about the production handoff rather
+    than about a mock.
+    """
+    from types import SimpleNamespace
+
+    from spectramr.models.diffusion.kspace_process import (
+        KSpaceUndersamplingProcess,
+        resolve_undersampling_kwargs,
+    )
+
+    process = KSpaceUndersamplingProcess(
+        num_timesteps=timesteps,
+        **resolve_undersampling_kwargs(undersampling or {}, {}),
+    )
+    return SimpleNamespace(dc_layer=None, kspace_process=process)
+
+
+def test_the_strategy_borrows_the_models_generator_rather_than_building_one():
+    """THE pin for #2056. Two instances is the defect, not two log lines.
+
+    They agreed on every accelerator kwarg -- both sides translate the same
+    block through the same allowlist -- so the duplication was invisible except
+    as ``Creating Accelerator`` appearing twice. Identity is the only assertion
+    that a value comparison cannot pass by coincidence.
+    """
+    model = _model_with_process(_exp11_acceleration())
+    h = _AccelHarness(model)
+    h.setup_kspace_components()
+    assert h.mask_generator is model.kspace_process.mask_generator
+
+
+def test_one_accelerator_is_constructed_however_many_sides_ask_for_it(caplog):
+    """The duplicate log line the cluster run showed, pinned as a count.
+
+    ``_get_accelerator`` is lazy and memoises per pattern, so one shared
+    generator logs once no matter how many callers materialise it; two
+    generators log twice with byte-identical params, which is exactly what
+    job 8592576 printed.
+    """
+    import logging
+
+    model = _model_with_process(_exp11_acceleration())
+    h = _AccelHarness(model)
+    h.setup_kspace_components()
+
+    with caplog.at_level(logging.INFO, logger="spectramr.infrastructure.physics.sampling"):
+        h.mask_generator._get_accelerator(None)
+        model.kspace_process.mask_generator._get_accelerator(None)
+
+    created = [r for r in caplog.records if "Creating Accelerator" in r.getMessage()]
+    assert len(created) == 1, f"expected one accelerator, got {len(created)}"
+
+
+def test_a_ddp_wrapped_generator_is_unwrapped_before_the_lookup():
+    """``kspace_process`` hangs off the module, not off the DDP wrapper.
+
+    Without the unwrap the attribute lookup misses under distributed training
+    and every multi-GPU cold-diffusion arm would hit the raise below.
+    """
+    from types import SimpleNamespace
+
+    model = _model_with_process(_exp11_acceleration())
+    wrapped = SimpleNamespace(module=model, dc_layer=None)
+    h = _AccelHarness(wrapped)
+    h.setup_kspace_components()
+    assert h.mask_generator is model.kspace_process.mask_generator
+
+
+def test_a_generator_without_a_process_raises_rather_than_building_a_second():
+    """Non-negotiable 3. Falling back is what put two owners here."""
+    from types import SimpleNamespace
+
+    h = _AccelHarness(SimpleNamespace(dc_layer=None))
+    with pytest.raises(ValueError, match="kspace_process"):
+        h.setup_kspace_components()
+
+
 def test_validation_accelerator_constructs_from_a_real_arm_config():
-    """The exact construction that raised on the cluster must now succeed.
+    """The exact construction that raised on the cluster must still succeed.
 
     ``_get_accelerator`` is where the kwargs are finally splatted, so calling it
-    is the assertion — the vocabulary gate raises on any unread name.
+    is the assertion -- the vocabulary gate raises on any unread name.
     """
-    h = _AccelHarness(_exp11_acceleration())
-    h.setup_kspace_components(num_timesteps=28)
-    accelerator = h.mask_generator._get_accelerator(None)
-    assert accelerator is not None
+    h = _AccelHarness(_model_with_process(_exp11_acceleration()))
+    h.setup_kspace_components()
+    assert h.mask_generator._get_accelerator(None) is not None
 
 
 def test_mask_seed_reaches_the_accelerator_as_seed():
     """``seed=None`` would send masking to the global RNG (issue #1059).
 
     The cascade then re-draws a fresh permutation per call instead of
-    truncating one fixed ranking, so ``M_{t+1} ⊆ M_t`` no longer holds — which
-    cold diffusion's forward process assumes.
+    truncating one fixed ranking, so ``M_{t+1} subset-of M_t`` no longer holds
+    -- which cold diffusion's forward process assumes.
     """
-    h = _AccelHarness(_exp11_acceleration())
-    h.setup_kspace_components(num_timesteps=28)
+    h = _AccelHarness(_model_with_process(_exp11_acceleration()))
+    h.setup_kspace_components()
     assert h.mask_generator._accelerator_kwargs["seed"] == 42
     assert h.mask_generator._get_accelerator(None).seed == 42
 
 
 def test_unread_schema_defaults_are_not_forwarded():
     """Anti-vacuity for the test above: a dump-and-filter would carry these."""
-    h = _AccelHarness(_exp11_acceleration())
-    h.setup_kspace_components(num_timesteps=28)
+    h = _AccelHarness(_model_with_process(_exp11_acceleration()))
+    h.setup_kspace_components()
     kwargs = h.mask_generator._accelerator_kwargs
     for junk in (
         "mixed_precision",
@@ -183,11 +262,17 @@ def test_unread_schema_defaults_are_not_forwarded():
         assert junk not in kwargs, f"{junk} would reach the accelerator"
 
 
-def test_declared_values_survive_the_translation():
-    """Filtering alone could pass the tests above while dropping real values."""
-    h = _AccelHarness(_exp11_acceleration())
-    h.setup_kspace_components(num_timesteps=28)
+def test_declared_values_survive_the_handoff():
+    """Borrowing must not cost the arm its ladder.
+
+    Filtering alone could pass the two tests above while dropping real values,
+    and a borrow could pass the identity test while the MODEL's generator was
+    the one built wrong.
+    """
+    h = _AccelHarness(_model_with_process(_exp11_acceleration()))
+    h.setup_kspace_components()
     kwargs = h.mask_generator._accelerator_kwargs
+    assert h.mask_generator.num_timesteps == 28, "the arm's schedule length must survive"
     assert h.mask_generator.default_pattern == "density_nested"
     assert kwargs["max_acceleration"] == 32.0
     assert kwargs["base_acceleration"] == 2.0
@@ -198,12 +283,19 @@ def test_declared_values_survive_the_translation():
     assert kwargs["acceleration_range"] == [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]
 
 
-def test_absent_undersampling_block_keeps_the_historical_default():
-    """No declaration must not silently materialise a 32x ladder."""
-    h = _AccelHarness(None)
-    h.setup_kspace_components(num_timesteps=28)
-    assert h.mask_generator.default_pattern == "linear"
-    assert h.mask_generator._accelerator_kwargs == {}
+def test_an_absent_undersampling_block_still_yields_one_owner():
+    """The two sides agree even where there is nothing declared to agree on.
+
+    This replaces a pin on the strategy's own "linear, no kwargs" default.
+    That default existed to stop a strategy-side resolver from inventing a 32x
+    ladder for an arm that declared none; with no strategy-side resolver left,
+    the model's process is the only thing that can answer, and agreeing with it
+    is the property worth holding.
+    """
+    model = _model_with_process(None)
+    h = _AccelHarness(model)
+    h.setup_kspace_components()
+    assert h.mask_generator is model.kspace_process.mask_generator
 
 
 # ---------------------------------------------------------------------------

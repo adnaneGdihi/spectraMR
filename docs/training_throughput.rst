@@ -107,6 +107,25 @@ Listed here to be clear that it is **not** a throughput lever: it trades compute
 for memory, recomputing activations in the backward pass. Reach for it to fit a
 model that will not otherwise fit, then use the headroom for a larger batch.
 
+The knob reaches the model through the backbone's own ``set_grad_checkpointing``
+hook, and ``KSpaceColdDiffusionGenerator`` **raises at build** when the selected
+backbone has none — a memory claim that silently did not happen OOMs later with
+nothing to point at (non-negotiable 3). Implemented for ``complex_unet``,
+``swin_diff_rec``, ``swin_diff_rec_kan``, ``diff_varnet``, ``diff_varnet_kan``
+and ``nafnet``; measured on a ``[2, 8, 128, 128]`` batch, peak allocation falls
+by 49–61 % on the latter three and the forward output is unchanged. It is a
+**training-only** lever: ``_checkpointing_active()`` requires ``self.training``
+and ``torch.is_grad_enabled()``, so the reverse sampler used for validation
+takes the plain path, where there is nothing saved for backward to shrink.
+
+One consequence is easy to miss when adding a checkpointed block: PyTorch ends a
+non-reentrant recompute by raising ``_StopRecomputationError`` **through** the
+code it is re-running, so a ``try``/``except Exception`` anywhere inside a
+checkpointed block catches it. The DC layer's shape diagnostic did, and turning
+the knob on reported ten ``[DC LAYER CRASH]`` errors per ``diff_varnet`` run
+that trained to completion. Catch the error class you are diagnosing --
+``RuntimeError`` for a broadcast failure -- never ``Exception``.
+
 **6. Sharding** — ``parallel.strategy: fsdp | deepspeed``
 
 Only once a single GPU is genuinely the constraint. Needs a launcher

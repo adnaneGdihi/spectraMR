@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from spectramr.infrastructure.physics.forward_operator import (
-    DataConsistencyLayer,
+    MultiCoilDataConsistency,
     MultiCoilForwardOperator,
     NullSpaceProjection,
     create_cartesian_mask,
@@ -199,7 +199,7 @@ def test_null_space_plus_range_equals_input() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DataConsistencyLayer
+# MultiCoilDataConsistency
 # ---------------------------------------------------------------------------
 
 
@@ -210,7 +210,7 @@ def test_data_consistency_hard_replaces_kspace_at_mask() -> None:
     mask[..., : h // 2, :] = 1.0
     coils = _identity_coils(1, h, w)
     fwd = MultiCoilForwardOperator(coil_sensitivities=coils, mask=mask)
-    dc = DataConsistencyLayer(fwd, mode="hard")
+    dc = MultiCoilDataConsistency(fwd, mode="hard")
 
     x = torch.complex(torch.randn(1, 1, h, w), torch.randn(1, 1, h, w))
     y_target = torch.complex(torch.randn(1, 1, h, w), torch.randn(1, 1, h, w)) * mask
@@ -225,7 +225,7 @@ def test_data_consistency_soft_returns_residual_when_requested() -> None:
     """``return_residual=True`` returns a ``(x_dc, residual)`` tuple."""
     coils = _identity_coils(1, 8, 8)
     fwd = MultiCoilForwardOperator(coil_sensitivities=coils, mask=_full_mask(8, 8))
-    dc = DataConsistencyLayer(fwd, mode="soft", lambda_dc=0.5)
+    dc = MultiCoilDataConsistency(fwd, mode="soft", lambda_dc=0.5)
     x = torch.complex(torch.randn(1, 1, 8, 8), torch.randn(1, 1, 8, 8))
     y = fwd.forward(x)
     x_dc, residual = dc.forward(x, y, return_residual=True)

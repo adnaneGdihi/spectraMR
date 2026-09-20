@@ -5,7 +5,7 @@ import torch
 
 from spectramr.infrastructure.physics.data_consistency import (
     AdaptiveDataConsistency,
-    DataConsistencyLayer,
+    NoiseSimulatingDataConsistency,
     NoiseAdaptiveDataConsistency,
     SimpleDataConsistency,
     data_consistency,
@@ -57,7 +57,7 @@ class TestSimpleDataConsistencyMethod:
 class TestDataConsistencyLayerNoiseTypeValidation:
     """Regression: noise_type knob must be validated, not silently no-op'd.
 
-    Previously DataConsistencyLayer accepted any noise_type string but
+    Previously NoiseSimulatingDataConsistency accepted any noise_type string but
     ``_add_realistic_noise`` only branched on 'gaussian'; any other value
     (e.g. 'rician', or the typo 'guassian') silently added ZERO noise
     (CLAUDE.md pitfalls #9/#15). The fix validates the knob in __init__.
@@ -66,22 +66,22 @@ class TestDataConsistencyLayerNoiseTypeValidation:
     def test_rejects_unsupported_noise_type(self):
         """An advertised-but-unimplemented noise model must RAISE at construction."""
         with pytest.raises(ValueError, match="unsupported noise_type"):
-            DataConsistencyLayer(noise_type="rician")
+            NoiseSimulatingDataConsistency(noise_type="rician")
 
     def test_rejects_typo_noise_type(self):
         """A typo in noise_type must RAISE, not silently disable noise."""
         with pytest.raises(ValueError, match="unsupported noise_type"):
-            DataConsistencyLayer(noise_type="guassian")  # typo
+            NoiseSimulatingDataConsistency(noise_type="guassian")  # typo
 
     def test_accepts_gaussian(self):
         """The one supported value is accepted and normalised to lowercase."""
-        layer = DataConsistencyLayer(noise_type="GAUSSIAN")
+        layer = NoiseSimulatingDataConsistency(noise_type="GAUSSIAN")
         assert layer.noise_type == "gaussian"
 
     def test_gaussian_noise_actually_added_in_training(self):
         """The gaussian path adds non-zero noise (no silent no-op fallback)."""
         torch.manual_seed(0)
-        layer = DataConsistencyLayer(train_noise_level=0.5)
+        layer = NoiseSimulatingDataConsistency(train_noise_level=0.5)
         layer.train()
         kspace = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
         noised = layer._add_realistic_noise(kspace)
@@ -89,11 +89,11 @@ class TestDataConsistencyLayerNoiseTypeValidation:
 
 
 class TestDataConsistencyLayerBasic:
-    """Test basic DataConsistencyLayer functionality."""
+    """Test basic NoiseSimulatingDataConsistency functionality."""
 
     def test_initialization_default(self):
         """Test initialization with default parameters."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         assert dc_layer is not None
         assert dc_layer.noise_lvl is None
@@ -101,13 +101,13 @@ class TestDataConsistencyLayerBasic:
     def test_initialization_with_noise_level(self):
         """Test initialization with noise level."""
         noise_lvl = 0.01
-        dc_layer = DataConsistencyLayer(noise_lvl=noise_lvl)
+        dc_layer = NoiseSimulatingDataConsistency(noise_lvl=noise_lvl)
 
         assert dc_layer.noise_lvl == noise_lvl
 
     def test_forward_basic(self):
         """Test basic forward pass."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create tensors
         # Use (B, C, H, W) complex format which is robust
@@ -126,7 +126,7 @@ class TestDataConsistencyLayerComplexFormat:
 
     def test_forward_complex_input(self):
         """Test forward pass with complex tensors."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create complex tensors
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -139,7 +139,7 @@ class TestDataConsistencyLayerComplexFormat:
 
     def test_forward_mixed_complex_and_real(self):
         """Test forward with mixed complex and real inputs."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Complex predicted, real-imag measured
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -156,7 +156,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_full_sampling_mask(self):
         """Test with fully sampled mask."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -168,7 +168,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_zero_sampling_mask(self):
         """Test with zero sampling (no measured data)."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -180,7 +180,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_partial_sampling_mask(self):
         """Test with partial sampling mask."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -193,7 +193,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_mask_broadcasting(self):
         """Test mask broadcasting to match k-space dimensions."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(2, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(2, 1, 16, 16, dtype=torch.complex64)
@@ -209,7 +209,7 @@ class TestDataConsistencyLayerConsistency:
 
     def test_consistency_enforcement(self):
         """Test that measured k-space is enforced at sampled locations."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create image estimate
         predicted_img = torch.ones(1, 1, 16, 16, dtype=torch.complex64)
@@ -226,7 +226,7 @@ class TestDataConsistencyLayerConsistency:
 
     def test_selective_consistency(self):
         """Test consistency enforcement at masked locations only."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.ones(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.zeros(1, 1, 16, 16, dtype=torch.complex64)
@@ -245,7 +245,7 @@ class TestDataConsistencyLayerBatchProcessing:
 
     def test_batch_forward(self):
         """Test forward with batch of samples."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         batch_size = 4
         predicted_img = torch.randn(batch_size, 1, 16, 16, dtype=torch.complex64)
@@ -258,7 +258,7 @@ class TestDataConsistencyLayerBatchProcessing:
 
     def test_batch_processing_preserves_batch_size(self):
         """Test that batch size is preserved."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         for batch_size in [1, 2, 4, 8]:
             predicted_img = torch.randn(batch_size, 1, 16, 16, dtype=torch.complex64)
@@ -275,7 +275,7 @@ class TestDataConsistencyLayerMultiCoil:
 
     def test_multicoil_forward(self):
         """Test forward with multi-coil data."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         num_coils = 4
         predicted_img = torch.randn(1, num_coils, 16, 16, dtype=torch.complex64)
@@ -288,7 +288,7 @@ class TestDataConsistencyLayerMultiCoil:
 
     def test_multicoil_with_sensitivity_handling(self):
         """Test multi-coil processing."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         num_coils = 8
         height, width = 32, 32
@@ -309,7 +309,7 @@ class TestDataConsistencyLayerGradientFlow:
 
     def test_gradient_propagation(self):
         """Test that gradients propagate through DC layer."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(
             1, 1, 16, 16, dtype=torch.complex64, requires_grad=True
@@ -335,7 +335,7 @@ class TestDataConsistencyLayerEdgeCases:
 
     def test_small_image(self):
         """Test with very small image."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 4, 4, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 4, 4, dtype=torch.complex64)
@@ -347,7 +347,7 @@ class TestDataConsistencyLayerEdgeCases:
 
     def test_large_image(self):
         """Test with large image."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 256, 256, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 256, 256, dtype=torch.complex64)
@@ -483,7 +483,7 @@ class TestDataConsistencyIntegration:
             def __init__(self, num_unrolls=5):
                 super().__init__()
                 self.dc_layers = torch.nn.ModuleList(
-                    [DataConsistencyLayer() for _ in range(num_unrolls)]
+                    [NoiseSimulatingDataConsistency() for _ in range(num_unrolls)]
                 )
                 self.image_updates = torch.nn.ModuleList(
                     [
@@ -698,7 +698,7 @@ class TestNoiseAdaptiveDataConsistency:
 # noise_type: one owner, one policy (#1525)
 #
 # Three layers took this parameter and applied three different policies:
-# DataConsistencyLayer validated it, SimpleDataConsistency stored it unchecked,
+# NoiseSimulatingDataConsistency validated it, SimpleDataConsistency stored it unchecked,
 # and HardDataConsistency accepted it and never stored it at all -- so an
 # unsupported value degraded silently to Gaussian on two of the three.
 # ---------------------------------------------------------------------------
@@ -710,12 +710,12 @@ class TestNoiseTypeIsValidatedEverywhere:
     @staticmethod
     def _layers():
         from spectramr.infrastructure.physics.data_consistency import (
-            DataConsistencyLayer,
+            NoiseSimulatingDataConsistency,
             HardDataConsistency,
             SimpleDataConsistency,
         )
 
-        return [DataConsistencyLayer, HardDataConsistency, SimpleDataConsistency]
+        return [NoiseSimulatingDataConsistency, HardDataConsistency, SimpleDataConsistency]
 
     def test_gaussian_is_accepted_and_stored(self) -> None:
         for cls in self._layers():

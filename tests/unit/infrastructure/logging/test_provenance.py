@@ -1759,3 +1759,99 @@ def test_knobs_line_omits_a_single_sample_validation():
 
 def test_knobs_line_survives_a_validation_block_without_sampling():
     assert "val_ensemble" not in prov.format_runtime_knobs(_knobs_config())
+
+
+# --------------------------------------------------------------------------- #
+# compile: declared vs applied
+#
+# The config can only speak to what was ASKED for. `DDP(compile(m))` and
+# `compile(DDP(m))` are different runs with identical YAML -- only the second
+# engages DDPOptimizer -- so a record assembled from the config alone reads the
+# same either way, which is the distinction the placement work turns on.
+# --------------------------------------------------------------------------- #
+def _compile_config(**overrides):
+    defaults = {
+        "enabled": True,
+        "mode": "default",
+        "backend": "inductor",
+        "fullgraph": False,
+        "dynamic": True,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(optimization=SimpleNamespace(compile=SimpleNamespace(**defaults)))
+
+
+def test_compile_provenance_records_the_declared_knobs():
+    record = prov.compile_provenance(_compile_config(), {})
+    assert record["declared"]["enabled"] is True
+    assert record["declared"]["backend"] == "inductor"
+
+
+def test_compile_provenance_records_where_the_wrap_landed():
+    """The half the config cannot answer."""
+    applied = {"generator": {"stage": "after_stage_b", "backend": "inductor", "wrapped": True}}
+    record = prov.compile_provenance(_compile_config(), applied)
+    assert record["applied"]["generator"]["stage"] == "after_stage_b"
+    assert record["applied"]["generator"]["wrapped"] is True
+
+
+def test_the_same_declaration_at_two_stages_is_distinguishable():
+    """Planted: this is the whole point. Identical YAML, different runs."""
+    config = _compile_config()
+    early = prov.compile_provenance(config, {"generator": {"stage": "after_stage_a"}})
+    late = prov.compile_provenance(config, {"generator": {"stage": "after_stage_b"}})
+    assert early["declared"] == late["declared"]
+    assert early["applied"] != late["applied"]
+
+
+def test_an_eager_arm_records_an_empty_applied_map():
+    """`{}` is a finding -- it says the build ran and compiled nothing."""
+    record = prov.compile_provenance(_compile_config(enabled=False), {})
+    assert record["applied"] == {}
+    assert "incomplete" not in record
+
+
+def test_a_build_that_never_reported_goes_in_incomplete():
+    """`None` means the build never got far enough to say, which is NOT the
+    same as "not compiled" -- flattening the two is what pitfall 16 calls a
+    silent omission."""
+    record = prov.compile_provenance(_compile_config(), None)
+    assert record["incomplete"] == ["applied"]
+    assert "applied" not in record
+
+
+def test_the_applied_entries_are_copies():
+    """The record is serialised later; handing out the live dict lets a caller
+    mutate provenance after the fact."""
+    applied = {"generator": {"stage": "after_stage_b"}}
+    record = prov.compile_provenance(_compile_config(), applied)
+    applied["generator"]["stage"] = "tampered"
+    assert record["applied"]["generator"]["stage"] == "after_stage_b"
+
+
+def test_every_compile_knob_the_schema_declares_is_stamped():
+    """Planted: `regional` and `allow_complex` were added to the schema, read
+    and validated, and left out of this record.
+
+    A knob that is read and validated but not stamped is two thirds of
+    non-negotiable 8, and the missing third is the one that makes a finished
+    run explicable -- provenance is where you go when the numbers are in and
+    the question is what produced them.
+
+    Asserts against the real schema, not the stub above, so it fails the moment
+    the declared keys stop being derived from it.
+    """
+    from spectramr.config.schemas.optimization import CompileConfigSchema
+
+    config = SimpleNamespace(optimization=SimpleNamespace(compile=CompileConfigSchema()))
+    declared = prov.compile_provenance(config, {})["declared"]
+    missing = set(CompileConfigSchema.model_fields) - set(declared)
+    assert not missing, f"compile knobs declared but never stamped: {sorted(missing)}"
+
+
+def test_a_compile_block_without_a_schema_still_records_the_core_knobs():
+    """Partial configs and stubs have no `model_fields`; the record must still
+    carry the knobs rather than come back empty."""
+    record = prov.compile_provenance(_compile_config(), {})
+    assert record["declared"]["enabled"] is True
+    assert set(record["declared"]) >= {"enabled", "mode", "backend"}

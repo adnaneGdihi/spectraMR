@@ -168,6 +168,33 @@ def unread_init_params(cls: type) -> frozenset[str]:
     return frozenset(p for p in declared if p not in used)
 
 
+def declared_knobs_out_of_scope(
+    declared_kwargs: dict[str, Any] | None, model_class: type | None
+) -> frozenset[str]:
+    """Declared keys this detector structurally cannot answer about.
+
+    A key absorbed by ``**kwargs`` is never a candidate for
+    :func:`unread_init_params`, which enumerates only named parameters. On the
+    ``kspace_filling`` cohort that is 1365 of 1590 declared keys (85.8 %), so a
+    verdict that does not separate *measured* from *in scope* reads as a clean
+    bill of health for a population the check never looked at. Callers report
+    this count beside the verdict; the package-wide reader census in
+    ``scripts/ci/check_model_kwargs_are_read.py`` is what covers these keys.
+    """
+    if not declared_kwargs or model_class is None or not inspect.isclass(model_class):
+        return frozenset()
+    node = _init_source_tree(model_class)
+    if node is None:
+        return frozenset(declared_kwargs)
+    args = node.args
+    named = {
+        p.arg
+        for p in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+        if p.arg not in ("self", "cls")
+    }
+    return frozenset(k for k in declared_kwargs if k not in named)
+
+
 def find_inert_declared_knobs(
     model_type: str | None,
     declared_kwargs: dict[str, Any] | None,

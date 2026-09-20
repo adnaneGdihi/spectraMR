@@ -78,11 +78,69 @@ extras are deliberately outside it because they cannot build under isolation:
 
 Mamba and SSM models (``hilbert_mamba``, ``geomamba``, ``bloch_mamba``, …) need
 the official CUDA selective-scan kernel, which compiles from source. Install it
-as a second step on a machine with ``nvcc``:
+as a second step, on a machine with ``nvcc`` and ``ninja`` (the latter is
+declared in no dependency group — without it the build ignores ``MAX_JOBS`` and
+compiles serially, so the script refuses to start and tells you to
+``pip install ninja``), **through the script** — not through the bare pip line:
 
 .. code-block:: bash
 
-   pip install -e ".[mamba]" --no-build-isolation
+   make install-mamba                                  # or, equivalently:
+   python scripts/install_mamba_extra.py               # default archs: 7.0;8.9
+   python scripts/install_mamba_extra.py --verify-only  # audit an existing install
+
+.. _mamba-arch-list:
+
+Why the mamba extra needs a script
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``pip install -e '.[mamba]' --no-build-isolation`` builds a kernel that cannot
+run on a V100, and reports success. Three upstream mechanisms have to be
+overridden, and the obvious one does nothing:
+
+#. **It does not compile at all by default.** ``mamba-ssm`` and
+   ``causal-conv1d`` each install a ``CachedWheelsCommand`` that first downloads
+   a prebuilt wheel keyed on the CUDA / torch / CPython / C++-ABI tuple, and
+   builds from source only when that 404s. A downloaded wheel carries upstream's
+   architectures, so any compile flag you set is irrelevant.
+   ``MAMBA_FORCE_BUILD`` and ``CAUSAL_CONV1D_FORCE_BUILD`` are what make a build
+   happen. Two further short-circuits sit in front of those: pip skips the build
+   entirely for an **already-satisfied requirement**, which is the state of any
+   node that already ran the bare pip line, and again for a **cached wheel** in
+   ``~/.cache/pip/wheels``. The script uninstalls both packages first and passes
+   ``--no-cache-dir``.
+#. **``TORCH_CUDA_ARCH_LIST`` is inert for these two packages.** Both hardcode
+   their ``-gencode`` flags, and ``torch.utils.cpp_extension`` drops the flags it
+   would derive from that variable as soon as a user-supplied nvcc flag contains
+   the substring ``arch``. Setting it here changes nothing — which is why the
+   script also sets ``NVCC_APPEND_FLAGS``, read by the **nvcc driver itself**
+   and therefore not suppressible by a package's own gencode list.
+#. **Upstream's hardcoded list has no ``sm_70``.** It is ``sm_75``, ``sm_80``,
+   ``sm_87``, plus ``sm_90`` from CUDA 11.8, ``sm_100``/``sm_120`` from 12.8 and
+   ``sm_103``/``sm_110``/``sm_121`` from 13.0 — Volta at no toolkit version. A
+   V100 therefore raises ``cudaErrorNoKernelImageForDevice`` at the first
+   selective-scan launch, the same failure the cu126 torch pin exists to
+   prevent one layer down.
+
+The default arch list is ``7.0;8.9`` — Volta and Ada, the two families on the
+target clusters. **Ada was never broken**: a cubin built for compute capability
+X.y runs on X.z for z ≥ y, so upstream's ``sm_80`` already executes on an 8.9
+device; ``sm_89`` is native codegen for Ada, not a repair. ``sm_70`` is the
+repair. ``+PTX`` is deliberately omitted — Turing, Ampere, Jetson-Ampere and
+Hopper are already covered, and forward-JIT can never back-compile down to 7.0.
+Override with ``--arch-list`` (or ``make install-mamba ARCH_LIST=…``) when a
+cluster gains a family; requesting one upstream already emits merely duplicates
+its ``-gencode``.
+
+The script ends by reading the architectures back out of the built ``.so`` with
+``cuobjdump --list-elf`` and failing on anything missing, because a forgotten
+``FORCE_BUILD`` is indistinguishable from a successful build until a job lands
+on a V100.
+
+``flash-attn`` (the ``attention`` extra) cannot be extended the same way: its
+kernels require Ampere or newer, so no gencode makes it run on Volta. It builds
+for the Ada half of the cluster only, and that is a separate decision rather
+than a different value for this list.
 
 Check the installation
 ----------------------

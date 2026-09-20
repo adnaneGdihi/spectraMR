@@ -1136,7 +1136,7 @@ class TestProbeConstructsTheModelTrainingBuilds:
 #
 # The gap was invisible for a year because the generator's own DC path narrows
 # a too-wide measurement before using it. Only a backbone with an INTERNAL
-# ``DataConsistencyLayer`` -- which receives the kwarg verbatim -- can see it,
+# ``MaskedReplacementDataConsistency`` -- which receives the kwarg verbatim -- can see it,
 # so ``_MeasurementWidthModel`` raises on the mismatch the way that DC does.
 # These assert at the CALL SITE (through ``synthetic_forward_probe``), not on a
 # helper: a helper-only pin would score the real defect green.
@@ -1166,7 +1166,7 @@ class _MeasurementWidthModel(torch.nn.Module):
         type(self).seen_forward_width = int(x.shape[1])
         out = self.conv(x)
         if kspace_measured is not None and kspace_measured.shape[1] != out.shape[1]:
-            # Stands in for DataConsistencyLayer's broadcast against the
+            # Stands in for MaskedReplacementDataConsistency's broadcast against the
             # prediction -- the crash swin_diff_rec died on.
             raise RuntimeError(
                 f"measurement width {kspace_measured.shape[1]} does not match "

@@ -63,8 +63,6 @@ class DDIMSampler:
         # Pre-compute DDIM parameters
         self._precompute_ddim_parameters()
 
-        self._step_compiled = self._ddim_step
-
     def _precompute_ddim_parameters(self):
         """Pre-compute parameters needed for DDIM sampling."""
         # DDIM parameters (equations from the paper)
@@ -229,7 +227,7 @@ class DDIMSampler:
                 predicted_noise = torch.clamp(predicted_noise, -1.0, 1.0)
 
             # DDIM sampling step
-            x = self._step_compiled(x, predicted_noise, t_tensor, num_inference_steps)
+            x = self._ddim_step(x, predicted_noise, t_tensor, num_inference_steps)
 
             # Apply data consistency if available
             if self.data_consistency is not None and measured_kspace is not None:

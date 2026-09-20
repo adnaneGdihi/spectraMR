@@ -103,7 +103,6 @@ def setup_builder_mocks(
     # PhysicsBuilder
     mock_pb = mock_pb_cls.return_value
     mock_pb.build_fft_transformer.return_value = mock_pb
-    mock_pb.build_mask_generator.return_value = mock_pb
     mock_pb.build_data_consistency.return_value = mock_pb
     mock_pb.build_coil_sensitivity.return_value = mock_pb
     mock_pb.validate.return_value = mock_pb

@@ -14,6 +14,7 @@ import pytest
 from spectramr.infrastructure.validation.inert_knobs import (
     DELIBERATELY_UNREAD,
     InertKnob,
+    declared_knobs_out_of_scope,
     find_inert_declared_knobs,
     unread_init_params,
 )
@@ -152,3 +153,115 @@ def test_regression_kspace_cold_diffusion_swallows_four_knobs():
     assert unread_init_params(KSpaceColdDiffusionGenerator) == frozenset(
         {"activation", "use_complex_conv", "time_embedding_type", "training_mode"}
     )
+
+
+# ── the scope the detector cannot see (non-negotiable 15) ────────────────────
+class _AbsorbsEverything:
+    """One named knob; the rest arrive through ``**kwargs`` and nothing reads them."""
+
+    def __init__(self, named: int = 1, **kwargs):
+        self.named = named
+
+
+def test_kwargs_absorbed_knobs_are_reported_as_out_of_scope():
+    """The planted violation: a declared key nothing reads, hidden behind **kwargs.
+
+    ``unread_init_params`` enumerates named parameters only, so this key can
+    never appear in its answer. Before the scope accessor existed the audit
+    still printed "all 3 declared model_kwargs are read", which is a clean
+    verdict over a population the check never looked at.
+    """
+    declared = {"named": 1, "invisible": 2, "also_invisible": 3}
+    assert find_inert_declared_knobs("demo", declared, _AbsorbsEverything) == []
+    assert declared_knobs_out_of_scope(declared, _AbsorbsEverything) == frozenset(
+        {"invisible", "also_invisible"}
+    )
+
+
+def test_a_fully_named_signature_has_nothing_out_of_scope():
+    """Guards the check above from passing because the accessor returns everything."""
+
+    class _AllNamed:
+        def __init__(self, a: int = 1, b: int = 2):
+            self.a, self.b = a, b
+
+    assert declared_knobs_out_of_scope({"a": 1, "b": 2}, _AllNamed) == frozenset()
+
+
+def test_the_audit_message_no_longer_claims_unmeasured_knobs_are_read():
+    """The message must separate *measured* from *declared*, or it overclaims.
+
+    Measured on the kspace_filling cohort: 1365 of 1590 declared keys are
+    absorbed by ``**kwargs``, so "all N are read" spoke for 85.8 % of knobs the
+    detector cannot see.
+    """
+    import inspect as _inspect
+
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    src = _inspect.getsource(ConfigHealthChecker.check_declared_model_kwargs_are_read)
+    assert "declared model_kwargs are in" in src, "the scoped message was reverted"
+    assert "are NOT measured by this check" in src
+    assert "all {len(declared)} declared model_kwargs are read" not in src
+
+
+def test_the_scale_domain_check_fires_where_the_transform_guard_cannot():
+    """The transform's refusal is unreachable; this is the owner that can answer.
+
+    ``KSpaceNormalizationSpec`` refuses a ``processing`` block that omits
+    ``kspace_scale_domain``, but training hands it ``config.data`` and inference
+    hands it ``config.model_dump()`` — pydantic filled the default in both, so
+    the only input that trips it is a raw mapping nothing passes.
+    ``model_fields_set`` still records what the author typed, which is why the
+    question is answerable here and nowhere downstream.
+    """
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    arm = "experiments/inprogress/kspace_filling/experiment_11_kfn_none.yaml"
+    cfg = TrainingSettings.from_yaml(arm)
+    declared = ConfigHealthChecker().check_kspace_scale_domain_is_declared(cfg)
+    assert "declared as 'image'" in declared.message
+
+    processing = cfg.data.processing.model_copy()
+    processing.model_fields_set.discard("kspace_scale_domain")
+    data = cfg.data.model_copy(update={"processing": processing})
+    undeclared = ConfigHealthChecker().check_kspace_scale_domain_is_declared(
+        cfg.model_copy(update={"data": data})
+    )
+    assert "declares no kspace_scale_domain" in undeclared.message
+
+
+def test_a_divergent_metric_transform_is_reported_not_silently_compared():
+    """69 cohort arms measure train_<m> and val_<m> through different transforms.
+
+    The training path reads ``metrics.transform`` and the validation path reads
+    ``validation.scoring.output_transform``. On this cohort that is
+    ``ifft_sense_adjoint`` in normalised log-compressed units against
+    ``ifft_magnitude`` in denormalised physical ones, so the two series share a
+    name stem and measure different quantities — and their difference reads as
+    a generalisation gap when it is arithmetic.
+    """
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    arm = "experiments/inprogress/kspace_filling/experiment_11_kfn_none.yaml"
+    cfg = TrainingSettings.from_yaml(arm)
+    assert cfg.metrics.transform != cfg.validation.scoring.output_transform
+    result = ConfigHealthChecker().check_metric_transforms_agree(cfg)
+    assert "different measurements under one name" in result.message
+
+    scoring = cfg.validation.scoring.model_copy(
+        update={"output_transform": cfg.metrics.transform}
+    )
+    validation = cfg.validation.model_copy(update={"scoring": scoring})
+    agreed = ConfigHealthChecker().check_metric_transforms_agree(
+        cfg.model_copy(update={"validation": validation})
+    )
+    assert "share one transform" in agreed.message

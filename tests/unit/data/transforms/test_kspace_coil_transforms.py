@@ -28,6 +28,7 @@ These tests:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 import torchio as tio
 
@@ -289,3 +290,72 @@ def test_complex_multi_coil_input_still_combines() -> None:
     assert out_data.shape[0] == 2, (
         f"rss output must be 2-channel (R, I); got C={out_data.shape[0]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# rss_per_channel — Shen 2024's own coil combination (#2093)
+# ---------------------------------------------------------------------------
+
+
+def test_rss_per_channel_matches_the_authors_own_call() -> None:
+    """The mode reproduces ``fastmri.rss`` on the upstream's ``[Nc,H,W,2]`` layout.
+
+    This is the oracle for a lifted behaviour: there is no upstream call left to
+    spy on, so equivalence to the original at a fixed seed is the evidence.
+    """
+    fastmri = pytest.importorskip("fastmri")
+
+    torch.manual_seed(0)
+    kspace = torch.randn(4, 16, 16, 1, dtype=torch.complex64)
+
+    combined = CoilCombineTransform(method="rss_per_channel")._rss_per_channel_combine(kspace)
+    ours = ifft2c(combined.permute(0, 3, 1, 2))[0, 0]
+
+    # Shen's path: ifft2c per coil, then fastmri.rss over the coil axis of
+    # a real/imag-last tensor (utils/data_transform.py:51 and :62).
+    per_coil = ifft2c(kspace.permute(0, 3, 1, 2))
+    theirs = fastmri.rss(torch.stack([per_coil.real, per_coil.imag], dim=-1)[:, 0])
+
+    assert torch.allclose(theirs[..., 0], ours.real, atol=1e-5)
+    assert torch.allclose(theirs[..., 1], ours.imag, atol=1e-5)
+
+
+def test_rss_per_channel_leaves_both_channels_non_negative() -> None:
+    """``sqrt(sum(x**2))`` per channel cannot return a negative part.
+
+    Pins the property that separates this mode from a complex-magnitude RSS.
+    Swapping the implementation to ``fastmri.rss_complex`` turns this red, which
+    is the point: the published numbers came from the per-channel reduction.
+    """
+    torch.manual_seed(1)
+    kspace = torch.randn(4, 16, 16, 1, dtype=torch.complex64)
+
+    combined = CoilCombineTransform(method="rss_per_channel")._rss_per_channel_combine(kspace)
+    image = ifft2c(combined.permute(0, 3, 1, 2))
+
+    assert image.real.min() >= 0.0
+    assert image.imag.min() >= 0.0
+
+
+def test_rss_per_channel_is_not_the_magnitude_rss() -> None:
+    """Non-vacuity: the new mode is a different reduction, not a second spelling."""
+    torch.manual_seed(2)
+    kspace = torch.randn(4, 16, 16, 1, dtype=torch.complex64)
+
+    transform = CoilCombineTransform(method="rss_per_channel")
+    per_channel = transform._rss_per_channel_combine(kspace)
+    magnitude = transform._rss_combine(kspace)
+
+    assert per_channel.shape == magnitude.shape
+    assert not torch.allclose(per_channel, magnitude, atol=1e-4)
+
+
+def test_rss_per_channel_apply_transform_emits_two_real_channels() -> None:
+    """The subject path returns ``(2, H, W, D)`` real, the layout the arms need."""
+    kspace = _make_asymmetric_coil_kspace(n_coils=4, H=16, W=16, D=2)
+    subject = tio.Subject(kspace=tio.ScalarImage(tensor=kspace))
+
+    out = CoilCombineTransform(method="rss_per_channel")(subject)["kspace"].data
+
+    assert out.shape == (2, 16, 16, 2)
+    assert not torch.is_complex(out)

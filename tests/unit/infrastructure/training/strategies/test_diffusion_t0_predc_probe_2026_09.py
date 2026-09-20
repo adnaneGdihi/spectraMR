@@ -36,7 +36,7 @@ class _Generator:
         return x, torch.full_like(x, 7.0)
 
 
-def _make_self(generator, *, metrics=None):
+def _make_self(generator, *, metrics=None, chunk_size=2):
     """A stub `self` carrying only what `_t0_pre_dc_probe_metrics` reaches for."""
     recorded = {"score_calls": []}
 
@@ -53,15 +53,21 @@ def _make_self(generator, *, metrics=None):
         _is_cold_diffusion=lambda: True,
         _build_generator_kwargs=_build_generator_kwargs,
         _compute_validation_metrics=_compute_validation_metrics,
+        # The probe chunks its forward on the same knob as the cascade rungs,
+        # so the stub has to carry it; `validation: None` is a legal arm and
+        # reaches this method too, which the sibling test below pins.
+        config=SimpleNamespace(
+            validation=SimpleNamespace(loader=SimpleNamespace(chunk_size=chunk_size))
+        ),
     )
     return obj, recorded
 
 
-def _run(obj):
+def _run(obj, *, batch=1):
     return DiffusionTrainingStrategy._t0_pre_dc_probe_metrics(
         obj,
-        target_batch=torch.zeros(1, 2, 4, 4),
-        input_batch=torch.zeros(1, 2, 4, 4),
+        target_batch=torch.zeros(batch, 2, 4, 4),
+        input_batch=torch.zeros(batch, 2, 4, 4),
         batch_data={},
         scale_factor=torch.ones(1),
         batch_idx=0,
@@ -135,6 +141,32 @@ def test_generator_without_the_capability_emits_nothing_and_never_scores():
     obj, rec = _make_self(Plain())
     assert _run(obj) == {}
     assert rec["score_calls"] == []
+
+
+def test_probe_chunks_its_forward_on_validation_loader_chunk_size():
+    """The knob the cascade rungs honour reaches the probe too.
+
+    An unchunked pass here is the densest forward of the sweep -- the depth
+    flatten at an all-ones mask, run after the cascade has filled the card --
+    and it was the one validation forward that ignored the knob.
+    """
+    gen = _Generator()
+    obj, _ = _make_self(gen, chunk_size=2)
+    _run(obj, batch=6)
+    assert [int(c["timesteps"].shape[0]) for c in gen.calls] == [2, 2, 2]
+
+
+def test_an_arm_with_no_validation_block_chunks_at_one_row():
+    """`config.validation` is Optional and defaults to None (a legal arm).
+
+    Dereferencing it here would turn a memory guard into an AttributeError on
+    the arms least likely to have tuned anything.
+    """
+    gen = _Generator()
+    obj, _ = _make_self(gen)
+    obj.config = SimpleNamespace(validation=None)
+    assert _run(obj, batch=3) == {"val_t0_predc_psnr": 21.0}
+    assert [int(c["timesteps"].shape[0]) for c in gen.calls] == [1, 1, 1]
 
 
 # --- Detector cores (pure, so they can be planted) ---------------------------

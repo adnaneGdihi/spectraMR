@@ -22,6 +22,10 @@ from spectramr.core.compute_device import (
     AcceleratorRequiredError,
     resolve_torch_device,
 )
+from spectramr.cli.val_batches import (
+    add_val_batches_argument,
+    resolve_val_batches_overrides,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,11 @@ def _dispatch_training(args: argparse.Namespace, *, is_sanity_check: bool) -> in
     args.seed = getattr(args, "seed", None)
     args.override = getattr(args, "override", None)
     args.resume = getattr(args, "resume", None)
+    # `--val-batches` is sugar for an override, resolved here rather than in each
+    # subparser so `train` and `sanity_check` cannot drift apart on it.
+    args.override = resolve_val_batches_overrides(
+        args.override, getattr(args, "val_batches", None)
+    )
 
     from spectramr.main import sanity_check_command, train_command
 
@@ -723,6 +732,7 @@ def _audit_report(config_path: str, config: Any) -> Any:
     validation-metric and strategy-dispatch witnesses): 647 arms reported clean on
     checks the single-arm audit fails them on (2026-09-03). One builder, two callers.
     """
+    from spectramr.infrastructure.validation.audit_waivers import apply_audit_waivers
     from spectramr.infrastructure.validation.config_health_checker import (
         HealthCheckReport,
     )
@@ -737,6 +747,10 @@ def _audit_report(config_path: str, config: Any) -> Any:
 
     subject = WitnessSubject.for_audit(config_path=config_path, settings=config)
     verdicts = run_witnesses(subject, tiers=frozenset({Tier.T0, Tier.T1}))
+    # An arm may acknowledge a warning its own physics makes unfixable, by name and
+    # in writing, rather than the whole run reaching for --allow-warnings. Applied
+    # here so both audit surfaces and the exit code see the same report.
+    verdicts = apply_audit_waivers(verdicts, subject.raw_config)
     return HealthCheckReport(results=[verdict_to_health_result(v) for v in verdicts])
 
 
@@ -2250,7 +2264,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint. Path to file or 'auto' for latest.",
+        help=(
+            "Resume from checkpoint: a path, 'auto' (latest; raises if none), "
+            "or 'if-present' (latest, else start fresh — the wall-clock chain spelling)."
+        ),
     )
     train_parser.add_argument(
         "--allow-status",
@@ -2263,6 +2280,7 @@ def build_parser() -> argparse.ArgumentParser:
             "it is stamped into provenance. Without it such an arm refuses to launch."
         ),
     )
+    add_val_batches_argument(train_parser)
     train_parser.set_defaults(func=train)
 
     # Sanity check command
@@ -2300,8 +2318,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint. Path to file or 'auto' for latest.",
+        help=(
+            "Resume from checkpoint: a path, 'auto' (latest; raises if none), "
+            "or 'if-present' (latest, else start fresh — the wall-clock chain spelling)."
+        ),
     )
+    add_val_batches_argument(sanity_parser)
     sanity_parser.set_defaults(func=sanity_check)
 
     # Ablation command — baseline + one variant per --vary override, with an
@@ -2458,7 +2480,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint (path or 'auto')",
+        help="Resume from checkpoint (path, 'auto', or 'if-present')",
     )
     dist_parser.add_argument(
         "--backend",

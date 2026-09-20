@@ -47,11 +47,12 @@ class TestFacadeIdentity:
         """The third concern was not moved; it must not have become a re-export."""
         assert cv.build_cascade_row.__module__ == cv.__name__
         assert cv.aggregate_cascade_rows.__module__ == cv.__name__
+        assert cv.flatten_band_records.__module__ == cv.__name__
 
     def test_all_covers_every_public_name_the_split_touched(self) -> None:
         assert set(cv.__all__) == set(cascade_levels.__all__) | set(
             cascade_round_trip.__all__
-        ) | {"build_cascade_row", "aggregate_cascade_rows"}
+        ) | {"build_cascade_row", "aggregate_cascade_rows", "flatten_band_records"}
 
 
 class TestSiblingsAreIndependent:

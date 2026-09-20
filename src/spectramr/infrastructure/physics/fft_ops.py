@@ -16,6 +16,8 @@ from collections.abc import Callable
 
 import torch
 
+from spectramr.core.compile_fences import dynamo_disable
+
 from .interfaces import IPhysicsOperator
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,7 @@ def _to_ri(x: torch.Tensor) -> torch.Tensor:
     return torch.view_as_real(x)
 
 
+@dynamo_disable
 def fft2c(x: torch.Tensor) -> torch.Tensor:
     """Centered 2D FFT with orthonormal normalization.
 
@@ -127,6 +130,7 @@ def fft2c(x: torch.Tensor) -> torch.Tensor:
         return k
 
 
+@dynamo_disable
 def ifft2c(k: torch.Tensor) -> torch.Tensor:
     """Centered 2D inverse FFT with orthonormal normalization.
 

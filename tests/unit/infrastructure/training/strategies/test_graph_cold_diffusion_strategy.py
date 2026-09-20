@@ -23,6 +23,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy import (
     GraphColdDiffusionStrategy as S,
@@ -134,3 +135,135 @@ class TestTheScheduleThatJustifiesTheRefusal:
         tested is 'saturates', not 'saturates at exactly 200'."""
         f = self._fractions(pattern, timesteps=(400, 600, 999))
         assert max(f) - min(f) < 0.01, f
+
+
+class TestTheUndersamplingBlockReachesTheAccelerator:
+    """#2060. The pattern was wired by #1092; everything else still was not.
+
+    ``__init__`` built the generator with only a timestep count and a device, so
+    ``accelerator_kwargs`` defaulted to ``{}`` and the accelerator used its own
+    defaults for the whole ladder. The three arms on this strategy are the
+    literature baselines for the experiment_11 shootout, and all three were
+    degraded on a sweep to R=64 from the global RNG while declaring R=8 or R=32
+    with ``mask_seed: 42``.
+    """
+
+    @staticmethod
+    def _generator(undersampling, *, timesteps: int = 1000):
+        """Bind the builder to a stand-in, as the resolver tests above do.
+
+        A real instance needs a ``TrainingEnvironment``; the builder reads two
+        config paths and a device, so a namespace keeps the test on the wiring.
+        """
+        fake_self = SimpleNamespace(
+            config=SimpleNamespace(
+                undersampling=undersampling,
+                training=SimpleNamespace(diffusion=SimpleNamespace(timesteps=timesteps)),
+            ),
+            device=torch.device("cpu"),
+        )
+        return S._build_mask_generator(fake_self)
+
+    @staticmethod
+    def _cdiffmr_block():
+        """``baseline_cdiffmr.yaml``'s block, including the ACS floor #2060 added."""
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        return AccelerationConfigSchema(
+            acceleration_type="equispaced",
+            base_acceleration=2.0,
+            max_acceleration=32.0,
+            center_fraction=0.04,
+            min_center_fraction=0.02,
+            acceleration_range=[32.0],
+            mask_direction="phase",
+            schedule_type="power_law",
+            schedule_steps=1000,
+            enable_dynamic_mask=True,
+            mask_seed=42,
+        )
+
+    def test_the_declared_ladder_is_the_one_built(self):
+        """Unwired this reaches R=64 at the top of a declared 32x sweep."""
+        accelerator = self._generator(self._cdiffmr_block())._get_accelerator("random_cartesian")
+        assert float(accelerator.get_acceleration_factor(999)) == pytest.approx(32.0)
+        assert float(accelerator.get_acceleration_factor(0)) == pytest.approx(2.0)
+
+    def test_the_declared_seed_reaches_the_accelerator(self):
+        """``seed=None`` is the global RNG, so the cascade stops being nested.
+
+        Cold diffusion's forward process assumes ``M_{t+1}`` is a subset of
+        ``M_t``; without a fixed seed each call draws a fresh permutation
+        instead of truncating one ranking (#1059).
+        """
+        accelerator = self._generator(self._cdiffmr_block())._get_accelerator("random_cartesian")
+        assert accelerator.accelerator.seed == 42
+
+    def test_an_unreachable_acs_floor_is_refused_rather_than_approximated(self):
+        """What the arm declared before #2060 added the floor.
+
+        A 4% ACS cannot fit the 3.1% budget at R=32, so the declared sweep is
+        unrealisable. Failing at build beats reporting R=32 while realising ~25.
+        """
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        block = AccelerationConfigSchema(
+            acceleration_type="equispaced",
+            base_acceleration=2.0,
+            max_acceleration=32.0,
+            center_fraction=0.04,
+            mask_seed=42,
+        )
+        with pytest.raises(ValueError, match="sampling budget"):
+            self._generator(block)._get_accelerator("random_cartesian")
+
+    def test_an_absent_block_leaves_the_accelerator_on_its_own_defaults(self):
+        """No declaration must not synthesise one (non-negotiable 3)."""
+        assert self._generator(None)._accelerator_kwargs == {}
+
+
+class TestTheNameDoesNotPromiseAGraph:
+    """The class is named for a method it does not implement.
+
+    The warning block has said "CARTESIAN-only, despite its name" since #1092, but the
+    feature list 100 lines below it went on asserting "Graph architecture handles
+    arbitrary k-space trajectories" through two fix passes. These pin the claims to the
+    code so the contradiction cannot silently return (#2082).
+    """
+
+    @staticmethod
+    def _docstring() -> str:
+        from spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy import (
+            GraphColdDiffusionStrategy,
+        )
+
+        return GraphColdDiffusionStrategy.__doc__ or ""
+
+    def test_no_graph_capability_is_claimed_outside_the_aspirational_section(self) -> None:
+        doc = self._docstring()
+        head, marker, tail = doc.partition("ASPIRATIONAL, NOT IMPLEMENTED")
+        assert marker, "the aspirational marker is what separates spec from description"
+        # Everything before the marker describes CURRENT behaviour, and the feature list
+        # after it must not re-assert the capability the marker just disclaimed.
+        live = head + tail.split("## Training Process", 1)[-1]
+        for claim in ("Graph architecture handles", "GNN forward passes", "GNN: Aggregates"):
+            assert claim not in live, f"docstring re-asserts an unimplemented capability: {claim!r}"
+
+    def test_the_cartesian_only_warning_is_still_present(self) -> None:
+        assert "CARTESIAN-only, despite its name" in self._docstring()
+
+    def test_no_dead_nufft_projection_helper(self) -> None:
+        from spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy import (
+            GraphColdDiffusionStrategy,
+        )
+
+        # `self.nufft_op` is never assigned, so a caller would AttributeError into a bare
+        # `except Exception` that returned the IMAGE where k-space was expected.
+        assert not hasattr(GraphColdDiffusionStrategy, "_project_to_kspace")
+
+    def test_documented_attributes_are_ones_the_strategy_actually_sets(self) -> None:
+        doc = self._docstring()
+        attrs = doc.split("Attributes:", 1)[1].split("References:", 1)[0]
+        for gone in ("k_space_mask_gen", "trajectory:"):
+            assert gone not in attrs, f"Attributes names something the instance lacks: {gone!r}"
+        assert "mask_generator" in attrs

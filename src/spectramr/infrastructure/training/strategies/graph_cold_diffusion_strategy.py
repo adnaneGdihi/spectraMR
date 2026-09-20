@@ -1,6 +1,7 @@
 """Graph Cold Diffusion Training Strategy.
 
-Cold Diffusion for Non-Cartesian MRI using Graph Neural Networks.
+Cartesian k-space cold diffusion. The name is historical: no graph operation runs
+here and no arm on this strategy uses a graph model -- see the class warning (#2082).
 
 Physics-Based Degradation (instead of Gaussian Noise):
 - Forward Process (t=0 → t=T): Progressively undersample k-space (remove spokes/arms)
@@ -134,10 +135,8 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
 
     1. **Sample Degradation Level**: Randomly choose t ∈ [0, T]
     2. **Apply Degradation**: x_t = D_t(x_0) via undersampling + B0
-    3. **Forward Pass**: Model predicts x_0 from x_t
-       - Encoder: Processes undersampled k-space
-       - GNN: Aggregates information across trajectory
-       - Decoder: Outputs full k-space estimate
+    3. **Forward Pass**: Model predicts x_0 from x_t. The model is whatever the arm
+       declares; every arm on this strategy today declares a convolutional UNet.
     4. **Loss**: L(x_0_pred, x_0_true) + optional physics constraints
     5. **Backward**: Update model weights
 
@@ -180,9 +179,10 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
 
     ✅ **Physics-Based**: Degradation matches acquisition physics (not arbitrary noise)
     ✅ **Invertible**: Degradation steps are reversible (unlike Gaussian noise)
-    ✅ **Non-Cartesian**: Graph architecture handles arbitrary k-space trajectories
     ✅ **Interpretable**: Degradation type has direct clinical meaning (undersampling)
     ✅ **Stable**: Deterministic degradation enables stable score-based matching
+    ❌ **Cartesian only**: the non-Cartesian claim this list used to carry contradicted
+       the warning above it and survived two fix passes (#2082).
 
     ## Inference
 
@@ -199,15 +199,13 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
     - ✅ Interpretable (know exact degradation at each step)
     - ✅ Better for undersampled data (matches MRI reality)
     - ❌ More complex (must implement specific degradations)
-    - ❌ Slower inference (many GNN forward passes)
+    - ❌ Slower inference (one model forward per reverse step)
 
     Attributes:
-        state: TrainingState with graph neural network
-        loss_computer: Loss computation for k-space reconstruction
         fft_transformer: FFT operations with centering/normalization
-        k_space_mask_gen: Generator for k-space undersampling masks
-        device: Computation device (CUDA/CPU)
-        trajectory: Type of non-Cartesian trajectory ('radial', 'spiral')
+        mask_generator: Generator for k-space undersampling masks
+        timesteps: Number of degradation levels
+        loss_computer: Loss computation, built lazily on first step
 
     References:
         - Bansal et al. (2022): Cold Diffusion: Inverting Arbitrary Image Transforms
@@ -231,12 +229,49 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         super().__init__(env=env, **kwargs)
 
         self.fft_transformer = FFTTransformer(device=self.device)
-        self.mask_generator = KSpaceMaskGenerator(
-            num_timesteps=self.config.training.diffusion.timesteps,
-            device=self.device,
-        )
+        self.mask_generator = self._build_mask_generator()
 
         self._setup_cold_diffusion_components()
+
+    def _build_mask_generator(self) -> KSpaceMaskGenerator:
+        """Mask generator carrying the arm's declared ``undersampling:`` block.
+
+        The block reached nothing here: the generator was built with only a
+        timestep count and a device, so the accelerator fell back to its own
+        defaults (#2060). On ``baseline_cdiffmr`` that meant a ladder running to
+        R=64 against a declared 32, and ``seed=None`` -- the global RNG, so the
+        cascade re-drew per call instead of truncating one ranking and stopped
+        being nested, which the cold-diffusion forward process assumes (#1059).
+        All three arms on this strategy are the literature baselines for the
+        experiment_11 shootout, so the regime they were de-confounded to match
+        was not the one they trained on.
+
+        ``accelerator_kwargs_from_config`` is the allowlist
+        ``KSpaceUndersamplingProcess`` and ``KspaceMixin`` already resolve
+        through, so the three paths build one accelerator from one YAML.
+
+        The PATTERN is deliberately not taken from there. It is owned by
+        ``physics.compressed_sensing.sampling_pattern`` and resolved once by
+        ``_resolve_degradation_pattern`` (#1092); every mask call passes it
+        explicitly, so ``default_pattern`` here would be a second owner.
+        """
+        # Function-local: infrastructure -> models is a legal edge, but
+        # ``spectramr.infrastructure.training.__init__`` eagerly imports
+        # ``.strategies``, so importing at module scope closes a cycle back
+        # through this package.
+        from spectramr.models.diffusion.kspace_process import (
+            accelerator_kwargs_from_config,
+        )
+
+        accel_config = self.config.undersampling
+        accelerator_kwargs = (
+            accelerator_kwargs_from_config(accel_config)[1] if accel_config else {}
+        )
+        return KSpaceMaskGenerator(
+            num_timesteps=self.config.training.diffusion.timesteps,
+            device=self.device,
+            accelerator_kwargs=accelerator_kwargs,
+        )
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize strategy-specific components."""
@@ -541,35 +576,6 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
 
         target_signal = x_0  # loss is against the clean image
         return x_t, None, target_signal
-
-    def _project_to_kspace(
-        self,
-        image: torch.Tensor,
-        trajectory: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project image to non-Cartesian k-space."""
-        # Convert [B, 2, H, W] to complex if needed
-        if image.shape[1] == 2:
-            image_complex = torch.complex(image[:, 0], image[:, 1])
-        elif image.is_complex():
-            image_complex = image.squeeze(1) if image.shape[1] == 1 else image
-        else:
-            # Single channel real - treat as complex with zero imag
-            image_complex = torch.complex(image[:, 0], torch.zeros_like(image[:, 0]))
-
-        # NUFFT forward
-        try:
-            kspace = self.nufft_op.forward(
-                image_complex.unsqueeze(1),  # [B, 1, H, W]
-                trajectory=trajectory.to(image.device),
-            )
-            # Return as [B, 2, N] (real/imag stacked)
-            if kspace.is_complex():
-                return torch.stack([kspace.real, kspace.imag], dim=1).squeeze(2)
-            return kspace
-        except Exception as e:
-            logger.debug("[Cold Diffusion] NUFFT forward failed: %s", str(e))
-            return image
 
     def _build_forward_kwargs(
         self,
