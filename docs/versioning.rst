@@ -52,8 +52,8 @@ build. The fourth is defined by what it *documents*.
        requests target -- and the only ref from which
        ``.github/workflows/dev-publish.yml`` will publish
        ``X.Y.B.dev<run number>`` to PyPI as a pre-release. A change on ``dev`` is
-       installable as soon as a maintainer dispatches that lane, rather than at
-       the next release.
+       installable as soon as a maintainer pushes a ``dev-build-*`` tag on its
+       head, rather than at the next release.
    * - ``nightly``
      - ``X.Y.B.devN``
      - **The latest unstable version** -- the newest build, named by a ref so it
@@ -143,21 +143,24 @@ What publishes a dev build
 ``X.Y.B.dev<github.run_number>`` into every file that states the version, builds
 and verifies the distribution with ``build_dist.py``, and uploads it to PyPI.
 
-**It is dispatched, not automatic**, and that is a constraint rather than a
+**A** ``dev-build-*`` **tag starts it**, and that is a constraint rather than a
 preference. ``test_workflow_triggers.py::test_push_triggers_are_tag_only`` admits
 a ``push:`` trigger only when it is scoped to tags -- a branch push is autonomous
-CI, and no allowlist entry can license one. The other autonomous option, a
-``schedule:`` cron, registers from the **default branch**: on the public
+CI, and no allowlist entry can license one. ``schedule:`` and
+``workflow_dispatch`` both register from the **default branch**: on the public
 repository that is ``main``, which carries the release rather than this lane, so
-a cron would fire zero times until a release export put the file there. That is
-the shape ``manual-full-suite.yml``'s cron had for its entire life. Dispatch both
-passes the gate and actually runs, and it places a publish behind a person --
-the same posture as the release lane, where a human pushes the tag.
+a cron fires zero times and a dispatch returns 404 until a release export puts
+the file there. A tag push instead runs the workflow file *at the tagged
+commit*, so it works from the moment ``dev`` carries the file, and a person
+pushes it -- the same posture as the release lane. ``workflow_dispatch`` is kept
+and starts working once a release carries the file to ``main``.
 
-The **ref** decides whether anything is uploaded, not the event: the ``pypi`` job
-carries ``if: github.ref == 'refs/heads/dev'``. A dispatch from any other branch
-builds and verifies exactly what ``dev`` would publish and uploads nothing, which
-is how a change to this file is rehearsed.
+The **commit** decides whether anything is uploaded, not the event or the ref: the
+``build`` job compares the commit it built with public ``dev``'s head
+(``git ls-remote origin refs/heads/dev``) and the ``pypi`` job runs only when the
+two match. A tag on any other commit builds and verifies the distribution and
+uploads nothing, which is how a change to this file is rehearsed; if ``dev``
+moved after the tag was pushed, tag the new head.
 
 .. warning::
 
@@ -170,9 +173,10 @@ is how a change to this file is rehearsed.
 
    Until the move is automated -- one job on this lane, after ``pypi``, pushing
    the published commit onto ``nightly`` -- advance it by hand, immediately after
-   dispatching the lane against ``dev``::
+   tagging ``dev``'s head::
 
       git push origin dev
+      t=dev-build-$(date -u +%Y%m%d-%H%M); git tag "$t" dev && git push origin "$t"
       git push --force origin dev:nightly   # nightly NAMES a build; it is moved, not merged
 
 Three properties of that lane are load-bearing rather than incidental:
@@ -195,7 +199,7 @@ allowlist is not already shipping -- so a public-repo-only workflow file is not
 available as an option. Every job therefore carries
 ``if: github.repository == 'adnaneGdihi/spectraMR'``. The private research
 repository this tree is exported from also carries a ``dev`` branch, and it is
-that repository's main working branch -- without the guard, a dispatch there
+that repository's main working branch -- without the guard, a run there
 would attempt a PyPI upload.
 
 Trusted Publishing is pinned to a **workflow filename**, so ``release.yml``'s

@@ -9,20 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`dev` ships builds.** `.github/workflows/dev-publish.yml` publishes
-  `X.Y.B.dev<run number>` to PyPI when it is dispatched against the public
-  repository's `dev`, so a change is installable with `pip install --pre
-  spectramr` without waiting for the next release. It is dispatch-only because a
+  `X.Y.B.dev<run number>` to PyPI when a `dev-build-*` tag is pushed on the public
+  repository's `dev` head, so a change is installable with `pip install --pre
+  spectramr` without waiting for the next release. It is tag-triggered because a
   branch push is autonomous CI (`test_push_triggers_are_tag_only` admits a `push:`
-  only when tag-scoped) and a `schedule:` cron registers from the default branch,
-  where this file will not be until a release export puts it there. The `pypi` job
-  is gated on the **ref**, so a dispatch from any other branch rehearses the build
-  and uploads nothing. The counter is `github.run_number` because it
-  is the only monotonic one available and PyPI never re-issues a filename; the
-  lane refuses to run from a tree carrying a release version, since a
-  `0.1.3.dev<n>` wheel would sort before an 0.1.3 that has already shipped. The
-  file ships to both repositories -- the export allowlist selects `.github/`
-  wholesale and the overlay is replace-only -- so every job carries
-  `if: github.repository == 'adnaneGdihi/spectraMR'`.
+  only when tag-scoped), while `schedule:` and `workflow_dispatch` register from
+  the default branch, where this file will not be until a release export puts it
+  there -- a dispatch returned 404. The `pypi` job is gated on the
+  **commit**: it uploads only when the build is of public `dev`'s current head, so
+  a tag anywhere else rehearses the build and uploads nothing. The counter is
+  `github.run_number` because it is the only monotonic one available and PyPI
+  never re-issues a filename; the lane refuses to run from a tree carrying a
+  release version, since a `0.1.3.dev<n>` wheel would sort before an 0.1.3 that
+  has already shipped. The file ships to both repositories -- the export
+  allowlist selects `.github/` wholesale and the overlay is replace-only -- so
+  every job carries `if: github.repository == 'adnaneGdihi/spectraMR'`.
 - **The branch model is written down.** `docs/versioning.rst` states what `main`,
   `dev` and `nightly` each are and what moves them, and records that nothing
   currently moves `nightly`: on 2026-09-06 it sat 10 commits behind `main`,

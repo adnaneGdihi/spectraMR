@@ -1,32 +1,29 @@
 name: Dev publish
 
-# `dev` ships builds. Dispatching this lane against `dev` publishes a pre-release
-# to PyPI, which `pip install --pre spectramr` installs and a plain
+# `dev` ships builds. A `dev-build-*` tag on public `dev`'s head publishes a
+# pre-release to PyPI, which `pip install --pre spectramr` installs and a plain
 # `pip install spectramr` never prefers, because PEP 440 sorts a `.devN` build
 # BEFORE the release whose number it carries. The newest one is what `nightly`
 # names.
 #
-# DISPATCH-ONLY, and neither half of that is a shortcut.
-#
-# `push: branches: [dev]` is what this lane wanted and cannot have:
-# `test_workflow_triggers.py::test_push_triggers_are_tag_only` allows a `push:`
-# trigger only when it is scoped to tags, with no allowlist entry able to license
-# a branch push -- "a branch push is autonomous CI". A `schedule:` cron is the
-# other autonomous option and is worse here: crons register from the DEFAULT
-# branch, so one would fire zero times until a release export carries this file
-# onto public `main` (the shape `nightly.yml` had for its entire life). Dispatch
-# is therefore the only trigger that both passes the gate and actually runs, and
-# it puts a publish behind a person -- the same posture as the release lane,
-# where a human pushes the tag.
+# TRIGGERED BY A `dev-build-*` TAG, because nothing else both runs and passes the
+# gate. `test_push_triggers_are_tag_only` admits a `push:` only when tag-scoped (a
+# branch push is autonomous CI), and `workflow_dispatch` and `schedule:` register
+# from the DEFAULT branch -- public `main`, which carries the release and not this
+# file, so a dispatch there returned 404. A tag push runs the workflow file
+# at the tagged commit, and a person pushes it -- the release lane's posture.
+# `workflow_dispatch` stays: once a release carries this file to `main` it works too.
 #
 # This file ships to BOTH repositories, because the export allowlist selects
 # `.github/` wholesale and the overlay is replace-only: it cannot add a path the
 # allowlist is not already shipping, so a public-repo-only workflow file does not
 # exist as an option. The private research repository this tree is exported from
 # also carries a `dev`, and it is that repository's main working branch -- so
-# without the repository guard on every job below, a dispatch there would attempt
+# without the repository guard on every job below, a run there would attempt
 # a PyPI publish. The guard is the mechanism; do not remove it.
 on:
+  push:
+    tags: ['dev-build-*']
   workflow_dispatch:
 
 # Not at workflow level -- see release.yml. `id-token: write` IS the upload
@@ -42,8 +39,27 @@ jobs:
     # foreground `./run.sh` and a job targeted there queues until it is started.
     # ubuntu-latest also keeps the amd64-only pypi-publish image reachable.
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Upload only a build of the commit public dev names right now
+        # The COMMIT, not the ref, licenses an upload: a tag push carries a tag ref,
+        # and a tag can name any commit. A build of anything else would publish
+        # `X.Y.B.dev<n>` from a tree that is not `dev` and burn that filename for
+        # good (PyPI never re-issues one), so it builds, verifies and stops -- which
+        # is also how a change to this file is rehearsed.
+        id: gate
+        run: |
+          set -euo pipefail
+          dev_head=$(git ls-remote origin refs/heads/dev | cut -f1)
+          if [ -n "$dev_head" ] && [ "$GITHUB_SHA" = "$dev_head" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_SHA is not public dev's head (${dev_head:-unresolved}); building without upload"
+          fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
@@ -94,14 +110,7 @@ jobs:
 
   pypi:
     needs: build
-    # `dev` ships builds -- so the REF, not the event, is what licenses an upload.
-    # `workflow_dispatch` runs from any branch, and without this a dispatch from a
-    # feature branch would upload `X.Y.B.dev<n>` built from a tree that is not
-    # `dev` and burn that filename permanently (PyPI never re-issues one). A
-    # dispatch from any other ref therefore builds and verifies exactly what `dev`
-    # would publish, and uploads nothing -- which is also how you rehearse a
-    # change to this file.
-    if: github.ref == 'refs/heads/dev' && github.repository == 'adnaneGdihi/spectraMR'
+    if: needs.build.outputs.publish == 'true' && github.repository == 'adnaneGdihi/spectraMR'
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # OIDC Trusted Publishing -- scoped to this job alone

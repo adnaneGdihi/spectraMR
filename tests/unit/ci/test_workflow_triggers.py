@@ -66,6 +66,12 @@ _ALLOWED_NON_PR_EVENTS: dict[str, dict[str, str]] = {
         # queued a second full-length run behind the tag's. `_stale_entries` is what
         # made the pair inseparable, which is the point of it.
     },
+    "dev-publish.yml": {
+        # Not dispatch: dispatch registers from the default branch, which does not
+        # carry this file. A tag push runs the file at the tagged commit.
+        "push": "tag-only: fires on `git push origin dev-build-<stamp>`; uploads only a "
+        "build of public dev's head",
+    },
     "claude.yml": {
         "issues": "the @claude bot; the job body requires an @claude mention",
         "issue_comment": "the @claude bot; the job body requires an @claude mention",
