@@ -113,12 +113,61 @@ def _reader_missing(package: str, suffix: str) -> str:
         f"Install it first:  pip install {package}"
     )
 
+def repetition_group_key(file_id: str) -> str:
+    """The NEX group a file belongs to, by M4Raw's own naming convention.
+
+    Delegates to the package so this and ``M4RawRepetitionDataset`` cannot
+    drift: it used to "mirror" the dataset's ``stem[:-2]``, which is the
+    two-owners shape that only stays correct while nobody edits either.
+    """
+    from spectramr.data.datasets.m4raw_identity import repetition_group_key as _key
+
+    return _key(file_id)
+
+
+def filter_short_repetition_groups(
+    records: list[dict], min_reps: int
+) -> tuple[list[dict], dict[str, int]]:
+    """Drop every NEX group with fewer than *min_reps* repetitions.
+
+    A leave-one-out NEX target needs ``min_reps`` repetitions (1 input + the
+    rest averaged). Where a group is short, the dataset's only two escapes both
+    change the experiment: ``nex_fallback: all_reps`` swaps in a reference that
+    carries the input's own noise at 1/N, and ``pairing.contrasts`` can drop
+    only a whole contrast. Removing the deficient GROUP at manifest time keeps
+    the reference definition intact and keeps every arm of a cohort on one
+    subject set, which is what makes their metrics comparable.
+
+    Returns the surviving records and ``{group: count}`` for those removed.
+    """
+    counts: dict[str, int] = {}
+    for record in records:
+        counts[repetition_group_key(record["file_id"])] = (
+            counts.get(repetition_group_key(record["file_id"]), 0) + 1
+        )
+    dropped = {group: n for group, n in counts.items() if n < min_reps}
+    kept = [r for r in records if repetition_group_key(r["file_id"]) not in dropped]
+    return kept, dropped
+
+
+def min_reps_manifest_path(output_path: Path, min_reps: int) -> Path:
+    """Where a repetition-filtered manifest is written.
+
+    Never the unfiltered name. ``m4raw_train.json`` is shared by the
+    reconstruction, physics_driven, vae_latent and transformers cohorts among
+    others, so filtering in place would silently change the corpus every one of
+    them trains on.
+    """
+    return output_path.with_name(f"{output_path.stem}_nex{min_reps}{output_path.suffix}")
+
+
 def create_manifest(
     data_root: Path,
     databases_root: Path,
     pattern: str,
     output_path: Path,
     file_type: str,
+    min_reps: int | None = None,
 ) -> int:
     """Create a v3 JSON manifest with relative paths.
 
@@ -128,10 +177,14 @@ def create_manifest(
         pattern: Glob pattern to match files
         output_path: Path to save the JSON manifest
         file_type: Type of files ('h5', 'nifti', 'numpy', etc.)
+        min_reps: Keep only NEX groups with at least this many repetitions, and
+            write to the ``_nex<N>`` sibling name. ``None`` disables both.
 
     Returns:
         Number of files indexed
     """
+    if min_reps is not None:
+        output_path = min_reps_manifest_path(output_path, min_reps)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"  Scanning {data_root}...")
@@ -194,6 +247,17 @@ def create_manifest(
         print("  ⚠ No valid files found")
         return 0
 
+    if min_reps is not None:
+        records, dropped = filter_short_repetition_groups(records, min_reps)
+        if dropped:
+            detail = ", ".join(f"{g} ({n})" for g, n in sorted(dropped.items()))
+            print(f"  min-reps {min_reps}: dropped {len(dropped)} short group(s): {detail}")
+        if not records:
+            # Every group was short. Writing an empty manifest here would exit 0
+            # and the arm would fail later at queue-build with no trace of why.
+            print(f"  ⚠ No group survived --min-reps {min_reps}")
+            return 0
+
     manifest = {
         "manifest_version": "3.0",
         "dataset_name": output_path.stem,
@@ -242,7 +306,22 @@ def main():
         action="store_true",
         help="Just check what would be regenerated, don't write",
     )
+    parser.add_argument(
+        "--min-reps",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Keep only NEX groups with at least N repetitions, and write to the "
+            "'_nexN' sibling manifest (m4raw_train.json -> m4raw_train_nex3.json). "
+            "The unfiltered manifest is never overwritten -- it is shared across "
+            "cohorts. Use for leave-one-out NEX arms, which need N=3."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.min_reps is not None and args.min_reps < 2:
+        raise SystemExit(f"--min-reps must be at least 2, got {args.min_reps}")
 
     data_base = Path(args.data_base)
 
@@ -289,9 +368,22 @@ def main():
 
         if args.dry_run:
             files = list(data_root.glob(cfg["pattern"]))
-            print(f"  Would index {len(files)} files → {cfg['manifest']}")
-            total_indexed += len(files)
-            if name in requested and not files:
+            destination = Path(cfg["manifest"])
+            if args.min_reps is not None:
+                # Report the FILTERED count and the '_nexN' destination. Printing
+                # the unfiltered pair here would make the dry run agree with a
+                # real run it does not describe.
+                stems = [{"file_id": p.stem.replace(".nii", "")} for p in files]
+                kept, dropped = filter_short_repetition_groups(stems, args.min_reps)
+                if dropped:
+                    print(f"  min-reps {args.min_reps}: would drop {len(dropped)} short group(s)")
+                destination = min_reps_manifest_path(destination, args.min_reps)
+                count = len(kept)
+            else:
+                count = len(files)
+            print(f"  Would index {count} files → {destination}")
+            total_indexed += count
+            if name in requested and not count:
                 unproduced.append((name, f"no files matched {cfg['pattern']}"))
         else:
             count = create_manifest(
@@ -300,6 +392,7 @@ def main():
                 cfg["pattern"],
                 Path(cfg["manifest"]),
                 cfg["file_type"],
+                min_reps=args.min_reps,
             )
             total_indexed += count
             if name in requested and count == 0:

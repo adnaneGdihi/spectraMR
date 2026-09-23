@@ -6,9 +6,11 @@ import torch
 from spectramr.infrastructure.physics.fft_ops import (
     _to_complex,
     _to_ri,
+    coil_combine,
     fft2c,
     fft2c_masked,
     ifft2c,
+    sense_adjoint,
 )
 
 
@@ -283,7 +285,15 @@ class TestFFTNumericalAccuracy:
     """Test numerical accuracy of FFT operations."""
 
     def test_fft_linearity(self):
-        """Test FFT linearity: FFT(a*x + b*y) = a*FFT(x) + b*FFT(y)."""
+        """Test FFT linearity: FFT(a*x + b*y) = a*FFT(x) + b*FFT(y).
+
+        Seeded: the inputs were unseeded and `rtol=1e-5` is checked against a
+        default `atol=1e-8`, so a draw where `a*x + b*y` nearly cancels in a bin
+        fails on complex64 rounding alone. Observed failing once in eight runs
+        when an unrelated test changed the global RNG stream. Pinning the draw
+        keeps the tolerance honest; widening it would hide a real regression.
+        """
+        torch.manual_seed(20260921)
         x = torch.randn(2, 8, 8, dtype=torch.complex64)
         y = torch.randn(2, 8, 8, dtype=torch.complex64)
         a = 2.5
@@ -567,3 +577,61 @@ class TestTheDynamoFence:
     def test_round_trip_survives_the_fence(self):
         x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
         assert torch.allclose(ifft2c(fft2c(x)), x, atol=1e-5)
+
+
+class TestSenseAdjointNormalize:
+    """``sense_adjoint(normalize=...)``: matched filter vs Roemer estimate.
+
+    The flag exists because ``A^H`` returns ``(sum_c |S_c|^2) * m``, not ``m``.
+    That shading is correct inside a physics expression and wrong in a readout or
+    a fidelity term, where it silently weights the image by the coil intensity
+    profile.
+    """
+
+    @staticmethod
+    def _phantom(shaded: bool, seed: int = 0):
+        """``(kspace, smaps, m)`` for coil images that are exactly ``S_c * m``."""
+        torch.manual_seed(seed)
+        b, c, h, w = 2, 4, 16, 16
+        m = torch.randn(b, 1, h, w, dtype=torch.complex64)
+        s = torch.randn(b, c, h, w, dtype=torch.complex64)
+        s = s / s.abs().pow(2).sum(1, keepdim=True).sqrt()  # unit RSS
+        if shaded:
+            s = s * (0.3 + 0.7 * torch.rand(b, 1, h, w))
+        return fft2c(s * m), s, m
+
+    def test_roemer_recovers_the_magnetization_through_shaded_maps(self):
+        """The property the matched filter does NOT have."""
+        k, s, m = self._phantom(shaded=True)
+        assert torch.allclose(sense_adjoint(k, s, normalize=True), m, atol=1e-4)
+
+    def test_the_adjoint_is_shaded_by_the_same_maps(self):
+        """The planted counterpart: without the divide the answer is not ``m``."""
+        k, s, m = self._phantom(shaded=True)
+        assert not torch.allclose(sense_adjoint(k, s), m, atol=1e-2)
+
+    def test_the_default_is_the_adjoint_unchanged(self):
+        """68 arms declare a term that routes through here; the default must not
+        move them. Bit-identical to the explicit sum, not merely close."""
+        k, s, _ = self._phantom(shaded=True)
+        expected = (ifft2c(k) * torch.conj(s)).sum(dim=1, keepdim=True)
+        assert torch.equal(sense_adjoint(k, s), expected)
+
+    def test_the_support_floor_bounds_the_out_of_support_amplification(self):
+        """Planted violation: a dead strip in the maps is where a normalized
+        combine divides noise by nothing. ``coil_combine_sense`` owns the floor;
+        ``min_support_frac=0.0`` restores the unprotected divide and must blow up.
+        """
+        k, s, _ = self._phantom(shaded=True)
+        s = s.clone()
+        s[..., :4, :] *= 1e-4
+        noisy = fft2c(ifft2c(k) + 0.01 * torch.randn_like(k))
+        floored = sense_adjoint(noisy, s, normalize=True).abs().max()
+        unprotected = sense_adjoint(noisy, s, normalize=True, min_support_frac=0.0).abs().max()
+        assert unprotected > 20 * floored
+
+    def test_coil_combine_sense_is_the_magnitude_of_the_normalized_adjoint(self):
+        """One owner: the two entry points differ only in domain and in ``abs``."""
+        k, s, _ = self._phantom(shaded=True)
+        combined = coil_combine(ifft2c(k), method="sense", smaps=s)
+        assert torch.allclose(combined, sense_adjoint(k, s, normalize=True).abs(), atol=1e-6)

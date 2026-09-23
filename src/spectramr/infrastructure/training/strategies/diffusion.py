@@ -38,7 +38,7 @@ from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.physics.coil_sensitivity import (
     SMAP_KSPACE_PEAK_RATIO,
-    estimate_smaps,
+    estimate_smaps_calibrated,
     prepare_smaps_for_kspace_conditioning,
 )
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
@@ -609,31 +609,16 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         if cached is not None:
             return cached
 
-        smaps = estimate_smaps(
+        # Estimate + ACS confinement + RSS normalisation through the physics
+        # SSOT, which detaches. This block used to normalise on the acs_size
+        # grid and then interpolate up, which collapsed RSS to 0.0024 between
+        # grid nodes (#2213); the owner does it in the order that cannot.
+        smaps = estimate_smaps_calibrated(
             acs_kspace_t,
             method=self._configured_estimation_method(),
-            acs_only=True,  # crop to the dense center so aliasing can't seed calibration
+            out_size=(h, w),
             **self._configured_estimation_kwargs(),
-        ).detach()  # DETACH to prevent gradient flow through S-maps
-
-        # Energy-preserving normalization: sum of squared magnitudes across coils = 1
-        rss = torch.sqrt((smaps.abs() ** 2).sum(dim=1, keepdim=True) + 1e-8)
-        smaps = smaps / rss
-
-        # Ensure matching resolution if needed (estimate_smaps returns full size)
-        if smaps.shape[-2:] != (h, w):
-            if smaps.is_complex():
-                smaps_r = torch.nn.functional.interpolate(
-                    smaps.real, size=(h, w), mode="bilinear", align_corners=False
-                )
-                smaps_i = torch.nn.functional.interpolate(
-                    smaps.imag, size=(h, w), mode="bilinear", align_corners=False
-                )
-                smaps = torch.complex(smaps_r, smaps_i)
-            else:
-                smaps = torch.nn.functional.interpolate(
-                    smaps, size=(h, w), mode="bilinear", align_corners=False
-                )
+        )
 
         if len(cache) >= self._SMAPS_CACHE_MAX:
             cache.pop(next(iter(cache)))  # FIFO eviction
@@ -2872,15 +2857,43 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             return None
         return w
 
-    def declared_metric_keys(self) -> frozenset[str]:
-        """Declare ``pre_dc_kspace_l1`` whenever the pre-DC term is enabled (#1682).
+    @staticmethod
+    def _acquired_weight(mask: torch.Tensor | None, ref: torch.Tensor) -> torch.Tensor | None:
+        """Broadcastable ``mask`` weight over ACQUIRED k-space bins.
 
-        ``_add_pre_dc_fidelity`` stamps this key on BOTH of its ``lam > 0``
+        The complement of :meth:`_unsampled_weight`, and the two differ in what
+        ``None`` means, deliberately. There, ``None`` routes the caller to a
+        uniform L1 -- correct, because a fully-sampled rung has no unmeasured
+        bins and that fallback is the only gradient the generator gets at
+        ``t = 0``. Here ``None`` means the acquired support is unknown or empty,
+        and a uniform L1 would silently duplicate the null-band term over the
+        whole plane. The caller skips instead, and stamps a zero so the
+        inactivity is visible in the metrics rather than inferred (pitfall #9).
+        """
+        if mask is None or not torch.is_tensor(mask):
+            return None
+        m = mask.real if torch.is_complex(mask) else mask
+        m = m.to(dtype=ref.dtype, device=ref.device)
+        if m.ndim != ref.ndim or m.shape[-2:] != ref.shape[-2:]:
+            return None
+        if m.shape[1] not in (1, ref.shape[1]):
+            m = m.amax(dim=1, keepdim=True)
+        w = m.clamp(0.0, 1.0)
+        # Same host sync as the sibling, and load-bearing for the same reason:
+        # the branch has to be taken on the host to return None at all.
+        if not w.any():
+            return None
+        return w
+
+    def declared_metric_keys(self) -> frozenset[str]:
+        """Declare each pre-DC term's column whenever that term is enabled (#1682).
+
+        ``_add_pre_dc_fidelity`` stamps a key on BOTH of a term's ``lam > 0``
         paths -- the active one and the INACTIVE sentinel that fires when the
-        generator exposed no pre-DC tuple -- and on neither when ``lam <= 0``.
-        The condition below is therefore the producer's own gate verbatim, so
-        the column is promised exactly when a value will be written to it and
-        never when one will not.
+        term cannot run -- and on neither when ``lam <= 0``. The conditions
+        below are therefore the producer's own gates verbatim, so a column is
+        promised exactly when a value will be written to it and never when one
+        will not.
 
         Why this key in particular matters: it is the only observable of the
         only gradient the terminal (``t = 0``) rung receives. Under
@@ -2899,8 +2912,12 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         # column". `reconstruction` is a declared field, so it is always present
         # (possibly None, which correctly means no pre-DC term).
         recon = self.config.losses.reconstruction
-        lam = float(getattr(recon, "lambda_pre_dc_kspace", 0.0) or 0.0)
-        return frozenset({"pre_dc_kspace_l1"}) if lam > 0.0 else frozenset()
+        keys: set[str] = set()
+        if float(getattr(recon, "lambda_pre_dc_kspace", 0.0) or 0.0) > 0.0:
+            keys.add("pre_dc_kspace_l1")
+        if float(getattr(recon, "lambda_pre_dc_acquired", 0.0) or 0.0) > 0.0:
+            keys.add("pre_dc_acquired_l1")
+        return frozenset(keys)
 
     def _add_pre_dc_fidelity(
         self,
@@ -2920,53 +2937,69 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         tuple element), this adds a k-space L1 between that pre-DC prediction
         and the target, pressuring the net's OWN output.
 
-        The L1 is weighted by the UNSAMPLED complement ``(1 - mask)`` (when a
-        mask is available): a uniform k-space L1 is dominated by the high-energy
-        low-frequency centre and the always-sampled ACS bins that DC already
-        injects, so it barely pressures the high frequencies the model must
-        hallucinate. Concentrating the gradient on the unmeasured bins is where
-        it actually closes the across-R gap. Without a mask it degrades to the
-        uniform ``mean|pre_dc - target|`` (byte-identical to the legacy form).
+        There are TWO such terms and they partition the plane between them.
+        ``lambda_pre_dc_kspace`` weights the UNSAMPLED complement ``(1 - mask)``:
+        a uniform k-space L1 is dominated by the high-energy low-frequency centre
+        and the always-sampled ACS bins that DC already injects, so it barely
+        pressures the high frequencies the model must hallucinate. Without a mask
+        it degrades to the uniform ``mean|pre_dc - target|`` (byte-identical to
+        the legacy form).
 
-        Default weight 0.0 -> exact no-op. Fail-safe: any shape edge case
-        returns ``total_loss`` unchanged rather than crashing training. When
-        ``lam > 0`` but the pre-DC prediction is unavailable, the term is
-        INACTIVE — it stamps ``pre_dc_kspace_l1 = 0.0`` and warns once so the
-        gap is visible in the CSV/provenance instead of vanishing silently
-        (pitfall #9/#15).
+        ``lambda_pre_dc_acquired`` weights ``mask`` itself, and exists because
+        nothing else scores those bins at all: hard DC makes the derivative of
+        the output with respect to the prediction exactly ``(1 - mask)``, so
+        every POST-DC term is a constant there and the null-band term above is
+        masked away from them by construction. The acquired bins are the only
+        place the target is knowable from the input, which makes them the only
+        place the output scale and the inter-coil phase relationship can be
+        learned -- in the null band the L1 optimum is ~0 and phase is undefined.
+        The two are independent knobs, so an arm may declare either or both.
+
+        Both default to 0.0 -> exact no-op. Fail-safe: any shape edge case
+        returns ``total_loss`` unchanged rather than crashing training. A term
+        that is declared but cannot run is INACTIVE rather than absent — it
+        stamps its key at ``0.0`` and warns once, so the gap is visible in the
+        CSV/provenance instead of vanishing silently (pitfall #9/#15).
 
         Args:
             total_loss: The aggregated training loss so far.
             predicted_output: Raw generator output; the pre-DC prediction is
                 ``[1]`` when it is a ``(post_dc, pre_dc)`` tuple.
             target_for_loss: The (already real-stacked, aligned) loss target.
-            mask: Sampling mask (``1`` = acquired). Drives the unsampled-bin
-                weighting; ``None`` -> uniform L1.
+            mask: Sampling mask (``1`` = acquired). Splits the plane between the
+                two terms; ``None`` -> uniform L1 for the null-band term and
+                INACTIVE for the acquired-band one.
 
         Returns:
-            ``total_loss`` plus ``lambda * weighted_L1(pre_dc, target)`` when
-            enabled, else ``total_loss`` unchanged.
+            ``total_loss`` plus each enabled term's ``lambda * weighted_L1``.
         """
         recon = self.config.losses.reconstruction
         lam = float(getattr(recon, "lambda_pre_dc_kspace", 0.0) or 0.0)
-        if lam <= 0.0:
+        lam_acquired = float(getattr(recon, "lambda_pre_dc_acquired", 0.0) or 0.0)
+        if lam <= 0.0 and lam_acquired <= 0.0:
             return total_loss
         if not (
             isinstance(predicted_output, tuple)
             and len(predicted_output) > 1
             and torch.is_tensor(predicted_output[1])
         ):
-            # Advertised (lam > 0) but the generator did not expose its pre-DC
-            # prediction (only happens off the training-mode tuple path). Make
-            # the inactivity VISIBLE rather than a silent no-op (pitfall #9/#15).
-            self._loss_dict_reuse["pre_dc_kspace_l1"] = torch.zeros((), device=total_loss.device)
+            # Advertised but the generator did not expose its pre-DC prediction
+            # (only happens off the training-mode tuple path). Make the
+            # inactivity VISIBLE rather than a silent no-op (pitfall #9/#15).
+            zero = torch.zeros((), device=total_loss.device)
+            if lam > 0.0:
+                self._loss_dict_reuse["pre_dc_kspace_l1"] = zero
+            if lam_acquired > 0.0:
+                self._loss_dict_reuse["pre_dc_acquired_l1"] = zero
             if not getattr(self, "_pre_dc_inactive_warned", False):
                 logger.warning(
-                    "losses.reconstruction.lambda_pre_dc_kspace=%.3g is set but "
-                    "the generator did not expose a pre-DC prediction (expected a "
-                    "(post_dc, pre_dc) tuple in training mode); the pre-DC "
-                    "fidelity term is INACTIVE.",
+                    "losses.reconstruction.lambda_pre_dc_kspace=%.3g / "
+                    "lambda_pre_dc_acquired=%.3g are set but the generator did "
+                    "not expose a pre-DC prediction (expected a (post_dc, pre_dc) "
+                    "tuple in training mode); the pre-DC fidelity terms are "
+                    "INACTIVE.",
                     lam,
+                    lam_acquired,
                 )
                 self._pre_dc_inactive_warned = True
             return total_loss
@@ -2997,18 +3030,46 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             return total_loss  # fail-safe — never crash training on an edge case
 
         diff = torch.abs(pre_dc - tgt)
-        w = self._unsampled_weight(mask, diff)
-        if w is not None:
-            # Broadcast the per-location weight over the channel axis BEFORE
-            # normalising, so the denominator counts every weighted (channel,
-            # bin) position — otherwise a [B,1,H,W] mask under-counts vs a
-            # [B,2C,H,W] diff and the mean is scaled by the channel factor.
-            w = w.expand_as(diff)
-            term = (w * diff).sum() / w.sum().clamp_min(1.0)
-        else:
-            term = diff.mean()
-        self._loss_dict_reuse["pre_dc_kspace_l1"] = term.detach()
-        return total_loss + lam * term
+
+        if lam > 0.0:
+            w = self._unsampled_weight(mask, diff)
+            if w is not None:
+                # Broadcast the per-location weight over the channel axis BEFORE
+                # normalising, so the denominator counts every weighted (channel,
+                # bin) position — otherwise a [B,1,H,W] mask under-counts vs a
+                # [B,2C,H,W] diff and the mean is scaled by the channel factor.
+                w = w.expand_as(diff)
+                term = (w * diff).sum() / w.sum().clamp_min(1.0)
+            else:
+                term = diff.mean()
+            self._loss_dict_reuse["pre_dc_kspace_l1"] = term.detach()
+            total_loss = total_loss + lam * term
+
+        if lam_acquired > 0.0:
+            w_acq = self._acquired_weight(mask, diff)
+            if w_acq is None:
+                # No usable acquired support. Falling back to a uniform L1 here
+                # would duplicate the null-band term over the whole plane, so the
+                # term stands down and says so.
+                self._loss_dict_reuse["pre_dc_acquired_l1"] = torch.zeros(
+                    (), device=total_loss.device
+                )
+                if not getattr(self, "_pre_dc_acquired_inactive_warned", False):
+                    logger.warning(
+                        "losses.reconstruction.lambda_pre_dc_acquired=%.3g is set "
+                        "but no acquired support could be resolved for this batch "
+                        "(mask absent, unalignable, or all-zero); the acquired-band "
+                        "pre-DC term is INACTIVE.",
+                        lam_acquired,
+                    )
+                    self._pre_dc_acquired_inactive_warned = True
+            else:
+                w_acq = w_acq.expand_as(diff)
+                term_acq = (w_acq * diff).sum() / w_acq.sum().clamp_min(1.0)
+                self._loss_dict_reuse["pre_dc_acquired_l1"] = term_acq.detach()
+                total_loss = total_loss + lam_acquired * term_acq
+
+        return total_loss
 
     def _build_output_snapshot(
         self,
@@ -3861,8 +3922,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                             acs_kspace_t.view(b, c2, 2, h, w).permute(0, 1, 3, 4, 2).contiguous()
                         )
 
-                # Memoized ACS-cropped estimate (the acs_only crop lives in the
-                # cache fn); honors physics.coil_processing.estimation.* (#15).
+                # Memoized; the ACS confinement and the RSS normalisation live
+                # in the cache fn, and honour physics.coil_processing.estimation.* (#15).
                 smaps = self._estimate_smaps_cached(acs_kspace_t, h, w)
                 self._current_smaps = smaps
                 self.logging_service.log_debug(
@@ -6177,7 +6238,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                 # Calibrate from the FULLY-SAMPLED reference (kspace alias / clean
                 # target), never the undersampled input — coil maps are
                 # acceleration-invariant and the aliased periphery corrupts
-                # calibration (CLAUDE.md #9/#16). acs_only crops to the dense center.
+                # calibration (CLAUDE.md #9/#16); the estimator is confined to the
+                # dense centre.
                 acs_kspace = batch_data.get("kspace") if isinstance(batch_data, dict) else None
                 if not isinstance(acs_kspace, torch.Tensor):
                     acs_kspace = target_batch
@@ -6199,27 +6261,15 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                             acs_kspace_t.view(b, c2, 2, h, w).permute(0, 1, 3, 4, 2).contiguous()
                         )
 
-                # Configured-method + sub-knob smaps fallback (pitfall #15).
-                # acs_only crops to the dense center (aliasing can't seed calibration).
-                smaps = estimate_smaps(
+                # Configured-method + sub-knob smaps fallback (pitfall #15), through
+                # the same owner training uses -- a checkpoint must be graded with the
+                # maps it trained with.
+                smaps = estimate_smaps_calibrated(
                     acs_kspace_t,
                     method=self._configured_estimation_method(),
-                    acs_only=True,
+                    out_size=(h, w),
                     **self._configured_estimation_kwargs(),
-                ).detach()
-
-                rss = torch.sqrt((smaps.abs() ** 2).sum(dim=1, keepdim=True) + 1e-8)
-                smaps = smaps / rss
-
-                # Resize if needed
-                if smaps.shape[-2:] != (h, w):
-                    smaps_r = torch.nn.functional.interpolate(
-                        smaps.real, size=(h, w), mode="bilinear", align_corners=False
-                    )
-                    smaps_i = torch.nn.functional.interpolate(
-                        smaps.imag, size=(h, w), mode="bilinear", align_corners=False
-                    )
-                    smaps = torch.complex(smaps_r, smaps_i)
+                )
 
                 # Persist the complex S-maps so downstream consumers
                 # (`_compute_validation_metrics` losses like `sense_adjoint_l1`
@@ -6842,11 +6892,16 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         val_loss = torch.tensor(0.0, device=hr_fakes_for_metrics.device)
         if env_losses:
-            # `_call_safe_loss` signature-filters, so each term receives the
-            # physics kwargs it names -- the same contract `_compute_losses_impl`
-            # applies. Both keys are load-bearing: without `smaps`
+            # `_call_safe_loss` signature-filters on the CALLEE's parameter
+            # names, so each term receives only the physics kwargs it declares
+            # and both keys here are load-bearing: without `smaps`
             # `sense_adjoint_l1` early-returns 0.0, and without `mask`
-            # `null_space_content` raises rather than scoring an empty null space.
+            # `null_space_content` raises rather than scoring an empty null
+            # space. The coil maps need only ONE spelling -- `_call_safe_loss`
+            # re-files them under whichever alias a term declares. This dict is
+            # hand-built and so a NARROWER surface than `_compute_losses_impl`'s
+            # kwargs; a key added there and not here gives a term that trains
+            # and then raises in validation.
             loss_kwargs: dict[str, Any] = {
                 "smaps": getattr(self, "_current_smaps", None),
                 "mask": _rung_mask,
@@ -7333,6 +7388,12 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             # feeds the report case recorder and the TensorBoard renders; a
             # second call would add a row per batch and, at
             # ``cascade_level=None``, overwrite the cascade images.
+            #
+            # The seam reads the producing mask from the ``_rung_mask`` stash and
+            # clears it, so by now the last rung has taken its own. Stash the one
+            # this prediction was made with; without it ``null_space_content``
+            # raises and every validation batch fails.
+            self._rung_mask = mask
             return self._compute_validation_metrics(
                 prediction,
                 target_batch,

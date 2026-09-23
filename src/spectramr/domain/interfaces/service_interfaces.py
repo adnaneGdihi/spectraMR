@@ -47,6 +47,7 @@ class ILoggingService(ABC):
             +log_info(message)
             +log_warning(message)
             +log_error(message)
+            +log_critical(message)
             +log_debug(message)
         }
     ```
@@ -94,6 +95,21 @@ class ILoggingService(ABC):
         extra: dict[str, Any] | None = None,
     ) -> None:
         """Log an error message."""
+
+    @abstractmethod
+    def log_critical(
+        self,
+        message: str,
+        model_type: str = "",
+        epoch: int = -1,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Log a critical message: a condition that stops the run.
+
+        Abstract rather than a default shim because an implementation that silently
+        lacked this rung is exactly how the training loop's divergence tripwire spent
+        its life raising ``AttributeError`` instead of halting (#2254).
+        """
 
     @abstractmethod
     def log_debug(

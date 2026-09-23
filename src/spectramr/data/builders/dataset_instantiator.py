@@ -312,6 +312,11 @@ class DatasetInstantiator:
         # wrong alpha does not raise anywhere downstream -- it just shifts noise
         # between the two R2R halves. Bare attribute read, for the reason above.
         r2r_alpha = config.r2r_alpha
+        # Read unconditionally for the same reason as r2r_alpha: the schema
+        # already refuses it outside r2r, and a source that never reached the
+        # dataset would leave the arm drawing from the committed matrix while
+        # its YAML declared a per-scan fit (non-negotiable 8).
+        r2r_covariance_source = config.r2r_covariance_source
         nex_exclude_input = config.nex_target_exclude_input
         nex_fallback = config.nex_fallback
         # ``use_repetitions`` defaults to None in the schema: the ROUTE decides.
@@ -337,6 +342,7 @@ class DatasetInstantiator:
             log_scaling=config.processing.enable_log_scaling,
             target_mode=target_mode,
             r2r_alpha=r2r_alpha,
+            r2r_covariance_source=r2r_covariance_source,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
             slice_level_records=slice_level_records,
@@ -353,6 +359,7 @@ class DatasetInstantiator:
             log_scaling=config.processing.enable_log_scaling,
             target_mode=val_target_mode,
             r2r_alpha=r2r_alpha,
+            r2r_covariance_source=r2r_covariance_source,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
             slice_level_records=slice_level_records,

@@ -5,6 +5,7 @@ or building on-the-fly indexes from raw directories.
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,36 @@ from spectramr.data.metadata.path_resolver import PathResolver
 from spectramr.data.split_utils import split_index
 
 logger = logging.getLogger(__name__)
+
+
+#: Manifests are gitignored and never rsynced -- the committed generator is their
+#: SSOT -- so "not found" is almost always "not generated yet on this host", and
+#: naming the path alone costs a cluster round trip to work that out.
+_MANIFEST_GENERATOR = "scripts/data/regenerate_cluster_manifests.py"
+
+
+def _missing_manifest_message(path: str) -> str:
+    """Name the path AND the command that produces it."""
+    stem = Path(path).stem
+    lines = [
+        f"Index file not found at {path}",
+        "",
+        "Manifests are gitignored and generated on the host that holds the data:",
+        f"    python {_MANIFEST_GENERATOR} --data-base <databases> \\",
+        "        --datasets m4raw_multicoil_train m4raw_multicoil_val m4raw_multicoil_test",
+    ]
+    match = re.search(r"_nex(\d+)$", stem)
+    if match:
+        lines += [
+            "",
+            f"This is a repetition-filtered manifest ({stem}), so it also needs the",
+            f"filter that produces it -- the same command with --min-reps {match.group(1)}.",
+            "It keeps only NEX groups with that many repetitions, which a leave-one-out",
+            "target requires, and writes to this '_nex' name rather than the shared one.",
+        ]
+    lines += ["", "Run with --dry-run first to see what would be indexed."]
+    return "\n".join(lines)
+
 
 
 class ManifestLoader:
@@ -169,7 +200,7 @@ class ManifestLoader:
         # 1. Load Primary Manifest
         if resolved_index_path:
             if not Path(resolved_index_path).exists():
-                raise ValueError(f"Index file not found at {resolved_index_path}")
+                raise ValueError(_missing_manifest_message(resolved_index_path))
 
             # BUG FIX: v2 manifests have their own embedded data_root which should always be used
             # NEVER pass config.data_root to parse_fastmri_index for v2 manifests

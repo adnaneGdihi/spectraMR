@@ -98,3 +98,41 @@ def test_multislice_flag_is_read_without_a_hasattr_fallback() -> None:
     src = inspect.getsource(reconstruction)
     assert 'hasattr(config.data, "multislice_enabled")' not in src
     assert "multislice_enabled = config.data.multislice_enabled" in src
+
+
+class TestCoilMapsReachTheLosses:
+    """The maps reached the MODEL's forward and stopped there.
+
+    ``_prepare_generator_inputs`` passes ``batch_context['coil_sensitivities']``
+    to the model as ``sensitivity_maps``, but the declarative loss terms are
+    invoked through ``UnifiedReconstructionLossComputer.compute``, whose
+    ``_call_safe_loss`` filters kwargs by signature -- so a term needing the
+    coil geometry was called as ``(pred, target)`` and raised. The maps are a
+    loss kwarg too now.
+    """
+
+    def test_the_strategy_threads_the_maps_into_the_loss_computer(self) -> None:
+        """Source-level, because constructing the strategy needs a built model."""
+        import inspect
+
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        source = inspect.getsource(ReconstructionTrainingStrategy._compute_losses_impl)
+        assert 'batch_context["coil_sensitivities"]' in source, (
+            "the strategy no longer threads the coil maps into the loss computer, so "
+            "a term like coil_subspace_residual is invoked as (pred, target) and raises"
+        )
+        assert "**loss_context" in source, "the threaded kwargs no longer reach compute()"
+
+    def test_it_is_conditional_so_armless_runs_are_untouched(self) -> None:
+        """An arm with no maps must not gain a `coil_sensitivities=None` kwarg."""
+        import inspect
+
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        source = inspect.getsource(ReconstructionTrainingStrategy._compute_losses_impl)
+        assert 'if batch_context.get("coil_sensitivities") is not None:' in source

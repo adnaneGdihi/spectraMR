@@ -18,6 +18,7 @@ import torch
 
 from spectramr.core.compile_fences import dynamo_disable
 
+from .coil_sensitivity import coil_combine_sense
 from .interfaces import IPhysicsOperator
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,8 @@ def sense_adjoint(
     smaps: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
     combine_rss: bool = False,
+    normalize: bool = False,
+    min_support_frac: float = 1e-2,
 ) -> torch.Tensor:
     """Adjoint operator A^H: k-space -> image.
 
@@ -423,6 +426,16 @@ def sense_adjoint(
         mask: optional sampling mask
         combine_rss: if True and smaps provided, return RSS magnitude;
             else SENSE combine
+        normalize: divide by ``sum_c |S_c|^2``, turning the matched-filter
+            adjoint ``(sum_c|S_c|^2) * m`` into an estimate of ``m`` itself.
+            Default ``False`` keeps A^H, which is what a physics expression
+            means by "adjoint"; ``True`` is what a *readout* or an image-domain
+            fidelity term wants, because the shading is otherwise a spatial
+            weight nobody chose. Delegates to ``coil_combine_sense``, the
+            measured owner of that divide and of its support floor
+            (non-negotiable 17) -- do not re-derive the denominator here.
+        min_support_frac: forwarded to ``coil_combine_sense``; inert unless
+            ``normalize``.
     Returns:
         complex image (B, 1 or C, H, W) if smaps provided; else complex image
         matching input channels
@@ -434,6 +447,8 @@ def sense_adjoint(
         smaps_c = _to_complex(smaps)
         if combine_rss:
             return coil_combine_rss(img)
+        if normalize:
+            return coil_combine_sense(img, smaps_c, min_support_frac=min_support_frac)
         # SENSE combine: sum over coils of conj(smaps) * img_coil
         img = (img * torch.conj(smaps_c)).sum(dim=1, keepdim=True)
     return img
@@ -450,15 +465,12 @@ def coil_combine(
     if method == "sense":
         if smaps is None:
             raise ValueError("coil_combine method='sense' requires smaps")
-        # Roemer/SENSE-optimal combine = (sum_c conj(S_c) I_c) / (sum_c |S_c|^2).
-        # The denominator is what distinguishes the *combine* (an unbiased
-        # magnetization estimate) from the matched-filter *adjoint*
-        # (``sense_adjoint``, which correctly omits it). Without it the result is
-        # shaded by sum_c|S_c|^2 unless the maps are unit-RSS-normalized.
-        smaps_c = _to_complex(smaps)
-        num = (_to_complex(coil_imgs) * torch.conj(smaps_c)).sum(dim=1, keepdim=True)
-        denom = (smaps_c.abs() ** 2).sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return (num / denom).abs()
+        # Roemer: the divide is what distinguishes the *combine* (an unbiased
+        # magnetization estimate) from the matched-filter *adjoint*, which
+        # correctly omits it. ``coil_combine_sense`` owns that divide and the
+        # relative support floor it needs -- an additive Tikhonov term in its
+        # place measures 1.7e-2 relative error against the clamp's 6.7e-8.
+        return coil_combine_sense(_to_complex(coil_imgs), _to_complex(smaps)).abs()
     raise ValueError(f"Unknown coil combine method {method!r}. Valid: rss, sense.")
 
 

@@ -5,28 +5,10 @@ import torch
 
 from spectramr.config.schemas.enums import Axis
 
-#: Every spelling the codebase uses for per-coil sensitivity maps, mapped onto
-#: the one canonical field (audit C11).
-#:
-#: There were FIVE, split across the boundary with nothing reconciling them: the
-#: data layer produces ``sensitivity`` (``torchio_subject_builder``), while
-#: consumers ask for ``sensitivity_maps`` (10 files), ``coil_sensitivities``
-#: (5), ``smaps`` (3) and ``coil_maps`` (1). Because ``BatchAdapter`` files
-#: every non-core key into ``metadata`` verbatim, a consumer's ``in`` check
-#: simply answered False — so a SENSE term guarded by one ran coil-blind rather
-#: than failing (pitfall #16).
-#:
-#: The table lives HERE, at the one boundary every batch crosses, rather than as
-#: a per-consumer rename: 19 consumer files keep their own spelling and the
-#: reconciliation has a single home. ``coil_maps`` is canonical because
-#: ``sensitivity`` alone is ambiguous with the physics sense-of-the-word.
-COIL_MAP_ALIASES: tuple[str, ...] = (
-    "coil_maps",
-    "sensitivity",
-    "sensitivity_maps",
-    "coil_sensitivities",
-    "smaps",
-)
+#: Re-exported from ``core.coil_map_names``, the one owner. It moved there so the
+#: loss-kwarg boundary could reconcile the same five spellings -- ``models/``
+#: cannot import ``data/``, so a table here could serve only one of the two.
+from spectramr.core.coil_map_names import COIL_MAP_ALIASES
 
 
 @dataclass

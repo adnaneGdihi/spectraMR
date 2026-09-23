@@ -390,22 +390,11 @@ def infer_output_domain(
     # this override the model output_domain falls through to "kspace"
     # and downstream visualisation IFFTs an already-image tensor.
     dataset_type = _get_attr_safe(data_cfg, "dataset_type", "")
-    normalize_kspace = _data_leaf(
-        data_cfg,
-        "processing",
-        "enable_kspace_normalization",
-        "normalize_kspace",
-        False,
-    )
     coil_processing_mode = str(
         _data_leaf(data_cfg, "coils", "processing_mode", "coil_processing_mode", "") or ""
     ).lower()
 
-    data_is_kspace = (
-        str(dataset_type).lower() in ("kspace", "kspace_paired") or bool(normalize_kspace)
-    ) and coil_processing_mode not in IMAGE_DOMAIN_COIL_MODES
-
-    if data_is_kspace:
+    if loader_serves_kspace(config):
         logger.debug(
             "[DomainInference] P6 dataset_type='%s' coil_mode='%s' → kspace",
             dataset_type,
@@ -423,6 +412,100 @@ def infer_output_domain(
     # ── Priority 7: Default fallback ──
     logger.debug("[DomainInference] P7 default → image")
     return "image"
+
+
+def loader_serves_kspace(config: Any) -> bool:
+    """Does the dataloader hand the strategy a k-space tensor?
+
+    The ONE owner of that question (non-negotiable 17). ``infer_output_domain``'s
+    Priority-6 heuristic and :func:`needs_ifft_for_visualization` both used to
+    recompute it inline from the same four leaves, and
+    :func:`needs_kspace_to_image_bridge` is a third consumer — three copies of a
+    predicate is how they start to disagree.
+
+    ``coil_processing_mode`` in ``rss_image`` / ``magnitude`` wins over
+    ``dataset_type: kspace``: those modes IFFT inside the dataset's TorchIO chain,
+    so the tensor that reaches the model is already an image.
+
+    Args:
+        config: the resolved training config.
+
+    Returns:
+        ``True`` when the batch the strategy receives is k-space.
+    """
+    data_cfg = _get_attr_safe(config, "data")
+    dataset_type = str(_get_attr_safe(data_cfg, "dataset_type", "") or "").lower()
+    normalize_kspace = _data_leaf(
+        data_cfg,
+        "processing",
+        "enable_kspace_normalization",
+        "normalize_kspace",
+        False,
+    )
+    coil_processing_mode = str(
+        _data_leaf(data_cfg, "coils", "processing_mode", "coil_processing_mode", "") or ""
+    ).lower()
+    return (
+        dataset_type in ("kspace", "kspace_paired") or bool(normalize_kspace)
+    ) and coil_processing_mode not in IMAGE_DOMAIN_COIL_MODES
+
+
+def needs_kspace_to_image_bridge(config: Any) -> bool:
+    r"""Must the batch be ``ifft2c``'d before it reaches the network's ``forward``?
+
+    True when the loader serves k-space and the model is registered as consuming
+    the **image** domain — i.e. the adjoint :math:`A^H` is the strategy's job, not
+    the network's.
+
+    This decision used to have no owner at all. It rode on ``use_dc``, the
+    data-consistency flag: ``_prepare_generator_inputs`` applied ``ifft2c`` only
+    ``if use_dc``, and ``use_dc`` is set from ``batch['use_dc']``, which is
+    ``strategy.dc_layer is not None``. ``initialize_data_consistency`` sets
+    ``dc_layer = None`` whenever the generator has no built-in DC module — with a
+    log *warning*, not a raise — so an arm declaring
+    ``physics.data_consistency.enabled: true`` over a plain U-Net got **no DC and
+    no adjoint**, and the network was handed raw k-space while every consumer
+    downstream (the loss's Fourier bridge, the metrics, the previewer) read its
+    output as an image. Observed on ``ei_unet_m4raw_r4`` / ``ei_control_mc_only``
+    (cluster run 2026-09-20): the reported reconstruction is the DC-spike blob,
+    because it *is* k-space.
+
+    Reading the registry rather than ``model.input_type`` is deliberate: that
+    field defaults to ``"image"`` and 165 of 672 corpus arms never set it, so a
+    config-level read would flip the bridge on for arms that never asked. The
+    ``@register_model`` capability is a positive declaration by the model itself
+    — ``standard_unet`` says ``input_domain='image'``, ``complex_unet`` says
+    ``'kspace'`` — and only 117 of 593 registered models claim ``image``.
+
+    Args:
+        config: the resolved training config.
+
+    Returns:
+        ``True`` when the strategy must apply the k-space → image adjoint.
+    """
+    if not loader_serves_kspace(config):
+        return False
+
+    model_cfg = _get_attr_safe(config, "model")
+    model_type = _get_attr_safe(model_cfg, "model_type", None)
+    if not model_type:
+        return False
+
+    try:
+        from spectramr.models.registry import get_model_capabilities
+
+        caps = get_model_capabilities(str(model_type))
+    except Exception:  # pragma: no cover - registry import is best effort
+        return False
+
+    declared = getattr(caps, "input_domain", None) if caps is not None else None
+    if declared is None:
+        # Unannotated: say nothing rather than guess. 443 of 593 models are in
+        # this bucket, and flipping a domain bridge on a guess is the failure
+        # this function exists to end.
+        return False
+    domains = declared if isinstance(declared, tuple) else (declared,)
+    return "image" in domains
 
 
 def needs_ifft_for_visualization(
@@ -454,37 +537,17 @@ def needs_ifft_for_visualization(
         not re-transform it.
     """
     output_domain = infer_output_domain(config)
-
-    data_cfg = _get_attr_safe(config, "data")
-
-    dataset_type = _get_attr_safe(data_cfg, "dataset_type", "")
-    normalize_kspace = _data_leaf(
-        data_cfg,
-        "processing",
-        "enable_kspace_normalization",
-        "normalize_kspace",
-        False,
-    )
-    coil_processing_mode = str(
-        _data_leaf(data_cfg, "coils", "processing_mode", "coil_processing_mode", "") or ""
-    ).lower()
-    coil_mode_emits_image = coil_processing_mode in IMAGE_DOMAIN_COIL_MODES
-
-    targets_are_kspace = (
-        str(dataset_type).lower() in ("kspace", "kspace_paired") or bool(normalize_kspace)
-    ) and not coil_mode_emits_image
+    targets_are_kspace = loader_serves_kspace(config)
 
     needs_ifft_preds = output_domain == "kspace"
     needs_ifft_targets = targets_are_kspace
 
     logger.debug(
         "[DomainInference] Visualization: IFFT preds=%s, IFFT targets=%s "
-        "(output_domain=%s, targets_kspace=%s, coil_mode=%s)",
+        "(output_domain=%s)",
         needs_ifft_preds,
         needs_ifft_targets,
         output_domain,
-        targets_are_kspace,
-        coil_processing_mode or "none",
     )
 
     return needs_ifft_preds, needs_ifft_targets
@@ -584,7 +647,9 @@ __all__ = [
     "KNOWN_IMAGE_OUTPUT_MODELS",
     "KNOWN_KSPACE_OUTPUT_MODELS",
     "infer_output_domain",
+    "loader_serves_kspace",
     "looks_like_kspace",
     "metric_transform_produced_image",
     "needs_ifft_for_visualization",
+    "needs_kspace_to_image_bridge",
 ]

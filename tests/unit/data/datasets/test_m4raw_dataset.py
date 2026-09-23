@@ -1683,3 +1683,176 @@ def test_m4raw_encoding_limits_report_counts_not_inclusive_maxima() -> None:
         f"{len(files)} .h5 files under {_M4RAW_CORPUS} but none carried both "
         "'ismrmrd_header' and 'kspace' -- the assertion never ran."
     )
+
+
+class TestSelfCalibratedR2RCovariance:
+    r"""Where the R2R draw's ``Sigma_n`` comes from, and why it can matter.
+
+    R2R's decorrelation ``Cov(y + a*z, y - z/a) = Sigma_n - Sigma_z`` is exactly
+    zero only where the drawn covariance matches the scan's own. ``m4raw_noise``
+    ships one measured on 7 subjects from a single study series and says so:
+    "Receiver gain may differ elsewhere in the corpus." Every ``committed`` arm
+    inherits that scope, and a gain mismatch does not raise anywhere -- it just
+    leaves a residual correlation the network then learns.
+
+    ``self_calibrated`` fits one per scan from the scan's own coil null space,
+    where a physical image is rank one and the residual is pure noise. It needs
+    no second repetition, which is what lets a single-excitation arm use it.
+    """
+
+    @staticmethod
+    def _scan(gain: float, coils: int = 4, size: int = 128) -> torch.Tensor:
+        """Multi-coil k-space whose noise is ``gain`` times the committed level."""
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+
+        torch.manual_seed(0)
+        chol = torch.linalg.cholesky(
+            single_repetition_covariance().to(torch.complex128)
+        ).to(torch.complex64)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, size), torch.linspace(-1, 1, size), indexing="ij"
+        )
+        anatomy = (((xx**2 + yy**2) < 0.5).float() * (0.6 + 0.4 * torch.rand(size, size))).to(
+            torch.complex64
+        )
+        centres = [(-0.6, -0.6), (0.6, -0.6), (-0.6, 0.6), (0.6, 0.6)][:coils]
+        sens = torch.stack([torch.exp(-((xx - a) ** 2 + (yy - b) ** 2)) for a, b in centres]).to(
+            torch.complex64
+        )
+        sens = sens * torch.exp(
+            1j * torch.stack([k * xx for k in range(coils)]).to(torch.complex64)
+        )
+        sens = sens / sens.abs().pow(2).sum(0, keepdim=True).sqrt().clamp(min=1e-6)
+        white = (torch.randn(coils, size, size) + 1j * torch.randn(coils, size, size)).to(
+            torch.complex64
+        ) / (2**0.5)
+        image = sens * anatomy * 30.0 * gain + torch.einsum("ij,jhw->ihw", chol * gain, white)
+        return fft2c(image)
+
+    @staticmethod
+    def _bare(source: str, alpha: float = 1.0):
+        """A dataset exercising only the sampler path -- no file IO."""
+        from spectramr.data.datasets.m4raw_dataset import M4RawRepetitionDataset
+
+        ds = M4RawRepetitionDataset.__new__(M4RawRepetitionDataset)
+        ds.r2r_alpha = alpha
+        ds.r2r_covariance_source = source
+        ds._r2r_cov_cache = {}
+        ds._r2r_sampler = None
+        if source == "committed":
+            from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
+
+            ds._r2r_sampler = M4RawNoiseSampler(alpha=alpha)
+        return ds
+
+    def test_the_committed_source_is_blind_to_receiver_gain(self) -> None:
+        """The failure the knob exists for, stated as a number."""
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+
+        gain = 3.0
+        kspace = self._scan(gain)
+        committed = self._bare("committed")._sampler_for_scan(kspace, "scan")
+        drawn = float(committed._cov.diagonal().real.sum())
+        truth = float(single_repetition_covariance().diagonal().real.sum()) * gain**2
+        assert drawn == pytest.approx(truth / gain**2, rel=1e-6), (
+            "the committed sampler should draw the committed matrix regardless of scan"
+        )
+        assert drawn < truth / 4, "a 3x-gain scan is ~9x under-drawn; that is the point"
+
+    def test_the_self_calibrated_source_recovers_the_scans_own_sigma(self) -> None:
+        """~1% on synthetic 4-coil data at this noise level."""
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+
+        gain = 3.0
+        kspace = self._scan(gain)
+        fitted = self._bare("self_calibrated")._sampler_for_scan(kspace, "scan")
+        drawn = float(fitted._cov.diagonal().real.sum())
+        truth = float(single_repetition_covariance().diagonal().real.sum()) * gain**2
+        assert drawn == pytest.approx(truth, rel=0.05), (drawn, truth)
+
+    def test_the_fit_is_cached_per_scan(self) -> None:
+        """Sigma_n is a receive-chain property; ESPIRiT is ~1 s per slice.
+
+        Without the cache, `samples_per_volume` draws per volume per epoch each
+        pay a full eigendecomposition.
+        """
+        kspace = self._scan(1.0)
+        ds = self._bare("self_calibrated")
+        first = ds._sampler_for_scan(kspace, "scanA")
+        again = ds._sampler_for_scan(kspace, "scanA")
+        assert again is first, "the per-scan covariance was refitted"
+        assert set(ds._r2r_cov_cache) == {"scanA"}
+
+    def test_two_scans_get_two_covariances(self) -> None:
+        """The cache must key on the scan, not collapse the corpus to one fit."""
+        ds = self._bare("self_calibrated")
+        quiet = ds._sampler_for_scan(self._scan(1.0), "scanA")
+        loud = ds._sampler_for_scan(self._scan(4.0), "scanB")
+        assert quiet is not loud
+        quiet_trace = float(quiet._cov.diagonal().real.sum())
+        loud_trace = float(loud._cov.diagonal().real.sum())
+        assert loud_trace > 4 * quiet_trace, (quiet_trace, loud_trace)
+
+    def test_an_unknown_source_raises(self) -> None:
+        """Pitfall #9: never degrade to the committed matrix."""
+        from spectramr.data.datasets.m4raw_dataset import M4RawRepetitionDataset
+
+        with pytest.raises(ValueError, match="Unknown r2r_covariance_source"):
+            M4RawRepetitionDataset.__init__(
+                M4RawRepetitionDataset.__new__(M4RawRepetitionDataset),
+                [],
+                target_mode="r2r",
+                r2r_covariance_source="measured_somewhere_else",
+            )
+
+    def test_the_recorruption_uses_the_fitted_sigma(self) -> None:
+        """End of the chain: the draw itself, not just the sampler it came from."""
+        kspace = self._scan(3.0)
+        committed_in, _ = self._bare("committed")._recorrupt_r2r(kspace.clone(), scan_key="s")
+        fitted_in, _ = self._bare("self_calibrated")._recorrupt_r2r(kspace.clone(), scan_key="s")
+        added_committed = (committed_in - kspace).abs().pow(2).sum()
+        added_fitted = (fitted_in - kspace).abs().pow(2).sum()
+        assert float(added_fitted) > 4 * float(added_committed), (
+            float(added_committed),
+            float(added_fitted),
+        )
+
+
+class TestTheKnobIsWiredEndToEnd:
+    """Declared, read, passed to the dataset, and stamped (non-negotiable 8)."""
+
+    def test_the_schema_defaults_to_committed(self) -> None:
+        """Every existing r2r arm keeps byte-identical behaviour."""
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        assert DataConfigSchema.model_fields["r2r_covariance_source"].default == "committed"
+
+    def test_the_schema_refuses_it_outside_r2r(self) -> None:
+        """An unread declaration states a calibration choice nothing acts on."""
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        with pytest.raises(ValueError, match="r2r_covariance_source is read only"):
+            DataConfigSchema(target_mode="rep_pair", r2r_covariance_source="self_calibrated")
+
+    def test_the_instantiator_passes_it_to_the_dataset(self) -> None:
+        """Otherwise the arm draws from the committed matrix while its YAML lies."""
+        import inspect
+
+        from spectramr.data.builders import dataset_instantiator
+
+        source = inspect.getsource(dataset_instantiator)
+        assert source.count("r2r_covariance_source=r2r_covariance_source") == 2, (
+            "the knob must reach BOTH the train and val datasets"
+        )
+
+    def test_it_is_stamped_into_provenance(self) -> None:
+        from spectramr.infrastructure.training.snapshot_provenance import _CONSTRUCTION_FIELDS
+
+        assert "r2r_covariance_source" in _CONSTRUCTION_FIELDS
+
+    def test_paired_arms_can_see_it(self) -> None:
+        """Otherwise an A-vs-E ablation reports no difference at all."""
+        from spectramr.infrastructure.validation.paired_arms_diff_paths import DEFAULT_DIFF_PATHS
+
+        assert "data.r2r_covariance_source" in DEFAULT_DIFF_PATHS

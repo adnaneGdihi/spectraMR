@@ -5,10 +5,9 @@ import pytest
 from spectramr.infrastructure.domain_validation import (
     DomainMismatchWarning,
     DomainValidationResult,
-    _get_loss_domain,
+    _loss_domain_of,
     _normalize_loss_name,
     get_domain_report,
-    register_loss_domain,
     validate_loss_domains,
     verify_startup_loss_domains,
 )
@@ -23,16 +22,23 @@ def test_normalize_loss_name(input_name, expected):
 
 
 @pytest.mark.parametrize(
-    "loss_name,expected_domain",
-    [("complex_l1", "kspace"), ("mae", "agnostic"), ("non_existent_loss", None)],
+    "loss_name,expected_domain,expected_agnostic,expected_registered",
+    [
+        # `complex_l1` was `kspace` in the deleted hand table and is `agnostic`
+        # on the decorator -- the single disagreement between the two owners,
+        # and the decorator is the one that is right: an elementwise L1 is
+        # defined on any tensor.
+        ("complex_l1", None, True, True),
+        ("mae", None, True, True),
+        ("hfen", "image", False, True),
+        ("non_existent_loss", None, False, False),
+    ],
 )
-def test_get_loss_domain(loss_name, expected_domain):
-    meta = _get_loss_domain(loss_name)
-    if expected_domain is None:
-        assert meta is None
-    else:
-        assert meta is not None
-        assert meta["domain"] == expected_domain
+def test_loss_domain_of(loss_name, expected_domain, expected_agnostic, expected_registered):
+    domain, agnostic, registered = _loss_domain_of(loss_name)
+    assert domain == expected_domain
+    assert agnostic is expected_agnostic
+    assert registered is expected_registered
 
 
 @patch("spectramr.infrastructure.domain_validation.LossBuilder")
@@ -66,16 +72,27 @@ def test_validate_loss_domains_warning(mock_builder):
     assert result.warnings[0].severity == "warning"
 
 
+@pytest.mark.parametrize(
+    "loss_name,expected_label",
+    [
+        # Two different absences. Conflating them under one "unknown" label is
+        # what let an un-audited loss read like a deliberately generic one, and
+        # the old `fix` text pointed at a table that no longer exists.
+        ("custom_unknown_loss", "unregistered"),
+        ("bloch_residual", "unannotated"),
+    ],
+)
 @patch("spectramr.infrastructure.domain_validation.LossBuilder")
-def test_validate_loss_domains_unknown_loss(mock_builder):
+def test_validate_loss_domains_reports_which_absence(mock_builder, loss_name, expected_label):
     mock_instance = mock_builder.return_value
-    mock_instance.get_enabled_losses.return_value = {"custom_unknown_loss": 1.0}
+    mock_instance.get_enabled_losses.return_value = {loss_name: 1.0}
 
     result = validate_loss_domains({}, "kspace")
     assert result.is_valid is True
     assert len(result.errors) == 0
     assert len(result.warnings) == 1
-    assert result.warnings[0].loss_domain == "unknown"
+    assert result.warnings[0].loss_domain == expected_label
+    assert "LOSS_DOMAIN_REGISTRY" not in result.warnings[0].fix
 
 
 def test_validate_loss_domains_invalid_input_domain():
@@ -114,15 +131,14 @@ def test_verify_startup_loss_domains_failure(mock_validate):
     assert verify_startup_loss_domains({}, "kspace", fail_on_error=False) is False
 
 
-def test_register_loss_domain():
-    register_loss_domain("new_loss", "kspace", ["agnostic"])
-    meta = _get_loss_domain("new_loss")
-    assert meta is not None
-    assert meta["domain"] == "kspace"
-    assert meta["compatible_with"] == ["agnostic"]
+def test_registration_is_the_decorators_job():
+    """`register_loss_domain` is gone. It mutated a module-level dict that was a
+    second owner of the domain a loss declares, had zero callers in `src/` and
+    `tests/`, and the registration path is `@register_loss(domain=...)`."""
+    import spectramr.infrastructure.domain_validation as dv
 
-    with pytest.raises(ValueError, match="Invalid domain"):
-        register_loss_domain("bad_loss", "invalid_domain")
+    assert not hasattr(dv, "register_loss_domain")
+    assert not hasattr(dv, "LOSS_DOMAIN_REGISTRY")
 
 
 @patch("spectramr.infrastructure.domain_validation.validate_loss_domains")

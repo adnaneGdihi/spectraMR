@@ -1349,3 +1349,82 @@ class TestResolveEstimationSettings:
         # full-size maps and silently mis-align the conditioning.
         assert maps.shape[:2] == kspace.shape[:2]
         assert maps.shape[-2:] == (24, 24)
+
+
+class TestReturnSubspace:
+    """The eigenbasis was computed and thrown away on every call.
+
+    ``estimate_csm_espirit`` eigendecomposes a per-pixel Gram matrix and keeps
+    only the leading eigenvector; the other ``C - k`` span the coil null space.
+    ``return_subspace=True`` surfaces the projector built from that SAME
+    decomposition, so the maps and the projector cannot disagree -- recomputing
+    it in a caller would be a second owner of the same eigenproblem (NN17).
+    """
+
+    @staticmethod
+    def _kspace(coils: int = 4, size: int = 64) -> torch.Tensor:
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        torch.manual_seed(0)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, size), torch.linspace(-1, 1, size), indexing="ij"
+        )
+        mag = ((xx**2 + yy**2) < 0.6).float()
+        centres = [(-0.6, -0.6), (0.6, -0.6), (-0.6, 0.6), (0.6, 0.6)][:coils]
+        sens = torch.stack(
+            [torch.exp(-((xx - a) ** 2 + (yy - b) ** 2)) for a, b in centres]
+        ).to(torch.complex64)
+        sens = sens / sens.abs().pow(2).sum(0, keepdim=True).sqrt().clamp(min=1e-6)
+        return fft2c(sens * mag.to(torch.complex64)).unsqueeze(0)
+
+    def test_the_default_return_is_unchanged(self):
+        """Every existing caller consumes a bare tensor positionally."""
+        k = self._kspace()
+        maps = estimate_csm_espirit(k, num_coils=4, acs_size=24)
+        assert isinstance(maps, torch.Tensor)
+        assert maps.shape == (1, 4, 64, 64)
+
+    def test_the_maps_are_identical_either_way(self):
+        """The flag must not perturb the estimate it rides along with."""
+        k = self._kspace()
+        bare = estimate_csm_espirit(k, num_coils=4, acs_size=24)
+        rich = estimate_csm_espirit(k, num_coils=4, acs_size=24, return_subspace=True)
+        assert torch.equal(bare, rich.maps)
+
+    def test_the_shapes_are_what_the_consumer_indexes(self):
+        rich = estimate_csm_espirit(self._kspace(), num_coils=4, acs_size=24, return_subspace=True)
+        assert rich.null_projector.shape == (1, 64, 64, 4, 4)
+        assert rich.leading_eigenvalue.shape == (1, 64, 64)
+        assert torch.is_complex(rich.null_projector)
+        assert not torch.is_complex(rich.leading_eigenvalue)
+
+    def test_the_flag_is_keyword_only(self):
+        """A positional would land on `max_n_keep` and silently change the maps."""
+        with pytest.raises(TypeError):
+            estimate_csm_espirit(self._kspace(), 4, 6, 24, 0.02, 0.95, 0, None, True)
+
+    def test_the_second_eigenvalue_is_reported(self):
+        """The rank-one assumption is checkable, not assumed.
+
+        Where lambda_2 approaches 1 the pixel needs a second ESPIRiT map and its
+        null space is C-2, so the budget's denominator is too large there. The
+        field exists so a consumer can measure that instead of hoping.
+        """
+        rich = estimate_csm_espirit(
+            self._kspace(), num_coils=4, acs_size=24, return_subspace=True
+        )
+        support = rich.leading_eigenvalue >= 0.95
+        assert rich.second_eigenvalue.shape == rich.leading_eigenvalue.shape
+        # eigh returns ascending order, so the second-largest never exceeds the
+        # largest -- a swap here would silently invert every rank verdict.
+        assert (rich.second_eigenvalue <= rich.leading_eigenvalue + 1e-6).all()
+        assert rich.second_eigenvalue[support].mean() < rich.leading_eigenvalue[support].mean()
+
+    def test_the_projector_annihilates_the_leading_eigenvector(self):
+        """The direct statement of what 'null space' means here."""
+        rich = estimate_csm_espirit(self._kspace(), num_coils=4, acs_size=24, return_subspace=True)
+        support = rich.leading_eigenvalue >= 0.95
+        assert support.any(), "phantom produced no in-support pixels -- test is vacuous"
+        maps = rich.maps[0].permute(1, 2, 0).unsqueeze(-1)  # (H, W, C, 1)
+        residual = (rich.null_projector[0] @ maps).squeeze(-1).abs().pow(2).sum(-1)
+        assert residual[support[0]].max() < 1e-6

@@ -162,7 +162,11 @@ from . import (
 
 # Operator-ID (Proposal 1): structured-Gaussian paired likelihood (complex)
 # and unpaired pushforward-MMD (image), registered via @register_loss.
-from .complex import structured_gaussian_nll  # noqa: F401
+# coil_subspace_residual penalises energy off the per-pixel coil manifold.
+from .complex import (  # noqa: F401
+    coil_subspace_residual,
+    structured_gaussian_nll,
+)
 
 # Phase 5: Composed loss classes
 from .composed_loss import ComposedLoss, ConditionalComposedLoss, WeightedLoss

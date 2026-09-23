@@ -61,6 +61,10 @@ _CONSTRUCTION_FIELDS = (
     # the two recorrupted halves, so two runs differing only in alpha are
     # different constructions that no other stamped field distinguishes.
     "r2r_alpha",
+    # Also r2r-only. Two runs differing only in where Sigma_n came from are
+    # different constructions -- the committed matrix is scoped to one M4Raw
+    # study series -- and nothing else stamped would tell them apart.
+    "r2r_covariance_source",
     "nex_target_exclude_input",
     "nex_fallback",
     # One record per slice (depth-1 subjects, one slice read per repetition)

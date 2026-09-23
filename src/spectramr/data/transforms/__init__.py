@@ -8,6 +8,7 @@ from . import foreground_mask_extractor as _foreground_mask_extractor  # noqa: F
 from . import graph_transform as _graph_transform  # noqa: F401
 from . import homomorphic_bias_field as _homomorphic_bias_field  # noqa: F401
 from . import joint_rotation as _joint_rotation  # noqa: F401
+from . import espirit_sensitivity as _espirit_sensitivity  # noqa: F401
 from . import phase_residual as _phase_residual  # noqa: F401
 from . import qmap_ulf_operator_transform as _qmap_ulf_operator_transform  # noqa: F401
 from . import scout_acquisition as _scout_acquisition  # noqa: F401

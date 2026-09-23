@@ -57,6 +57,7 @@ class TestILoggingService:
             "log_info",
             "log_warning",
             "log_error",
+            "log_critical",
             "log_debug",
             "log_images_batch",
             "epoch",
@@ -116,6 +117,15 @@ class TestILoggingService:
                 pass
 
             def log_error(
+                self,
+                message: str,
+                model_type: str = "",
+                epoch: int = -1,
+                extra: dict[str, Any] | None = None,
+            ) -> None:
+                pass
+
+            def log_critical(
                 self,
                 message: str,
                 model_type: str = "",
@@ -630,6 +640,15 @@ class TestInterfaceInheritance:
                 pass
 
             def log_error(
+                self,
+                message: str,
+                model_type: str = "",
+                epoch: int = -1,
+                extra: dict[str, Any] | None = None,
+            ) -> None:
+                pass
+
+            def log_critical(
                 self,
                 message: str,
                 model_type: str = "",

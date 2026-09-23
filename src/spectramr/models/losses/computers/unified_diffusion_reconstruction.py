@@ -7,13 +7,13 @@ Handles diffusion-specific loss computation including:
 - Weighting and scheduling
 """
 
-import inspect
 import logging
 from collections.abc import Mapping
 from typing import Any
 
 import torch
 
+from spectramr.core.coil_map_names import kwargs_accepted_by
 from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
 from spectramr.models.losses.weights import is_loss_configured
 
@@ -87,23 +87,15 @@ def _unwrap_tensor_arg(name: str, value: Any) -> torch.Tensor:
 def _call_safe_loss(
     loss_fn: Any, pred: torch.Tensor, target: torch.Tensor, **kwargs
 ) -> torch.Tensor:
-    """Invokes a loss function safely by filtering available kwargs according to its signature."""
+    """Invoke ``loss_fn`` with the kwargs its signature accepts, coil maps reconciled.
+
+    The filter is ``kwargs_accepted_by``, shared with ``DifferentiableFourierBridge``:
+    a bridged term sits behind a ``**kwargs`` wrapper, so the hop that narrows its
+    kwargs is the bridge, and a filter that reconciled here alone never reached it.
+    """
     pred = _unwrap_tensor_arg("pred", pred)
     target = _unwrap_tensor_arg("target", target)
-
-    if hasattr(loss_fn, "forward"):
-        sig = inspect.signature(loss_fn.forward)
-    else:
-        sig = inspect.signature(loss_fn)
-
-    valid_kwargs = {}
-    has_varkw = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
-
-    for k, v in kwargs.items():
-        if k in sig.parameters or has_varkw:
-            valid_kwargs[k] = v
-
-    return loss_fn(pred, target, **valid_kwargs)
+    return loss_fn(pred, target, **kwargs_accepted_by(loss_fn, kwargs))
 
 
 def _get_config_value(obj: Any, path: str, default: Any = None) -> Any:

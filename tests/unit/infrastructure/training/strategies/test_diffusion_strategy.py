@@ -609,9 +609,13 @@ class TestPreDcFidelity:
     """OPT-IN pre-DC fidelity supervision (DC-blob L1+)."""
 
     @staticmethod
-    def _strategy(training_env, mock_diffusion_config, lam):
+    def _strategy(training_env, mock_diffusion_config, lam, lam_acquired=0.0):
         strategy = DiffusionTrainingStrategy(env=training_env)
         mock_diffusion_config.losses.reconstruction.lambda_pre_dc_kspace = lam
+        # Set explicitly, always. `MagicMock.__float__` returns 1.0, so an
+        # unset weight on this fixture reads as ENABLED rather than as the
+        # schema default -- a landmine for every knob added to this block.
+        mock_diffusion_config.losses.reconstruction.lambda_pre_dc_acquired = lam_acquired
         strategy.config = mock_diffusion_config
         strategy._loss_dict_reuse = {}
         return strategy

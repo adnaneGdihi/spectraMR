@@ -19,6 +19,7 @@ from typing import Any
 from spectramr.config.schemas.campaign import (
     CampaignConfigSchema,
     CampaignExperimentSchema,
+    SlurmDefaultsSchema,
 )
 from spectramr.infrastructure.orchestration.ablation_config_generator import (
     AblationConfigGenerator,
@@ -60,6 +61,7 @@ class CampaignOrchestrator:
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         where: str = "slurm",
+        slurm_overrides: dict[str, Any] | None = None,
     ) -> None:
         """Initialise orchestrator.
 
@@ -80,11 +82,20 @@ class CampaignOrchestrator:
                 (the arm matches if **any** include matches).
             exclude: Same syntax as ``include``; arms matching **any**
                 exclude are dropped.
+            slurm_overrides: SLURM resources to apply on top of the campaign's
+                ``slurm_defaults`` and any per-group/per-arm override. The
+                world size belongs here rather than in the YAML: it is a
+                property of the allocation you have today, and under a sharded
+                strategy it also sets the effective batch (``num_devices`` x
+                ``data.batch_size``, with no world-size LR scaling in-tree), so
+                committing one number to the corpus would fix an optimisation
+                decision on behalf of every future submitter.
         """
         if where not in self._CAMPAIGN_WHERE:
             raise ValueError(
                 f"Unknown campaign --where {where!r}. Choose from {list(self._CAMPAIGN_WHERE)}."
             )
+        self.slurm_overrides = self._validate_slurm_overrides(slurm_overrides)
         self.base_dir = str(Path(base_dir).resolve())
         self.dry_run = dry_run
         self.resume = resume
@@ -93,6 +104,51 @@ class CampaignOrchestrator:
         self.include = list(include or [])
         self.exclude = list(exclude or [])
         self.slurm = SLURMBackend(dry_run=dry_run)
+
+    # ── SLURM resources ──────────────────────────────────────────
+
+    @staticmethod
+    def _validate_slurm_overrides(raw: dict[str, Any] | None) -> dict[str, Any]:
+        """Check keys and types against the schema, and raise on anything else.
+
+        The job-script generator takes a plain dict, so an unrecognised key
+        would be dropped in silence and the submitter would read the absence of
+        an error as the override having applied (pitfall #15). Validating the
+        merged result through ``SlurmDefaultsSchema`` also coerces ``"4"`` to
+        ``4`` and rejects ``gpus=-1``, which argparse's ``key=value`` shape
+        cannot do on its own.
+        """
+        if not raw:
+            return {}
+        allowed = set(SlurmDefaultsSchema.model_fields)
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValueError(
+                f"Unknown SLURM override key(s): {', '.join(unknown)}. "
+                f"Valid keys are {', '.join(sorted(allowed))}."
+            )
+        # Round-trip through the schema so a bad value fails here, on the login
+        # node, rather than as an sbatch rejection per arm.
+        return SlurmDefaultsSchema(**raw).model_dump(include=set(raw))
+
+    def _resolve_slurm_params(
+        self,
+        config: CampaignConfigSchema,
+        *layered: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Campaign defaults, then each *layered* override, then the CLI's.
+
+        One owner for the precedence, because three call sites built it
+        independently and only one of them consulted the per-arm layer
+        (non-negotiable 17). The CLI goes last on purpose: it is the only layer
+        that knows what allocation the submitter actually holds.
+        """
+        params = config.slurm_defaults.model_dump()
+        for layer in layered:
+            if layer:
+                params.update(layer)
+        params.update(self.slurm_overrides)
+        return params
 
     # ── Filtering ────────────────────────────────────────────────
 
@@ -256,9 +312,7 @@ class CampaignOrchestrator:
             exp_output = campaign_dir / name
             exp_output.mkdir(parents=True, exist_ok=True)
 
-            # Merge SLURM params: defaults + overrides
-            slurm_params = config.slurm_defaults.model_dump()
-            slurm_params.update(overrides)
+            slurm_params = self._resolve_slurm_params(config, overrides)
 
             # Resolve test manifest path for auto-inference
             test_manifest_path = None
@@ -403,7 +457,7 @@ class CampaignOrchestrator:
             base_dir=self.base_dir,
             concurrency=config.array_concurrency,
             dispatch_dir=str(campaign_dir / "dispatch"),
-            slurm_params=config.slurm_defaults.model_dump(),
+            slurm_params=self._resolve_slurm_params(config),
             resume=self.resume,
         )
         array_job_id = self.slurm.submit_job(script)
@@ -877,10 +931,9 @@ class CampaignOrchestrator:
                 exp_output = campaign_dir / exp.name
                 exp_output.mkdir(parents=True, exist_ok=True)
 
-                # Merge SLURM params: defaults → group → experiment
-                slurm_params = config.slurm_defaults.model_dump()
-                slurm_params.update(group.slurm_overrides)
-                slurm_params.update(exp.slurm_overrides)
+                slurm_params = self._resolve_slurm_params(
+                    config, group.slurm_overrides, exp.slurm_overrides
+                )
 
                 # Resolve checkpoint_from → config overrides
                 extra_overrides: dict[str, str] | None = None

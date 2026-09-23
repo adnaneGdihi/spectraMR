@@ -129,6 +129,97 @@ The ``ConfigHealthChecker`` validates before GPU allocation. Common fixes:
        channel check and the metric reducer read only the mean channel
 
 
+The reconstruction is a bright lobe over a fine grid texture
+-------------------------------------------------------------
+
+Two separable things are on that picture, and neither is a plot of k-space.
+
+The **grid** is decoder checkerboard — the signature of transposed-convolution
+upsampling in an untrained or barely-trained U-Net. The **lobe** is the network's
+response to an input whose energy is concentrated in one pixel: undersampled
+k-space has a DC value tens of times its own standard deviation, and a
+convolutional stack smears that spike into a blob rather than transforming it.
+
+So the picture says the network was handed **raw k-space where it expected an
+image**, i.e. the adjoint :math:`A^H` never ran. Measured on an untrained
+``standard_unet`` over an R4 phantom:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 22 44
+
+   * - Model input
+     - Output ``|max|``
+     - Energy in the central 32x32
+   * - raw k-space
+     - 32.7
+     - **22.6%**
+   * - :math:`A^H y` (the adjoint image)
+     - 5.0
+     - 8.6%
+   * - *(the phantom itself, for reference)*
+     -
+     - 11.6%
+
+Confirm it from the arm's first ``debug_snapshots/first_steps_*`` entry: if
+``input_raw`` and ``input_prepared`` are identical **and** span a k-space dynamic
+range (``|max|`` in the tens against a ``std`` near 0.2), the adjoint is missing.
+
+Who is supposed to apply it depends on what the model registered:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Registered ``input_domain``
+     - Who applies ``ifft2c``
+   * - ``kspace`` (``complex_unet``, ``unrolled_reconstruction``, ...)
+     - Nobody. The network consumes k-space and the loss should be native to it.
+   * - ``image`` (``standard_unet``, ...)
+     - The strategy, through ``needs_kspace_to_image_bridge``, before ``forward``.
+   * - unannotated
+     - Nobody, deliberately - the bridge is never applied on a guess. Annotate
+       the model's ``@register_model`` capabilities if it needs one.
+
+``physics.data_consistency.enabled`` does **not** control this. It used to, as a
+side effect, which is what produced the picture on the ``self_supervised`` cohort
+(issue #2238); the two decisions are separate owners now.
+
+A related but distinct picture - a black frame with a single saturated pixel at
+the exact centre and nothing else - really *is* k-space drawn as an image, and
+means a previewer or metric IFFT'd one tensor of a pair and not the other.
+
+Every declared loss is weighted to zero and the model never learns
+-------------------------------------------------------------------
+
+Symptom: ``g_total_loss``, ``loss`` and ``final_loss`` are exactly ``0.0`` in
+``run_summary.json`` while the individual component (``l1``, say) is reported
+and non-zero. Two arms differing only in their training target write
+byte-identical validation PNGs, because both are still the initialisation.
+
+Cause: the warm-up gate. ``losses.reconstruction.warmup_losses`` defaults to
+``LEGACY_WARMUP_LOSSES`` — ``l1``, ``perceptual``, ``adversarial``,
+``complex_spatial_gradient``, ``rician_consistency``,
+``background_suppression`` — and ``warmup_iterations`` defaults to **1000**. An
+arm whose only declared loss is one of those, running fewer than 1000
+iterations, trains on a zero-gradient leaf for its entire life.
+
+Declare the gate rather than inheriting it::
+
+    losses:
+      reconstruction:
+        warmup_losses: []
+
+``BaseLossComputer._stack_components`` does detect this and logs
+``[LossComputer] DEAD LOSS: ...`` at ``ERROR`` — but on the module logger, which
+the run's log file does not capture (issue #2239). Check the loss weight the
+arm actually resolves rather than the one it declares::
+
+    from spectramr.models.losses.weights import build_loss_weight_table, resolve_loss_weight
+    table = build_loss_weight_table(config.losses)
+    resolve_loss_weight(table, "l1", scheduled=None, iteration=1)   # 0.0 means gated
+
+
 AMP / NaN Gradient Errors
 ===========================
 

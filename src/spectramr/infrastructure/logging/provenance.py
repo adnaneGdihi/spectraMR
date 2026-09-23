@@ -917,6 +917,26 @@ def collect_run_provenance(
             }
     except Exception:
         _logger.debug("cold-diffusion provenance capture failed", exc_info=True)
+    # The resolved loss objective (non-negotiable 8's third obligation). A weight
+    # is declarable on two surfaces and canonicalised across aliases, so the YAML
+    # does NOT say what the run optimised: `lambda_mse` files under `l2`, an
+    # equal-weight duplicate reconciles into one entry naming both paths, and a
+    # warm-up-gated term resolves to 0.0 for its first N iterations. This stamps
+    # the table the run actually trained against, per term, with the declaration
+    # each weight came from.
+    #
+    # `LossWeightTable.provenance()` has existed since the weight-table work and
+    # its docstring called itself "the stamp written into the run record" while
+    # having no caller outside a unit test -- the advertised-but-unwired shape
+    # pitfall #16 is about, in the mechanism meant to enforce pitfall #15.
+    try:
+        from spectramr.models.losses.weights import build_loss_weight_table
+
+        losses_cfg = getattr(config, "losses", None)
+        if losses_cfg is not None:
+            record["losses"] = build_loss_weight_table(losses_cfg).provenance()
+    except Exception:  # provenance never BLOCKS training; surfaced, not swallowed.
+        _logger.debug("loss-weight provenance capture failed", exc_info=True)
     # Launcher resources (pitfall #15c — when started via ``spectramr launch`` the
     # resolved ResourceSpec is handed to this child via SPECTRAMR_LAUNCH_* env, so
     # the run is traceable to the backend + resources it actually ran under). A

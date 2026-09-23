@@ -64,6 +64,10 @@ import torch
 import torchio as tio
 from torch.utils.data import Dataset
 
+from spectramr.data.datasets.m4raw_identity import (
+    parse_m4raw_file_id,
+    repetition_group_key,
+)
 from spectramr.data.datasets.m4raw_slice_records import expand_to_slice_records, retry_step
 from spectramr.data.io_strategies import read_h5_kspace
 
@@ -152,6 +156,11 @@ _UNIMPLEMENTED_COIL_MODES: frozenset[str] = frozenset({"svd"})
 _VALID_TARGET_MODES: frozenset[str] = frozenset(
     {"complex_mean", "phase_aligned_mean", "rep_pair", "r2r"}
 )
+
+#: Where r2r draws its Sigma_n. 'committed' is the matrix measured on one M4Raw
+#: study series; 'self_calibrated' fits one per scan from its own coil null
+#: space, which needs no second repetition and so costs the arm no excitation.
+_VALID_R2R_COVARIANCE_SOURCES: frozenset[str] = frozenset({"committed", "self_calibrated"})
 #: ``rep_pair`` needs one input repetition and one other; the averaged modes need
 #: two others so leave-one-out still averages (``_MIN_REPS_FOR_LOO``).
 _MIN_REPS_FOR_REP_PAIR: int = 2
@@ -575,6 +584,7 @@ class M4RawRepetitionDataset(Dataset):
         log_scaling: bool = False,
         target_mode: str = "complex_mean",
         r2r_alpha: float = 1.0,
+        r2r_covariance_source: str = "committed",
         nex_target_exclude_input: bool = False,
         nex_fallback: str = "error",
         slice_level_records: bool = False,
@@ -646,8 +656,20 @@ class M4RawRepetitionDataset(Dataset):
         # rather than at iteration 1 in a worker process, where the traceback is
         # a DataLoader crash with no arm in it.
         self.r2r_alpha = float(r2r_alpha)
+        if r2r_covariance_source not in _VALID_R2R_COVARIANCE_SOURCES:
+            raise ValueError(
+                f"[M4Raw] Unknown r2r_covariance_source: {r2r_covariance_source!r}. "
+                f"Valid: {sorted(_VALID_R2R_COVARIANCE_SOURCES)}."
+            )
+        self.r2r_covariance_source = r2r_covariance_source
+        #: Per-scan Sigma_n under 'self_calibrated', keyed by repetition group.
+        #: Sigma_n is a property of the RECEIVE CHAIN, not of a slice, so one fit
+        #: serves every slice of a scan -- which is also what makes the knob
+        #: affordable: the ESPIRiT eigendecomposition behind it costs ~1 s per
+        #: slice on CPU, against `samples_per_volume` draws per volume.
+        self._r2r_cov_cache: dict[str, Any] = {}
         self._r2r_sampler: Any = None
-        if target_mode == "r2r":
+        if target_mode == "r2r" and r2r_covariance_source == "committed":
             from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
 
             self._r2r_sampler = M4RawNoiseSampler(alpha=self.r2r_alpha)
@@ -872,9 +894,10 @@ class M4RawRepetitionDataset(Dataset):
         groups: dict[str, list[Path]] = {}
         for path in h5_files:
             stem = path.name.split(".")[0]  # filename without ANY extensions
-            # <3 chars cannot carry a 2-digit rep suffix -> singleton group.
-            # Otherwise strip the rep number ("01", "02", "03").
-            base = stem if len(stem) < 3 else stem[:-2]
+            # One owner for the rule (m4raw_identity): it was written here as
+            # `stem[:-2]` and again in the manifest generator, and the batch
+            # identity fields were about to add a third copy.
+            base = repetition_group_key(stem)
             if base not in groups:
                 groups[base] = []
             groups[base].append(path)
@@ -1104,7 +1127,52 @@ class M4RawRepetitionDataset(Dataset):
             f"refusing to substitute a zero-filled sample and train on garbage."
         )
 
-    def _recorrupt_r2r(self, kspace: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sampler_for_scan(self, kspace: torch.Tensor, scan_key: str) -> Any:
+        """The R2R sampler for this scan, fitting Sigma_n when self-calibrating.
+
+        Sigma_n describes the RECEIVE CHAIN, not a slice, so one fit serves every
+        slice of a scan and the result is cached per repetition group. That is
+        also what makes the mode affordable: the ESPIRiT eigendecomposition it
+        rests on costs ~1 s per slice on CPU, against `samples_per_volume` draws
+        per volume and several epochs.
+
+        A failed fit RAISES rather than falling back to the committed matrix
+        (pitfall #9): the arm exists to test the self-calibrated draw, and
+        silently serving it the constant would make the comparison vacuous while
+        the YAML still said `self_calibrated`.
+        """
+        if self.r2r_covariance_source == "committed":
+            if self._r2r_sampler is None:  # pragma: no cover - guarded in __init__
+                raise RuntimeError("[M4Raw] r2r requested but no sampler was built.")
+            return self._r2r_sampler
+
+        cached = self._r2r_cov_cache.get(scan_key)
+        if cached is None:
+            from spectramr.infrastructure.physics.coil_noise_fit import (
+                estimate_covariance_from_nullspace,
+            )
+            from spectramr.infrastructure.physics.coil_sensitivity import estimate_csm_espirit
+            from spectramr.infrastructure.physics.fft_ops import ifft2c
+            from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
+
+            coils = kspace.reshape(-1, *kspace.shape[-2:]).unsqueeze(0)
+            subspace = estimate_csm_espirit(
+                coils, num_coils=coils.shape[1], return_subspace=True
+            )
+            covariance = estimate_covariance_from_nullspace(ifft2c(coils), subspace.null_projector)
+            cached = M4RawNoiseSampler(covariance=covariance, alpha=self.r2r_alpha)
+            self._r2r_cov_cache[scan_key] = cached
+            logger.info(
+                "[M4Raw] self-calibrated Sigma_n for scan %s: trace=%.4g over %d coils",
+                scan_key,
+                float(covariance.diagonal().real.sum()),
+                int(covariance.shape[0]),
+            )
+        return cached
+
+    def _recorrupt_r2r(
+        self, kspace: torch.Tensor, scan_key: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Split ONE acquired repetition into an R2R ``(input, target)`` pair.
 
         ``input = y + alpha*z``, ``target = y - z/alpha`` with
@@ -1128,8 +1196,6 @@ class M4RawRepetitionDataset(Dataset):
         recorruption across epochs (which is the point -- it is an augmentation
         over the noise, not a fixed second copy).
         """
-        if self._r2r_sampler is None:  # pragma: no cover - guarded in __init__
-            raise RuntimeError("[M4Raw] r2r requested but no sampler was built.")
         if kspace.dim() < 3:
             raise ValueError(
                 f"[M4Raw] r2r needs at least (C, H, W) k-space, got {tuple(kspace.shape)}."
@@ -1141,7 +1207,7 @@ class M4RawRepetitionDataset(Dataset):
                 "(the whole k-space is zero). Recorrupting it would train on noise "
                 "alone."
             )
-        return self._r2r_sampler.recorrupt(kspace, support_mask=support)
+        return self._sampler_for_scan(kspace, scan_key).recorrupt(kspace, support_mask=support)
 
     def _note_loo_declined(self, n_reps: int) -> None:
         """Report that the leave-one-out NEX gate declined, once per rep count.
@@ -1267,7 +1333,11 @@ class M4RawRepetitionDataset(Dataset):
                 #     match Sigma_n;
                 #   * with ~24 % of phase-encode columns zero-filled, image-space
                 #     noise is spatially correlated, so it cannot be drawn there.
-                input_kspace, target_kspace = self._recorrupt_r2r(input_kspace)
+                # Keyed on the GROUP, not the slice: Sigma_n is a receive-chain
+                # property, so one fit per scan serves every slice of it.
+                input_kspace, target_kspace = self._recorrupt_r2r(
+                    input_kspace, scan_key=str(rep_paths[0].parent / rep_paths[0].stem[:-2])
+                )
             elif self.use_repetitions and len(kspace_reps) > 1:
                 # Leave-one-out only when it leaves >=2 reps to average (>=3
                 # total); with exactly 2 reps LOO would yield a single noisy
@@ -1340,6 +1410,16 @@ class M4RawRepetitionDataset(Dataset):
             )
             subject["contrast_idx"] = torch.tensor(contrast_idx, dtype=torch.long)
             subject["file_id"] = rep_paths[0].stem
+            # The identities latent in that name, made explicit. `subject_id` is
+            # the INDEPENDENCE unit a risk certificate needs: two contrasts of
+            # one patient share an anatomy, so counting them separately inflates
+            # n (#1707). On this corpus the Hoeffding half-width is 0.0100 per
+            # slice, 0.0693 per repetition group and 0.1200 per subject -- a
+            # certificate built on the wrong unit reads 12x tighter than it is.
+            _identity = parse_m4raw_file_id(rep_paths[0].stem)
+            subject["subject_id"] = _identity.subject
+            subject["repetition_group"] = _identity.repetition_group
+            subject["repetition_index"] = _identity.repetition
             # The contrast NAME, beside the index. `contrast_idx` alone forces
             # every consumer to carry a copy of the 0=T1/1=T2/2=FLAIR mapping,
             # and the per-case CSV writer is a generic reporting component that
@@ -1494,6 +1574,11 @@ class M4RawRepetitionDataset(Dataset):
         # and stacked automatically by ImageCollateStrategy
         subject["contrast_idx"] = torch.tensor(contrast_idx, dtype=torch.long)
         subject["file_id"] = target_paths[0].stem
+        # See the single-contrast branch: `subject_id` is the independence unit.
+        _identity = parse_m4raw_file_id(target_paths[0].stem)
+        subject["subject_id"] = _identity.subject
+        subject["repetition_group"] = _identity.repetition_group
+        subject["repetition_index"] = _identity.repetition
         # The TARGET contrast: what this sample is reconstructed *into*. The
         # source side is T1 by construction for every federated pair, so naming
         # it here would label all of them "T1" and make the column useless.

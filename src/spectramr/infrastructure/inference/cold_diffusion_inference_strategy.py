@@ -14,7 +14,7 @@ from spectramr.config.schemas.enums import TrainingModeTypes
 from spectramr.core.module_utils import unwrap_model
 from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
 from spectramr.infrastructure.physics.coil_sensitivity import (
-    estimate_smaps,
+    estimate_smaps_calibrated,
     prepare_smaps_for_kspace_conditioning,
     resolve_estimation_settings,
 )
@@ -365,30 +365,17 @@ class ColdDiffusionInferenceStrategy(BaseInferenceStrategy):
             # ``physics.coil_processing.estimation`` a silent no-op at sampling
             # time (non-negotiable 8 / pitfall #15) -- 59 of the 95 cold-
             # diffusion arms declare that block and one of them asks for
-            # ``espirit``.  ``acs_only=True`` binds harder here than in
+            # ``espirit``.  The ACS confinement binds harder here than in
             # validation: validation calibrates from the fully-sampled
             # reference, while sampling only ever sees the undersampled input,
-            # so the aliased periphery must be cropped off before calibration.
+            # so the aliased periphery must be excluded before calibration.
             _method, _est_kwargs = resolve_estimation_settings(self.config)
-            smaps = estimate_smaps(
+            smaps = estimate_smaps_calibrated(
                 acs_kspace_t,
                 method=_method,
-                acs_only=True,
+                out_size=(h, w),
                 **_est_kwargs,
-            ).detach()
-
-            rss = torch.sqrt((smaps.abs() ** 2).sum(dim=1, keepdim=True) + 1e-8)
-            smaps = smaps / rss
-
-            # Resize if needed
-            if smaps.shape[-2:] != (h, w):
-                smaps_r = torch.nn.functional.interpolate(
-                    smaps.real, size=(h, w), mode="bilinear", align_corners=False
-                )
-                smaps_i = torch.nn.functional.interpolate(
-                    smaps.imag, size=(h, w), mode="bilinear", align_corners=False
-                )
-                smaps = torch.complex(smaps_r, smaps_i)
+            )
 
             # Domain translation
             if not torch.is_complex(x_t) and torch.is_complex(smaps):

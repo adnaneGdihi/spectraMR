@@ -31,6 +31,9 @@ class MockLoggingService(ILoggingService):
     def log_error(self, msg: str):
         pass
 
+    def log_critical(self, msg: str):
+        pass
+
     def log_warning(self, msg: str):
         pass
 

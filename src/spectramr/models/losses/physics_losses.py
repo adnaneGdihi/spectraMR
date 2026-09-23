@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.core.coil_map_names import kwargs_accepted_by
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c, sense_forward
 from spectramr.models.losses.registry import register_loss
 
@@ -1785,26 +1786,10 @@ class DifferentiableFourierBridge(nn.Module):
             img_pred = img_pred * spatial_mask
             img_target = img_target * spatial_mask
 
-        # Filter kwargs to only those accepted by the spatial_loss_fn
-        import inspect
-
-        try:
-            if hasattr(self.spatial_loss_fn, "forward"):
-                sig = inspect.signature(self.spatial_loss_fn.forward)
-            else:
-                sig = inspect.signature(self.spatial_loss_fn)
-
-            valid_kwargs = {}
-            for k, v in kwargs.items():
-                if k in sig.parameters or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                ):
-                    valid_kwargs[k] = v
-        except Exception:
-            valid_kwargs = kwargs
-
-        # Compute the loss; gradients will backpropagate through the iFFT to k_pred
-        return self.spatial_loss_fn(img_pred, img_target, **valid_kwargs)
+        # The builder's wrapper forwards everything, so this is the hop that narrows
+        # kwargs to the inner loss, and the one that must re-file the coil maps.
+        accepted = kwargs_accepted_by(self.spatial_loss_fn, kwargs)
+        return self.spatial_loss_fn(img_pred, img_target, **accepted)
 
 
 @register_loss(name="background_suppression", aliases=["BackgroundSuppressionLoss"])

@@ -761,3 +761,91 @@ def test_checkpoint_without_rng_state_still_loads(tmp_path) -> None:
         .with_pipeline(_rng_pipeline())
     )
     assert loaded.load_from(str(path)) is True
+
+
+# ── cleanup_old_checkpoints is deprecated ────────────────────────────────────
+# It has no callers and is not the retention policy the corpus configures, so
+# the warning is the only thing standing between a future caller and a SECOND
+# retention policy that cannot see keep_best_n (#1972 / #1973).
+
+
+def _touch_epoch_checkpoints(tmp_path: Path, n: int) -> Path:
+    """`n` checkpoints in the director's own filename format, oldest first."""
+    ckpt_dir = tmp_path / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    for epoch in range(n):
+        (ckpt_dir / f"checkpoint_epoch_{epoch:04d}_step_{epoch * 1000:06d}.pt").touch()
+    return ckpt_dir
+
+
+def _director_at(tmp_path: Path) -> CheckpointDirector:
+    return CheckpointDirector(MagicMock()).with_checkpoint_dir(str(tmp_path / "checkpoints"))
+
+
+def test_cleanup_old_checkpoints_warns_that_it_is_deprecated(tmp_path: Path) -> None:
+    """The planted call must turn the warning red, or it guards nothing (NN15)."""
+    _touch_epoch_checkpoints(tmp_path, 5)
+
+    with pytest.warns(DeprecationWarning, match="cleanup_old_checkpoints is deprecated"):
+        _director_at(tmp_path).cleanup_old_checkpoints(keep_last_n=3)
+
+
+def test_cleanup_old_checkpoints_names_the_owner_it_defers_to(tmp_path: Path) -> None:
+    """A deprecation that does not say what to use instead sends people nowhere."""
+    _touch_epoch_checkpoints(tmp_path, 2)
+
+    with pytest.warns(DeprecationWarning) as caught:
+        _director_at(tmp_path).cleanup_old_checkpoints(keep_last_n=1)
+
+    message = str(caught[0].message)
+    assert "CheckpointService._apply_retention_policy" in message
+    assert "keep_best_n" in message
+
+
+def test_cleanup_old_checkpoints_still_keeps_the_last_n(tmp_path: Path) -> None:
+    """Deprecating it must not quietly change what a surviving caller gets."""
+    ckpt_dir = _touch_epoch_checkpoints(tmp_path, 5)
+
+    with pytest.warns(DeprecationWarning):
+        removed = _director_at(tmp_path).cleanup_old_checkpoints(keep_last_n=3)
+
+    assert removed == 2
+    survivors = sorted(p.name for p in ckpt_dir.glob("checkpoint_epoch_*.pt"))
+    assert survivors == [
+        "checkpoint_epoch_0002_step_002000.pt",
+        "checkpoint_epoch_0003_step_003000.pt",
+        "checkpoint_epoch_0004_step_004000.pt",
+    ]
+
+
+def test_cleanup_old_checkpoints_with_keep_zero_removes_nothing(tmp_path: Path) -> None:
+    """Pins the edge the docstring names: `checkpoints[:-0]` is `checkpoints[:0]`.
+
+    So "keep the last 0" silently means "keep all" -- the opposite of what the
+    argument reads as. Asserted rather than fixed, because fixing it would make
+    a dead method safer to call and the point is that it should not be called.
+    """
+    ckpt_dir = _touch_epoch_checkpoints(tmp_path, 4)
+
+    with pytest.warns(DeprecationWarning):
+        removed = _director_at(tmp_path).cleanup_old_checkpoints(keep_last_n=0)
+
+    assert removed == 0
+    assert len(list(ckpt_dir.glob("checkpoint_epoch_*.pt"))) == 4
+
+
+def test_cleanup_old_checkpoints_has_no_production_callers() -> None:
+    """The premise of the deprecation. If this fails, the warning now fires on a
+    real run and the message must be revisited before the call is accepted."""
+    src = Path("src/spectramr")
+    # The defining module is excluded: it names the method in its own signature,
+    # docstring and deprecation message, none of which is a call.
+    definer = src / "infrastructure/builders/directors/checkpoint_director.py"
+    callers = [
+        f"{path}:{n}"
+        for path in src.rglob("*.py")
+        if path != definer
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "cleanup_old_checkpoints(" in line
+    ]
+    assert callers == [], f"cleanup_old_checkpoints gained a production caller: {callers}"

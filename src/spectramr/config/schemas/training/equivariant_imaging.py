@@ -82,6 +82,23 @@ class TrainingConfigEquivariantImaging(BaseModel):
         ge=1,
         description="Number of coils (degrees of freedom L) for the nc-χ noise floor.",
     )
+    multicoil_operator: bool = Field(
+        default=False,
+        description=(
+            "Use the multi-coil forward operator A = M F S (sense_forward) "
+            "instead of the coil-combined A = M F. EI exists to recover what a "
+            "single A leaves unidentifiable, so the operator decides whether "
+            "the arm has a problem to solve: built explicitly at R=4 on a "
+            "16-pixel line, the physical signal set has 12 of 16 directions "
+            "unidentifiable through one virtual coil and 0 of 16 through four "
+            "physical ones (condition number 34.7). The reconstructed image is "
+            "the coil-COMBINED one either way -- the coils enter only through "
+            "the operator -- so the model and the group action are unchanged. "
+            "Requires complex coil sensitivities in the batch (the "
+            "`espirit_sensitivity` transform supplies them) and raises without "
+            "them rather than silently reverting to the single-coil operator."
+        ),
+    )
     split_seed: int = Field(
         default=0,
         ge=0,

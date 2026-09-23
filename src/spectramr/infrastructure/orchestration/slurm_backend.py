@@ -482,10 +482,16 @@ echo ""
 # v6.2 PR-14: when the per-arm parallel block requests >1 GPU, dispatch
 # through torchrun so FSDP / DDP land on every rank. Single-GPU path is
 # unchanged.
+#
+# The multi-rank verb is `train-distributed`, NOT `train`: `train` never calls
+# `setup_distributed`, so no process group exists and every group-requiring
+# strategy raises out of `_require_process_group` during `adopt` -- at Stage B,
+# after the model and the data are already built. `launcher.py` fixed the same
+# defect in its own emitter; this was the copy that kept it (#2228).
 NUM_GPUS={params["gpus"]}
 NUM_NODES={params["nodes"]}
 if [[ "${{NUM_GPUS}}" -gt 1 || "${{NUM_NODES}}" -gt 1 ]]; then
-    TRAIN_CMD="torchrun --nproc_per_node=${{NUM_GPUS}} --nnodes=${{NUM_NODES}} --rdzv_backend=c10d --rdzv_endpoint=${{SLURMD_NODENAME:-127.0.0.1}}:29500 -m spectramr.cli train --config \\"{config_path}\\"{resume_flag}{output_override}{extra_overrides}"
+    TRAIN_CMD="torchrun --nproc_per_node=${{NUM_GPUS}} --nnodes=${{NUM_NODES}} --rdzv_backend=c10d --rdzv_endpoint=${{SLURMD_NODENAME:-127.0.0.1}}:29500 -m spectramr.cli train-distributed --config \\"{config_path}\\"{resume_flag}{output_override}{extra_overrides}"
 else
     export CUDA_VISIBLE_DEVICES=0
     TRAIN_CMD="python -m spectramr.cli train --config \\"{config_path}\\"{resume_flag}{output_override}{extra_overrides}"

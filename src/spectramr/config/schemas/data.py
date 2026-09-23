@@ -3588,6 +3588,24 @@ class DataConfigSchema(BaseModel):
             "target, alpha>1 the reverse."
         ),
     )
+    r2r_covariance_source: Literal["committed", "self_calibrated"] = Field(
+        default="committed",
+        description=(
+            "Where data.target_mode='r2r' gets the Sigma_n it draws from. Read "
+            "ONLY under that mode. 'committed' (default) uses the matrix in "
+            "m4raw_noise.py, which scopes itself to 7 subjects from one M4Raw "
+            "study series and warns that receiver gain may differ elsewhere -- "
+            "and R2R's decorrelation Cov(y + a*z, y - z/a) = Sigma_n - Sigma_z "
+            "is exact only where the two match, so every arm inherits that "
+            "scope. 'self_calibrated' fits Sigma_n per scan from that scan's own "
+            "coil null space, where a physical image is rank one and the "
+            "residual is pure noise, and needs no second repetition. Measured "
+            "against a known Sigma on synthetic 4-coil data: ~1% relative "
+            "Frobenius error and unbiased from 0.5x to 2x the committed noise "
+            "level, degrading to ~22% with a 13% high bias at 4x, where ESPIRiT's "
+            "own maps blur and the null space starts to contain signal."
+        ),
+    )
     nex_target_exclude_input: bool = Field(
         default=False,
         description=(
@@ -3624,6 +3642,14 @@ class DataConfigSchema(BaseModel):
         """
         if isinstance(data, dict):
             mode = data.get("target_mode")
+            if mode != "r2r" and "r2r_covariance_source" in data:
+                raise ValueError(
+                    "data.r2r_covariance_source is read only under "
+                    "data.target_mode='r2r' (it selects the Sigma_n that mode "
+                    f"draws from); declaring it with target_mode={mode!r} states a "
+                    "calibration choice nothing acts on (non-negotiable 8). Remove "
+                    "it, or set target_mode: r2r."
+                )
             if mode != "r2r" and "r2r_alpha" in data:
                 raise ValueError(
                     "data.r2r_alpha is read only under data.target_mode='r2r' (it "

@@ -379,3 +379,80 @@ class TestDeclarationsOutrankLegacyTables:
             physics=None,
         )
         assert infer_output_domain(cfg) == "image"
+
+
+class TestTheKspaceToImageBridgeHasAnOwner:
+    """``needs_kspace_to_image_bridge`` answers "must the strategy apply A^H?".
+
+    Until it existed the answer rode on ``use_dc``, so a k-space arm over a plain
+    U-Net with no DC layer got raw k-space into its ``forward`` and rendered the
+    DC-spike blob (``ei_unet_m4raw_r4``, cluster run 2026-09-20).
+    """
+
+    @staticmethod
+    def _cfg(model_type: str, *, dataset_type: str = "kspace", coil_mode: str = "none"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model=SimpleNamespace(model_type=model_type),
+            data=SimpleNamespace(
+                dataset_type=dataset_type,
+                processing=SimpleNamespace(enable_kspace_normalization=True),
+                coils=SimpleNamespace(processing_mode=coil_mode),
+            ),
+            physics=None,
+        )
+
+    def test_an_image_domain_model_over_a_kspace_loader_needs_it(self):
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("standard_unet")) is True
+
+    def test_a_kspace_native_model_does_not(self):
+        """``complex_unet`` declares ``input_domain='kspace'`` — the n2n backbone."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("complex_unet")) is False
+
+    def test_an_unannotated_model_is_not_guessed_at(self):
+        """443 of 593 registered models declare no ``input_domain``; "nobody said"
+        must not resolve to "image"."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("varnet")) is False
+
+    def test_an_image_domain_coil_mode_vetoes_it(self):
+        """``rss_image`` IFFTs inside the dataset's TorchIO chain, so the batch is
+        already an image even though ``dataset_type`` still reads kspace."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        cfg = self._cfg("standard_unet", coil_mode="rss_image")
+        assert needs_kspace_to_image_bridge(cfg) is False
+
+    def test_loader_serves_kspace_is_the_one_owner_the_visualiser_also_reads(self):
+        """Three call sites recomputed this predicate inline from the same four
+        leaves. One owner, so they cannot drift (non-negotiable 17)."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            loader_serves_kspace,
+            needs_ifft_for_visualization,
+        )
+
+        for coil_mode in ("none", "rss_image"):
+            cfg = self._cfg("standard_unet", coil_mode=coil_mode)
+            assert needs_ifft_for_visualization(cfg)[1] is loader_serves_kspace(cfg)

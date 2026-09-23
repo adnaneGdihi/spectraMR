@@ -15,7 +15,7 @@ import torch.nn as nn
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.component_signature import signature_contract
 from spectramr.domain.exceptions import ConfigurationError
-from spectramr.models.losses.registry import LossRegistry, create_loss
+from spectramr.models.losses.registry import LossRegistry, create_loss, get_loss_capabilities
 
 from .base import Builder
 
@@ -65,6 +65,7 @@ STRATEGY_MANAGED_LOSSES: frozenset[str] = frozenset(
         # was verified, not because it looked unbuilt (#9: a declared exemption,
         # never a silent fallback).
         "pre_dc_kspace",  # strategies/diffusion.py:2593 — `lam > 0.0` then inline
+        "pre_dc_acquired",  # same site, the acquired-bin half — `lam > 0.0` then inline
         "cycle_adv",  # strategies/cycle_bloch_strategy.py:212 — losses.gan.lambda_cycle_adv
         "cycle_bloch",  # strategies/cycle_bloch_strategy.py:211 — losses.gan.lambda_cycle_bloch
     }
@@ -718,6 +719,44 @@ class LossBuilder(Builder):
                         f"not `config:` — LossComponentConfig is extra='ignore', "
                         f"so a `config:` block is silently dropped (issue #468)."
                     )
+
+                # Reject the ZERO bridge, the complement of the guard above. That
+                # one catches a tensor transformed twice; this one catches a loss
+                # that expects an image, sits in a list the builder does not
+                # bridge, and does not bridge itself — so nothing transforms
+                # anything and it reads raw k-space as if it were anatomy. The
+                # symptom is identical to the double bridge: finite values, no
+                # raise, a green run measuring nothing it advertises.
+                #
+                # Only under ``output_domain: kspace``, because that is the one
+                # combination where ``bridge_mode == "none"`` leaves a k-space
+                # tensor; with an image or complex-image output the unbridged
+                # tensor is already what the loss wants.
+                if bridge_mode == "none" and output_domain == "kspace":
+                    caps = get_loss_capabilities(name)
+                    registered_domain = getattr(
+                        getattr(caps, "domain", None), "value", getattr(caps, "domain", None)
+                    )
+                    declared_image = kwargs.get("input_domain") == "image"
+                    if (
+                        declared_image or registered_domain == "image"
+                    ) and not getattr(loss_fn, "use_fourier_bridge", False):
+                        why = (
+                            "kwargs declare input_domain: image"
+                            if declared_image
+                            else f"it is registered domain='{registered_domain}'"
+                        )
+                        raise ConfigurationError(
+                            f"Loss '{name}' expects an IMAGE ({why}) but is declared "
+                            f"under a loss list that adds no bridge for "
+                            f"output_domain='kspace', and it does not bridge itself "
+                            f"(use_fourier_bridge is False) — it would receive raw "
+                            f"k-space and score it as an image. Declare '{name}' under "
+                            f"losses.image_losses (bridge 'ifft_magnitude') or "
+                            f"losses.complex_losses (bridge 'ifft_complex'), or set "
+                            f"kwargs: {{input_domain: kspace}} if it really is meant to "
+                            f"read k-space and bridge itself."
+                        )
 
                 if bridge_mode == "ifft_magnitude":
                     loss_fn = _BridgedLoss(loss_fn, return_complex=False)

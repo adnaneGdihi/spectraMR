@@ -50,7 +50,9 @@ repos:
         #   - the conventional local name for a strategy instance across
         #     tests/unit/infrastructure/training/strategies/ (144 occurrences in
         #     the 30 files issue #1918 touched alone).
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat"]
+        # `gool` is Luc Van Gool, a co-author on the SwinIR paper every arm
+        # citing that backbone names; codespell reads the surname as "ghoul".
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat,gool"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint

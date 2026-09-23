@@ -140,6 +140,40 @@ Planted violations for both live in
 ``tests/unit/infrastructure/validation/test_config_health_checker_loss_ssot_2026_09.py``
 and ``tests/unit/infrastructure/training/builders/test_loss_builder_unmigrated_guard_2026_09.py``.
 
+Under hard DC the plane has two halves, and both need a term
+-------------------------------------------------------------
+
+``dc_method: hard`` replaces the prediction with the measurement at every
+acquired bin — ``(1 - M) * prediction + M * measurement`` — so
+``d(output)/d(prediction)`` is exactly ``(1 - M)`` and **every post-DC term is a
+constant on the acquired bins**. Two strategy-inline weights in
+``losses.reconstruction`` partition what is left, and neither has a list form
+(``DiffusionTrainingStrategy._add_pre_dc_fidelity`` reads both directly):
+
+``lambda_pre_dc_kspace``
+   L1 between the generator's **pre-DC** prediction and the target, weighted by
+   ``(1 - M)``. Without a mask it degrades to a uniform ``mean|pre_dc - target|``,
+   which is the only gradient the terminal ``t = 0`` rung receives.
+
+``lambda_pre_dc_acquired``
+   The same L1 weighted by ``M`` itself. It exists because nothing else scores
+   those bins at all, and they are the only place the target is *knowable* from
+   the input — which makes them the only place the output scale and the
+   inter-coil phase relationship can be learned. In the null band the L1 optimum
+   is ~0 and the phase of a near-zero prediction is undefined.
+
+Leaving the second off is visible as a scale deficit. ``pred_target_optimal_gain``
+— the scalar minimising :math:`\lVert a\,\hat{x} - x \rVert` — ran **1.070 to
+1.840** (median 1.238) across 45 arm-by-rung points of the ``kspace_filling``
+cohort with no arm below 1.0, tracking ``null_band_energy_deficit`` at
+**r = +0.909**. Note that ``pred_target_scale_ratio`` is a *peak* ratio and reads
+in-band on the same runs; use the gain and ``pred_target_energy_ratio`` instead.
+
+``None`` means different things for the two, deliberately: the null-band term
+falls back to the uniform L1, and the acquired-band term stands down and stamps
+``pre_dc_acquired_l1 = 0.0``, because a uniform L1 there would silently
+duplicate its sibling over the whole plane.
+
 The GAN block's ``enable_`` flags gate their weights
 ----------------------------------------------------
 
@@ -823,6 +857,95 @@ Computes L1 error in the SENSE-adjoint image domain:
 .. math::
 
    \mathcal{L} = \left\| \sum_c S_c^* \cdot \mathcal{F}^{-1}(y_c) - \hat{x} \right\|_1
+
+The matched-filter adjoint above returns :math:`\left(\sum_c |S_c|^2\right) m`
+rather than :math:`m`, so on a *fidelity* term it weights the image by the coil
+intensity profile — a spatial weight nobody chose, which varies per subject.
+Measured on shaded maps, one identical perturbation costs **11.1x** more where
+the array is sensitive than where it is not. ``kwargs: {normalize: true}``
+divides the shading out through ``coil_combine_sense``, the owner of that divide
+and of the support floor it needs, and takes that ratio to **1.00**:
+
+.. math::
+
+   \mathcal{L}_{\text{Roemer}} = \left\|
+     \frac{\sum_c S_c^* \mathcal{F}^{-1}(\hat{y}_c)}{\sum_c |S_c|^2}
+   - \frac{\sum_c S_c^* \mathcal{F}^{-1}(y_c)}{\sum_c |S_c|^2} \right\|_1
+
+It defaults to ``false``: flipping it moves the loss on every declaring arm, so
+it is opted into per-arm and the recipe stays visible in the config. Outside the
+object :math:`\sum_c |S_c|^2 \to 0`, so ``min_support_frac`` (default ``1e-2``,
+a fraction of that map's own spatial maximum) caps the noise amplification —
+without it a dead strip in the maps reaches 557.6 against 3.07.
+
+.. note::
+
+   The loss bridges from k-space itself (``use_fourier_bridge=True``), so it
+   must be declared under ``losses.kspace_losses``, where the builder adds no
+   second bridge. A list whose bridge mode is not ``none`` raises at
+   construction rather than iFFT-ing twice.
+
+
+Coil Subspace Residual Loss
+---------------------------
+
+**Registry name:** ``coil_subspace_residual`` — **Alias:** ``coil_null_residual``
+— **Class:** ``CoilSubspaceResidualLoss`` — **Domain:** ``complex_image``
+
+Penalises reconstruction energy no coil combination could have produced. A
+physical multi-coil image is rank one in coil space, :math:`x_c = S_c m`, so its
+component along any direction orthogonal to :math:`S` is exactly zero:
+
+.. math::
+
+   \mathcal{L}_{\mathrm{coil}} =
+     \frac{\sum_c w_c \lVert P_c^{\perp} \hat{x}_c \rVert^2}{\sum_c w_c},
+   \qquad P_c^{\perp} = I - \hat{s}_c \hat{s}_c^{H}
+
+With four coils that is **six of eight** real degrees of freedom per pixel, and
+nothing else in a k-space recipe constrains them: ``sense_adjoint_l1``
+supervises the single on-manifold direction and is blind to the orthogonal
+complement, while ``complex_l1`` penalises off-manifold error exactly as much as
+on-manifold error. The penalty is identically zero on every realisable image, so
+unlike a regulariser it cannot trade against fidelity — it has gradient only
+where the reconstruction put energy the array cannot reach.
+
+It names its maps ``coil_sensitivities``, not ``smaps``, and declares no
+``**kwargs``. Every hop that narrows a loss's kwargs to its signature —
+``_call_safe_loss``, and the ``DifferentiableFourierBridge`` the builder puts in
+front of each ``complex_losses`` term — goes through
+``core.coil_map_names.kwargs_accepted_by``, which re-files maps held under any of
+the five aliases as the one the term declares. A strategy therefore sends one
+spelling; the term raises only when no maps arrive at all. Declare it under
+``losses.complex_losses`` with
+``kwargs: {input_domain: image}`` — ``kspace`` there sets its own
+``use_fourier_bridge`` and trips the double-bridge guard.
+
+.. _coil-axis-precondition:
+
+Both coil-domain terms require dim 1 to BE the coil axis
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``coil_subspace_residual`` and ``sense_adjoint_l1`` both read the channel axis
+as coils and pair it against the sensitivity maps. On a cross-contrast arm that
+axis carries something else: ``model.model_kwargs.prior_channel_range: [0, 8]``
+makes channels 0–7 a fully-sampled prior contrast and 8–15 the target, so 16
+channels are *two contrasts* × 4 coils × (real, imag) — eight apparent coils
+against four maps. Both terms raise there:
+
+.. code-block:: text
+
+   sense_adjoint_l1        RuntimeError: size of tensor a (8) must match b (4) at dim 1
+   coil_subspace_residual  ValueError: prediction (1, 8, H, W) and maps (1, 4, H, W)
+                           disagree; the projector is per-pixel and per-coil
+
+``sense_adjoint_l1`` does slice ``smaps[:, :pred_coils]``, but that handles only
+the opposite mismatch — a model emitting *fewer* coils than the maps. Neither
+term slices the target contrast out of a prior-carrying tensor, so an arm with a
+prior channel range declares the rest of the k-space recipe and leaves these two
+off (``experiment_cross_contrast_kspace_diffusion``). Giving them a
+target-channel slice would make them declarable there; until then the exclusion
+is a precondition, not an oversight.
 
 
 Helmholtz PDE Loss (PINN CSM)

@@ -36,6 +36,10 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "metadata.baseline",
         "metadata.negative_result_plan",
         "metadata.secondary_metrics",
+        # Read as a pair with `metadata.baseline`, already exempt above: it names
+        # the direction the hypothesis predicts ('comparable' / 'ceiling' /
+        # 'floor'), so it differs by construction wherever the arms differ at all.
+        "metadata.expected_outcome",
         "metadata.audit_waivers",
         "metadata.tags.type",
         "metadata.tags.domain",
@@ -44,6 +48,10 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "training.input_domain",
         "training.output_domain",
         "training.output_dir",
+        # The equivariance-ablation factor. At 0 the objective reduces exactly to
+        # measurement-consistency-only reconstruction, which is the control the
+        # self_supervised cohort is read against; the treatment sets 1.0.
+        "training.equivariant_imaging.alpha_equivariance",
         "training.diffusion.degradation",
         "training.diffusion.enforce_output_range",
         "training.diffusion.enable_proximal_dc",
@@ -78,6 +86,15 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "data.domain.output",
         "data.collation.log_strategy_selection",
         "data.collation",
+        # The NEX-target ablation factor. Before these two the list carried three
+        # `data.*` paths and none was a target mode, so no repetition-target
+        # ablation could pass however cleanly it was built -- the n2n cohort
+        # varies exactly these and was reported as three spurious diffs.
+        # `r2r_alpha` rides with it: it is read only under `target_mode: r2r`, so
+        # it is absent on every arm that does not select that mode.
+        "data.target_mode",
+        "data.r2r_alpha",
+        "data.r2r_covariance_source",
         "acceleration.center_fraction",
         "acceleration.min_center_fraction",
         "metrics.transform",

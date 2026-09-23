@@ -16,6 +16,8 @@ lives behind the ``@pytest.mark.integration`` marker (none yet).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from spectramr.infrastructure.orchestration.slurm_backend import JobStatus, SLURMBackend
@@ -234,6 +236,53 @@ class TestGenerateJobScript:
         # Multi-GPU branch uses torchrun.
         assert "torchrun" in out
         assert "--nproc_per_node=" in out
+
+    @staticmethod
+    def _train_cmd(script: str, *, torchrun: bool) -> str:
+        """The one ``TRAIN_CMD=`` line for the requested branch.
+
+        Both branches are emitted into every script -- the selection is a bash
+        ``if`` on ``NUM_GPUS`` at run time, not a generator-side choice -- so a
+        bare ``in out`` assertion reads the wrong branch's text and passes
+        whatever the other one says. That is precisely how the
+        ``cli train``-under-torchrun defect stayed green (#2228): the multi-rank
+        case asserted only that the word ``torchrun`` appeared somewhere.
+        """
+        lines = [ln for ln in script.splitlines() if "TRAIN_CMD=" in ln]
+        picked = [ln for ln in lines if ("torchrun" in ln) is torchrun]
+        assert len(picked) == 1, f"expected one branch, got {picked}"
+        return picked[0]
+
+    def test_the_multi_rank_branch_launches_train_distributed(self) -> None:
+        """#2228: ``train`` never calls ``setup_distributed``.
+
+        Under torchrun that spelling leaves every rank without a process group,
+        so a DeepSpeed/DDP/FSDP arm builds its model and data and only then
+        raises out of ``_require_process_group`` at Stage B.
+        """
+        cmd = self._train_cmd(self._script(slurm_params={"gpus": 4}), torchrun=True)
+        assert "-m spectramr.cli train-distributed --config" in cmd
+        # The planted spelling: `cli train` followed by anything but `-distributed`.
+        assert not re.search(r"cli train(?!-distributed)", cmd), cmd
+
+    def test_multi_node_takes_the_same_branch_as_multi_gpu(self) -> None:
+        """The second shape of the same rule: ``nodes > 1`` at one GPU each."""
+        cmd = self._train_cmd(
+            self._script(slurm_params={"gpus": 1, "nodes": 2}), torchrun=True
+        )
+        assert "-m spectramr.cli train-distributed --config" in cmd
+
+    def test_the_single_process_branch_keeps_the_plain_train_verb(self) -> None:
+        """Not a copy of the rule above -- its inverse.
+
+        One process with no rendezvous genuinely wants ``train``;
+        ``train-distributed`` there would call ``setup_distributed`` with no
+        launcher behind it. Pinning both directions is what stops a fix to one
+        branch being pasted over the other.
+        """
+        cmd = self._train_cmd(self._script(slurm_params={"gpus": 1}), torchrun=False)
+        assert "python -m spectramr.cli train --config" in cmd
+        assert "train-distributed" not in cmd
 
     def test_single_gpu_uses_canonical_cli_entrypoint(self) -> None:
         out = self._script()

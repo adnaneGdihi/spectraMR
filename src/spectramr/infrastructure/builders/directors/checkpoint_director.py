@@ -8,6 +8,7 @@ Handles model state, optimizer state, and scheduler state persistence.
 import logging
 import os
 import shutil
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -901,33 +902,54 @@ class CheckpointDirector(DirectorBuilder[Path | CheckpointState]):
             logger.error(f"Failed to load checkpoint: {e}")
             raise RuntimeError(f"Failed to load checkpoint: {e}") from e
 
-    def _resolve_monitor_metric(self) -> str:
-        """Resolve the run's monitor metric name from config (best-effort).
-
-        Tries ``metrics.best_metric_name`` → ``early_stopping.metric`` →
-        ``validation.primary_metric``, defaulting to ``loss``.
-        """
-        cfg = self._config
-        for section, field in (
-            ("metrics", "best_metric_name"),
-            ("early_stopping", "metric"),
-            ("validation", "primary_metric"),
-        ):
-            block = getattr(cfg, section, None)
-            value = getattr(block, field, None)
-            if isinstance(value, str) and value:
-                return value
-        return "loss"
+    # `_resolve_monitor_metric` was deleted here, not wired. It had zero callers
+    # and the WRONG precedence: it tried `metrics.best_metric_name` before
+    # `early_stopping.metric`, so wiring it -- the obvious repair for an inert
+    # knob -- would have silently flipped the selection metric on the 75 arms
+    # where the two disagree, and defaulted the rest to a magic "loss" that is
+    # not a registered metric name. The one owner of checkpoint selection is
+    # `early_stopping.metric`, resolved by `EarlyStoppingService` and consumed
+    # at `training_loop.py`'s `save_best` (non-negotiable 17).
 
     def cleanup_old_checkpoints(self, keep_last_n: int = 3) -> int:
-        """Remove old checkpoints, keeping only the last n.
+        """Deprecated. Remove old checkpoints, keeping only the last n.
+
+        **Nothing calls this**, and it is not the retention policy the corpus
+        configures. `checkpoint.keep_last_n` / `keep_best_n` are read by
+        :meth:`CheckpointService._apply_retention_policy`, which is the one
+        owner (non-negotiable 17) -- this method takes `keep_last_n` as an
+        argument and so cannot see either knob. Wiring it here would create a
+        second retention policy rather than fix the first: it keeps by filename
+        recency only, where the service protects the most-recent `keep_last_n`
+        **union** the best `keep_best_n` by recorded metric, so a run switched
+        to this one would start deleting its own best checkpoints.
+
+        Why it is deprecated rather than deleted: the director is the primary
+        writer on the training path, and a retention method on it reads as the
+        one that runs. That both retention paths are currently dead is #1972 /
+        #1973, and whichever fix those take should have one owner at the end of
+        it, not three.
 
         Args:
-            keep_last_n: Number of recent checkpoints to keep
+            keep_last_n: Number of recent checkpoints to keep. **`0` removes
+                nothing**, because `checkpoints[:-0]` is `checkpoints[:0]`, the
+                empty list -- so "keep zero" silently means "keep all". The
+                service's policy has no such edge: it builds a protected set
+                rather than slicing a complement.
 
         Returns:
             Number of checkpoints removed
         """
+        warnings.warn(
+            "CheckpointDirector.cleanup_old_checkpoints is deprecated and has no "
+            "callers. Checkpoint retention is owned by "
+            "CheckpointService._apply_retention_policy, which reads "
+            "checkpoint.keep_last_n and checkpoint.keep_best_n; this method reads "
+            "neither and keeps by filename recency alone. See #1972 and #1973 for "
+            "why neither path currently prunes on a normal run.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not self._checkpoint_dir:
             return 0
 

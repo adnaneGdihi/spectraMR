@@ -782,8 +782,8 @@ class TestAccessorReadPathsAreTheExecutedReadSet:
     def test_the_static_export_equals_the_executed_read_set(self):
         leaves = _leaf_fields()
         lambdas = [p for p, _ in leaves if len(p) == 2 and p[1].startswith("lambda_")]
-        assert len(lambdas) == 106, (
-            f"expected 106 lambda_* leaves, walked {len(lambdas)}. A section typed "
+        assert len(lambdas) == 107, (
+            f"expected 107 lambda_* leaves, walked {len(lambdas)}. A section typed "
             "`X | None` has no `.model_fields`, so a permissive walk silently "
             "enumerates zero and every verdict below becomes vacuous."
         )
@@ -847,7 +847,7 @@ class TestAccessorReadPathsAreTheExecutedReadSet:
             "accessor_read_paths() -- an UNDER-claim leaves a real read invisible to "
             "the reachability gate:\n  " + "\n  ".join(sorted(read - static))
         )
-        assert len(read) == len(static) == 112
+        assert len(read) == len(static) == 113
 
     def test_paths_are_keyed_full_not_by_leaf(self):
         """A leaf-keyed map would call 54 stage-scoped paths consumed.

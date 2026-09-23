@@ -29,9 +29,9 @@ sensing theorems) requires :math:`A` to break the group symmetry, which the
 ``ei_sensing_margin`` audit enforces. Corner case: ``alpha_equivariance == 0``
 reduces this to a measurement-consistency reconstruction.
 
-This strategy assumes a single (coil-combined) complex forward operator
-:math:`A = M F`; multi-coil EI (:math:`A = M F S` via ``sense_forward``) is a
-future extension.
+:math:`A = M F` by default, :math:`A = M F S` under ``multicoil_operator`` --
+:mod:`spectramr.infrastructure.physics.multicoil_ei_operator` owns that choice
+and the identifiability measurement behind it.
 """
 
 from __future__ import annotations
@@ -44,6 +44,10 @@ import torch
 
 from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.infrastructure.physics.group_actions import GroupAction, get_group_action
+from spectramr.infrastructure.physics.multicoil_ei_operator import (
+    MulticoilEIOperator,
+    interleaved_to_complex,
+)
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.reconstruction import (
     ReconstructionTrainingStrategy,
@@ -52,11 +56,6 @@ from spectramr.models.losses.equivariant_recon_loss import EquivariantSSLReconLo
 from spectramr.models.losses.sure_n2self_losses import GSUREKspaceLoss
 
 logger = logging.getLogger(__name__)
-
-
-def _to_complex_image(x: torch.Tensor) -> torch.Tensor:
-    """Coerce a real image to complex (zero imaginary part); pass complex through."""
-    return x if x.is_complex() else torch.complex(x, torch.zeros_like(x))
 
 
 def equivariant_imaging_branches(
@@ -132,6 +131,7 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
         self.robust = bool(cfg.robust_correction)
         self.noise_model = str(cfg.noise_model)
         self.n_coils = int(cfg.n_coils)
+        self.multicoil_operator = bool(cfg.multicoil_operator)
         self.noise_std = cfg.noise_std_estimate
 
         group_kwargs: dict[str, Any] = {}
@@ -211,6 +211,17 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
             self._owned_ei_loss = EquivariantSSLReconLoss(norm="l2")
         return self._owned_ei_loss
 
+    def _prepare_generator_inputs(
+        self, batch_context: dict[str, Any], input_batch: torch.Tensor, *, validation: bool = False
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Apply A^H = S^H F^H M when this arm inverts the multi-coil operator."""
+        mc = MulticoilEIOperator.resolve(
+            self.multicoil_operator, batch_context, batch_context.get("mask")
+        )
+        if mc is not None:
+            input_batch, batch_context = mc.prepare(batch_context, input_batch)
+        return super()._prepare_generator_inputs(batch_context, input_batch, validation=validation)
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor,
@@ -232,8 +243,8 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
 
         mask_c = mask if mask.is_complex() else mask.to(torch.complex64)
 
-        def forward_op(x: torch.Tensor) -> torch.Tensor:
-            return mask_c * fft2c(_to_complex_image(x))
+        mc = MulticoilEIOperator.resolve(self.multicoil_operator, batch_context, mask_c)
+        forward_op = mc.forward if mc else (lambda x: mask_c * fft2c(interleaved_to_complex(x)))
 
         def reconstruct(kspace: torch.Tensor) -> torch.Tensor:
             bc = dict(batch_context)
@@ -267,6 +278,8 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
 
         assert x_hat_ref is not None  # loop runs at least once
         a_xhat = forward_op(x_hat_ref)
+        # One representation before subtracting; broadcasting them is not the anchor.
+        y = interleaved_to_complex(y)
         if self.robust:
             assert self._gsure is not None
             consistency = self._gsure(a_xhat, y)

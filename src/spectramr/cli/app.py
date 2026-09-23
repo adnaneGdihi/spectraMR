@@ -1251,15 +1251,29 @@ def campaign_submit(args: argparse.Namespace) -> int:
     # --only is a comma-separated list. --include / --exclude are repeatable
     # `key=value` selectors (key in {name, role, tag.<key>}).
     only = [s for raw in (args.only or []) for s in raw.split(",") if s]
-    orchestrator = CampaignOrchestrator(
-        base_dir=base_dir,
-        dry_run=args.dry_run,
-        resume=args.resume,
-        only=only,
-        include=args.include or [],
-        exclude=args.exclude or [],
-        where=getattr(args, "where", "slurm") or "slurm",
-    )
+    # --slurm is `key=value`, repeatable. Split once from the left so a value
+    # containing '=' survives; the orchestrator owns key/type validation.
+    slurm_overrides: dict[str, str] = {}
+    for raw in getattr(args, "slurm", None) or []:
+        if "=" not in raw:
+            logger.error(f"Invalid --slurm {raw!r}: expected 'key=value' form.")
+            return 1
+        key, value = raw.split("=", 1)
+        slurm_overrides[key.strip()] = value.strip()
+    try:
+        orchestrator = CampaignOrchestrator(
+            base_dir=base_dir,
+            dry_run=args.dry_run,
+            resume=args.resume,
+            only=only,
+            include=args.include or [],
+            exclude=args.exclude or [],
+            where=getattr(args, "where", "slurm") or "slurm",
+            slurm_overrides=slurm_overrides,
+        )
+    except ValueError as e:
+        logger.error(f"Campaign submission failed: {e}")
+        return 1
     try:
         state = orchestrator.submit_campaign(str(args.config))
         print(state.summary_table())
@@ -2750,6 +2764,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="key=value",
         help="Exclude selector (same syntax as --include; repeatable).",
+    )
+    cs.add_argument(
+        "--slurm",
+        action="append",
+        default=None,
+        metavar="key=value",
+        help=(
+            "SLURM resource override (repeatable), applied on top of the "
+            "campaign's slurm_defaults and any per-arm override: e.g. "
+            "--slurm gpus=4 --slurm cpus_per_task=32. Keys are the "
+            "slurm_defaults fields (partition, time, mem, cpus_per_task, "
+            "gpus, nodes, ntasks, mail_type); an unknown key raises. Set "
+            "gpus here rather than in the YAML — under a sharded strategy "
+            "the world size also sets the effective batch."
+        ),
     )
     cs.set_defaults(func=campaign_submit)
 

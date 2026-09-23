@@ -176,3 +176,29 @@ def test_gradients_flow_through_the_single_bridge(
     assert k_pred.grad is not None
     assert torch.isfinite(k_pred.grad).all()
     assert k_pred.grad.abs().sum() > 0
+
+
+class _SpyLoss(torch.nn.Module):
+    """Records what the bridge hands it; names only ``coil_sensitivities``."""
+
+    def forward(self, pred, target, coil_sensitivities=None):
+        self.received = coil_sensitivities
+        return pred.abs().mean()
+
+
+def test_the_bridge_refiles_the_coil_maps_for_its_inner_loss() -> None:
+    """The bridge is the hop that narrows kwargs to a bridged term.
+
+    The builder's wrapper forwards ``**kwargs`` untouched, so the diffusion
+    strategy's ``smaps`` reaches the bridge intact; a bridge that filtered on the
+    inner signature without reconciling dropped it, and the coil barrier bound
+    ``None`` on every kspace_filling arm.
+    """
+    maps = torch.randn(SHAPE, dtype=torch.complex64)
+    spy = _SpyLoss()
+    bridge = DifferentiableFourierBridge(spatial_loss_fn=spy, return_complex=True)
+    kspace = torch.randn(SHAPE[0], 2 * COILS, SHAPE[2], SHAPE[3])
+
+    bridge(kspace, kspace, smaps=maps, timesteps=torch.zeros(SHAPE[0]))
+
+    assert spy.received is maps

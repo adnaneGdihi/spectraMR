@@ -406,3 +406,123 @@ def test_sense_adjoint_l1_bridge_flag_off_skips_the_internal_ifft() -> None:
         once(img_pred, img_target, smaps=smaps),
         twice(img_pred, img_target, smaps=smaps),
     )
+
+
+# ---------------------------------------------------------------------------
+# SENSEAdjointL1Loss(normalize=...) — the shading is a spatial weight on a
+# fidelity term, and nobody chose it.
+#
+# A^H returns (sum_c |S_c|^2) * m, so the SAME error costs less where the array
+# is less sensitive. That is a per-subject, per-slice reweighting of a
+# data-fidelity term. `normalize` divides it out through `coil_combine_sense`,
+# the owner of that divide and of the support floor it needs.
+# ---------------------------------------------------------------------------
+
+
+def _sense_phantom(seed: int = 0):
+    """``(k_target, smaps, m)`` with deliberately SHADED maps (not unit RSS)."""
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    torch.manual_seed(seed)
+    b, c, s = 2, 4, 16
+    m = torch.randn(b, 1, s, s, dtype=torch.complex64)
+    maps = torch.randn(b, c, s, s, dtype=torch.complex64)
+    maps = maps / maps.abs().pow(2).sum(1, keepdim=True).sqrt()
+    maps = maps * (0.3 + 0.7 * torch.rand(b, 1, s, s))
+    return fft2c(maps * m), maps, m
+
+
+def test_normalize_defaults_off_so_declaring_arms_do_not_move():
+    """68 cohort arms plus 6 elsewhere declare this term; the default is the
+    pre-change matched filter, bit-for-bit."""
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+    k, maps, _ = _sense_phantom()
+    assert SENSEAdjointL1Loss().normalize is False
+    got = SENSEAdjointL1Loss().eval()(k, k, smaps=maps)
+    expected = torch.nn.functional.l1_loss(
+        torch.view_as_real((ifft2c(k) * maps.conj()).sum(1, keepdim=True)),
+        torch.view_as_real((ifft2c(k) * maps.conj()).sum(1, keepdim=True)),
+    )
+    assert torch.equal(got, expected)
+
+
+def test_the_adjoint_weights_the_same_error_by_where_it_lands():
+    """The planted defect, stated as a measurement: one identical perturbation,
+    two locations, and the loss differs by the coil intensity ratio."""
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    k, maps, m = _sense_phantom()
+    support = (maps.abs() ** 2).sum(1, keepdim=True)
+    weak = support.flatten(2).argmin(-1)
+    strong = support.flatten(2).argmax(-1)
+
+    def perturbed(idx):
+        d = torch.zeros_like(m)
+        for b in range(m.shape[0]):
+            d[b, 0].view(-1)[idx[b, 0]] = 0.5
+        return fft2c(maps * (m + d))
+
+    adjoint = SENSEAdjointL1Loss().eval()
+    lo = float(adjoint(perturbed(weak), k, smaps=maps))
+    hi = float(adjoint(perturbed(strong), k, smaps=maps))
+    assert hi > 3 * lo, f"expected a strong shading, got {hi / lo:.2f}x"
+
+
+def test_normalize_removes_that_weighting():
+    """The fix, stated as the same measurement: the ratio goes to one."""
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    k, maps, m = _sense_phantom()
+    support = (maps.abs() ** 2).sum(1, keepdim=True)
+    weak = support.flatten(2).argmin(-1)
+    strong = support.flatten(2).argmax(-1)
+
+    def perturbed(idx):
+        d = torch.zeros_like(m)
+        for b in range(m.shape[0]):
+            d[b, 0].view(-1)[idx[b, 0]] = 0.5
+        return fft2c(maps * (m + d))
+
+    roemer = SENSEAdjointL1Loss(normalize=True).eval()
+    lo = float(roemer(perturbed(weak), k, smaps=maps))
+    hi = float(roemer(perturbed(strong), k, smaps=maps))
+    assert abs(hi / lo - 1.0) < 0.05, f"expected parity, got {hi / lo:.3f}x"
+
+
+def test_normalize_is_zero_on_an_exact_match_and_differentiable():
+    import torch
+
+    k, maps, _ = _sense_phantom()
+    pred = k.clone().requires_grad_(True)
+    loss = SENSEAdjointL1Loss(normalize=True).eval()
+    assert float(loss(k, k, smaps=maps)) < 1e-6
+    loss(pred + 0.1, k, smaps=maps).backward()
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+
+
+def test_the_support_floor_is_reachable_from_the_yaml_kwargs():
+    """``min_support_frac`` is the knob that stops out-of-support air noise from
+    becoming the dominant term; an unread knob here would be pitfall #15."""
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+
+    k, maps, _m = _sense_phantom()
+    dead = maps.clone()
+    dead[..., :4, :] *= 1e-4
+    noisy = fft2c(ifft2c(k) + 0.01 * torch.randn_like(k))
+
+    floored = float(SENSEAdjointL1Loss(normalize=True).eval()(noisy, k, smaps=dead))
+    unprotected = float(
+        SENSEAdjointL1Loss(normalize=True, min_support_frac=0.0).eval()(noisy, k, smaps=dead)
+    )
+    assert unprotected > 5 * floored, (unprotected, floored)

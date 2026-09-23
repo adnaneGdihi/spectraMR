@@ -748,6 +748,29 @@ class LoggingService(ILoggingService):
             epoch=epoch,
         )
 
+    def log_critical(
+        self,
+        message: str,
+        model_type: str = "",
+        epoch: int = -1,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Log a critical message.
+
+        The fifth rung of a ladder whose other four already delegate to :meth:`log`;
+        ``"critical"`` was in ``_SUPPORTED_LEVELS`` and ``_level_map`` from the start
+        and only this wrapper was missing, so callers reached for a method that was
+        never defined (#2254).
+        """
+
+        self.log(
+            "critical",
+            message,
+            extra=extra,
+            model_type=model_type,
+            epoch=epoch,
+        )
+
     def log_debug(
         self,
         message: str,

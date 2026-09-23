@@ -40,8 +40,10 @@ help:
 	@echo "make eda-quick   - Dataset EDA with a small sample budget (2/dataset)"
 	@echo "make eda-dataset - Dataset EDA for a subset (DATASETS='id1 id2 ...')"
 	@echo "make gate        - Run the blocking PR lane locally (PASS/FAIL/UNRUNNABLE)"
-	@echo "make diagnostics      - Refresh diagnostics bundles (md summary + fresh forensics png)"
-	@echo "make diagnostics-fast - Refresh diagnostics bundles, logs/audit/metrics only (no forensics)"
+	@echo "make diagnostics      - Every diagnostic pass + the compiled bundle"
+	@echo "                        (snapshots, mosaics, forensics, Tier-0/1 audit, Tier-2 probe)"
+	@echo "make diagnostics-fast - Same minus the slow passes (no forensics/probe/mosaic)"
+	@echo "                        Selectors: ROOT=<tree> OUT=<bundle> COHORT='vf kspace_filling'"
 
 # Activate .venv when it exists (local dev) and stay silent when it does not (CI).
 # A hosted runner has no .venv, and an unconditional `. .venv/bin/activate &&` kills
@@ -248,21 +250,24 @@ eda-clean:
 	@echo "Cleaning EDA results..."
 	rm -rf experiments/results
 
-# Diagnostics bundles: tests_experiments/diagnostics (local dispatch) +
-# <cluster>_diagnostics (downloaded cluster tree, if present). `diagnostics`
-# always re-renders forensics (contact-sheet PNGs) so the md+png are current;
-# `diagnostics-fast` skips the (slower) image pass and only refreshes
-# logs/audit/run_summary/validation_metrics evidence. See
-# docs/validation_image_audit.rst#diagnostics_targetable_tree.
-#
-# Invoked by its own executable path (shebang-resolved by the kernel), NOT
-# `bash <path>` — the .env-loading block above mangles Make's exported PATH
-# for recipe shells (a pre-existing bug: `include .env` parses .env's bash
-# `export VAR=$(pwd)` syntax as Make syntax, where `$(pwd)`/`$VAR` mean
-# something different, corrupting PATH to "ART_TOOLBOX_PATH:ATH"), so a bare
-# `bash` lookup fails inside a recipe even though PATH looks fine outside `make`.
+# Diagnostics bundles. `diagnostics` runs every pass; `diagnostics-fast` drops
+# the three slow ones (forensics, Tier-2 probe, validation mosaic). Both are
+# invoked by the script's own executable path, NOT `bash <path>`: the .env block
+# above corrupts the PATH Make exports to recipe shells, so a bare `bash` lookup
+# fails inside a recipe even though PATH looks fine outside `make`.
+# See docs/validation_image_audit.rst#diagnostics_make_targets.
+
+# Empty by default, so a bare `make diagnostics` still refreshes the known trees.
+# COHORT takes inprogress names or aliases, resolved by scripts/cohort_membership.py.
+#   make diagnostics ROOT=sabine_tests_experiments OUT=sabine_diagnostics
+#   make diagnostics-fast COHORT="mamba geomamba"
+ROOT ?=
+OUT ?=
+COHORT ?=
+DIAG_ARGS := $(if $(ROOT),--root $(ROOT)) $(if $(OUT),--out $(OUT)) $(if $(COHORT),--cohort $(COHORT))
+
 diagnostics:
-	./scripts/ci/refresh_diagnostics.sh
+	./scripts/ci/refresh_diagnostics.sh $(DIAG_ARGS)
 
 # --- developer-loop health checks -------------------------------------------
 # Both are cheap, local, and exit non-zero on a finding, so they compose:
@@ -314,7 +319,7 @@ gate:
 	@$(PYTHON) scripts/ci/run_required_locally.py $(GATE_ARGS)
 
 diagnostics-fast:
-	./scripts/ci/refresh_diagnostics.sh --no-forensics
+	./scripts/ci/refresh_diagnostics.sh --no-forensics --no-probe --no-mosaic $(DIAG_ARGS)
 
 # Install cubical persistent homology + Wasserstein-2 backends
 # (gudhi, POT) used by the GeoMamba-ULF topology losses.

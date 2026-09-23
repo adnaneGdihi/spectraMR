@@ -150,6 +150,20 @@ class ReconstructionLossesConfig(CompatSchema):
         ge=0,
         description="Pre-DC k-space L1 fidelity weight (DC-blob L1+; 0 disables)",
     )
+    # Its sibling, on the ACQUIRED bins. The plainer name above is the
+    # null-band term -- `_add_pre_dc_fidelity` masks it with `_unsampled_weight`
+    # -- so under `dc_method: hard` NOTHING scores the bins the scanner
+    # measured: hard DC makes d(output)/d(prediction) exactly (1 - M), which
+    # zeroes every post-DC term there too. The acquired bins are the only place
+    # the target is knowable from the input, so they are where the output scale
+    # and the inter-coil phase relationship are learnable at all; in the null
+    # band the L1 optimum is ~0 and phase is undefined. Default 0.0 keeps every
+    # arm that does not declare it bit-for-bit unchanged.
+    lambda_pre_dc_acquired: float = Field(
+        default=0.0,
+        ge=0,
+        description="Pre-DC k-space L1 on the ACQUIRED bins (calibration anchor; 0 disables)",
+    )
 
     # ==================== PERCEPTUAL LOSSES ====================
     enable_perceptual: bool = Field(default=False, description="Enable perceptual (VGG) loss")

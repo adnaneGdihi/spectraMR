@@ -530,3 +530,206 @@ def test_deepcompile_and_torch_compile_are_not_both_on(arm: Path) -> None:
         f"{_arm_id(arm)}: optimization.compile and parallel.deepspeed.compile "
         "are both enabled. Pick one — DeepCompile must own the engine graph."
     )
+
+
+@pytest.mark.skipif(not _ARMS, reason="kspace_filling cohort not present")
+@pytest.mark.parametrize("arm", _ARMS, ids=[_arm_id(a) for a in _ARMS])
+def test_null_space_content_is_enabled_cohort_wide(arm: Path) -> None:
+    """The null-band term is a loss-recipe axis, so it moves on every arm at once.
+
+    Under ``dc_method: hard`` the measurement replaces the prediction at every
+    acquired bin, so every post-DC term is a constant there and
+    ``lambda_pre_dc_kspace`` is masked to ``(1 - M)`` as well. This term is the
+    cohort's only weighted supervision of the unobserved bins. An arm that
+    silently keeps it off is not a control -- it is a second axis inside a
+    shootout whose contract is one axis, and the resulting numbers are
+    unattributable rather than merely different.
+
+    It is asserted through the resolved weight table, not the YAML key: a
+    declared ``enabled: true`` that resolves to weight 0.0 reads as on and
+    trains as off (pitfall 15).
+    """
+    cfg = yaml.safe_load(arm.read_text()) or {}
+    entries = ((cfg.get("losses") or {}).get("kspace_losses")) or []
+    declared = [e for e in entries if isinstance(e, dict) and e.get("name") == "null_space_content"]
+    if not declared:
+        pytest.skip(f"{_arm_id(arm)} does not declare null_space_content")
+
+    assert declared[0].get("enabled") is True, (
+        f"{_arm_id(arm)}: null_space_content is declared but switched off while "
+        "its cohort siblings carry it."
+    )
+    table = build_loss_weight_table(LossConfigSchema(**cfg["losses"]))
+    entry = table.get("null_space_content")
+    assert entry is not None, f"{_arm_id(arm)}: enabled but absent from the weight table"
+    assert float(entry.weight) > 0.0, (
+        f"{_arm_id(arm)}: null_space_content resolves to weight {entry.weight} -- "
+        "declared on, trains off."
+    )
+
+
+@pytest.mark.skipif(not _ARMS, reason="kspace_filling cohort not present")
+@pytest.mark.parametrize("arm", _ARMS, ids=[_arm_id(a) for a in _ARMS])
+def test_the_coil_manifold_barrier_is_enabled_cohort_wide(arm: Path) -> None:
+    """Same axis argument as the null-band term, one dimension over.
+
+    ``sense_adjoint_l1`` supervises the single on-manifold direction and is blind
+    to its 3-D orthogonal complement; ``complex_l1`` sees all four coils but
+    penalises off-manifold error exactly as much as on-manifold error. This is
+    the only term that couples the channels, so an arm that keeps it off is a
+    second axis inside a one-axis shootout.
+
+    ``input_domain: image`` is asserted, not assumed: the loss sets
+    ``use_fourier_bridge`` from it, and under ``output_domain: kspace`` the
+    ``complex_losses`` bridge is ``ifft_complex``, so ``kspace`` would trip the
+    builder's double-bridge guard at construction.
+    """
+    cfg = yaml.safe_load(arm.read_text()) or {}
+    losses = cfg.get("losses") or {}
+    entries = losses.get("complex_losses") or []
+    declared = [
+        e for e in entries if isinstance(e, dict) and e.get("name") == "coil_subspace_residual"
+    ]
+    if not declared:
+        pytest.skip(f"{_arm_id(arm)} does not declare coil_subspace_residual")
+
+    entry = declared[0]
+    assert entry.get("enabled") is True, f"{_arm_id(arm)}: declared but switched off"
+    assert (entry.get("kwargs") or {}).get("input_domain") == "image", (
+        f"{_arm_id(arm)}: input_domain must be 'image' under complex_losses, or the "
+        "builder's double-bridge guard raises at construction."
+    )
+    table = build_loss_weight_table(LossConfigSchema(**losses))
+    resolved = table.get("coil_subspace_residual")
+    assert resolved is not None and float(resolved.weight) > 0.0, (
+        f"{_arm_id(arm)}: resolves to {resolved} -- declared on, trains off."
+    )
+
+
+@pytest.mark.skipif(not _ARMS, reason="kspace_filling cohort not present")
+@pytest.mark.parametrize("arm", _ARMS, ids=[_arm_id(a) for a in _ARMS])
+def test_the_acquired_band_anchor_is_enabled_cohort_wide(arm: Path) -> None:
+    """Every arm that supervises the null band must also anchor the acquired one.
+
+    The two are complementary halves of one plane: under hard DC the null-band
+    term is all the gradient there is, and it is masked away from the only bins
+    where the target is knowable from the input. An arm carrying one and not the
+    other is training on half the plane with no scale reference.
+    """
+    cfg = yaml.safe_load(arm.read_text()) or {}
+    recon = ((cfg.get("losses") or {}).get("reconstruction")) or {}
+    if "lambda_pre_dc_kspace" not in recon:
+        pytest.skip(f"{_arm_id(arm)} carries a different pre-DC recipe")
+
+    assert float(recon.get("lambda_pre_dc_acquired", 0.0)) > 0.0, (
+        f"{_arm_id(arm)}: declares lambda_pre_dc_kspace={recon['lambda_pre_dc_kspace']} "
+        "on the unobserved bins but nothing on the acquired ones, where hard DC "
+        "leaves d(output)/d(prediction) == 0 for every other term."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 cross-contrast objective fence.
+#
+# ``experiment_cross_contrast_kspace_diffusion`` was the one LIVE arm in the
+# cohort still on the pre-#2220 recipe: its resolved table held three terms
+# against the cohort's fourteen, so neither the null-space supervision (#2220)
+# nor the acquired-band anchor (#2244) ever reached it. It was brought onto the
+# cohort objective, MINUS the two coil-domain terms -- and that subtraction is
+# the fragile half, because it reads as an oversight rather than as a fact
+# about the arm's channel axis. The second test below states the fact.
+# ---------------------------------------------------------------------------
+
+_CROSS_CONTRAST = _COHORT / "experiment_cross_contrast_kspace_diffusion.yaml"
+
+#: What the arm must share with the cohort reference, weight for weight. The
+#: two coil-domain terms are absent by measurement, not by preference; `l2` is
+#: the arm's own diffusion objective and has no counterpart in the reference.
+_CROSS_CONTRAST_SHARED_WEIGHTS = {
+    "bloch_residual": 0.0,
+    "complex_l1": 1.0,
+    "complex_spatial_gradient": 1.0,
+    "hfen": 0.3,
+    "log_spectral": 0.1,
+    "null_space_content": 0.25,
+    "perceptual": 0.0,
+    "physics_constraint": 0.0,
+    "pre_dc_acquired": 0.5,
+    "pre_dc_kspace": 0.3,
+    "snr_preserving": 0.0,
+    "sobolev_kspace": 0.05,
+}
+
+
+@pytest.mark.skipif(not _CROSS_CONTRAST.exists(), reason="cross-contrast arm not present")
+def test_cross_contrast_resolves_the_cohort_objective() -> None:
+    """The arm trains on the cohort's terms, at the cohort's weights.
+
+    Asserted on the RESOLVED table rather than on the YAML keys: the weight is
+    declarable on two surfaces and canonicalised across aliases, so a key being
+    present is not evidence that the term trains at that number.
+    """
+    losses = (yaml.safe_load(_CROSS_CONTRAST.read_text()) or {}).get("losses") or {}
+    table = build_loss_weight_table(LossConfigSchema(**losses))
+    for name, expected in sorted(_CROSS_CONTRAST_SHARED_WEIGHTS.items()):
+        entry = table.get(name)
+        assert entry is not None, (
+            f"cross_contrast: '{name}' is not in the resolved weight table -- the arm "
+            "has fallen back off the cohort objective."
+        )
+        assert float(entry.weight) == pytest.approx(expected), (
+            f"cross_contrast: '{name}' resolves to {float(entry.weight)}, cohort weight "
+            f"is {expected}."
+        )
+
+
+@pytest.mark.skipif(not _CROSS_CONTRAST.exists(), reason="cross-contrast arm not present")
+def test_the_coil_domain_terms_cannot_run_on_the_cross_contrast_layout() -> None:
+    """Why ``sense_adjoint_l1`` and ``coil_subspace_residual`` are absent there.
+
+    ``prior_channel_range: [0, 8]`` makes channels 0-7 the fully-sampled T1
+    prior and 8-15 the target contrast, so the 16 channels are TWO CONTRASTS x
+    4 coils x (real, imag) -- not 8 coils. Both terms read dim 1 as the coil
+    axis, so both raise against this arm's 4 sensitivity maps.
+
+    This asserts the mechanism in both directions: red if the losses start
+    accepting the layout (then the exclusion is stale and the arm should get
+    them back), and red if they stop scoring the cohort's own 8-channel layout
+    (then the exclusion has been misattributed). Pinning only the absence would
+    catch neither.
+    """
+    torch = pytest.importorskip("torch")
+    from spectramr.models.losses.registry import create_loss
+
+    cfg = yaml.safe_load(_CROSS_CONTRAST.read_text()) or {}
+    model_kwargs = (cfg.get("model") or {}).get("model_kwargs") or {}
+    assert model_kwargs.get("prior_channel_range") == [0, 8], (
+        "the prior no longer occupies channels 0-7; re-derive whether the coil "
+        "terms can run before trusting this exclusion."
+    )
+    n_ch = int((cfg.get("model") or {}).get("out_channels"))
+    n_coils = int(model_kwargs.get("num_physical_coils"))
+
+    smaps = torch.randn(1, n_coils, 16, 16, dtype=torch.complex64)
+    terms = {
+        "sense_adjoint_l1": (create_loss("sense_adjoint_l1", normalize=True), "smaps"),
+        "coil_subspace_residual": (
+            create_loss("coil_subspace_residual", input_domain="image", weight_by_support=True),
+            "coil_sensitivities",
+        ),
+    }
+    for name, (fn, kw) in terms.items():
+        with pytest.raises((RuntimeError, ValueError)):
+            fn(
+                torch.randn(1, n_ch, 16, 16),
+                torch.randn(1, n_ch, 16, 16),
+                **{kw: smaps},
+            )
+        # ...and the same call scores on the cohort's own layout, so the raise
+        # above is about THIS arm's channel axis and not about the loss.
+        value = fn(
+            torch.randn(1, n_coils * 2, 16, 16),
+            torch.randn(1, n_coils * 2, 16, 16),
+            **{kw: smaps},
+        )
+        assert torch.isfinite(value), f"{name} did not score the {n_coils}-coil layout"

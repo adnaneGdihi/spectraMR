@@ -17,6 +17,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.utils.repo_scripts import require_repo_file
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -75,8 +77,20 @@ def test_missing_tree_is_skipped_not_fatal() -> None:
     downloaded — the wrapper must not abort when it (or, in principle,
     tests_experiments) is absent."""
     text = _script().read_text()
-    assert '-d "${REPO_ROOT}/${root}"' in text
+    assert '-d "${root_abs}"' in text
     assert "set -e" not in text, "must not hard-abort on a missing optional tree"
+
+
+def test_an_absolute_root_is_not_prefixed_with_the_repo_root() -> None:
+    """A downloaded tree lives wherever rsync put it. Prefixing REPO_ROOT at
+    every use turned ``--out /tmp/x`` into ``<repo>/tmp/x`` -- the bundle was
+    written, just not where it was asked for."""
+    text = _script().read_text()
+    assert "abspath()" in text
+    assert '/*) printf \'%s\' "$1" ;;' in text
+    body = text.split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    assert '"${REPO_ROOT}/${root}' not in body
+    assert '"${REPO_ROOT}/${out}' not in body
 
 
 def test_no_forensics_flag_skips_the_image_pass() -> None:
@@ -108,9 +122,129 @@ def test_forensics_script_path_is_overridable() -> None:
 
 def test_makefile_wires_diagnostics_targets() -> None:
     text = MAKEFILE.read_text()
-    assert "diagnostics:\n\t./scripts/ci/refresh_diagnostics.sh\n" in text
-    assert "diagnostics-fast:\n\t./scripts/ci/refresh_diagnostics.sh --no-forensics\n" in text
+    assert "diagnostics:\n\t./scripts/ci/refresh_diagnostics.sh $(DIAG_ARGS)\n" in text
+    fast = "diagnostics-fast:\n\t./scripts/ci/refresh_diagnostics.sh "
+    assert fast in text
+    fast_recipe = text.split(fast, 1)[1].splitlines()[0]
+    for flag in ("--no-forensics", "--no-probe", "--no-mosaic", "$(DIAG_ARGS)"):
+        assert flag in fast_recipe, f"diagnostics-fast must pass {flag}"
     assert "diagnostics" in text.split(".PHONY:", 1)[1].splitlines()[0]
+
+
+def test_makefile_exposes_the_tree_and_cohort_selectors() -> None:
+    """ROOT / OUT / COHORT are the whole point of the targets being parameterised;
+    a selector that is defined but not forwarded is an unread knob (pitfall #15)."""
+    text = MAKEFILE.read_text()
+    diag = text.split("DIAG_ARGS :=", 1)[1].splitlines()[0]
+    for var, flag in (("ROOT", "--root"), ("OUT", "--out"), ("COHORT", "--cohort")):
+        assert f"{var} ?=" in text, f"{var} must be an overridable Make variable"
+        assert f"$(if $({var}),{flag} $({var}))" in diag, f"{var} must reach {flag}"
+
+
+@pytest.mark.parametrize(
+    "pass_script",
+    [
+        "scripts/diagnostics/render_report_cases.py",
+        "scripts/diagnostics/debug_snapshot_audit.py",
+        "scripts/generate_validation_mosaic.py",
+        "scratch/batch_scientific_audit.py",
+        "scratch/batch_probe.py",
+        "scratch/compile_diagnostics.py",
+    ],
+)
+def test_every_diagnostic_pass_runs_inside_refresh_one(pass_script: str) -> None:
+    """`make diagnostics` is the one command, so each pass has to be IN it.
+
+    Before this, the wrapper ran three of the six: the Tier-0/1 audit and the
+    Tier-2 probe were never called, so a refresh republished the previous run's
+    scientific_audit.json / probe_results.json under today's date stamp, and
+    nothing said so."""
+    body = _script().read_text().split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    assert pass_script in body, f"{pass_script} must run inside refresh_one"
+
+
+def test_root_and_out_select_one_tree() -> None:
+    text = _script().read_text()
+    for flag in ("--root)", "--root=*)", "--out)", "--out=*)"):
+        assert flag in text, f"wrapper must accept {flag.rstrip(')*=')}"
+    # That the no-argument path still refreshes both known trees is
+    # test_both_known_trees_are_refreshed's assertion, not a second copy here.
+    assert 'refresh_one "${ROOT}" "${OUT:-${ROOT}/diagnostics}"' in text
+
+
+def test_out_without_root_is_refused_rather_than_applied_to_both_trees() -> None:
+    """--out names ONE bundle; silently applying it to both trees would make the
+    second overwrite the first."""
+    text = _script().read_text()
+    assert '-n "${OUT}" && -z "${ROOT}"' in text
+
+
+def test_cohort_reaches_every_pass_that_can_filter() -> None:
+    text = _script().read_text()
+    assert "--cohort)" in text and "--cohort=*)" in text
+    assert 'cohort_args=(--cohort "${COHORTS[@]}")' in text
+    body = text.split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    # One per pass that takes --cohort: snapshots, audit, probe, compile.
+    assert body.count('"${cohort_args[@]}"') >= 4
+
+
+def test_cohort_names_are_resolved_by_the_one_owner_not_a_bash_alias_table() -> None:
+    """A second alias table in bash would drift from the python passes' -- the
+    same name would then select different arms in different passes."""
+    text = _script().read_text()
+    assert "scripts/cohort_membership.py" in text
+    for alias in ("mrixfields2026", "hilbert_mamba", "ldm_two_stage_ulf_to_hf"):
+        assert alias not in text, f"{alias} must not be spelled out in the wrapper"
+
+
+def test_slow_passes_are_individually_skippable() -> None:
+    """diagnostics-fast is composed of these, so each must exist on its own."""
+    text = _script().read_text()
+    for flag, var in (("--no-forensics", "RUN_FORENSICS=0"),
+                      ("--no-snapshots", "RUN_SNAPSHOTS=0"),
+                      ("--no-mosaic", "RUN_MOSAIC=0"),
+                      ("--no-audit", "RUN_AUDIT=0"),
+                      ("--no-probe", "RUN_PROBE=0")):
+        assert flag in text and var in text, f"{flag} must set {var}"
+
+
+def test_a_cohort_matching_no_arm_stops_the_arm_level_passes() -> None:
+    """The scope-widening shape, planted as an assertion because it is invisible
+    at the call site: ``generate_validation_mosaic.py`` with no ``--filter``
+    means EVERY arm, so resolving a cohort to an empty arm list and then omitting
+    the flag renders the whole tree under a cohort-scoped invocation. Observed
+    once here -- `--cohort mamba` against a tree holding only kspace_filling arms
+    started mosaicking all 68."""
+    text = _script().read_text()
+    body = text.split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    assert 'arms_resolved' in body, "the wrapper must distinguish 'no selection' from 'empty selection'"
+    assert body.count('"${arms_resolved}" == "0" && -z "${arms}"') >= 2, (
+        "both arm-level passes (mosaic, forensics) must refuse an empty resolution"
+    )
+    assert "cohort matched no arm" in body
+
+
+def test_cohort_filters_the_image_passes_too_not_only_the_config_passes() -> None:
+    """--cohort that filtered five passes and silently not the sixth would put a
+    whole-tree contact sheet next to a one-cohort summary."""
+    body = _script().read_text().split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    assert "filter_args=(--filter ${arms})" in body, "mosaic must be filtered"
+    assert "arm_args=(--arms" in body, "forensics must be filtered"
+
+
+def test_the_arm_list_is_resolved_once_per_tree() -> None:
+    """Two resolutions are two chances to disagree; the window resolver above is
+    pinned the same way."""
+    body = _script().read_text().split("refresh_one() {", 1)[1].split("\n}", 1)[0]
+    assert body.count("cohort_membership.py") == 1
+
+
+def test_a_skipped_tier_pass_is_reported_not_silent() -> None:
+    """The republished-stale-JSON trap: skipping the audit/probe leaves the
+    previous run's verdicts in the bundle, so the skip has to be visible."""
+    text = _script().read_text()
+    assert "scientific audit: skipped" in text
+    assert "forward probe: skipped" in text
 
 
 def test_makefile_does_not_invoke_bash_by_bare_name() -> None:

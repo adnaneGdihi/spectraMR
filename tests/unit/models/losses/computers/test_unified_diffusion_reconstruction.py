@@ -32,6 +32,7 @@ from spectramr.config.schemas.loss import (
 from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
     UnifiedDiffusionLossComputer,
     UnifiedReconstructionLossComputer,
+    _call_safe_loss,
 )
 
 
@@ -421,3 +422,64 @@ def test_the_guarded_log_still_reports_when_debug_is_on():
 
     src = inspect.getsource(mod.UnifiedDiffusionLossComputer.compute)
     assert '"[Loss %s] OK: loss_val=%s"' in src, "the debug message was dropped, not deferred"
+
+
+_KSPACE_FILLING_ARM = (
+    "experiments/inprogress/kspace_filling/attention_shootout/experiment_11_attention_none.yaml"
+)
+
+
+@pytest.fixture(scope="module")
+def built_coil_barrier():
+    """The ``coil_subspace_residual`` module the builder registers for a shipped arm."""
+    from pathlib import Path
+
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
+
+    if not Path(_KSPACE_FILLING_ARM).exists():
+        pytest.skip("kspace_filling cohort not present")
+    cfg = TrainingSettings.from_yaml(_KSPACE_FILLING_ARM)
+    losses = LossBuilder(cfg, torch.device("cpu")).build_reconstruction_losses().build()
+    return losses["coil_subspace_residual"]
+
+
+class TestTheBuiltBarrierReceivesTheStrategysMaps:
+    """``_call_safe_loss`` on what the builder actually registers, not the bare loss.
+
+    The earlier reachability test called ``_call_safe_loss`` on a bare
+    ``CoilSubspaceResidualLoss`` and passed, while production hands it the
+    builder's ``_BridgedLoss``: a ``**kwargs`` wrapper whose inner bridge did its
+    own filtering without the coil-map reconciliation, so every kspace_filling arm
+    raised ``requires coil_sensitivities`` at iteration 1.
+    """
+
+    @staticmethod
+    def _kspace(images: torch.Tensor) -> torch.Tensor:
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        k = fft2c(images)
+        return torch.stack([k.real, k.imag], dim=2).flatten(1, 2)
+
+    @staticmethod
+    def _phantom() -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        m = torch.randn(2, 1, 16, 16, dtype=torch.complex64)
+        maps = torch.randn(2, 4, 16, 16, dtype=torch.complex64)
+        maps = maps / maps.abs().pow(2).sum(1, keepdim=True).sqrt()
+        return maps * m, maps
+
+    def test_the_arm_bridges_it(self, built_coil_barrier) -> None:
+        """Pins the shape this class exists for; if it stops bridging, re-aim the test."""
+        assert type(built_coil_barrier).__name__ == "_BridgedLoss"
+
+    def test_a_realisable_image_costs_nothing(self, built_coil_barrier) -> None:
+        images, maps = self._phantom()
+        k = self._kspace(images)
+        assert float(_call_safe_loss(built_coil_barrier, k, k, smaps=maps, mask=None)) < 1e-6
+
+    def test_energy_off_the_manifold_is_penalised(self, built_coil_barrier) -> None:
+        images, maps = self._phantom()
+        images[:, 0] += 0.5
+        k = self._kspace(images)
+        assert float(_call_safe_loss(built_coil_barrier, k, k, smaps=maps, mask=None)) > 1e-2

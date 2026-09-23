@@ -124,7 +124,7 @@ class ReconstructionTrainingStrategy(
     #: Loss ownership (mrixfields review 2026-09-03). The base reconstruction path
     #: computes every declared ``losses.image_losses`` entry through the builder:
     #: nothing inline, everything folded. A subclass that overrides
-    #: ``_compute_losses_impl`` re-declares both, and ``test_loss_ownership`` pins
+    #: ``_compute_losses_impl`` redeclares both, and ``test_loss_ownership`` pins
     #: ``folds_image_losses`` against the source (a call to
     #: ``super()._compute_losses_impl`` or ``_apply_builder_image_losses``).
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
@@ -136,6 +136,16 @@ class ReconstructionTrainingStrategy(
         workflows=frozenset({Regime.STRUCTURAL}),
         tasks=frozenset({Task.RECONSTRUCTION}),
     )
+
+    #: The k-space -> image bridge decision, resolved on first use and cached:
+    #: `needs_kspace_to_image_bridge` reads the registry and the config, neither of
+    #: which moves inside a run. Declared on the CLASS, not in `__init__`, because
+    #: derived strategies and the validation harnesses build instances that never
+    #: run it -- an `__init__`-only attribute turns every such path into an
+    #: AttributeError on the forward seam.
+    _kspace_bridge: bool | None = None
+    _kspace_bridge_checked: bool = False
+    _model_accepts_complex: bool | None = None
 
     def __init__(
         self,
@@ -326,6 +336,15 @@ class ReconstructionTrainingStrategy(
         # Dynamic loss-schedule overrides are published to ``self.loss_computer``
         # by the paradigm-agnostic ``BaseTrainingStrategy.sync_scheduled_loss_weights``
         # (called by the training loop each step) -- no per-strategy copy needed.
+        # Coil maps travel as a loss kwarg, not just a model one. `_call_safe_loss`
+        # filters by signature, so a declared term that needs the coil geometry
+        # (`coil_subspace_residual`) receives it and every other term is untouched.
+        # Without this the term is built, invoked as `(pred, target)`, and raises --
+        # the maps reach `_prepare_generator_inputs` and stop there.
+        loss_context: dict[str, Any] = {}
+        if batch_context.get("coil_sensitivities") is not None:
+            loss_context["coil_sensitivities"] = batch_context["coil_sensitivities"]
+
         loss_output = self.loss_computer.compute(
             pred=eval_fakes,
             target=target,
@@ -334,6 +353,7 @@ class ReconstructionTrainingStrategy(
             losses_dict=env_losses,
             pinn_loss=pinn_loss,
             intermediate_outputs=intermediate_outputs,
+            **loss_context,
         )
 
         total_loss = loss_output.total
@@ -457,6 +477,102 @@ class ReconstructionTrainingStrategy(
         """Delegate to ReconstructionMixin."""
         return self._prepare_batch_context_reconstruction(input_batch, target_batch, **kwargs)
 
+    def _needs_kspace_adjoint(self, batch_context: dict[str, Any]) -> bool:
+        r"""Must this batch be ``ifft2c``'d before the network sees it?
+
+        The adjoint :math:`A^H` and data consistency are two different questions,
+        and until #2233 they shared one answer: the ``ifft2c`` below ran ``if
+        use_dc``, and ``use_dc`` is ``dc_layer is not None``. A plain U-Net owns
+        no DC module, so ``initialize_data_consistency`` cleared the flag — with
+        a warning, not a raise — and took the domain bridge down with it. The
+        network was then handed raw k-space while the loss, the metrics and the
+        previewer all read its output as an image, which renders as the DC-spike
+        blob (``ei_unet_m4raw_r4``, cluster run 2026-09-20).
+
+        A strategy that has already applied the adjoint itself — the multi-coil
+        EI operator's :meth:`MulticoilEIOperator.prepare` — says so by stamping
+        ``kspace_adjoint_applied``, because clearing ``use_dc`` no longer
+        suppresses the bridge on its own.
+        """
+        if batch_context.get("kspace_adjoint_applied"):
+            return False
+        if self._kspace_bridge is None:
+            from spectramr.infrastructure.training.utils.domain_inference import (
+                needs_kspace_to_image_bridge,
+            )
+
+            self._kspace_bridge = needs_kspace_to_image_bridge(self.config)
+            if self._kspace_bridge:
+                logger.info(
+                    "[DomainBridge] %s consumes the image domain over a k-space "
+                    "loader: applying ifft2c to the model input (A^H y).",
+                    self.config.model.model_type,
+                )
+        return self._kspace_bridge
+
+    def _match_declared_input_layout(self, image: torch.Tensor) -> torch.Tensor:
+        """Hand the network the complex layout it registered for.
+
+        ``ifft2c`` always returns complex, and a real-valued backbone cannot
+        consume that — ``standard_unet`` declares ``accepts_complex=False`` and
+        ``in_channels: 2``, i.e. one coil as ``(real, imag)``. Interleaved per
+        coil rather than ``cat([real, imag])``: the two differ from two coils up.
+
+        Reuses ``attention_domains.complex_to_interleaved`` rather than adding a
+        second one (non-negotiable 17). That function's contract is 4-D; on 5-D
+        it interleaves a different axis than a volumetric caller would want, so
+        the rank is checked here instead of assumed.
+        """
+        if not torch.is_complex(image):
+            return image
+        if self._model_accepts_complex is None:
+            from spectramr.models.registry import get_model_capabilities
+
+            caps = get_model_capabilities(str(self.config.model.model_type))
+            self._model_accepts_complex = bool(getattr(caps, "accepts_complex", False) or False)
+        if self._model_accepts_complex:
+            return image
+        if image.ndim != 4:
+            raise ValueError(
+                "[DomainBridge] the k-space adjoint returned a "
+                f"{image.ndim}-D tensor; complex_to_interleaved's contract is "
+                "[B, C, H, W]. A volumetric arm needs its own layout step rather "
+                "than this one applied to the wrong axis."
+            )
+        from spectramr.models.blocks.attention_domains import complex_to_interleaved
+
+        return complex_to_interleaved(image)
+
+    def _verify_kspace_bridge_once(self, kspace: torch.Tensor) -> None:
+        """Confirm the declared bridge against the first batch, then never again.
+
+        ``looks_like_kspace`` needs a host sync, which is forbidden in the loop
+        (non-negotiable 9) — so this runs on **one** batch and caches. It raises
+        rather than vetoing: a config that declares a k-space loader while the
+        loader serves images would otherwise train on a silently IFFT'd image
+        and report success (pitfall #9).
+        """
+        if self._kspace_bridge_checked:
+            return
+        self._kspace_bridge_checked = True
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            looks_like_kspace,
+        )
+
+        probe = kspace.detach()
+        if looks_like_kspace(probe.abs()):
+            return
+        raise ValueError(
+            "[DomainBridge] The config declares a k-space loader feeding an "
+            f"image-domain model ({self.config.model.model_type}), so the "
+            "strategy is about to apply ifft2c to the model input — but the "
+            f"tensor it received (shape={tuple(probe.shape)}) carries no "
+            "k-space DC signature, i.e. it is already an image. IFFT-ing it "
+            "would train the model on a Hermitian-symmetric 'doubled brain'. "
+            "Fix data.dataset_type / data.coils.processing_mode, or the "
+            "model's registered input_domain."
+        )
+
     def _prepare_generator_inputs(
         self,
         batch_context: dict[str, Any],
@@ -467,7 +583,11 @@ class ReconstructionTrainingStrategy(
         """Prepare input tensors and forward kwargs (CC=4 extracted)."""
         multimodal_inputs = batch_context.get("multimodal_inputs")
         measured_kspace = batch_context.get("measured_kspace")
-        use_dc = batch_context["use_dc"]
+        # Two questions, two answers (non-negotiable 17): `use_dc` says a data
+        # consistency layer exists; `_needs_kspace_adjoint` says the network
+        # consumes images over a k-space loader. Either one requires the bridge.
+        needs_bridge = self._needs_kspace_adjoint(batch_context)
+        use_dc = batch_context["use_dc"] or needs_bridge
 
         # Handle multimodal inputs
         if multimodal_inputs is not None:
@@ -561,6 +681,8 @@ class ReconstructionTrainingStrategy(
                 # But BaseTrainingStrategy does NOT guarantee fft_transformer attribute.
                 # reconstruction.py sets it in __init__.
                 # We should check for it safely.
+                if needs_bridge:
+                    self._verify_kspace_bridge_once(kspace_for_input)
                 fft_transformer = getattr(self, "fft_transformer", None)
                 if fft_transformer:
                     lr_image = fft_transformer.ifft2c(kspace_for_input)
@@ -572,6 +694,8 @@ class ReconstructionTrainingStrategy(
 
                     transformer = FFTTransformer(device=self.device)
                     lr_image = transformer.ifft2c(kspace_for_input)
+                if needs_bridge:
+                    lr_image = self._match_declared_input_layout(lr_image)
 
         # Track if we reshapped slices (for reshaping auxiliary tensors)
         num_slices = 1

@@ -487,8 +487,8 @@ class HardDataConsistency(nn.Module):
         self,
         mask=None,
         kspace_obs=None,
-        train_noise_level=0.01,
-        eval_noise_level=0.005,
+        train_noise_level=0.0,
+        eval_noise_level=0.0,
         noise_type="gaussian",
     ):
         """__init__.
@@ -496,8 +496,16 @@ class HardDataConsistency(nn.Module):
         Args:
             mask (Any): Description.
             kspace_obs (Any): Description.
-            train_noise_level (Any): Description.
-            eval_noise_level (Any): Description.
+            train_noise_level: Acquisition-noise std added to the measurement
+                before it is pinned. **0.0** -- hard DC holds the measurement and
+                nothing else, which is the contract its name states and the one
+                the reverse loop's ``_apply_observed_dc`` already implemented.
+                The previous 0.01/0.005 defaults were reached by four
+                no-argument construction sites here, two of them on inference
+                paths, so a deployed reconstruction perturbed its own input.
+            eval_noise_level: As above. Non-zero at eval also contradicts the
+                ``sampler_sigma: 0.0`` determinism every cohort arm declares
+                (#1689).
             noise_type (Any): Description.
         """
         super().__init__()

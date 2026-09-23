@@ -271,3 +271,71 @@ def test_log_provenance_emits_and_never_raises():
     log.addHandler(_H())
     prov.log_provenance({"git": {"available": False}}, logger=log)
     assert any("run provenance" in m for m in records)
+
+
+class TestTheLossObjectiveIsStamped:
+    """Non-negotiable 8's third obligation, for the one thing a run optimises.
+
+    ``LossWeightTable.provenance()`` called itself "the stamp written into the
+    run record" and had no caller outside a unit test -- the advertised-but-
+    unwired shape, in the mechanism meant to enforce wiring. The YAML is not a
+    substitute: a weight is declarable on two surfaces, ``lambda_mse`` files
+    under ``l2``, an equal-weight duplicate reconciles into one entry naming
+    both paths, and a warm-up-gated term resolves to 0.0 for its first N steps.
+    """
+
+    ARM = (
+        "experiments/inprogress/kspace_filling/attention_shootout/"
+        "experiment_11_attention_none.yaml"
+    )
+
+    def _record(self):
+        import pathlib
+
+        import pytest as _pytest
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.logging.provenance import collect_run_provenance
+
+        if not pathlib.Path(self.ARM).exists():
+            _pytest.skip("kspace_filling cohort not present")
+        cfg = TrainingSettings.from_yaml(self.ARM)
+        return collect_run_provenance(config=cfg, seed=42, device="cpu", run_name="t")
+
+    def test_the_block_reaches_the_run_record(self):
+        assert "losses" in self._record()
+
+    def test_it_carries_the_semantics_version(self):
+        """Without it, two records are not comparable across a change in what a
+        weight MEANS -- which is the failure a stamp exists to prevent."""
+        assert self._record()["losses"]["semantics_version"] is not None
+
+    def test_every_resolved_term_names_the_declaration_it_came_from(self):
+        """The `source` is the half the YAML cannot supply: it says which of the
+        two surfaces won, after canonicalisation."""
+        resolved = self._record()["losses"]["resolved"]
+        assert resolved, "no terms stamped"
+        for name, spec in resolved.items():
+            assert spec["source"], f"{name} stamped with no declaration source"
+            assert set(spec) == {"weight", "enabled", "source", "warmup_gated"}
+
+    def test_a_strategy_inline_lambda_is_stamped_beside_a_list_entry(self):
+        """The two declaration surfaces reach the same record."""
+        resolved = self._record()["losses"]["resolved"]
+        assert resolved["pre_dc_kspace"]["source"].endswith("lambda_pre_dc_kspace")
+        assert "kspace_losses[" in resolved["complex_l1"]["source"]
+
+    def test_provenance_never_blocks_the_run(self, monkeypatch):
+        """A capture failure is logged, not raised -- the record is a by-product
+        of training, never a precondition for it."""
+        import spectramr.models.losses.weights as _weights
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.logging import provenance as _prov
+
+        def boom(*_a, **_k):
+            raise RuntimeError("planted")
+
+        monkeypatch.setattr(_weights, "build_loss_weight_table", boom)
+        cfg = TrainingSettings.from_yaml(self.ARM)
+        record = _prov.collect_run_provenance(config=cfg, seed=1, device="cpu", run_name="t")
+        assert "losses" not in record

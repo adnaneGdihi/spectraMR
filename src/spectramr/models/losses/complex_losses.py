@@ -530,10 +530,17 @@ class SENSEAdjointL1Loss(nn.Module):
     The loss bridges from k-space itself (``use_fourier_bridge=True``, the
     default): it iFFTs the prediction before the coil-adjoint combination. It
     must therefore be declared under ``losses.kspace_losses`` so the LossBuilder
-    adds no second bridge — see issue #467 and ``docs/loss_domain_bridging.rst``.
+    adds no second bridge — see issue #467 and ``docs/losses_reference.rst``
+    (``docs/loss_domain_bridging.rst``, cited here since #467, was never written).
     """
 
-    def __init__(self, reduction: str = "mean", use_fourier_bridge: bool = True):
+    def __init__(
+        self,
+        reduction: str = "mean",
+        use_fourier_bridge: bool = True,
+        normalize: bool = False,
+        min_support_frac: float = 1e-2,
+    ):
         """__init__.
 
         Args:
@@ -544,10 +551,25 @@ class SENSEAdjointL1Loss(nn.Module):
                 ``complex_losses`` wrapper) has already moved them to the image
                 domain, so the transform is applied exactly once. The attribute
                 is what LossBuilder inspects to reject a double bridge.
+            normalize (bool): Divide the coil combination by ``sum_c |S_c|^2``,
+                i.e. score the Roemer estimate of the magnetization rather than
+                the matched-filter adjoint. The adjoint's output is
+                ``(sum_c|S_c|^2) * m``, so without this the term weights the
+                image by the coil intensity profile -- a spatial weight on a
+                *fidelity* term that nobody chose and that varies per subject.
+                Defaults to ``False`` because flipping it moves the loss on every
+                declaring arm; it is opted into per-arm from the YAML ``kwargs:``
+                so the recipe stays visible in the config.
+            min_support_frac (float): Forwarded to ``coil_combine_sense``; inert
+                unless ``normalize``. Outside the object ``sum_c|S_c|^2 -> 0``,
+                and an unprotected divide there makes amplified air noise the
+                dominant term.
         """
         super().__init__()
         self.reduction = reduction
         self.use_fourier_bridge = use_fourier_bridge
+        self.normalize = normalize
+        self.min_support_frac = float(min_support_frac)
 
     def forward(
         self,
@@ -669,15 +691,26 @@ class SENSEAdjointL1Loss(nn.Module):
             img_pred = pred_complex
             img_target = target_complex
 
-        # 2. Optimal Adjoint Combination (Sum(Image * Map^*) -> single complex image)
-        # Handle cross-contrast channel mismatch: model may output fewer coils
-        # than smaps (e.g. 4 output coils vs 8 input coils in cross-contrast mode).
+        # 2. Coil combination -> a single complex image. The matched-filter form
+        # is A^H and carries a sum|S|^2 shading; ``normalize`` divides it out
+        # through the owner of that divide. Slicing first handles the
+        # cross-contrast mismatch, where the model emits fewer coils than smaps.
         pred_coils = img_pred.shape[1]
         smap_coils = smaps_complex.shape[1]
         if smap_coils != pred_coils:
             smaps_complex = smaps_complex[:, :pred_coils]
-        sense_pred = torch.sum(img_pred * smaps_complex.conj(), dim=1, keepdim=True)
-        sense_target = torch.sum(img_target * smaps_complex.conj(), dim=1, keepdim=True)
+        if self.normalize:
+            from spectramr.infrastructure.physics.coil_sensitivity import coil_combine_sense
+
+            sense_pred = coil_combine_sense(
+                img_pred, smaps_complex, min_support_frac=self.min_support_frac
+            )
+            sense_target = coil_combine_sense(
+                img_target, smaps_complex, min_support_frac=self.min_support_frac
+            )
+        else:
+            sense_pred = torch.sum(img_pred * smaps_complex.conj(), dim=1, keepdim=True)
+            sense_target = torch.sum(img_target * smaps_complex.conj(), dim=1, keepdim=True)
 
         # 3. Direct Complex L1 Loss on the true anatomical manifold (NO RSS!)
         loss = torch.nn.functional.l1_loss(

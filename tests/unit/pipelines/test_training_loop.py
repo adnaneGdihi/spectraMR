@@ -3433,3 +3433,86 @@ def test_a_skipped_validation_says_so():
 
     assert "elif time_for_eval and wall_clock_yield and logging_service:" in src
     assert "Skipping validation at iteration" in src
+
+
+class TestLoggingServiceCallsResolve:
+    """#2254: the divergence tripwire called ``logging_service.log_critical``, a
+    method ``ILoggingService`` never declared and ``LoggingService`` never defined.
+
+    The guard therefore raised ``AttributeError`` on the exact step it was built to
+    catch, and the ``break`` on the next line never ran — a run with a non-finite
+    loss died on the reporting path instead of stopping cleanly, and the log named a
+    logging object rather than the iteration or the loss value.
+
+    Pinning the literal name ``log_critical`` would only close this spelling. What is
+    checked instead is the shape: every method the loop calls on the logging service
+    must exist on the interface it is typed against. A full loop OOM-kills a dev box,
+    so this is an AST check over the source, per the file-level note above.
+    """
+
+    @staticmethod
+    def _logging_service_attrs(func) -> set[str]:
+        """Every ``<recv>.<attr>(...)`` where ``<recv>`` names a logging service."""
+        receivers = {"logging_service", "_logging_service", "self.logging_service"}
+        found: set[str] = set()
+        for node in ast.walk(_ast_of(func)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, ast.Attribute):
+                continue
+            recv = fn.value
+            bare_name = isinstance(recv, ast.Name) and recv.id in receivers
+            self_attribute = (
+                isinstance(recv, ast.Attribute)
+                and isinstance(recv.value, ast.Name)
+                and recv.value.id == "self"
+                and f"self.{recv.attr}" in receivers
+            )
+            if bare_name or self_attribute:
+                found.add(fn.attr)
+        return found
+
+    def test_every_logging_call_in_the_loop_exists_on_the_interface(self):
+        from spectramr.domain.interfaces.service_interfaces import ILoggingService
+
+        called = self._logging_service_attrs(tl._execute_training_loop)
+        assert called, "no logging_service calls found — the walker stopped matching"
+
+        missing = sorted(a for a in called if not hasattr(ILoggingService, a))
+        assert not missing, (
+            f"_execute_training_loop calls {missing} on the logging service, and "
+            f"ILoggingService declares no such method. Each one raises AttributeError "
+            f"at the moment its guard fires. Add the rung to the interface AND to "
+            f"LoggingService, or call a method that exists."
+        )
+
+    def test_the_divergence_guard_calls_a_real_method(self):
+        """The specific rung, on the specific guard, with the concrete service."""
+        from spectramr.infrastructure.services.logging_service import LoggingService
+
+        src = inspect.getsource(tl._execute_training_loop)
+        guard = src[src.index("if not math.isfinite(_quick_scalar):") :]
+        guard = guard[: guard.index("break") + len("break")]
+
+        called = re.findall(r"logging_service\.(\w+)\(", guard)
+        assert called, "the divergence guard no longer logs at all"
+        for attr in called:
+            assert callable(getattr(LoggingService, attr, None)), (
+                f"divergence guard calls LoggingService.{attr}, which does not exist"
+            )
+
+    def test_the_guard_still_breaks_after_logging(self):
+        """The ``break`` is the load-bearing half: logging names the failure, the
+        break is what stops training before the weights are corrupted."""
+        src = inspect.getsource(tl._execute_training_loop)
+        guard_at = src.index("if not math.isfinite(_quick_scalar):")
+        tail = src[guard_at:]
+        log_at = tail.index("DIVERGENCE DETECTED")
+        break_at = tail.index("break")
+        assert log_at < break_at, "the guard must log before it breaks"
+        between = tail[log_at:break_at]
+        assert "try:" not in between, (
+            "a try/except around the divergence log would swallow the failure it "
+            "reports (non-negotiable 3) — fix the call, do not guard it"
+        )

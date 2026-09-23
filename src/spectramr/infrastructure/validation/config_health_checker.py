@@ -655,6 +655,134 @@ class ConfigHealthChecker:
             severity="info",
         )
 
+    @staticmethod
+    def _validation_sample_is_a_stub(cls: type) -> bool:
+        """True when ``cls.validation_sample`` can only raise ``NotImplementedError``.
+
+        A method that raises on *some* path and returns on another is a live
+        implementation with a guard; one that carries a ``raise NotImplementedError``
+        and no ``return``/``yield`` anywhere cannot produce a reconstruction on any
+        input. Verified to separate the four adapters on ``dev``: the base and
+        ``FDBBaseline`` are stubs, ``CDiffMRBaseline`` and ``Shen2024Baseline`` are not.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        fn = None
+        for klass in getattr(cls, "__mro__", (cls,)):
+            if "validation_sample" in vars(klass):
+                fn = vars(klass)["validation_sample"]
+                break
+        if fn is None:
+            return False
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        except (OSError, TypeError, SyntaxError, IndentationError):
+            # No source (C extension, exec'd class): unprovable, so not asserted.
+            return False
+
+        nodes = list(ast.walk(tree))
+        returns_a_value = any(
+            isinstance(n, ast.Return) and n.value is not None for n in nodes
+        ) or any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in nodes)
+        raises_not_implemented = any(
+            isinstance(n, ast.Raise)
+            and n.exc is not None
+            and (
+                (isinstance(n.exc, ast.Call) and getattr(n.exc.func, "id", "") == "NotImplementedError")
+                or getattr(n.exc, "id", "") == "NotImplementedError"
+            )
+            for n in nodes
+        )
+        return raises_not_implemented and not returns_a_value
+
+    def check_validation_path_is_wired(self, config: TrainingSettings) -> HealthCheckResult:
+        """Tier-1: an arm whose validation drives a reverse process must have one.
+
+        ``UpstreamProcessStrategy`` validates through the adapter's own
+        ``validation_sample`` rather than a bare ``forward``. When that method is a
+        stub, every validation batch raises, ``_run_validation`` correctly refuses to
+        call the run passing — and all of it happens at the FIRST eval interval, after
+        the training budget up to that point has already been spent.
+
+        ``baseline_fdb`` cost 999 iterations and 18 minutes of GPU that way on
+        2026-09-21 while ``audit --strict`` reported it clean (#2255). Its three
+        sibling baselines declare ``metadata.status='needs_implementation'`` and are
+        refused in under two seconds; this check gives the same answer to an arm whose
+        gap is in the code rather than in its metadata.
+
+        Declaring the status is the accepted way to run one anyway: the launch guard
+        then names it, and ``--allow-status needs_implementation`` is an explicit
+        wiring exercise rather than an accident.
+        """
+        model_type = getattr(getattr(config, "model", None), "model_type", "") or ""
+        if not model_type:
+            return HealthCheckResult(
+                passed=True,
+                check_name="validation_path_is_wired",
+                message="no model_type to resolve",
+                severity="info",
+            )
+
+        from spectramr.config.schemas.base import LAUNCH_REFUSED_STATUSES
+
+        status = getattr(getattr(config, "metadata", None), "status", None)
+        if status in LAUNCH_REFUSED_STATUSES:
+            return HealthCheckResult(
+                passed=True,
+                check_name="validation_path_is_wired",
+                message=f"metadata.status={status!r} already refuses this arm at launch",
+                severity="info",
+            )
+
+        try:
+            from spectramr.models.init_registry import populate_model_registry
+            from spectramr.models.registry import MODEL_REGISTRY
+
+            if not MODEL_REGISTRY:
+                populate_model_registry()
+        except Exception as e:
+            return HealthCheckResult(
+                passed=False,
+                check_name="validation_path_is_wired",
+                message=(
+                    f"model registry unavailable ({e}); the validation-path check "
+                    "could NOT run — an import regression, not a clean config"
+                ),
+                severity="error",
+            )
+
+        entry = MODEL_REGISTRY.get(model_type)
+        cls = entry.get("class") if entry else None
+        if cls is None or not self._validation_sample_is_a_stub(cls):
+            return HealthCheckResult(
+                passed=True,
+                check_name="validation_path_is_wired",
+                message=f"model_type='{model_type}' has no stubbed validation_sample",
+                severity="info",
+            )
+
+        return HealthCheckResult(
+            passed=False,
+            check_name="validation_path_is_wired",
+            message=(
+                f"model_type='{model_type}' ({cls.__qualname__}.validation_sample) can "
+                "only raise NotImplementedError, so EVERY validation batch will fail and "
+                "the run will abort at the first eval interval — after spending the "
+                "training budget up to that point"
+            ),
+            severity="error",
+            yaml_keys=["model.model_type", "metadata.status"],
+            category="validation_path_is_wired",
+            fix_hint=(
+                "Implement validation_sample, or declare "
+                "metadata.status='needs_implementation' with a status_reason so the arm "
+                "is refused at launch like its siblings (run it deliberately with "
+                "--allow-status needs_implementation)."
+            ),
+        )
+
     def check_namespace_axis(self, config: TrainingSettings) -> HealthCheckResult:
         """Tier-1: reject cross-axis token reuse under ``model.model_type``.
 
@@ -10756,6 +10884,99 @@ class ConfigHealthChecker:
         }
     )
 
+    def check_best_metric_matches_early_stopping(
+        self,
+        config: TrainingSettings,
+    ) -> HealthCheckResult:
+        """``metrics.best_metric_name`` must not contradict the live selector.
+
+        Checkpoint selection has ONE live owner: ``early_stopping.metric``,
+        resolved by ``EarlyStoppingService`` and consumed by ``save_best``.
+        ``metrics.best_metric_name`` is inert for selection -- it is read by the
+        witness check and the reporting layer, nothing else -- so an arm whose
+        two spellings disagree writes a report naming a metric that did NOT pick
+        its checkpoint.
+
+        Measured across ``experiments/``: 126 arms disagree, and on **75** of
+        them early stopping is enabled, so a wrong selection really happens.
+
+        Severities:
+
+        - ``info`` (passes): the two agree, or only one is declared, or early
+          stopping is disabled so no selection happens and the key is decorative.
+        - ``error``: they disagree while early stopping is enabled.
+        """
+        check_name = "best_metric_matches_early_stopping"
+        early = getattr(config, "early_stopping", None)
+        metrics = getattr(config, "metrics", None)
+        if early is None or metrics is None:
+            return HealthCheckResult(True, check_name, "no selector blocks declared", "info")
+        if not getattr(early, "enabled", False):
+            return HealthCheckResult(
+                True,
+                check_name,
+                "early stopping disabled — no checkpoint selection happens, so "
+                "metrics.best_metric_name selects nothing either way",
+                "info",
+            )
+        # DECLARED, not defaulted. `metrics.best_metric_name` defaults to
+        # 'val_loss' and `best_metric_mode` to MIN, so an arm that sets only
+        # `early_stopping.metric` parses with a value it never wrote -- and
+        # comparing that would report a contradiction the author did not make,
+        # on 109 inprogress arms. Pydantic records what was actually supplied.
+        supplied = getattr(metrics, "model_fields_set", None)
+        if supplied is not None and "best_metric_name" not in supplied:
+            return HealthCheckResult(
+                True,
+                check_name,
+                "metrics.best_metric_name is not declared — nothing contradicts "
+                "the live early_stopping selector",
+                "info",
+            )
+        live_name = getattr(early, "metric", None)
+        declared_name = getattr(metrics, "best_metric_name", None)
+        # `.value` first: both spellings resolve to a `MetricMode`, and printing
+        # the enum repr would put "MetricMode.MAX" in a message whose whole job
+        # is to be compared against a YAML line that reads `max`.
+        def _mode(raw: object) -> str:
+            return str(getattr(raw, "value", raw) or "")
+
+        live_mode = _mode(getattr(early, "mode", ""))
+        declared_mode = (
+            _mode(getattr(metrics, "best_metric_mode", ""))
+            if supplied is None or "best_metric_mode" in supplied
+            else ""
+        )
+        clashes = []
+        if live_name and declared_name and str(live_name) != str(declared_name):
+            clashes.append(
+                f"metrics.best_metric_name={declared_name!r} vs "
+                f"early_stopping.metric={live_name!r}"
+            )
+        if live_mode and declared_mode and live_mode != declared_mode:
+            clashes.append(
+                f"metrics.best_metric_mode={declared_mode!r} vs "
+                f"early_stopping.mode={live_mode!r}"
+            )
+        if not clashes:
+            return HealthCheckResult(
+                True,
+                check_name,
+                f"selector agrees across both spellings ({live_name!r}, {live_mode!r})",
+                "info",
+            )
+        return HealthCheckResult(
+            False,
+            check_name,
+            "checkpoint selection is declared two ways and they disagree: "
+            + "; ".join(clashes)
+            + ". early_stopping is the LIVE one; metrics.best_metric_name is read "
+            "only by the witness check and the report, so this run would select on "
+            f"{live_name!r} while its report named {declared_name!r}. Make them "
+            "match, or drop metrics.best_metric_name.",
+            "error",
+        )
+
     def check_output_dir_convention(
         self,
         config: TrainingSettings,
@@ -14137,6 +14358,10 @@ class ConfigHealthChecker:
         # d8ccb8452 deletion ledger. See
         # TODO/deleted_model_types_reimplementation_plan.md Phase 0.
         report.results.append(self.check_registered_model_resolves(config))
+        # #2255: resolving to a buildable class is not enough when the strategy
+        # validates through the adapter's own reverse process — that method can
+        # still be a stub, and the run finds out at the first eval interval.
+        report.results.append(self.check_validation_path_is_wired(config))
         report.results.append(self.check_namespace_axis(config))
         report.results.extend(self.check_phase3_model_constraints(config))
         report.results.append(self.check_strategy_registry(config))
@@ -14305,6 +14530,9 @@ class ConfigHealthChecker:
         report.results.append(self.check_output_dir_convention(config))
         # #1929: the convention check above is a PREFIX test and cannot see an
         # arm whose output_dir, checkpoints and logs name different experiments.
+        # Checkpoint selection is declared two ways and only one is live; 75 arms
+        # in the corpus disagree with early stopping enabled (non-negotiable 17).
+        report.results.append(self.check_best_metric_matches_early_stopping(config))
         report.results.append(self.check_identity_paths_agree(config))
         report.results.append(self.check_epochs_max_iterations_mutex(config))
 

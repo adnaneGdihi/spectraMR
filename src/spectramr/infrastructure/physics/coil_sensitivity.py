@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Mapping
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -635,6 +636,36 @@ def espirit_min_acs_size(
     return side
 
 
+class ESPIRiTSubspace(NamedTuple):
+    """Sensitivity maps plus the coil subspace they were read off.
+
+    ``estimate_csm_espirit`` eigendecomposes a per-pixel Gram matrix and keeps
+    only the leading eigenvector. The remaining ``C - k`` eigenvectors span the
+    coil NULL space: directions no coil combination can produce, so a physical
+    signal has exactly zero component there while noise does not. Returning the
+    projector makes that measurable instead of discarding it.
+
+    Attributes:
+        maps: ``(B, C, H, W)`` complex sensitivity maps -- what the bare
+            ``estimate_csm_espirit`` call returns.
+        null_projector: ``(B, H, W, C, C)`` complex ``P = I - V V^H``, with ``V``
+            the eigenvectors at or above ``eigen_threshold``. Hermitian and
+            idempotent per pixel.
+        leading_eigenvalue: ``(B, H, W)`` real. Near 1 inside the support,
+            near 0 outside it.
+        second_eigenvalue: ``(B, H, W)`` real. The rank-one signal model this
+            module assumes holds only where this is well below 1; where it is
+            not, the pixel needs a second ESPIRiT map (FOV wrap) and its null
+            space is ``C - 2`` rather than ``C - 1``. Checking it is how you
+            find that out instead of assuming it.
+    """
+
+    maps: torch.Tensor
+    null_projector: torch.Tensor
+    leading_eigenvalue: torch.Tensor
+    second_eigenvalue: torch.Tensor
+
+
 def estimate_csm_espirit(
     kspace: torch.Tensor,
     num_coils: int,
@@ -644,7 +675,9 @@ def estimate_csm_espirit(
     eigen_threshold: float = 0.95,
     phase_ref_coil: int = 0,
     max_n_keep: int | None = None,
-) -> torch.Tensor:
+    *,
+    return_subspace: bool = False,
+) -> torch.Tensor | ESPIRiTSubspace:
     """Estimate coil sensitivity maps using the canonical ESPIRiT algorithm.
 
     Implements the full 7-step ESPIRiT pipeline from Uecker et al.,
@@ -738,6 +771,9 @@ def estimate_csm_espirit(
 
     # We operate per-batch item. Collect smaps for each item then stack.
     smaps_batch: list[torch.Tensor] = []
+    null_batch: list[torch.Tensor] = []
+    lead_batch: list[torch.Tensor] = []
+    second_batch: list[torch.Tensor] = []
 
     for b in range(batch_size):
         acs_b = acs[b]  # (C, acs_h, acs_w)
@@ -854,6 +890,21 @@ def estimate_csm_espirit(
         lead_eigenval = eigenvalues[:, -1]  # (N,)  real
         lead_eigenvec = eigenvectors[:, :, -1]  # (N, C) complex
 
+        if return_subspace:
+            # The C - k eigenvectors BELOW the support threshold span directions
+            # no coil combination can produce, so a physical signal has exactly
+            # zero component there. Built from the same eigendecomposition the
+            # maps come from rather than recomputed, so the two cannot disagree.
+            in_support = eigenvalues >= eigen_threshold  # (N, C)
+            basis = eigenvectors * in_support.unsqueeze(1).to(eigenvectors.dtype)
+            signal_proj = basis @ basis.conj().transpose(-2, -1)  # (N, C, C)
+            identity = torch.eye(n_coils, dtype=signal_proj.dtype, device=signal_proj.device)
+            null_batch.append(
+                (identity - signal_proj).reshape(height, width, n_coils, n_coils)
+            )
+            lead_batch.append(lead_eigenval.reshape(height, width))
+            second_batch.append(eigenvalues[:, -2].reshape(height, width))
+
         # ESPIRiT Soft-SENSE Weighting (Replaces the hard boolean mask)
         # We linearly map the eigenvalues from the threshold up to 1.0.
         # This smoothly tapers the boundaries to exactly zero, preventing jagged cutouts.
@@ -878,7 +929,15 @@ def estimate_csm_espirit(
         smaps_batch.append(smaps_b)
 
     # Stack batch dimension: (B, C, H, W)
-    return torch.stack(smaps_batch, dim=0)
+    maps = torch.stack(smaps_batch, dim=0)
+    if not return_subspace:
+        return maps
+    return ESPIRiTSubspace(
+        maps=maps,
+        null_projector=torch.stack(null_batch, dim=0),
+        leading_eigenvalue=torch.stack(lead_batch, dim=0),
+        second_eigenvalue=torch.stack(second_batch, dim=0),
+    )
 
 
 def estimate_csm_pinn(
@@ -1176,6 +1235,95 @@ def estimate_smaps(
         f"Unknown sensitivity estimation method {method!r}. Valid: "
         "none, power_iter, espirit, pinn, rss, file."
     )
+
+
+def confine_to_acs(kspace: torch.Tensor, acs_size: int | tuple[int, int]) -> torch.Tensor:
+    """Zero every bin outside the central ACS block, keeping the full grid.
+
+    The same calibration confinement :func:`extract_acs_region` performs by
+    cropping, expressed so the estimator still receives a full-resolution grid
+    and returns full-resolution maps. Cropping buys the same protection against
+    aliased periphery and then costs the resolution back, which a caller can
+    only recover by interpolating.
+    """
+    if kspace.dim() != 4:
+        raise ValueError(f"Expected 4D kspace (B, C, H, W), got {kspace.dim()}D.")
+    _, _, height, width = kspace.shape
+    if isinstance(acs_size, int):
+        acs_h, acs_w = min(acs_size, height), min(acs_size, width)
+    else:
+        acs_h, acs_w = min(acs_size[0], height), min(acs_size[1], width)
+    h0, w0 = height // 2 - acs_h // 2, width // 2 - acs_w // 2
+    confined = torch.zeros_like(kspace)
+    confined[:, :, h0 : h0 + acs_h, w0 : w0 + acs_w] = kspace[
+        :, :, h0 : h0 + acs_h, w0 : w0 + acs_w
+    ]
+    return confined
+
+
+def estimate_smaps_calibrated(
+    kspace: torch.Tensor,
+    *,
+    method: str = "power_iter",
+    out_size: tuple[int, int] | None = None,
+    eps: float = 1e-8,
+    **estimation_kwargs: object,
+) -> torch.Tensor | None:
+    """Calibrate coil maps from the ACS and return them RSS-normalised at full size.
+
+    The single owner (non-negotiable 17) of the three-step sequence every
+    runtime consumer needs: confine the calibration to the ACS, estimate, and
+    normalise so ``sum_c |s_c|^2 == 1``. It replaces three hand-rolled copies --
+    training (``DiffusionTrainingStrategy._estimate_smaps_cached``), validation
+    (the same class's validation branch) and sampling
+    (``ColdDiffusionInferenceStrategy``) -- which had to agree for a checkpoint
+    to sample with the maps it trained with, and were kept in step by hand.
+
+    **The order is the whole point.** All three copies normalised on the
+    ``acs_size x acs_size`` grid and then bilinearly interpolated ``real`` and
+    ``imag`` separately up to the image size. Linear interpolation between two
+    unit-modulus complex numbers whose phases differ returns the chord, not the
+    arc, so the modulus collapsed everywhere between grid nodes: RSS was 1.0
+    exactly at the 24 node positions and 0.0024 between them, i.e. a 256/24 =
+    10.67 px mesh, with ``E[sum_c |s_c|^2] = 0.58`` against the contracted 1.0.
+    Measured identically on a synthetic 4-coil phantom (0.5824) and on the
+    archived ``experiment_11_attention_none`` snapshot (0.5717); #2213.
+
+    So nothing is interpolated here. ``power_iter`` is handed an ACS-confined
+    grid at full resolution rather than a crop (:func:`confine_to_acs`), and
+    ``espirit`` extracts its own ACS internally and already returns at input
+    resolution -- both come back the size they went in, and ``out_size`` exists
+    only for a caller whose k-space genuinely differs from its image grid. When
+    it does fire, the normalisation runs *after* it.
+
+    Args:
+        kspace: Complex k-space ``(B, C, H, W)``, DC centred.
+        method: Any :func:`estimate_smaps` method. ``"none"`` returns ``None``.
+        out_size: ``(H, W)`` to resize onto when the maps do not already match.
+        eps: Floor inside the RSS divide.
+        **estimation_kwargs: ``kernel_size`` / ``acs_size`` / ``eigen_threshold``
+            / ``maps_path``, as :func:`resolve_estimation_settings` returns them.
+
+    Returns:
+        ``(B, C, H, W)`` complex maps with unit coil-RSS, or ``None`` for
+        ``method="none"``.
+    """
+    acs_size = int(estimation_kwargs.get("acs_size", 24))  # type: ignore[call-overload]
+    # ``espirit`` crops internally and is measured against the FULL grid's
+    # eigenvalues; ``power_iter`` IFFTs whatever it is given, so it is the one
+    # that needs the periphery zeroed before it sees the tensor.
+    calibration = confine_to_acs(kspace, acs_size) if method == "power_iter" else kspace
+    smaps = estimate_smaps(calibration, method=method, acs_only=False, **estimation_kwargs)  # type: ignore[arg-type]
+    if smaps is None:
+        return None
+    smaps = smaps.detach()
+
+    if out_size is not None and tuple(smaps.shape[-2:]) != tuple(out_size):
+        smaps = torch.complex(
+            F.interpolate(smaps.real, size=out_size, mode="bilinear", align_corners=False),
+            F.interpolate(smaps.imag, size=out_size, mode="bilinear", align_corners=False),
+        )
+    return smaps / torch.sqrt((smaps.abs() ** 2).sum(dim=1, keepdim=True) + eps)
 
 
 _ESTIMATION_SUB_KNOBS = ("kernel_size", "acs_size", "eigen_threshold", "maps_path")
@@ -1498,6 +1646,7 @@ __all__ = [
     "SMAP_KSPACE_PEAK_RATIO",
     "coil_combine_rss",
     "coil_combine_sense",
+    "confine_to_acs",
     "create_synthetic_csm",
     "espirit_min_acs_size",
     "estimate_acs_hanning_csm",
@@ -1506,6 +1655,7 @@ __all__ = [
     "estimate_csm_power_iter",
     "estimate_csm_rss",
     "estimate_smaps",
+    "estimate_smaps_calibrated",
     "extract_acs_region",
     "load_csm_from_file",
     "prepare_smaps_for_kspace_conditioning",

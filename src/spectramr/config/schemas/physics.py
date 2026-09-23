@@ -127,20 +127,33 @@ class DataConsistencyConfig(BaseModel):
         description="Method for data consistency: projection_2d_consistency, adaptive_soft_dc, etc.",
     )
     train_noise_level: float = Field(
-        default=0.01,
+        default=0.0,
         ge=0.0,
         le=1.0,
-        description="Noise standard deviation during training (prevents ground truth leakage). "
-        "Typical values: 0.01 (1%) for high SNR, 0.05 (5%) for low SNR clinical data. "
+        description="Acquisition-noise standard deviation added to the measurement "
+        "before data consistency pins it, during training. Default 0.0: DC holds "
+        "the measurement and nothing else. "
+        "ABSOLUTE, not a percentage — the description used to read '0.01 (1%)' and "
+        "that is the trap, because the k-space it perturbs is log1p-compressed. "
+        "Measured on a percentile-normalised phantom at 256x256, 0.01 is 1.8% of "
+        "the mean |k| in the DC annulus and 46.5% in the outer one, randomising "
+        "observed outer-band phase by up to 23.9 degrees — on the very bins hard "
+        "DC exists to hold, so the model cannot correct it. This default is what "
+        "every arm gets: 0 of the corpus declares either level, and the resolver "
+        "forwards the schema value regardless, so it reaches all 68 "
+        "'dc_method: hard' arms. Declare a non-zero value to opt in. "
         "Read only by DC methods whose layer accepts a noise level ('hard' and the "
         "SimpleDataConsistency fallback); inert under soft/learned methods.",
     )
     eval_noise_level: float = Field(
-        default=0.005,
+        default=0.0,
         ge=0.0,
         le=1.0,
-        description="Noise standard deviation during inference (realistic measurement noise). "
-        "Should match actual acquisition noise level.",
+        description="As train_noise_level, at eval. Default 0.0: a non-zero value "
+        "contradicts the 'sampler_sigma: 0.0' determinism every cohort arm "
+        "declares (#1689), and the reverse loop's own hard-DC branch "
+        "(_apply_observed_dc) never added noise — so a non-zero value here made "
+        "training and the path that reports the numbers two different mechanisms.",
     )
     noise_type: str = Field(
         default="gaussian",

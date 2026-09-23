@@ -26,6 +26,7 @@ from spectramr.models.diffusion.kspace_process import (
     apply_ceiling_ratio,
     clamp_to_magnitude_ceiling,
     paired_magnitude,
+    paired_squared_magnitude,
 )
 
 
@@ -141,3 +142,47 @@ class TestCeilingRatioDomain:
         compounded = math.expm1(math.sqrt(2) * 1.3 * ref) / math.expm1(ref)
         assert compounded == pytest.approx(29.8, rel=0.01)
         assert compounded > log_only * box_only * 4  # super-linear, not a product
+
+
+class TestTheClampHasAFiniteGradientAtAnExactZero:
+    """Hard DC copies the M4Raw readout window's zeros into the generator output.
+
+    Flooring the modulus AFTER ``sqrt`` guarded the forward divide and not the
+    backward: ``clamp_min`` returns 0 into sqrt's infinite gradient, 0 * inf is
+    NaN, and on experiment_11_attention_dual_domain every one of the generator's
+    204 gradient tensors came back NaN while the loss stayed finite. The first
+    optimizer step then made every weight NaN and every validation sample
+    non-finite.
+    """
+
+    @staticmethod
+    def _grad(x: torch.Tensor) -> torch.Tensor:
+        x = x.clone().requires_grad_(True)
+        out = clamp_to_magnitude_ceiling(x, torch.tensor(0.5))
+        (torch.view_as_real(out) if out.is_complex() else out).sum().backward()
+        return x.grad
+
+    def test_interleaved_zeros(self) -> None:
+        x = torch.randn(1, 4, 4, 4)
+        x[..., :2] = 0.0  # both halves of every coefficient in two columns
+        assert torch.isfinite(self._grad(x)).all()
+
+    def test_complex_zeros(self) -> None:
+        """Complex ``abs()`` was never NaN-prone; the fix takes ``sqrt`` here too."""
+        z = torch.complex(torch.randn(1, 2, 4, 4), torch.randn(1, 2, 4, 4))
+        z[..., :2] = 0
+        assert torch.isfinite(self._grad(z)).all()
+
+    def test_the_forward_value_is_unchanged(self) -> None:
+        """Only the gradient moves: the floored modulus is still max(|z|, eps)."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 6, 8, 8) * 3
+        x[..., :3] = 0.0
+        ceiling = torch.tensor(1.0)
+        legacy = x * (ceiling / paired_magnitude(x).clamp_min(1e-8)).clamp(max=1.0).repeat_interleave(2, dim=-3)
+        assert torch.equal(clamp_to_magnitude_ceiling(x, ceiling, 1e-8), legacy)
+
+    def test_the_squared_modulus_agrees_with_the_modulus(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(2, 6, 8, 8)
+        assert torch.allclose(paired_squared_magnitude(x).sqrt(), paired_magnitude(x), atol=1e-6)

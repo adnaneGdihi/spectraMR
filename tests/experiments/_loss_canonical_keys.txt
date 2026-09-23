@@ -13,6 +13,7 @@
 beltrami_diagnostic -> beltrami_diagnostic
 beltrami_epi_residual -> beltrami_epi_residual
 bloch_equivariance_residual -> bloch_equivariance_residual
+coil_subspace_residual -> coil_subspace_residual
 complex_l1 -> complex_l1
 complex_mse -> complex_mse
 complex_spatial_gradient -> complex_spatial_gradient
@@ -58,6 +59,7 @@ lambda_nce -> nce
 lambda_pde -> helmholtz_pde
 lambda_perceptual -> perceptual
 lambda_pinn_dc -> pinn_dc
+lambda_pre_dc_acquired -> pre_dc_acquired
 lambda_pre_dc_kspace -> pre_dc_kspace
 lambda_r1 -> r1
 lambda_se3_equivariance -> se3_equivariance_defect

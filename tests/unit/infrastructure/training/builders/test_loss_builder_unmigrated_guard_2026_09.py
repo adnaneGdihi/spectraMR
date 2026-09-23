@@ -263,12 +263,20 @@ class TestGuardScopeIsDeclaredNotAssumed:
         _build(block)  # documents the boundary; must not raise
 
     def test_one_list_entry_is_enough_to_arm_the_guard(self):
-        """The discriminator between the two cases above."""
+        """The discriminator between the two cases above.
+
+        The entry is a k-space loss on purpose. It used to be ``hfen``, which is
+        registered ``domain="image"`` -- under ``kspace_losses`` with
+        ``output_domain: kspace`` nothing bridges it, so it would have scored raw
+        k-space as anatomy. That is a real defect the zero-bridge guard now
+        rejects before this one is reached, and the fixture only ever needed
+        *some* list entry to arm the guard under test.
+        """
         from spectramr.domain.exceptions import ConfigurationError
 
         block = {
             "reconstruction": {"lambda_complex_l1": 1.0},
-            "kspace_losses": [{"name": "hfen", "weight": 0.3, "enabled": True}],
+            "kspace_losses": [{"name": "null_space_content", "weight": 0.3, "enabled": True}],
             "policy": {"output_domain": "kspace"},
         }
         assert _settings(block).losses.uses_list_based_losses is True

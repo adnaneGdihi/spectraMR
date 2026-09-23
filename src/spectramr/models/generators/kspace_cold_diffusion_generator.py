@@ -2729,8 +2729,30 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # was silently discarded. Only the branches whose layer accepts them
         # pass them on -- ``dc_settings.DCKnobReadership`` is the SSOT for which
         # those are, and the audit reports a declaration the method cannot read.
-        self.dc_train_noise_level = float(kwargs.get("train_noise_level", 0.01))
-        self.dc_eval_noise_level = float(kwargs.get("eval_noise_level", 0.005))
+        #
+        # The defaults are 0.0, i.e. data consistency pins to the measurement
+        # and nothing else. They used to be 0.01/0.005, which no arm ever
+        # declared -- 0 of the corpus sets either knob, so all 68 `dc_method:
+        # hard` arms simulated acquisition noise nobody chose. The level is
+        # ABSOLUTE and the k-space it perturbs is log1p-compressed, so a single
+        # number lands as a different corruption in every band: measured on a
+        # percentile-normalised phantom at 256x256, 0.005 is 0.9% of the mean
+        # |k| in the DC annulus and 23.2% in the outer one, and the training
+        # level 0.01 reaches 46.5% there. That randomises the PHASE of observed
+        # outer-band lines by up to 23.9 degrees -- on the bins hard DC exists
+        # to hold exactly, and which the model therefore cannot correct.
+        #
+        # The reverse loop already disagreed: `_apply_observed_dc` is
+        # `x0*(1-obs) + measurement*obs` with no noise term, so training saw
+        # corrupted measurements and the validation that reports the numbers saw
+        # clean ones. Electing the reverse loop's semantics (non-negotiable 17)
+        # makes the two paths one mechanism again.
+        #
+        # The knobs stay read, so an arm that wants acquisition-noise
+        # augmentation declares it and the audit still reports a declaration the
+        # method cannot consume.
+        self.dc_train_noise_level = float(kwargs.get("train_noise_level", 0.0))
+        self.dc_eval_noise_level = float(kwargs.get("eval_noise_level", 0.0))
         self.dc_noise_type = kwargs.get("noise_type", "gaussian")
 
         # 2026-05-28: ``dc_method: null`` (Python ``None``) and the empty

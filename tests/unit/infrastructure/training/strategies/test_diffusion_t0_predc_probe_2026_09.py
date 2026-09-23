@@ -120,6 +120,35 @@ def test_probe_passes_an_all_ones_mask_because_t0_reveals_everything():
     assert mask.shape[1] == 1
 
 
+def test_probe_scores_against_its_own_mask_not_the_cleared_rung_stash():
+    """The scoring seam reads the producing mask from ``_rung_mask`` and clears it.
+
+    By the time the probe runs, the last cascade rung has already taken its
+    mask, so a probe that stashes nothing hands ``null_space_content`` a
+    ``None`` and every validation batch raises. The stub below mirrors the real
+    seam's pop-then-score against the real loss; at t=0 the null space is empty,
+    so the correct score is exactly zero.
+    """
+    from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
+        _call_safe_loss,
+    )
+    from spectramr.models.losses.null_space_loss import NullSpaceContentLoss
+
+    gen = _Generator()
+    obj, rec = _make_self(gen)
+    obj._rung_mask = None  # what the last rung's scoring call leaves behind
+
+    def _seam(prediction, target, *args, **kwargs):
+        mask, obj._rung_mask = obj._rung_mask, None
+        loss = _call_safe_loss(NullSpaceContentLoss(), prediction, prediction, mask=mask)
+        rec["loss"] = float(loss)
+        return {"val_null_space_content": float(loss)}
+
+    obj._compute_validation_metrics = _seam
+    assert _run(obj) == {"val_t0_predc_null_space_content": 0.0}
+    assert obj._rung_mask is None, "the stash must not outlive the probe's scoring"
+
+
 def test_ddp_wrapped_generator_is_unwrapped():
     """A wrapper has no `exposes_pre_dc`, so the probe would go silently empty.
 

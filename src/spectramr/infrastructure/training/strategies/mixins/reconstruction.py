@@ -18,6 +18,34 @@ from spectramr.infrastructure.training.strategies.mixins.utils import (
 logger = logging.getLogger(__name__)
 
 
+
+def _as_aux_mapping(batch: Any) -> dict[str, Any]:
+    """Flatten whatever the loop hands a strategy into a key -> tensor mapping.
+
+    A plain dict passes through. A ``TrainingBatch`` -- what the loop actually
+    delivers, since ``BatchAdapter.from_dict`` runs before ``train_step`` -- is
+    unpacked to the same shape: its bound fields plus everything ``from_dict``
+    parked in ``metadata``. Anything else returns empty, which is the old
+    behaviour for an unrecognised batch.
+    """
+    if isinstance(batch, dict):
+        return batch
+    fields = ("input", "target", "mask", "coil_maps")
+    if not any(hasattr(batch, name) for name in fields):
+        return {}
+    merged: dict[str, Any] = {}
+    metadata = getattr(batch, "metadata", None)
+    if isinstance(metadata, dict):
+        merged.update(metadata)
+    for name in fields:
+        value = getattr(batch, name, None)
+        if value is not None:
+            # `coil_maps` is the dataclass spelling; the key_mapping below reads
+            # the dataset spellings, so bind it under one it recognises.
+            merged["coil_sensitivities" if name == "coil_maps" else name] = value
+    return merged
+
+
 class ReconstructionMixin:
     """Mixin for reconstruction-specific logic."""
 
@@ -126,12 +154,33 @@ class ReconstructionMixin:
 
         # [PIPELINE FIX] Extract auxiliary tensors from raw TorchIO/Dataset subject
         # which is usually passed down as kwargs['batch']
-        raw_batch = kwargs.get("batch", {})
+        #
+        # The loop converts the collated dict to a ``TrainingBatch`` BEFORE
+        # calling ``train_step`` (``training_loop.py``: ``BatchAdapter.from_dict``),
+        # and that dataclass is not a Mapping -- so the ``isinstance(dict)`` test
+        # below was False on the production path and this whole extraction was
+        # dead. EquivariantImagingStrategy is where it surfaced: it needs
+        # ``mask`` and ``measured_kspace``, the loader produces both, and the
+        # strategy raised "Ensure the dataset/director provides both" on the
+        # first step of every run. Flatten it back to the shape this reads:
+        # ``from_dict`` binds input/target/mask/coil-maps as fields and puts
+        # every other key in ``metadata``, so nothing is lost either way.
+        raw_batch = _as_aux_mapping(kwargs.get("batch", {}))
         if raw_batch and isinstance(raw_batch, dict):
             # Map canonical model kwargs to TorchIO/Dataset keys
             # (e.g. models usually expect 'coil_sensitivities', but dataset provides 'sensitivity')
             key_mapping = {
-                "coil_sensitivities": ["sensitivity", "coil_sensitivities"],
+                # `sensitivity_complex` FIRST. The subject builder's second
+                # branch stores `sensitivity` as `sens_tensor.abs()`, and a
+                # magnitude map is not merely lossy for a phase-sensitive
+                # consumer -- `I - s s^H` with real `s` is a real projector, so
+                # it silently computes something else. Prefer the complex
+                # spelling and fall back only where no complex map exists.
+                "coil_sensitivities": [
+                    "sensitivity_complex",
+                    "sensitivity",
+                    "coil_sensitivities",
+                ],
                 "measured_kspace": ["kspace", "measured_kspace"],
                 "mask": ["mask"],
                 "trajectory": ["trajectory"],

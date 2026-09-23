@@ -54,6 +54,25 @@ class SSDUTrainingConfigSchema(BaseModel):
             "reduces to vanilla SSDU."
         ),
     )
+    noise_std_source: Literal["declared", "self_calibrated"] = Field(
+        default="declared",
+        description=(
+            "Where the Noisier2Noise sigma comes from. 'declared' (default) uses "
+            "noise_std_estimate verbatim. 'self_calibrated' measures it per batch "
+            "from the coil null space, where a physical image is rank one and the "
+            "residual is pure noise, and ignores noise_std_estimate. "
+            "A constant cannot be right for every scan once the pipeline "
+            "normalizes per subject: normalization removes SCALE but turns "
+            "receiver-gain and SNR differences into sigma differences. Measured "
+            "on synthetic 4-coil data through this arm's own image-domain "
+            "quantile normalization, the correct sigma runs 0.018 at high SNR to "
+            "0.268 at low -- a 15x span, around a declared 0.02. M4Raw is 0.3T, "
+            "where the low end is the design point, so a high-SNR constant leaves "
+            "the correction under-powered by 3-13x and by a different factor per "
+            "subject. Self-calibration costs 2-4 ms per batch and reuses the coil "
+            "maps already in it; it reads 1.5-7% HIGH with ESPIRiT maps."
+        ),
+    )
     noise_model: Literal["gaussian_kspace", "ncchi_magnitude"] = Field(
         default="gaussian_kspace",
         description=(
@@ -70,10 +89,23 @@ class SSDUTrainingConfigSchema(BaseModel):
 
     @model_validator(mode="after")
     def _validate_robust_requires_noise(self) -> SSDUTrainingConfigSchema:
-        if self.noisier2noise_correction and self.noise_std_estimate is None:
+        if (
+            self.noisier2noise_correction
+            and self.noise_std_estimate is None
+            and self.noise_std_source == "declared"
+        ):
             raise ValueError(
                 "ssdu.noisier2noise_correction=true requires noise_std_estimate "
-                "(the k-space noise σ); none was set (pitfall #15: the knob must "
-                "be wired)."
+                "(the k-space noise sigma); none was set (pitfall #15: the knob "
+                "must be wired). Set ssdu.noise_std_source: self_calibrated to "
+                "measure it per batch from the coil null space instead."
+            )
+        if self.noise_std_source == "self_calibrated" and self.noise_std_estimate is not None:
+            raise ValueError(
+                "ssdu.noise_std_source: self_calibrated IGNORES noise_std_estimate, "
+                f"but it is declared as {self.noise_std_estimate}. Leaving it would "
+                "put a number in the config that nothing reads and that a reader "
+                "would take for the sigma actually used (pitfall #15). Remove it, "
+                "or set noise_std_source: declared."
             )
         return self

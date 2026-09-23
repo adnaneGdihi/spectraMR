@@ -54,6 +54,9 @@ class NullSpaceContentLoss(nn.Module):
         observed. The mask is MANDATORY at forward — a null space is undefined
         without one, and silently skipping would leave the term reading as
         "on" in the YAML while training without it (pitfall #9).
+
+        The mask may be ``bool`` (what the loader delivers), float or complex;
+        all three are cast to the k-space dtype before the complement is taken.
     """
 
     def __init__(
@@ -104,7 +107,12 @@ class NullSpaceContentLoss(nn.Module):
         k_pred = self._to_kspace(pred)
         k_target = self._to_kspace(target)
         m = mask.real if torch.is_complex(mask) else mask
-        null = (1.0 - m).to(k_pred.real.dtype if torch.is_complex(k_pred) else k_pred.dtype)
+        # Cast the OPERAND, not the result: torch refuses `1.0 - m` outright on a bool
+        # tensor, and bool is what the loader delivers, so casting afterwards never got
+        # the chance to run (#2253). `~m` is not a substitute -- the complement is used
+        # as a WEIGHT below, so a soft mask has to keep its fractional values.
+        weight_dtype = k_pred.real.dtype if torch.is_complex(k_pred) else k_pred.dtype
+        null = 1.0 - m.to(weight_dtype)
 
         diff = k_pred - k_target
         if torch.is_complex(diff):

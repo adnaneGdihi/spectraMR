@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from spectramr.config.schemas.campaign import (
     AblationAxisSchema,
@@ -809,3 +810,85 @@ class TestBestMetricsExtraction:
             "#1343 reported"
         )
 
+
+
+# ── --slurm overrides ───────────────────────────────────────────────
+
+
+class TestSlurmOverrides:
+    """The world size is a launch-time decision, not a committed constant.
+
+    Under a sharded strategy ``num_devices`` also sets the effective batch
+    (there is no world-size LR scaling in-tree), so baking one number into a
+    campaign YAML would fix an optimisation decision for every later submitter
+    on whatever allocation they happen to hold.
+    """
+
+    def test_overrides_win_over_campaign_defaults(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "c.yaml"
+        _write_campaign_yaml(cfg, experiment_configs=[tmp_path / "e.yaml"])
+        campaign = CampaignConfigSchema(**yaml.safe_load(cfg.read_text()))
+
+        o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "4"})
+        assert o._resolve_slurm_params(campaign)["gpus"] == 4
+
+    def test_overrides_win_over_a_per_arm_override_too(self, tmp_path: Path) -> None:
+        """The CLI is last because it is the layer that knows the allocation."""
+        cfg = tmp_path / "c.yaml"
+        _write_campaign_yaml(cfg, experiment_configs=[tmp_path / "e.yaml"])
+        campaign = CampaignConfigSchema(**yaml.safe_load(cfg.read_text()))
+
+        o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "8"})
+        resolved = o._resolve_slurm_params(campaign, {"gpus": 2}, {"gpus": 3})
+        assert resolved["gpus"] == 8
+
+    def test_layers_below_the_cli_still_apply_in_order(self, tmp_path: Path) -> None:
+        """Group then arm, unchanged when the CLI says nothing about that key."""
+        cfg = tmp_path / "c.yaml"
+        _write_campaign_yaml(cfg, experiment_configs=[tmp_path / "e.yaml"])
+        campaign = CampaignConfigSchema(**yaml.safe_load(cfg.read_text()))
+
+        o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "4"})
+        resolved = o._resolve_slurm_params(campaign, {"mem": "16GB"}, {"mem": "32GB"})
+        assert (resolved["mem"], resolved["gpus"]) == ("32GB", 4)
+
+    def test_no_override_leaves_the_campaign_untouched(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "c.yaml"
+        _write_campaign_yaml(cfg, experiment_configs=[tmp_path / "e.yaml"])
+        campaign = CampaignConfigSchema(**yaml.safe_load(cfg.read_text()))
+
+        o = CampaignOrchestrator(dry_run=True)
+        assert o.slurm_overrides == {}
+        assert o._resolve_slurm_params(campaign) == campaign.slurm_defaults.model_dump()
+
+    def test_a_string_value_is_coerced_to_the_schema_type(self) -> None:
+        """argparse hands over ``"4"``; sbatch directives need the int."""
+        o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "4"})
+        assert o.slurm_overrides["gpus"] == 4
+        assert isinstance(o.slurm_overrides["gpus"], int)
+
+    def test_an_unknown_key_raises_rather_than_being_dropped(self) -> None:
+        """Planted: the shape the guard exists for.
+
+        The generator takes a plain dict, so a typo'd key would vanish without
+        a word and the submitter would read the silence as the override having
+        applied (pitfall #15).
+        """
+        with pytest.raises(ValueError, match="Unknown SLURM override key"):
+            CampaignOrchestrator(dry_run=True, slurm_overrides={"gpu": "4"})
+
+    def test_an_out_of_range_value_raises_rather_than_reaching_sbatch(self) -> None:
+        """The second shape: key is real, value is not.
+
+        ``gpus`` is ``ge=0`` in the schema; without the round-trip this lands
+        as ``#SBATCH --gpus=-1`` and is rejected once per arm, on the cluster,
+        after the campaign has already been submitted.
+        """
+        with pytest.raises(ValidationError):
+            CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "-1"})
+
+    def test_only_the_keys_given_are_returned(self) -> None:
+        """Not the whole schema: an override must not silently reinstate a
+        default the campaign deliberately changed."""
+        o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "4"})
+        assert set(o.slurm_overrides) == {"gpus"}

@@ -156,6 +156,27 @@ def paired_magnitude(x: Tensor, eps: float = 1e-8) -> Tensor:
     """
     if torch.is_complex(x):
         return x.abs()
+    return torch.sqrt(paired_squared_magnitude(x))
+
+
+def paired_squared_magnitude(x: Tensor) -> Tensor:
+    """``|z|^2`` per complex coefficient, on the layout :func:`paired_magnitude` reads.
+
+    The squared modulus is smooth at zero and the modulus is not: the gradient of
+    ``sqrt`` there is infinite. A term that needs a floored modulus on a
+    gradient-carrying tensor therefore floors THIS and takes the root afterwards.
+
+    Args:
+        x: ``[..., C, H, W]``, complex or interleaved real-stacked.
+
+    Returns:
+        ``[..., C // 2, H, W]`` for real input, ``[..., C, H, W]`` for complex.
+
+    Raises:
+        ValueError: fewer than 3 dims, or an odd channel count on a real tensor.
+    """
+    if torch.is_complex(x):
+        return x.real * x.real + x.imag * x.imag
     if x.dim() < 3:
         raise ValueError(f"paired_magnitude expects at least [C, H, W], got {tuple(x.shape)}.")
     c = x.shape[-3]
@@ -167,7 +188,7 @@ def paired_magnitude(x: Tensor, eps: float = 1e-8) -> Tensor:
         )
     re = x[..., 0::2, :, :]
     im = x[..., 1::2, :, :]
-    return torch.sqrt(re * re + im * im)
+    return re * re + im * im
 
 
 def paired_complex(x: Tensor) -> Tensor:
@@ -232,7 +253,13 @@ def clamp_to_magnitude_ceiling(x: Tensor, ceiling: Tensor, eps: float = 1e-8) ->
     Returns:
         Same shape and dtype as ``x``.
     """
-    scale = (ceiling / paired_magnitude(x).clamp_min(eps)).clamp(max=1.0)
+    # Floor the SQUARED modulus, then take the root. Flooring the modulus after
+    # `sqrt` guards the forward divide but not the backward: at an exact zero
+    # (hard DC copies the readout window's zeros into the output) `clamp_min`
+    # returns 0 into sqrt's infinite gradient, 0 * inf = NaN, and every weight
+    # goes NaN at the first optimizer step.
+    modulus = torch.sqrt(paired_squared_magnitude(x).clamp_min(eps * eps))
+    scale = (ceiling / modulus).clamp(max=1.0)
     if torch.is_complex(x):
         return x * scale
     # One scale per (Re, Im) pair -> expand back over the interleaved axis so

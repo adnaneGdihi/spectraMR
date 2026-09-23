@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_kspace_batch
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.reconstruction import (
     ReconstructionTrainingStrategy,
@@ -135,6 +136,7 @@ class SSDUReconstructionStrategy(ReconstructionTrainingStrategy):
             self.noisier2noise = bool(cfg.noisier2noise_correction)
             self.noise_std = cfg.noise_std_estimate
             self.noise_model = str(cfg.noise_model)
+            self.noise_std_source = str(cfg.noise_std_source)
             self.n_coils = int(cfg.n_coils)
         else:
             self.theta_fraction = 0.4
@@ -143,14 +145,17 @@ class SSDUReconstructionStrategy(ReconstructionTrainingStrategy):
             self.noisier2noise = False
             self.noise_std = None
             self.noise_model = "gaussian_kspace"
+            self.noise_std_source = "declared"
             self.n_coils = 1
 
         # Robust SSDU correction requires a noise estimate (pitfall #15); the
         # schema validator already enforces this, but guard at construction too.
-        if self.noisier2noise and self.noise_std is None:
+        if self.noisier2noise and self.noise_std is None and self.noise_std_source == "declared":
             raise ValueError(
                 "Robust SSDU (noisier2noise_correction=true) requires "
-                "ssdu.noise_std_estimate (the k-space noise σ); none was set."
+                "ssdu.noise_std_estimate (the k-space noise sigma); none was set. "
+                "Set ssdu.noise_std_source: self_calibrated to measure it per "
+                "batch from the coil null space instead."
             )
         # The 'robust_ssdu' key advertises the Noisier2Noise correction; refuse
         # the contradiction of selecting it with the correction off (pitfall #16).
@@ -226,8 +231,17 @@ class SSDUReconstructionStrategy(ReconstructionTrainingStrategy):
         mask_dtype = target_kspace.real.dtype if target_kspace.is_complex() else target_kspace.dtype
         network_kspace = target_kspace
         if self.noisier2noise:
+            # A DECLARED sigma is a constant, and after per-subject normalization
+            # the correct one is not: normalization removes scale but turns SNR
+            # differences into sigma differences (0.018 at high SNR to 0.268 at
+            # low, measured through this cohort's own image-domain quantile).
+            sigma = (
+                sigma_from_kspace_batch(target_kspace, batch_context.get("coil_sensitivities"))
+                if self.noise_std_source == "self_calibrated"
+                else self.noise_std
+            )
             network_kspace = inject_noisier_kspace(
-                target_kspace, acquired, float(self.noise_std), generator=self._rng
+                target_kspace, acquired, float(sigma), generator=self._rng
             )
         lam_k = network_kspace * lam.to(mask_dtype)
         batch_context["measured_kspace"] = lam_k

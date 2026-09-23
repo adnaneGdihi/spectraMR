@@ -401,20 +401,20 @@ def test_the_width_guard_stays_out_of_the_odd_channel_case():
 def test_the_configured_estimation_method_reaches_the_sampler(monkeypatch):
     """``physics.coil_processing.estimation`` is honored, not hardcoded away.
 
-    Training and validation dispatch through ``estimate_smaps``; pinning
-    ``power_iter`` at this call site made the arm's declared method a silent
-    no-op at sampling time (non-negotiable 8 / pitfall #15).
+    Training and validation dispatch through ``estimate_smaps_calibrated``;
+    pinning ``power_iter`` at this call site made the arm's declared method a
+    silent no-op at sampling time (non-negotiable 8 / pitfall #15).
     """
     from spectramr.infrastructure.inference import cold_diffusion_inference_strategy as mod
 
     seen: list[tuple] = []
-    real = mod.estimate_smaps
+    real = mod.estimate_smaps_calibrated
 
     def spy(kspace, method="power_iter", **kwargs):
         seen.append((method, kwargs))
-        return real(kspace, method="power_iter", acs_only=kwargs.get("acs_only", False))
+        return real(kspace, method="power_iter", out_size=kwargs.get("out_size"))
 
-    monkeypatch.setattr(mod, "estimate_smaps", spy)
+    monkeypatch.setattr(mod, "estimate_smaps_calibrated", spy)
 
     model = _WidthRecordingModel(condition_with_smaps=True, in_channels=8)
     strategy = mod.ColdDiffusionInferenceStrategy(
@@ -431,13 +431,15 @@ def test_the_configured_estimation_method_reaches_the_sampler(monkeypatch):
     mask[..., ::2] = 1.0
     strategy.run_inference(full * mask, mask=mask)
 
-    assert seen, "estimate_smaps was never called"
+    assert seen, "estimate_smaps_calibrated was never called"
     method, kwargs = seen[0]
     assert method == "espirit"
     assert kwargs["kernel_size"] == 5
-    # Calibration must crop to the dense center: sampling only ever sees the
-    # undersampled input, so the aliased periphery would poison the maps.
-    assert kwargs["acs_only"] is True
+    # The maps must land on the image grid the sampler works on. Confinement to
+    # the dense centre is no longer the caller's to pass -- the owner applies it,
+    # which is what lets the maps come back full-resolution instead of cropped
+    # and then interpolated back up (#2213).
+    assert kwargs["out_size"] == (32, 32)
 
 
 # ---------------------------------------------------------------------------
