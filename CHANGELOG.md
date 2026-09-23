@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release version, since a `0.1.3.dev<n>` wheel would sort before an 0.1.3 that
   has already shipped. The file ships to both repositories -- the export
   allowlist selects `.github/` wholesale and the overlay is replace-only -- so
-  every job carries `if: github.repository == 'adnaneGdihi/spectraMR'`.
+  every job carries `if: github.repository == 'adnaneGdihi/spectraMR'`. The lane
+  is not yet switched on: no PyPI trusted publisher names this file, so PyPI
+  still receives only tagged releases.
 - **The branch model is written down.** `docs/versioning.rst` states what `main`,
   `dev` and `nightly` each are and what moves them, and records that nothing
   currently moves `nightly`: on 2026-09-06 it sat 10 commits behind `main`,
@@ -44,6 +46,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `refs/heads/docs/` (40 of them on 2026-09-06), and git cannot hold a ref at
   `docs` and refs beneath `docs/` at the same time.
 
+- **Non-Cartesian k-space.** Golden-angle radial acquisition, gridding by
+  attention, a phase-exact per-annulus gain with one owner for the radial
+  partition, and per-annulus latent tokens for the outer band.
+- **Multi-coil operators.** A coil-subspace residual loss, a multi-coil
+  equivariant-imaging operator and an ESPIRiT sensitivity transform.
+- **A run survives the end of its cluster time allocation.** The allocation's end is derived
+  once; training stops a margin ahead of it, saves, requeues and resumes with the
+  random-number stream it left off on, rather than restarting the augmentation
+  sequence.
+- **Compilation and sharding.** Regional `torch.compile` with an explicit opt-out
+  for complex-valued modules, placement chosen per parallel strategy, and bf16
+  gated on the device's native compute capability rather than on a version
+  string. The n2n and two Mamba cohorts shard on DeepSpeed ZeRO-2.
+- **Cold diffusion can end its reverse loop at t=0**, as a terminal step, and
+  error is attributed to the k-space band that wrote it.
+- **Launch.** Process-group arms launch under `torchrun`, `-O` overrides reach
+  every task of an experiment array, and the array wrapper accepts sbatch flags,
+  a launch verb and node exclusion. One diagnostics make target runs every pass,
+  with cohort and tree selection.
+
+### Changed
+- **Coil sensitivity maps are normalised after they are resized**, not before.
+  Bilinear interpolation between unit-modulus complex values returns the chord,
+  so maps normalised on the calibration grid and then upsampled fell to a mean
+  squared norm of 0.58 between grid nodes; they now hold 1.0 inside the support.
+  The SENSE projection and every coil-weighted loss and metric move with them, so
+  results from before this change are not comparable with results after it.
+- **Hard data consistency replaces only the acquired k-space bins**, and
+  `null_space_content` is enabled across the k-space-filling experiments, so the
+  unsampled bins receive a gradient that the post-consistency losses cannot
+  supply. Metrics from before this change are not comparable either.
+- **Loss weights have one declaration surface.** The domain-grouped loss lists
+  build the loss modules and the weight table is derived from them; a `lambda_*`
+  scalar that names the same loss at a different weight raises.
+- **GAN critics score the prepared target in the domain they were built for**, and
+  the composite-GAN weight is read from the configuration instead of a hardcoded
+  10.0.
+- **`IModel` is an `nn.Module`**, gradient reversal has one implementation, and
+  model capabilities are read from one table.
+
+### Deprecated
+- `CheckpointDirector.cleanup_old_checkpoints`, which no code path calls.
+
 ### Fixed
 - **The dev series could not be built at all.** `build_dist.py` compared
   `CHANGELOG.md`'s newest dated heading against the wheel's version as strings,
@@ -59,6 +104,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so reported `DISAGREEMENT` on every tree its own `nightly` mode had just
   written. Both now call `build_dist.version_disagreements`, which takes the
   reference version and the raw changelog text (non-negotiable 17).
+
+- **Training produced NaN weights at the first optimizer step** on arms using the
+  k-space magnitude clamp: the square root was taken before a lower bound was
+  applied to the squared modulus.
+- **Coil maps were dropped at the Fourier bridge**, so every arm declaring the
+  coil-subspace residual crashed at the first iteration; and validation raised on
+  `null_space_content` because the t=0 probe did not pass its mask on.
+- **Three prior-method baselines did not run their authors' methods**, EMA
+  blended zero tensors on 75 arms with a validation swap that could not restore
+  the weights, and five backbone arms could not build a model.
+- **The SSL k-space adjoint rendered k-space as an image**, so the n2n cohort
+  did not train.
+- The k-space mask no longer writes in place, a severed autograd graph in one
+  strategy is reconnected, and `contrast_idx` is aligned to the flattened batch.
 
 ### Security
 - **Six open vulnerability alerts on the published repository, closed by three
