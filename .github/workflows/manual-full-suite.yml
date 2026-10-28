@@ -124,7 +124,7 @@ jobs:
           pip install pip-audit
           pip install --upgrade 'setuptools>=83.0.0'
       - run: pip-audit --skip-editable --progress-spinner off
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39  # v3.2.4
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
       # Scan root is `.github/`, NOT `.github/workflows/`. The composite action
       # at .github/actions/setup-env/action.yml is referenced by nine jobs
       # across both lanes and sits outside the narrower root, so the one tool
