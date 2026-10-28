@@ -13,7 +13,12 @@ from torch import nn
 from spectramr.models.registry import register_model
 
 
-@register_model(name="ldm_latent_discriminator", training_mode="gan")
+@register_model(
+    role="discriminator",
+    name="ldm_latent_discriminator",
+    training_mode="gan",
+    input_domain="latent",
+)
 class LatentDiscriminator(nn.Module):
     """Discriminator for latent space in latent GAN models.
 
@@ -201,7 +206,12 @@ class LatentDiscriminator(nn.Module):
         return (input_shape[0], 1)
 
 
-@register_model(name="ldm_patch_latent_discriminator", training_mode="gan")
+@register_model(
+    role="discriminator",
+    name="ldm_patch_latent_discriminator",
+    training_mode="gan",
+    input_domain="latent",
+)
 class PatchLatentDiscriminator(nn.Module):
     """Patch-based discriminator for latent space.
 
@@ -337,7 +347,12 @@ class PatchLatentDiscriminator(nn.Module):
         return (input_shape[0], 1, h_out, w_out)
 
 
-@register_model(name="ldm_multiscale_latent_discriminator", training_mode="gan")
+@register_model(
+    role="discriminator",
+    name="ldm_multiscale_latent_discriminator",
+    training_mode="gan",
+    input_domain="latent",
+)
 class MultiScaleLatentDiscriminator(nn.Module):
     """Multi-scale discriminator for latent space.
 

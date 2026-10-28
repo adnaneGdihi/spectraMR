@@ -57,9 +57,7 @@ def _identity_gen() -> _RecordingGen:
 
 
 def _make_strategy(gen: _RecordingGen) -> CrossContrastKspaceDiffusionStrategy:
-    s = CrossContrastKspaceDiffusionStrategy.__new__(
-        CrossContrastKspaceDiffusionStrategy
-    )
+    s = CrossContrastKspaceDiffusionStrategy.__new__(CrossContrastKspaceDiffusionStrategy)
     s.env = types.SimpleNamespace(generator=gen)
     return s
 
@@ -77,9 +75,7 @@ def _spy_on_parent(monkeypatch) -> list:
         calls.append((args, kwargs))
         return {"loss_total": torch.zeros(())}
 
-    monkeypatch.setattr(
-        DiffusionTrainingStrategy, "_compute_losses_impl", _spy, raising=True
-    )
+    monkeypatch.setattr(DiffusionTrainingStrategy, "_compute_losses_impl", _spy, raising=True)
     return calls
 
 
@@ -160,9 +156,7 @@ class TestPairedBatchStillTrains:
         assert len(gen.calls) == 1
         assert set(out) == {"loss_destination", "loss_residual", "loss_total"}
         assert all(torch.isfinite(v).all() for v in out.values())
-        assert torch.allclose(
-            out["loss_total"], out["loss_destination"] + out["loss_residual"]
-        )
+        assert torch.allclose(out["loss_total"], out["loss_destination"] + out["loss_residual"])
 
     def test_contrast_idx_emits_per_contrast_diagnostics(self):
         # ``iteration`` defaults to 0, so the log-interval gate is open and the
@@ -197,9 +191,7 @@ class TestNonDictBatchAndMissingGenerator:
         s = _make_strategy(gen)
 
         with pytest.raises(ValueError) as exc:
-            s._compute_losses_impl(
-                input_batch=torch.randn(2, 1, 8, 8), target_batch=None, epoch=0
-            )
+            s._compute_losses_impl(input_batch=torch.randn(2, 1, 8, 8), target_batch=None, epoch=0)
 
         assert parent_calls == []
         assert gen.calls == []
@@ -233,9 +225,7 @@ class TestNonDictBatchAndMissingGenerator:
         s = _make_strategy(_identity_gen())
 
         with pytest.raises(ValueError) as exc:
-            s._compute_losses_impl(
-                input_batch=torch.randn(2, 1, 8, 8), target_batch=None, epoch=0
-            )
+            s._compute_losses_impl(input_batch=torch.randn(2, 1, 8, 8), target_batch=None, epoch=0)
 
         assert "'NoneType'" in str(exc.value)
 
@@ -272,9 +262,7 @@ class TestNoParentFallbackRemains:
         """
         import inspect
 
-        src = inspect.getsource(
-            CrossContrastKspaceDiffusionStrategy._compute_losses_impl
-        )
+        src = inspect.getsource(CrossContrastKspaceDiffusionStrategy._compute_losses_impl)
         assert "super()._compute_losses_impl" not in src
 
 
@@ -447,3 +435,17 @@ class TestGeneratorDispatchIsIntrospectedNotSwallowed:
         s._compute_losses_impl(input_batch=_paired_batch(), target_batch=None, epoch=0)
 
         assert seen == [None]
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: its fidelity term is in k-space against the destination contrast.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert CrossContrastKspaceDiffusionStrategy.__dict__["folds_image_losses"] is False
+    assert CrossContrastKspaceDiffusionStrategy.__dict__["inline_losses"] == frozenset()

@@ -12,6 +12,7 @@ must still be trained — passing an unexpected kwarg would raise ``TypeError``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -87,6 +88,11 @@ def _make_sfc_strategy(generator: torch.nn.Module) -> AdaptiveSFCHSSCStrategy:
     strategy.lambda_mu = 0.01
     strategy.lambda_traj = 0.01
     strategy.device = None
+    # What BaseTrainingStrategy.__init__ provides for owned modules (#2629).
+    strategy.config = SimpleNamespace(parallel=None)
+    strategy._owned_modules = {}
+    strategy._owned_wrappers = {}
+    strategy.register_owned_module("sfc", strategy.sfc)
     # ``generator_model`` is a read-only property delegating to
     # ``self.env.generator`` — drive it through a stub env.
     strategy.env = _StubEnv(generator)

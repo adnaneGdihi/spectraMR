@@ -100,7 +100,7 @@ KNOWN_ACCELERATION_DEPRECATED = {
     "gradient_accumulation_steps",  # DEPRECATED → optimization.gradient.accumulation_steps
     "use_compile",  # DEPRECATED → optimization.use_compile
     "use_distributed",  # DEPRECATED → parallel.strategy
-    "use_gradient_checkpointing",  # DEPRECATED → optimization.enable_gradient_checkpointing
+    "use_gradient_checkpointing",  # DEPRECATED → optimization.gradient.enable_checkpointing
 }
 
 # Fields that are schema-only (not deprecated, just unimplemented consumers)
@@ -109,7 +109,6 @@ KNOWN_ACCELERATION_SCHEMA_ONLY = {
     "schedule_steps",  # Steps to max accel — no consumer
     "schedule_power",  # Polynomial power — no consumer
     "mask_direction",  # Direction of masking — not in KSpaceMaskGenerator
-    "line_axis",  # Phase/readout axis — not in KSpaceMaskGenerator
     "density_power",  # VD density power — not forwarded to generator
     "sigma_scaling",  # Gaussian sigma — not forwarded
     "std_scale",  # Gaussian std — not forwarded

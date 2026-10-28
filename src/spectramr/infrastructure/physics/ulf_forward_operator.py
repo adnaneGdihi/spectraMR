@@ -32,6 +32,7 @@ from spectramr.infrastructure.physics.dispersion import (
     power_law_t1_transport,
     power_law_t2_transport,
 )
+from spectramr.infrastructure.physics.emi_degradation import readout_tone_field
 from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.infrastructure.physics.field_simulation import B0MapSimulator
 from spectramr.infrastructure.physics.spherical_harmonics import (
@@ -298,8 +299,13 @@ class DifferentiableULFForwardOperator(nn.Module):
         image_shape: Spatial dimensions (H, W). Default: (256, 256).
         gx: Readout gradient amplitude in mT/m. Default: 15.0.
         gy: Phase-encode gradient amplitude in mT/m. Default: 15.0.
+        gz: Slice-select gradient amplitude in mT/m. Default: 0.0.
+        slice_offset_m: Slice position from isocentre in metres. Default: 0.0. Every
+            concomitant term needs ``gz`` or a slice offset, so with both at zero the
+            Maxwell stage is exactly zero (an axial slice at isocentre).
+        emi_frequencies: EMI offsets from the Larmor frequency in Hz; on the Cartesian
+            path a tone at ``f`` lands ``f * T_read`` pixels from the readout centre.
         thermal_scale: Thermal noise scaling. Default: 1e-5.
-        emi_frequencies: EMI frequencies in Hz. Default: (60, 120, 180).
         enable_emi: Whether to inject EMI. Default: True.
         enable_gnl: Whether to apply GNL warping. Default: True.
         enable_maxwell: Whether to apply concomitant phase. Default: True.
@@ -323,6 +329,8 @@ class DifferentiableULFForwardOperator(nn.Module):
         image_shape: tuple[int, int] = (256, 256),
         gx: float = 15.0,
         gy: float = 15.0,
+        gz: float = 0.0,
+        slice_offset_m: float = 0.0,
         thermal_scale: float = 1e-5,
         emi_frequencies: tuple[float, ...] = (60.0, 120.0, 180.0),
         emi_amplitudes: tuple[float, ...] = (5e-3, 2e-3, 1e-3),
@@ -344,6 +352,8 @@ class DifferentiableULFForwardOperator(nn.Module):
         self.image_shape = image_shape
         self.gx = gx
         self.gy = gy
+        self.gz = gz
+        self.slice_offset_m = slice_offset_m
         self.thermal_scale = thermal_scale
         self.emi_frequencies = emi_frequencies
         self.emi_amplitudes = emi_amplitudes
@@ -449,6 +459,8 @@ class DifferentiableULFForwardOperator(nn.Module):
                 field_strength=self.b0_target,
                 gx=self.gx,
                 gy=self.gy,
+                gz=self.gz,
+                z_offset=self.slice_offset_m,
                 device=device,
             )
             # φ = 2π · Δf · TE_seconds
@@ -456,7 +468,9 @@ class DifferentiableULFForwardOperator(nn.Module):
             phase_maxwell = 2.0 * math.pi * phi_c * te_seconds
             mxy = mxy * torch.exp(-1j * phase_maxwell.to(mxy.dtype))
 
-        if b0_map is not None:
+        # Cartesian: the off-resonance phase at the echo. The TS-NUFFT path integrates
+        # b0 over the readout time itself, so applying TE here too would count it twice.
+        if b0_map is not None and trajectory is None:
             te_seconds = self.te * 1e-3
             phase_b0 = 2.0 * math.pi * b0_map * te_seconds
             if not torch.is_complex(mxy):
@@ -480,26 +494,36 @@ class DifferentiableULFForwardOperator(nn.Module):
 
         # ── Stage 5: ULF Noise ──
         if self.enable_noise:
-            if time_vector is None:
-                K = kspace.shape[-1] * kspace.shape[-2] if kspace.ndim == 4 else kspace.shape[-1]
-                time_vector = torch.linspace(0, 0.03, K, device=device)
-
             if kspace.ndim == 4:
-                # Flatten for noise injection, then reshape
+                # Cartesian: each PE line is its own readout. Thermal noise is white; EMI
+                # is a tone per readout row whose phase is not locked between lines.
                 B, C, H, W = kspace.shape
-                kspace_flat = kspace.reshape(B, C, -1)
-                tv = torch.linspace(0, 0.03, H * W, device=device)
-                kspace_flat = inject_ulf_noise(
-                    kspace_flat,
-                    tv,
+                if time_vector is not None and time_vector.numel() != W:
+                    raise ValueError(
+                        f"Cartesian time_vector must hold the {W} readout timestamps; "
+                        f"got {time_vector.numel()}."
+                    )
+                t_read = (
+                    0.03
+                    if time_vector is None
+                    else float(time_vector[-1] - time_vector[0]) * W / max(W - 1, 1)
+                )
+                kspace = inject_ulf_noise(
+                    kspace.reshape(B, C, -1),
+                    torch.zeros(H * W, device=device),
                     b0=self.b0_target,
                     thermal_scale=self.thermal_scale,
-                    emi_frequencies=self.emi_frequencies,
-                    emi_amplitudes=self.emi_amplitudes,
-                    enable_emi=self.enable_emi,
-                )
-                kspace = kspace_flat.reshape(B, C, H, W)
+                    enable_emi=False,
+                ).reshape(B, C, H, W)
+                if self.enable_emi and len(self.emi_frequencies) > 0:
+                    freqs = torch.tensor(self.emi_frequencies, device=device)
+                    amps = torch.tensor(self.emi_amplitudes, device=device)
+                    kspace = kspace + readout_tone_field(
+                        (B, C, H, W), freqs * t_read, amps, device=device
+                    )
             else:
+                if time_vector is None:
+                    time_vector = torch.linspace(0, 0.03, kspace.shape[-1], device=device)
                 kspace = inject_ulf_noise(
                     kspace,
                     time_vector,
@@ -546,7 +570,9 @@ class DifferentiableULFForwardOperator(nn.Module):
 
             # B₀ drift + off-resonance phase
             if b0_map is not None:
-                drifted_b0 = b0_map + self.b0_target * self.thermal_drift_rate * 1e-6 * tau
+                # B0(t) = B0 (1 + r 1e-6 t), so the drift is gamma B0 r 1e-6 t in Hz.
+                drift_hz = self.gamma_hz * self.b0_target * self.thermal_drift_rate * 1e-6 * tau
+                drifted_b0 = b0_map + drift_hz
                 phase = 2.0 * math.pi * drifted_b0 * tau
                 m_shifted = mxy * torch.exp(-1j * phase)
             else:

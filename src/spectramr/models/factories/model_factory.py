@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 import torch
 from torch import nn
 
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.errors import ModelCreationError
 
 # NOTE (2026-07-02): the ``import spectramr.models.sota_registry`` block that
@@ -27,6 +28,7 @@ from spectramr.models.errors import ModelCreationError
 # Presets imported from external file to reduce bloat
 from spectramr.models.factories.presets import DIFFUSION_CONFIGS, DIFFUSION_PROCESSES
 from spectramr.models.interfaces import IDiscriminator, IGenerator, IModel
+from spectramr.models.registry import is_strict_kwargs
 
 #: Module logger. Its absence was not cosmetic: `create_model` and
 #: `_create_diffusion_model_internal` each open with a bare `logger.debug`,
@@ -46,24 +48,38 @@ class ModelRegistry:
         self._generators: dict[str, type[IGenerator]] = {}
         self._discriminators: dict[str, type[IDiscriminator]] = {}
 
-        # Sync with global registry
-        try:
-            import spectramr.models.registry as global_registry
+        # Sync with global registry, bucketing on the role each registration
+        # DECLARES rather than one guessed from its base classes.
+        #
+        # This used to read ``issubclass(cls, IDiscriminator)`` with an
+        # ``else: # Default to generator for backward compatibility`` tail.
+        # Only 10 of the framework's discriminators subclass that interface,
+        # so 9 more -- domain_discriminator, frequency_domain_discriminator,
+        # kan_discriminator, kspace_discriminator, ldm_latent_discriminator,
+        # ldm_multiscale_latent_discriminator, ldm_patch_latent_discriminator,
+        # stargan_v2_discriminator, wasserstein_discriminator -- fell through
+        # to the generator bucket, and ``create_discriminator`` then raised
+        # "Discriminator type '<x>' not registered" for each. A live build
+        # failure for any GAN arm naming one of them, produced by a
+        # classifier that could not report its own uncertainty (#1932).
+        #
+        # The import is NOT wrapped in try/except ImportError. The old bare
+        # ``except ImportError: pass`` left BOTH buckets empty and silent, so
+        # every create_generator and create_discriminator call reported its
+        # name as unregistered -- a failure indistinguishable from an empty
+        # registry (non-negotiable 3). spectramr.models.registry is a
+        # first-party module; if it cannot import, that is not a condition to
+        # degrade past.
+        import spectramr.models.registry as global_registry
 
-            global_models = global_registry.list_models()
-            for name, metadata in global_models.items():
-                cls = metadata.get("class")
-                if cls:
-                    # Categorize based on interface
-                    if issubclass(cls, IDiscriminator):
-                        self._discriminators[name] = cls
-                    elif issubclass(cls, IGenerator):
-                        self._generators[name] = cls
-                    else:
-                        # Default to generator for backward compatibility
-                        self._generators[name] = cls
-        except ImportError:
-            pass
+        for name, metadata in global_registry.list_models().items():
+            cls = metadata.get("class")
+            if cls is None:
+                continue
+            if metadata.get("role") == "discriminator":
+                self._discriminators[name] = cls
+            else:
+                self._generators[name] = cls
 
     def register_generator(self, name: str, generator_class: type[IGenerator]) -> None:
         """Register a generator class."""
@@ -98,6 +114,19 @@ class ModelRegistry:
         return list(self._discriminators.keys())
 
 
+_DIFFUSION_UNET_FILTER = {"acceleration_config", "features", "time_dim", "hidden_dims", "num_resblocks", "param_group"}
+
+
+def _diffusion_unet_defaults() -> dict[str, Any]:
+    return {
+        "model_channels": 128,
+        "channel_mult": (1, 2, 4, 8),
+        "use_dense_skip": True,
+        "dropout": 0.1,
+        "output_activation": nn.Tanh(),
+    }
+
+
 class ParameterMapper:
     """Component for mapping parameters between different model types."""
 
@@ -107,15 +136,15 @@ class ParameterMapper:
             "vit_kan": {
                 "num_heads": "heads",  # Map num_heads -> heads
             },
-            "enhanced_deep_unet": {
-                # Map config params to EnhancedDeepDiffusionUNet params
-                # Note: 'features' is not directly mappable - needs custom handling
-            },
+        }
+
+        # The diffusion-denoiser UNet is the configurable UNet with these options on.
+        self._model_default_kwargs = {
+            "enhanced_deep_unet": _diffusion_unet_defaults
         }
 
         # Model-specific kwargs to filter (remove if present)
         self._model_filter_list = {
-            "pimn": {"hidden_channels"},
             "diffusion_sr": {
                 "acceleration_config",
                 "use_mc_dropout",
@@ -203,15 +232,7 @@ class ParameterMapper:
                 "atol",
                 "adaptive",
             },
-            "enhanced_deep_unet": {
-                "acceleration_config",
-                # EnhancedDeepDiffusionUNet doesn't accept these config params
-                "features",  # Uses channel_mult instead (handled by map_generator_params)
-                "time_dim",  # Uses model_channels * 4 internally
-                "hidden_dims",
-                "num_resblocks",  # Uses num_res_blocks
-                "param_group",
-            },
+            "enhanced_deep_unet": _DIFFUSION_UNET_FILTER,
             "latent_diffusion_sr": {
                 "acceleration_config",
                 "time_embedding_dim",
@@ -324,6 +345,9 @@ class ParameterMapper:
                 if old_key in result:
                     result[new_key] = result.pop(old_key)
 
+        for key, value in self._model_default_kwargs.get(model_type, lambda: {})().items():
+            result.setdefault(key, value)
+
         # Filter out model-specific invalid kwargs
         if model_type in self._model_filter_list:
             invalid_keys = self._model_filter_list[model_type]
@@ -386,8 +410,13 @@ def _filter_kwargs_to_signature(
     site: str,
     role: str = "",
     declared: frozenset[str] | None = None,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Drop kwargs the target's ``__init__`` cannot accept, and RECORD the drop.
+
+    ``strict=True`` (``register_model(strict_kwargs=True)``) additionally RAISES
+    when a key the arm declared in ``model_kwargs`` is dropped: an unread knob
+    must fail the build, not vanish.
 
     The filtering itself is deliberate and stays: injecting ``model_kwargs`` and
     physics config into a constructor that never declared those parameters is a
@@ -457,6 +486,13 @@ def _filter_kwargs_to_signature(
     )
     if not rejected:
         return mapped
+    unread = sorted(k for k in rejected if declared and k in declared)
+    if strict and unread:
+        raise ModelCreationError(
+            f"{label}.__init__ does not accept model_kwargs {unread}; the constructor "
+            f"has no **kwargs, so they would be silently dropped. Fix the key name "
+            f"or remove it from the arm."
+        )
     logger_.debug(f"[ModelCreator] Stripping invalid kwargs for {label}: {rejected}")
     return {k: v for k, v in mapped.items() if k in contract.accepted}
 
@@ -562,6 +598,7 @@ class ModelCreator:
             logger_=self._logger,
             site="spectramr.models.factories.model_factory:create_generator",
             declared=_declared_keys,
+            strict=is_strict_kwargs(model_type),
         )
 
         # [FIX] Coerce list-valued params to scalars ONLY when the constructor
@@ -1406,11 +1443,12 @@ class ModelFactory:
         try:
             from ..generators import (
                 CoilSensitivityNetwork,
-                EnhancedDeepUNetGenerator,
                 MultiContrastFusionGenerator,
                 PhysicsDrivenNetwork,
                 UnrolledReconstructionGenerator,
             )
+
+            from ..reconstruction.unet import UNet as ConfigurableUNet
 
             # Import B0Estimator directly from its module to ensure registration
             from ..geometric.b0_estimator import B0Estimator
@@ -1423,8 +1461,7 @@ class ModelFactory:
                 "multicontrast_fusion": MultiContrastFusionGenerator,
                 "multi_contrast_fusion_generator": MultiContrastFusionGenerator,
                 "fusion_unet": MultiContrastFusionGenerator,
-                "enhanced_deep_unet": EnhancedDeepUNetGenerator,
-                "diffusion_unet": EnhancedDeepUNetGenerator,
+                "enhanced_deep_unet": ConfigurableUNet,
                 "b0_estimator": B0Estimator,
             }
             for name, cls in mappings.items():
@@ -1547,14 +1584,14 @@ class ModelFactory:
 
         # Hilbert-Mamba ULF-to-HF reconstruction generators
         try:
+            from ..generators.crm_mamba_generator import CRMMamba
+            from ..generators.ct_mamba_generator import CTMamba
+            from ..generators.fe_mamba import FEMamba
+            from ..generators.hw_mamba import HWMamba
+            from ..generators.inr_mamba import INRMamba
             from ..generators.hilbert_mamba_generators import (
-                CRMMamba,
-                CTMamba,
-                FEMamba,
                 HilbertMambaUNet,
                 HLDMamba,
-                HWMamba,
-                INRMamba,
                 MDIMamba,
                 MMMamba,
                 TwoHalfDMamba,
@@ -2355,7 +2392,7 @@ class ModelFactory:
             )
             # Extract time embedding parameters
             time_dim = int(kwargs.get("time_dim", 256))
-            max_timesteps = int(kwargs.get("num_timesteps", 1000))
+            max_timesteps = int(kwargs.get("num_timesteps", DEFAULT_DIFFUSION_TIMESTEPS))
 
             model = TimeConditionedWrapper(
                 model, time_embed_dim=time_dim, max_timesteps=max_timesteps
@@ -2539,7 +2576,7 @@ class TimeConditionedWrapper(nn.Module, IGenerator, metaclass=ModuleABCMeta):
         self,
         model: nn.Module,
         time_embed_dim: int = 128,
-        max_timesteps: int = 1000,
+        max_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS,
         time_embed_type: str = "sinusoidal",
     ):
         """Initialize the time-conditioned wrapper.
@@ -2611,7 +2648,7 @@ class TimeConditionedWrapper(nn.Module, IGenerator, metaclass=ModuleABCMeta):
         """
         from ..blocks.embeddings import KANTimeEmbedding
 
-        return KANTimeEmbedding(dim)
+        return KANTimeEmbedding(dim, max_timesteps=max_timesteps)
 
     def _create_simple_kan(self, dim: int, max_timesteps: int) -> nn.Module:
         """_create_simple_kan.
@@ -2624,7 +2661,7 @@ class TimeConditionedWrapper(nn.Module, IGenerator, metaclass=ModuleABCMeta):
         """
         from ..diffusion.simple_enhanced_diffusion import SimpleKANTimeEmbedding
 
-        return SimpleKANTimeEmbedding(dim)
+        return SimpleKANTimeEmbedding(dim, max_timesteps)
 
     @property
     def name(self) -> str:

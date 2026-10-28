@@ -40,6 +40,7 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import Enum
 from typing import Any, Literal, cast
 
@@ -47,9 +48,16 @@ import numpy as np
 import torch
 
 from spectramr.infrastructure.physics.bounded_cache import BoundedLRUCache
+from spectramr.infrastructure.physics.line_axis import line_axis_for
 
 # [PHYSICS] Import TrajectoryFactory
 from spectramr.infrastructure.physics.trajectories import TrajectoryFactory
+from spectramr.infrastructure.physics.trajectory_ladder import (
+    NestedTrajectoryLadder,
+    golden_radial_ordering,
+    golden_spiral_ordering,
+    validate_ladder_reachable,
+)
 
 # Get a logger
 logger = logging.getLogger(__name__)
@@ -57,6 +65,11 @@ logger = logging.getLogger(__name__)
 
 # Global configuration for maximum acceleration factor
 MAX_ACCELERATION = 64.0
+
+#: Edge-to-DC growth of the variable-density Poisson-disc exclusion radius: the
+#: radius at the inscribed ellipse is ``1 + slope`` times the radius at DC, so the
+#: density there is ``(1 + slope)**-2`` of the centre's (1/16 at 3).
+POISSON_DENSITY_SLOPE = 3.0
 
 #: Rate constant of the ``exponential`` acceleration ramp.
 #:
@@ -176,6 +189,83 @@ class MaskGenerator:
         """
         self.seed = seed
 
+    @staticmethod
+    def trajectory_bin_indices(
+        trajectory: torch.Tensor, height: int, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grid ``(row, col)`` of every trajectory sample, in sample order.
+
+        The one owner of the rasteriser's index rule, so the nested trajectory ladder
+        (:mod:`~spectramr.infrastructure.physics.trajectory_ladder`) bins samples
+        exactly as :meth:`_rasterize_trajectory` does. ``[-pi, pi]`` maps to
+        ``[0, N]`` with ``k = 0`` on bin ``N // 2``; each sample goes to its nearest
+        bin, then clamps to the grid. Flooring sent a sample on the centre line to
+        either side by the sign of a float residue (``cos(pi/2) = -4.4e-8``), so a
+        0/90-degree spoke pair was not a transpose pair (#2551).
+        """
+        x_norm = trajectory[0] / (2 * np.pi) + 0.5
+        y_norm = trajectory[1] / (2 * np.pi) + 0.5
+        x_idx = torch.round(x_norm * width).long().clamp(0, width - 1)
+        y_idx = torch.round(y_norm * height).long().clamp(0, height - 1)
+        return y_idx, x_idx
+
+    @staticmethod
+    def variable_density_poisson_disc(
+        allowed: torch.Tensor,
+        radius: float,
+        generator: torch.Generator,
+        *,
+        density_slope: float = POISSON_DENSITY_SLOPE,
+    ) -> torch.Tensor:
+        r"""A saturated variable-density Poisson-disc set on the bins ``allowed`` marks.
+
+        Random sequential adsorption: bins are visited once in a seeded random order
+        and a bin is kept unless an earlier kept bin :math:`j` lies closer than
+        :math:`r_j = \mathrm{radius}\,(1 + \mathrm{slope}\,\rho_j)`, with
+        :math:`\rho` the distance from DC in half-grid units (1 on the inscribed
+        ellipse). Visiting every bin is dart throwing run to saturation, so the
+        density follows :math:`1/r^2` -- denser at DC -- and is set by ``radius``
+        alone. ``PoissonDiskKSpaceAccelerator`` keeps its fixed-radius master
+        pattern; that one is a cold-diffusion ladder and is not seeded per call.
+
+        Args:
+            allowed: ``(H, W)`` bool; only these bins may be kept.
+            radius: Exclusion radius at DC, in bins. Below 1 keeps every visited bin.
+            generator: Seeds the visiting order.
+            density_slope: How fast the radius grows towards the edge; 0 is uniform.
+
+        Returns:
+            ``(H, W)`` bool, a subset of ``allowed``.
+        """
+        height, width = allowed.shape
+        ky = (torch.arange(height, dtype=torch.float64) - height // 2) / (height / 2)
+        kx = (torch.arange(width, dtype=torch.float64) - width // 2) / (width / 2)
+        rho = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2).clamp(max=1.0)
+        quantised = torch.round(4.0 * radius * (1.0 + density_slope * rho)).numpy().astype(int)
+        blocked = (~allowed.bool()).numpy().copy()
+        kept = np.zeros((height, width), dtype=bool)
+        discs: dict[int, tuple[int, np.ndarray]] = {}
+        flat_blocked = blocked.reshape(-1)
+        for index in torch.randperm(height * width, generator=generator).tolist():
+            if flat_blocked[index]:
+                continue
+            y, x = divmod(index, width)
+            kept[y, x] = True
+            q = int(quantised[y, x])
+            if q not in discs:
+                reach = max(0, math.ceil(q / 4.0) - 1)
+                offsets = np.arange(-reach, reach + 1)
+                dist2 = offsets[:, None] ** 2 + offsets[None, :] ** 2
+                discs[q] = (reach, 16 * dist2 < q * q)
+            reach, disc = discs[q]
+            y0, y1 = max(0, y - reach), min(height, y + reach + 1)
+            x0, x1 = max(0, x - reach), min(width, x + reach + 1)
+            blocked[y0:y1, x0:x1] |= disc[
+                y0 - y + reach : y1 - y + reach, x0 - x + reach : x1 - x + reach
+            ]
+            blocked[y, x] = True
+        return torch.from_numpy(kept)
+
     def _rasterize_trajectory(
         self,
         trajectory: torch.Tensor,
@@ -203,23 +293,7 @@ class MaskGenerator:
             channels = 1
 
         mask = torch.zeros((channels, H, W), dtype=torch.bool)  # device? will be moved later
-
-        # Normalize [-pi, pi] -> [0, H-1], [0, W-1]
-        # k = 0 map to center
-        kx = trajectory[0]  # [-pi, pi]
-        ky = trajectory[1]
-
-        # Scale to [-0.5, 0.5] then to indices
-        # k / (2pi) + 0.5 -> [0, 1]
-        x_norm = kx / (2 * np.pi) + 0.5
-        y_norm = ky / (2 * np.pi) + 0.5
-
-        x_idx = (x_norm * W).long()
-        y_idx = (y_norm * H).long()
-
-        # Clamp to bounds
-        x_idx = x_idx.clamp(0, W - 1)
-        y_idx = y_idx.clamp(0, H - 1)
+        y_idx, x_idx = self.trajectory_bin_indices(trajectory, H, W)
 
         # Set mask
         if channels == 1:
@@ -1005,7 +1079,9 @@ _BASE_DYNAMIC_KWARGS: frozenset[str] = frozenset(
 
 #: Spellings :class:`ColdDiffusionAccelerator` translates before dispatch. They are
 #: accepted at the boundary and never reach a concrete accelerator under these names.
-_ACCELERATOR_KWARG_ALIASES: frozenset[str] = frozenset({"mask_direction", "schedule_type"})
+_ACCELERATOR_KWARG_ALIASES: frozenset[str] = frozenset(
+    {"mask_direction", "phase_encode_axis", "schedule_type"}
+)
 
 
 def _resolve_accelerator_cls(registry_entry: Any, acceleration_type: str) -> type:
@@ -1072,6 +1148,21 @@ def _accelerator_kwarg_vocabulary() -> set[str]:
     return vocabulary
 
 
+def family_reads_line_axis(acceleration_type: str) -> bool:
+    """Whether the family named ``acceleration_type`` consumes a ``line_axis``.
+
+    ``mask_direction`` reaches a family as ``line_axis``; one that does not consume
+    it (2-D point patterns, trajectories) drops it in ``**kwargs`` (#1082). Read off
+    the class signature, the same walk the unknown-kwarg gate uses, so there is no
+    hand-kept list of line families.
+    """
+    from spectramr.infrastructure.physics.sampling_registry import SamplingPatternRegistry
+
+    canonical = SamplingPatternRegistry.resolve(acceleration_type)
+    entry = _ACCELERATOR_REGISTRY[canonical]
+    return "line_axis" in _accepted_accelerator_kwargs(_resolve_accelerator_cls(entry, canonical))
+
+
 def _reject_unknown_accelerator_kwargs(accelerator_cls: type, kwargs: dict[str, Any]) -> None:
     """Raise on a construction kwarg NO registered family reads.
 
@@ -1124,7 +1215,7 @@ class KSpaceAccelerator(ABC):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         acceleration_schedule: str = "linear",
         schedule_power: float = 2.0,
@@ -1187,6 +1278,9 @@ class KSpaceAccelerator(ABC):
         # which the helper reads as "ACS does not shrink".
         if "min_center_fraction" not in vars(self):
             self.min_center_fraction: float | None = kwargs.get("min_center_fraction")
+        # The one place a declared floor is checked against the tightest budget, so
+        # the answer cannot depend on which family the arm picked (#2061).
+        self._validate_center_floor(self.max_acceleration)
 
     def _current_center_fraction(self, timestep: int, center_fraction: float) -> float:
         """The ACS fraction at ``timestep``, shrinking toward ``min_center_fraction``.
@@ -1250,13 +1344,11 @@ class KSpaceAccelerator(ABC):
         default mirrors ``center_fraction``, and rejecting that would refuse the
         library default at every ``max_acceleration`` above ~30.
 
-        Lives on the base because the guard is a property of the DECLARATION, not of
-        any one family's geometry. It was previously inline in
-        :class:`RandomCartesianKSpaceAccelerator` alone, which is why the trajectory
-        families accepted ``min_center_fraction: 0.08`` at ``max_acceleration: 32``
-        -- a floor 2.6x the entire budget -- and then discarded it (they read neither
-        ACS knob at all). One family rejecting the declaration while three silently
-        dropped it is the divergence this centralises away.
+        Called once, from ``KSpaceAccelerator.__init__``, because the guard is a
+        property of the DECLARATION, not of any one family's geometry: every family
+        answers the same declaration the same way. Callers must forward an undeclared
+        floor as ``None`` (``build_accelerator_kwargs`` does); substituting
+        ``center_fraction`` turns it into a declared one.
         """
         if self.min_center_fraction is None:
             return
@@ -1359,7 +1451,7 @@ class KSpaceAccelerator(ABC):
         The trajectory families build their mask through
         :meth:`MaskGenerator._rasterize_trajectory`, which mirrors the rank of the
         shape it was handed and so returns ``(H, W)`` for a 2-tuple. Every consumer
-        that indexes the result -- ``_first_drop_map`` most consequentially -- reads
+        that indexes the result -- ``_first_drop_map`` most consequently -- reads
         that as a channel axis and silently takes a single k-space row. Normalising
         here rather than at each consumer keeps the fix at the contract boundary:
         a family that forgets to call this is caught by the rank check in
@@ -1465,9 +1557,8 @@ class KSpaceAccelerator(ABC):
             timestep: Current diffusion timestep
 
         Returns:
-            Acceleration factor (higher = more undersampling)
-
-        # [STANDARD SEMANTICS] t=0 -> Base (Clean), t=T -> Max (Degraded)
+            Acceleration factor (higher = more undersampling): ``base`` at
+            ``t=0`` and ``max_acceleration`` at ``t=T-1``, the last timestep.
         """
         # ratio goes from 0 (t=0) to 1 (t=T-1)
         ratio = self._normalized_progress(timestep)
@@ -1643,9 +1734,7 @@ class KSpaceAccelerator(ABC):
             float: Description.
         """
         acceleration = max(1.0, self.get_acceleration_factor(timestep))
-        # [FIX] Simply return 1/acceleration. No min/max capping needed.
-        # At t=0: accel=1 → frac=1.0 (full sampling)
-        # At t=T: accel=max_accel → frac=1/max_accel (minimum sampling)
+        # 1.0 at t=0 (R=1) down to 1/max_acceleration at t=T-1.
         return 1.0 / acceleration
 
     @staticmethod
@@ -1851,7 +1940,7 @@ class UniformCartesianKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         base_acceleration: float = 1.0,
         center_fraction: float = 0.0325,
@@ -1875,7 +1964,6 @@ class UniformCartesianKSpaceAccelerator(KSpaceAccelerator):
             raise ValueError(msg)
         self.base_acceleration = max(1.0, base_acceleration)
         self.center_fraction = center_fraction
-        self.min_center_fraction = kwargs.get("min_center_fraction", center_fraction)
         self.line_axis = line_axis
         self.seed = seed
 
@@ -1945,8 +2033,10 @@ class UniformCartesianKSpaceAccelerator(KSpaceAccelerator):
 
                 # Select top N lines based on the fixed order
                 num_to_select = min(remaining_lines, len(available_indices))
-                selected_indices_idx = perm[:num_to_select]
-                selected_indices = [available_indices[i] for i in selected_indices_idx]
+                # A tensor gather: iterating ``perm`` read one index back to the
+                # host per selected line, a sync each on a CUDA mask (#2573).
+                pool = torch.tensor(available_indices, dtype=torch.long, device=device)
+                selected_indices = pool[perm[:num_to_select]]
 
                 if self.line_axis == "y":
                     mask[:, selected_indices, :] = True
@@ -1976,7 +2066,7 @@ class PartialFourierKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = 2.0,  # PF is typically < 2x
         center_fraction: float = 0.0325,
         pf_fraction: float = 0.75,
@@ -2082,7 +2172,7 @@ class VDCartesian1DAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         center_fraction: float = 0.0325,
         line_axis: Literal["y", "x"] = "y",
@@ -2210,7 +2300,7 @@ class VDCartesian2DGaussianAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         center_fraction: float = 0.0325,
         sigma_scaling: float = 0.25,
@@ -2347,7 +2437,7 @@ class VDCartesianCAVAAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         center_fraction: float = 0.0325,
         seed: int | None = None,
@@ -2454,7 +2544,7 @@ class LearnedPatternAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         pattern_path: str | None = None,
         seed: int | None = None,
@@ -2572,7 +2662,7 @@ class LowPassAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         center_fraction: float = 0.0325,  # Minimum center fraction at max degradation
         **kwargs: Any,
@@ -2597,13 +2687,7 @@ class LowPassAccelerator(KSpaceAccelerator):
         channels, height, width = self._unpack_shape(kspace_shape)
         mask = torch.zeros((channels, height, width), dtype=torch.bool, device=device)
 
-        # Calculate target fraction
-        # At t=0, fraction ~ 1.0 (full sample)
-        # At t=T, fraction ~ 1/max_acceleration (but at least center_fraction)
-
-        # Calculate target fraction
-        # At t=0, fraction ~ 1.0 (full sample)
-        # At t=T, fraction ~ 1/max_acceleration (but at least center_fraction)
+        # ~1.0 at t=0, ~1/max_acceleration at t=T-1 (never below center_fraction).
 
         desired_fraction = self._target_sampling_fraction(timestep)
 
@@ -2638,7 +2722,7 @@ class LinearKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         base_acceleration: float = 1.0,
         center_fraction: float = 0.0325,
@@ -2749,12 +2833,72 @@ class LinearKSpaceAccelerator(KSpaceAccelerator):
         return mask
 
 
-class RadialKSpaceAccelerator(KSpaceAccelerator):
-    """Radial acceleration pattern using spoke sampling.
+def _nested_trajectory_mask(
+    accelerator: KSpaceAccelerator,
+    ordering: Callable[[int, int], tuple[torch.Tensor, int]],
+    kspace_shape: tuple[int, ...],
+    timestep: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """The trajectory families' mask: the identity at ``R <= 1``, else a ladder prefix.
 
-    Note: This module generates a Cartesian mask that approximates the
-    coverage of a radial trajectory. True non-Cartesian reconstruction
-    (e.g., with NUFFT) is outside the scope of this accelerator.
+    One owner for radial and spiral, which differ only in their sample ordering
+    (see :mod:`~spectramr.infrastructure.physics.trajectory_ladder`). The ACS core is
+    fixed for the whole cascade at the size the tightest rung can afford, so the core
+    never changes between rungs and the prefix length decides nesting alone.
+    """
+    channels, height, width = accelerator._unpack_shape(kspace_shape)
+    desired_fraction = accelerator._target_sampling_fraction(timestep)
+    if desired_fraction >= 1.0:
+        return torch.ones((channels, height, width), dtype=torch.bool, device=device)
+
+    ladders: dict[tuple[int, int], NestedTrajectoryLadder] = accelerator._ladders  # type: ignore[attr-defined]
+    ladder = ladders.get((height, width))
+    if ladder is None:
+        traj, quantum = ordering(height, width)
+        rows, cols = MaskGenerator.trajectory_bin_indices(traj, height, width)
+        core = torch.zeros((1, height, width), dtype=torch.bool)
+        accelerator._apply_center_patch(core, accelerator._core_fraction)  # type: ignore[attr-defined]
+        family = type(accelerator).__name__
+        ladder = NestedTrajectoryLadder(rows, cols, height, width, quantum, core[0], family)
+        ladders[(height, width)] = ladder
+
+    # The prefix length is a pure function of (grid, timestep); memoised so the
+    # search's host sync runs once per rung rather than once per batch element.
+    counts: dict[tuple[int, int, int], int] = accelerator._sample_counts  # type: ignore[attr-defined]
+    key = (height, width, int(timestep))
+    samples = counts.get(key)
+    if samples is None:
+        samples = ladder.sample_count(desired_fraction)
+        counts[key] = samples
+    return accelerator._as_channelled(ladder.mask(samples).to(device), channels)
+
+
+def _fixed_trajectory_core(accelerator: KSpaceAccelerator, center_fraction: float) -> float:
+    """The ACS fraction a trajectory family keeps at every rung below the identity.
+
+    ``_guaranteed_core_fraction`` capped by the tightest declared budget: the class
+    default ``center_fraction`` (0.0325) exceeds ``1/R`` above R~30, and a core that
+    shrank per rung would let the prefix grow between adjacent rungs.
+    """
+    tightest = min(
+        1.0 / max(1.0, accelerator.get_acceleration_factor(t))
+        for t in range(accelerator.num_timesteps)
+    )
+    return min(accelerator._guaranteed_core_fraction(center_fraction), tightest)
+
+
+class RadialKSpaceAccelerator(KSpaceAccelerator):
+    """Golden-angle radial sampling: each rung keeps the first k spokes of one ordering.
+
+    Spokes advance by the radial golden angle, pi*(sqrt(5) - 1)/2 ~= 111.25 deg
+    (Winkelmann 2007), so the first ``k`` spokes are the same set for every rung and
+    the cascade nests (#612). ``k`` is derived per rung as the fewest whole spokes
+    that, with the ACS core, reach the rung's budget; there is no spoke floor. Serves
+    both the ``radial`` and the ``golden_angle`` registry keys.
+
+    The mask approximates the trajectory on the Cartesian grid; true non-Cartesian
+    reconstruction (NUFFT) is outside the scope of this accelerator.
     """
 
     #: The trajectory defines the support; see KSpaceAccelerator.
@@ -2762,36 +2906,25 @@ class RadialKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
-        min_spokes: int = 6,
-        max_spokes: int | None = None,
         center_fraction: float = 0.0325,
         **kwargs: Any,
     ):
-        """__init__.
+        """Build the accelerator and refuse a ladder no trajectory can realise.
 
         Args:
-            num_timesteps (int): Description.
-            max_acceleration (float): Description.
-            min_spokes (int): Description.
-            max_spokes (int | None): Description.
-            center_fraction (float): Description.
+            num_timesteps: Number of rungs.
+            max_acceleration: Acceleration at the last rung.
+            center_fraction: ACS fraction when no ``min_center_fraction`` floor is
+                declared; the core is fixed for the whole cascade.
         """
         super().__init__(num_timesteps, max_acceleration, **kwargs)
-        self.min_spokes = max(1, min_spokes)
-        if max_spokes is None:
-            max_spokes = self.min_spokes * 16
-        self.max_spokes = max(self.min_spokes, max_spokes)
         self.center_fraction = max(0.0, min(center_fraction, 0.5))
-        # The ACS knobs are read (see ``get_acceleration_mask``), so the floor has
-        # to be reachable. Shared with the Cartesian families via the base class.
-        self._validate_center_floor(max_acceleration)
-        # best_spokes is a pure function of (H, W, timestep); memoize it so
-        # the 12-iteration binary search (each step rasterizes a trajectory
-        # AND syncs via .item()) runs once per (shape, timestep) instead of
-        # every batch element every diffusion step.
-        self._spoke_cache: dict[tuple[int, int, int], int] = {}
+        validate_ladder_reachable(self, "radial")
+        self._core_fraction = _fixed_trajectory_core(self, self.center_fraction)
+        self._ladders: dict[tuple[int, int], NestedTrajectoryLadder] = {}
+        self._sample_counts: dict[tuple[int, int, int], int] = {}
 
     def get_acceleration_mask(
         self,
@@ -2799,112 +2932,58 @@ class RadialKSpaceAccelerator(KSpaceAccelerator):
         timestep: int,
         device: torch.device = torch.device("cpu"),
     ) -> torch.Tensor:
-        """Generate radial mask via TrajectoryFactory with calibrated spoke count."""
-        channels, height, width = self._unpack_shape(kspace_shape)
-        desired_fraction = self._target_sampling_fraction(timestep)
-
-        logger.debug(
-            f"Radial (TrajectoryFactory): t={timestep} | Desired Frac: {desired_fraction:.4f}"
-        )
-
-        # The ACS core is counted INSIDE the budget, not added on top. These families
-        # set ``enforces_sample_budget = False`` and never truncate, so a core applied
-        # after the spoke search simply widens the realised fraction -- measured
-        # R=32 realising 14.3x once the knobs were first honoured. Clamping to the
-        # budget covers the UNDECLARED case: ``_validate_center_floor`` refuses a
-        # declared floor wider than the budget at build time, but the class-default
-        # ``center_fraction`` (0.0325) still exceeds the budget above R~30.
-        core_fraction = min(self._guaranteed_core_fraction(self.center_fraction), desired_fraction)
-
-        from spectramr.infrastructure.physics.trajectories import TrajectoryFactory
-
-        cache_key = (height, width, int(timestep))
-        best_spokes = self._spoke_cache.get(cache_key)
-        if best_spokes is None:
-
-            def _coverage(n_spokes: int) -> float:
-                traj, _ = TrajectoryFactory.get_radial_trajectory(
-                    im_size=(height, width),
-                    num_spokes=n_spokes,
-                    golden_angle=False,
-                )
-                m = MaskGenerator()._rasterize_trajectory(traj, kspace_shape)
-                m = self._as_channelled(m, 1)
-                self._apply_center_patch(m, core_fraction)
-                return m[0].float().sum().item() / (height * width)
-
-            # Binary search for the spoke count that yields the desired fraction
-            lo, hi = self.min_spokes, max(height, width) * 2
-            best_spokes = lo
-            for _ in range(12):  # ~12 iterations gives <0.1% precision
-                mid = (lo + hi) // 2
-                cov = _coverage(mid)
-                if cov < desired_fraction:
-                    lo = mid + 1
-                else:
-                    hi = mid
-                    best_spokes = mid
-            self._spoke_cache[cache_key] = best_spokes
-
-        traj, _ = TrajectoryFactory.get_radial_trajectory(
-            im_size=(height, width),
-            num_spokes=best_spokes,
-            golden_angle=False,
-        )
-        generator = MaskGenerator()
-        mask = generator._rasterize_trajectory(traj, kspace_shape).to(device)
-
-        # ``_rasterize_trajectory`` mirrors the rank it was handed, so a 2-tuple
-        # ``kspace_shape`` returns ``(H, W)`` where every Cartesian family returns
-        # ``(1, H, W)``. See ``KSpaceAccelerator.get_acceleration_mask`` for the
-        # contract and for what the missing normalisation cost.
-        mask = self._as_channelled(mask, channels)
-
-        # ACS. ``center_fraction`` was stored by every trajectory family and read by
-        # none, so an arm declaring ``center_fraction: 0.08`` trained on masks whose
-        # centre band was whatever the spokes happened to cross -- 9.6% filled at the
-        # top rung of the radial arm's ladder. Cold diffusion needs the calibration
-        # region to survive to the HIGHEST acceleration, which is exactly what
-        # ``min_center_fraction`` declares, so the width comes from
-        # ``_guaranteed_core_fraction`` (issue #1069's lesson: sizing the core from
-        # ``center_fraction`` instead makes the top rungs a pure low-pass filter).
-        # ``core_fraction`` is the same value the spoke search calibrated against, so
-        # the core lives inside the declared budget rather than on top of it.
-        self._apply_center_patch(mask, core_fraction)
-        return mask
+        """The first ``k(R)`` golden-angle spokes plus the ACS core; all ones at ``R <= 1``."""
+        return _nested_trajectory_mask(self, golden_radial_ordering, kspace_shape, timestep, device)
 
 
 class VariableDensityKSpaceAccelerator(KSpaceAccelerator):
-    """Variable density acceleration, higher sampling in center."""
+    """Radial variable-density point sampling with a guaranteed centred ACS disc.
+
+    Bins are ranked once by a radially decaying density, with a centred disc of
+    ``_guaranteed_core_fraction(center_fraction)`` of k-space placed at the head
+    of the ranking; each rung takes the top-K of that ranking, so
+    ``M_{t+1} subset-of M_t`` holds exactly. The seeded jitter only breaks ties
+    within an equal-radius shell, so the realised mask is close to a disc; a
+    weighted random draw is what ``density_nested`` provides.
+    """
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         density_power: float = 2.0,
         center_fraction: float = 0.0325,
         seed: int | None = None,
         **kwargs: Any,
     ):
-        """__init__.
+        """Initialise the variable-density accelerator.
 
         Args:
-            num_timesteps (int): Description.
-            max_acceleration (float): Description.
-            density_power (float): Description.
-            center_fraction (float): Description.
-            seed (int | None): Description.
+            num_timesteps: Diffusion horizon.
+            max_acceleration: Acceleration at the top of the ladder.
+            density_power: Exponent of the radial density decay.
+            center_fraction: Nominal ACS fraction; the guaranteed core when no
+                ``min_center_fraction`` floor is declared.
+            seed: Seed for the timestep-invariant tie-breaking jitter.
+
+        Raises:
+            ValueError: If a declared ``min_center_fraction`` exceeds the
+                sampling budget at ``max_acceleration``.
         """
         super().__init__(num_timesteps, max_acceleration, **kwargs)
         self.density_power = density_power
         self.center_fraction = max(0.0, min(center_fraction, 0.5))
         self.seed = seed
-        # The priority ranking (distance map + jitter + argsort) is, by the
-        # forensic nesting fix below, timestep-INVARIANT — only the top-K
-        # budget changes per timestep. Cache it per (C, H, W, device) so the
-        # O(H·W·log) argsort runs once per shape instead of every batch
-        # element every diffusion step.
-        self._priority_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
+        # Bounded and seed-keyed: dynamic-mask training mutates ``.seed`` per
+        # sample on one instance, so a seedless key replayed the first draw for
+        # every sample and an unbounded one grew by an entry per sample (#1071).
+        self._priority_cache: BoundedLRUCache[tuple[Any, ...], torch.Tensor] = BoundedLRUCache()
+
+    def _priority_cache_key(
+        self, channels: int, height: int, width: int, device: torch.device
+    ) -> tuple[Any, ...]:
+        """Memo key for the ranking: everything it depends on, seed included."""
+        return (channels, height, width, str(device), self.seed)
 
     def _priority_ranking(
         self, channels: int, height: int, width: int, device: torch.device
@@ -2912,9 +2991,10 @@ class VariableDensityKSpaceAccelerator(KSpaceAccelerator):
         """Return the flattened pixel priority order (descending), memoized.
 
         The ranking is constant across timesteps (the jitter uses a fixed,
-        timestep-independent seed), so it is a pure function of shape+device.
+        timestep-independent seed), so it is a pure function of shape, device
+        and seed.
         """
-        cache_key = (channels, height, width, str(device))
+        cache_key = self._priority_cache_key(channels, height, width, device)
         cached = self._priority_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2942,6 +3022,15 @@ class VariableDensityKSpaceAccelerator(KSpaceAccelerator):
             jitter = torch.rand_like(probabilities) * 1e-6
 
         sorted_indices = torch.argsort((probabilities + jitter).view(-1), descending=True)
+
+        # The ACS disc (equal area to the core fraction, the #581 geometry) goes
+        # to the head of the ranking with the density order kept on both sides,
+        # so any budget at or above the core fully samples it. The floor's
+        # reachability is checked at construction by `_validate_center_floor`.
+        core_fraction = self._guaranteed_core_fraction(self.center_fraction)
+        core_radius = math.sqrt(max(height * width * core_fraction, 1.0) / math.pi)
+        in_core = (distances <= core_radius).view(-1)[sorted_indices]
+        sorted_indices = torch.cat((sorted_indices[in_core], sorted_indices[~in_core]))
         self._priority_cache[cache_key] = sorted_indices
         return sorted_indices
 
@@ -2984,45 +3073,57 @@ class VariableDensityKSpaceAccelerator(KSpaceAccelerator):
 
 
 class SpiralKSpaceAccelerator(KSpaceAccelerator):
-    """Archimedean spiral sampling that increases arms and turns over time."""
+    """Golden-angle spiral sampling: each rung keeps a prefix of one interleave sequence.
+
+    One Archimedean arm at a fixed turn count; interleave ``a`` is that arm rotated by
+    ``a`` times the full-circle golden angle (137.5 deg, see
+    :data:`~spectramr.infrastructure.physics.trajectories.SPIRAL_GOLDEN_ANGLE`).
+    Samples are ordered by (interleave, readout) and a rung may end mid-arm, so every
+    rung hits its budget to the bin and the cascade nests (#612).
+    """
 
     #: The trajectory defines the support; see KSpaceAccelerator.
     enforces_sample_budget = False
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
-        num_arms_base: int = 4,
-        max_extra_arms: int = 8,
-        base_turns: float = 2.5,
+        num_turns: float = 4.0,
         samples_per_arm: int = 1024,
         center_fraction: float = 0.0325,
         **kwargs: Any,
     ):
-        """__init__.
+        """Build the accelerator and refuse a ladder no trajectory can realise.
 
         Args:
-            num_timesteps (int): Description.
-            max_acceleration (float): Description.
-            num_arms_base (int): Description.
-            max_extra_arms (int): Description.
-            base_turns (float): Description.
-            samples_per_arm (int): Description.
-            center_fraction (float): Description.
+            num_timesteps: Number of rungs.
+            max_acceleration: Acceleration at the last rung.
+            num_turns: Turns of the one arm, fixed for every rung.
+            samples_per_arm: Readout samples per interleave.
+            center_fraction: ACS fraction when no ``min_center_fraction`` floor is
+                declared; the core is fixed for the whole cascade.
+
+        Raises:
+            ValueError: On a non-positive ``num_turns`` or ``samples_per_arm``, or a
+                rung with ``1 < R < 1 / COVERAGE_CEILING``.
         """
         super().__init__(num_timesteps, max_acceleration, **kwargs)
-        self.num_arms_base = max(1, num_arms_base)
-        self.max_extra_arms = max(0, max_extra_arms)
-        self.base_turns = max(1.0, base_turns)
-        self.samples_per_arm = max(128, samples_per_arm)
+        if num_turns <= 0 or samples_per_arm < 1:
+            msg = f"num_turns and samples_per_arm must be positive, got {num_turns}, {samples_per_arm}"
+            raise ValueError(msg)
+        self.num_turns = float(num_turns)
+        self.samples_per_arm = int(samples_per_arm)
         self.center_fraction = max(0.0, min(center_fraction, 0.5))
-        # The ACS knobs are read (see ``get_acceleration_mask``), so the floor has
-        # to be reachable. Shared with the Cartesian families via the base class.
-        self._validate_center_floor(max_acceleration)
-        # best_arms is a pure function of (H, W, timestep); memoize it so the
-        # 12-iteration binary search runs once per (shape, timestep).
-        self._arm_cache: dict[tuple[int, int, int], int] = {}
+        validate_ladder_reachable(self, "spiral")
+        self._core_fraction = _fixed_trajectory_core(self, self.center_fraction)
+        self._ladders: dict[tuple[int, int], NestedTrajectoryLadder] = {}
+        self._sample_counts: dict[tuple[int, int, int], int] = {}
+
+    def _ordering(self, height: int, width: int) -> tuple[torch.Tensor, int]:
+        return golden_spiral_ordering(
+            height, width, num_turns=self.num_turns, samples_per_arm=self.samples_per_arm
+        )
 
     def get_acceleration_mask(
         self,
@@ -3030,225 +3131,25 @@ class SpiralKSpaceAccelerator(KSpaceAccelerator):
         timestep: int,
         device: torch.device = torch.device("cpu"),
     ) -> torch.Tensor:
-        """Generate spiral mask via TrajectoryFactory with calibrated arm count."""
-        channels, height, width = self._unpack_shape(kspace_shape)
-        desired_fraction = self._target_sampling_fraction(timestep)
-
-        logger.debug(
-            f"Spiral (TrajectoryFactory): t={timestep} | Desired Frac: {desired_fraction:.4f}"
-        )
-
-        # The ACS core is counted INSIDE the budget, not added on top. These families
-        # set ``enforces_sample_budget = False`` and never truncate, so a core applied
-        # after the spoke search simply widens the realised fraction -- measured
-        # R=32 realising 14.3x once the knobs were first honoured. Clamping to the
-        # budget covers the UNDECLARED case: ``_validate_center_floor`` refuses a
-        # declared floor wider than the budget at build time, but the class-default
-        # ``center_fraction`` (0.0325) still exceeds the budget above R~30.
-        core_fraction = min(self._guaranteed_core_fraction(self.center_fraction), desired_fraction)
-
-        from spectramr.infrastructure.physics.trajectories import TrajectoryFactory
-
-        # Adaptive turns: more turns per fewer arms for better coverage
-        num_turns = max(self.base_turns, 4.0 + (1.0 - desired_fraction) * 8.0)
-
-        cache_key = (height, width, int(timestep))
-        best_arms = self._arm_cache.get(cache_key)
-        if best_arms is None:
-
-            def _coverage(n_arms: int) -> float:
-                traj, _ = TrajectoryFactory.get_spiral_trajectory(
-                    im_size=(height, width),
-                    num_arms=n_arms,
-                    num_turns=num_turns,
-                    samples_per_arm=self.samples_per_arm,
-                )
-                m = MaskGenerator()._rasterize_trajectory(traj, kspace_shape)
-                m = self._as_channelled(m, 1)
-                self._apply_center_patch(m, core_fraction)
-                return m[0].float().sum().item() / (height * width)
-
-            # Binary search for the arm count that yields the desired fraction
-            lo, hi = 1, max(height, width)
-            best_arms = lo
-            for _ in range(12):
-                mid = (lo + hi) // 2
-                cov = _coverage(mid)
-                if cov < desired_fraction:
-                    lo = mid + 1
-                else:
-                    hi = mid
-                    best_arms = mid
-            self._arm_cache[cache_key] = best_arms
-
-        traj, _ = TrajectoryFactory.get_spiral_trajectory(
-            im_size=(height, width),
-            num_arms=best_arms,
-            num_turns=num_turns,
-            samples_per_arm=self.samples_per_arm,
-        )
-        generator = MaskGenerator()
-        mask = generator._rasterize_trajectory(traj, kspace_shape).to(device)
-
-        # ``_rasterize_trajectory`` mirrors the rank it was handed, so a 2-tuple
-        # ``kspace_shape`` returns ``(H, W)`` where every Cartesian family returns
-        # ``(1, H, W)``. See ``KSpaceAccelerator.get_acceleration_mask`` for the
-        # contract and for what the missing normalisation cost.
-        mask = self._as_channelled(mask, channels)
-
-        # ACS. ``center_fraction`` was stored by every trajectory family and read by
-        # none, so an arm declaring ``center_fraction: 0.08`` trained on masks whose
-        # centre band was whatever the spokes happened to cross -- 9.6% filled at the
-        # top rung of the radial arm's ladder. Cold diffusion needs the calibration
-        # region to survive to the HIGHEST acceleration, which is exactly what
-        # ``min_center_fraction`` declares, so the width comes from
-        # ``_guaranteed_core_fraction`` (issue #1069's lesson: sizing the core from
-        # ``center_fraction`` instead makes the top rungs a pure low-pass filter).
-        # ``core_fraction`` is the same value the spoke search calibrated against, so
-        # the core lives inside the declared budget rather than on top of it.
-        self._apply_center_patch(mask, core_fraction)
-        return mask
-
-
-class GoldenAngleRadialKSpaceAccelerator(KSpaceAccelerator):
-    """Golden-angle radial sampling with progressive spoke density."""
-
-    #: Radial-MRI golden angle, pi*(sqrt(5) - 1)/2 ~= 111.246 deg (Winkelmann 2007) --
-    #: the same value :data:`spectramr.infrastructure.physics.nufft_ops.GOLDEN_ANGLE`
-    #: and :func:`~spectramr.infrastructure.physics.trajectories.TrajectoryFactory.
-    #: get_radial_trajectory` use, which is where this class's spokes actually come
-    #: from. It previously read ``pi*(3 - sqrt(5)) ~= 137.508 deg`` -- the 2-D
-    #: phyllotaxis angle, a DIFFERENT constant that also goes by "golden angle" and
-    #: is wrong for radial MRI. Nothing read it, so the contradiction sat next to a
-    #: docstring promising "~111.25 deg" without ever being exercised; it is kept
-    #: (rather than deleted) and corrected so a future caller binds to the right one.
-    GOLDEN_ANGLE = np.pi * (np.sqrt(5.0) - 1.0) / 2.0
-
-    def __init__(
-        self,
-        num_timesteps: int = 1000,
-        max_acceleration: float = MAX_ACCELERATION,
-        min_spokes: int = 4,
-        max_spokes: int = 128,
-        center_fraction: float = 0.0325,
-        seed: int | None = None,
-        **kwargs: Any,
-    ):
-        """__init__.
-
-        Args:
-            num_timesteps (int): Description.
-            max_acceleration (float): Description.
-            min_spokes (int): Description.
-            max_spokes (int): Description.
-            center_fraction (float): Description.
-            seed (int | None): Description.
-        """
-        super().__init__(num_timesteps, max_acceleration, **kwargs)
-        self.min_spokes = max(4, min_spokes)
-        self.max_spokes = max(self.min_spokes, max_spokes)
-        self.center_fraction = max(0.0, min(center_fraction, 0.5))
-        # The ACS knobs are read (see ``get_acceleration_mask``), so the floor has
-        # to be reachable. Shared with the Cartesian families via the base class.
-        self._validate_center_floor(max_acceleration)
-        self.seed = seed
-        # best_spokes is a pure function of (H, W, timestep); memoize it so the
-        # 12-iteration binary search runs once per (shape, timestep).
-        self._spoke_cache: dict[tuple[int, int, int], int] = {}
-
-    def get_acceleration_mask(
-        self,
-        kspace_shape: tuple[int, ...],
-        timestep: int,
-        device: torch.device = torch.device("cpu"),
-    ) -> torch.Tensor:
-        """Generate golden-angle radial mask via TrajectoryFactory.
-
-        Uses the irrational golden angle (~111.25°) increment between spokes,
-        which provides near-optimal k-space coverage and enables flexible
-        retrospective undersampling.
-        """
-        channels, height, width = self._unpack_shape(kspace_shape)
-        desired_fraction = self._target_sampling_fraction(timestep)
-
-        logger.debug(
-            f"GoldenAngle (TrajectoryFactory): t={timestep} | Desired Frac: {desired_fraction:.4f}"
-        )
-
-        # The ACS core is counted INSIDE the budget, not added on top. These families
-        # set ``enforces_sample_budget = False`` and never truncate, so a core applied
-        # after the spoke search simply widens the realised fraction -- measured
-        # R=32 realising 14.3x once the knobs were first honoured. Clamping to the
-        # budget covers the UNDECLARED case: ``_validate_center_floor`` refuses a
-        # declared floor wider than the budget at build time, but the class-default
-        # ``center_fraction`` (0.0325) still exceeds the budget above R~30.
-        core_fraction = min(self._guaranteed_core_fraction(self.center_fraction), desired_fraction)
-
-        from spectramr.infrastructure.physics.trajectories import TrajectoryFactory
-
-        cache_key = (height, width, int(timestep))
-        best_spokes = self._spoke_cache.get(cache_key)
-        if best_spokes is None:
-
-            def _coverage(n_spokes: int) -> float:
-                traj, _ = TrajectoryFactory.get_radial_trajectory(
-                    im_size=(height, width),
-                    num_spokes=n_spokes,
-                    golden_angle=True,
-                )
-                m = MaskGenerator()._rasterize_trajectory(traj, kspace_shape)
-                m = self._as_channelled(m, 1)
-                self._apply_center_patch(m, core_fraction)
-                return m[0].float().sum().item() / (height * width)
-
-            # Binary search for the spoke count that yields the desired fraction
-            lo, hi = self.min_spokes, max(height, width) * 2
-            best_spokes = lo
-            for _ in range(12):
-                mid = (lo + hi) // 2
-                cov = _coverage(mid)
-                if cov < desired_fraction:
-                    lo = mid + 1
-                else:
-                    hi = mid
-                    best_spokes = mid
-            self._spoke_cache[cache_key] = best_spokes
-
-        traj, _ = TrajectoryFactory.get_radial_trajectory(
-            im_size=(height, width),
-            num_spokes=best_spokes,
-            golden_angle=True,
-        )
-
-        generator = MaskGenerator()
-        mask = generator._rasterize_trajectory(traj, kspace_shape).to(device)
-
-        # ``_rasterize_trajectory`` mirrors the rank it was handed, so a 2-tuple
-        # ``kspace_shape`` returns ``(H, W)`` where every Cartesian family returns
-        # ``(1, H, W)``. See ``KSpaceAccelerator.get_acceleration_mask`` for the
-        # contract and for what the missing normalisation cost.
-        mask = self._as_channelled(mask, channels)
-
-        # ACS. ``center_fraction`` was stored by every trajectory family and read by
-        # none, so an arm declaring ``center_fraction: 0.08`` trained on masks whose
-        # centre band was whatever the spokes happened to cross -- 9.6% filled at the
-        # top rung of the radial arm's ladder. Cold diffusion needs the calibration
-        # region to survive to the HIGHEST acceleration, which is exactly what
-        # ``min_center_fraction`` declares, so the width comes from
-        # ``_guaranteed_core_fraction`` (issue #1069's lesson: sizing the core from
-        # ``center_fraction`` instead makes the top rungs a pure low-pass filter).
-        # ``core_fraction`` is the same value the spoke search calibrated against, so
-        # the core lives inside the declared budget rather than on top of it.
-        self._apply_center_patch(mask, core_fraction)
-        return mask
+        """The first ``n(R)`` spiral samples plus the ACS core; all ones at ``R <= 1``."""
+        return _nested_trajectory_mask(self, self._ordering, kspace_shape, timestep, device)
 
 
 class RandomCartesianKSpaceAccelerator(KSpaceAccelerator):
-    """Variable-density Cartesian sampling with centre-line guarantees."""
+    """Random point sampling with a graded centred ACS disc and a uniform periphery.
+
+    One timestep-invariant ranking -- a centre-out disc of
+    ``_guaranteed_core_fraction(center_fraction)`` of k-space, then i.i.d.
+    uniform scores -- is truncated by budget, so ``M_{t+1} subset-of M_t`` holds
+    exactly. The peripheral density is flat, not variable-density, and the mask
+    selects individual ``(k_y, k_x)`` bins rather than phase-encode lines, so no
+    line is fully sampled and the pattern is not acquirable on a 2D Cartesian
+    scanner. ``variable_density`` decays radially; ``equispaced`` samples lines.
+    """
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         min_sampling_rate: float = 0.0,
         max_sampling_rate: float = 1.0,
@@ -3274,7 +3175,9 @@ class RandomCartesianKSpaceAccelerator(KSpaceAccelerator):
                 on that and raises when the floor is unsatisfiable.
             seed (int | None): Description.
         """
-        super().__init__(num_timesteps, max_acceleration, **kwargs)
+        super().__init__(
+            num_timesteps, max_acceleration, min_center_fraction=min_center_fraction, **kwargs
+        )
         self.min_sampling_rate = max(0.0, min(min_sampling_rate, 1.0))
         self.max_sampling_rate = max(self.min_sampling_rate, min(max_sampling_rate, 1.0))
         self.center_fraction = max(0.0, min(center_fraction, 0.5))
@@ -3291,16 +3194,6 @@ class RandomCartesianKSpaceAccelerator(KSpaceAccelerator):
             )
             raise ValueError(msg)
 
-        # An EXPLICIT floor the tightest budget cannot honour is a config error: no mask
-        # can deliver it, so fail at BUILD rather than silently at the top of the ladder
-        # (#9). Only when explicitly declared -- with centre-out grading the realised ACS
-        # is min(budget, center_fraction) and shrinks with acceleration by construction,
-        # so a budget narrower than the nominal ACS is the NORMAL high-R regime, not a
-        # fault. Raising on the default (min_center_fraction is None => mirrors
-        # center_fraction) would reject the library default 0.0325 at every
-        # max_acceleration above ~30.
-        if min_center_fraction is not None:
-            self._validate_center_floor(max_acceleration)
 
     def get_acceleration_mask(
         self,
@@ -3423,7 +3316,7 @@ class FractionalVariableDensityAccelerator(VariableDensityKSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         min_acceleration: float = 1.5,
         max_acceleration: float = 8.0,
         density_power: float = 2.0,
@@ -3475,7 +3368,7 @@ class PoissonDiskKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         min_radius: int = 2,
         max_radius_fraction: float = 0.12,
@@ -3739,7 +3632,7 @@ class NestedKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         seed: int | None = None,
         center_fraction: float = 0.0,
@@ -3758,24 +3651,21 @@ class NestedKSpaceAccelerator(KSpaceAccelerator):
         super().__init__(num_timesteps, max_acceleration, **kwargs)
         self.seed = seed
         self.center_fraction = center_fraction
-        self._permutation_cache = {}
+        # Seed-keyed and bounded for the same reason as the variable-density
+        # ranking: dynamic-mask training mutates ``.seed`` per sample (#1071).
+        self._permutation_cache: BoundedLRUCache[tuple[Any, ...], torch.Tensor] = (
+            BoundedLRUCache()
+        )
         import logging
 
         logging.getLogger(__name__).info(f"Initialized NestedKSpaceAccelerator with seed={seed}")
 
     def _get_fixed_permutation(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
-        """Get or generate a fixed permutation for the given shape."""
-        # Use shape as key (assuming shape doesn't change for a given instance context)
-        # Note: In a real training loop, shape is usually constant.
-        # If we need to support varying shapes, we should cache by shape.
-
-        # We need a cache key that captures the shape
-        shape_key = tuple(shape)
+        """Get or generate the fixed permutation for ``shape`` and the current seed."""
+        seed = self.seed if self.seed is not None else 0
+        shape_key = (tuple(shape), str(device), seed)
 
         if shape_key not in self._permutation_cache:
-            # Generate permutation
-            # Use the provided seed or a default one
-            seed = self.seed if self.seed is not None else 0
             gen = torch.Generator(device=device)
             gen.manual_seed(seed)
 
@@ -3895,7 +3785,7 @@ class DensityNestedKSpaceAccelerator(KSpaceAccelerator):
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = MAX_ACCELERATION,
         density_power: float = 2.0,
         center_fraction: float = 0.0325,
@@ -4071,7 +3961,7 @@ _ACCELERATOR_REGISTRY: dict[str, type[KSpaceAccelerator] | dict[str, Any]] = {
     "variable_density": VariableDensityKSpaceAccelerator,
     "fractional_variable_density": FractionalVariableDensityAccelerator,
     "spiral": SpiralKSpaceAccelerator,
-    "golden_angle": GoldenAngleRadialKSpaceAccelerator,
+    "golden_angle": RadialKSpaceAccelerator,
     "random_cartesian": RandomCartesianKSpaceAccelerator,
     "poisson_disk": PoissonDiskKSpaceAccelerator,
     # New types from audit file
@@ -4101,7 +3991,7 @@ class ColdDiffusionAccelerator:
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         acceleration_type: str = "variable_density",
         enforce_nested: bool = False,
         nested_tolerance: float = 0.5,
@@ -4173,17 +4063,20 @@ class ColdDiffusionAccelerator:
             f"| Timesteps: {num_timesteps} | Params: {kwargs}"
         )
 
-        # [COMPATIBILITY] Map 'mask_direction' to 'line_axis' if present
-        if "mask_direction" in kwargs and "line_axis" not in kwargs:
+        # ``phase``/``readout`` name a physical axis, so they resolve through the
+        # arm's declared phase-encode axis (#2160). The axis is consumed whether
+        # or not a direction was declared: every family would swallow it.
+        phase_encode_axis = kwargs.pop("phase_encode_axis", None)
+        if "mask_direction" in kwargs:
             direction = kwargs.pop("mask_direction")
-            mapping = {"phase": "y", "readout": "x", "y": "y", "x": "x"}
-            if direction not in mapping:
+            resolved_axis = line_axis_for(direction, phase_encode_axis)
+            declared_axis = kwargs.get("line_axis")
+            if declared_axis is not None and declared_axis != resolved_axis:
                 raise ValueError(
-                    f"Unknown mask_direction {direction!r}. Expected 'phase' "
-                    f"(lines indexed by k_y) or 'readout' (lines indexed by "
-                    f"k_x); 'y'/'x' are accepted as the raw axis names."
+                    f"mask_direction={direction!r} resolves to line_axis={resolved_axis!r} "
+                    f"but line_axis={declared_axis!r} was also passed; declare one."
                 )
-            kwargs["line_axis"] = mapping[direction]
+            kwargs["line_axis"] = resolved_axis
 
         # [COMPATIBILITY] Map 'schedule_type' to 'acceleration_schedule' if present
         # If schedule_type is explicitly provided (not None), use it instead of acceleration_schedule
@@ -4396,7 +4289,8 @@ class ColdDiffusionAccelerator:
 # Factory function for creating accelerators
 def create_kspace_accelerator(
     acceleration_type: str = "variable_density",
-    num_timesteps: int = 1000,
+    *,
+    num_timesteps: int,
     **kwargs: Any,
 ) -> ColdDiffusionAccelerator:
     """Factory function for creating k-space accelerators.
@@ -4404,7 +4298,7 @@ def create_kspace_accelerator(
     Args:
         acceleration_type: Type of acceleration. Supported values are listed in
             ``SUPPORTED_ACCELERATION_TYPES``.
-        num_timesteps: Number of diffusion timesteps
+        num_timesteps: Number of diffusion timesteps; the caller owns the horizon (#2443).
         **kwargs: Additional arguments for accelerator
 
     Returns:

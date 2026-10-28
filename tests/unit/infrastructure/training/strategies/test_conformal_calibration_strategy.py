@@ -121,25 +121,62 @@ def test_dice_risk_enabled_collection() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_split_calibration_test_disjoint_halves() -> None:
+def _subject_batches(subjects_per_batch: list[list[str]]) -> list[dict]:
+    """One dict batch per entry; each image is a random 8x8 pair tagged with its subject."""
+    out = []
+    for ids in subjects_per_batch:
+        x = torch.rand(len(ids), 1, 8, 8)
+        out.append({"input": x, "target": x + 0.1 * torch.rand_like(x), "subject_id": ids})
+    return out
+
+
+def _conformal_strategy(seed: int = 42, **cert) -> ConformalCalibrationStrategy:
+    strat = object.__new__(ConformalCalibrationStrategy)
+    strat.device = torch.device("cpu")
+    strat._enabled_certs = list(cert)
+    strat.config = types.SimpleNamespace(
+        run=types.SimpleNamespace(seed=seed),
+        certification=types.SimpleNamespace(**cert),
+    )
+    strat.env = types.SimpleNamespace(generator=_Identity())
+    return strat
+
+
+def test_subject_split_keeps_every_subject_on_one_side() -> None:
+    batches = _subject_batches([["a", "a", "b"], ["b", "c", "c"], ["d", "d", "e"]])
+    calib, test, info = _conformal_strategy()._subject_split(batches, seed=7)
+    cal_ids = {sid for b in calib for sid in b["subject_id"]}
+    test_ids = {sid for b in test for sid in b["subject_id"]}
+    assert cal_ids and test_ids
+    assert cal_ids.isdisjoint(test_ids)
+    assert cal_ids | test_ids == {"a", "b", "c", "d", "e"}
+    assert info["split_unit"] == "subject" and info["split_seed"] == 7
+
+
+def test_subject_split_is_seeded_from_run_seed() -> None:
+    batches = _subject_batches([[f"s{i}", f"s{i}"] for i in range(8)])
+    strat = _conformal_strategy()
+    first = strat._subject_split(batches, seed=3)[0]
+    again = strat._subject_split(batches, seed=3)[0]
+    assert [b["subject_id"] for b in first] == [b["subject_id"] for b in again]
+
+
+def test_subject_split_refuses_fewer_than_two_subjects() -> None:
+    with pytest.raises(ValueError, match="at least 2 subjects"):
+        _conformal_strategy()._subject_split(_subject_batches([["a", "a"]]), seed=1)
+
+
+def test_cap_images_keeps_exactly_n_and_raises_when_fewer() -> None:
     from spectramr.infrastructure.training.strategies.conformal_calibration_strategy import (
-        _split_calibration_test,
+        _cap_images,
     )
 
-    calib, test = _split_calibration_test([1, 2, 3, 4])
-    assert calib == [1, 2]
-    assert test == [3, 4]
-    assert set(calib).isdisjoint(set(test))
-
-
-def test_split_calibration_test_too_few_to_hold_out() -> None:
-    from spectramr.infrastructure.training.strategies.conformal_calibration_strategy import (
-        _split_calibration_test,
-    )
-
-    calib, test = _split_calibration_test([1])
-    assert calib == [1]
-    assert test is None
+    batches = _subject_batches([["a", "a", "a"], ["b", "b", "b"]])
+    kept, n = _cap_images(batches, 4)
+    assert n == 4
+    assert sum(len(b["subject_id"]) for b in kept) == 4
+    with pytest.raises(ValueError, match="n_calibration=7 but the calibration half holds 6"):
+        _cap_images(batches, 7)
 
 
 def test_calibration_input_target_unpacks_dict_and_tuple() -> None:
@@ -162,7 +199,6 @@ def test_runner_measures_coverage_only_with_test_split() -> None:
     )
     from spectramr.infrastructure.training.strategies.conformal_calibration_strategy import (
         _calibration_input_target,
-        _split_calibration_test,
     )
 
     torch.manual_seed(0)
@@ -173,7 +209,7 @@ def test_runner_measures_coverage_only_with_test_split() -> None:
     batches = [
         {"input": torch.randn(2, 1, 8, 8), "target": torch.randn(2, 1, 8, 8)} for _ in range(6)
     ]
-    calib, test = _split_calibration_test(batches)
+    calib, test = batches[:3], batches[3:]
     runner = ConformalCalibrationRunner(
         model=nn.Identity(),
         calibrator=ConformalCalibrator(score_fn=score, alpha=0.1),
@@ -194,8 +230,8 @@ def test_run_calibration_passes_held_out_test_split() -> None:
     src = pathlib.Path(
         "src/spectramr/infrastructure/training/strategies/conformal_calibration_strategy.py"
     ).read_text(encoding="utf-8")
-    assert "runner.run(calib_batches, test_batches)" in src
-    assert "_split_calibration_test(batches)" in src
+    assert "runner.run(calib_batches, test_all)" in src
+    assert "self._subject_split(batches, int(self.config.run.seed))" in src
 
 
 # ── #1707: one Hoeffding draw per INDEPENDENT unit ─────────────────────────────
@@ -256,3 +292,114 @@ def test_sample_unit_keeps_the_old_count_and_says_so(tmp_path) -> None:
         "r6_dice_risk"
     ]
     assert rep["n"] == 4 and rep["independence_unit"] == "sample" and rep["n_samples_scored"] == 4
+
+
+class _GeometryModel(nn.Module):
+    """Stand-in for a geometry-plane generator: raises without ``mask=``, records it."""
+
+    kspace_geometry_channels = 6
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.masks: list[torch.Tensor] = []
+
+    def forward(self, x, mask=None):
+        if mask is None:
+            raise ValueError("forward needs mask=")
+        self.masks.append(mask)
+        return x
+
+
+@pytest.mark.parametrize("as_dict", [True, False])
+def test_calibration_pair_gives_a_geometry_model_the_measurement_support(as_dict) -> None:
+    """The dice/CHD paths called the kspace_cold_diffusion generator without a mask."""
+    from spectramr.models.blocks.kspace_geometry_encoding import measurement_support
+
+    y = torch.zeros(1, 2, 8, 8)
+    y[..., 1::3] = 1.0
+    batch = {"input": y, "target": y.clone()} if as_dict else (y, y.clone())
+    model = _GeometryModel()
+    pred, target = ConformalCalibrationStrategy._unpack_calibration_pair(batch, model)
+    assert pred is y and target is not None
+    torch.testing.assert_close(model.masks[0], measurement_support(y))
+
+
+def test_calibration_pair_passes_no_mask_to_a_model_without_geometry_planes() -> None:
+    seen: list[dict] = []
+
+    class _Bare(nn.Module):
+        def forward(self, x, **kwargs):
+            seen.append(kwargs)
+            return x
+
+    y = torch.ones(1, 2, 4, 4)
+    ConformalCalibrationStrategy._unpack_calibration_pair((y, y), _Bare())
+    assert seen == [{}]
+
+
+# ── Planted violations for the certificate branches (#3041) ────────────────────
+
+
+def test_chd_branch_writes_a_stamped_artefact(tmp_path) -> None:
+    """CHD fits on the calibration half and measures FPR on the disjoint test half."""
+    out = tmp_path / "chd.json"
+    chd = types.SimpleNamespace(
+        beta=0.2,
+        delta=0.05,
+        n_calibration=4,
+        foreground_threshold=None,
+        output_artefact=str(out),
+    )
+    strat = _conformal_strategy(chd=chd)
+    loader = _subject_batches([["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]])
+    torch.manual_seed(0)
+    reports = strat.run_calibration(loader)
+    payload = reports["r2_chd"]
+    assert out.exists()
+    assert payload["n_calibration_images"] == 4
+    assert payload["n_calibration_requested"] == 4
+    assert payload["split_unit"] == "subject"
+    assert 0.0 <= payload["empirical_fpr"] <= 1.0
+    assert payload["score_fn"] == "absolute_residual"
+
+
+def test_chd_cap_raises_when_the_calibration_half_is_too_small() -> None:
+    chd = types.SimpleNamespace(
+        beta=0.2, delta=0.05, n_calibration=50, foreground_threshold=None, output_artefact=None
+    )
+    strat = _conformal_strategy(chd=chd)
+    loader = _subject_batches([["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]])
+    with pytest.raises(ValueError, match="n_calibration=50"):
+        strat.run_calibration(loader)
+
+
+@pytest.mark.parametrize(
+    ("cert_name", "cert", "message"),
+    [
+        (
+            "pathology_recall",
+            types.SimpleNamespace(
+                classes=["infarct"], delta=0.05, target_recall=0.9, output_artefact=None
+            ),
+            "lesion detector",
+        ),
+        (
+            "pac_bayes",
+            types.SimpleNamespace(
+                delta=0.05, tv_tolerance_tau=0.05, loss_bound_M=1.0, output_artefact=None
+            ),
+            "KL",
+        ),
+    ],
+)
+def test_uncomputable_certificates_refuse_instead_of_faking_a_result(cert_name, cert, message):
+    strat = _conformal_strategy(**{cert_name: cert})
+    with pytest.raises(NotImplementedError, match=message):
+        strat.run_calibration(_subject_batches([["a", "a"], ["b", "b"]]))
+
+
+def test_subject_split_names_the_loader_when_subject_id_is_missing() -> None:
+    """Planted: a val loader without subject_id must fail with a conformal-specific message."""
+    batches = [{"input": torch.rand(2, 1, 8, 8), "target": torch.rand(2, 1, 8, 8)}]
+    with pytest.raises(ValueError, match="M4Raw k-space val loader must emit it"):
+        _conformal_strategy()._subject_split(batches, seed=1)

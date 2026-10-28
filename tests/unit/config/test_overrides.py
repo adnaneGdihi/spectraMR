@@ -348,6 +348,23 @@ def _settings():
     return TrainingSettings(**_minimal_config())
 
 
+@pytest.mark.parametrize("spelling", ["none", "None", "NONE"])
+def test_none_reaches_a_literal_field_that_rejects_none(spelling):
+    """#1480: `parallel.strategy` declares the string 'none' and refuses None."""
+    updated = apply_overrides(_settings(), [f"parallel.strategy={spelling}"])
+    assert updated.parallel.strategy == "none"
+
+
+def test_none_still_clears_an_optional_field():
+    updated = apply_overrides(_settings(), ["data.source.test_index_path=none"])
+    assert updated.data.source.test_index_path is None
+
+
+def test_null_is_never_rewritten_to_the_string():
+    with pytest.raises(ValueError, match=r"parallel\.strategy"):
+        apply_overrides(_settings(), ["parallel.strategy=null"])
+
+
 class TestOverrideEcho:
     """An applied ``-O`` must be visible in a normally-configured run's log.
 

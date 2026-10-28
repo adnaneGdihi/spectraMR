@@ -24,6 +24,15 @@ their own baselines. A gate that fails on another gate's debt inherits it and
 stops meaning anything — the same scoping rule
 ``check_scheduler_specs_resolve.py`` states for the ``optimization`` block.
 
+Two trees, two baselines. This gate runs over ``experiments/inprogress`` and,
+under a SEPARATE hook id, over ``tests/audit/corpus`` -- where a fixture
+declaring a key the schema discards is a planted violation that carries none of
+the shape it advertises (#1933). Each root passes its own ``--baseline``. Sharing
+one is the failure this docstring already argues against, and it is not
+hypothetical: run against ``tests/audit/corpus`` while reading the experiments
+baseline, the gate reported all 2658 entries as "now clean" and invited an
+``--update-baseline`` that would have erased the entire debt record (#1930).
+
 Ratchet. Identical three-way shape to
 ``check_acceleration_ladder_realisable.py``:
 
@@ -37,6 +46,8 @@ Usage::
     python scripts/ci/check_witness_corpus.py experiments/inprogress
     python scripts/ci/check_witness_corpus.py --strict
     python scripts/ci/check_witness_corpus.py --update-baseline
+    python scripts/ci/check_witness_corpus.py tests/audit/corpus \
+        --baseline scripts/ci/witness_baseline_audit_corpus.txt
 """
 
 from __future__ import annotations
@@ -70,11 +81,7 @@ def findings_for(path: Path) -> list[str]:
     ExecutionLedger.reset()
     ledger = ExecutionLedger.begin_run(source=str(path))
     TrainingSettings.from_yaml(str(path))
-    return [
-        f"{s.class_id.value}: {s.path}"
-        for s in ledger.substitutions
-        if s.class_id in BLOCKING
-    ]
+    return [f"{s.class_id.value}: {s.path}" for s in ledger.substitutions if s.class_id in BLOCKING]
 
 
 def meta_findings() -> list[str]:
@@ -94,18 +101,30 @@ def meta_findings() -> list[str]:
     ]
 
 
-def read_baseline() -> set[str]:
-    if not BASELINE.exists():
-        return set()
+class MissingBaselineError(Exception):
+    """The baseline file is absent (non-negotiable 18).
+
+    Inferring ``set()`` here grades every known finding as a NEW regression on one
+    run, and -- because the operator's obvious response is ``--update-baseline``
+    -- silently blesses the whole corpus on the next. A deleted baseline must be
+    reported, not guessed at.
+    """
+
+
+def read_baseline(baseline: Path | None = None) -> set[str]:
+    baseline = BASELINE if baseline is None else baseline
+    if not baseline.exists():
+        raise MissingBaselineError(str(baseline))
     return {
         line.strip()
-        for line in BASELINE.read_text().splitlines()
+        for line in baseline.read_text().splitlines()
         if line.strip() and not line.startswith("#")
     }
 
 
-def write_baseline(entries: list[str]) -> None:
-    BASELINE.write_text(
+def write_baseline(entries: list[str], baseline: Path | None = None) -> None:
+    baseline = BASELINE if baseline is None else baseline
+    baseline.write_text(
         "# Configs that declare a key the schema then discards (issue #550).\n"
         "# One `<path>::<class>: <dotted key>` per line.\n"
         "#\n"
@@ -122,6 +141,16 @@ def write_baseline(entries: list[str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", nargs="?", default="experiments")
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Baseline file for THIS root. A second tree MUST carry its own: "
+        "pointing this gate at `tests/audit/corpus` while it reads the "
+        "experiments baseline reported 2658 entries as 'now clean' and invited "
+        "an --update-baseline that would have erased the whole debt record "
+        "(#1930). That is the failure this gate's own docstring argues against.",
+    )
     parser.add_argument(
         "--strict",
         action="store_true",
@@ -176,14 +205,24 @@ def main(argv: list[str] | None = None) -> int:
     meta = meta_findings()
 
     if args.update_baseline:
-        write_baseline(sorted(current))
+        write_baseline(sorted(current), args.baseline)
         print(f"baseline rewritten with {len(current)} entr(ies)")
         return 0
 
     print(f"resolved {checked} config(s); {unloadable} skipped (schema-invalid)")
     print(f"declared-but-discarded keys: {len(current)}")
 
-    baseline = read_baseline()
+    try:
+        baseline = read_baseline(args.baseline)
+    except MissingBaselineError as exc:
+        print(
+            f"\nFAILED: the baseline file is absent ({exc}). Refusing to treat a "
+            "missing baseline as an empty one -- that grades every known finding "
+            "as a new regression, and blesses the corpus on the next "
+            "--update-baseline. Restore it from git, or create it deliberately "
+            "with --update-baseline."
+        )
+        return 1
     new = sorted(current - baseline)
     fixed = sorted(baseline - current)
 
@@ -215,8 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(
-        f"\nOK: {len(current)} known finding(s) in the baseline, 0 new; "
-        f"every meta-witness passes."
+        f"\nOK: {len(current)} known finding(s) in the baseline, 0 new; every meta-witness passes."
     )
     return 0
 

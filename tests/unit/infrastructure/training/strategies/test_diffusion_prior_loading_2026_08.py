@@ -29,6 +29,7 @@ import torch
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
 )
+from tests.fixtures.run_state_files import write_run_state
 
 
 class _Logging:
@@ -108,8 +109,9 @@ def test_zero_key_overlap_raises(monkeypatch, tmp_path):
     ``strict=False`` while matching nothing."""
     model = torch.nn.Linear(2, 2)
     _stub_builder(monkeypatch, model)
-    ckpt = tmp_path / "other_arch.pth"
-    torch.save({"model_state_dict": {"totally.different.weight": torch.zeros(3)}}, ckpt)
+    ckpt = write_run_state(
+        tmp_path / "other_arch.pt", {"generator": {"totally.different.weight": torch.zeros(3)}}
+    )
 
     strategy = _Strategy(str(ckpt))
     with pytest.raises(RuntimeError, match=r"shares\s+NO parameter names"):
@@ -121,8 +123,7 @@ def test_partial_overlap_is_still_accepted(monkeypatch, tmp_path):
     zero-overlap case is a mismatch in disguise."""
     model = torch.nn.Linear(2, 2)
     _stub_builder(monkeypatch, model)
-    ckpt = tmp_path / "partial.pth"
-    torch.save({"model_state_dict": {"weight": torch.ones(2, 2)}}, ckpt)
+    ckpt = write_run_state(tmp_path / "partial.pt", {"generator": {"weight": torch.ones(2, 2)}})
 
     strategy = _Strategy(str(ckpt))
     _run(strategy)
@@ -137,10 +138,9 @@ def test_module_prefix_is_still_stripped(monkeypatch, tmp_path):
     """DataParallel checkpoints keep loading -- the raise must not fire on them."""
     model = torch.nn.Linear(2, 2)
     _stub_builder(monkeypatch, model)
-    ckpt = tmp_path / "dp.pth"
-    torch.save(
-        {"model_state_dict": {"module.weight": torch.ones(2, 2), "module.bias": torch.zeros(2)}},
-        ckpt,
+    ckpt = write_run_state(
+        tmp_path / "dp.pt",
+        {"generator": {"module.weight": torch.ones(2, 2), "module.bias": torch.zeros(2)}},
     )
 
     strategy = _Strategy(str(ckpt))
@@ -148,8 +148,45 @@ def test_module_prefix_is_still_stripped(monkeypatch, tmp_path):
     assert any("Matched 2/2" in i for i in strategy.logging_service.infos)
 
 
+def test_a_pre_v1_prior_names_the_converter(monkeypatch, tmp_path):
+    """An old envelope is a schema error, not an architecture mismatch: the user
+    must be told to convert the run, not to point at a different checkpoint."""
+    _stub_builder(monkeypatch, torch.nn.Linear(2, 2))
+    ckpt = tmp_path / "old.pt"
+    torch.save({"model_state_dict": torch.nn.Linear(2, 2).state_dict()}, ckpt)
+
+    with pytest.raises(ValueError, match="convert_checkpoints_v1") as info:
+        _run(_Strategy(str(ckpt)))
+    assert "NO parameter names" not in str(info.value)
+
+
 def test_disabled_prior_loading_is_a_no_op(monkeypatch):
     strategy = _Strategy("")
     strategy.config.data.prior_loading.enabled = False
     _run(strategy)
     assert strategy.prior_model is None
+
+
+def test_zero_overlap_message_keeps_the_key_counts(monkeypatch, tmp_path):
+    _stub_builder(monkeypatch, torch.nn.Linear(2, 2))
+    ckpt = write_run_state(
+        tmp_path / "alien.pt",
+        {"generator": {"a.w": torch.zeros(1), "b.w": torch.zeros(1), "c.w": torch.zeros(1)}},
+    )
+    with pytest.raises(RuntimeError, match=r"2 expected keys, 3 unexpected in the checkpoint"):
+        _run(_Strategy(str(ckpt)))
+
+
+def test_an_unrelated_codec_error_keeps_its_own_message(monkeypatch, tmp_path):
+    """Only a genuine zero overlap is reported as an architecture mismatch."""
+    import spectramr.infrastructure.training.strategies.diffusion as diffusion_mod
+
+    _stub_builder(monkeypatch, torch.nn.Linear(2, 2))
+
+    def _boom(*args, **kwargs):
+        raise ValueError("checkpoint x.pt has unknown part(s) ['bogus']")
+
+    monkeypatch.setattr(diffusion_mod, "weights", _boom)
+    with pytest.raises(ValueError, match="unknown part") as info:
+        _run(_Strategy(str(tmp_path / "x.pt")))
+    assert "NO parameter names" not in str(info.value)

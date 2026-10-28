@@ -129,6 +129,23 @@ class DynamicOTFlow(nn.Module):
         self.num_steps = num_steps
         self.velocity_net = VelocityFieldNetwork(in_channels, hidden_dim)
 
+    def _euler_path(
+        self,
+        x0: torch.Tensor,
+        t_start: float = 0.0,
+        t_end: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Explicit-Euler transport of ``x0``: ``(endpoint, kinetic action)``."""
+        dt = (t_end - t_start) / self.num_steps
+        x = x0
+        total_energy = x0.new_zeros(())
+        for i in range(self.num_steps):
+            t = torch.tensor(t_start + i * dt, device=x.device)
+            v: torch.Tensor = self.velocity_net(x, t)
+            total_energy = total_energy + dt * (v**2).mean()
+            x = x + dt * v
+        return x, total_energy
+
     def integrate(
         self,
         x0: torch.Tensor,
@@ -136,26 +153,22 @@ class DynamicOTFlow(nn.Module):
         t_end: float = 1.0,
     ) -> torch.Tensor:
         """Integrate the ODE to transport ``x0`` from ``t_start`` to ``t_end``."""
-        dt = (t_end - t_start) / self.num_steps
-        x = x0
-        for i in range(self.num_steps):
-            t = torch.tensor(t_start + i * dt, device=x.device)
-            v = self.velocity_net(x, t)
-            x = x + dt * v
-        return x
+        return self._euler_path(x0, t_start, t_end)[0]
 
     def compute_kinetic_energy(self, x0: torch.Tensor) -> torch.Tensor:
         """Compute the kinetic-energy action integral along the transport path."""
-        dt = 1.0 / self.num_steps
-        x = x0
-        total_energy: torch.Tensor | float = 0.0
-        for i in range(self.num_steps):
-            t = torch.tensor(i * dt, device=x.device)
-            v = self.velocity_net(x, t)
-            energy = (v**2).mean()
-            total_energy = total_energy + dt * energy
-            x = x + dt * v
-        return total_energy
+        return self._euler_path(x0)[1]
+
+    def transport_loss(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        lambda_terminal: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(kinetic + lambda_terminal * terminal MSE, transported)`` from one Euler pass."""
+        transported, kinetic_loss = self._euler_path(source)
+        terminal_loss = F.mse_loss(transported, target)
+        return kinetic_loss + lambda_terminal * terminal_loss, transported
 
     def forward(
         self,
@@ -164,10 +177,7 @@ class DynamicOTFlow(nn.Module):
         lambda_terminal: float = 1.0,
     ) -> torch.Tensor:
         """Kinetic-energy action + terminal MSE matching."""
-        transported = self.integrate(source)
-        kinetic_loss = self.compute_kinetic_energy(source)
-        terminal_loss = F.mse_loss(transported, target)
-        return kinetic_loss + lambda_terminal * terminal_loss
+        return self.transport_loss(source, target, lambda_terminal)[0]
 
 
 @register_loss("kidot", aliases=["knowledge_informed_ot"])
@@ -211,9 +221,10 @@ class KIDOTLoss(nn.Module):
         measurements: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Transport loss + optional physics consistency term."""
-        transport_loss = self.dynamic_ot(source, target, self.lambda_terminal)
+        transport_loss, transported = self.dynamic_ot.transport_loss(
+            source, target, self.lambda_terminal
+        )
         if self.forward_operator is not None and measurements is not None:
-            transported = self.dynamic_ot.integrate(source)
             predicted_meas = self.forward_operator(transported)
             physics_loss = F.mse_loss(predicted_meas, measurements)
             transport_loss = transport_loss + self.lambda_physics * physics_loss

@@ -35,7 +35,11 @@ def _resolve_sharding_strategy(name: str) -> Any:
     return table[name]
 
 
-def _resolve_mixed_precision_policy(dtype_name: str | None) -> Any:
+def _resolve_mixed_precision_policy(
+    dtype_name: str | None,
+    reduce_dtype: str = "float32",
+    buffer_dtype: str = "float32",
+) -> Any:
     if dtype_name is None:
         return None
     from torch.distributed.fsdp import MixedPrecision
@@ -44,7 +48,15 @@ def _resolve_mixed_precision_policy(dtype_name: str | None) -> Any:
     if dtype_name not in dtype_map:
         raise ValueError(f"Unknown FSDP mixed_precision={dtype_name!r}. Use fp16 | bf16 | null.")
     dtype = dtype_map[dtype_name]
-    return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+    resolved = {"float32": torch.float32, "match_param": dtype}
+    for knob, value in (("reduce_dtype", reduce_dtype), ("buffer_dtype", buffer_dtype)):
+        if value not in resolved:
+            raise ValueError(f"Unknown FSDP {knob}={value!r}. Use float32 | match_param.")
+    return MixedPrecision(
+        param_dtype=dtype,
+        reduce_dtype=resolved[reduce_dtype],
+        buffer_dtype=resolved[buffer_dtype],
+    )
 
 
 def _resolve_layer_classes(names: tuple[str, ...]) -> set[type]:
@@ -90,6 +102,39 @@ def _resolve_layer_classes(names: tuple[str, ...]) -> set[type]:
             "nn.Module subclass in torch.nn or the model packages. A name that "
             "resolves to nothing would silently shrink the wrap set -- the same "
             "failure as the empty set this replaced."
+        )
+    return resolved
+
+
+def resolve_fsdp_precision(fsdp_cfg: Any, precision_cfg: Any = None) -> str | None:
+    """The precision FSDP runs in: ``"bf16"`` or ``None`` (single precision).
+
+    ``optimization.precision`` owns the arm's precision, the same block DeepSpeed reads, so
+    FSDP follows it: off means float32, and ``enabled`` with no dtype means float16, the
+    global convention. ``parallel.fsdp.mixed_precision`` overrides it when an arm names one.
+    Every other precision has to be declared.
+
+    Raises:
+        ValueError: the resolved precision is float16. FSDP needs a ``ShardedGradScaler``
+            that is not wired, so float16 would underflow its gradients unscaled.
+    """
+    from spectramr.infrastructure.training.mixed_precision import resolve_amp_precision
+
+    explicit = getattr(fsdp_cfg, "mixed_precision", None)
+    if explicit is not None:
+        return explicit
+    enabled, resolved = resolve_amp_precision(
+        bool(getattr(precision_cfg, "enabled", False)),
+        getattr(precision_cfg, "dtype", None),
+    )
+    if not enabled:
+        return None
+    if resolved == "fp16":
+        raise ValueError(
+            "optimization.precision resolves to float16 under FSDP, which needs a "
+            "ShardedGradScaler that is not wired, so gradients would underflow unscaled. "
+            "Declare optimization.precision.dtype: bfloat16 (Ampere or newer), or "
+            "optimization.precision.enabled: false for float32."
         )
     return resolved
 
@@ -151,12 +196,16 @@ def _maybe_apply_activation_checkpointing(model: nn.Module) -> None:
     )
 
 
-def maybe_wrap_with_fsdp(model: nn.Module, parallel_cfg: Any) -> nn.Module:
+def maybe_wrap_with_fsdp(
+    model: nn.Module, parallel_cfg: Any, precision_cfg: Any = None
+) -> nn.Module:
     """Wrap ``model`` with FSDP if ``parallel.fsdp.enabled`` is True.
 
     Args:
         model: The bare ``nn.Module`` returned by the model factory.
         parallel_cfg: ``TrainingSettings.parallel`` (a ParallelismConfigSchema).
+        precision_cfg: ``TrainingSettings.optimization.precision``; the source of FSDP's
+            precision unless ``parallel.fsdp.mixed_precision`` names one.
 
     Returns:
         Either the wrapped FSDP module, or the input unchanged when
@@ -184,7 +233,8 @@ def maybe_wrap_with_fsdp(model: nn.Module, parallel_cfg: Any) -> nn.Module:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
     sharding = _resolve_sharding_strategy(cfg.sharding_strategy)
-    mp_policy = _resolve_mixed_precision_policy(cfg.mixed_precision)
+    precision = resolve_fsdp_precision(cfg, precision_cfg)
+    mp_policy = _resolve_mixed_precision_policy(precision, cfg.reduce_dtype, cfg.buffer_dtype)
     wrap_policy = _build_auto_wrap_policy(cfg)
     cpu_offload = CPUOffload(offload_params=True) if cfg.cpu_offload else None
 
@@ -204,7 +254,7 @@ def maybe_wrap_with_fsdp(model: nn.Module, parallel_cfg: Any) -> nn.Module:
     logger.info(
         "FSDP wrapped: sharding=%s mp=%s cpu_offload=%s ckpt=%s",
         cfg.sharding_strategy,
-        cfg.mixed_precision,
+        precision,
         cfg.cpu_offload,
         cfg.activation_checkpointing,
     )

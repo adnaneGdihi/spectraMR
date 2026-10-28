@@ -2,64 +2,7 @@ Config-declarable transform registry
 ====================================
 
 ``data.processing.transforms`` is the YAML seam for "run this transform on every
-subject". This page describes what it does now, and what it silently did not do
-before 2026-08-04.
-
-The defect
-----------
-
-The field was typed ``list[dict[str, Any]]`` — anything validated — and its only
-consumer scanned the list for the single literal string ``"graph_encoding"`` and
-``break``\ ed:
-
-.. code-block:: python
-
-   for t_config in transforms_config:
-       t_name = t_config.get("name")
-       if t_name == "graph_encoding":
-           enable_graph_encoding = True
-           ...
-           break
-
-Every other entry was accepted at config load and then discarded without a word.
-There was no dotted-path resolver anywhere in the data path, so the four arms
-declaring ``name: spectramr.data.transforms.slice_profile.SliceProfileTransform``
-never ran that transform; the arm spelling the key ``type: scout_acquisition``
-was not even read; and an entry after a ``graph_encoding`` entry was dropped by
-the ``break``. Each of those arms is *named* for the mechanism it was not
-running, smoke-passed, and reported success — pitfall #16 (inert mechanism)
-sitting behind pitfall #15 (an advertised knob nothing reads).
-
-Three chains were dead at link 0
---------------------------------
-
-The consequence was not confined to the transforms. Three of them are the sole
-documented producer of a key a live consumer reads, and because the transform
-could not be constructed from any config, the consumer silently did nothing:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Transform
-     - Key it produces
-     - Consumer that was silently inert
-   * - ``PhaseResidualTransform``
-     - ``phase_residual``
-     - ``inverse_bloch_phase_strategy`` — the Tikhonov phase-smoothness prior,
-       its defining term. 17 arms set ``lambda_phase_smooth``; the weight was
-       validated, read and INFO-logged over a term that could never fire.
-   * - ``ScoutAcquisitionTransform``
-     - ``scout``
-     - ``scas_strategy`` — the hypernet was never built, never joined
-       ``opt_g``, and neither ``scas_mask`` nor ``scas_logits`` was written, so
-       the density penalty also no-opped. The arm was plain LOUPE under the
-       SCAS name.
-   * - ``ForegroundMaskExtractor``
-     - ``foreground_mask``
-     - ``core.metrics.context`` — eight no-reference metrics fell back to a
-       cruder ``0.05 × max`` threshold instead of the 99th-percentile-of-nonzero
-       mask, which the module's own comment explains is the wrong statistic
-       because background dominates the histogram.
+subject".
 
 The registry
 ------------
@@ -89,12 +32,8 @@ Kwargs may be nested under ``kwargs:`` (preferred) or written flat beside
 so it keeps working. An unknown kwarg is *not* swallowed: it reaches the
 transform constructor and surfaces as a ``TypeError`` naming the transform.
 
-``produces`` is the anti-facade payload. It lets an audit answer "is there any
-registered producer for the key this strategy reads?" without importing every
-strategy — see :func:`~spectramr.data.transforms.registry.transforms_producing`.
-``tests/unit/data/transforms/test_registry.py`` pins that invariant for the
-three keys above, so a future refactor that unregisters one of them fails a test
-instead of quietly reinstating the dead chain.
+``produces`` lets an audit answer "is there any registered producer for the key
+this strategy reads?" without importing every strategy — see :func:`~spectramr.data.transforms.registry.transforms_producing`.
 
 Where the transforms are applied
 --------------------------------
@@ -110,7 +49,7 @@ Three layers of enforcement
 
 #. **Schema** — ``TransformSpecSchema`` requires ``name``, which alone rejects
    the ``type:`` spelling at config load. Registry membership is deliberately
-   *not* checked here: ``config/`` may not import ``data/`` (non-negotiable #5).
+   *not* checked here: ``config/`` may not import ``data/``.
 #. **Builder** — ``TorchIOTransformConfig.from_training_config`` resolves every
    name through the registry and raises ``KeyError`` listing the valid names,
    with an explicit hint when the name looks like a dotted import path.
@@ -120,8 +59,8 @@ Three layers of enforcement
 Adding a transform
 ------------------
 
-#. Put the class in ``src/spectramr/data/transforms/`` (non-negotiable #12 — one
-   canonical home).
+#. Put the class in ``src/spectramr/data/transforms/`` — transforms have one
+   canonical home.
 #. Decorate it with ``@register_transform("<name>", produces=(...))``.
 #. Import the module from ``src/spectramr/data/transforms/__init__.py`` — the
    decorator only runs when the module is imported, and a transform nobody
@@ -129,8 +68,55 @@ Adding a transform
    ``data/adapters/__init__.py``.
 #. Add a test asserting it is registered and constructs with defaults.
 
-Currently registered: ``foreground_mask``, ``graph_encoding``, ``phase_residual``,
-``scout_acquisition``. The remaining caller-free transforms under
+Currently registered (re-measure with ``TRANSFORM_REGISTRY``, this list moves):
+``complementary_rep_masking``, ``espirit_sensitivity``, ``foreground_mask``,
+``graph_encoding``, ``homomorphic_bias_field``, ``joint_rotation``,
+``phase_residual``, ``scout_acquisition``, ``select_middle_slice``,
+``simulate_ulf_from_hf``, ``simulate_ulf_from_qmaps``, ``slab_to_channel``,
+``slice_profile``, ``svd_coil_compression``.
+
+``svd_coil_compression`` (``requires=("input", "mask")``) is the M4Raw
+repetition route's coil compression, which the loader's
+``coils.processing_mode: svd`` cannot be on that route. Declared after
+``complementary_rep_masking``, it fits one SVD basis per slice on the masked
+``input`` alone and applies it to ``input``, ``measured_kspace``, ``target``,
+``kspace`` and ``input_alt``. Compression is linear on the coil axis and the
+mask acts on k-space positions, so the two commute and no unacquired line or
+reference repetition chooses the basis. It raises when ``mask`` is absent or a
+physical-coil key (coil maps, ``noise_covariance``) is present.
+
+``espirit_sensitivity`` estimates complex ESPIRiT maps from the subject's
+k-space and writes ``sensitivity_complex`` and its magnitude ``sensitivity``.
+Under ``data.coil_maps_root`` the M4Raw loader has already attached the group's
+precomputed maps and stamped the calibration that made them; the transform
+then estimates nothing, and raises if that calibration or the maps' shape
+differs from its own ``acs_size``/``kernel_size``/``eigen_threshold``.
+
+``complementary_rep_masking`` (``produces=("mask", "loss_mask", "measured_kspace")``) is the
+CoNEX protocol's data side (``experiments/inprogress/n2n/PAPER.md`` § 4): it
+undersamples ``input`` by a mask :math:`M_1` drawn inside the acquired
+phase-encode columns and emits ``loss_mask`` = :math:`M_2` for the
+``masked_kspace_l2`` loss (:doc:`losses_reference`). ``mode`` selects how
+:math:`M_2` relates to :math:`M_1` -- ``independent`` (a fresh draw),
+``complementary`` (disjoint, subsampled to :math:`|M_2| = |M_1|` above R = 2),
+``same`` and ``full_target`` (the two controls) -- and an unknown mode raises.
+Seeds are a CRC32 of ``(file_id, slice, seed)`` so every arm of an ablation sees
+the same :math:`M_1`. It also overwrites ``measured_kspace`` with the masked
+input. The M4Raw dataset publishes that key as the unmasked ``input`` and serves
+the reference under ``kspace``, so the strategy's measurement :math:`y` is the
+acquired input on every M4Raw arm and never the target (#2761).
+
+``pattern`` chooses the family of :math:`M_1`. ``cartesian_1d`` (the default) is the
+uniform random line draw above. ``poisson_disk``, ``radial``/``golden_angle`` and
+``spiral`` -- names resolved through ``SamplingPatternRegistry``, any other name
+raising -- draw 2-D masks over the whole grid (``data/transforms/rep_mask_patterns.py``):
+a variable-density Poisson-disc from ``MaskGenerator.variable_density_poisson_disc``,
+or a seeded rotation of the golden-angle orderings rasterised onto the grid. R
+means :math:`|M_1 \cap \mathrm{support}| = \mathrm{round}(|\mathrm{support}|/R)` for
+every family, and every 2-D mask holds the centred
+``round(center_fraction * W)``-square ESPIRiT window in both masks. A calibration
+region that fills the budget raises instead of silently lowering R, and the achieved
+R is stamped as ``realised_acceleration``. The remaining caller-free transforms under
 ``data/transforms/`` are a separate decision — several are duplicates that
 *disagree numerically* with a live implementation and should be deleted rather
 than registered.

@@ -291,3 +291,80 @@ class TestDomainAdaptationTrainingStep:
         # Verify train_step exists
         assert hasattr(strategy, "train_step")
         assert callable(strategy.train_step)
+
+
+class TestLiveIterationReachesTheLossComputer:
+    """#1950 -- ``_compute_losses_impl`` called ``compute()`` without ``iteration=``.
+
+    ``UnifiedGANLossComputer.compute`` declares ``iteration: int = 0``, so the
+    omission was not an error -- the parameter simply defaulted, forever. Every
+    warm-up-gated loss therefore resolved to 0.0 for the whole run, and a gated
+    loss is **absent from** ``components`` rather than scaled to zero, so
+    nothing in the logs said a term had gone missing.
+
+    ``resolve_loop_iteration`` is the elected owner of this seam (pitfall #16,
+    #1937): ``self.env.step`` does not exist as a field and is never assigned,
+    so the historical read was structurally frozen.
+    """
+
+    @patch("spectramr.infrastructure.di.di_container.resolve_service")
+    def test_compute_receives_the_live_loop_iteration(
+        self, mock_resolve, mock_domain_adaptation_state
+    ):
+        from types import SimpleNamespace
+
+        from spectramr.models.losses.computers.base import LossOutput
+
+        mock_resolve.return_value = MagicMock()
+        strategy = DomainAdaptationTrainingStrategy(env=mock_domain_adaptation_state)
+
+        seen: dict = {}
+
+        def _record(**kwargs):
+            seen.update(kwargs)
+            total = kwargs["pred"].sum() * 0.0
+            return LossOutput(total=total, components={"reconstruction": total}, metrics={})
+
+        strategy.loss_computer = MagicMock()
+        strategy.loss_computer.compute.side_effect = _record
+        # The live seam the training loop advances each step.
+        strategy.loop_state = SimpleNamespace(iteration=4242)
+
+        inputs = torch.rand(2, 1, 16, 16)
+        targets = torch.rand(2, 1, 16, 16)
+        strategy._compute_losses_impl(inputs, targets, 0)
+
+        assert "iteration" in seen, "compute() was called without iteration= at all"
+        assert seen["iteration"] == 4242
+
+    @patch("spectramr.infrastructure.di.di_container.resolve_service")
+    def test_the_iteration_is_read_from_the_seam_not_from_kwargs(
+        self, mock_resolve, mock_domain_adaptation_state
+    ):
+        """A ``kwargs.get("iteration", 0)`` here would be a second resolver
+        (non-negotiable 17): ``g_closure`` calls ``_compute_losses_impl``
+        directly, so whatever it forwards would silently outrank the loop."""
+        from types import SimpleNamespace
+
+        from spectramr.models.losses.computers.base import LossOutput
+
+        mock_resolve.return_value = MagicMock()
+        strategy = DomainAdaptationTrainingStrategy(env=mock_domain_adaptation_state)
+
+        seen: dict = {}
+
+        def _record(**kwargs):
+            seen.update(kwargs)
+            total = kwargs["pred"].sum() * 0.0
+            return LossOutput(total=total, components={"reconstruction": total}, metrics={})
+
+        strategy.loss_computer = MagicMock()
+        strategy.loss_computer.compute.side_effect = _record
+        strategy.loop_state = SimpleNamespace(iteration=99)
+
+        inputs = torch.rand(2, 1, 16, 16)
+        targets = torch.rand(2, 1, 16, 16)
+        # A stale/absent kwargs value must not win over the live seam.
+        strategy._compute_losses_impl(inputs, targets, 0, iteration=0)
+
+        assert seen["iteration"] == 99

@@ -623,3 +623,19 @@ def test_sample_radial_cfl_renders_nufft_recon(tmp_path):
     assert len(s.kspace) >= 1                              # raw k-space logmag kept
     assert len(s.images) >= 1                              # AND a NUFFT recon image
     assert any("nufft" in n.lower() for n in s.notes)      # labeled (golden-angle assumed)
+
+
+def test_a_scaled_int16_nifti_decodes_with_slope_and_intercept_applied():
+    """np.asarray(dataobj, dtype=float32) replaced np.array(..., copy=...) for numpy 2 (#2674);
+    it must still return scaled values, as get_fdata does, not the stored integers."""
+    import nibabel as nib
+
+    from spectramr.data.eda.loader import _decode_member_image
+
+    stored = (np.arange(64).reshape(8, 8, 1) * 7).astype(np.int16)
+    img = nib.Nifti1Image(stored, np.eye(4))
+    img.header.set_data_dtype(np.int16)
+    img.header.set_slope_inter(2.5, 10.0)
+    decoded = _decode_member_image("scan.nii", img.to_bytes())
+    assert decoded is not None
+    assert np.allclose(decoded.numpy().ravel(), np.sort((stored * 2.5 + 10.0).ravel()))

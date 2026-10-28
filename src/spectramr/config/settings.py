@@ -3,10 +3,10 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from spectramr.config.io import load_yaml_strict
 from spectramr.config.schemas.acceleration import AccelerationConfigSchema
 from spectramr.config.schemas.acquisition import AcquisitionConfigSchema
 from spectramr.config.schemas.adapters import AdaptersConfigSchema
@@ -51,6 +51,7 @@ from spectramr.config.schemas.training.base import TrainingStrategyConfigSchema
 from spectramr.config.schemas.training.privacy import PrivacyConfig
 from spectramr.config.schemas.validation import ValidationConfigSchema
 from spectramr.config.schemas.workflow import WorkflowConfigSchema
+from spectramr.config.schemas.training.levy_denoising import reads_levy_denoising
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,8 @@ def _bind_config_version(data: dict[str, Any], version: str | None) -> dict[str,
     return data
 
 
-class TrainingSettings(BaseSettings):
+# The mypy hook env has no pydantic-settings, so BaseSettings is Any there (#2659).
+class TrainingSettings(BaseSettings):  # type: ignore[misc]
     """
     Main configuration class for the application.
     Uses Pydantic V2 and pydantic-settings for robust validation and loading.
@@ -253,20 +255,7 @@ class TrainingSettings(BaseSettings):
         ),
     )
     physics: PhysicsConfigSchema | None = Field(default=None)
-    # Deprecated: ``artifacts.persistent_root`` was a planned alternative to
-    # ``training.output_dir`` but no production code reads it. Several
-    # `experiments/inprogress/hilbert_mamba/*` YAMLs still set it; for now we
-    # accept-and-ignore (warning at load time below) so they don't reject under
-    # ``extra="forbid"``. Remove once those YAMLs are migrated to put the path
-    # under ``training.output_dir`` exclusively.
-    artifacts: dict[str, Any] | None = Field(
-        default=None,
-        deprecated=(
-            "config.artifacts is unused — set training.output_dir instead. "
-            "This field is kept solely to avoid breaking legacy YAMLs under "
-            "extra='forbid'."
-        ),
-    )
+    # `artifacts` was removed (#698) and is refused at load; see removals.py.
     # Declarative adapter chains. Per CLAUDE.md #9 adapters NEVER fire
     # silently — they're the only way to bridge a capability mismatch
     # between data, model, loss, and metric layers. See
@@ -354,7 +343,9 @@ class TrainingSettings(BaseSettings):
     # alias whose only job is to be copied somewhere else is a second spelling,
     # and `renames.py` now rejects it by name pointing at `model.model_domain`.
 
-    _reject_renamed_root = model_validator(mode="before")(classmethod(reject_renamed_keys(ROOT)))
+    _reject_renamed_root = model_validator(mode="before")(
+        classmethod(reject_renamed_keys(ROOT))  # type: ignore[arg-type]
+    )
 
     # The only fold that may cross top-level blocks. A per-block fold validator
     # is mounted on one class and cannot reach a sibling; this one is mounted
@@ -373,7 +364,9 @@ class TrainingSettings(BaseSettings):
     __folded_input_keys__ = folded_input_keys(ROOT)
     __folded_input_paths__ = folded_input_paths(ROOT)
 
-    _fold_renamed_root = model_validator(mode="before")(classmethod(fold_renamed_keys(ROOT)))
+    _fold_renamed_root = model_validator(mode="before")(
+        classmethod(fold_renamed_keys(ROOT))  # type: ignore[arg-type]
+    )
 
     @model_validator(mode="after")
     def _warn_on_deprecated_top_level_blocks(self) -> "TrainingSettings":
@@ -398,13 +391,37 @@ class TrainingSettings(BaseSettings):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        if self.__dict__.get("artifacts") is not None:
-            warnings.warn(
-                "config.artifacts is unused — set training.output_dir instead. "
-                "This field is kept solely to avoid breaking legacy YAMLs under "
-                "extra='forbid'.",
-                DeprecationWarning,
-                stacklevel=2,
+        return self
+
+    @model_validator(mode="after")
+    def _recorrupted_inference_needs_an_r2r_target(self) -> "TrainingSettings":
+        """Refuse ``validation.scoring.recorrupted_inference`` where nothing recorrupts.
+
+        The Monte-Carlo estimator (#2329) redraws the training recorruption at
+        validation, so it is defined only for ``data.target_mode`` ``r2r`` (a
+        drawn ``alpha``) and ``nullspace_r2r`` (a split ``angle_deg``). The
+        validation mixin re-checks the same facts at the first batch; refusing
+        here is what lets ``spectramr audit`` reject the YAML at load time
+        (non-negotiable 3) instead of the first validation step.
+        """
+        scoring = getattr(self.validation, "scoring", None)
+        knob = getattr(scoring, "recorrupted_inference", None)
+        if knob is None:
+            return self
+        mode = getattr(self.data, "target_mode", None)
+        strengths = {"r2r": "alpha", "nullspace_r2r": "angle_deg"}
+        if mode not in strengths:
+            raise ValueError(
+                "validation.scoring.recorrupted_inference is read only under "
+                f"data.target_mode 'r2r' or 'nullspace_r2r'; this arm declares {mode!r}, "
+                "which draws no recorruption to average over."
+            )
+        other = "angle_deg" if strengths[mode] == "alpha" else "alpha"
+        if getattr(knob, other, None) is not None:
+            raise ValueError(
+                f"validation.scoring.recorrupted_inference.{other} is the strength of the "
+                f"other target mode; under data.target_mode={mode!r} declare "
+                f"'{strengths[mode]}' or leave the strength to the data block."
             )
         return self
 
@@ -443,6 +460,56 @@ class TrainingSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _forward_noise_excludes_sampler_sigma(self) -> "TrainingSettings":
+        """Refuse ``forward_noise_sigma > 0`` with ``sampler_sigma > 0`` (one owner of reverse noise).
+
+        Both knobs inject noise into the reverse trajectory, so declaring both would
+        make the reverse noise a sum of two undeclared scales. Mirrors the build-time
+        check in ``KSpaceColdDiffusionGenerator``.
+        """
+        model_kwargs = getattr(self.model, "model_kwargs", None) or {}
+        forward = float(model_kwargs.get("forward_noise_sigma", 0.0) or 0.0)
+        sampler = float(model_kwargs.get("sampler_sigma", 0.0) or 0.0)
+        if forward > 0 and sampler > 0:
+            raise ValueError(
+                "model.model_kwargs.forward_noise_sigma > 0 and model.model_kwargs.sampler_sigma > 0 "
+                "both inject reverse-trajectory noise; declare one."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _tall_locality_needs_a_tall_model(self) -> "TrainingSettings":
+        """Refuse ``training.tall_sr.lambda_locality > 0`` on any model but ``tall_sr``.
+
+        The locality term reads the TALL traversal of the ``tall_sr`` generator; any
+        other model has none to regularise. Refused here (non-negotiable 3) rather
+        than at the first training step.
+        """
+        tall_cfg = getattr(self.training, "tall_sr", None)
+        weight = getattr(tall_cfg, "lambda_locality", 0.0)
+        model_type = getattr(self.model, "model_type", None)
+        if weight > 0 and model_type != "tall_sr":
+            raise ValueError(
+                f"training.tall_sr.lambda_locality={weight} requires model.model_type "
+                f"'tall_sr'; this arm declares {model_type!r}, which has no TALL traversal."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _levy_denoising_needs_its_strategy(self) -> "TrainingSettings":
+        """Refuse ``training.levy_denoising`` on a strategy that never reads it."""
+        if getattr(self.training, "levy_denoising", None) is None:
+            return self
+        strategy = getattr(self.training, "strategy_class", None)
+        mode = getattr(self.training, "training_mode", None)
+        if not reads_levy_denoising(strategy, mode):
+            raise ValueError(
+                "training.levy_denoising is read only by LevyDenoisingStrategy; this arm "
+                f"routes to strategy_class={strategy!r}, training_mode={mode!r}."
+            )
+        return self
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainingSettings":
         """Load settings from a YAML file with strict version enforcement.
@@ -467,7 +534,7 @@ class TrainingSettings(BaseSettings):
 
         # Performance: single file read operation with context manager
         with path_obj.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)  # Returns Any (dict-like)
+            data = load_yaml_strict(f)
 
         # Fail-Fast: Validate we got dict-like structure
         if not isinstance(data, dict):
@@ -495,6 +562,23 @@ class TrainingSettings(BaseSettings):
         data = _bind_config_version(data, config_version)
 
         return cls._finalize_from_dict(data, source=str(path))
+
+    @model_validator(mode="after")
+    def _domain_grl_needs_cyclegan(self) -> "TrainingSettings":
+        """Refuse ``losses.gan.domain_grl.enabled`` on any strategy but ``cyclegan``.
+
+        Only CycleGANTrainingStrategy builds the bottleneck head; another strategy would
+        read the block as an unread knob (non-negotiable 8).
+        """
+        gan_cfg = getattr(self.losses, "gan", None)
+        enabled = bool(getattr(getattr(gan_cfg, "domain_grl", None), "enabled", False))
+        strategy = getattr(self.training, "strategy_class", None)
+        if enabled and strategy != "cyclegan":
+            raise ValueError(
+                "losses.gan.domain_grl.enabled requires training.strategy_class 'cyclegan'; "
+                f"this arm declares {strategy!r}, which builds no domain head."
+            )
+        return self
 
     @classmethod
     def _finalize_from_dict(cls, data: dict[str, Any], *, source: str) -> "TrainingSettings":
@@ -684,7 +768,7 @@ class TrainingSettings(BaseSettings):
         ``exclude_unset`` / ``exclude_defaults`` would silently omit exactly the
         defaulted knobs whose value we need to certify, so they are NOT used.
         """
-        return self.model_dump(mode="json")
+        return dict(self.model_dump(mode="json"))
 
 
 #: Module-level alias of :meth:`TrainingSettings.settings_from_dict` so the

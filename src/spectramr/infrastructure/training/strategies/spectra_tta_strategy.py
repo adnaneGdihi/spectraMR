@@ -23,7 +23,7 @@ measured and stable). It composes with the SPECTRA inference backend
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -73,6 +73,11 @@ class SpectraTestTimeAdaptationStrategy(BaseTrainingStrategy, KspaceMixin):
         freeze_backbone: When True (default), freeze every parameter that is not
             a norm/adapter parameter. Set False only to debug.
     """
+
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     #: Validation keys this strategy's own ``validation_step`` writes (cohort
     #: review 2026-09-02, T0.5); ``validation.scoring.compute`` may name them.

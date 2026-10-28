@@ -25,16 +25,33 @@ not covered, per CLAUDE.md #9 — no silent no-op).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
 from spectramr.models.conditioning import AdaptiveConditioner, ConditioningContext
 
 logger = logging.getLogger(__name__)
 
 # Domain axes the data pipeline can expose via ``data.expose_*`` flags.
 _DOMAIN_BATCH_KEYS = ("field_strength", "scanner_id", "site_id", "contrast_id")
+
+
+def conditioning_block_of(config: Any) -> Any | None:
+    """``config.model.conditioning``, read one getattr at a time (``config`` may be unbound)."""
+    model_cfg = getattr(config, "model", None)
+    return getattr(model_cfg, "conditioning", None)
+
+
+def conditioning_enabled(cfg: Any | None) -> bool:
+    """Whether a conditioner is built for ``cfg``: the one predicate build and gate share."""
+    return (
+        cfg is not None
+        and bool(getattr(cfg, "enabled", False))
+        and bool(getattr(cfg, "sources", None))
+    )
 
 
 class ConditioningMixin:
@@ -45,11 +62,22 @@ class ConditioningMixin:
     _SUPPORTED_CONDITION_SOURCES: tuple[str, ...] = ()
 
     def _conditioning_cfg(self) -> Any | None:
-        # Sequential single getattrs (a mixin may run before ``config`` is
-        # bound) — not a nested chain.
-        _cfg = getattr(self, "config", None)
-        model_cfg = getattr(_cfg, "model", None)
-        return getattr(model_cfg, "conditioning", None)
+        return conditioning_block_of(getattr(self, "config", None))
+
+    #: Set by a step that calls ``_apply_input_conditioning`` on its forward path. The
+    #: conditioner is built only there, so only these classes own it at runtime.
+    consumes_input_conditioning: ClassVar[bool] = False
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        """Owned parameters this config adds to the generator optimizer.
+
+        Read by the parallel gate (``strategy_compat``) before any build, so a config the
+        build path would refuse is refused at audit time. Subclasses extend it via super().
+        """
+        if cls.consumes_input_conditioning and conditioning_enabled(conditioning_block_of(config)):
+            return (("_conditioner", OWNED_PARAM_GROUP),)
+        return ()
 
     @classmethod
     def _validate_condition_sources(cls, sources: list[str]) -> None:
@@ -76,7 +104,7 @@ class ConditioningMixin:
         they train. Returns ``None`` when conditioning is disabled / sourceless.
         """
         cfg = self._conditioning_cfg()
-        if cfg is None or not getattr(cfg, "enabled", False) or not getattr(cfg, "sources", None):
+        if not conditioning_enabled(cfg):
             return None
         self._validate_condition_sources(list(cfg.sources))
         if getattr(self, "_conditioner", None) is None:
@@ -90,7 +118,9 @@ class ConditioningMixin:
                     or getattr(env, "optimizer", None)
                 )
                 if opt is not None:
-                    opt.add_param_group({"params": list(cond.parameters())})
+                    add_owned_param_group(
+                        self, opt, {"params": list(cond.parameters())}, owner="its conditioner"
+                    )
                 else:
                     logger.warning(
                         "[%s] no generator optimizer found; conditioner params "

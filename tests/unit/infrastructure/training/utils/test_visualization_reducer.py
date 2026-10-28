@@ -21,11 +21,14 @@ from spectramr.infrastructure.training.utils.visualization_reducer import (
 
 
 def _cfg(*, model_type="unet", log_scaling=False):
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+    processing = DataProcessingConfigSchema(
+        enable_kspace_normalization=log_scaling, enable_log_scaling=log_scaling
+    )
     return types.SimpleNamespace(
         model=types.SimpleNamespace(model_type=model_type),
-        data=types.SimpleNamespace(
-            processing=types.SimpleNamespace(enable_log_scaling=log_scaling)
-        ),
+        data=types.SimpleNamespace(processing=processing),
     )
 
 

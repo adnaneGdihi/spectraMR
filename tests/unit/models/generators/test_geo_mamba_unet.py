@@ -202,3 +202,105 @@ def test_rejects_wrong_channel_count() -> None:
     volume, mask, _ = _toy_inputs()  # 1 channel
     with pytest.raises(ValueError, match="2"):
         model(volume, mask=mask)
+
+
+def _lazy_curve_model(**kw) -> GeoMambaUNet:
+    return GeoMambaUNet(
+        in_channels=1,
+        out_channels=1,
+        d_model=8,
+        n_blocks=1,
+        sfc_smoothing_sigma=0.0,
+        sfc_cache_dir=None,
+        **kw,
+    )
+
+
+def test_stored_curve_survives_strict_load_into_fresh_model() -> None:
+    """The lazily built curve is persisted, so a fresh model loads it strictly
+    and gets the identical permutation without running a forward pass."""
+    volume, mask, _ = _toy_inputs()
+    trained = _lazy_curve_model()
+    trained._resolve_linearizer(volume, mask, None)
+    sd = trained.state_dict()
+    assert "_linearizer_template" in sd and "_linearizer_mask" in sd
+    fresh = _lazy_curve_model()
+    assert fresh._linearizer is None
+    fresh.load_state_dict(sd)
+    assert fresh._linearizer is not None
+    assert torch.equal(fresh._linearizer.forward_idx, trained._linearizer.forward_idx)
+    assert torch.equal(fresh._linearizer.inverse_idx, trained._linearizer.inverse_idx)
+
+
+def test_second_foreground_reuses_stored_curve() -> None:
+    volume, mask, _ = _toy_inputs()
+    model = _lazy_curve_model()
+    first = model._resolve_linearizer(volume, mask, None)
+    other = (torch.rand_like(mask) > 0.5).to(mask.dtype)
+    second = model._resolve_linearizer(volume, other, None)
+    assert second is first
+    assert torch.equal(model._linearizer_mask, mask[0] if mask.ndim == 4 else mask)
+
+
+def test_linearizer_rejects_mismatched_spatial_shape() -> None:
+    volume, mask, _ = _toy_inputs()
+    model = _lazy_curve_model()
+    lin = model._resolve_linearizer(volume, mask, None)
+    with pytest.raises(ValueError, match="spatial shape mismatch"):
+        lin(torch.zeros(1, 1, 4, 8, 4))
+
+
+def test_checkpoint_without_stored_curve_raises() -> None:
+    """Pre-persistence checkpoints carry SFC index buffers but no template; they
+    must fail by name rather than load with a silently different curve."""
+    volume, mask, _ = _toy_inputs()
+    trained = _lazy_curve_model()
+    trained._resolve_linearizer(volume, mask, None)
+    sd = {
+        k: v
+        for k, v in trained.state_dict().items()
+        if "_linearizer_" not in k or "_linearizer." in k
+    }
+    fresh = _lazy_curve_model()
+    with pytest.raises(ValueError, match="predates the persisted curve"):
+        fresh.load_state_dict(sd)
+
+
+def test_displacement_head_off_exposes_no_displacement() -> None:
+    model = GeoMambaUNet(in_channels=1, out_channels=1, d_model=8, n_blocks=1)
+    volume, mask, _ = _toy_inputs()
+    model(volume, mask=mask)
+    assert model.last_displacement is None
+
+
+def test_zero_displacement_is_the_identity_resample() -> None:
+    out = torch.rand(1, 1, 4, 8, 8)
+    warped, disp_px = GeoMambaUNet._warp_by_displacement(out, torch.zeros(1, 3, 4, 8, 8), (4, 8, 8))
+    torch.testing.assert_close(warped, out)
+    assert torch.count_nonzero(disp_px) == 0
+
+
+def test_head_bias_is_a_planted_shift_in_voxels() -> None:
+    """A bias of 0.5 on x is 0.5 * (W-1)/2 voxels of displacement along W."""
+    model = GeoMambaUNet(
+        in_channels=1, out_channels=1, d_model=8, n_blocks=1, displacement_head=True
+    )
+    assert model.displacement_head is not None
+    with torch.no_grad():
+        model.displacement_head.bias[0] = 0.5
+    volume, mask, _ = _toy_inputs()
+    model(volume, mask=mask)
+    disp = model.last_displacement
+    assert disp is not None and disp.shape == (1, 3, 4, 8, 8)
+    assert torch.allclose(disp[:, 0], torch.full_like(disp[:, 0], 0.5 * (8 - 1) / 2))
+
+
+def test_displacement_head_receives_gradient() -> None:
+    model = GeoMambaUNet(
+        in_channels=1, out_channels=1, d_model=8, n_blocks=1, displacement_head=True
+    )
+    volume, mask, _ = _toy_inputs()
+    out = model(volume, mask=mask)
+    out.sum().backward()
+    assert model.displacement_head.weight.grad is not None
+    assert torch.any(model.displacement_head.weight.grad != 0)

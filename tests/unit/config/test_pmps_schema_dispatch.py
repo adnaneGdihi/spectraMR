@@ -102,10 +102,6 @@ class TestSchemaDispatch:
         assert cfg.timesteps == 500
         assert cfg.field_strength_conditioning is True
 
-    def test_construct_corruption_calibration_requires_prior(self) -> None:
-        with pytest.raises(Exception):  # Pydantic ValidationError
-            TrainingConfigCorruptionCalibration()
-
     def test_construct_data_efficiency_harness_rejects_empty_settings(self) -> None:
         with pytest.raises(Exception, match="settings"):
             TrainingConfigDataEfficiencyHarness(

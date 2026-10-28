@@ -72,6 +72,7 @@ class BasicLayer(nn.Module):
         window_size: tuple[int, int, int],
         mlp_ratio: float = 4.0,
         gamma: float = 1.0,
+        gamma_trainable: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -86,6 +87,7 @@ class BasicLayer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     gamma=gamma,
+                    gamma_trainable=gamma_trainable,
                 )
                 for _ in range(depth)
             ]
@@ -132,6 +134,7 @@ class StructureTensorTransformer(nn.Module):
         window_size: tuple[int, int, int] = (4, 4, 4),
         mlp_ratio: float = 4.0,
         gamma: float = 1.0,
+        gamma_trainable: bool = True,
         **kwargs: Any,
     ):
         super().__init__()
@@ -158,6 +161,7 @@ class StructureTensorTransformer(nn.Module):
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
                 gamma=gamma,
+                gamma_trainable=gamma_trainable,
             )
             self.layers.append(layer)
 
@@ -190,6 +194,7 @@ class StructureTensorTransformer(nn.Module):
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
                 gamma=gamma,
+                gamma_trainable=gamma_trainable,
             )
             self.up_layers.append(layer)
 

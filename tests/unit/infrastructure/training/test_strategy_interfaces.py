@@ -154,3 +154,109 @@ def test_amp_policy_abstract_methods_raise() -> None:
 
     with pytest.raises(TypeError):
         _Partial()
+
+
+# ---------------------------------------------------------------------------
+# guard_loss agrees across ranks (a lone raise strands peers in the next collective)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGroup:
+    """Patches torch.distributed to a 2-rank group whose peer reports ``peer_flag``."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, peer_flag: float) -> None:
+        self.reduces = 0
+        dist = torch.distributed
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 2)
+
+        def _all_reduce(tensor: torch.Tensor, op: object = None, **_: object) -> None:
+            self.reduces += 1
+            tensor.copy_(torch.maximum(tensor, torch.tensor([peer_flag])))
+
+        monkeypatch.setattr(dist, "all_reduce", _all_reduce)
+
+
+def _guard(loss: torch.Tensor, scaler: object | None = None) -> None:
+    from spectramr.infrastructure.training.optimizers import AMPPolicy
+
+    policy = AMPPolicy(max_grad_norm=1.0, enable_gradient_clipping=False)
+    policy.guard_loss(loss, name="gen", global_step=7, scaler=scaler)
+
+
+def test_guard_loss_single_process_raises_without_a_collective() -> None:
+    with pytest.raises(RuntimeError, match=r"on this rank"):
+        _guard(torch.tensor(float("nan")))
+
+
+def test_guard_loss_peer_nan_raises_on_a_finite_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = _FakeGroup(monkeypatch, peer_flag=1.0)
+    with pytest.raises(RuntimeError, match=r"on a peer rank"):
+        _guard(torch.tensor(0.5))
+    assert group.reduces == 1
+
+
+def test_guard_loss_local_nan_raises_after_agreeing(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = _FakeGroup(monkeypatch, peer_flag=0.0)
+    with pytest.raises(RuntimeError, match=r"on this rank"):
+        _guard(torch.tensor(float("inf")))
+    assert group.reduces == 1
+
+
+def test_guard_loss_finite_everywhere_passes_with_one_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = _FakeGroup(monkeypatch, peer_flag=0.0)
+    _guard(torch.tensor(0.5))
+    assert group.reduces == 1
+
+
+def test_guard_loss_reads_the_flags_back_in_one_transfer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeGroup(monkeypatch, peer_flag=1.0)
+    calls: list[str] = []
+    real = torch.Tensor.tolist
+
+    def _counting_tolist(self: torch.Tensor) -> object:
+        calls.append("tolist")
+        return real(self)
+
+    def _no_item(self: torch.Tensor) -> object:
+        raise AssertionError("guard_loss must not call .item() in the step")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", _counting_tolist)
+    monkeypatch.setattr(torch.Tensor, "item", _no_item)
+    with pytest.raises(RuntimeError, match=r"on a peer rank"):
+        _guard(torch.tensor(0.5))
+    assert calls == ["tolist"]
+
+
+def test_guard_loss_with_a_monitor_records_without_a_collective_or_a_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loop's path: the agreement moves to the monitor's end_step, so the
+    guard itself enters no collective, reads nothing back and never raises."""
+    from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+    from spectramr.infrastructure.training.optimizers import AMPPolicy
+
+    group = _FakeGroup(monkeypatch, peer_flag=1.0)
+    monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+
+    def _no_readback(self: torch.Tensor, *a: object) -> object:
+        raise AssertionError("guard_loss must not read a tensor back under a monitor")
+
+    for attr in ("tolist", "item", "__bool__"):
+        monkeypatch.setattr(torch.Tensor, attr, _no_readback)
+    policy = AMPPolicy(max_grad_norm=1.0, enable_gradient_clipping=False)
+    policy.guard_loss(torch.tensor(float("nan")), name="gen", global_step=7, scaler=None, monitor=monitor)
+    assert group.reduces == 0
+    monkeypatch.undo()
+    monitor.end_step(7)
+    assert monitor.resolve().names == ("gen",)
+
+
+def test_guard_loss_defers_to_the_scaler_without_a_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = _FakeGroup(monkeypatch, peer_flag=1.0)
+    _guard(torch.tensor(float("nan")), scaler=object())
+    assert group.reduces == 0

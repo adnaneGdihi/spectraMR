@@ -129,6 +129,15 @@ class TestModelTimestepsConsistency:
         result = _check(timesteps=28, model_timesteps=28)
         assert result.passed
 
+    def test_num_timesteps_spelling_mismatch_fails(self):
+        # The builder refuses either spelling, so the audit must too (#2468).
+        model = _Model()
+        model.model_kwargs = {"num_timesteps": 1000}
+        cfg = _Config(training=_Training(timesteps=28), model=model)
+        result = ConfigHealthChecker().check_time_keys_within_num_timesteps(cfg)
+        assert not result.passed
+        assert "model.model_kwargs.num_timesteps=1000" in result.message
+
 
 class TestExperiment11OriginalStateFails:
     """The pre-fix experiment_11 YAML triggered ALL FOUR problems."""

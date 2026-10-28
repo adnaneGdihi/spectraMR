@@ -4,11 +4,15 @@
 Common attention mechanisms used across different model architectures.
 """
 
+import math
 import warnings
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from spectramr.models.layers.complex_conv import ComplexConv2d
 
 
 class SelfAttention2D(nn.Module):
@@ -337,6 +341,32 @@ class CBAMSpatialAttention(nn.Module):
         return self.sigmoid(out) * x
 
 
+def orthogonal_random_features(
+    num_heads: int, num_features: int, head_dim: int, generator: torch.Generator
+) -> torch.Tensor:
+    """Performer ORF draw: ``[num_heads, num_features, head_dim]``.
+
+    Blockwise ``QR`` gives mutually orthogonal directions, then each row is
+    rescaled to a chi_d norm so the marginal stays ``N(0, I_d)`` and the softmax
+    kernel estimate remains unbiased -- only its variance drops. Measured over 8
+    seeds on a 1/f k-space feature map at L = 4096: relative error against exact
+    softmax attention 0.1185 -> 0.0992 mean, 0.0154 -> 0.0109 std.
+    """
+    blocks: list[torch.Tensor] = []
+    remaining = num_features
+    while remaining > 0:
+        take = min(remaining, head_dim)
+        gaussian = torch.randn(num_heads, head_dim, head_dim, generator=generator)
+        q, _ = torch.linalg.qr(gaussian)
+        blocks.append(q.transpose(-2, -1)[:, :take])
+        remaining -= take
+    directions = torch.cat(blocks, dim=1)
+    chi_norms = torch.randn(num_heads, num_features, head_dim, generator=generator).norm(
+        dim=-1, keepdim=True
+    )
+    return directions * chi_norms
+
+
 class KernelizedAttention(nn.Module):
     """FAVOR+ kernelized attention (Performer; Choromanski et al., 2021), O(L).
 
@@ -346,16 +376,29 @@ class KernelizedAttention(nn.Module):
     ``D^{-1} phi(Q) (phi(K)^T V)``, where ``D^{-1}`` replaces the softmax
     denominator.
 
-    History (issue #405): the previous implementation used sign-indefinite
-    cos/sin random Fourier features and computed the numerator only, so its
-    gain scaled with sequence length -- the exp_11 energy probe measured
-    ``worst_rho ~ 3.6e3`` (2200x the sibling arms) on full-resolution k-space.
-    The block is now residual with a zero-initialized output projection
-    (identity at init, rho = 1.0), matching the LinearAttention /
-    WindowAttention family convention.
+    Two details are what make that estimate usable on k-space rather than merely
+    correct in expectation (issue #405). The ``LayerNorm`` is per TOKEN, because
+    k-space dynamic range is spatial: without it the DC bin drives
+    ``|q.k/sqrt(d)|`` to ~5e3 and a 256-feature Monte-Carlo estimate of ``exp()``
+    carries ~100 % relative error against the softmax attention it approximates.
+    The features are orthogonal (Performer ORF), which cuts the residual variance
+    rather than the bias. Measured against exact softmax on a 1/f k-space feature
+    map at L = 4096: 0.998 as shipped, 0.121 with the norm, 0.099 with both.
+
+    The norm feeds ``q`` and ``k`` only. ``V`` is projected (bias-free) from the
+    raw tokens, so the attended values keep the power-law magnitude of the bins
+    they come from; values drawn from whitened tokens are flat in radius and
+    write O(1) energy into outer bins whose true magnitude is orders lower.
     """
 
-    def __init__(self, channels: int, num_heads: int = 8, num_features: int = 256):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        num_features: int = 256,
+        zero_init_output: bool = True,
+        feature_seed: int = 0,
+    ):
         """__init__.
 
         Args:
@@ -364,6 +407,14 @@ class KernelizedAttention(nn.Module):
             num_heads (int): Attention heads.
             num_features (int): Total random features ``m`` (must be even; the
                 two halves are antithetic ``+/- w`` pairs).
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee -- see the note at the
+                initialiser below.
+            feature_seed (int): Seeds the random-feature draw from a LOCAL
+                generator, so every rank of a distributed run builds the same
+                features by construction rather than by trusting buffer
+                broadcast.
         """
         super().__init__()
         if num_features % 2 != 0:
@@ -373,18 +424,36 @@ class KernelizedAttention(nn.Module):
         self.num_features = num_features
         self.head_dim = channels // num_heads
 
+        # Per-TOKEN pre-norm, the axis LinearAttention's InstanceNorm2d does not
+        # cover: k-space dynamic range is spatial (the DC bin dwarfs the periphery),
+        # so a per-channel norm leaves the logits at |q.k/sqrt(d)| ~ 5e3, far outside
+        # the range a 256-feature Monte-Carlo estimate of exp() can represent.
+        # Its mean subtraction over interleaved Re/Im is not phase-equivariant,
+        # which is acceptable because it only shapes the attention weights.
+        self.norm = nn.LayerNorm(channels)
         self.q_proj = nn.Linear(channels, channels)
         self.k_proj = nn.Linear(channels, channels)
-        self.v_proj = nn.Linear(channels, channels)
+        # No bias: a row-stochastic attention maps a constant value field to itself,
+        # so a value bias would paint one constant over every k-space bin.
+        self.v_proj = nn.Linear(channels, channels, bias=False)
         self.out_proj = nn.Linear(channels, channels)
-        # Identity at init: the residual carries the signal until training
-        # grows the attention gain (energy-probe rho = 1.0 at init).
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
 
-        # Gaussian directions; forward mirrors them into antithetic +/- pairs.
+        # Orthogonal directions; forward mirrors them into antithetic +/- pairs.
         self.register_buffer(
-            "rand_features", torch.randn(num_heads, num_features // 2, self.head_dim)
+            "rand_features",
+            orthogonal_random_features(
+                num_heads,
+                num_features // 2,
+                self.head_dim,
+                torch.Generator().manual_seed(int(feature_seed)),
+            ),
         )
 
     def _favor_plus_features(self, x: torch.Tensor, stabilizer: str = "none") -> torch.Tensor:
@@ -438,10 +507,11 @@ class KernelizedAttention(nn.Module):
         batch, channels, height, width = x.shape
         seq_len = height * width
 
-        x_flat = x.view(batch, channels, seq_len).transpose(1, 2)  # [B, L, C]
+        tokens = x.reshape(batch, channels, seq_len).transpose(1, 2)  # [B, L, C]
+        x_flat = self.norm(tokens)
         q = self.q_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x_flat).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(tokens).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         out = self._favor_attention(q, k, v)  # [B, heads, L, head_dim]
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, channels)
@@ -450,99 +520,177 @@ class KernelizedAttention(nn.Module):
         return x + out
 
 
+#: Upper clamp on the learned QK-norm temperature (Swin-v2's ``log(100)``).
+_MAX_LOGIT_SCALE = math.log(100.0)
+
+
+def qk_normalize(t: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
+    """L2-normalise ``t`` over its last (head) dim and scale by ``exp(log_scale)``.
+
+    k-space magnitude follows a power law with a dominant DC peak, so raw
+    dot-product logits grow with magnitude squared and the softmax collapses onto
+    the DC/low-frequency tokens. On unit vectors a logit is bounded by the learned
+    temperature whatever the token energy. ``log_scale`` broadcasts against ``t``.
+    """
+    return F.normalize(t, dim=-1) * log_scale.clamp(max=_MAX_LOGIT_SCALE).exp()
+
+
 class WindowAttention(nn.Module):
-    """Efficient Window Attention (O(N) memory/compute).
-    Replaces the broken 'SparseAttention'.
+    """PE-axial window attention with QK-normalised logits and a PE-distance bias.
+
+    Every window spans the FULL width ``W`` -- the phase-encode axis, along which
+    the mask acquires whole columns -- and ``window_size`` readout rows (``H``).
+    Square 8x8 windows were narrower than the gap between acquired columns at
+    R >= 16 (at R = 32 the median missing-to-acquired gap is ~30 columns, max
+    ~103 at W = 256), so 86 % of windows held no acquired column and had nothing
+    to propagate. A learned bias indexed by PE distance (``2 * max_width - 1``
+    entries per head) gives the logits the position information the windows used
+    to lack. ``H`` not divisible by ``window_size`` is zero-padded, the padded
+    tokens are masked out of the keys, and the output is cropped back.
+
+    The class name and the ``sparse`` dispatch key (via ``SparseAttention``) are
+    kept for config compatibility; the window geometry is what changed.
     """
 
-    def __init__(self, channels: int, window_size: int = 8, num_heads: int = 8):
+    def __init__(
+        self,
+        channels: int,
+        window_size: int = 2,
+        num_heads: int = 8,
+        zero_init_output: bool = True,
+        max_width: int = 512,
+    ):
         """__init__.
 
         Args:
-            channels (int): Description.
-            window_size (int): Description.
-            num_heads (int): Description.
+            channels (int): Token channels; must divide by ``num_heads``.
+            window_size (int): Readout rows per window. Tokens per window are
+                ``window_size * W``, so this is the memory knob.
+            num_heads (int): Attention heads.
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee.
+            max_width (int): Largest PE width the bias table covers; a wider
+                input raises rather than reusing clipped distances.
         """
         super().__init__()
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
+        if max_width < 1:
+            raise ValueError(f"max_width must be >= 1, got {max_width}")
+        if channels % num_heads != 0:
+            raise ValueError(f"channels={channels} must divide by num_heads={num_heads}")
         self.window_size = window_size
         self.num_heads = num_heads
-        # No explicit scale: F.scaled_dot_product_attention applies the
-        # identical 1/sqrt(head_dim) default internally.
+        self.head_dim = channels // num_heads
+        self.max_width = max_width
         self.qkv = nn.Linear(channels, channels * 3)
         self.proj = nn.Linear(channels, channels)
-        # Identity at init: zero output projection => forward(x) == x, so the
-        # residual family starts at energy gain rho = 1.0 (exp_11 probe).
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.logit_scale = nn.Parameter(torch.full((num_heads, 1, 1), math.log(10.0)))
+        self.relative_position_bias = nn.Parameter(torch.zeros(num_heads, 2 * max_width - 1))
+        nn.init.trunc_normal_(self.relative_position_bias, std=0.02)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def _partition(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """``[B, C, H, W] -> [B * nW, window_size * W, C]`` plus the row padding."""
+        batch, channels, height, width = x.shape
+        if width > self.max_width:
+            raise ValueError(
+                f"WindowAttention: PE width {width} exceeds max_width={self.max_width}; "
+                "construct the block with a larger max_width"
+            )
+        ws = self.window_size
+        pad_h = (-height) % ws
+        if pad_h:
+            x = F.pad(x, (0, 0, 0, pad_h))
+        n_win = (height + pad_h) // ws
+        tokens = x.reshape(batch, channels, n_win, ws, width).permute(0, 2, 3, 4, 1)
+        return tokens.reshape(batch * n_win, ws * width, channels), pad_h
+
+    def _reverse(self, tokens: torch.Tensor, batch: int, height: int, width: int) -> torch.Tensor:
+        """Inverse of :meth:`_partition`, cropping the padded rows."""
+        channels = tokens.shape[-1]
+        rows = tokens.shape[0] // batch * self.window_size
+        out = tokens.reshape(batch, -1, self.window_size, width, channels)
+        out = out.permute(0, 4, 1, 2, 3).reshape(batch, channels, rows, width)
+        return out[:, :, :height]
+
+    def _qkv(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-head ``q`` (normalised and temperature-scaled), unit ``k`` and ``v``."""
+        n, length, _ = tokens.shape
+        q, k, v = (
+            t.reshape(n, length, self.num_heads, self.head_dim).transpose(1, 2)
+            for t in self.qkv(tokens).chunk(3, dim=-1)
+        )
+        return qk_normalize(q, self.logit_scale), F.normalize(k, dim=-1), v
+
+    def _attn_bias(
+        self, width: int, pad_h: int, ref: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Additive logits ``[1, heads, L, L]`` for interior windows and for the last one.
+
+        Only the last window row-block can hold padded keys, so the padding mask is
+        folded into a second single-window bias instead of being repeated over every
+        window and batch item; neither tensor scales with ``B`` or ``nW``.
+        """
+        cols = torch.arange(width, device=ref.device)
+        index = cols[:, None] - cols[None, :] + self.max_width - 1
+        ws = self.window_size
+        # Distance depends on the column only, so one [W, W] tile repeats over the rows.
+        bias = self.relative_position_bias[:, index].repeat(1, ws, ws).unsqueeze(0).to(ref.dtype)
+        if not pad_h:
+            return bias, None
+        padded = torch.zeros(ws, width, dtype=torch.bool, device=ref.device)
+        padded[ws - pad_h :] = True
+        key_mask = torch.zeros(padded.shape, dtype=ref.dtype, device=ref.device)
+        key_mask = key_mask.masked_fill(padded, float("-inf")).reshape(1, 1, 1, ws * width)
+        return bias, bias + key_mask
+
+    def _split_windows(self, t: torch.Tensor, batch: int) -> torch.Tensor:
+        """``[B * nW, heads, L, d] -> [B, nW, heads, L, d]`` as a view."""
+        return t.reshape(batch, -1, *t.shape[1:])
+
+    def attention_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Softmax weights ``[B * nW, heads, L, L]`` -- a diagnostic, materialised densely."""
+        batch = x.shape[0]
+        tokens, pad_h = self._partition(x)
+        q, k, _ = self._qkv(tokens)
+        bias, last_bias = self._attn_bias(x.shape[-1], pad_h, q)
+        logits = self._split_windows(q @ k.transpose(-2, -1), batch) + bias
+        if last_bias is not None:
+            logits[:, -1] += last_bias - bias
+        return logits.flatten(0, 1).softmax(dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input: [B, C, H, W]
-        """forward.
-
-        Args:
-            x (torch.Tensor): Description.
-        Returns:
-            torch.Tensor: Description.
-
-        forward method for WindowAttention.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
-        """
-        B, C, H, W = x.shape
-        ws = self.window_size
-
-        # Pad if dimensions aren't divisible by window size
-        pad_h = (ws - H % ws) % ws
-        pad_w = (ws - W % ws) % ws
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-
-        H_pad, W_pad = x.shape[2:]
-
-        # 1. Window Partition: [B, C, H, W] -> [B * NumWindows, WindowSize*WindowSize, C]
-        # Reshape to [B, C, H/ws, ws, W/ws, ws] -> permute -> flatten
-        x_windows = x.view(B, C, H_pad // ws, ws, W_pad // ws, ws)
-        x_windows = x_windows.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x_windows = x_windows.view(-1, ws * ws, C)  # [Batch*Windows, SeqLen, C]
-
-        # 2. Compute Attention on small windows (Sequence Length = ws*ws = 64)
-        # This fits easily in L1/Shared Memory
-        qkv = self.qkv(x_windows).chunk(3, dim=-1)
-        q, k, v = map(
-            lambda t: t.view(t.shape[0], t.shape[1], self.num_heads, -1).transpose(1, 2),
-            qkv,
-        )
-
-        # Flash Attention (PyTorch 2.0+)
-        # uses minimal memory and fuses operations
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-
-        # 3. Reshape back
-        attn_out = attn_out.transpose(1, 2).reshape(x_windows.shape)
-        attn_out = self.proj(attn_out)
-
-        # 4. Window Reverse
-        attn_out = attn_out.view(B, H_pad // ws, W_pad // ws, ws, ws, C)
-        attn_out = attn_out.permute(0, 5, 1, 3, 2, 4).contiguous()
-        attn_out = attn_out.view(B, C, H_pad, W_pad)
-
-        # Crop padding
-        if pad_h > 0 or pad_w > 0:
-            attn_out = attn_out[:, :, :H, :W]
-
-        return attn_out + x
+        """Residual PE-axial attention: ``[B, C, H, W] -> [B, C, H, W]``."""
+        batch, _, height, width = x.shape
+        tokens, pad_h = self._partition(x)
+        q, k, v = self._qkv(tokens)
+        bias, last_bias = self._attn_bias(width, pad_h, q)
+        # scale=1.0: the learned temperature is already folded into q.
+        if last_bias is None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=1.0)
+        else:
+            # SDPA takes the window dim as a batch dim, so each [1, heads, L, L] bias
+            # broadcasts over B and nW instead of being materialised per window.
+            q, k, v = (self._split_windows(t, batch) for t in (q, k, v))
+            head = F.scaled_dot_product_attention(
+                q[:, :-1], k[:, :-1], v[:, :-1], attn_mask=bias, scale=1.0
+            )
+            tail = F.scaled_dot_product_attention(
+                q[:, -1:], k[:, -1:], v[:, -1:], attn_mask=last_bias, scale=1.0
+            )
+            out = torch.cat((head, tail), dim=1).flatten(0, 1)
+        out = self.proj(out.transpose(1, 2).reshape(tokens.shape))
+        return x + self._reverse(out, batch, height, width)
 
 
-# Alias for backward compatibility if needed, though implementation changed
 SparseAttention = WindowAttention
 
 
@@ -561,10 +709,13 @@ class ChannelAttention(nn.Module):
         """
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Floor of 1: below reduction_ratio channels a zero-width bottleneck made
+        # the gate a constant sigmoid(0) = 0.5 that no parameter could move.
+        hidden = max(1, in_channels // reduction_ratio)
         self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
             nn.ReLU(),
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False),
+            nn.Conv2d(hidden, in_channels, 1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
@@ -592,10 +743,13 @@ class ChannelAttention(nn.Module):
         """
         avg_out = self.fc(self.avg_pool(x))
 
-        # Manual max pooling for Inductor compatibility
-        # Reshape to [B, C, H*W], compute max across spatial dims, reshape back to [B, C, 1, 1]
+        # Manual max pooling for Inductor compatibility. ``reshape``, not
+        # ``view``: ``view`` refuses a permuted or strided input outright rather
+        # than copying, so any caller that hands this block a non-contiguous
+        # feature map fails here instead of pooling it. Same tensor when the
+        # input is already contiguous, which is the common case.
         B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1)  # [B, C, H*W]
+        x_flat = x.reshape(B, C, -1)  # [B, C, H*W]
         max_pooled = x_flat.max(dim=-1, keepdim=True)[0]  # [B, C, 1]
         max_pooled = max_pooled.unsqueeze(-1)  # [B, C, 1, 1]
         max_out = self.fc(max_pooled)
@@ -604,116 +758,151 @@ class ChannelAttention(nn.Module):
         return x * self.sigmoid(out)
 
 
+def _complex_channels(channels: int, owner: str) -> int:
+    """Complex channel count of an interleaved ``[R1, I1, R2, I2, ...]`` map; raise on odd."""
+    if channels % 2 != 0:
+        raise ValueError(f"{owner} expects interleaved Re/Im channels (even count), got {channels}")
+    return channels // 2
+
+
+class ComplexChannelAttention(nn.Module):
+    """Squeeze-excitation gate with ONE gain per complex channel, shared by Re and Im.
+
+    :class:`ChannelAttention` gates every real channel separately, so the Re and
+    Im halves of one complex channel get different sigmoid gains -- a phase
+    rotation -- and its signed avg/max pools are driven by the DC bin. Here the
+    squeeze is ``log1p(mean |z|)`` per complex channel: ``|z|`` is invariant to a
+    global phase, so ``gate(x * e^{i theta}) = gate(x) * e^{i theta}``, and the
+    log keeps the power-law magnitude range out of the sigmoid's saturated tails.
+    For interleaved k-space features; real image features keep ChannelAttention.
+    """
+
+    def __init__(self, in_channels: int, reduction_ratio: int = 16):
+        """__init__.
+
+        Args:
+            in_channels (int): Interleaved real channel count (even).
+            reduction_ratio (int): Bottleneck divisor applied to the complex
+                channel count (floor 1).
+        """
+        super().__init__()
+        complex_channels = _complex_channels(in_channels, type(self).__name__)
+        hidden = max(1, complex_channels // reduction_ratio)
+        self.fc = nn.Sequential(
+            nn.Linear(complex_channels, hidden, bias=False),
+            nn.ReLU(),
+            nn.Linear(hidden, complex_channels, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Gate ``[B, 2C, H, W]`` interleaved features by a per-complex-channel gain."""
+        batch, channels, height, width = x.shape
+        z = x.reshape(batch, channels // 2, 2, height * width)
+        squeeze = torch.log1p(torch.linalg.vector_norm(z, dim=2).mean(dim=-1))  # [B, C]
+        gain = torch.sigmoid(self.fc(squeeze))
+        return (z * gain[:, :, None, None]).reshape(batch, channels, height, width)
+
+
+#: q/k pre-norms LinearAttention accepts; an unknown name raises (non-negotiable 3).
+_LINEAR_ATTENTION_NORMS: dict[str, Callable[[int], nn.Module]] = {
+    "instance": lambda c: nn.InstanceNorm2d(c, affine=True),
+    "layer": nn.LayerNorm,
+    "batch": nn.BatchNorm2d,
+    "group": lambda c: nn.GroupNorm(8, c),
+    "none": lambda c: nn.Identity(),
+}
+
+
 class LinearAttention(nn.Module):
     """Linear Attention O(N) following Katharopoulos et al.
     "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention".
 
     Computes Attention(Q,K,V) = phi(Q) @ (phi(K).T @ V)
     where phi(x) = elu(x) + 1 is the feature map.
+
+    Input is interleaved ``[R1, I1, R2, I2, ...]``. Only ``q``/``k`` see the
+    pre-norm, since they produce real weights. The value and output projections
+    are complex-linear 1x1 maps (:class:`ComplexConv2d`, no bias) applied to the
+    raw input: a real 1x1 conv over interleaved channels mixes Re and Im across
+    coils arbitrarily, and values from normalised tokens lose the k-space
+    magnitude profile. Each head holds whole Re/Im pairs, so for fixed weights
+    the attended output is complex-linear in the input.
     """
 
-    def __init__(self, channels: int, num_heads: int = 4, norm_type: str = "instance"):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        norm_type: str = "instance",
+        zero_init_output: bool = True,
+    ):
         """__init__.
 
         Args:
-            channels (int): Description.
-            num_heads (int): Description.
-            norm_type (str): Description.
+            channels (int): Interleaved real channel count; ``channels //
+                num_heads`` must be even so no head splits a Re/Im pair.
+            num_heads (int): Attention heads.
+            norm_type (str): Pre-norm for the q/k path.
+            zero_init_output (bool): Zero the output projection so the block
+                starts as an exact identity. Pass ``False`` when an outer
+                wrapper already owns that guarantee.
         """
         super().__init__()
+        complex_channels = _complex_channels(channels, type(self).__name__)
+        if channels % num_heads != 0 or (channels // num_heads) % 2 != 0:
+            raise ValueError(
+                f"LinearAttention: channels={channels} / num_heads={num_heads} must give an "
+                "even head dim so each head holds whole Re/Im pairs"
+            )
 
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
 
-        # Normalization
-        if norm_type == "instance":
-            self.norm = nn.InstanceNorm2d(channels, affine=True)
-        elif norm_type == "layer":
-            self.norm = nn.LayerNorm(channels)  # Note: LayerNorm expects specific shape usually
-        elif norm_type == "batch":
-            self.norm = nn.BatchNorm2d(channels)
-        elif norm_type == "group":
-            self.norm = nn.GroupNorm(8, channels)
-        else:
-            self.norm = nn.Identity()
+        if norm_type not in _LINEAR_ATTENTION_NORMS:
+            raise ValueError(
+                f"LinearAttention: unknown norm_type {norm_type!r}; "
+                f"expected one of {sorted(_LINEAR_ATTENTION_NORMS)}"
+            )
+        self.norm = _LINEAR_ATTENTION_NORMS[norm_type](channels)
 
-        self.qkv = nn.Conv2d(channels, channels * 3, 1)
-        self.proj = nn.Conv2d(channels, channels, 1)
-        # Identity at init: zero output projection => forward(x) == x, so the
-        # residual family starts at energy gain rho = 1.0 (exp_11 probe).
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.qk = nn.Conv2d(channels, channels * 2, 1)
+        self.v_proj = ComplexConv2d(complex_channels, complex_channels, 1, bias=False)
+        self.proj = ComplexConv2d(complex_channels, complex_channels, 1, bias=False)
+        # Identity at init, but ONLY when this block owns that guarantee. Wrapped in
+        # IdentityAtInitAttention the two mechanisms multiply into
+        # ``y = x + g*(P*a + b)`` with ``g == P == b == 0``, whose every gradient is
+        # exactly zero -- a fixed point the optimiser never leaves (issue #471).
+        if zero_init_output:
+            nn.init.zeros_(self.proj.weight_real)
+            nn.init.zeros_(self.proj.weight_imag)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """forward.
-
-        Args:
-            x (torch.Tensor): Description.
-        Returns:
-            torch.Tensor: Description.
-
-        forward method for LinearAttention.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
-        """
+        """Residual linear attention: ``[B, C, H, W] -> [B, C, H, W]``."""
         B, C, H, W = x.shape
-        N = H * W  # Sequence length
-        D = self.head_dim  # Head dimension
+        N = H * W
+        D = self.head_dim
 
-        # Pre-norm
         if isinstance(self.norm, nn.LayerNorm):
-            # LayerNorm typically on last dim, but here x is BCHW
             x_norm = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         else:
             x_norm = self.norm(x)
 
-        # Generate Q, K, V
-        qkv = self.qkv(x_norm)
-        q, k, v = qkv.chunk(3, dim=1)
+        q, k = self.qk(x_norm).chunk(2, dim=1)
+        v = self.v_proj(x)
 
-        # Reshape to [B, Heads, N, D]
-        q = q.view(B, self.num_heads, D, N).permute(0, 1, 3, 2)
-        k = k.view(B, self.num_heads, D, N).permute(0, 1, 3, 2)
-        v = v.view(B, self.num_heads, D, N).permute(0, 1, 3, 2)
+        # [B, Heads, N, D]; contiguous channel groups keep each Re/Im pair in one head.
+        q = F.elu(q.reshape(B, self.num_heads, D, N).transpose(-2, -1)) + 1.0
+        k = F.elu(k.reshape(B, self.num_heads, D, N).transpose(-2, -1)) + 1.0
+        v = v.reshape(B, self.num_heads, D, N).transpose(-2, -1)
 
-        # Apply feature map phi(x) = elu(x) + 1
-        q = F.elu(q) + 1.0
-        k = F.elu(k) + 1.0
-
-        # Linear Attention: Q @ (K.T @ V)
-        # K.T @ V: [B, H, D, N] @ [B, H, N, D] -> [B, H, D, D]
-        kv = torch.matmul(k.transpose(-2, -1), v)
-
-        # Q @ KV: [B, H, N, D] @ [B, H, D, D] -> [B, H, N, D]
-        numerator = torch.matmul(q, kv)
-
-        # Denominator: Q @ K.sum(dim=sequence)
-        # K.sum(dim=-2): [B, H, D]
-        k_sum = k.sum(dim=-2, keepdim=True)  # [B, H, 1, D]
-
-        # Q @ K_sum.T: [B, H, N, D] @ [B, H, D, 1] -> [B, H, N, 1]
-        denominator = torch.matmul(q, k_sum.transpose(-2, -1))
-
-        # Normalize
+        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
+        numerator = torch.matmul(q, kv)  # [B, H, N, D]
+        denominator = torch.matmul(q, k.sum(dim=-2, keepdim=True).transpose(-2, -1))
         out = numerator / (denominator + 1e-6)
 
-        # Reshape back to image: [B, H, N, D] -> [B, C, H, W]
-        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)
-
-        # Project
-        out = self.proj(out)
-
-        return x + out
+        out = out.transpose(-2, -1).reshape(B, C, H, W)
+        return x + self.proj(out)
 
 
 class IdentityAtInitAttention(nn.Module):
@@ -760,36 +949,50 @@ class IdentityAtInitAttention(nn.Module):
         """
         super().__init__()
         self.inner = inner
-        self.takes_t_emb = self._accepts_t_emb(inner)
+        self.takes_t_emb = self._accepts(inner, "t_emb")
+        self.takes_mask = self._accepts(inner, "mask")
         # Scalar, not per-channel: the point is a single interpretable "how much of
         # this block is switched on" knob that the energy probe can read directly.
         self.gamma = nn.Parameter(torch.zeros(1))
 
     @staticmethod
-    def _accepts_t_emb(inner: nn.Module) -> bool:
-        """True when ``inner.forward`` takes a second positional argument."""
+    def _accepts(inner: nn.Module, name: str) -> bool:
+        """True when ``inner.forward`` declares a parameter called ``name``.
+
+        By NAME, not by positional arity: with two optional extras in play, arity
+        cannot tell ``forward(x, t_emb)`` from ``forward(x, mask)``, and would hand
+        a block expecting the mask the timestep embedding instead.
+        """
         import inspect
 
         try:
-            params = list(inspect.signature(inner.forward).parameters.values())
+            params = inspect.signature(inner.forward).parameters
         except (TypeError, ValueError):
             return False
-        positional = [
-            prm for prm in params if prm.kind in (prm.POSITIONAL_ONLY, prm.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(positional) >= 2
+        return name in params
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Identity-at-init residual around ``inner``.
 
         Args:
             x: Feature map ``[B, C, H, W]`` in the caller's feature domain.
             t_emb: Timestep embedding, forwarded only when ``inner`` accepts it.
+            mask: Acquisition mask, forwarded only when ``inner`` accepts it.
 
         Returns:
             ``x + gamma * (inner(x) - x)``, identical to ``x`` at initialisation.
         """
-        out = self.inner(x, t_emb) if self.takes_t_emb else self.inner(x)
+        extra: dict[str, torch.Tensor | None] = {}
+        if self.takes_t_emb:
+            extra["t_emb"] = t_emb
+        if self.takes_mask:
+            extra["mask"] = mask
+        out = self.inner(x, **extra)
         if out.shape != x.shape:
             raise ValueError(
                 f"{type(self.inner).__name__} changed the feature shape from "
@@ -811,31 +1014,25 @@ class PhaseSafeDualAttention(nn.Module):
     Fuses image-domain feature guidance (Q: query) with k-space frequency
     information (K: key, V: value) to improve reconstruction accuracy.
 
+    Attention is linear (Katharopoulos et al., 2020), O(N) at the native
+    resolution: pooling complex k-space to a coarse grid and upsampling the
+    result averaged acquired with missing columns. ``q``/``k`` are L2-normalised
+    per token and head and scaled by a learned per-head temperature before the
+    ``elu + 1`` feature map, so the DC peak cannot claim the attention mass.
+    Weights are real and row-stochastic, and the value and output projections
+    are complex-linear (:class:`ComplexConv2d`, no bias), so the attended output
+    is a phase-preserving combination of complex values.
+
     Args:
-        in_channels (int): Number of input channels. If input is stacked real/imag
-                          [B, 2*C, H, W], pass in_channels=C. This module will
-                          internally handle the stacked representation.
-        num_heads (int): Number of attention heads. Default: 8.
-        reduction (int): Reduction factor for query/key/value projections.
-                        Default: 2 (reduces compute cost).
+        in_channels (int): Number of COMPLEX input channels ``C``; tensors carry
+            ``2*C`` interleaved real channels.
+        num_heads (int): Attention heads; must divide the q/k width. Default: 8.
+        reduction (int): Divisor on the q/k projection width. Default: 2.
 
     Shape:
-        - Input x_kspace: (B, 2*C, H, W) where C=in_channels, channels 0:C are real, C:2C are imag
-        - Input x_image: (B, 2*C, H, W) guidance for attention
+        - Input x_kspace: (B, 2*C, H, W), interleaved [R1, I1, R2, I2, ...]
+        - Input x_image: (B, 2*C, H, W) guidance for attention, same layout
         - Output: (B, 2*C, H, W)
-
-    Architecture:
-        Image Feature (Mag) -> Q projection (real-valued)
-        K-Space (Mag) -----> K projection (real-valued)
-               |
-               v
-           Softmax Attention (magnitude-based, phase-neutral)
-               |
-               v
-        K-Space (Complex) -> V projection (complex-valued)
-                 |
-                 v
-           Apply Attention Weights -> Output (phase-preserved)
     """
 
     def __init__(
@@ -843,157 +1040,92 @@ class PhaseSafeDualAttention(nn.Module):
         in_channels: int,
         num_heads: int = 8,
         reduction: int = 2,
-        max_tokens: int = 4096,
     ) -> None:
         """__init__.
 
         Args:
-            in_channels (int): Description.
-            num_heads (int): Description.
-            reduction (int): Description.
-            max_tokens (int): OOM cap on the attended token count. The dense
-                softmax matrix is ``[B, H*W, H*W]`` -- O((H*W)^2) memory -- so a
-                256x256 feature map (N=65536) would need ~32 GiB. When
-                ``H*W > max_tokens`` the q/k/v maps are adaptive-pooled to a
-                coarser grid before attention and the output is bilinearly
-                upsampled; the gamma-gated residual on the full-resolution
-                input preserves fine detail. Mirrors the cap in
-                ``dual_domain_attention_kan.py`` (added after the 2026-05-10
-                cluster OOM).
+            in_channels (int): Complex channel count ``C``.
+            num_heads (int): Attention heads.
+            reduction (int): q/k projection width divisor (>= 1).
         """
         super().__init__()
-        if max_tokens < 1:
-            raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+        if reduction < 1:
+            raise ValueError(f"reduction must be >= 1, got {reduction}")
         self.in_channels = in_channels
         self.num_heads = num_heads
         self.reduction = reduction
-        self.max_tokens = int(max_tokens)
 
-        if reduction < 1:
-            raise ValueError(f"reduction must be >= 1, got {reduction}")
-
-        # For stacked real/imag representation [B, 2*C, H, W]
         stacked_channels = in_channels * 2
-        # `reduction` is a DIVISOR, so the floor has to be 1, not stacked_channels.
-        # The previous spelling was `max(stacked_channels // reduction, stacked_channels)`,
-        # and since reduction >= 1 makes the left operand <= the right one, that max
-        # ALWAYS returned stacked_channels -- the knob provably could not change the
-        # module (pitfall #15: advertised but unread). No corpus arm sets
-        # `phase_safe_attention_reduction`, so at the default reduction=1 both
-        # spellings give stacked_channels and every existing state_dict still loads.
+        # `reduction` is a divisor, so the floor is 1 channel (Conv2d rejects 0).
         hidden_dim = max(stacked_channels // reduction, 1)
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"PhaseSafeDualAttention: q/k width {hidden_dim} must divide by num_heads={num_heads}"
+            )
+        self.head_dim = hidden_dim // num_heads
 
-        # Query projection: image feature guidance (real-valued, on stacked repr)
         self.query_proj = nn.Sequential(
             nn.Conv2d(stacked_channels, hidden_dim, kernel_size=1),
-            nn.GroupNorm(num_groups=max(1, num_heads), num_channels=hidden_dim),
+            nn.GroupNorm(num_groups=num_heads, num_channels=hidden_dim),
             nn.ReLU(inplace=True),
         )
-
-        # Key projection: k-space frequency (real-valued magnitude)
         self.key_proj = nn.Sequential(
             nn.Conv2d(stacked_channels, hidden_dim, kernel_size=1),
-            nn.GroupNorm(num_groups=max(1, num_heads), num_channels=hidden_dim),
+            nn.GroupNorm(num_groups=num_heads, num_channels=hidden_dim),
             nn.ReLU(inplace=True),
         )
-
-        # Value projection: k-space (stacked real/imag)
-        self.value_proj = nn.Conv2d(stacked_channels, stacked_channels, kernel_size=1)
-
-        # Output projection
-        self.out_proj = nn.Conv2d(stacked_channels, stacked_channels, kernel_size=1)
-
-        # Residual connection weight
+        self.qk_log_scale = nn.Parameter(
+            torch.full((1, num_heads, 1, 1), 0.5 * math.log(self.head_dim))
+        )
+        self.value_proj = ComplexConv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        self.out_proj = ComplexConv2d(in_channels, in_channels, kernel_size=1, bias=False)
         self.gamma = nn.Parameter(torch.zeros(1))
 
-    def forward(
-        self,
-        x_kspace: torch.Tensor,
-        x_image: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply phase-safe dual attention.
+    def _features(self, t: torch.Tensor) -> torch.Tensor:
+        """``[B, hidden, H, W] -> [B, heads, head_dim, N]``: QK-norm, then ``elu + 1``."""
+        b = t.shape[0]
+        t = t.reshape(b, self.num_heads, self.head_dim, -1).transpose(-2, -1)
+        return (F.elu(qk_normalize(t, self.qk_log_scale)) + 1.0).transpose(-2, -1)
+
+    def kernel_features(
+        self, x_kspace: torch.Tensor, x_image: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Positive feature maps ``phi(q), phi(k)``, each ``[B, heads, head_dim, N]``."""
+        real_k = x_kspace[:, 0::2]
+        imag_k = x_kspace[:, 1::2]
+        mag = torch.sqrt(real_k**2 + imag_k**2 + 1e-8)
+        mag_interleaved = torch.stack([mag, mag], dim=2).flatten(1, 2)
+        return self._features(self.query_proj(x_image)), self._features(self.key_proj(mag_interleaved))
+
+    def forward(self, x_kspace: torch.Tensor, x_image: torch.Tensor) -> torch.Tensor:
+        """Apply phase-safe dual attention.
 
         Args:
-            x_kspace (torch.Tensor): K-space input [B, 2*C, H, W] (stacked real/imag).
-            x_image (torch.Tensor): Image-domain guidance [B, 2*C, H, W] (stacked real/imag).
+            x_kspace (torch.Tensor): ``[B, 2*C, H, W]`` interleaved k-space;
+                value source and residual base.
+            x_image (torch.Tensor): ``[B, 2*C, H, W]`` image-domain guidance;
+                steers the weights only.
 
         Returns:
-            torch.Tensor: Attentioned output [B, 2*C, H, W] (phase preserved).
-
-        forward method for PhaseSafeDualAttention.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x_kspace (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            x_image (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
+            torch.Tensor: ``x_kspace + gamma * out_proj(attention)``, same shape.
         """
         B, stacked_c, H, W = x_kspace.shape
-        C = self.in_channels
-
-        # Extract magnitude for attention computation (phase-neutral)
-        # x_kspace: [B, 2*C, H, W] -> real=[B, C, H, W] and imag=[B, C, H, W]
-        # Interleaved parsing: [R1, I1, R2, I2, ...]
-        real_k = x_kspace[:, 0::2, ...]
-        imag_k = x_kspace[:, 1::2, ...]
-        x_kspace_mag = torch.sqrt(real_k**2 + imag_k**2 + 1e-8)  # [B, C, H, W]
-
-        # Reconstruct interleaved magnitude for projection
-        # Interleave mag with itself: [M1, M1, M2, M2, ...]
-        x_kspace_mag_interleaved = torch.stack([x_kspace_mag, x_kspace_mag], dim=2).flatten(1, 2)
-
-        # Project to attention space (full-resolution 1x1 convs — cheap).
-        q = self.query_proj(x_image)  # [B, hidden_dim, H, W]
-        k = self.key_proj(x_kspace_mag_interleaved)  # [B, hidden_dim, H, W]
-        v = self.value_proj(x_kspace)  # [B, 2*C, H, W]
-
-        hidden_dim = q.shape[1]
-
-        # OOM cap: the dense [B, N, N] softmax is O((H*W)^2) memory — a
-        # 256x256 map (N=65536) needs ~32 GiB. When the token count exceeds
-        # ``max_tokens``, attend on an adaptive-pooled coarse grid and
-        # bilinearly upsample the result; the gamma-gated residual below
-        # restores full-resolution detail. Mirrors the cap in the KAN
-        # dual-domain blocks (added after the 2026-05-10 cluster OOM).
-        if self.max_tokens < H * W:
-            ratio = (self.max_tokens / float(H * W)) ** 0.5
-            ah, aw = max(1, int(H * ratio)), max(1, int(W * ratio))
-            q = F.adaptive_avg_pool2d(q, (ah, aw))
-            k = F.adaptive_avg_pool2d(k, (ah, aw))
-            v = F.adaptive_avg_pool2d(v, (ah, aw))
-        else:
-            ah, aw = H, W
-
-        # Reshape for attention: [B, C, N] with N = ah*aw <= max_tokens
-        q_flat = q.reshape(B, hidden_dim, ah * aw)  # [B, hidden_dim, N]
-        k_flat = k.reshape(B, hidden_dim, ah * aw)  # [B, hidden_dim, N]
-        v_flat = v.reshape(B, v.shape[1], ah * aw)  # [B, 2*C, N]
-
-        # Compute attention weights using magnitude (phase-neutral)
-        # attn = softmax(Q^T @ K)
-        attn = torch.bmm(q_flat.transpose(1, 2), k_flat)  # [B, N, N]
-        attn = attn / (hidden_dim**0.5 + 1e-8)
-        attn = F.softmax(attn, dim=-1)  # [B, N, N]
-
-        # Apply attention to complex values (phase-preserved): out = attn @ V
-        out_flat = torch.bmm(v_flat, attn.transpose(1, 2))  # [B, 2*C, N]
-        out = out_flat.reshape(B, v.shape[1], ah, aw)  # [B, 2*C, ah, aw]
-
-        # Upsample the (possibly coarse) attention output back to full res.
-        if (ah, aw) != (H, W):
-            out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
-
-        # Project output
-        out = self.out_proj(out)  # [B, 2*C, H, W]
-
-        # Residual connection with learnable gate
+        if stacked_c != 2 * self.in_channels:
+            raise ValueError(
+                f"PhaseSafeDualAttention(in_channels={self.in_channels}) expects "
+                f"{2 * self.in_channels} interleaved channels, got {stacked_c}"
+            )
+        phi_q, phi_k = self.kernel_features(x_kspace, x_image)
+        v = self.value_proj(x_kspace).reshape(B, stacked_c, H * W)
+        # fp32 reductions: a sum of N = H*W k-space values overflows fp16 under AMP.
+        with torch.autocast(device_type=x_kspace.device.type, enabled=False):
+            phi_q, phi_k, v32 = phi_q.float(), phi_k.float(), v.float()
+            kv = torch.einsum("bhdn,bcn->bhdc", phi_k, v32)
+            numerator = torch.einsum("bhdn,bhdc->bhcn", phi_q, kv)
+            denominator = torch.einsum("bhdn,bhd->bhn", phi_q, phi_k.sum(dim=-1))
+            # Positive features make D > 0; heads are averaged, so rows stay stochastic.
+            out = (numerator / denominator.clamp_min(1e-6).unsqueeze(2)).mean(dim=1)
+        out = self.out_proj(out.to(v.dtype).reshape(B, stacked_c, H, W))
         return x_kspace + self.gamma * out
 
 
@@ -1139,6 +1271,7 @@ class CrossContrastOLMPA(nn.Module):
 __all__ = [
     "CBAMSpatialAttention",
     "ChannelAttention",
+    "ComplexChannelAttention",
     "CrossAttention",
     "CrossContrastOLMPA",
     "IdentityAtInitAttention",
@@ -1148,4 +1281,6 @@ __all__ = [
     "SelfAttention",
     "SparseAttention",
     "SpatialAttention",
+    "WindowAttention",
+    "qk_normalize",
 ]

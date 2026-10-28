@@ -58,12 +58,21 @@ def test_validation_step_does_not_reseed_global_rng() -> None:
 
     def fake_compute(input_batch, target_batch, epoch):  # noqa: ANN001
         captured["compute_args"] = (input_batch, target_batch, epoch)
+        fake_self._last_prediction = torch.ones(1, 1, 8, 8)
+        fake_self._last_target = torch.ones(1, 1, 8, 8)
         return {"g_total_loss": torch.tensor(0.0)}
 
     fake_self = object.__new__(ConcretePMAVarNetStrategy)
     fake_self._unpack_batch = fake_unpack
     fake_self._compute_losses_impl = fake_compute
     fake_self.env = SimpleNamespace(generator=None)
+    fake_self.device = torch.device("cpu")
+    fake_self.config = SimpleNamespace(
+        validation=SimpleNamespace(
+            scoring=SimpleNamespace(compute=["psnr"], primary="psnr", transform=None)
+        ),
+        metrics=None,
+    )
 
     # Pin a known global RNG state, then snapshot it.
     torch.manual_seed(123456)

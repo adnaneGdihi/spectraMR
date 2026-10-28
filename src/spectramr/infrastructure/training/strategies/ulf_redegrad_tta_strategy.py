@@ -18,10 +18,10 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from .reconstruction import ReconstructionTrainingStrategy
-from .ulf_map_strategy import ulf_degrade
+from .ulf_lowpass_operator import UlfLowpassOperator, build_ulf_lowpass_operator
 
 
 def compute_redegrad_tta_train_loss(
@@ -50,8 +50,9 @@ def redegrad_tta_render(
     adaptation_steps: int,
     adaptation_lr: float,
     consistency_weight: float,
-    blur_cutoff: float,
+    blur_cutoff: float = 0.5,
     contrast_id: torch.Tensor | None = None,
+    forward_op: UlfLowpassOperator | None = None,
 ) -> torch.Tensor:
     """Per-sample test-time adaptation then render, with rollback-to-best-residual.
 
@@ -70,6 +71,7 @@ def redegrad_tta_render(
     ``enable_grad`` so it works under the validation ``no_grad`` context.
     """
     b_t = b_t.reshape(-1).float()
+    op = forward_op if forward_op is not None else UlfLowpassOperator.constant_cutoff(blur_cutoff)
     if adaptation_steps <= 0:
         with torch.no_grad():
             return model(source, field_strength=b_t, contrast_id=contrast_id).clamp(0.0, 1.0)
@@ -77,9 +79,7 @@ def redegrad_tta_render(
     def _residual() -> float:
         with torch.no_grad():
             r = F.mse_loss(
-                ulf_degrade(
-                    model(source, field_strength=b_t, contrast_id=contrast_id), blur_cutoff
-                ),
+                op.apply(model(source, field_strength=b_t, contrast_id=contrast_id), contrast_id),
                 source,
             )
         return float(r)
@@ -94,7 +94,7 @@ def redegrad_tta_render(
             for _ in range(adaptation_steps):
                 opt.zero_grad(set_to_none=True)
                 pred = model(source, field_strength=b_t, contrast_id=contrast_id)
-                loss = consistency_weight * F.mse_loss(ulf_degrade(pred, blur_cutoff), source)
+                loss = consistency_weight * F.mse_loss(op.apply(pred, contrast_id), source)
                 if not torch.isfinite(loss):  # divergence/NaN guard -> keep best so far
                     break
                 loss.backward()
@@ -126,7 +126,7 @@ class UlfReDegradationTTAStrategy(ReconstructionTrainingStrategy):
         self._tta_steps = int(getattr(cfg, "adaptation_steps", 8)) if cfg else 8
         self._tta_lr = float(getattr(cfg, "adaptation_lr", 1e-4)) if cfg else 1e-4
         self._tta_weight = float(getattr(cfg, "consistency_weight", 1.0)) if cfg else 1.0
-        self._tta_cutoff = float(getattr(cfg, "blur_cutoff", 0.5)) if cfg else 0.5
+        self._ulf_lowpass = build_ulf_lowpass_operator(self.config)
         self._tta_lambda_l1 = self._declared_inline_l1_weight()
 
     def _compute_losses_impl(
@@ -196,7 +196,7 @@ class UlfReDegradationTTAStrategy(ReconstructionTrainingStrategy):
             "adaptation_steps": getattr(self, "_tta_steps", 8),
             "adaptation_lr": getattr(self, "_tta_lr", 1e-4),
             "consistency_weight": getattr(self, "_tta_weight", 1.0),
-            "blur_cutoff": getattr(self, "_tta_cutoff", 0.5),
+            "forward_op": self._ulf_lowpass,
         }
         gen = self.env.generator
         cid = batch_context.get("contrast_id", kwargs.get("contrast_id"))

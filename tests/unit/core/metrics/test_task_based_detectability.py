@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F  # noqa: N812 - universal PyTorch idiom
+import torch.nn.functional as F
 
 from spectramr.core.metrics.task_based_detectability import TaskBasedDetectability
 

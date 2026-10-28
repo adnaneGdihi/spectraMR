@@ -34,7 +34,7 @@ class DeepSupervisionLoss(nn.Module):
 
         \mathcal{L}_{DeepSupervision} = w \sum_{l} \mathcal{L}_{base}(\hat{y}^{(l)}, y)"""
 
-    def __init__(self, base_loss_fn: nn.Module = None, weight: float = 0.1):
+    def __init__(self, base_loss_fn: nn.Module | None = None, weight: float = 0.1) -> None:
         """__init__.
 
         Args:

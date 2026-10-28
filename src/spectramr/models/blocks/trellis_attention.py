@@ -5,7 +5,6 @@ Migrated from src/implementations/blocks/attention.py during consolidation.
 
 from __future__ import annotations
 
-import math
 
 import torch
 from torch import nn
@@ -29,10 +28,7 @@ except ImportError:  # pragma: no cover - fallback for older PyTorch
         Returns:
             torch.Tensor: Description.
         """
-        scale = 1.0 / math.sqrt(q.size(-1))
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        weights = torch.softmax(scores, dim=-1)
-        return torch.matmul(weights, v)
+        return F.scaled_dot_product_attention(q, k, v)
 
 
 class MultiHeadRMSNorm(nn.Module):

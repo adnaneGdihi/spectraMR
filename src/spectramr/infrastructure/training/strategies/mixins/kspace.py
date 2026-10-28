@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
 from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.utils.data_adapters import TorchIOAdapter
-from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
 from spectramr.infrastructure.training.utils.transform_ops import FFTTransformer
 
 from .utils import _get_config_value, pick_present
@@ -119,40 +119,23 @@ class KspaceMixin:
             and "kspace_cold_diffusion" in str(self.config.model.model_type).lower()
         )
 
-    def setup_kspace_components(self: "BaseTrainingStrategy", num_timesteps: int = 1000) -> None:
-        """Initialize K-Space specific components (Mask Generator, Data Consistency)."""
+    def setup_kspace_components(self: "BaseTrainingStrategy") -> None:
+        """Initialize K-Space specific components (Mask Generator, Data Consistency).
+
+        Took a ``num_timesteps`` argument until the mask generator moved to the
+        model (#2056). The process was built from the same
+        ``training.diffusion.timesteps``, so the parameter became a second way
+        to state one value and nothing read it (non-negotiable 8).
+        """
         if not self._is_cold_diffusion():
             return
 
-        # Function-local: the edge infrastructure -> models is legal, but
-        # ``spectramr.infrastructure.training.__init__`` eagerly imports
-        # ``.strategies``, so a module-level import here closes a cycle through
-        # this very module. ``physics_builder`` imports the same helper the same
-        # way, for the same reason.
-        from spectramr.models.diffusion.kspace_process import (
-            accelerator_kwargs_from_config,
-        )
-
-        # Extract acceleration configuration.
-        #
-        # This used to dump the whole frozen schema and remove exactly one key
-        # (``acceleration_type``), which is a denylist over ``model_dump()``:
-        # every field the schema defines rides along, defaults included. Once
-        # ``_reject_unknown_accelerator_kwargs`` landed, the first validation
-        # step raised a TypeError naming seventeen unread names, and before that
-        # gate existed the same kwargs were silently discarded — including
-        # ``mask_seed``, which this path never translated to the accelerator's
-        # ``seed``. That is issue #1059's failure mode: ``seed=None`` falls back
-        # to the global RNG, each call draws a fresh permutation instead of
-        # truncating one fixed ranking, and the cascade stops being nested.
-        # ``accelerator_kwargs_from_config`` is the same allowlist
-        # ``KSpaceUndersamplingProcess`` uses, so the two paths build the same
-        # accelerator from the same YAML.
-        accel_config = self.config.undersampling
-
         generator = self.env.generator
-        if hasattr(generator, "dc_layer") and generator.dc_layer is not None:
-            self.dc_layer = generator.dc_layer
+        # Through unwrap_model: a DDP/DP wrapper hides dc_layer, and the probe then
+        # reported a model that owns one as having none.
+        inner = unwrap_model(generator)
+        if hasattr(inner, "dc_layer") and inner.dc_layer is not None:
+            self.dc_layer = inner.dc_layer
             if hasattr(self, "logging_service"):
                 self.logging_service.log_info(
                     f"🧲 Data Consistency: Using model-integrated {type(self.dc_layer).__name__}"
@@ -171,28 +154,37 @@ class KspaceMixin:
                     "🧲 Data Consistency: Enabled in config but NOT found in model. Skipping strategy-side DC."
                 )
 
-        # Mask Generator. An absent ``undersampling:`` block keeps the historical
-        # "linear, no kwargs" generator rather than materialising the resolver's
-        # full default ladder, which would silently give a config that declares
-        # no acceleration a 32x one.
-        if accel_config is None:
-            pattern, accelerator_kwargs = "linear", {}
-        else:
-            pattern, accelerator_kwargs = accelerator_kwargs_from_config(accel_config)
+        # The mask generator is BORROWED from the model, never rebuilt (#2056).
+        # Both sides resolved the same ``undersampling:`` block through the same
+        # allowlist, so the two instances agreed on every accelerator kwarg --
+        # which is why the duplication survived: it showed only as
+        # ``Creating Accelerator`` logged twice per run. What a strategy-owned
+        # copy can never share is the knobs the ACCELERATOR does not carry:
+        # ``accelerator_kwargs_from_config`` drops ``enable_dynamic_mask`` by
+        # design, because the per-sample seed jitter lives in
+        # ``KSpaceUndersamplingProcess.q_sample``. One object, and
+        # ``self.training`` decides whether the pattern jitters.
+        unwrapped = unwrap_model(generator)
+        process = getattr(unwrapped, "kspace_process", None)
+        if process is None:
+            raise ValueError(
+                f"{self.config.model.model_type!r} routes through the cold-diffusion "
+                f"setup, but its generator {type(unwrapped).__name__} exposes no "
+                f"'kspace_process' to take the mask generator from. Building a second "
+                f"one here is what #2056 removed: it would resolve the same "
+                f"'undersampling:' block through a second code path nothing compares "
+                f"against, and would miss every knob the accelerator does not carry."
+            )
+        self.mask_generator = process.mask_generator
 
-        if pattern == "multi_mask":
-            if hasattr(self, "logging_service"):
-                self.logging_service.log_warning(
-                    "Using 'multi_mask' pattern - ensure KSpaceMaskGenerator supports it",
-                    model_type=self.config.model.model_type,
-                )
+        pattern = self.mask_generator.default_pattern
+        accelerator_kwargs = self.mask_generator._accelerator_kwargs
 
-        self.mask_generator = KSpaceMaskGenerator(
-            num_timesteps=num_timesteps,
-            device=self.device,
-            default_pattern=pattern,
-            accelerator_kwargs=accelerator_kwargs,
-        )
+        if pattern == "multi_mask" and hasattr(self, "logging_service"):
+            self.logging_service.log_warning(
+                "Using 'multi_mask' pattern - ensure KSpaceMaskGenerator supports it",
+                model_type=self.config.model.model_type,
+            )
 
         if hasattr(self, "logging_service"):
             # ``density_power`` is flattened into the kwargs, not nested under a
@@ -201,9 +193,60 @@ class KspaceMixin:
             self.logging_service.log_info(
                 f"🔧 Acceleration config: type={pattern}, "
                 f"density_power={accelerator_kwargs.get('density_power', 'default')}, "
+                f"schedule={accelerator_kwargs.get('acceleration_schedule', 'default')}, "
+                f"schedule_power={accelerator_kwargs.get('schedule_power', 'default')}, "
                 f"max_accel={accelerator_kwargs.get('max_acceleration', 'default')}, "
                 f"seed={accelerator_kwargs.get('seed', 'default')}"
             )
+
+    def _check_acquired_lines(
+        self: "BaseTrainingStrategy", kspace: torch.Tensor, batch_data: Any, split: str
+    ) -> None:
+        """Check ``data.acquisition.acquired_pe_lines`` against the first ``split`` batch (#2160).
+
+        ``kspace`` is plane-last and not yet masked. One host read per split; the
+        verdict joins the process's line-axis record, which the snapshot
+        provenance stamps. Arms without a line mask or a declared block skip it.
+        """
+        from spectramr.models.diffusion.acquired_line_budget import check_declared_lines
+
+        gen = getattr(self, "generator_model", None)
+        gen = getattr(gen, "module", gen)
+        process = getattr(gen, "kspace_process", None)
+        key = f"{split}_acquired_lines"
+        if not hasattr(process, "acquired_lines") or key in process.line_axis_gate:
+            return
+        acquisition = getattr(getattr(self.config, "data", None), "acquisition", None)
+        acquired = process.acquired_lines(kspace)
+        if acquisition is None or acquired is None:
+            return
+        contrasts = read_batch_field(batch_data, "contrast")
+        if isinstance(contrasts, str):
+            contrasts = [contrasts]
+        process.line_axis_gate[key] = check_declared_lines(
+            acquisition.acquired_pe_lines, acquired, list(contrasts) if contrasts else None
+        )
+
+    def _gate_validation_line_axis(
+        self: "BaseTrainingStrategy", input_batch: torch.Tensor, batch_data: Any = None
+    ) -> None:
+        """Run the k-space process's line-axis gate on the first validation batch.
+
+        The validation input is the delivered k-space before any mask is applied,
+        so its never-acquired lines are the data's own (#2160). A 5-D batch is
+        ``(B, C, H, W, D)`` here, so the depth axis moves off the plane first.
+        Arms without a ``kspace_process`` have no line mask to check.
+        """
+        gen = getattr(self, "generator_model", None)
+        gen = getattr(gen, "module", gen)
+        process = getattr(gen, "kspace_process", None)
+        check = getattr(process, "check_line_axis", None)
+        if check is None:
+            return
+        plane_last = input_batch.movedim(-1, 1) if input_batch.dim() == 5 else input_batch
+        if "validation" not in process.line_axis_gate:
+            check(plane_last, "validation")
+        self._check_acquired_lines(plane_last, batch_data, "validation")
 
     def _prepare_validation_data(
         self: "BaseTrainingStrategy",
@@ -223,6 +266,7 @@ class KspaceMixin:
         )
         input_batch = TorchIOAdapter.to_batch_format(input_batch, in_channels)
         target_batch = TorchIOAdapter.to_batch_format(target_batch, in_channels)
+        self._gate_validation_line_axis(input_batch, batch_data)
 
         # [FIX] Handle 5D tensors from dataloader (B, C, H, W, D) → (B*D, C, H, W)
         if input_batch.dim() == 5:
@@ -537,8 +581,14 @@ class KspaceMixin:
         target_shape: tuple[int, ...],
         current_step: int = 0,
         batch_data: dict | None = None,
+        acquired: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Generate and process acceleration mask for cold diffusion."""
+        """Generate and process acceleration mask for cold diffusion.
+
+        ``acquired`` (``[B, N]``, the process's ``acquired_lines``) counts each
+        rung's R over the lines each sample acquired, as ``q_sample`` does in
+        training (#2160).
+        """
         mask = None
         if batch_data is not None and isinstance(batch_data, dict):
             mask = pick_present(batch_data.get("mask"), batch_data.get("acceleration_mask"))
@@ -561,16 +611,28 @@ class KspaceMixin:
 
             pattern = None  # Could default from config
 
-            mask = self.mask_generator.generate_batch_masks(
-                batch_size=batch_size,
-                timesteps=timesteps,
-                image_shape=image_shape,
-                pattern=pattern,
-            )
+            gen = getattr(self, "generator_model", None)
+            process = getattr(getattr(gen, "module", gen), "kspace_process", None)
+            if acquired is not None and process is not None:
+                if not isinstance(timesteps, torch.Tensor) or timesteps.dim() == 0:
+                    timesteps = torch.full((batch_size,), int(timesteps), dtype=torch.long)
+                mask = process.cascade_batch_masks(
+                    timesteps, image_shape, acquired.device, acquired=acquired
+                )
+            else:
+                mask = self.mask_generator.generate_batch_masks(
+                    batch_size=batch_size,
+                    timesteps=timesteps,
+                    image_shape=image_shape,
+                    pattern=pattern,
+                )
 
-            # Logging
+            # Logging, on a real step only: validation passes ``current_step=0``,
+            # which satisfies the modulo on every call and made this log (and
+            # its ``mask.sum().item()``) a per-batch sync.
             if (
-                hasattr(self, "_cached_log_interval")
+                current_step > 0
+                and hasattr(self, "_cached_log_interval")
                 and current_step % self._cached_log_interval == 0
             ):
                 try:
@@ -595,35 +657,11 @@ class KspaceMixin:
 
         mask = mask.to(self.device, non_blocking=True).float()
 
-        # Phase 4.1: Asymmetric Degradation Masking for TI-CCD
-        # We want the mask to only degrade the Target channels.
-        # Source channels should always have a mask of 1.0 (fully sampled).
+        # The diffusion state holds the target contrast alone; a source contrast
+        # arrives as the generator's reference and is never masked (#2452).
         C_total = target_shape[1]
-
-        # Determine the number of target channels based on domain (complex vs real-interleaved)
-        # If C_total is 16 (for 2 contrasts, 4 coils, interleaved real/imag), target is 8
-        # We dynamically assume the second half of channels belong to Target
-        # based on TI-CCD design (concatenated [Source, Target])
-
-        # First, ensure the mask itself is expanded to C_total
         if mask.shape[1] != C_total:
             mask = self.mask_generator.expand_mask_to_channels(mask, C_total)
-
-        # Apply asymmetric logic if we're dealing with multi-contrast concatenated input
-        # Standard configs shouldn't be affected if they only have exactly the Target channels
-        # But for TI-CCD where C_total == 16, the first 8 are source, last 8 are target
-        #
-        # [ROBUSTNESS FIX] Use config.data.domain.target_channels (SSOT) to determine the
-        # source/target split boundary instead of assuming C_total // 2.
-        target_ch = self.config.data.domain.target_channels
-        if target_ch is not None and C_total > target_ch:
-            C_source = C_total - target_ch  # e.g. 16 - 8 = 8 source channels
-            # Force mask of 1.0 on the Source channels (preserve fully-sampled prior)
-            mask[:, :C_source, ...] = 1.0
-        elif C_total > self.config.model.out_channels and C_total % 2 == 0:
-            # Legacy fallback: assume equal split
-            C_source = C_total // 2
-            mask[:, :C_source, ...] = 1.0
 
         # Saturation check. Gate on the LIVE iteration (loop_state seam): the
         # old ``self.env.step`` was a frozen 0, so ``0 in [0, 1, 2]`` was always

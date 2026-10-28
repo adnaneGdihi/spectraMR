@@ -32,6 +32,8 @@ from typing import Any, ClassVar
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_BUFFERS, sync_owned_buffers
+
 from .reconstruction import ReconstructionTrainingStrategy
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,16 @@ class PnPStrategy(ReconstructionTrainingStrategy):
     #: Loss ownership (mrixfields review 2026-09-03): folds the builder's other declared entries (calls the fold or the parent path).
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
     folds_image_losses: ClassVar[bool | None] = True
+
+    # parallel_compat: The denoiser reparameterises the wrapped generator in place; its
+    # spectral-norm vectors are added after the wrap and broadcast once under ddp.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        pnp = getattr(getattr(config, "training", None), "pnp", None)
+        own = (("_denoiser", OWNED_BUFFERS),) if getattr(pnp, "enabled", False) else ()
+        return (*super().owned_module_declarations(config), *own)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -115,6 +127,15 @@ class PnPStrategy(ReconstructionTrainingStrategy):
                 "PnP requires a Lipschitz-constrained denoiser, but the "
                 "generator exposed no Conv/Linear layers to spectral-normalise."
             )
+        # Each rank draws its own power-iteration start vectors, and DDP broadcasts only
+        # the buffers it saw at the wrap. Once equal, they stay equal: they iterate on
+        # the synchronised weights.
+        sync_owned_buffers(
+            [b for n, b in denoiser.named_buffers() if n.endswith(("weight_u", "weight_v"))],
+            owner=type(self).__name__,
+            name="_denoiser",
+            parallel=getattr(self.config, "parallel", None),
+        )
         self._denoiser = denoiser
         # Stamp the resolved knobs into provenance (pitfall #15).
         self.pnp_provenance = {

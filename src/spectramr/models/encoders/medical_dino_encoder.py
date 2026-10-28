@@ -11,13 +11,6 @@ import logging
 import torch
 from torch import nn
 
-try:
-    import timm
-
-    TIMM_AVAILABLE = True
-except ImportError:
-    TIMM_AVAILABLE = False
-
 from spectramr.models.interfaces.latent_access import LatentAccessMixin
 from spectramr.models.lora import LoRAAdapter
 from spectramr.models.registry import register_model
@@ -122,10 +115,12 @@ class MedicalDINOv2Encoder(LatentAccessMixin, nn.Module, metaclass=ModuleABCMeta
             freeze_backbone: Whether to freeze model parameters
             num_register_tokens: Number of register tokens (DINOv2 feature)
         """
-        if not TIMM_AVAILABLE:
+        try:
+            import timm
+        except ImportError as exc:
             raise ImportError(
                 "timm is required for MedicalDINOv2Encoder. Install with: pip install timm"
-            )
+            ) from exc
 
         super().__init__()
 

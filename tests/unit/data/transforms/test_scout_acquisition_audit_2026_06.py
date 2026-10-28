@@ -8,7 +8,6 @@ key into ``batch_context``.
 """
 from __future__ import annotations
 
-import inspect
 
 import torch
 
@@ -55,7 +54,20 @@ def test_scout_transform_emits_separate_scout_preserving_input() -> None:
 
 
 def test_reconstruction_mixin_propagates_scout_key() -> None:
-    from spectramr.infrastructure.training.strategies.mixins import reconstruction
+    """A batch carrying the transform's ``scout`` view reaches the batch context
+    the SCAS hypernet reads (#2439: asserted on behaviour, not on source text)."""
+    from types import SimpleNamespace
 
-    src = inspect.getsource(reconstruction)
-    assert '"scout": ["scout"]' in src
+    from spectramr.infrastructure.training.strategies.mixins.reconstruction import (
+        ReconstructionMixin,
+    )
+
+    class _Probe(ReconstructionMixin):
+        env = None
+        state = SimpleNamespace(config=SimpleNamespace(model=SimpleNamespace(input_type="image")))
+
+    scout = torch.randn(1, 1, 8, 8)
+    context = _Probe()._prepare_batch_context_reconstruction(
+        torch.randn(1, 1, 8, 8), torch.randn(1, 1, 8, 8), batch={"scout": scout}
+    )
+    assert torch.equal(context["scout"], scout)

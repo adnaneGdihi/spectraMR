@@ -11,16 +11,19 @@ box, so the heavy end-to-end check belongs on the cluster.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import logging
 import pathlib
 import re
 import textwrap
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
 
+from spectramr.config.schemas.logging import LoggingConfigSchema
 from spectramr.core.topology import RunTopology
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.pipelines import training_loop as tl
@@ -191,40 +194,87 @@ def test_invariant_config_lookups_hoisted_above_loop():
     assert 'getattr(config, "ema", None)' not in inside
 
 
-def test_divergence_guard_piggybacks_on_postfix_sync():
-    """Perf review 2026-07-01: the NaN/Inf divergence guard must reuse the
-    host float the tqdm postfix already paid the per-step ``.item()`` sync
-    for — ``math.isfinite`` on that scalar adds zero GPU syncs. The old block
-    called ``torch.isfinite`` on a CUDA scalar (a SECOND per-step sync) and
-    selected the loss via ``result.get("g_total_loss") or result.get("loss")``
-    — tensor truthiness (also a sync) that made a legitimate 0.0
-    ``g_total_loss`` fall through to the wrong key. Pin at source level (a
-    full loop OOM-kills a dev box — same pattern as the loop_state test)."""
+def test_ema_is_gated_on_the_optimizer_step_cadence():
+    """The EMA gate receives the same accumulation cadence as the schedulers;
+    without it the shadow was blended on every micro-batch."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    loop = training_loop_mod._execute_training_loop
+    (call,) = _plain_calls(loop, "ema_should_update")
+    assert _positional_names(call)[-1] == "_gas"
+    assert any("_gas" in _positional_names(c) for c in _plain_calls(loop, "_should_step_schedulers"))
+
+
+def test_the_divergence_guard_is_the_monitor_on_every_step():
+    """The NaN check is ``NonFiniteMonitor``: a device flag recorded every step and
+    read one step late, so a non-log step pays no host sync for it.
+
+    The guard it replaced read the tqdm postfix's per-step ``.item()``; that sync
+    is gone, and so is the postfix outside the log gate. The guard must still not
+    be gated on ``optimization.gradient.detect_anomalies``, which also drives
+    ``torch.autograd.set_detect_anomaly(True)`` (issue #467): turning the debug
+    mode off must never delete the tripwire.
+    """
     import spectramr.pipelines.training_loop as training_loop_mod
 
     src = inspect.getsource(training_loop_mod._execute_training_loop)
+    loop_at = src.index("for iteration in pbar:")
+    inside = src[loop_at:]
 
-    # Guard exists, is UNCONDITIONAL, and uses the synced host float.
-    assert "if not math.isfinite(_quick_scalar):" in src
-    assert "DIVERGENCE DETECTED" in src
+    # Every rank, every step, unconditionally: end_step is a collective under DDP.
+    assert "\n        _verdict = nonfinite_monitor.end_step(iteration)\n" in inside
+    assert "any_rank_nonfinite" not in inspect.getsource(training_loop_mod)
+    assert not re.search(r"\bif\b[^\n]*detect_anomalies", inside)
 
-    # 2026-07-24 (issue #467 review): the guard must NOT be gated on
-    # ``optimization.gradient.detect_anomalies``. That knob also drives
-    # ``torch.autograd.set_detect_anomaly(True)`` (global, 2-4x slower), so one
-    # flag bundled a free NaN tripwire with an expensive debug mode — turning the
-    # debug mode off to recover throughput silently deleted the tripwire. A
-    # non-finite loss must always stop training.
-    assert "detect_anomalies and not math.isfinite" not in src
+    # The total is recorded before end_step closes the step, under a scaler too.
+    record_at = inside.index("nonfinite_monitor.record(")
+    assert record_at < inside.index("nonfinite_monitor.end_step(iteration)")
+    assert "scaler" not in inside[inside.rindex("\n", 0, record_at) : record_at]
 
-    # It runs AFTER the tqdm postfix sync (that .item() is the one it reuses).
-    assert src.index("set_postfix") < src.index("if not math.isfinite(_quick_scalar):")
+    # The per-step .item() survives only for the sanity trace; the postfix is set
+    # at the log gate alone.
+    assert inside.count("pbar.set_postfix(") == 1
+    assert inside.index("pbar.set_postfix(") > inside.index("iteration % log_interval == 0")
+    item_at = inside.index("_quick_loss.item()")
+    assert "if is_sanity_check" in inside[inside.rindex("\n        if ", 0, item_at) : item_at]
 
-    # The old second-sync guard and its truthiness bug must not return.
-    assert "torch.isfinite(total_loss_val)" not in src
+    # A legitimate 0.0 g_total_loss must not fall through to "loss".
+    assert 'losses_history.get("g_total_loss", losses_history.get("loss"))' in src
     assert 'result.get("g_total_loss") or result.get("loss")' not in src
 
-    # Fallback is a None-safe get-chain, so a 0.0 g_total_loss is preserved.
-    assert 'losses_history.get("g_total_loss", losses_history.get("loss"))' in src
+
+def test_every_save_and_validation_resolves_the_monitor_first():
+    """Lag 1 leaves the newest step unread, so anything that persists or evaluates
+    the weights drains it first; otherwise a NaN step's weights are saved."""
+    src = _loop_source()
+    loop_at = src.index("for iteration in pbar:")
+
+    # The periodic/yield save, best save and validation are all preceded by one
+    # rank-uniform resolve in the same iteration.
+    resolve_at = src.index("_verdict = nonfinite_monitor.resolve()", src.index("time_for_eval ="))
+    assert resolve_at < src.index("val_metrics = _run_validation(")
+    assert resolve_at < src.index("best_path = checkpoint_service.save_best(")
+    assert resolve_at < src.index('reason="yield" if wall_clock_yield else "periodic"')
+    gate = src[src.rindex("\n        if ", 0, resolve_at) : resolve_at]
+    for operand in ("time_for_eval", "wall_clock_yield", "iteration % checkpoint_interval == 0"):
+        assert operand in gate, gate
+    assert "may_checkpoint" not in gate, "a rank-0-only resolve strands its peers"
+
+    # The loss-schedule save at the top of an iteration resolves too.
+    ls_save = src.index("_save_loss_schedule_checkpoint(", loop_at)
+    assert "nonfinite_monitor.resolve()" in src[src.rindex("_ls_decision = RankUtility", 0, ls_save) : ls_save]
+
+    # Loop exit drains the final step before the final save: a top-level
+    # statement between the iteration loop and the save that holds reason="final".
+    func = _ast_of(tl._execute_training_loop).body[0]
+    top = [ast.unparse(stmt) for stmt in func.body]
+    loop_ix = next(i for i, s in enumerate(top) if s.startswith("for iteration in pbar:"))
+    final_ix = next(i for i, s in enumerate(top) if "reason='final'" in s)
+    drains = [
+        i for i, s in enumerate(top)
+        if s.startswith("if diverged_at is None:") and "nonfinite_monitor.resolve()" in s
+    ]
+    assert drains and loop_ix < drains[0] < final_ix, (loop_ix, drains, final_ix)
 
 
 def test_evaluate_wraps_run_validation_in_eval_mode(monkeypatch):
@@ -274,6 +324,39 @@ def test_evaluate_wraps_run_validation_in_eval_mode(monkeypatch):
     assert captured["epoch"] == 0
     assert captured["logging_service"] == "log"
     assert captured["metrics_service"] == "met"
+
+
+def test_evaluate_drains_the_validation_image_writer(monkeypatch):
+    """A standalone eval must leave its PNGs written and the writer thread stopped."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    monkeypatch.setattr(training_loop_mod, "_run_validation", lambda *a, **k: {"m": 1.0})
+    metrics_service = MagicMock()
+    pipeline = MagicMock()
+    pipeline.generator.training = False
+    TrainingLoop("strat", pipeline, "cfg", "unet", metrics_service=metrics_service).evaluate()
+    metrics_service.shutdown_image_writer.assert_called_once_with()
+
+
+def test_evaluate_warns_when_the_image_drain_fails(monkeypatch):
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    monkeypatch.setattr(training_loop_mod, "_run_validation", lambda *a, **k: {"m": 1.0})
+    metrics_service = MagicMock()
+    metrics_service.shutdown_image_writer.side_effect = OSError("disk full")
+    logging_service = MagicMock()
+    pipeline = MagicMock()
+    pipeline.generator.training = False
+    loop = TrainingLoop(
+        "strat",
+        pipeline,
+        "cfg",
+        "unet",
+        metrics_service=metrics_service,
+        logging_service=logging_service,
+    )
+    assert loop.evaluate() == {"m": 1.0}
+    assert "disk full" in logging_service.log_warning.call_args.args[0]
 
 
 def test_evaluate_returns_empty_dict_when_validator_yields_none(monkeypatch):
@@ -395,7 +478,10 @@ def test_loop_gates_shared_writes_on_main_rank():
     assert 'output_paths.get("run_output_dir") and is_main_process' in src
     # checkpoints route through the collective-aware predicate, derived from it
     assert "may_checkpoint = is_main_process or checkpoints_need_all_ranks" in src
-    assert "checkpoint_enabled and checkpoint_service and may_checkpoint" in src
+    assert re.search(r"checkpoint_enabled\s+and may_checkpoint\b", src)
+    # the gate reads config, not a service's truthiness (the injected-store check is
+    # an explicit ``is None`` test)
+    assert not re.search(r"and checkpoint_service(?! is None)", src)
     assert src.count("may_checkpoint") >= 4
     assert src.count("is_main_process") >= 4
 
@@ -419,12 +505,12 @@ def test_loss_schedule_decision_is_broadcast_from_rank0():
     # Unchanged: the decision is still computed once and broadcast.
     assert src.count("RankUtility.broadcast_object(_ls_decision)") >= 2
     # Changed: every rank may now enter the save under a collective strategy.
-    assert 'if _ls_decision["checkpoint"] and may_checkpoint' in src
+    assert 'if _ls_decision["checkpoint"] and checkpoint_enabled and may_checkpoint' in src
     assert 'if _ls_decision["checkpoint"] and is_main_process' not in src
 
 
 def test_best_checkpoint_path_broadcast_before_restore():
-    """DDP: only rank 0 wrote best.pt, so its path is broadcast before
+    """DDP: only rank 0 wrote the best checkpoint, so its path is broadcast before
     restore_best_weights — otherwise non-main ranks keep their latest weights and
     the final model differs across ranks."""
     import spectramr.pipelines.training_loop as training_loop_mod
@@ -433,8 +519,42 @@ def test_best_checkpoint_path_broadcast_before_restore():
     bcast = src.index(
         "best_checkpoint_path = RankUtility.broadcast_object(best_checkpoint_path)"
     )
-    restore = src.index("load_from(best_checkpoint_path)")  # the actual restore call
+    restore = src.index("checkpoint_service.best_weights(")
     assert bcast < restore  # broadcast happens before the restore
+    # The broadcast value is what the restore reads, not some other path.
+    call = src[restore : src.index(")", restore)]
+    assert "best_checkpoint_path" in call
+
+
+def test_the_final_save_precedes_the_best_restore():
+    """#2799: the final file is the last state; restore-best then swaps in the best weights."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    src = inspect.getsource(training_loop_mod._execute_training_loop)
+    restore = src.index("checkpoint_service.best_weights(")
+    assert src.index('reason="final"') < restore
+    assert "best_checkpoint_path" in src[restore : src.index(")", restore)]
+
+
+def test_the_final_step_is_the_last_iteration_that_ran():
+    src = _loop_source()
+    final_at = src.index("# Final checkpoint on completion")
+    block = src[final_at : final_at + 1600]
+    assert "ran_a_step = iteration >= first_iteration" in block
+    assert "step=iteration," in block
+    assert "step=max_iterations" not in src
+
+
+def test_no_step_ran_means_no_final_save():
+    src = _loop_source()
+    final_at = src.index("# Final checkpoint on completion")
+    assert "and ran_a_step" in src[final_at : final_at + 1600]
+
+
+def test_a_loop_with_nowhere_to_checkpoint_fails_before_step_one():
+    src = _loop_source()
+    check = src.index("the loop has no run directory")
+    assert check < src.index("for iteration in pbar:")
 
 
 def test_throttle_interval_lives_in_controller_not_save_helper():
@@ -552,6 +672,42 @@ class TestScheduleFreeOptimizerModeBoundary:
         _set_optimizer_eval_mode(pipeline, train=True)
         assert calls == []
 
+    def test_train_mode_is_set_before_the_first_step(self) -> None:
+        """schedulefree 1.4 constructs in eval mode and raises on a step taken
+        there; the post-validation switch was the only one, so step 1 raised."""
+        import spectramr.pipelines.training_loop as training_loop_mod
+
+        loop = training_loop_mod._execute_training_loop
+        to_train = [
+            c
+            for c in _plain_calls(loop, "_set_optimizer_eval_mode")
+            if any(
+                k.arg == "train" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in c.keywords
+            )
+        ]
+        first_step = min(c.lineno for c in _method_calls(loop, "train_step", on="strategy"))
+        assert any(c.lineno < first_step for c in to_train)
+
+    def test_standalone_evaluate_grades_the_averaged_weights(self, monkeypatch) -> None:
+        import spectramr.pipelines.training_loop as training_loop_mod
+
+        opt, calls = self._schedule_free()
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            training_loop_mod,
+            "_run_validation",
+            lambda *a, **k: seen.append(list(calls)) or {"val_psnr": 1.0},
+        )
+        pipeline = MagicMock()
+        pipeline.generator.training = True
+        pipeline.optimizers = {"opt_g": opt}
+
+        TrainingLoop("strat", pipeline, "cfg", "unet").evaluate()
+
+        assert seen == [["eval"]]
+        assert calls == ["eval", "train"]
+
     def test_it_reaches_through_the_lookahead_wrapper(self) -> None:
         """``optimizers`` holds the WRAPPER once lookahead.enabled is set.
 
@@ -598,53 +754,24 @@ class TestCollectiveCheckpointGate:
     def test_no_checkpoint_site_still_gates_on_is_main_process_alone(self):
         """The regression guard: a new checkpoint call site that copies the old
         `and is_main_process` line reintroduces the hang."""
-        import ast
-
-        source = self._source()
-        tree = ast.parse(source)
-        offenders = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If):
-                continue
-            names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
-            if "is_main_process" not in names:
-                continue
-            # DERIVE the "this builds a checkpoint" property instead of
-            # enumerating spellings. The first version of this guard matched
-            # only the literals `CheckpointDirector`/`save_best`, so the two
-            # loss-schedule sites -- which reach a checkpoint through the
-            # `_save_loss_schedule_checkpoint` HELPER -- were invisible to it
-            # and shipped gated on `is_main_process` alone. Any callee whose
-            # name mentions a checkpoint now counts, helper or not.
-            called = {
-                (
-                    n.func.id
-                    if isinstance(n.func, ast.Name)
-                    else getattr(n.func, "attr", "")
-                )
-                for n in ast.walk(node)
-                if isinstance(n, ast.Call)
-            }
-            # CALLEES only, and only those that SAVE. Two false-positive classes
-            # this deliberately excludes, both of which rank-0 gating is correct
-            # for:
-            #   * `checkpoints_need_all_ranks` in a log line -- a Name, not a
-            #     call, so scanning every Name node flagged the explanatory
-            #     logger.info block itself;
-            #   * `consume_checkpoint_request` -- rank 0 DECIDING whether to
-            #     checkpoint, which is then broadcast so all ranks agree
-            #     (test_loss_schedule_decision_is_broadcast_from_rank0). The
-            #     decision must be single-source; only the SAVE is collective.
-            if any(
-                ("save" in name.lower() and "checkpoint" in name.lower())
-                or name in ("CheckpointDirector", "save_best")
-                for name in called
-            ):
-                offenders.append(node.lineno)
+        offenders = _rank0_only_checkpoint_blocks(self._source())
         assert not offenders, (
             f"checkpoint block(s) at line(s) {offenders} gate on is_main_process "
             "alone; use `may_checkpoint` or an FSDP/DeepSpeed run deadlocks"
         )
+
+    @pytest.mark.parametrize(
+        "save",
+        [
+            "store.save_step(pipeline, step=1)",
+            "store.save_best(pipeline, metric_name='m', metric_value=1.0)",
+            "_save_loss_schedule_checkpoint(config=config)",
+            "restore.best_weights(path, pipeline, parallel=parallel_runtime)",
+        ],
+    )
+    def test_the_guard_turns_red_on_every_save_shape(self, save):
+        planted = f"def f():\n    if is_main_process:\n        {save}\n"
+        assert _rank0_only_checkpoint_blocks(planted) == [2]
 
     def test_the_loss_schedule_helper_receives_the_parallel_runtime(self):
         """It builds a checkpoint like every other site, so it needs the
@@ -653,12 +780,57 @@ class TestCollectiveCheckpointGate:
         assert "parallel_runtime=parallel_runtime," in source
         helper = source[source.index("def _save_loss_schedule_checkpoint") :]
         helper = helper[: helper.index("\nclass ")]
-        assert ".with_parallel_runtime(parallel_runtime)" in helper
+        assert "parallel=parallel_runtime," in helper
 
-    def test_the_runtime_is_threaded_into_the_director(self):
-        """Without with_parallel_runtime the director keeps the default adapter
-        and writes this rank's SHARD as if it were the whole model."""
-        assert ".with_parallel_runtime(parallel_runtime)" in self._source()
+    def test_the_runtime_reaches_every_store_call(self):
+        """Without the runtime the store resolves the default adapter and writes this
+        rank's SHARD as if it were the whole model."""
+        for func in (tl._execute_training_loop, tl._save_loss_schedule_checkpoint):
+            calls = [*_method_calls(func, "save_step"), *_method_calls(func, "save_best"),
+                     *_method_calls(func, "best_weights")]
+            assert calls, func.__name__
+            for call in calls:
+                kw = {k.arg: k.value for k in call.keywords}
+                assert isinstance(kw.get("parallel"), ast.Name), call.lineno
+                assert kw["parallel"].id == "parallel_runtime", call.lineno
+
+
+def _rank0_only_checkpoint_blocks(source: str) -> list[int]:
+    """Line numbers of ``if`` blocks that gate a checkpoint save on
+    ``is_main_process`` alone."""
+    import ast
+
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "is_main_process" not in names:
+            continue
+        # Derived, not enumerated: any callee that saves a checkpoint, or the one
+        # restore that is collective under DeepSpeed.
+        called = {
+            (n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", ""))
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call)
+        }
+        # CALLEES only, and only those that SAVE. Two false-positive classes
+        # this deliberately excludes, both of which rank-0 gating is correct
+        # for:
+        #   * `checkpoints_need_all_ranks` in a log line -- a Name, not a
+        #     call, so scanning every Name node flagged the explanatory
+        #     logger.info block itself;
+        #   * `consume_checkpoint_request` -- rank 0 DECIDING whether to
+        #     checkpoint, which is then broadcast so all ranks agree
+        #     (test_loss_schedule_decision_is_broadcast_from_rank0). The
+        #     decision must be single-source; only the SAVE is collective.
+        if any(
+            ("save" in name.lower() and "checkpoint" in name.lower())
+            or name in ("save_step", "save_best", "best_weights", "_save_loss_schedule_checkpoint")
+            for name in called
+        ):
+            offenders.append(node.lineno)
+    return offenders
 
 
 class TestSchedulerStepFailuresRaise:
@@ -1021,7 +1193,7 @@ def test_run_summary_reads_the_same_key_the_loop_returns():
 # mechanisms: `save_best` is gated on `math.isfinite(monitor_value)`, and
 # `EarlyStoppingService.update` returns early on non-finite so `wait_count`
 # never moves and the stop can never trigger. The run then burns its full budget
-# and exits 0 with no checkpoint_best.pt.
+# and exits 0 with no best checkpoint.
 #
 # Reachable today: an arm whose data honours no normalization contract gets
 # `val_psnr = NaN` from the range resolver (#180), not a wrong-but-finite score.
@@ -1987,10 +2159,10 @@ class TestTheFailureSentinelIsNotReadAsAMetricVocabulary:
 
     def test_it_points_at_the_upstream_failure_by_its_log_string(self):
         msg = self._sentinel_message()
-        assert "Validation generation failed" in msg, (
-            "the message must name the exact WARNING string to grep for; the "
-            "traceback is emitted immediately before this raise"
-        )
+        # Generation errors now propagate (#1152), so the cascade is the only
+        # remaining producer of the sentinel and the string to grep for.
+        assert "[Cascading Validation]" in msg
+        assert "Validation generation failed" not in msg
 
     def test_it_stays_fatal_and_says_why(self):
         msg = self._sentinel_message()
@@ -2001,7 +2173,7 @@ class TestTheFailureSentinelIsNotReadAsAMetricVocabulary:
 
 class TestAGenuinelyAbsentMonitorStillGetsTheOriginalMessage:
     """Anti-vacuity. The sentinel branch must not swallow the real YAML defect
-    -- #178's raise is the reason `checkpoint_best.pt` failures are catchable."""
+    -- #178's raise is the reason best-checkpoint failures are catchable."""
 
     def _absent_message(self) -> str:
         from spectramr.pipelines.training_loop import _unresolvable_monitor_error
@@ -2063,7 +2235,7 @@ class TestTheLoopRaisesThroughTheHelper:
 # collapsed 6 validation events into 1 -- on the final iteration. A
 # deterministic, weight-independent mask-schedule failure was therefore not
 # discovered until 5 h 17 m of 4-GPU compute had been spent, and no
-# `checkpoint_best.pt` was written.
+# best checkpoint was written.
 #
 # One notch lower (`max_iterations=4000`) the same arm produces ZERO validation
 # events and exits 0 reporting success -- early stopping never evaluates, no
@@ -2097,7 +2269,7 @@ def _guard_config(
     return SimpleNamespace(
         data=None,
         training=SimpleNamespace(max_iterations=max_iterations, epochs=None),
-        logging=SimpleNamespace(intervals=SimpleNamespace(log=100)),
+        logging=LoggingConfigSchema(intervals={"log": 100}),
         metrics=SimpleNamespace(train_metric_interval=100),
         validation=validation,
     )
@@ -2146,8 +2318,8 @@ class TestValidationIntervalBudgetGuard:
         assert "4000" in message
         # The message must name BOTH losses, not just "validation is off":
         # an operator who reads only "no validation" may accept it, while
-        # "no checkpoint_best.pt" is what makes the run unusable.
-        assert "checkpoint_best" in message
+        # "no best checkpoint" is what makes the run unusable.
+        assert "best checkpoint" in message
         assert "early stopping" in message
 
     def test_the_raise_precedes_any_training_step(self):
@@ -2605,46 +2777,24 @@ def test_missing_ema_or_config_is_no_gate():
 
 
 # ---------------------------------------------------------------------------
-# CheckpointDirector wiring in the training loop.
+# The best-weights restore in the training loop.
 #
-# The director resolves its checkpoint adapter from the ParallelRuntime handed to
-# ``with_parallel_runtime``; omit it and it silently gets DefaultCheckpointAdapter
-# (``writes_native_artifact=False``). Every WRITER site passed it, the
-# EarlyStopping restore site did not -- so a DeepSpeed arm trained for 8h45m and
-# then failed to reload its own best checkpoint with KeyError('generator'),
-# because save_best skips the generic payload whenever the adapter wrote a native
-# artifact and the restore side parsed that artifact as a generic payload.
+# The restore resolves its checkpoint adapter from the runtime it is handed; without
+# it a DeepSpeed arm failed to reload its own best checkpoint after an 8h45m run.
 # ---------------------------------------------------------------------------
 
 
-def _builder_chain(call: ast.Call) -> list[str]:
-    """Attribute names in the builder chain *call* is the tail of.
+class TestBestRestoreWiringInTheLoop:
+    def test_the_best_restore_attaches_the_parallel_runtime(self) -> None:
+        (call,) = _method_calls(tl._execute_training_loop, "best_weights", on="checkpoint_service")
+        kw = {k.arg: k.value for k in call.keywords}
+        assert isinstance(kw["parallel"], ast.Name) and kw["parallel"].id == "parallel_runtime"
 
-    ``d.with_a(x).with_b(y).load_from(p)`` -> ``['load_from', 'with_b', 'with_a']``.
-    """
-    names: list[str] = []
-    node: ast.expr = call
-    while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        names.append(node.func.attr)
-        node = node.func.value
-    return names
-
-
-class TestCheckpointDirectorWiringInTheLoop:
-    def test_every_load_from_chain_attaches_the_parallel_runtime(self) -> None:
-        chains = [
-            _builder_chain(call)
-            for call in _method_calls(tl._execute_training_loop, "load_from")
-        ]
-        # Non-vacuity: an invariant that inspects nothing passes forever.
-        assert chains, "no load_from call found in _execute_training_loop"
-        for chain in chains:
-            assert "with_parallel_runtime" in chain, (
-                "a CheckpointDirector chain calls load_from without "
-                f"with_parallel_runtime: {chain!r}. It resolves "
-                "DefaultCheckpointAdapter and cannot read any sharded "
-                "strategy's checkpoint."
-            )
+    def test_the_best_restore_is_handed_the_strategy(self) -> None:
+        """Without it a multi-stage run's stages keep their last weights (#2962)."""
+        (call,) = _method_calls(tl._execute_training_loop, "best_weights", on="checkpoint_service")
+        kw = {k.arg: k.value for k in call.keywords}
+        assert isinstance(kw.get("strategy"), ast.Name) and kw["strategy"].id == "strategy"
 
     def test_the_restore_site_can_actually_see_parallel_runtime(self) -> None:
         """The other half: the name must be bound in the enclosing scope.
@@ -2659,8 +2809,8 @@ class TestCheckpointDirectorWiringInTheLoop:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         }
         assert "parallel_runtime" in bound, (
-            "_execute_training_loop calls load_from but never binds "
-            "parallel_runtime; with_parallel_runtime would raise NameError."
+            "_execute_training_loop calls best_weights but never binds "
+            "parallel_runtime; the restore would raise NameError."
         )
 
 
@@ -2971,6 +3121,45 @@ class TestProducerDeclaredColumns:
         strategy = SimpleNamespace(declared_metric_keys=lambda: frozenset({"pre_dc_kspace_l1"}))
         assert resolve_producer_declared_columns(strategy) == {"pre_dc_kspace_l1"}
 
+    def test_a_forwarding_strategy_declares_its_computers_stamped_keys(self):
+        """#2546: the non-finite substitution count needs a CSV column to be seen."""
+        from spectramr.pipelines.training_loop import resolve_producer_declared_columns
+
+        class _Forwarding:
+            forwards_loss_components = True
+            loss_computer = SimpleNamespace(stamped_component_keys=frozenset({"stamped"}))
+
+            def declared_metric_keys(self):
+                return frozenset({"own"})
+
+        class _NotForwarding(_Forwarding):
+            forwards_loss_components = False
+
+        assert resolve_producer_declared_columns(_Forwarding()) == {"own", "stamped"}
+        assert resolve_producer_declared_columns(_NotForwarding()) == {"own"}
+
+    def test_the_strategies_that_forward_components_say_so(self):
+        """Each flag matches its step dict: ``update(loss_output.components)``."""
+        from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+        from spectramr.infrastructure.training.strategies.diff_siren import DIFFSirenStrategy
+        from spectramr.infrastructure.training.strategies.diffusion import (
+            DiffusionTrainingStrategy,
+        )
+        from spectramr.infrastructure.training.strategies.hssc_strategy import HSSCStrategy
+        from spectramr.infrastructure.training.strategies.n2n_strategy import (
+            NoiseToNoiseStrategy,
+        )
+
+        assert BaseTrainingStrategy.forwards_loss_components is False
+        for cls in (
+            NoiseToNoiseStrategy,
+            HSSCStrategy,
+            DIFFSirenStrategy,
+            DiffusionTrainingStrategy,
+        ):
+            assert cls.forwards_loss_components is True, cls.__name__
+            assert "update(loss_output.components)" in inspect.getsource(cls), cls.__name__
+
     def test_production_path_calls_the_resolver(self):
         assert "resolve_producer_declared_columns" in _calls_in_training_loop()
 
@@ -3239,3 +3428,1481 @@ class TestSchedulerLrCallSiteIsPinned:
     def test_the_warn_once_set_is_actually_populated(self):
         """Without the `.add`, the guard stays true and the warning fires per row."""
         assert "csv_empty_lr_warned.add" in _attribute_calls(_training_loop_source())
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock yield: stopping in time to write a checkpoint.
+#
+# A production arm gets 120h per job and needs more. What was missing was never
+# resume -- the checkpoint has carried every piece of state all along -- it was
+# STOPPING IN TIME TO WRITE ONE. These pin the four places the yield has to
+# touch, each of which is independently satisfiable while the feature is dead:
+# a decision nobody acts on, a save that never fires, a loop that never leaves,
+# an epilogue that overwrites the yield's own checkpoint with a completed one.
+#
+# Source-level for the same reason as the loop_state and divergence-guard tests
+# above: a full loop OOM-kills a dev box. The DECISION itself is executed in
+# tests/unit/core/test_wall_clock.py.
+# ---------------------------------------------------------------------------
+
+
+def _loop_source() -> str:
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    return inspect.getsource(training_loop_mod._execute_training_loop)
+
+
+def test_wall_clock_budget_is_resolved_before_the_loop():
+    """A malformed or already-expired budget must fail at startup, not after
+    hours of GPU — and re-reading the environment per step is a syscall in the
+    hot path (non-negotiable 9)."""
+    src = _loop_source()
+    loop_at = src.index("for iteration in pbar:")
+    before, inside = src[:loop_at], src[loop_at:]
+
+    assert "wall_clock_budget = resolve_wall_clock_budget()" in before
+    assert "resolve_wall_clock_budget()" not in inside
+
+
+def test_the_wall_clock_check_has_its_own_capped_cadence():
+    """NOT the logging cadence, which is what this rode first.
+
+    65 corpus arms declare `logging.intervals.log: 5000`; at ~1s a step that
+    inspects the deadline every ~83 min against a 900s margin, so the job is
+    killed before the check fires -- on exactly the long-running arms the yield
+    exists for. A `time.monotonic` read is a vDSO call, not a device sync, so
+    non-negotiable 9 never bore on how often it happens.
+    """
+    src = _loop_source()
+    loop_at = src.index("for iteration in pbar:")
+    before, inside = src[:loop_at], src[loop_at:]
+
+    assert "_wall_clock_every = resolve_check_interval(log_interval)" in before
+    assert "iteration % _wall_clock_every == 0" in inside
+    assert "resolve_check_interval" not in inside, "cadence recomputed per step"
+
+    # The logging gate must stay the only `if` whose test mentions the log
+    # cadence: TestEveryRunYieldsAnInterpretableCurve locates and executes it by
+    # exactly that property, and a second match errors all nine of its tests.
+    tree = ast.parse(textwrap.dedent(src))
+    matching = [
+        ast.unparse(n.test)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "iteration % log_interval" in ast.unparse(n.test)
+    ]
+    assert len(matching) == 1, matching
+
+    # The decision is broadcast: ranks disagreeing by one iteration deadlock,
+    # one entering the collective checkpoint save while the others step.
+    check = src.index("iteration % _wall_clock_every == 0")
+    assert "RankUtility.broadcast_object" in src[check : check + 600], (
+        "the yield decision is per-rank -- under DDP the ranks will disagree "
+        "and the collective save will hang"
+    )
+
+
+def test_a_budget_that_cannot_be_honoured_is_refused():
+    """`checkpoint.enabled: false` plus a budget yields, saves nothing, requeues
+    and repeats forever. Same family as the already-inside-the-margin refusal."""
+    src = _loop_source()
+
+    assert "A wall-clock budget is declared but checkpointing is off" in src
+    guard_at = src.index("A wall-clock budget is declared but checkpointing is off")
+    assert "raise RuntimeError(" in src[max(0, guard_at - 200) : guard_at]
+    # It must sit above the loop -- refusing at iteration 40k is not a refusal.
+    assert guard_at < src.index("for iteration in pbar:")
+
+
+def test_the_certification_hook_is_skipped_on_a_yield():
+    """A certificate from a half-trained reconstructor describes a model that
+    will not exist by the end of the chain -- and it runs inside the save
+    margin, eating the time reserved for getting out cleanly."""
+    src = _loop_source()
+
+    assert "if not is_sanity_check and not wall_clock_yield and diverged_at is None:" in src
+
+
+def test_the_yield_forces_a_checkpoint_and_then_leaves():
+    """A yield without the save it exists to make room for is just a crash."""
+    src = _loop_source()
+
+    assert "iteration % checkpoint_interval == 0 or wall_clock_yield" in src
+    assert "if wall_clock_yield:\n            break" in src
+    # The save must come first, or the break drops the very state it yielded for.
+    assert src.index("or wall_clock_yield") < src.index("if wall_clock_yield:\n            break")
+
+
+def test_the_completion_epilogue_is_skipped_on_a_yield():
+    """The final save is the last state of a finished run; on a yield or a
+    divergence there is no finished run to stamp."""
+    src = _loop_source()
+
+    final_at = src.index("# Final checkpoint on completion")
+    guard = src[final_at : final_at + 1600]
+    assert "not wall_clock_yield" in guard
+    # A diverged run broke out early; a final file would mark it finished.
+    assert "diverged_at is None" in guard
+
+    restore_at = src.index('getattr(config.early_stopping, "restore_best_weights", False)')
+    assert "not wall_clock_yield" in src[restore_at : restore_at + 400], (
+        "a yielded run is mid-training; swapping in best weights hands the next "
+        "link a model that is not where the loop left off"
+    )
+
+
+def test_the_result_distinguishes_yielded_from_completed():
+    """`success: True` alone would let a caller archive a half-trained run."""
+    src = _loop_source()
+
+    assert '"wall_clock_yield": wall_clock_yield,' in src
+    assert '"resume_from_iteration": iteration if wall_clock_yield else None,' in src
+
+
+def test_validation_is_gated_on_the_yield_and_on_the_budget():
+    """Validation is the longest thing in the loop body and the wall-clock check
+    cannot interrupt it -- the check runs BETWEEN iterations, validation is
+    inside one. A deadline landing mid-pass kills the job with no checkpoint, no
+    marker and no requeue, so the chain stops looking like an ordinary TIMEOUT.
+
+    `experiment_11_attention_none.yaml:506` records one validation event at 6.4 h
+    and validation at 41% of the run's wall clock, so this is the dominant
+    exposure rather than a corner.
+    """
+    src = _loop_source()
+
+    # Gate on the EXECUTION line. Gating `time_for_eval` at its first assignment
+    # is bypassed: the epoch-boundary branch re-sets it to True afterwards.
+    assert (
+        'if pipeline.data_loaders.get("val") and time_for_eval and not wall_clock_yield:'
+        in src
+    )
+    first_assign = src.index("time_for_eval = iteration % eval_interval == 0")
+    epoch_reassign = src.index("            time_for_eval = True")
+    execution = src.index('if pipeline.data_loaders.get("val") and time_for_eval and not')
+    assert first_assign < epoch_reassign < execution, (
+        "the gate moved above the epoch-boundary re-assignment, where it is a no-op"
+    )
+
+    # And the budget check, which is what covers a deadline arriving mid-pass.
+    assert "VALIDATION_SAFETY_FACTOR" in src
+    assert "_last_val_seconds" in src
+
+
+def test_the_budget_check_is_rank_uniform_and_broadcast():
+    """A rank that skipped validation while another ran it would arrive at the
+    collective checkpoint save an iteration apart and deadlock."""
+    src = _loop_source()
+
+    gate = src.index("if wall_clock_budget is not None and time_for_eval and not wall_clock_yield:")
+    window = src[gate : gate + 900]
+
+    # Entry depends only on values every rank computes identically; the
+    # rank-local duration is read INSIDE, by rank 0, and the verdict broadcast.
+    assert "RankUtility.broadcast_object(_fits)" in window
+    assert "if is_main_process:" in window
+    assert "_last_val_seconds" not in src[gate : gate + src[gate:].index("if is_main_process:")], (
+        "the rank-local duration is read in the entry condition -- ranks can "
+        "disagree about whether to enter the collective"
+    )
+
+
+def test_the_validation_duration_is_measured_not_assumed():
+    """There was no validation timing in the loop; the budget check needs one."""
+    src = _loop_source()
+
+    assert "_val_started = time.monotonic() if time_for_eval else None" in src
+    assert "_last_val_seconds = time.monotonic() - _val_started" in src
+    # Only on eval iterations -- not a clock read every step.
+    assert "time.monotonic() if time_for_eval else None" in src
+
+
+def test_a_skipped_validation_says_so():
+    """A validation event that vanishes without a line is an unexplained gap in
+    the arm's record."""
+    src = _loop_source()
+
+    assert "elif time_for_eval and wall_clock_yield and logging_service:" in src
+    assert "Skipping validation at iteration" in src
+
+
+class TestLoggingServiceCallsResolve:
+    """#2254: the divergence tripwire called ``logging_service.log_critical``, a
+    method ``ILoggingService`` never declared and ``LoggingService`` never defined.
+
+    The guard therefore raised ``AttributeError`` on the exact step it was built to
+    catch, and the ``break`` on the next line never ran — a run with a non-finite
+    loss died on the reporting path instead of stopping cleanly, and the log named a
+    logging object rather than the iteration or the loss value.
+
+    Pinning the literal name ``log_critical`` would only close this spelling. What is
+    checked instead is the shape: every method the loop calls on the logging service
+    must exist on the interface it is typed against. A full loop OOM-kills a dev box,
+    so this is an AST check over the source, per the file-level note above.
+    """
+
+    @staticmethod
+    def _logging_service_attrs(func) -> set[str]:
+        """Every ``<recv>.<attr>(...)`` where ``<recv>`` names a logging service."""
+        receivers = {"logging_service", "_logging_service", "self.logging_service"}
+        found: set[str] = set()
+        for node in ast.walk(_ast_of(func)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, ast.Attribute):
+                continue
+            recv = fn.value
+            bare_name = isinstance(recv, ast.Name) and recv.id in receivers
+            self_attribute = (
+                isinstance(recv, ast.Attribute)
+                and isinstance(recv.value, ast.Name)
+                and recv.value.id == "self"
+                and f"self.{recv.attr}" in receivers
+            )
+            if bare_name or self_attribute:
+                found.add(fn.attr)
+        return found
+
+    def test_every_logging_call_in_the_loop_exists_on_the_interface(self):
+        from spectramr.domain.interfaces.service_interfaces import ILoggingService
+
+        called = self._logging_service_attrs(tl._execute_training_loop)
+        assert called, "no logging_service calls found — the walker stopped matching"
+
+        missing = sorted(a for a in called if not hasattr(ILoggingService, a))
+        assert not missing, (
+            f"_execute_training_loop calls {missing} on the logging service, and "
+            f"ILoggingService declares no such method. Each one raises AttributeError "
+            f"at the moment its guard fires. Add the rung to the interface AND to "
+            f"LoggingService, or call a method that exists."
+        )
+
+    def test_the_divergence_guard_calls_a_real_method(self):
+        """The specific rung, on the specific guard, with the concrete service."""
+        from spectramr.infrastructure.services.logging_service import LoggingService
+
+        src = inspect.getsource(tl._stop_on_divergence)
+        called = re.findall(r"logging_service\.(\w+)\(", src)
+        assert called, "the divergence guard no longer logs at all"
+        for attr in called:
+            assert callable(getattr(LoggingService, attr, None)), (
+                f"divergence guard calls LoggingService.{attr}, which does not exist"
+            )
+        assert "try:" not in src, (
+            "a try/except around the divergence log would swallow the failure it "
+            "reports (non-negotiable 3) -- fix the call, do not guard it"
+        )
+
+    def test_the_guard_still_breaks_after_logging(self):
+        """The ``break`` is the load-bearing half: logging names the failure, the
+        break is what stops training before the weights are saved. Every in-loop
+        verdict site sets ``diverged_at`` from the helper and breaks next."""
+        loop = next(
+            n for n in ast.walk(_ast_of(tl._execute_training_loop))
+            if isinstance(n, ast.For) and ast.unparse(n.iter) == "pbar"
+        )
+        sites = 0
+        for node in ast.walk(loop):
+            if not isinstance(node, ast.If) or ast.unparse(node.test) != "_verdict is not None":
+                continue
+            sites += 1
+            body = [ast.unparse(stmt) for stmt in node.body]
+            assert body[-2].startswith("diverged_at = _stop_on_divergence("), body
+            assert body[-1] == "break", body
+        assert sites == 4, (
+            f"expected end_step, two resolve sites and the step-failure handler, found {sites}"
+        )
+
+    def test_a_failed_step_resolves_the_monitor_before_it_reraises(self):
+        """A step that fails on the NaN weights an unread step wrote must report
+        that step's divergence; only a clean resolve lets the error propagate."""
+        handler = next(
+            n for n in ast.walk(_ast_of(tl._execute_training_loop))
+            if isinstance(n, ast.ExceptHandler)
+            and n.type is not None
+            and ast.unparse(n.type) == "Exception"
+            and any("Training Step Failed" in ast.unparse(s) for s in n.body)
+        )
+        body = [ast.unparse(stmt) for stmt in handler.body]
+        assert body[0] == "_verdict = nonfinite_monitor.resolve()", body
+        assert body[1].startswith("if _verdict is not None:"), body
+        assert body[-1] == "raise", body
+
+
+def test_every_checkpoint_save_goes_through_the_store():
+    """#2304, #2799: every save hands the store the strategy, the early-stopping
+    service and the runtime, so a file's contents do not depend on which event wrote it."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    for func in (
+        training_loop_mod._execute_training_loop,
+        training_loop_mod._save_loss_schedule_checkpoint,
+    ):
+        saves = _method_calls(func, "save_step") + _method_calls(func, "save_best")
+        assert saves, func.__name__
+        for call in saves:
+            assert isinstance(call.func.value, ast.Name) and call.func.value.id == "checkpoint_service"
+            keywords = {k.arg for k in call.keywords}
+            assert {"strategy", "early_stopping", "parallel", "layout"} <= keywords, call.lineno
+
+
+def test_the_final_checkpoint_carries_strategy_state_and_the_live_scaler(
+    monkeypatch, tmp_path
+):
+    """#2799: drives a real run to its final save, then repeats that save with the
+    run's strategy holding owned state and a live scaler."""
+    import torch
+
+    from spectramr.infrastructure.checkpointing import codecs, store
+
+    real_save = store.save_step
+    calls: list = []
+    saved: list = []
+    _run_deferring_finite_check(
+        monkeypatch, tmp_path, diverge=False, saved_steps=saved, saved_calls=calls
+    )
+    pipeline, kw = calls[-1]
+    assert (kw["step"], kw["reason"]) == (4, "final")
+    strategy = kw["strategy"]
+    assert strategy is not None, "the final save attaches no strategy"
+
+    class _LiveScaler:
+        def state_dict(self):
+            return {"scale": 1024.0, "_growth_tracker": 7}
+
+    owned = {"modules": {}, "params": {"sigma": torch.tensor([0.25])}}
+    monkeypatch.setattr(strategy, "strategy_state_dict", lambda: owned, raising=False)
+    monkeypatch.setattr(
+        strategy, "amp_helper", SimpleNamespace(scaler=_LiveScaler()), raising=False
+    )
+    written = codecs.read(real_save(pipeline, **kw))
+    assert torch.equal(written["strategy"]["params"]["sigma"], owned["params"]["sigma"])
+    assert written["scaler"] == {"scale": 1024.0, "_growth_tracker": 7}
+
+
+def test_the_resumed_early_stopping_state_is_restored_into_the_service():
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    loop = training_loop_mod._execute_training_loop
+    (call,) = _method_calls(loop, "load_state_dict", on="early_stopping_service")
+    assert _positional_names(call) == ["early_stopping_state"]
+    run_calls = _plain_calls(TrainingLoop.run, "_execute_training_loop")
+    assert any(k.arg == "early_stopping_state" for c in run_calls for k in c.keywords)
+
+
+def test_a_resumed_early_stopped_run_trains_no_step():
+    """The final file of an early-stopped run is stamped at the step it stopped, and
+    should_stop() is otherwise read only after a validation: without this gate the
+    resumed run trains one more validation window and writes a new final file."""
+    src = _loop_source()
+    restore_at = src.index("early_stopping_service.load_state_dict(early_stopping_state)")
+    gate_at = src.index("early_stopping_service.should_stop()")
+    loop_at = src.index("for iteration in pbar:")
+    assert restore_at < gate_at < loop_at, "the stop check must sit before the iteration loop"
+
+    gate = src[gate_at:loop_at]
+    assert "already early-stopped" in gate
+
+    # The rebind must sit inside the should_stop() branch, or every fresh run is emptied.
+    tree = ast.parse(textwrap.dedent(src))
+    gates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and "early_stopping_service.should_stop()" in ast.unparse(node.test)
+    ]
+    rebinds = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "pbar" for t in node.targets)
+        and ast.unparse(node.value) == "make_progress((), config.logging, desc='Training')"
+    ]
+    assert len(rebinds) == 1, "the gate must empty the iteration range"
+    assert any(rebinds[0] in g.body for g in gates if g.lineno < rebinds[0].lineno)
+    # ran_a_step then stays False, so no final save follows.
+    assert "ran_a_step = iteration >= first_iteration" in src
+    assert "iteration = start_iteration - 1" in src[:loop_at]
+
+
+# ---------------------------------------------------------------------------
+# A run the divergence guard stopped must not report success
+# ---------------------------------------------------------------------------
+#
+# The guard stops the loop on a non-finite total, and the loop used to fall
+# through to `success: True`. The total reaches it non-finite when the backend
+# defers the finite check -- DeepSpeed's `guard_loss` is a no-op and a
+# GradScaler defers -- so these drive the real director-built pipeline on CPU
+# with that policy and a graph-connected NaN total.
+
+
+def _divergence_config(
+    tmp_path,
+    *,
+    checkpoint_enabled=False,
+    checkpoint=None,
+    max_iterations=4,
+    logging=None,
+    validation=None,
+    log_interval=None,
+):
+    from spectramr.config.settings import TrainingSettings
+
+    return TrainingSettings.settings_from_dict(
+        {
+            "model": {
+                "model_type": "dummy",
+                "in_channels": 1,
+                "out_channels": 1,
+                "spatial_dims": 2,
+                "model_kwargs": {"base_channels": 4, "num_res_blocks": 1},
+            },
+            "data": {
+                "dataset_type": "synthetic",
+                "patch_size": [16, 16, 1],
+                "img_size": [16, 16],
+                "batch_size": 1,
+                "num_workers": 0,
+                "synthetic_samples": 8,
+                "target_channels": 1,
+            },
+            "losses": {"output_domain": "image", "image_losses": [{"name": "l1", "weight": 1.0}]},
+            "checkpoint": {"enabled": checkpoint_enabled, **(checkpoint or {})},
+            "optimization": {},
+            "logging": logging or ({"intervals": {"log": log_interval}} if log_interval else {}),
+            **({"validation": validation} if validation else {}),
+            "training": {
+                "strategy_class": "reconstruction",
+                "output_dir": str(tmp_path),
+                "max_iterations": max_iterations,
+                "device": "cpu",
+            },
+        }
+    )
+
+
+def _run_deferring_finite_check(
+    monkeypatch, tmp_path, *, diverge, saved_steps=None, saved_calls=None, checkpoint=None
+):
+    """``saved_steps`` (a list) turns checkpointing on and collects the step of
+    every ``store.save_step``; ``saved_calls`` collects ``(pipeline, kwargs)``."""
+    import spectramr.pipelines.train as train_mod
+    from spectramr.infrastructure.training.backward_guard import ensure_backward_ready
+    from spectramr.infrastructure.training.step_executor import StepExecutor
+    from spectramr.models.losses.computers.base import BaseLossComputer
+
+    # Keep only the graph-connectivity check, as DeepSpeedStepPolicy does.
+    monkeypatch.setattr(
+        StepExecutor,
+        "_guard_loss",
+        lambda self, loss, *, name, global_step: ensure_backward_ready(
+            loss, name=name, global_step=global_step
+        ),
+    )
+    if diverge:
+        stack = BaseLossComputer._stack_components
+        monkeypatch.setattr(
+            BaseLossComputer,
+            "_stack_components",
+            lambda self, *a, **k: stack(self, *a, **k) * float("nan"),
+        )
+    if saved_steps is not None:
+        from spectramr.infrastructure.checkpointing import store
+
+        def _record(pipeline, **kw):
+            saved_steps.append(kw["step"])
+            if saved_calls is not None:
+                saved_calls.append((pipeline, kw))
+            return tmp_path / "recorded.safetensors"
+
+        monkeypatch.setattr(store, "save_step", _record)
+    calibrations = []
+    monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: calibrations.append(a))
+    config = _divergence_config(
+        tmp_path, checkpoint_enabled=saved_steps is not None, checkpoint=checkpoint
+    )
+    result = train_mod.run_training_pipeline(config, device="cpu")
+    return result, calibrations
+
+
+def _single_artifact(tmp_path, name):
+    import json
+
+    (path,) = list(tmp_path.rglob(name))
+    return json.loads(path.read_text())
+
+
+class TestDivergedRunReportsFailure:
+    def test_a_diverged_run_returns_failure_and_says_where(self, monkeypatch, tmp_path):
+        result, calibrations = _run_deferring_finite_check(monkeypatch, tmp_path, diverge=True)
+        assert result["success"] is False
+        assert result["diverged_at_iteration"] == 1
+        assert "diverged at iteration 1" in result["error"]
+        # A certificate for a model with NaN weights is not a certificate.
+        assert calibrations == []
+
+    def test_run_summary_and_final_metrics_record_the_divergence(self, monkeypatch, tmp_path):
+        _run_deferring_finite_check(monkeypatch, tmp_path, diverge=True)
+        summary = _single_artifact(tmp_path, "run_summary.json")
+        assert summary["success"] is False
+        assert "diverged" in summary["error"]
+        assert _single_artifact(tmp_path, "final_metrics.json")["diverged_at_iteration"] == 1
+
+    def test_the_same_run_without_divergence_still_succeeds(self, monkeypatch, tmp_path):
+        """Control: the failure above is the divergence, not the harness."""
+        result, calibrations = _run_deferring_finite_check(monkeypatch, tmp_path, diverge=False)
+        assert result["success"] is True
+        assert _single_artifact(tmp_path, "final_metrics.json")["diverged_at_iteration"] is None
+        assert len(calibrations) == 1
+
+    def test_a_diverged_run_writes_no_final_checkpoint(self, monkeypatch, tmp_path):
+        """The final save stamps the last iteration; on a diverged run that tag
+        marks it finished and ``--resume if-present`` would load it."""
+        saved = []
+        _run_deferring_finite_check(monkeypatch, tmp_path, diverge=True, saved_steps=saved)
+        assert saved == []
+
+    def test_the_non_diverged_control_still_writes_the_final_checkpoint(
+        self, monkeypatch, tmp_path
+    ):
+        saved = []
+        _run_deferring_finite_check(monkeypatch, tmp_path, diverge=False, saved_steps=saved)
+        assert saved and saved[-1] == 4
+
+
+# ---------------------------------------------------------------------------
+# NonFiniteMonitor in the real loop: lag 1, and never a saved NaN step
+# ---------------------------------------------------------------------------
+#
+# The monitor reports a non-finite step one step late, or at the resolve that
+# precedes a save, validation, yield or loop exit. These drive the director-built
+# dummy run on CPU through the production guard (no `_guard_loss` patch).
+
+
+def _nan_from(monkeypatch, step, *, only=False):
+    """Make the loss non-finite from ``step`` on (the executor's global_step), or
+    at ``step`` alone when ``only`` -- the later steps then see the NaN weights
+    that step's update wrote, as a real run would."""
+    from spectramr.infrastructure.training.step_executor import StepExecutor
+    from spectramr.models.losses.computers.base import BaseLossComputer
+
+    current = {"step": None}
+    execute = StepExecutor.execute_step
+
+    def _tracking(self, step_configs, epoch, global_step, *a, **k):
+        current["step"] = global_step
+        return execute(self, step_configs, epoch, global_step, *a, **k)
+
+    stack = BaseLossComputer._stack_components
+
+    def _poisoned(self, *a, **k):
+        out = stack(self, *a, **k)
+        at = current["step"]
+        hit = at == step if only else at is not None and at >= step
+        return out * float("nan") if hit else out
+
+    monkeypatch.setattr(StepExecutor, "execute_step", _tracking)
+    monkeypatch.setattr(BaseLossComputer, "_stack_components", _poisoned)
+
+
+def _record_saves(monkeypatch, tmp_path, saved_steps):
+    from spectramr.infrastructure.checkpointing import store
+
+    def _record(pipeline, **kw):
+        saved_steps.append(kw["step"])
+        return tmp_path / "recorded.safetensors"
+
+    monkeypatch.setattr(store, "save_step", _record)
+
+
+class _StubScaler:
+    """A GradScaler stand-in that, like a real one on overflow, skips every step."""
+
+    def __init__(self):
+        self._per_optimizer_states = {}
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):
+        return None
+
+    def step(self, optimizer):
+        return None  # the skipped optimizer step of an overflowing scaler
+
+    def update(self):
+        return None
+
+
+def _run_dummy(monkeypatch, tmp_path, **config_kw):
+    import spectramr.pipelines.train as train_mod
+
+    monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: None)
+    return train_mod.run_training_pipeline(
+        _divergence_config(tmp_path, **config_kw), device="cpu"
+    )
+
+
+def test_run_detaches_the_monitor_when_the_loop_raises(monkeypatch):
+    """A raise out of the loop must not leave the executor recording into a
+    monitor nobody reads; ``TrainingLoop.run`` owns the detach on every exit."""
+    strategy = SimpleNamespace(step_executor=SimpleNamespace(nonfinite_monitor=None))
+
+    def _attach_then_raise(strategy, *a, **k):
+        strategy.step_executor.nonfinite_monitor = object()
+        raise RuntimeError("step failed")
+
+    monkeypatch.setattr(tl, "_execute_training_loop", _attach_then_raise)
+    with pytest.raises(RuntimeError, match="step failed"):
+        TrainingLoop(strategy, MagicMock(), None, "m").run()
+    assert strategy.step_executor.nonfinite_monitor is None
+
+
+def test_final_loss_scalar_is_one_host_float_or_none():
+    import torch
+
+    assert tl._final_loss_scalar({}) is None
+    assert tl._final_loss_scalar({"g_total_loss": torch.tensor(0.25)}) == 0.25
+    assert isinstance(tl._final_loss_scalar({"g_total_loss": torch.tensor(0.0)}), float)
+    assert tl._final_loss_scalar({"g_total_loss": 3}) == 3.0
+
+
+def test_stop_on_divergence_names_the_scanned_state_and_the_value(caplog):
+    """The scan runs on the weights after ``state_after`` (they already carry the
+    NaN step's update), and the critical line says nan vs inf when known."""
+    import torch
+
+    from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteVerdict
+
+    lines: list[str] = []
+    service = SimpleNamespace(log_critical=lines.append)
+    verdict = NonFiniteVerdict(iteration=2, names=("generator",), on_peer_rank=False)
+    with caplog.at_level(logging.CRITICAL):
+        got = tl._stop_on_divergence(
+            verdict,
+            logging_service=service,
+            generator=torch.nn.Linear(2, 2),
+            state_after=3,
+            losses={"g_total_loss": torch.tensor(float("inf"))},
+        )
+    assert got == 2
+    assert "iteration 2" in lines[0] and "(total = inf)" in lines[0]
+    assert "weights after iteration 3" in lines[0]
+    assert "[Divergence] iteration 3" in caplog.text
+
+    tl._stop_on_divergence(
+        verdict, logging_service=service, generator=torch.nn.Linear(2, 2), state_after=3
+    )
+    assert "total =" not in lines[1]
+
+
+class TestNonFiniteMonitorInTheLoop:
+    def test_a_nan_at_the_save_iteration_is_never_saved(self, monkeypatch, tmp_path):
+        """(a) Lag 1 alone would save step 2 and report it at step 3; the resolve
+        before the periodic save stops the run first and names step 2."""
+        saved: list[int] = []
+        _record_saves(monkeypatch, tmp_path, saved)
+        _nan_from(monkeypatch, 2)
+        result = _run_dummy(
+            monkeypatch, tmp_path, checkpoint_enabled=True, checkpoint={"save_interval": 2}
+        )
+        assert result["success"] is False, result
+        assert result["diverged_at_iteration"] == 2
+        assert saved == [], f"a checkpoint was written at {saved}"
+
+    def test_one_nan_step_stops_at_that_step_when_the_next_one_raises(
+        self, monkeypatch, tmp_path
+    ):
+        """A single NaN at step 2 writes NaN weights; step 3 then fails inside the
+        executor (every loss component is dropped, so the total is a leaf) before
+        the loop reaches ``end_step``. The failure must be reported as the
+        divergence at step 2, not as step 3's secondary error."""
+        saved: list[int] = []
+        _record_saves(monkeypatch, tmp_path, saved)
+        _nan_from(monkeypatch, 2, only=True)
+        result = _run_dummy(
+            monkeypatch, tmp_path, checkpoint_enabled=True, checkpoint={"save_interval": 1000}
+        )
+        assert result["success"] is False, result
+        assert result["diverged_at_iteration"] == 2
+        assert _single_artifact(tmp_path, "final_metrics.json")["diverged_at_iteration"] == 2
+        assert saved == [], f"a checkpoint was written at {saved}"
+
+    def test_run_summary_final_loss_is_a_number(self, monkeypatch, tmp_path):
+        """The loop keeps losses on the device; the summary must still carry a
+        float, not ``str(tensor)`` from ``json.dumps(default=str)``."""
+        result = _run_dummy(monkeypatch, tmp_path)
+        assert result["success"] is True, result.get("error")
+        assert isinstance(result["final_loss"], float)
+        final_loss = _single_artifact(tmp_path, "run_summary.json")["final_loss"]
+        assert isinstance(final_loss, float), repr(final_loss)
+
+    def test_a_nan_between_saves_is_named_at_its_own_iteration(self, monkeypatch, tmp_path):
+        """The verdict reaches the loop one step late but names the NaN step."""
+        _nan_from(monkeypatch, 1)
+        result = _run_dummy(monkeypatch, tmp_path)
+        assert result["success"] is False
+        assert result["diverged_at_iteration"] == 1
+
+    def test_a_nan_in_the_last_iteration_is_caught_at_loop_exit(self, monkeypatch, tmp_path):
+        """Iteration 5 of 5 is neither a validation (every 2) nor a save step, so
+        only the loop-exit resolve can see it before the final save."""
+        saved: list[int] = []
+        _record_saves(monkeypatch, tmp_path, saved)
+        _nan_from(monkeypatch, 5)
+        result = _run_dummy(
+            monkeypatch,
+            tmp_path,
+            max_iterations=5,
+            checkpoint_enabled=True,
+            checkpoint={"save_interval": 1000},
+            validation={"schedule": {"interval_steps": 2}},
+        )
+        assert result["diverged_at_iteration"] == 5
+        assert saved == [], "the final checkpoint of a diverged run was written"
+
+    def test_a_scaler_does_not_hide_a_nan_total(self, monkeypatch, tmp_path):
+        """(b) Under a GradScaler the per-config guard defers to the scaler, so
+        the loop's own record of the total is what stops the run."""
+        from spectramr.infrastructure.training.mixed_precision import (
+            MixedPrecisionIntegrationHelper,
+        )
+
+        init = MixedPrecisionIntegrationHelper.__init__
+
+        def _with_stub_scaler(self, *a, **k):
+            init(self, *a, **k)
+            self.scaler = _StubScaler()
+
+        monkeypatch.setattr(MixedPrecisionIntegrationHelper, "__init__", _with_stub_scaler)
+        _nan_from(monkeypatch, 1)
+        result = _run_dummy(monkeypatch, tmp_path)
+        assert result["success"] is False, result
+        assert result["diverged_at_iteration"] == 1
+
+    def test_a_non_log_step_performs_no_host_sync(self, monkeypatch, tmp_path):
+        """(c) Iterations 2..6 of 7 are not log steps (interval 1000; the first
+        and last are forced). Count every host read issued from the loop and the
+        guard path on those iterations. The monitor's own CPU read is excluded:
+        on CPU it is free, and its CUDA path is proven sync-free under
+        ``set_sync_debug_mode("error")`` in ``test_nonfinite_monitor.py``.
+
+        Positive controls: the tracked iterations must cover every non-log step,
+        and the same counter must see at least one host read from a file outside
+        the scoped three on those steps, so an inert patch cannot pass."""
+        result, reads = _count_non_log_host_reads(monkeypatch, tmp_path)
+        assert result["success"] is True, result.get("error")
+        assert reads.seen >= _NON_LOG_STEPS, f"tracked iterations {sorted(reads.seen)}"
+        assert reads.elsewhere, "the counter saw no host read at all; it is not live"
+        assert reads.owned == [], f"host syncs on non-log steps: {reads.owned}"
+
+    def test_the_host_sync_counter_flags_a_planted_read(self, monkeypatch, tmp_path):
+        """Planted violation (rule 15): an ``.item()`` compiled as if it were a
+        line of ``training_loop.py`` and run on every step must be counted on
+        each non-log step."""
+        result, reads = _count_non_log_host_reads(monkeypatch, tmp_path, plant=True)
+        assert result["success"] is True, result.get("error")
+        flagged = {it for it, path, _, attr in reads.owned if path == tl.__file__ and attr == "item"}
+        assert flagged == _NON_LOG_STEPS, reads.owned
+
+
+_NON_LOG_STEPS = set(range(2, 7))
+
+
+def _count_non_log_host_reads(monkeypatch, tmp_path, *, plant=False):
+    """Run the 7-step dummy with log interval 1000 and count host reads on the
+    non-log steps, split by whether the caller is the loop or the guard path."""
+    import sys
+
+    import torch
+
+    import spectramr.infrastructure.training.step_executor as executor_mod
+    import spectramr.infrastructure.training.strategy_interfaces as interfaces_mod
+
+    owned_files = {tl.__file__, executor_mod.__file__, interfaces_mod.__file__}
+    current: dict[str, int | None] = {"iteration": None}
+    reads = SimpleNamespace(owned=[], elsewhere=[], seen=set())
+
+    real_make_progress = tl.make_progress
+
+    class _Tracking:
+        """The real progress object, plus which iteration is running."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __iter__(self):
+            for it in self._inner:
+                current["iteration"] = it
+                reads.seen.add(it)
+                yield it
+            current["iteration"] = None
+
+        def set_postfix(self, data):
+            self._inner.set_postfix(data)
+
+        def close(self):
+            self._inner.close()
+
+    def _counting(attr):
+        real = getattr(torch.Tensor, attr)
+
+        def _wrapper(self, *a, **k):
+            caller = sys._getframe(1)
+            if current["iteration"] in _NON_LOG_STEPS:
+                where = (current["iteration"], caller.f_code.co_filename, caller.f_lineno, attr)
+                owned = caller.f_code.co_filename in owned_files
+                (reads.owned if owned else reads.elsewhere).append(where)
+            return real(self, *a, **k)
+
+        return _wrapper
+
+    monkeypatch.setattr(
+        tl, "make_progress", lambda *a, **k: _Tracking(real_make_progress(*a, **k))
+    )
+    for attr in ("item", "tolist", "cpu", "__bool__"):
+        monkeypatch.setattr(torch.Tensor, attr, _counting(attr))
+    if plant:
+        from spectramr.infrastructure.training.step_executor import StepExecutor
+
+        namespace: dict = {}
+        exec(compile("def _planted(t):\n    t.item()\n", tl.__file__, "exec"), namespace)
+        execute = StepExecutor.execute_step
+
+        def _with_planted_read(self, *a, **k):
+            out = execute(self, *a, **k)
+            namespace["_planted"](torch.zeros(()))
+            return out
+
+        monkeypatch.setattr(StepExecutor, "execute_step", _with_planted_read)
+    result = _run_dummy(
+        monkeypatch, tmp_path, max_iterations=7, logging={"intervals": {"log": 1000}}
+    )
+    return result, reads
+
+
+class TestFinalSaveIsNotDuplicated:
+    def _run(self, monkeypatch, tmp_path, interval):
+        calls: list = []
+        _run_deferring_finite_check(
+            monkeypatch,
+            tmp_path,
+            diverge=False,
+            saved_steps=[],
+            saved_calls=calls,
+            checkpoint={"save_interval": interval},
+        )
+        return [(kw["step"], kw["reason"]) for _, kw in calls]
+
+    def test_interval_dividing_the_run_saves_the_last_step_once(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, 2) == [(2, "periodic"), (4, "periodic")]
+
+    def test_interval_not_dividing_the_run_still_saves_final(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, 3) == [(3, "periodic"), (4, "final")]
+
+    def test_run_shorter_than_the_interval_saves_final(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, 100) == [(4, "final")]
+
+
+def test_evaluate_forwards_the_iteration_and_csv_of_a_validate_only_pass(monkeypatch):
+    """``--validate-only`` re-validates a resumed run at its own step and writes
+    the row where the in-training passes wrote theirs."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    captured: dict = {}
+
+    def fake_validation(pipeline, strategy, iteration, epoch, logging_service, **kw):
+        captured.update(iteration=iteration, epoch=epoch, **kw)
+        return {"val_nex_equivalent": 9.0}
+
+    drained: dict = {}
+    monkeypatch.setattr(training_loop_mod, "_run_validation", fake_validation)
+    monkeypatch.setattr(
+        training_loop_mod, "_drain_cascade_rows", lambda *a, **k: drained.update(k)
+    )
+    pipeline = MagicMock()
+    pipeline.generator.training = False
+    loop = TrainingLoop("strat", pipeline, "cfg", "unet")
+    metrics = loop.evaluate(iteration=25000, epoch=48, csv_file="run/logs/training_metrics.csv")
+    assert metrics == {"val_nex_equivalent": 9.0}
+    assert captured["iteration"] == 25000 and captured["epoch"] == 48
+    assert captured["csv_file"] == "run/logs/training_metrics.csv"
+    assert drained["iteration"] == 25000 and drained["epoch"] == 48
+
+
+def test_every_validation_event_is_tallied_and_judged_before_success():
+    """#181: the run-level verdict is only as good as its wiring. A full loop
+    OOM-kills a dev box, so the placement is pinned at source level (the repo's
+    convention for loop-body invariants); the verdict itself is exercised in
+    ``test_validation_evidence.py`` and its consumer in ``test_train.py``."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    src = inspect.getsource(training_loop_mod._execute_training_loop)
+    run_at = src.index("val_metrics = _run_validation(")
+    assert src.index("validation_tally.record(val_metrics)") > run_at
+    verdict_at = src.index("validation_failure_reason(validation_tally)")
+    success_at = src.rindex('"success": True')
+    assert verdict_at < success_at, "the verdict must gate the success return"
+    assert src.index("validation_failure_reason(validation_tally)") < src.index(
+        "if is_sanity_check:\n        passed, report"
+    ), "a sanity check must not pass on a validation that measured nothing"
+    assert src.count("**validation_tally.as_result_fields()") == 4
+
+
+class TestPolicyOwnsLrScheduler:
+    """The loop must not step a scheduler the step policy already steps."""
+
+    def test_owned_policy_is_detected(self):
+        from types import SimpleNamespace
+
+        from spectramr.pipelines.training_loop import policy_owns_lr_scheduler
+
+        strategy = SimpleNamespace(step_executor=SimpleNamespace(_policy_owns_lr_scheduler=True))
+        assert policy_owns_lr_scheduler(strategy) is True
+
+    @pytest.mark.parametrize("executor", [None, object()])
+    def test_absent_or_unflagged_executor_means_the_loop_steps(self, executor):
+        from types import SimpleNamespace
+
+        from spectramr.pipelines.training_loop import policy_owns_lr_scheduler
+
+        assert policy_owns_lr_scheduler(SimpleNamespace(step_executor=executor)) is False
+
+    def test_truthy_accident_is_not_ownership(self):
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.training_loop import policy_owns_lr_scheduler
+
+        assert policy_owns_lr_scheduler(MagicMock()) is False
+
+
+# ---------------------------------------------------------------------------
+# #1972 -- one checkpoint writer, one destination, and a failed save raises
+# ---------------------------------------------------------------------------
+#
+# A failed periodic save used to select a second writer (the pre-1.0 service) by
+# exception. It wrote a generator-only file into the retired
+# ``checkpoint.checkpoint_dir`` and the run carried on reporting success. These
+# drive the real dummy-model run.
+
+
+def _run_with_checkpoint_dir_elsewhere(monkeypatch, tmp_path, *, save_interval, fail_at=None):
+    """Run 4 iterations launched from ``elsewhere``, a directory outside the run.
+
+    The retired ``checkpoint.checkpoint_dir`` defaulted to ``./checkpoints``, which
+    the service created under the launch CWD (#2842). ``fail_at`` makes
+    ``store.save_step`` raise ENOSPC at those steps. Returns the result
+    and the two directories.
+    """
+    import errno
+
+    import spectramr.pipelines.train as train_mod
+    run_dir = tmp_path / "run"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    config = _divergence_config(
+        run_dir,
+        checkpoint_enabled=True,
+        checkpoint={"save_interval": save_interval},
+    )
+
+    if fail_at is not None:
+        from spectramr.infrastructure.checkpointing import store
+
+        real_save = store.save_step
+
+        def _save(pipeline, **kw):
+            if kw["step"] in fail_at:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_save(pipeline, **kw)
+
+        monkeypatch.setattr(store, "save_step", _save)
+    monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: None)
+    result = train_mod.run_training_pipeline(config, device="cpu")
+    return result, run_dir / "checkpoints", elsewhere
+
+
+def test_every_loss_schedule_save_is_gated_on_checkpoint_enabled_and_may_checkpoint():
+    """With ``checkpoint.enabled: false`` the loss-schedule save must not run.
+
+    Ungated, it called ``None.save_step`` (swallowed by the fail-soft handler and
+    logged as a save failure), or wrote a checkpoint the user had disabled when a
+    store was present. ``may_checkpoint`` stays in the gate: the save is a
+    collective under FSDP/DeepSpeed.
+    """
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    tree = _ast_of(training_loop_mod._execute_training_loop)
+    sites = 0
+
+    def _names(test: ast.AST) -> set[str]:
+        return {n.id for n in ast.walk(test) if isinstance(n, ast.Name)}
+
+    def _visit(node: ast.AST, guards: list[set[str]]) -> None:
+        nonlocal sites
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_save_loss_schedule_checkpoint"
+        ):
+            sites += 1
+            seen = set().union(*guards) if guards else set()
+            assert {"checkpoint_enabled", "may_checkpoint"} <= seen, seen
+        for child in ast.iter_child_nodes(node):
+            if isinstance(node, ast.If) and child in node.body:
+                _visit(child, [*guards, _names(node.test)])
+            else:
+                _visit(child, guards)
+
+    _visit(tree, [])
+    assert sites == 2, f"expected the two loss-schedule save sites, found {sites}"
+
+
+class TestOneCheckpointWriter:
+    def test_the_production_save_lands_in_the_run_and_nowhere_else(self, monkeypatch, tmp_path):
+        """Control and reachability: the real save path writes under output_dir."""
+        result, ckpt_dir, elsewhere = _run_with_checkpoint_dir_elsewhere(
+            monkeypatch, tmp_path, save_interval=2
+        )
+        assert result["success"] is True, result.get("error")
+        written = sorted(p.name for p in ckpt_dir.glob("step_*.safetensors"))
+        assert "step_00000002.safetensors" in written, written
+        assert "step_00000004.safetensors" in written, written
+        assert not (elsewhere / "checkpoints").exists(), "a checkpoints/ dir under the launch CWD"
+
+    def test_a_failed_periodic_save_stops_the_run_instead_of_writing_elsewhere(
+        self, monkeypatch, tmp_path
+    ):
+        result, _, elsewhere = _run_with_checkpoint_dir_elsewhere(
+            monkeypatch, tmp_path, save_interval=2, fail_at={2}
+        )
+        assert not (elsewhere / "checkpoints").exists()
+        assert result["success"] is False
+        assert "No space left on device" in result["error"]
+
+    def test_a_failed_final_save_fails_the_run(self, monkeypatch, tmp_path):
+        """No periodic save fires (interval 1000); only the final one, and it fails."""
+        result, ckpt_dir, _ = _run_with_checkpoint_dir_elsewhere(
+            monkeypatch, tmp_path, save_interval=1000, fail_at={4}
+        )
+        assert result["success"] is False
+        assert "No space left on device" in result["error"]
+        assert not list(ckpt_dir.glob("step_*.safetensors"))
+
+    def test_the_loop_holds_no_second_writer(self):
+        """Source pin: the loop never calls the service's save."""
+        for func in (tl._execute_training_loop, tl._save_loss_schedule_checkpoint):
+            assert not _method_calls(func, "save_checkpoint"), func.__name__
+
+
+def test_enabled_checkpointing_without_a_store_raises():
+    src = _loop_source()
+    assert "checkpoint.enabled is true but no checkpoint store was injected" in src
+
+
+def test_the_loss_schedule_save_goes_through_save_step(tmp_path):
+    """The helper writes a real step file through the store, with its reason, and
+    keep_last_n applies to it like any other step."""
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.checkpointing import codecs
+    from spectramr.infrastructure.checkpointing.facade import CheckpointStore
+    from tests.unit.infrastructure.checkpointing.conftest import make_pipeline
+
+    config = SimpleNamespace(checkpoint=SimpleNamespace(format="pt", keep_last_n=1))
+    for step in (3, 7):
+        tl._save_loss_schedule_checkpoint(
+            checkpoint_service=CheckpointStore(),
+            config=config, pipeline=make_pipeline(), strategy=None,
+            output_paths={"run_output_dir": str(tmp_path)}, epoch=0, iteration=step,
+            logging_service=None, parallel_runtime=None, early_stopping_service=None,
+        )
+    files = sorted((tmp_path / "checkpoints").iterdir())
+    assert [p.name for p in files] == ["step_00000007.pt"]
+    assert codecs.read(files[0])["meta"]["reason"] == "loss_schedule"
+
+
+# ---------------------------------------------------------------------------
+# checkpoint.async_write: one writer per run, drained before anything reads
+# ---------------------------------------------------------------------------
+
+
+def _failing_writer(tmp_path, *, fatal: bool):
+    from unittest.mock import patch
+
+    from spectramr.infrastructure.checkpointing import async_writer
+    from spectramr.infrastructure.checkpointing.async_writer import CheckpointWriter
+    from tests.unit.infrastructure.checkpointing.conftest import make_run_state
+
+    (tmp_path / "checkpoints").mkdir()
+    name, role = ("step_00000150.pt", "step") if fatal else ("best.pt", "best")
+    path = tmp_path / "checkpoints" / name
+    writer = CheckpointWriter()
+    with patch.object(async_writer.codecs, "write", side_effect=OSError("disk full")):
+        writer.submit(path, make_run_state("pt", role=role), None, fatal=fatal)
+        writer._pending.result()
+    return writer, path
+
+
+def test_the_end_of_loop_drain_fails_the_run_on_a_fatal_write(tmp_path):
+    """#1972, behaviourally: a periodic/final write that failed off-thread stops the run."""
+    from spectramr.infrastructure.checkpointing.async_writer import CheckpointWriteError
+
+    writer, path = _failing_writer(tmp_path, fatal=True)
+    with pytest.raises(CheckpointWriteError) as caught:
+        tl._finish_checkpoints(writer, None)
+    assert caught.value.path == path
+    assert writer._executor is None
+
+
+def test_the_end_of_loop_drain_records_a_failed_best_write(tmp_path):
+    """#713: a failed best write is reported as best_checkpoint_error, not raised."""
+    writer, path = _failing_writer(tmp_path, fatal=False)
+    error = tl._finish_checkpoints(writer, "iter 3: earlier", 3)
+    assert error.startswith("iter 150: ") and str(path) in error and "disk full" in error
+
+
+def test_a_later_synchronous_best_error_is_not_overridden_by_an_earlier_async_one(tmp_path):
+    writer, _ = _failing_writer(tmp_path, fatal=False)  # fails at iter 150
+    assert tl._finish_checkpoints(writer, "iter 200: sync", 200) == "iter 200: sync"
+
+
+def test_without_a_writer_the_best_error_passes_through():
+    assert tl._finish_checkpoints(None, "iter 3: x") == "iter 3: x"
+
+
+def test_every_save_site_hands_over_the_run_s_writer():
+    src = _loop_source() + inspect.getsource(tl._save_loss_schedule_checkpoint)
+    saves = src.count("checkpoint_service.save_step(") + src.count("checkpoint_service.save_best(")
+    assert saves == 4
+    assert len(re.findall(r"(?<!checkpoint_)writer=checkpoint_writer,", src)) == saves
+    assert src.count("checkpoint_writer=checkpoint_writer,") == 2  # both loss-schedule sites
+
+
+def test_the_fail_soft_saves_let_an_earlier_fatal_write_through():
+    """A periodic failure surfacing at a best or loss-schedule submit is not theirs to swallow."""
+    for src in (_loop_source(), inspect.getsource(tl._save_loss_schedule_checkpoint)):
+        reraise = src.index("except CheckpointWriteError:\n")
+        assert src[reraise:].split("\n")[1].strip().startswith("raise")
+        assert reraise < src.index("except Exception as", reraise)
+
+
+def test_writes_are_finished_before_the_best_path_is_broadcast_and_read():
+    src = _loop_source()
+    finish = src.index("best_checkpoint_error = _finish_checkpoints(")
+    assert src.index('reason="final"') < finish
+    assert finish < src.index("RankUtility.broadcast_object(best_checkpoint_path)")
+
+
+# The real store, the real writer thread and the real loop, on the CPU harness above.
+
+
+def _run_async(monkeypatch, tmp_path, *, save_interval, fail_step=None, budget=None):
+    import spectramr.pipelines.train as train_mod
+    from spectramr.infrastructure.checkpointing import async_writer, codecs
+
+    config = _divergence_config(
+        tmp_path,
+        checkpoint_enabled=True,
+        checkpoint={"async_write": True, "save_interval": save_interval, "format": "pt"},
+    )
+    if fail_step is not None:
+        real = codecs.write
+
+        def write(path, state):
+            if state["meta"]["step"] == fail_step:
+                raise OSError("disk full")
+            real(path, state)
+
+        monkeypatch.setattr(async_writer.codecs, "write", write)
+    if budget is not None:
+        monkeypatch.setattr(tl, "resolve_wall_clock_budget", lambda: budget)
+        monkeypatch.setattr(tl, "resolve_check_interval", lambda *_: 1)
+    monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: None)
+    result = train_mod.run_training_pipeline(config, device="cpu")
+    ckpt_dir = tmp_path / "checkpoints"
+    files = {p.name: codecs.read(p)["meta"]["reason"] for p in sorted(ckpt_dir.glob("step_*.pt"))}
+    return result, files
+
+
+class TestAsyncWriteThroughTheLoop:
+    def test_periodic_steps_land_and_the_last_one_is_not_written_twice(
+        self, monkeypatch, tmp_path
+    ):
+        result, files = _run_async(monkeypatch, tmp_path, save_interval=2)
+        assert result["success"] is True, result.get("error")
+        assert files == {"step_00000002.pt": "periodic", "step_00000004.pt": "periodic"}
+
+    def test_a_failed_periodic_write_fails_the_run_and_names_its_file(
+        self, monkeypatch, tmp_path
+    ):
+        result, _ = _run_async(monkeypatch, tmp_path, save_interval=2, fail_step=2)
+        assert result["success"] is False
+        assert "step_00000002" in result["error"] and "disk full" in result["error"]
+
+    def test_the_final_file_is_on_disk_when_the_call_returns(self, monkeypatch, tmp_path):
+        result, files = _run_async(monkeypatch, tmp_path, save_interval=3)
+        assert result["success"] is True, result.get("error")
+        assert files == {"step_00000003.pt": "periodic", "step_00000004.pt": "final"}
+
+    def test_a_yield_leaves_its_file_on_disk_when_the_call_returns(self, monkeypatch, tmp_path):
+        """Failure mode 4: the yield breaks the loop, and its save must still land."""
+        import time
+        from types import SimpleNamespace
+
+        calls = []
+
+        def expired():
+            calls.append(1)
+            return len(calls) >= 2
+
+        budget = SimpleNamespace(
+            expired=expired,
+            deadline=time.time() + 60,
+            seconds_remaining=lambda: 60.0,
+            margin_s=0.0,
+        )
+        result, files = _run_async(monkeypatch, tmp_path, save_interval=1000, budget=budget)
+        assert list(files.values()) == ["yield"], (result.get("error"), files)
+
+    def test_an_early_stop_at_a_periodic_step_still_writes_the_final(self, monkeypatch, tmp_path):
+        """The stop breaks before that step's periodic save, so no duplicate to skip."""
+        src = _loop_source()
+        stop = src.index("Early Stopping triggered at iter")
+        assert stop < src.index('reason="yield" if wall_clock_yield else "periodic"')
+        assert stop < src.index('reason="final"')
+
+    def test_an_exception_mid_loop_drains_the_write_and_keeps_the_real_error(
+        self, monkeypatch, tmp_path
+    ):
+        """The exit-stack close lands the in-flight periodic write and stops the thread."""
+        import threading
+
+        import spectramr.pipelines.train as train_mod
+        from spectramr.infrastructure.checkpointing import async_writer, codecs
+
+        planted = RuntimeError("planted step failure")
+        gate, submitted, writers, caught = threading.Event(), threading.Event(), [], []
+        real_write, real_submit, real_run = codecs.write, async_writer.CheckpointWriter.submit, tl.TrainingLoop.run
+
+        def slow_write(path, state):
+            assert gate.wait(timeout=10)
+            real_write(path, state)
+
+        def submit(self, *a, **k):
+            writers.append(self)
+            real_submit(self, *a, **k)
+            submitted.set()
+
+        def run(self, **kw):
+            real_step = self.strategy.train_step
+
+            def step(*a, **k):
+                if submitted.is_set():
+                    gate.set()  # the write is in flight; let it finish during teardown
+                    raise planted
+                return real_step(*a, **k)
+
+            self.strategy.train_step = step
+            try:
+                return real_run(self, **kw)
+            except BaseException as exc:
+                caught.append(exc)
+                raise
+
+        monkeypatch.setattr(async_writer.codecs, "write", slow_write)
+        monkeypatch.setattr(async_writer.CheckpointWriter, "submit", submit)
+        monkeypatch.setattr(tl.TrainingLoop, "run", run)
+        monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: None)
+        config = _divergence_config(
+            tmp_path,
+            checkpoint_enabled=True,
+            checkpoint={"async_write": True, "save_interval": 2, "format": "pt"},
+        )
+        result = train_mod.run_training_pipeline(config, device="cpu")
+
+        assert caught == [planted] and caught[0] is planted
+        assert result["success"] is False and result["error"] == "planted step failure"
+        [writer] = set(writers)
+        assert writer._executor is None
+        assert not any(t.name.startswith("ckpt-writer") for t in threading.enumerate())
+        assert codecs.read(tmp_path / "checkpoints" / "step_00000002.pt")["meta"]["reason"] == (
+            "periodic"
+        )
+
+
+# ---------------------------------------------------------------------------
+# training CSV: one persistent handle (Task 4.1)
+# ---------------------------------------------------------------------------
+
+
+class TestCsvRowSink:
+    FIELDS = ("iteration", "epoch", "g_total_loss")
+
+    def _rows(self):
+        return [{"iteration": i, "epoch": 0, "g_total_loss": 1.0 / i, "extra": 9} for i in range(1, 6)]
+
+    def test_five_rows_open_once_and_match_per_row_append(self, tmp_path, monkeypatch):
+        import builtins
+        import csv as csv_mod
+
+        from spectramr.pipelines.training_loop import _CsvRowSink
+
+        expected = tmp_path / "expected.csv"
+        with open(expected, "w", newline="") as f:
+            csv_mod.DictWriter(f, fieldnames=list(self.FIELDS)).writeheader()
+        for row in self._rows():
+            with open(expected, "a", newline="") as f:
+                csv_mod.DictWriter(f, fieldnames=list(self.FIELDS), extrasaction="ignore").writerow(row)
+
+        actual = tmp_path / "actual.csv"
+        with open(actual, "w", newline="") as f:
+            csv_mod.DictWriter(f, fieldnames=list(self.FIELDS)).writeheader()
+        opens = []
+        real_open = builtins.open
+        monkeypatch.setattr(
+            builtins, "open", lambda *a, **k: (opens.append(a), real_open(*a, **k))[1]
+        )
+        sink = _CsvRowSink(actual, list(self.FIELDS))
+        for row in self._rows():
+            sink.write(row)
+            # flushed: complete on disk before close
+            assert actual.read_text().count("\n") >= 1
+        assert len([o for o in opens if str(actual) in str(o[0])]) == 1
+        assert actual.read_text().splitlines()[-1] == expected.read_text().splitlines()[-1]
+        sink.close()
+        assert actual.read_text() == expected.read_text()
+
+    def test_rows_complete_on_disk_without_close(self, tmp_path):
+        from spectramr.pipelines.training_loop import _CsvRowSink
+
+        p = tmp_path / "m.csv"
+        p.write_text("iteration,epoch,g_total_loss\n")
+        sink = _CsvRowSink(p, list(self.FIELDS))
+        sink.write({"iteration": 1, "epoch": 0, "g_total_loss": 0.5})
+        assert p.read_text().splitlines()[-1] == "1,0,0.5"
+        sink.close()
+        sink.close()  # idempotent
+
+    def test_a_failed_flush_closes_the_handle_and_the_next_row_reopens(self, tmp_path):
+        import pytest
+
+        from spectramr.pipelines.training_loop import _CsvRowSink
+
+        p = tmp_path / "m.csv"
+        p.write_text("iteration,epoch,g_total_loss\n")
+        sink = _CsvRowSink(p, list(self.FIELDS))
+        sink.write({"iteration": 1, "epoch": 0, "g_total_loss": 0.5})
+        first_fh = sink._fh
+
+        def boom():
+            raise OSError("disk full")
+
+        first_fh.flush = boom
+        with pytest.raises(OSError, match="disk full"):
+            sink.write({"iteration": 2, "epoch": 0, "g_total_loss": 0.25})
+        assert sink._fh is None and first_fh.closed
+        sink.write({"iteration": 3, "epoch": 0, "g_total_loss": 0.125})
+        sink.close()
+        lines = p.read_text().splitlines()
+        assert lines[0] == "iteration,epoch,g_total_loss"
+        assert all(len(ln.split(",")) == 3 for ln in lines)
+        assert lines[-1] == "3,0,0.125"
+
+
+class _RecordingSink(tl._CsvRowSink):
+    instances: ClassVar[list[_RecordingSink]] = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.opens = 0
+        self.rows = 0
+        self.closed = False
+        _RecordingSink.instances.append(self)
+
+    def write(self, row):
+        was_open = self._fh is not None
+        super().write(row)
+        self.rows += 1
+        self.opens += 0 if was_open else 1
+
+    def close(self):
+        super().close()
+        self.closed = True
+
+
+class TestCsvSinkClosesOnEveryLoopExit:
+    """Drives the real (tiny, CPU) loop; every exit must leave the handle closed."""
+
+    def _run(self, monkeypatch, tmp_path, *, mode):
+        import spectramr.pipelines.train as train_mod
+        from spectramr.infrastructure.training.backward_guard import ensure_backward_ready
+        from spectramr.infrastructure.training.step_executor import StepExecutor
+        from spectramr.models.losses.computers.base import BaseLossComputer
+
+        _RecordingSink.instances = []
+        monkeypatch.setattr(tl, "_CsvRowSink", _RecordingSink)
+        monkeypatch.setattr(tl, "_maybe_run_calibration", lambda *a, **k: None)
+        stack = BaseLossComputer._stack_components
+        calls = {"n": 0}
+
+        def patched(self, *a, **k):
+            calls["n"] += 1
+            if mode == "exception" and calls["n"] >= 3:
+                raise RuntimeError("boom from train_step")
+            out = stack(self, *a, **k)
+            # NaN only from the third call: a first-step NaN breaks before any row is logged.
+            return out * float("nan") if mode == "diverge" and calls["n"] >= 3 else out
+
+        if mode == "diverge":
+            monkeypatch.setattr(
+                StepExecutor,
+                "_guard_loss",
+                lambda self, loss, *, name, global_step: ensure_backward_ready(
+                    loss, name=name, global_step=global_step
+                ),
+            )
+        monkeypatch.setattr(BaseLossComputer, "_stack_components", patched)
+        config = _divergence_config(tmp_path, log_interval=1)
+        with contextlib.suppress(RuntimeError):
+            train_mod.run_training_pipeline(config, device="cpu")
+        (sink,) = _RecordingSink.instances
+        return sink
+
+    def test_normal_completion_opens_once_and_closes(self, monkeypatch, tmp_path):
+        sink = self._run(monkeypatch, tmp_path, mode="normal")
+        assert sink.rows >= 3 and sink.opens == 1 and sink.closed
+        assert sink._fh is None
+
+    def test_exception_in_the_step_closes_the_handle(self, monkeypatch, tmp_path):
+        sink = self._run(monkeypatch, tmp_path, mode="exception")
+        assert sink.rows >= 1 and sink.closed and sink._fh is None
+
+    def test_divergence_break_closes_the_handle(self, monkeypatch, tmp_path):
+        sink = self._run(monkeypatch, tmp_path, mode="diverge")
+        assert _RecordingSink.instances
+        assert sink.rows >= 1 and sink.closed and sink._fh is None
+
+
+def test_the_finished_result_names_the_step_its_restored_weights_come_from() -> None:
+    """test_metrics.json said iteration 84001 for weights restored from step 54000.
+
+    Every dict literal that reports ``best_weights_restored`` must carry
+    ``best_iteration`` beside it, read from the early-stopping service.
+    """
+    from spectramr.pipelines import training_loop
+
+    tree = ast.parse(inspect.getsource(training_loop))
+    results = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "best_weights_restored" for k in node.keys)
+    ]
+    assert results, "the loop no longer reports best_weights_restored"
+    for node in results:
+        keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        assert "best_iteration" in keys
+    es = SimpleNamespace(best_iteration=54000)
+    assert training_loop._extract_es_best_iter(es) == 54000
+    assert training_loop._extract_es_best_iter(None) is None

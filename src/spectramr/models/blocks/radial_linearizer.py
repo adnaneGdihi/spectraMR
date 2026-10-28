@@ -28,6 +28,7 @@ Reference:
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -189,7 +190,7 @@ class MorphologicalRadialLinearizer(nn.Module):
             self.register_buffer("mac_fwd", torch.tensor(mac_fwd, dtype=torch.long))
         self.register_buffer("mac_inv", torch.argsort(self.mac_fwd))
 
-        total_patches = int(torch.prod(torch.tensor(list(grid_shape))).item())
+        total_patches = math.prod(grid_shape)
         logger.info(
             "[MorphologicalRadialLinearizer] mode=%s, shape=%s, "
             "patch_size=%d, grid=%s, total_patches=%d",

@@ -50,6 +50,9 @@ class InfoNCECritic(nn.Module):
         bank_size: Capacity of the momentum bank when enabled.
     """
 
+    _bank: torch.Tensor | None
+    _bank_ptr: torch.Tensor | None
+
     def __init__(
         self,
         temperature: float = 0.1,
@@ -61,6 +64,15 @@ class InfoNCECritic(nn.Module):
         super().__init__()
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0; got {temperature}.")
+        if negative_pool not in ("in_batch", "momentum_bank"):
+            raise ValueError(
+                f"negative_pool must be 'in_batch' or 'momentum_bank'; got {negative_pool!r}."
+            )
+        if negative_pool == "momentum_bank" and bank_size <= 0:
+            raise ValueError(
+                "negative_pool='momentum_bank' needs bank_size > 0; with an empty bank "
+                "the critic would score in-batch negatives only."
+            )
         self.temperature = float(temperature)
         self.negative_pool = negative_pool
         self.bank_size = bank_size
@@ -91,16 +103,19 @@ class InfoNCECritic(nn.Module):
 
         # Momentum bank (registered as a non-persistent buffer so it
         # doesn't pollute checkpoints; rotated FIFO).
-        if negative_pool == "momentum_bank" and bank_size > 0:
+        # ``_ptr`` mirrors ``_bank_ptr`` on the host so the FIFO write never reads
+        # the device buffer back (one ``.item()`` sync per step).
+        self._ptr = 0
+        if negative_pool == "momentum_bank":
             self.register_buffer("_bank", torch.empty(0), persistent=False)
             self.register_buffer("_bank_ptr", torch.zeros(1, dtype=torch.long), persistent=False)
         else:
-            self._bank = None  # type: ignore[assignment]
-            self._bank_ptr = None  # type: ignore[assignment]
+            self._bank = None
+            self._bank_ptr = None
 
     def _enqueue(self, y_proj: torch.Tensor) -> None:
         """Push the projected features into the momentum bank (FIFO)."""
-        if self.bank_size <= 0 or self._bank is None:
+        if self.bank_size <= 0 or self._bank is None or self._bank_ptr is None:
             return
         if self._bank.numel() == 0:
             self._bank = torch.zeros(
@@ -118,7 +133,7 @@ class InfoNCECritic(nn.Module):
         if y_proj.shape[0] > self.bank_size:
             y_proj = y_proj[-self.bank_size :]
         b = y_proj.shape[0]
-        ptr = int(self._bank_ptr.item())
+        ptr = self._ptr
         # Contiguous FIFO write with explicit split — robust to the exact-fill
         # case ``ptr + b == bank_size`` where ``(ptr + b) % bank_size`` wraps to
         # 0 and an ``[ptr:0]`` slice would silently drop the whole batch.
@@ -127,7 +142,8 @@ class InfoNCECritic(nn.Module):
         remainder = b - first
         if remainder > 0:
             self._bank[:remainder] = y_proj[first:].detach()
-        self._bank_ptr[0] = (ptr + b) % self.bank_size
+        self._ptr = (ptr + b) % self.bank_size
+        self._bank_ptr[0] = self._ptr
 
     def forward(
         self,

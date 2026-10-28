@@ -413,3 +413,54 @@ class TestUniversalTrainingKeysAreDeclared:
         assert cfg.training_mode == "diffusion"
         assert cfg.input_domain == "kspace"
         assert cfg.output_domain is None
+
+
+_GRAPH_COLD = (
+    "spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy."
+    "GraphColdDiffusionStrategy"
+)
+
+
+class TestRicianColdDiffusionKnobs:
+    """``degradation: rician`` + its sigma and the validation level are GraphCold-only."""
+
+    def test_rician_needs_its_noise_ceiling(self) -> None:
+        from spectramr.config.schemas.training.base import DiffusionTrainingConfigSchema
+
+        with pytest.raises(ValueError, match="needs rician_sigma_max"):
+            DiffusionTrainingConfigSchema(degradation="rician")
+
+    def test_a_noise_ceiling_without_rician_is_refused(self) -> None:
+        from spectramr.config.schemas.training.base import DiffusionTrainingConfigSchema
+
+        with pytest.raises(ValueError, match="read only with degradation: rician"):
+            DiffusionTrainingConfigSchema(degradation="kspace_mask", rician_sigma_max=0.1)
+
+    def test_the_validation_level_must_sit_on_the_schedule(self) -> None:
+        from spectramr.config.schemas.training.base import DiffusionTrainingConfigSchema
+
+        with pytest.raises(ValueError, match="must be < timesteps"):
+            DiffusionTrainingConfigSchema(timesteps=10, validation_timestep=10)
+
+    def test_the_graph_cold_strategy_accepts_them(self) -> None:
+        block = {"degradation": "rician", "rician_sigma_max": 0.2, "validation_timestep": 3}
+        cfg = TrainingStrategyConfigSchema(strategy_class=_GRAPH_COLD, diffusion=block)
+        assert cfg.diffusion.rician_sigma_max == 0.2
+        assert cfg.diffusion.validation_timestep == 3
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"degradation": "rician", "rician_sigma_max": 0.2},
+            {"validation_timestep": 3},
+        ],
+    )
+    def test_any_other_strategy_is_refused(self, block) -> None:
+        other = "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
+        with pytest.raises(ValueError, match="read only by GraphColdDiffusionStrategy"):
+            TrainingStrategyConfigSchema(strategy_class=other, diffusion=block)
+
+    def test_kspace_mask_stays_legal_everywhere(self) -> None:
+        other = "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
+        cfg = TrainingStrategyConfigSchema(strategy_class=other, diffusion={"degradation": "kspace_mask"})
+        assert cfg.diffusion.degradation == "kspace_mask"

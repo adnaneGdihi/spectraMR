@@ -48,7 +48,6 @@ class TestDiffusionSchemaFieldAccessibility:
         "type",
         "prediction_type",
         "degradation",
-        "degradation_dynamics",
         "enable_diffusion_amp",
         "enforce_output_range",
         "lambda_mse",
@@ -133,7 +132,6 @@ class TestDiffusionStrategyConsumesSchemaFields:
         "cond_drop_prob",  # Classifier-free guidance dropout — not yet wired
         "guidance_scale",  # CFG scale — not yet implemented in training loop
         "enable_diffusion_amp",  # Separate AMP path — not wired
-        "degradation_dynamics",  # Schema-only, no consumer yet
         "sampling_steps",  # Inference-only, not read during training
         "type",  # Used indirectly via cold_diffusion check
         "degradation",  # Read via cold_diffusion branch

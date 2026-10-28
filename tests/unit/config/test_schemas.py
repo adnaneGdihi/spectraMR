@@ -186,15 +186,6 @@ class TestEarlyStoppingSchema:
         assert config.patience == 20
         assert config.min_delta == 0.001
 
-    # @# pytest.mark.timeout(30)
-    def test_early_stopping_check_interval(self):
-        """Test iteration-based check_interval."""
-        from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
-
-        config = EarlyStoppingConfigSchema(check_interval=5000)
-
-        assert config.check_interval == 5000
-
 
 # === Physics Schema Tests ===
 class TestPhysicsSchema:

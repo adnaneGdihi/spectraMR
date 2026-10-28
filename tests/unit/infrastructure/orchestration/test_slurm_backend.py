@@ -16,6 +16,10 @@ lives behind the ``@pytest.mark.integration`` marker (none yet).
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+
 import pytest
 
 from spectramr.infrastructure.orchestration.slurm_backend import JobStatus, SLURMBackend
@@ -235,6 +239,53 @@ class TestGenerateJobScript:
         assert "torchrun" in out
         assert "--nproc_per_node=" in out
 
+    @staticmethod
+    def _train_cmd(script: str, *, torchrun: bool) -> str:
+        """The one ``TRAIN_CMD=`` line for the requested branch.
+
+        Both branches are emitted into every script -- the selection is a bash
+        ``if`` on ``NUM_GPUS`` at run time, not a generator-side choice -- so a
+        bare ``in out`` assertion reads the wrong branch's text and passes
+        whatever the other one says. That is precisely how the
+        ``cli train``-under-torchrun defect stayed green (#2228): the multi-rank
+        case asserted only that the word ``torchrun`` appeared somewhere.
+        """
+        lines = [ln for ln in script.splitlines() if "TRAIN_CMD=" in ln]
+        picked = [ln for ln in lines if ("torchrun" in ln) is torchrun]
+        assert len(picked) == 1, f"expected one branch, got {picked}"
+        return picked[0]
+
+    def test_the_multi_rank_branch_launches_train_distributed(self) -> None:
+        """#2228: ``train`` never calls ``setup_distributed``.
+
+        Under torchrun that spelling leaves every rank without a process group,
+        so a DeepSpeed/DDP/FSDP arm builds its model and data and only then
+        raises out of ``_require_process_group`` at Stage B.
+        """
+        cmd = self._train_cmd(self._script(slurm_params={"gpus": 4}), torchrun=True)
+        assert "-m spectramr.cli train-distributed --config" in cmd
+        # The planted spelling: `cli train` followed by anything but `-distributed`.
+        assert not re.search(r"cli train(?!-distributed)", cmd), cmd
+
+    def test_multi_node_takes_the_same_branch_as_multi_gpu(self) -> None:
+        """The second shape of the same rule: ``nodes > 1`` at one GPU each."""
+        cmd = self._train_cmd(
+            self._script(slurm_params={"gpus": 1, "nodes": 2}), torchrun=True
+        )
+        assert "-m spectramr.cli train-distributed --config" in cmd
+
+    def test_the_single_process_branch_keeps_the_plain_train_verb(self) -> None:
+        """Not a copy of the rule above -- its inverse.
+
+        One process with no rendezvous genuinely wants ``train``;
+        ``train-distributed`` there would call ``setup_distributed`` with no
+        launcher behind it. Pinning both directions is what stops a fix to one
+        branch being pasted over the other.
+        """
+        cmd = self._train_cmd(self._script(slurm_params={"gpus": 1}), torchrun=False)
+        assert "python -m spectramr.cli train --config" in cmd
+        assert "train-distributed" not in cmd
+
     def test_single_gpu_uses_canonical_cli_entrypoint(self) -> None:
         out = self._script()
         # Single-GPU path must use the canonical module entrypoint. The
@@ -257,6 +308,130 @@ class TestGenerateJobScript:
         assert "python -m spectramr.cli predict" in out
         assert "--model " in out
         assert "infer --checkpoint" not in out
+
+    def test_inference_block_carries_no_checkpoint_pattern_of_its_own(self) -> None:
+        """The block asks Python for the checkpoint; a bash glob would be a second owner of
+        the discovery rule, and the old one picked the deleted writer's files by mtime (#2853)."""
+        out = self._script(test_manifest="/shared/test_manifest.txt")
+        assert "checkpoint_step_" not in out
+        assert "checkpoint_epoch_" not in out
+        assert "ls -t" not in out
+        assert "python -m spectramr.cli.resolve_checkpoint" in out
+
+    @staticmethod
+    def _job_env() -> dict[str, str]:
+        """The job's python on PATH and this checkout's ``src`` first, as the script exports."""
+        import sys
+        from pathlib import Path
+
+        import spectramr
+
+        return {
+            **os.environ,
+            "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+            "PYTHONPATH": str(Path(spectramr.__file__).resolve().parents[1]),
+            "SPECTRAMR_SUPPRESS_CLINICAL_WARNING": "1",
+        }
+
+    @staticmethod
+    def _v1(path, mtime: float | None = None):
+        import torch
+
+        from tests.fixtures.run_state_files import write_run_state
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        role = "best" if path.stem == "best" else "step"
+        write_run_state(path, {"generator": {"w": torch.zeros(1)}}, role=role)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _resolved_checkpoint(self, tmp_path) -> subprocess.CompletedProcess[str]:
+        """Run the rendered checkpoint lookup against ``tmp_path`` and echo what it chose."""
+        script = SLURMBackend.generate_job_script(
+            experiment_name="exp_alpha",
+            config_path="experiments/inprogress/exp.yaml",
+            output_dir=str(tmp_path),
+            base_dir="/project/spectramr",
+            test_manifest="/shared/m.txt",
+        )
+        block = script.split("# ── Automated Inference ──", 1)[1].split("MANIFEST=", 1)[0]
+        return subprocess.run(
+            ["bash", "-c", block + 'echo "CHECKPOINT=${CHECKPOINT}"'],
+            env=self._job_env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_rendered_lookup_picks_the_latest_step(self, tmp_path) -> None:
+        self._v1(tmp_path / "checkpoints" / "step_00002000.pt", mtime=1_000)
+        latest = self._v1(tmp_path / "checkpoints" / "step_00003000.safetensors")
+        out = self._resolved_checkpoint(tmp_path).stdout
+        assert f"CHECKPOINT={latest}" in out
+
+    def test_rendered_lookup_prefers_the_best_checkpoint(self, tmp_path) -> None:
+        self._v1(tmp_path / "checkpoints" / "step_00002000.pt")
+        best = self._v1(tmp_path / "checkpoints" / "best.pt")
+        assert f"CHECKPOINT={best}" in self._resolved_checkpoint(tmp_path).stdout
+
+    def test_rendered_lookup_skips_loudly_without_a_checkpoint(self, tmp_path) -> None:
+        (tmp_path / "checkpoints").mkdir()
+        (tmp_path / "checkpoints" / "checkpoint_step_3000.safetensors").write_bytes(b"x")
+        proc = self._resolved_checkpoint(tmp_path)
+        assert "CHECKPOINT=\n" in proc.stdout
+        assert "no checkpoint" in proc.stderr
+        assert "convert_checkpoints_v1.py" in proc.stderr
+
+    @staticmethod
+    def _injection_block(script: str) -> str:
+        start = script.index("PARENT_CHECKPOINT_0=")
+        return script[start : script.index("\n", script.index("exit 3", start)) + 1]
+
+    @pytest.mark.parametrize("parent_name", ["parent", "par ent $HOME"])
+    def test_a_checkpoint_injection_resolves_at_job_start(self, tmp_path, parent_name) -> None:
+        """Review Focus 4: a parent with no best still chains through its latest step.
+
+        A space or a ``$`` in the campaign dir must reach the override verbatim.
+        """
+        parent = tmp_path / parent_name
+        step = self._v1(parent / "checkpoints" / "step_00000500.safetensors")
+        script = self._script(checkpoint_injections={"model.checkpoint_path": str(parent)})
+        block = self._injection_block(script)
+        # The single-process TRAIN_CMD line, assembled the way the job assembles it; the
+        # injected value must survive its double quotes and the later `eval`.
+        train_cmd = next(
+            line
+            for line in script.splitlines()
+            if line.strip().startswith('TRAIN_CMD="python -m spectramr.cli train ')
+        )
+        proc = subprocess.run(
+            ["bash", "-c", block + train_cmd.strip() + "\neval \"printf '%s\\n' $TRAIN_CMD\""],
+            env=self._job_env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert f"model.checkpoint_path={step}" in proc.stdout.splitlines()
+
+    def test_a_parent_without_any_checkpoint_fails_the_job(self, tmp_path) -> None:
+        script = self._script(checkpoint_injections={"model.checkpoint_path": str(tmp_path / "p")})
+        proc = subprocess.run(
+            ["bash", "-c", self._injection_block(script) + "echo FELL_THROUGH"],
+            env=self._job_env(),
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 3
+        assert f"could not resolve a checkpoint from {tmp_path / 'p'}" in proc.stderr
+        assert "FELL_THROUGH" not in proc.stdout
+
+    def test_injection_lines_sit_before_the_launch_verb_choice(self) -> None:
+        script = self._script(checkpoint_injections={"model.checkpoint_path": "/runs/parent"})
+        lines = script.splitlines()
+        inject = next(i for i, ln in enumerate(lines) if ln.startswith("PARENT_CHECKPOINT_0="))
+        assert lines[inject + 1].startswith('if [[ "${NUM_GPUS}" -gt 1')
+        assert script.count('-O model.checkpoint_path=\\"\\${PARENT_CHECKPOINT_0}\\"') == 2
 
     def test_test_manifest_threads_through(self) -> None:
         out = self._script(test_manifest="/shared/test_manifest.txt")
@@ -303,6 +478,21 @@ class TestGenerateArrayJobScript:
         }
         params.update(kwargs)
         return SLURMBackend.generate_array_job_script(**params)  # type: ignore[arg-type]
+
+    def test_inference_mode_spells_the_checkpoint_list_and_not_prod(self) -> None:
+        script = self._script(
+            inference_checkpoints="/camp/inference_checkpoints.txt",
+            inference_checkpoints_text="/r/best.safetensors\n",
+            manifest_text="/a.yaml\n",
+        )
+        assert "--inference-checkpoints ${ARRAY_MANIFEST_DIR}/inference_checkpoints.txt" in script
+        assert "/r/best.safetensors" in script
+        assert "--prod" not in script.split("python -m spectramr.cli.manifest_dispatch", 1)[1]
+
+    def test_inference_mode_excludes_resume_and_fresh(self) -> None:
+        for kw in ({"resume": True}, {"fresh": True}):
+            with pytest.raises(ValueError, match="inference array"):
+                self._script(inference_checkpoints="/c.txt", **kw)
 
     def test_starts_with_shebang(self) -> None:
         assert self._script().startswith("#!/bin/bash")
@@ -370,9 +560,86 @@ class TestGenerateArrayJobScript:
         assert "#SBATCH --gpus=2" in out
         assert "#SBATCH --time=48:00:00" in out
 
-    def test_resume_flag_threads_through(self) -> None:
-        assert "--resume" in self._script(resume=True)
-        assert "--resume" not in self._script(resume=False)
+    # The dispatch argv is observed by running the rendered body with the
+    # dispatcher replaced by `echo`, so the per-link bash guard is executed
+    # rather than pattern-matched (#2542).
+    @staticmethod
+    def _dispatch_argv(script: str, restart_count: str | None) -> list[str]:
+        body = script.split("cd /project/spectramr\n", 1)[1].split("TASK_EXIT_CODE=$?", 1)[0]
+        body = body.replace("python -m spectramr.cli.manifest_dispatch", "echo DISPATCH")
+        # The granted-GPU/core derivation is exercised on its own in
+        # test_slurm_backend_topology.py; this helper observes the resume guard, so
+        # the block is cut out and its one output is supplied.
+        from spectramr.infrastructure.orchestration.slurm_backend import (
+            _environment_guard_block,
+            _granted_topology_block,
+            _wall_clock_block,
+        )
+
+        body = body.replace(_granted_topology_block("/project/spectramr", 8), "")
+        body = body.replace(_environment_guard_block("/project/spectramr"), "")
+        # The deadline derivation is exercised in test_wall_clock_chaining.py.
+        body = body.replace(_wall_clock_block("/project/spectramr"), "")
+        env = {"PATH": os.environ["PATH"], "SLURM_ARRAY_TASK_ID": "0", "GPUS_PER_NODE": "1"}
+        if restart_count is not None:
+            env["SLURM_RESTART_COUNT"] = restart_count
+        out = subprocess.run(
+            ["bash", "-c", body], env=env, capture_output=True, text=True, check=True
+        ).stdout
+        line = next(ln for ln in out.splitlines() if ln.startswith("DISPATCH"))
+        return line.split()[1:]
+
+    @classmethod
+    def _assert_fresh_chain(cls, script: str) -> None:
+        """Fresh means: link 0 starts over, and every requeued link resumes."""
+        for first in (None, "0"):
+            argv = cls._dispatch_argv(script, first)
+            assert "--resume-off" in argv and "--requeue-resumes" in argv, argv
+            assert "--resume" not in argv, argv
+        for later in ("1", "4"):
+            argv = cls._dispatch_argv(script, later)
+            assert "--resume" in argv and "--resume-off" not in argv, argv
+
+    def test_fresh_starts_the_first_link_over_and_resumes_requeued_links(self) -> None:
+        self._assert_fresh_chain(self._script(fresh=True))
+
+    def test_resume_spells_resume_on_every_link(self) -> None:
+        script = self._script(resume=True)
+        for link in (None, "0", "3"):
+            argv = self._dispatch_argv(script, link)
+            assert "--resume" in argv and "--resume-off" not in argv, argv
+
+    def test_default_spells_neither_flag(self) -> None:
+        """--prod alone: the dispatcher's own if-present chaining applies."""
+        script = self._script()
+        for link in (None, "2"):
+            argv = self._dispatch_argv(script, link)
+            assert "--prod" in argv
+            assert not {"--resume", "--resume-off", "--requeue-resumes"} & set(argv), argv
+
+    def test_an_unguarded_fresh_script_fails_the_chain_check(self) -> None:
+        """Planted: --resume-off on every link restarts each requeued link at 0."""
+        unguarded = self._script(fresh=True).replace(
+            '"${SLURM_RESTART_COUNT:-0}" -eq 0', "1 -eq 1"
+        )
+        with pytest.raises(AssertionError):
+            self._assert_fresh_chain(unguarded)
+
+    def test_a_bare_prod_script_fails_the_chain_check(self) -> None:
+        """Planted: --prod with no guard resumes a stale checkpoint on link 0."""
+        with pytest.raises(AssertionError):
+            self._assert_fresh_chain(self._script())
+
+    def test_array_tasks_can_be_requeued_and_keep_their_log(self) -> None:
+        """Without these, the dispatcher's `scontrol requeue` is refused and a
+        yielded link is the last one, so no chain (fresh or default) continues."""
+        out = self._script()
+        assert "#SBATCH --requeue" in out
+        assert "#SBATCH --open-mode=append" in out
+
+    def test_fresh_and_resume_are_mutually_exclusive(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            self._script(fresh=True, resume=True)
 
     def test_output_and_error_use_array_tokens(self) -> None:
         # %A = array job id, %a = task id — so per-task logs don't collide.

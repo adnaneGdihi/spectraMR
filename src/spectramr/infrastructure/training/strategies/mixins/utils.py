@@ -5,6 +5,8 @@ Utility functions for training strategies and mixins.
 import inspect
 from typing import Any
 
+import torch
+
 # [PERF B1] Module-level cache for signature introspection.
 # Keyed on the *underlying function* (not ``id(bound_method)``): bound methods
 # are freshly created on every ``getattr(obj, "forward")`` and, once GC'd, their
@@ -28,6 +30,51 @@ def pick_present(*candidates: Any) -> Any:
         if candidate is not None:
             return candidate
     return None
+
+
+def reduce_on_device(key: str, value: Any) -> torch.Tensor | float:
+    """Scalar form of a step loss: real part of complex, ``mean()`` of non-scalar.
+
+    A tensor stays on its device (no host sync); a Python number becomes a float.
+    Mean-over-batch is right for a loss and wrong for a metric, which is why
+    the core transfer helper leaves the reduction to its callers.
+    """
+    if isinstance(value, torch.Tensor):
+        v = value.detach()
+        if torch.is_complex(v):
+            v = v.real
+        return v.mean() if v.numel() != 1 else v.reshape(())
+    if isinstance(value, (float, int)):
+        return float(value)
+    if isinstance(value, complex):
+        return float(value.real)
+    raise TypeError(
+        f"Cannot convert metric '{key}' of type {type(value).__name__} to float. "
+        f"Expected tensor, float, or int."
+    )
+
+
+def masked_measurement(input_batch: Any, mask: Any) -> Any:
+    """``input_batch * mask`` with the smaller channel axis tiled up to the larger.
+
+    One owner for what the measurement IS: validation scores from it and the training forward
+    must hand the generator the same tensor, because the output ceiling is read off it.
+    """
+    if input_batch.shape[1] > mask.shape[1]:
+        repeats = [1] * mask.dim()
+        repeats[1] = input_batch.shape[1] // mask.shape[1]
+        mask = mask.repeat(*repeats)
+        if mask.shape[1] < input_batch.shape[1]:
+            rem = input_batch.shape[1] - mask.shape[1]
+            mask = torch.cat([mask, mask[:, :rem]], dim=1)
+    elif input_batch.shape[1] < mask.shape[1]:
+        repeats = [1] * input_batch.dim()
+        repeats[1] = mask.shape[1] // input_batch.shape[1]
+        input_batch = input_batch.repeat(*repeats)
+        if input_batch.shape[1] < mask.shape[1]:
+            rem = mask.shape[1] - input_batch.shape[1]
+            input_batch = torch.cat([input_batch, input_batch[:, :rem]], dim=1)
+    return input_batch * mask
 
 
 def _cache_key(callable_obj: Any) -> Any:

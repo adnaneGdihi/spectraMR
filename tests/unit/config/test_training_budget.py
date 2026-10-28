@@ -16,7 +16,12 @@ def test_a_positive_iteration_budget_rescues_zero_epochs() -> None:
 
 
 def test_calibration_modes_optimise_nothing() -> None:
-    assert {"calibration", "phys_residual_conformal", "equivariance_conformal"} == NO_TRAINING_MODES
+    assert {
+        "calibration",
+        "phys_residual_conformal",
+        "equivariance_conformal",
+        "validation_badge",
+    } == NO_TRAINING_MODES
     for mode in NO_TRAINING_MODES:
         assert zero_budget_defect({"epochs": 0, "max_iterations": 0, "training_mode": mode}) is None
 

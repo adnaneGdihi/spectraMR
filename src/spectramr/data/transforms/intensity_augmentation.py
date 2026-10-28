@@ -64,8 +64,8 @@ class RandomBrightness(tio.IntensityTransform):
         p: Probability of applying the transform to a subject.
     """
 
-    def __init__(self, brightness_range: tuple[float, float], p: float = 1.0):
-        super().__init__(p=p)
+    def __init__(self, brightness_range: tuple[float, float], p: float = 1.0, **kwargs):
+        super().__init__(p=p, **kwargs)
         self.brightness_range = brightness_range
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
@@ -89,8 +89,8 @@ class RandomContrast(tio.IntensityTransform):
         p: Probability of applying the transform to a subject.
     """
 
-    def __init__(self, contrast_range: tuple[float, float], p: float = 1.0):
-        super().__init__(p=p)
+    def __init__(self, contrast_range: tuple[float, float], p: float = 1.0, **kwargs):
+        super().__init__(p=p, **kwargs)
         self.contrast_range = contrast_range
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
@@ -117,8 +117,8 @@ class RandomRicianNoise(tio.IntensityTransform):
         p: Probability of applying the transform to a subject.
     """
 
-    def __init__(self, noise_level: float, p: float = 1.0):
-        super().__init__(p=p)
+    def __init__(self, noise_level: float, p: float = 1.0, **kwargs):
+        super().__init__(p=p, **kwargs)
         self.noise_level = noise_level
         from spectramr.data.transforms.realistic_degradations import RicianNoise
 
@@ -156,8 +156,9 @@ class RandomMotionBlur(tio.IntensityTransform):
         motion_intensity: float,
         blur_kernel_size: int = 5,
         p: float = 1.0,
+        **kwargs,
     ):
-        super().__init__(p=p)
+        super().__init__(p=p, **kwargs)
         self.motion_intensity = motion_intensity
         self.blur_kernel_size = blur_kernel_size
         from spectramr.data.transforms.realistic_degradations import MotionBlur3D

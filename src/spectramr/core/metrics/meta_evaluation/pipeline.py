@@ -23,7 +23,7 @@ import logging
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -148,11 +148,10 @@ def _inter_ranker_spearman(
 
 
 def resolve_eval_mode(mode: str) -> str:
-    """Validate the evaluation dimensionality, failing loud on ``3d``.
+    """Validate the meta-evaluation dimensionality, failing loud on ``3d``.
 
-    Mirrors ``scripts.sim2rank.sim2rank._validate_eval_mode`` for the modern
-    ``spectramr meta-evaluate`` entry point so the two sim2rank surfaces share the
-    same fail-loud contract. ``2d`` is returned unchanged; ``3d`` raises
+    The one owner of this contract for ``spectramr meta-evaluate`` and the sim2rank
+    meta-evaluation paths. ``2d`` is returned unchanged; ``3d`` raises
     :class:`NotImplementedError` (the volumetric engine is deferred); any other
     value raises :class:`ValueError`.
     """
@@ -241,7 +240,7 @@ class MetaEvaluationPipeline:
         have_likert: bool = False,
         have_task_net: bool = False,
         ranker_kwargs: Mapping[str, Mapping[str, object]] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> MetaEvaluationPipeline:
         """Build a pipeline from every registered ranker whose deps are satisfied.
 

@@ -186,7 +186,7 @@ def test_strategy_registered_and_config_mounted() -> None:
 
 
 def _lowpass(z: torch.Tensor, scale: int) -> torch.Tensor:
-    import torch.nn.functional as F  # noqa: N812
+    import torch.nn.functional as F
 
     h, w = z.shape[-2:]
     down = F.interpolate(

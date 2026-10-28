@@ -78,7 +78,7 @@ class TestHFENMetric:
         pred = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
         target = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
         score = hfen(pred, target)
-        assert isinstance(score, float)
+        assert isinstance(score, torch.Tensor) and score.dim() == 0
         assert score >= 0
 
     def test_registry_resolution(self):
@@ -104,5 +104,5 @@ class TestHFENMetric:
         pred = torch.randn(2, 3, 32, 32)
         target = torch.randn(2, 3, 32, 32)
         score = hfen(pred, target)
-        assert isinstance(score, float)
+        assert isinstance(score, torch.Tensor) and score.dim() == 0
         assert score >= 0

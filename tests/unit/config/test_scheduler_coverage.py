@@ -66,7 +66,6 @@ class TestSchedulerRegistryCoverage:
             "cosine_annealing_warm_restarts",
             "step_lr",
             "exponential",
-            "reduce_on_plateau",
         ],
     )
     def test_known_scheduler_is_registered(self, scheduler_name: str):

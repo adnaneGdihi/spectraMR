@@ -11,8 +11,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.computers.base import (
+    DEFAULT_LOSS_DEVICE,
+    BaseLossComputer,
+    LossOutput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +47,32 @@ KNOWN_LOSS_COMPONENTS = [
 ]
 
 
+
+def _patch_nce(real: torch.Tensor, fake: torch.Tensor, tau: float, max_patches: int = 256):
+    """Mean over the batch of the InfoNCE between matching rows of ``fake`` and ``real``.
+
+    ``real``/``fake`` are ``[B, P, C]`` and L2-normalised. Past ``max_patches`` each batch
+    element draws its own random subset (a full ``[P, P]`` logits matrix would OOM), in one
+    batched draw instead of a ``randperm`` and a ``bmm`` per element.
+    """
+    b, num_patches, _ = real.shape
+    if num_patches > max_patches:
+        idx = torch.rand(b, num_patches, device=real.device).topk(max_patches, dim=1).indices
+        real = real.gather(1, idx.unsqueeze(-1).expand(-1, -1, real.shape[-1]))
+        fake = fake.gather(1, idx.unsqueeze(-1).expand(-1, -1, fake.shape[-1]))
+    logits = torch.bmm(fake, real.transpose(1, 2)) / tau  # [B, N, N]
+    n = logits.shape[-1]
+    labels = torch.arange(n, device=logits.device).expand(b, n)
+    return F.cross_entropy(logits.reshape(b * n, n), labels.reshape(-1))
+
+
 class UnifiedDisentangledLossComputer(BaseLossComputer):
     """Unified Disentangled loss computer implementing SSOT pattern.
 
     Handles the complex loss landscape of Disentangled Representation Learning (DRL).
     """
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """__init__.
 
         Args:
@@ -82,6 +106,7 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
                 .build_latent_losses()
                 .build()
             )
+            self._declared_recon_loss()
             return
 
         # No config supplied (direct construction in a test/script) — the ONLY
@@ -101,8 +126,7 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         **kwargs: Any,
     ) -> LossOutput:
         """Compute all disentanglement losses."""
-        device = pred.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
 
         # 1. Primary Reconstruction Loss
         recon_dict = self._compute_recon_losses(pred, target, **kwargs)
@@ -128,18 +152,36 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         # Weight and assembly
         total = self._stack_components(components, epoch=epoch, iteration=iteration)
 
-        # [FIX] Detach components for logging metrics
-        metrics = {
-            k: v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+        # Detached tensors, not ``.item()``: one device sync per component per
+        # step for a dict no training-path caller reads.
+        metrics: dict[str, float | torch.Tensor] = {
+            k: v.detach() if isinstance(v, torch.Tensor) else float(v)
             for k, v in components.items()
         }
 
         return LossOutput(total=total, components=components, metrics=metrics)
 
-    def _compute_recon_losses(self, pred, target, **kwargs) -> dict[str, torch.Tensor]:
+    def _declared_recon_loss(self) -> nn.Module:
+        """The declared reconstruction loss, never a bare L1 built here (#2016).
+
+        That L1 trained every disentangled arm at weight 10.0 while their declared
+        loss sat unused. Checked at construction too, so audit and smoke see it.
+        """
+        recon_type = getattr(self.config.losses.reconstruction, "loss_type", "l1")
+        loss_fn = self.losses.get(recon_type)
+        if loss_fn is None:
+            raise ValueError(
+                f"losses.reconstruction.loss_type={recon_type!r} is not among the built "
+                f"losses {sorted(self.losses)}; declare it under losses.image_losses (#2016)."
+            )
+        return loss_fn
+
+    def _compute_recon_losses(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> dict[str, torch.Tensor]:
         """Compute L1/L2 reconstruction losses."""
-        l1_fn = self.losses.get("l1", nn.L1Loss())
-        recon_components = {}
+        l1_fn = self._declared_recon_loss()
+        recon_components: dict[str, torch.Tensor] = {}
 
         recon_a = l1_fn(pred, target)
         recon_components["recon_a"] = recon_a
@@ -165,14 +207,12 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         if pred.shape == target.shape:
             return pred
         if pred.ndim == 4 and target.ndim == 4 and pred.shape[2:] != target.shape[2:]:
-            import torch.nn.functional as F
-
             pred = F.interpolate(pred, size=target.shape[2:], mode="bilinear", align_corners=False)
         return pred
 
-    def _compute_latent_losses(self, **kwargs) -> dict[str, torch.Tensor]:
+    def _compute_latent_losses(self, **kwargs: Any) -> dict[str, torch.Tensor]:
         """Compute MSE losses on style and content codes."""
-        components = {}
+        components: dict[str, torch.Tensor] = {}
         mse_fn = self.losses.get("mse", nn.MSELoss())
 
         s_a, s_b = kwargs.get("s_a"), kwargs.get("s_b")
@@ -194,14 +234,12 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
             feat_real = c_a
             feat_fake = self._align_spatial(c_a_recon, c_a)
 
-            b, c, h, w = feat_real.shape
+            b, c = feat_real.shape[:2]
             # Flatten spatial dimensions: [B, C, H*W] -> [B, H*W, C]
             feat_real_flat = feat_real.view(b, c, -1).transpose(1, 2)
             feat_fake_flat = feat_fake.view(b, c, -1).transpose(1, 2)
 
             # L2 Normalize features for cosine similarity
-            import torch.nn.functional as F
-
             feat_real_norm = F.normalize(feat_real_flat, p=2, dim=-1)
             feat_fake_norm = F.normalize(feat_fake_flat, p=2, dim=-1)
 
@@ -210,68 +248,31 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
             # A full [B, H*W, H*W] logits matrix would OOM at typical resolutions
             # (256*256 -> a 65536x65536 matrix), so we sample patches per batch
             # element below and build the small [N, N] logits there.
-            num_patches = feat_real_flat.shape[1]
-            max_patches = 256
-
-            patch_nce_total = 0.0
-            for i_b in range(b):
-                if num_patches > max_patches:
-                    # Randomly sample patches to avoid OOM
-                    indices = torch.randperm(num_patches, device=feat_real.device)[:max_patches]
-                else:
-                    indices = torch.arange(num_patches, device=feat_real.device)
-
-                cur_real = feat_real_norm[i_b : i_b + 1, indices, :]  # [1, N, C]
-                cur_fake = feat_fake_norm[i_b : i_b + 1, indices, :]  # [1, N, C]
-
-                cur_logits = torch.bmm(cur_fake, cur_real.transpose(1, 2)) / tau  # [1, N, N]
-                cur_logits = cur_logits.squeeze(0)  # [N, N]
-                cur_labels = torch.arange(cur_logits.shape[0], device=cur_logits.device)
-
-                patch_nce_total += F.cross_entropy(cur_logits, cur_labels)
-
-            components["patch_nce"] = patch_nce_total / b
+            components["patch_nce"] = _patch_nce(feat_real_norm, feat_fake_norm, tau)
 
         if c_b_recon is not None and c_b is not None:
             feat_real_b = c_b
             feat_fake_b = self._align_spatial(c_b_recon, c_b)
 
-            b, c, h, w = feat_real_b.shape
+            b, c = feat_real_b.shape[:2]
             feat_real_flat_b = feat_real_b.view(b, c, -1).transpose(1, 2)
             feat_fake_flat_b = feat_fake_b.view(b, c, -1).transpose(1, 2)
 
             feat_real_norm_b = F.normalize(feat_real_flat_b, p=2, dim=-1)
             feat_fake_norm_b = F.normalize(feat_fake_flat_b, p=2, dim=-1)
 
-            num_patches = feat_real_flat_b.shape[1]
-            max_patches = 256
-
-            patch_nce_total_b = 0.0
-            for i_b in range(b):
-                if num_patches > max_patches:
-                    indices = torch.randperm(num_patches, device=feat_real_b.device)[:max_patches]
-                else:
-                    indices = torch.arange(num_patches, device=feat_real_b.device)
-
-                cur_real = feat_real_norm_b[i_b : i_b + 1, indices, :]
-                cur_fake = feat_fake_norm_b[i_b : i_b + 1, indices, :]
-
-                cur_logits = torch.bmm(cur_fake, cur_real.transpose(1, 2)) / 0.07
-                cur_logits = cur_logits.squeeze(0)
-                cur_labels = torch.arange(cur_logits.shape[0], device=cur_logits.device)
-
-                patch_nce_total_b += F.cross_entropy(cur_logits, cur_labels)
+            patch_nce_b = _patch_nce(feat_real_norm_b, feat_fake_norm_b, 0.07)
 
             if "patch_nce" in components:
-                components["patch_nce"] = components["patch_nce"] + (patch_nce_total_b / b)
+                components["patch_nce"] = components["patch_nce"] + patch_nce_b
             else:
-                components["patch_nce"] = patch_nce_total_b / b
+                components["patch_nce"] = patch_nce_b
 
         return components
 
-    def _compute_physics_losses(self, **kwargs) -> dict[str, torch.Tensor]:
+    def _compute_physics_losses(self, **kwargs: Any) -> dict[str, torch.Tensor]:
         """Compute Bloch regression and bias field penalty."""
-        components = {}
+        components: dict[str, torch.Tensor] = {}
         mse_fn = self.losses.get("mse", nn.MSELoss())
 
         p_a, p_a_pred = kwargs.get("p_a"), kwargs.get("p_a_pred")
@@ -279,24 +280,26 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
             components["bloch_regression"] = mse_fn(p_a_pred, p_a)
 
         tissue_params_a = kwargs.get("tissue_params_a")
-        if tissue_params_a is not None:
-            if (
-                hasattr(self.config.losses, "physics")
-                and getattr(self.config.losses.physics, "lambda_tv_bias_field", 0.0) > 0
-            ):
-                if "bias_field" in tissue_params_a:
-                    bf = tissue_params_a["bias_field"]
-                    if bf.ndim == 4:
-                        tv_loss = torch.mean(
-                            (bf[:, :, :, :-1] - bf[:, :, :, 1:]) ** 2
-                        ) + torch.mean((bf[:, :, :-1, :] - bf[:, :, 1:, :]) ** 2)
-                        components["tv_bias_field"] = tv_loss
+        if (
+            tissue_params_a is not None
+            and hasattr(self.config.losses, "physics")
+            and getattr(self.config.losses.physics, "lambda_tv_bias_field", 0.0) > 0
+            and "bias_field" in tissue_params_a
+        ):
+            bf = tissue_params_a["bias_field"]
+            if bf.ndim == 4:
+                tv_loss = torch.mean((bf[:, :, :, :-1] - bf[:, :, :, 1:]) ** 2) + torch.mean(
+                    (bf[:, :, :-1, :] - bf[:, :, 1:, :]) ** 2
+                )
+                components["tv_bias_field"] = tv_loss
 
         return components
 
-    def _compute_structural_losses(self, pred, target, **kwargs) -> dict[str, torch.Tensor]:
+    def _compute_structural_losses(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> dict[str, torch.Tensor]:
         """Compute structural and perceptual losses."""
-        components = {}
+        components: dict[str, torch.Tensor] = {}
         for name in [
             "ssim",
             "ms_ssim",
@@ -312,9 +315,9 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
                 components[name] = fn(pred, target)
         return components
 
-    def _compute_kl_losses(self, **kwargs) -> dict[str, torch.Tensor]:
+    def _compute_kl_losses(self, **kwargs: Any) -> dict[str, torch.Tensor]:
         """Compute KL divergence with capacity scheduling."""
-        components = {}
+        components: dict[str, torch.Tensor] = {}
         kl_div = kwargs.get("kl_div")
 
         if kl_div is None:
@@ -360,7 +363,8 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         if not components:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        total = torch.tensor(0.0, device=self.device, requires_grad=True)
+        # Not a ``requires_grad`` leaf: see ``BaseLossComputer._stack_components``.
+        total = torch.zeros((), device=self.device)
         use_uncertainty = False
         latent_cfg = self.config.losses.latent if self.config.losses else None
         if latent_cfg:
@@ -369,7 +373,10 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         for name, loss_val in components.items():
             if loss_val is None:
                 continue
-            base_w = weights.get(name) if weights else self._get_loss_weight(name, epoch, iteration)
+            if weights and name in weights:
+                base_w = weights[name]
+            else:
+                base_w = self._get_loss_weight(name, epoch, iteration)
 
             if use_uncertainty and name in self.log_vars:
                 log_var = self.log_vars[name]
@@ -380,7 +387,7 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
         return total
 
     def _get_loss_weight(
-        self, loss_name: str, epoch: int = 0, iteration: int = 0, **kwargs
+        self, loss_name: str, epoch: int = 0, iteration: int = 0, **kwargs: Any
     ) -> float:
         """Get DRL-specific weight mapping with Curriculum Loss Scheduling."""
         recon_cfg = (
@@ -404,6 +411,13 @@ class UnifiedDisentangledLossComputer(BaseLossComputer):
                 decay = 0.5 * (1.0 + math.cos(math.pi * p))
                 if loss_name in ["recon", "l1"]:
                     return l1_end + (l1_start - l1_end) * decay
+
+        # The declared reconstruction loss is weighted by its image_losses entry, the one place
+        # an arm states it; the lambda_<name> lookup below never saw that list.
+        if recon_cfg is not None and loss_name == getattr(recon_cfg, "loss_type", None):
+            for entry in getattr(self.config.losses, "image_losses", None) or []:
+                if entry.name == loss_name and entry.enabled:
+                    return float(entry.weight)
 
         # Mapping
         mapping = {

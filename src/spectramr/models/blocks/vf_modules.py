@@ -401,11 +401,11 @@ class MarkerDictionaryLearner(nn.Module):
             corr = residual @ D_norm.T  # [N, K]
             best_idx = corr.abs().argmax(dim=1)  # [N]
 
-            # Update coefficients
-            for n in range(N):
-                k = best_idx[n].item()
-                coeffs[n, k] += corr[n, k]
-                residual[n] -= corr[n, k] * D_norm[k]
+            # Update coefficients and residual for every patch at once.
+            picked = best_idx.unsqueeze(1)  # [N, 1]
+            c = corr.gather(1, picked)  # [N, 1]
+            coeffs.scatter_add_(1, picked, c)
+            residual = residual - c * D_norm[best_idx]
 
         return coeffs
 

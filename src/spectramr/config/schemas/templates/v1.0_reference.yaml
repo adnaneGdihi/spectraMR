@@ -98,7 +98,7 @@ data:
 
   # How multi-coil data is reduced before the model sees it.
   coils:
-    processing_mode: 'none'                      # options: 'none', 'flatten', 'svd', 'magnitude', 'rss', 'rss_image'
+    processing_mode: 'none'                      # options: 'none', 'flatten', 'svd', 'magnitude', 'rss', 'rss_image', 'rss_per_channel'
     num_virtual_coils: 4
 
   # What representation the loader hands the model (phase 9b). Leaves drop the
@@ -163,7 +163,7 @@ data:
   # brain. `phase_aligned_mean` aligns each repetition's global phase to rep 0
   # first, which is what actually buys the sqrt(N) SNR.
   #
-  # target_mode: 'phase_aligned_mean'     # options: 'complex_mean', 'phase_aligned_mean', 'rep_pair'
+  # target_mode: 'phase_aligned_mean'     # options: 'complex_mean', 'phase_aligned_mean', 'rep_pair', 'r2r', 'nullspace_r2r'
   #                                       # 'complex_mean' is legacy and destructive on M4Raw
   #
   # Leave-one-out NEX target: drop the INPUT repetition (rep 0) from the average
@@ -180,6 +180,34 @@ data:
   # nex_fallback: 'error'                 # options: 'error', 'all_reps'
   #                                       # what a <3-repetition group does under leave-one-out:
   #                                       # 'error' refuses the input-correlated all-reps reference
+  # nex_registration: 'none'              # options: 'none', 'translation'
+  #                                       # register repetitions onto the input before averaging (#2849)
+  # nex_shift_root: null                 # directory with nex_shifts.json from precompute_m4raw_nex_shifts.py (#2977)
+  # nex_shifts_missing: 'raise'           # options: 'raise', 'estimate'
+  # val_target_mode: null                 # options: null, 'complex_mean', 'phase_aligned_mean', 'rep_pair'
+  #                                       # NEX target for the validation split only; null serves target_mode
+  # input_repetition: 'first'             # options: 'first', 'random'
+  #                                       # M4Raw train split: which repetition is the model input
+  # coil_maps_missing: 'raise'            # options: 'raise', 'estimate'
+  #                                       # with coil_maps_root: what a group without a map file does
+  # coil_maps_recipe: 'all_reps_mean'     # options: 'all_reps_mean', 'input_repetition'
+  #                                       # with coil_maps_root: which repetitions the stored maps came from
+  # noise_fit_support_policy: 'band'      # options: 'band', 'acs'
+  # noise_covariance_root: null          # directory with noise_covariance.json from precompute_m4raw_noise_covariance.py (#3117)
+  # noise_covariance_missing: 'raise'     # options: 'raise', 'fit'
+  #                                       # columns the per-scan Sigma_n fit uses (self-calibrated r2r / nullspace_r2r)
+  # r2r_covariance_source: 'committed'    # options: 'committed', 'self_calibrated'   (target_mode 'r2r' only)
+  # r2r_whitening: 'committed'            # options: 'none', 'committed', 'self_calibrated'   (target_mode 'nullspace_r2r' only)
+  #
+  # acquired_pe_lines also accepts an int, or an int per contrast.
+  # acquisition:
+  #   phase_encode_axis: -1               # options: -1, -2
+  #   acquired_pe_lines: 'measured'       # options: 'measured'
+  #
+  # Noise2Noise: serve a repetition stack (`kspace_reps`) on the train split and
+  # no averaged target; NoiseToNoiseStrategy forms the target from the stack.
+  # n2n_pairing: null                     # options: null, 'random_pair', 'one_vs_rest_mean', 'ordered'
+  #                                       # 'ordered' pairs the two halves of a split target_mode
   #
   # SSOT: data/datasets/m4raw_dataset.py::_average_reps · rules: .claude/rules/data.md
   # Audit: `m4raw_nex_target_mode_declared` (advisory) flags an m4raw arm that
@@ -206,6 +234,7 @@ data:
     patch_size: [128, 128, 32]   # (W, H, D); D=1 for 2D. A 2-tuple is normalised to D=1.
     samples_per_volume: 8
     queue_length: 64
+    subject_prefetch: 'auto'                     # options: 'auto' (an explicit int >= 1 is also accepted; subjects each queue worker loads ahead)
     enable_slab_mode: false      # 2.5D: flatten depth to channels, keep middle target slice
     enable_slice_2d: false       # one sample per axial slice of a 3D paired volume
     num_synthetic_samples: 10    # fallback when the dataset resolves empty
@@ -222,7 +251,8 @@ data:
     # k-space scaling
     enable_kspace_normalization: false
     kspace_percentile: 0.99
-    kspace_scale_domain: 'kspace'                # options: 'kspace', 'image'
+    kspace_scale_domain: 'kspace'                # options: 'kspace', 'image', 'acs'
+    kspace_scale_reference: 'target'             # options: 'target', 'input'
     enable_log_scaling: false
     log_scaling_center_fraction: 0.25
     # image-domain normalisation
@@ -230,7 +260,7 @@ data:
     normalization_kwargs: {}
     enable_image_normalization: false
     enable_image_rescale: false
-    rescale_range: [-1.0, 1.0]
+    # output range of minmax/percentile: normalization_kwargs.out_range (rescale_range is refused, #2739)
     rescale_percentiles: [0.0, 100.0]
     # downstream
     data_range: null                # explicit range for PSNR/SSIM; null = dynamic
@@ -249,6 +279,9 @@ data:
   # per-contrast NORMALIZATION specs rather than selection filters.
   pairing:
     # input side; null = load everything available
+    # M4Raw cross-contrast route only (dataset_type: m4raw, single_contrast: false); live, they are refused otherwise:
+    # cross_contrast_source: 'T1'                # options: 'T1', 'T2', 'FLAIR'
+    # source_layout: 'stacked'                   # options: 'stacked', 'separate', 'target_only'
     contrasts: null                 # e.g. ['T1w', 'FLAIR']
     sessions: null                  # e.g. ['01', '02']
     # target side; each null = mirror its input counterpart above
@@ -484,7 +517,7 @@ data:
 #     signal_model: 'mrs_lorentzian'             # options: 'mrs_lorentzian'
 #   target_contrast:
 #     normalization: 'percentile'                # options: 'percentile', 'zscore', 'minmax', 'none'
-#   target_mode: 'complex_mean'                  # options: 'complex_mean', 'phase_aligned_mean', 'rep_pair'
+#   target_mode: 'complex_mean'                  # options: 'complex_mean', 'phase_aligned_mean', 'rep_pair', 'r2r', 'nullspace_r2r'
 
 # ============================================================================
 # MODEL CONFIGURATION  (ModelConfigSchema)
@@ -586,6 +619,9 @@ training:
 #       activation: 'gelu'                       # options: 'gelu', 'relu', 'silu'
 #     scan:
 #       mode: 'hilbert_2d'                       # options: 'hilbert_2d', 'hilbert_3d', 'morton_2d', 'morton_3d', 'snake_2d', 'zigzag_2d', 'raster_2d', 'raster_3d'
+#   cycle_bloch:
+#     b1_plus: 'off'                             # options: 'off', 'estimated'
+#     backward_model: 'bloch_fixed'              # options: 'bloch_fixed', 'ulf_forward', 'epg_tse'
 #   diffusion:
 #     # Which generative paradigm trains this arm. `null` is the transitional
 #     # "unspecified" tag -- equivalent to omitting the key, and it is what the
@@ -594,9 +630,16 @@ training:
 #   equivariance_conformal:
 #     exchangeability_test: 'ks_test'            # options: 'ks_test', 'none'
 #     group: 'SO2'                               # options: 'SO2', 'SE2'
+#   phys_residual_conformal:
+#     contrast_type: 'spin_echo'                 # options: 'spin_echo', 'se', 't2', 'inversion_recovery', 'ir', 'flair', 'gradient_echo'
+#     stratify_by: 'none'                        # options: 'none', 'b0'
 #   equivariant_imaging:
 #     group: 'dihedral'                          # options: 'dihedral', 'small_rotation'
 #     noise_model: 'gaussian_kspace'             # options: 'gaussian_kspace', 'ncchi_magnitude'
+#     anchor_mask: 'input'                       # options: 'input', 'with_structural_zeros'
+#     anchor_normalization: 'all_entries'        # options: 'all_entries', 'selected'
+#     equivariance_target: 'transformed'         # options: 'transformed', 'band_limited'
+#     measurement_target: 'measured'             # options: 'measured', 'alternate_repetition'
 #   federated_config:
 #     aggregation_strategy: 'fed_avg'             # options: 'fed_avg', 'fed_prox', 'fed_opt', 'fed_adam', 'scaffold', 'fed_nova'
 #   flow:
@@ -654,6 +697,8 @@ training:
 #     group: 'SE3'                               # options: 'SO3', 'SE3'
 #   ssdu:
 #     noise_model: 'gaussian_kspace'             # options: 'gaussian_kspace', 'ncchi_magnitude'
+#     noise_std_source: 'declared'               # options: 'declared', 'self_calibrated'
+#     noise_covariance: 'white'                  # options: 'white', 'committed_m4raw'
 #   trajectory_recon:
 #     trajectory_units: 'cycles_per_fov'         # options: 'cycles_per_fov', 'rad_per_pixel'
 #   twin_dps:
@@ -931,7 +976,6 @@ metrics:
   compute_advanced_metrics: true
   metric_interval: 1000
   eval_on_epoch: true
-  track_best_metric: true
   best_metric_name: 'val_loss'
   best_metric_mode: 'min'          # options: 'min', 'max'
 
@@ -966,6 +1010,7 @@ validation:
     # nothing (#937); they RAISE now, so they are not listed.
     output_transform: null
     enable_image_metrics: true
+    measurement_maps: 'off'   # options: 'off', 'metrics'
 
   visualization:
     enabled: false
@@ -990,9 +1035,6 @@ validation:
   enabled: true               # INERT: validation runs regardless
   split: 0.2                  # INERT: data.split.validation_fraction is the live one
   validation_metric: 'loss'   # INERT: near-duplicate of scoring.primary, different default
-  use_training_loss: true     # INERT
-  num_visualizations: 4       # INERT
-  visualization_dir: './visualizations'   # INERT
 
   # The one LIVE ungrouped scalar: a memory-policy knob belonging to no group.
   empty_cache_before_validation: true
@@ -1002,22 +1044,18 @@ validation:
 # ============================================================================
 checkpoint:
   enabled: true
-  save_dir: './checkpoints'
   save_interval: 1000
-  save_on_epoch: true
   keep_last_n: 5
-  keep_best_n: 3
-  pretrained_path: null
   load_optimizer_state: true
   load_scheduler_state: true
-  resume_training: false
-  format: 'safetensors'            # options: 'safetensors', 'pt'
+  format: 'safetensors'            # options: 'safetensors', 'pt', 'pth'
+  async_write: false               # true: file writes run on a background thread
 
 # ============================================================================
 # LOGGING CONFIGURATION  (LoggingConfigSchema)
 # ============================================================================
 logging:
-  # Grouped into seven sub-blocks (phase 10b). The flat spellings still load and
+  # Grouped into nine sub-blocks (phase 10b, plus `distributed` and `progress`). The flat spellings still load and
   # are folded into place, but they are gone from Python.
   identity:
     # NB: the experiment name MUST live under `logging:`, not at top level --
@@ -1031,8 +1069,18 @@ logging:
     level: 'info'                    # options: 'debug', 'info', 'warning', 'error', 'critical'
     silent: false
     to_console: true
+    console_stream: 'split'          # options: 'split' (INFO -> stdout, WARNING+ -> stderr), 'stdout', 'stderr'
     to_file: true
     dir: './logs'
+
+  distributed:                       # what the ranks of a torchrun launch write
+    console_ranks: 'rank0'           # options: 'rank0', 'all'
+    secondary_level: 'error'         # options: 'debug', 'info', 'warning', 'error', 'critical' (console floor on ranks != 0 when console_ranks is 'rank0')
+    file_ranks: 'rank0'              # options: 'rank0', 'all' ('all': <name>.rank<N>.log per rank)
+
+  progress:                          # a bar on a TTY, one tracking line per N iterations in the log
+    mode: 'auto'                     # options: 'auto', 'bar', 'lines', 'off'
+    log_every_n_iterations: 1500
 
   intervals:                         # every-N-steps cadences
     log: 10
@@ -1086,9 +1134,9 @@ logging:
   log_activations: false             # INERT
   log_validation_graphs: true        # INERT
   save_images_per_epoch: 4           # INERT
-  progress_bar_enabled: true         # INERT
-  progress_bar_on_warning: true      # INERT
-  progress_bar_no_progress: false    # INERT
+  progress_bar_enabled: true         # read by infrastructure/logging/progress.py
+  progress_bar_on_warning: true      # read by infrastructure/logging/progress.py
+  progress_bar_no_progress: false    # read by infrastructure/logging/progress.py
 
   # LIVE, but both its group-mates above are inert, so there is no group to join.
   log_gradients: false
@@ -1103,7 +1151,6 @@ early_stopping:
   metric: 'val_loss'
   mode: 'min'                      # options: 'min', 'max'
   min_delta: 1.0e-4
-  check_interval: 1000
   restore_best_weights: true
 
 # ============================================================================
@@ -1195,13 +1242,10 @@ physics:
     train_noise_level: 0.01
     eval_noise_level: 0.005
     enable_acs_decoupling: false
-    enable_acs_replacement: true
-    acs_mask_center_fraction: 0.08
 
   # ESPIRiT / PINN coil sensitivity estimation.
   coil_sensitivity:
     enable_estimation: false
-    estimation_method: 'espirit'   # options: 'espirit', 'pinn', 'siren_pinn', 'cached'
     estimation_type: 'dynamic'     # options: 'dynamic', 'static'
     calibration_region_size: 24
     num_threads: 4
@@ -1307,6 +1351,8 @@ physics:
     enable_b0: false
     enable_b1: false
     enable_undersampling: false
+    # Lines the undersampling mask drops; needs data.acquisition.phase_encode_axis. Unset keeps the rows mask.
+    mask_axis: null                              # options: null, 'phase', 'readout'
     ood_acceleration_range: null     # or ascending rates above 1.0, e.g. [16.0, 32.0]: the VF-family validation re-scores each as val_ood_{R}x_<metric> (needs enable_undersampling)
     enable_gibbs: false
     enable_chemical_shift: false
@@ -1326,7 +1372,7 @@ physics:
 
     # Which degradations couple to the diffusion corruption factor, and the
     # [vmin, vmax] window each severity is remapped onto. Two banks are accepted:
-    # the simulator's 14 NATIVE axes, and the 31 keys of DEGRADATION_REGISTRY
+    # the simulator's 14 NATIVE axes, and the keys of DEGRADATION_REGISTRY
     # (applied as standalone operators after the native pipeline). Five names are in
     # both — b0, chemical_shift, gibbs, gradient_nonlinearity, magic_angle — and are
     # then handled NATIVELY, so the registry operator of the same name does not run.
@@ -1373,6 +1419,38 @@ physics:
     # internally; both routes at once double-corrupts.
     apply_as_transform: false
     transform_degradation_only: true  # skip VF marker embedding on the transform route
+
+    # Scanner profile for the registry operators (new in v1.0; additive, no key moved,
+    # so no RENAMES record). Absent (null) = no profile and the twin is unchanged. Present,
+    # it builds one ScannerProfile whose B0 is physics.field_strength, and the profile sets
+    # the conditioned operators' physical scale (e.g. b0_geometric_distortion's readout
+    # dwell from readout_bw_hz_per_px, concomitant_phase from B0). A preset supplies the
+    # defaults and any non-null field overrides it; a preset at a B0 other than
+    # physics.field_strength raises at load. Without a preset, readout_bw_hz_per_px and
+    # sequence are required and the geometry starts as slice_2d with unknown voxel size.
+    # The profile also owns the native stages: B0 scales b0 / b0_distortion / b1, the
+    # readout dwell and the sequence's shift model (epi, or spin-warp for every other
+    # Cartesian sequence; radial/spiral raise) drive b0_distortion, and the fat shift and
+    # fat fraction come from B0 and bandwidth. A b0_dwell_time or chemical_shift_pixels
+    # that differs from both its default and the profile's value raises. VF arms need
+    # sequence: epi (the field score grades the EPI phase-encode shift).
+    # A volume mode makes the twin read 5-D input as (B, C, D, PE, RO). multislice_2d runs
+    # the native stages per slice and the registry axes on the stack; volume_3d runs the
+    # registry axes and the receiver noise only, and raises on any enabled native stage.
+    # A geometry knob set in a mode that no operator reads it in raises at load:
+    # voxel_mm is read in every mode, slice_thickness_mm and slice_order need
+    # multislice_2d, line_order needs volume_3d, and slice_gap_mm is always refused
+    # (the stack spacing is voxel_mm[0]).
+    # acquisition:
+    #   scanner_profile: 'm4raw_0.3T'   # options: null, 'm4raw_0.3T', 'fastmri_3T' (needs field_strength 0.3 / 3.0)
+    #   mode: 'multislice_2d'           # options: null, 'slice_2d', 'multislice_2d', 'volume_3d'
+    #   voxel_mm: [5.0, 1.0, 1.0]       # (slice/kz, pe, ro) in mm; every mode
+    #   slice_thickness_mm: null        # multislice_2d only; needs voxel_mm
+    #   slice_gap_mm: null              # refused when set (gap = voxel_mm[0] - slice_thickness_mm)
+    #   slice_order: null               # options: null, 'sequential', 'interleaved' (multislice_2d only)
+    #   line_order: null                # options: null, 'linear', 'centric', 'kz_inner', 'ky_inner' (volume_3d only)
+    #   sequence: 'spin_echo'           # options: null, 'spin_echo', 'tse', 'gre', 'spoiled_gre', 'ir_tse', 'mprage', 'bssfp', 'epi', 'radial', 'spiral'
+    #   readout_bw_hz_per_px: 200.0
 
   # ----------------------------------------------------------------------------
   # v6.1 NEW: physics sub-blocks (default disabled — v6.0 behaviour preserved)
@@ -1509,6 +1587,8 @@ parallel:
     min_num_params: 1000000         # size_based policy only
     cpu_offload: false
     mixed_precision: 'bf16'         # options: 'bf16', 'fp16', null
+    reduce_dtype: 'float32'         # options: 'float32', 'match_param'
+    buffer_dtype: 'float32'         # options: 'float32', 'match_param'
     activation_checkpointing: false
     limit_all_gathers: true
     use_orig_params: true
@@ -1532,9 +1612,6 @@ parallel:
     allgather_bucket_size: 500000000
     round_robin_gradients: false
     stage3_gather_16bit_weights_on_model_save: true
-    # Also write a single-file checkpoint_best.pt beside the sharded tag dir, so
-    # inference / campaign evaluation need not understand ZeRO shards.
-    save_consolidated_best: true
     # OFF by default: engine.step() issues collectives, so a GAN whose
     # discriminator steps every k iterations DEADLOCKS rather than erroring.
     allow_multi_engine: false
@@ -1568,17 +1645,14 @@ parallel:
 #   task: 'default'                            # options: 'default', 'reconstruction', 'synthesis',
 #                                                         'super_resolution', 'gan', 'diffusion', 'vae', 'calibration'
 #   case_selection: 'best_median_worst'        # options: 'best_median_worst', 'random', 'first'
-#   style: 'nature'                            # options: 'nature', 'ieee'
+#   style: 'nature'                            # options: 'nature', 'ieee', 'poster', 'slides'
 #   out_subdir: 'report'
 #
 # adapters:                         # AdaptersConfigSchema — declarative adapter chains
 #   pre_model: []
 #   post_model: []
-#   pre_loss_pred: []
 #   pre_loss_target: []
 #   pre_metric: []
-#
-# artifacts: {}                # DEPRECATED and unused -- set training.output_dir instead
 #
 # backend_acceleration:          # SPECTRA / WCSR co-simulation backend
 #   backend: 'spectra'

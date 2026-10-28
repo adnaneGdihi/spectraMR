@@ -64,3 +64,36 @@ def test_the_constructor_no_longer_re_resolves_the_device() -> None:
 def test_module_has_no_availability_probe_at_all() -> None:
     source = inspect.getsource(pma_varnet_strategy)
     assert "torch.cuda.is_available()" not in source
+
+
+def test_validation_emits_the_val_psnr_the_pma_arms_select_on() -> None:
+    """#1774: the three pma arms set ``best_metric_name: val_psnr`` while
+    ``validation_step`` returned only loss keys, so no best checkpoint was ever
+    chosen. It now grades the prediction through the registry metrics computer."""
+    import contextlib
+
+    st = object.__new__(ConcretePMAVarNetStrategy)
+    st.config = SimpleNamespace(
+        validation=SimpleNamespace(
+            scoring=SimpleNamespace(compute=["psnr"], primary="psnr", transform=None)
+        ),
+        metrics=None,
+    )
+    st.env = SimpleNamespace(generator=None)
+    st.device = torch.device("cpu")
+    target = torch.rand(2, 1, 16, 16) + 0.5
+    pred = target + 0.01 * torch.randn_like(target)
+
+    def _losses(input_batch, target_batch, epoch):
+        st._last_prediction = pred.to(torch.complex64)
+        st._last_target = target.to(torch.complex64)
+        return {"g_total_loss": torch.tensor(0.1)}
+
+    st._compute_losses_impl = _losses
+    st._unpack_batch = lambda b: (b["input"], b["target"])
+    st.snapshot_source = lambda phase: contextlib.nullcontext()
+    st._capture_model_output = lambda **_: contextlib.nullcontext()
+
+    out = st.validation_step({"input": target, "target": target}, batch_idx=0)
+    assert "val_psnr" in out
+    assert float(out["val_psnr"]) > 20.0

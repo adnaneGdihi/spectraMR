@@ -26,8 +26,8 @@ Cleanup tracker (slow, opt-in with -m slow):
 
 from __future__ import annotations
 
+import ast
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -40,8 +40,6 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 SRC_ROOT = REPO_ROOT / "src" / "spectramr"
 ALLOWLIST_FILE = Path(__file__).parent / "_fft_allowlist.txt"
 VIOLATIONS_FILE = Path(__file__).parent / "_known_violations.json"
-
-_FFT_PATTERN = re.compile(r"\btorch\.fft\.")
 
 # Blanket-exempt subtrees (all files always allowed)
 BLANKET_EXEMPT_PREFIXES: list[str] = [
@@ -78,6 +76,38 @@ def _is_blanket_exempt(rel: str) -> bool:
     return any(rel.startswith(p) for p in BLANKET_EXEMPT_PREFIXES)
 
 
+def uses_raw_torch_fft(source: str) -> bool:
+    """Whether ``source`` reaches ``torch.fft`` in code: attribute, import or alias.
+
+    Parsed, not grepped: a ``"torch.fft."`` string, comment or docstring is not a
+    call, while ``import torch as T; T.fft.fft2`` and ``from torch import fft`` are.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    torch_names = {"torch"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "torch.fft" or alias.name.startswith("torch.fft."):
+                    return True
+                if alias.name == "torch" and alias.asname:
+                    torch_names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == "torch.fft" or (node.module or "").startswith("torch.fft."):
+                return True
+            if node.module == "torch" and any(a.name == "fft" for a in node.names):
+                return True
+    return any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "fft"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in torch_names
+        for node in ast.walk(tree)
+    )
+
+
 def _scan_all_raw_fft_files() -> list[str]:
     """All files outside blanket-exempt that use torch.fft.*."""
     results: list[str] = []
@@ -91,7 +121,7 @@ def _scan_all_raw_fft_files() -> list[str]:
             source = py_file.read_text(encoding="utf-8")
         except OSError:
             continue
-        if _FFT_PATTERN.search(source):
+        if uses_raw_torch_fft(source):
             results.append(rel)
     return results
 
@@ -206,3 +236,39 @@ def test_known_fft_violations_are_being_paid_down() -> None:
         )
 
     assert not still_in_debt, "\n\n".join(messages)
+
+
+@pytest.mark.architecture
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import torch\nx = torch.fft.fft2(y)",
+        "import torch\nf = torch.fft",
+        "import torch as T\nx = T.fft.ifft2(y)",
+        "import torch.fft\n",
+        "import torch.fft as F\nx = F.fft2(y)",
+        "from torch.fft import fft2\n",
+        "from torch import fft\n",
+        "from torch import nn, fft as tfft\n",
+    ],
+)
+def test_scanner_flags_every_spelling_of_torch_fft(source: str) -> None:
+    """Planted violations: each spelling that reaches torch.fft turns the gate red."""
+    assert uses_raw_torch_fft(source)
+
+
+@pytest.mark.architecture
+@pytest.mark.parametrize(
+    "source",
+    [
+        'PREFIXES = ("np.fft.", "torch.fft.")',
+        "# torch.fft.fft2 is not called here\nx = 1",
+        '"""Docstring naming torch.fft.ifft2."""',
+        "import numpy as np\nx = np.fft.fft2(y)",
+        "from spectramr.infrastructure.physics.fft_ops import fft2c",
+        "x = model.fft(y)",
+    ],
+)
+def test_scanner_ignores_text_that_is_not_a_torch_fft_reference(source: str) -> None:
+    """A string, comment or docstring naming torch.fft is not a call (#3119)."""
+    assert not uses_raw_torch_fft(source)

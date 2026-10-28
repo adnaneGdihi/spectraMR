@@ -106,7 +106,12 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
         x_noisy = x_clean + sigma.view(-1, 1, 1, 1) * eps
         eps_c = torch.randn_like(c_clean)
         c_noisy = c_clean + sigma.view(-1, 1) * eps_c
-        self._declare_model_input({"x_noisy": x_noisy, "c_noisy": c_noisy, "sigma": sigma})
+        # The network denoises both; x_noisy is the image it is named for, c_noisy
+        # the field it is conditioned on and scores alongside.
+        self._declare_model_input(
+            {"x_noisy": x_noisy, "c_noisy": c_noisy, "sigma": sigma},
+            extra={"model_input_key": "x_noisy"},
+        )
         s_x, s_c = self.generator_model(x_noisy, sigma, c_noisy)
         target_score_x = -eps / sigma.view(-1, 1, 1, 1)
         target_score_c = -eps_c / sigma.view(-1, 1)

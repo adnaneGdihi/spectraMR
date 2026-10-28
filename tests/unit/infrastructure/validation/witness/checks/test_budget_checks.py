@@ -12,8 +12,15 @@ from spectramr.infrastructure.validation.witness.registry import Severity, get_w
 from spectramr.infrastructure.validation.witness.subject import WitnessSubject
 
 
-def _subject(training: dict | None = None, scheduler: dict | None = None) -> WitnessSubject:
-    raw = {"training": training or {}, "optimization": {"scheduler": scheduler or {}}}
+def _subject(
+    training: dict | None = None,
+    scheduler: dict | None = None,
+    optimization: dict | None = None,
+) -> WitnessSubject:
+    raw = {
+        "training": training or {},
+        "optimization": {"scheduler": scheduler or {}, **(optimization or {})},
+    }
     return WitnessSubject.for_ci(None, raw)
 
 
@@ -47,6 +54,47 @@ def test_unbounded_budget_has_nothing_to_compare(training: dict) -> None:
 
 def test_no_warmup_declared_passes() -> None:
     assert warmup_shorter_than_budget(_subject({"max_iterations": 5}, {})).passed
+
+
+@pytest.mark.parametrize(("warmup", "max_iterations"), [(2000, 4000), (1000, 4000)])
+def test_the_budget_is_counted_in_optimizer_steps(warmup: int, max_iterations: int) -> None:
+    """Planted violation: 4000 micro-batches at accumulation 4 is 1000 scheduler steps."""
+    verdict = warmup_shorter_than_budget(
+        _subject(
+            {"max_iterations": max_iterations},
+            {"warmup_steps": warmup},
+            {"gradient": {"accumulation_steps": 4}},
+        )
+    )
+    assert verdict.passed is False and "1000 optimizer steps" in verdict.message
+
+
+def test_one_step_inside_the_optimizer_budget_passes() -> None:
+    assert warmup_shorter_than_budget(
+        _subject({"max_iterations": 4000}, {"warmup_steps": 999}, {"gradient": {"accumulation_steps": 4}})
+    ).passed
+
+
+def test_the_flat_warmup_spelling_is_read() -> None:
+    """``optimization.warmup_steps`` is the other spelling the scheduler resolver reads."""
+    verdict = warmup_shorter_than_budget(
+        _subject({"max_iterations": 1000}, {}, {"warmup_steps": 1000})
+    )
+    assert verdict.passed is False
+
+
+def test_declared_epochs_do_not_shorten_a_max_iterations_run() -> None:
+    """exp_ulf_01 shape: the loop reads epochs only when max_iterations <= 0
+    (pipelines/training_loop.py, the ``max_iterations <= 0`` branch), so 500000 // 4 =
+    125000 optimizer steps run and a 2000-step warm-up ends inside them."""
+    verdict = warmup_shorter_than_budget(
+        _subject(
+            {"max_iterations": 500000, "epochs": 150},
+            {"warmup_steps": 2000},
+            {"gradient": {"accumulation_steps": 4}},
+        )
+    )
+    assert verdict.passed is True and "125000" in verdict.message
 
 
 # --- training_budget_is_positive ----------------------------------------------------

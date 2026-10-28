@@ -39,13 +39,17 @@ from spectramr.models.losses.registry import register_loss
     name="concomitant_phase_residual",
     aliases=["ConcomitantPhaseResidualLoss"],
     domain="kspace",
-    # The loss penalizes a real-valued residual-phase head output (radians),
-    # not k-space data itself, so it is domain-agnostic and is routinely
-    # declared under losses.image_losses by image-domain reconstruction arms.
+    # Its input is a residual-phase head output in radians, not k-space or image
+    # data; forward() refuses the (prediction, target) call a loss list makes.
     compatible_with=["image"],
 )
 class ConcomitantPhaseResidualLoss(nn.Module):
     r"""Squared-L2 ridge on the concomitant-phase residual head output.
+
+    The residual phase must be passed by keyword. A loss list calls
+    ``loss(prediction, target)``, and penalising the prediction instead of the
+    residual phase trains ``λ · mean(prediction²)``, an image-energy penalty with
+    no concomitant-field content (#2275), so a positional call raises.
 
     Args:
         weight: ``λ`` multiplier. Must be ≥ 0.
@@ -64,26 +68,31 @@ class ConcomitantPhaseResidualLoss(nn.Module):
 
     def forward(
         self,
-        residual_phase: torch.Tensor,
-        target: torch.Tensor | None = None,  # unused; kept for API parity
+        *args: object,
+        residual_phase: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor:
         r"""Compute :math:`\lambda \, \lVert \Delta\phi \rVert_2^2`.
 
         Args:
-            residual_phase: Real-valued residual-phase tensor (radians).
-            target: Ignored. Present so the loss matches the standard
-                ``forward(prediction, target)`` signature used by the
-                builder layer.
+            residual_phase: Real-valued residual-phase tensor (radians),
+                keyword-only.
 
         Returns:
             Scalar tensor.
+
+        Raises:
+            TypeError: Called positionally, or without ``residual_phase``.
         """
+        if args or residual_phase is None:
+            raise TypeError(
+                "concomitant_phase_residual penalises the residual-phase head output and "
+                "must be called as loss(residual_phase=...). A (prediction, target) call "
+                "from a loss list would penalise the prediction's energy instead; no "
+                "strategy produces a residual phase, so disable this entry (#2275)."
+            )
         sq = residual_phase.pow(2)
-        if self.reduction == "mean":
-            penalty = sq.mean()
-        else:
-            penalty = sq.sum()
+        penalty = sq.mean() if self.reduction == "mean" else sq.sum()
         return self.weight * penalty
 
 

@@ -49,12 +49,6 @@ class GenerativeRefinerConfig(StrictSchema):
         "(the b22 recipe); 'wiener_band' projects onto the b27 Wiener recoverable band "
         "(the field-dependent SNR crossover). Unknown values raise at load time.",
     )
-    blur_cutoff: float = Field(
-        default=0.5,
-        gt=0.0,
-        le=1.0,
-        description="Normalized low-pass cutoff for the 'field_lowpass' forward operator.",
-    )
     source_field: float = Field(
         default=0.1,
         gt=0.0,

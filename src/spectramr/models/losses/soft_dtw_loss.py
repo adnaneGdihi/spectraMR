@@ -10,8 +10,8 @@ under such misalignment.  Soft-DTW allows elastic alignment while maintaining
 differentiability.
 
 To keep computation tractable, the loss operates on **windowed subsequences**
-of length ``window_size`` (default 64), giving O(B · K · w²) complexity where
-K = L / stride_size.
+of length ``window_size`` (default 64), giving O(B · K · w²) work where
+K = L / stride_size, in 2w - 1 batched anti-diagonal steps.
 
 Math:
     DTW(x, y) = min_π Σ_{(i,j)∈π} d(x_i, y_j)
@@ -37,6 +37,11 @@ def _soft_dtw_distance(
 ) -> torch.Tensor:
     """Compute Soft-DTW distance between two sequences.
 
+    The DP recursion ``R[i, j] = d[i-1, j-1] + softmin(R[i-1, j-1], R[i-1, j], R[i, j-1])``
+    is swept one anti-diagonal ``i + j = s`` at a time: every cell on a diagonal
+    depends only on the two previous diagonals, so ``N + M - 1`` vectorised steps
+    replace ``N * M`` scalar ones.
+
     Args:
         pred: Predicted sequence ``[B, L, D]``.
         target: Target sequence ``[B, L, D]``.
@@ -45,29 +50,40 @@ def _soft_dtw_distance(
     Returns:
         Scalar DTW distance per batch element ``[B]``.
     """
-    B, N, D = pred.shape
-    _, M, _ = target.shape
+    batch, n = pred.shape[0], pred.shape[1]
+    m = target.shape[1]
 
     # Pairwise squared Euclidean distance: [B, N, M]
     dist = torch.cdist(pred, target, p=2.0).pow(2)
+    # A diagonal of the column-flipped cost is an anti-diagonal of the cost,
+    # ordered by increasing row index i.
+    flipped = dist.flip(-1)
 
-    # DP table: [B, N+1, M+1] initialized to +inf
-    R = torch.full((B, N + 1, M + 1), float("inf"), device=pred.device, dtype=pred.dtype)
-    R[:, 0, 0] = 0.0
+    inf = float("inf")
+    # diag_s[:, i] holds R[i, s - i]; out-of-range cells are +inf.
+    prev2 = torch.full((batch, n + 1), inf, device=pred.device, dtype=dist.dtype)
+    prev2[:, 0] = 0.0  # R[0, 0]
+    prev1 = torch.full((batch, n + 1), inf, device=pred.device, dtype=dist.dtype)
+    for s in range(2, n + m + 1):
+        lo = max(1, s - m)
+        hi = min(n, s - 1)
+        cost = torch.diagonal(flipped, offset=m + 1 - s, dim1=1, dim2=2)  # rows lo..hi
+        r0 = prev2[:, lo - 1 : hi]  # R[i-1, j-1]
+        r1 = prev1[:, lo - 1 : hi]  # R[i-1, j]
+        r2 = prev1[:, lo : hi + 1]  # R[i, j-1]
+        stack = torch.stack([r0, r1, r2], dim=-1)
+        soft_min = -gamma * torch.logsumexp(-stack / gamma, dim=-1)
+        current = torch.cat(
+            [
+                prev1.new_full((batch, lo), inf),
+                cost + soft_min,
+                prev1.new_full((batch, n - hi), inf),
+            ],
+            dim=1,
+        )
+        prev2, prev1 = prev1, current
 
-    for i in range(1, N + 1):
-        for j in range(1, M + 1):
-            # soft-min over three predecessors
-            r0 = R[:, i - 1, j - 1]
-            r1 = R[:, i - 1, j]
-            r2 = R[:, i, j - 1]
-
-            stack = torch.stack([r0, r1, r2], dim=-1)  # [B, 3]
-            soft_min = -gamma * torch.logsumexp(-stack / gamma, dim=-1)
-
-            R[:, i, j] = dist[:, i - 1, j - 1] + soft_min
-
-    return R[:, N, M]
+    return prev1[:, n]
 
 
 @register_loss("soft_dtw", aliases=["SoftDTW", "sdtw"])
@@ -90,7 +106,7 @@ class SoftDTWLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SoftDTW} = \text{SoftDTW}_\\gamma(\\hat{y}, y)"""
+        \\mathcal{L}_{SoftDTW} = \\text{SoftDTW}_\\gamma(\\hat{y}, y)"""
 
     def __init__(
         self,
@@ -147,36 +163,36 @@ class SoftDTWLoss(nn.Module):
 
         # Flatten to [B, L, D] if spatial
         if prediction.dim() == 4:
-            B, C, H, W = prediction.shape
-            pred_seq = prediction.reshape(B, C, -1).permute(0, 2, 1)
-            tgt_seq = target.reshape(B, C, -1).permute(0, 2, 1)
+            b4, c4 = prediction.shape[0], prediction.shape[1]
+            pred_seq = prediction.reshape(b4, c4, -1).permute(0, 2, 1)
+            tgt_seq = target.reshape(b4, c4, -1).permute(0, 2, 1)
         elif prediction.dim() == 3:
             pred_seq = prediction
             tgt_seq = target
         else:
             raise ValueError(f"SoftDTWLoss expects 3D, 4D, or 5D input, got {prediction.dim()}D")
 
-        B, L, D = pred_seq.shape
-        total_loss = torch.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
-        num_windows = 0
-
-        # Windowed DTW
-        for start in range(0, L - self.window_size + 1, self.stride_size):
-            end = start + self.window_size
-            pred_win = pred_seq[:, start:end, :]
-            tgt_win = tgt_seq[:, start:end, :]
-            dtw_dist = _soft_dtw_distance(pred_win, tgt_win, self.gamma)
-            total_loss = total_loss + dtw_dist.mean()
-            num_windows += 1
-
-        if num_windows == 0:
+        batch, length, feat = pred_seq.shape
+        if length < self.window_size:
             # Sequence shorter than window: compute on full sequence
-            dtw_dist = _soft_dtw_distance(pred_seq, tgt_seq, self.gamma)
-            return dtw_dist.mean()
+            return _soft_dtw_distance(pred_seq, tgt_seq, self.gamma).mean()
 
+        # Windows are independent alignments, so they run as one batch of
+        # [B * K, window, D] sequences: [B, K, D, w] -> [B * K, w, D].
+        w = self.window_size
+        pred_win = pred_seq.unfold(1, w, self.stride_size).permute(0, 1, 3, 2)
+        tgt_win = tgt_seq.unfold(1, w, self.stride_size).permute(0, 1, 3, 2)
+        num_windows = pred_win.shape[1]
+        dtw_dist = _soft_dtw_distance(
+            pred_win.reshape(batch * num_windows, w, feat),
+            tgt_win.reshape(batch * num_windows, w, feat),
+            self.gamma,
+        ).view(batch, num_windows)
+
+        # Per-window batch mean, summed over windows.
+        total_loss = dtw_dist.mean(dim=0).sum()
         if self.normalize:
             total_loss = total_loss / num_windows
-
         return total_loss
 
 

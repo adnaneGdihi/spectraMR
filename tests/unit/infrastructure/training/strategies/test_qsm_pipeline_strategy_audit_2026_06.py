@@ -38,7 +38,7 @@ def _bare_strategy() -> QSMPipelineStrategy:
 class TestPipelineFailurePropagates:
     """Finding 2/4: run_pipeline failure must raise, not become a constant loss."""
 
-    def test_run_pipeline_error_propagates(self):
+    def test_run_pipeline_error_propagates(self, monkeypatch):
         s = _bare_strategy()
 
         sentinel = RuntimeError("qsm physics blew up")
@@ -53,25 +53,24 @@ class TestPipelineFailurePropagates:
         # batch dict, and rely on the parent impl being stubbed below.
         s.run_pipeline = lambda batch: (_ for _ in ()).throw(sentinel)  # type: ignore[method-assign]
 
-        # Patch the inherited parent impl + the static batch resolver.
+        # monkeypatch deletes the stub on undo; a plain assign-back would leave a
+        # copy of the inherited hook in the subclass's own namespace.
         from spectramr.infrastructure.training.strategies.reconstruction import (
             ReconstructionTrainingStrategy,
         )
 
-        orig_super = ReconstructionTrainingStrategy._compute_losses_impl
-        ReconstructionTrainingStrategy._compute_losses_impl = (  # type: ignore[method-assign]
-            lambda self, **kw: _fake_super_impl(**kw)
+        monkeypatch.setattr(
+            ReconstructionTrainingStrategy,
+            "_compute_losses_impl",
+            lambda self, **kw: _fake_super_impl(**kw),
         )
+        raised = False
         try:
-            raised = False
-            try:
-                s._compute_losses_impl(input_batch={"phase_echoes": torch.zeros(1)})
-            except RuntimeError as exc:
-                raised = True
-                assert exc is sentinel
-            assert raised, "pipeline failure must propagate, not be swallowed"
-        finally:
-            ReconstructionTrainingStrategy._compute_losses_impl = orig_super  # type: ignore[method-assign]
+            s._compute_losses_impl(input_batch={"phase_echoes": torch.zeros(1)})
+        except RuntimeError as exc:
+            raised = True
+            assert exc is sentinel
+        assert raised, "pipeline failure must propagate, not be swallowed"
 
     def test_no_constant_error_loss_key_assignment_in_source(self):
         # The constant grad-free fallback assignment must be gone. (The key

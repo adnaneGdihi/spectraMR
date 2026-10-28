@@ -59,7 +59,7 @@ class UncertaintyAwareLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{Uncertainty} = \frac{1}{2} e^{-\\log(\\sigma^2)} (\\hat{y} - y)^2 + \frac{1}{2} \\log(\\sigma^2)"""
+        \\mathcal{L}_{Uncertainty} = \\frac{1}{2} e^{-\\log(\\sigma^2)} (\\hat{y} - y)^2 + \\frac{1}{2} \\log(\\sigma^2)"""
 
     def __init__(
         self,

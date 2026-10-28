@@ -13,6 +13,8 @@ References:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
 
@@ -32,7 +34,7 @@ class EvidentialLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{Evidential} = \\mathbb{E}[\text{NLL}] + \\lambda \\cdot \text{KL}(\text{NIG} || \text{NIG}_0)"""
+        \\mathcal{L}_{Evidential} = \\mathbb{E}[\\text{NLL}] + \\lambda \\cdot \\text{KL}(\\text{NIG} || \\text{NIG}_0)"""
 
     def __init__(self, coeff: float = 1.0) -> None:
         super().__init__()
@@ -68,7 +70,8 @@ class EvidentialLoss(nn.Module):
         self,
         prediction: Tensor,
         target: Tensor,
-        **kwargs,
+        nig_params: Tensor | None = None,
+        **kwargs: Any,
     ) -> Tensor:
         """Compute the evidential loss.
 
@@ -96,11 +99,13 @@ class EvidentialLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Ensure prediction has exactly 4 channels
+        # The strategy hands the structural losses gamma alone and the NIG tensor here.
+        if nig_params is not None:
+            prediction = nig_params
         if prediction.shape[1] != 4:
             raise ValueError(
                 f"EvidentialLoss requires exactly 4 predicted channels (gamma, nu, alpha, beta), "
-                f"but got {prediction.shape[1]}."
+                f"but got {prediction.shape[1]} and no nig_params."
             )
 
         gamma = prediction[:, 0:1]

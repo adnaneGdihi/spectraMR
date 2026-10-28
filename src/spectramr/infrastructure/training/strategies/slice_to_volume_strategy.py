@@ -45,6 +45,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
 
@@ -171,11 +172,14 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
             pred_2d = x_hi
 
         env_losses = (self.env.losses or {}) if self.env else {}
+        # Live iteration (loop_state seam): the loop passes ``iteration=``,
+        # never ``step=``, so this was a constant 0 and every warm-up-gated
+        # loss stayed shut for the whole run (pitfall #16).
         loss_output = self.loss_computer.compute(
             pred=pred_2d,
             target=tgt_2d,
             epoch=epoch,
-            iteration=int(kwargs.get("step", 0)),
+            iteration=resolve_loop_iteration(self),
             losses_dict=env_losses,
         )
 

@@ -220,7 +220,9 @@ class TestBatchInference:
 
         def test_batch_inference_with_data_consistency(self, synthetic_test_batch):
             """Test batch inference with Data Consistency Layer."""
-            from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+            from spectramr.infrastructure.physics.data_consistency import (
+                NoiseSimulatingDataConsistency,
+            )
             from spectramr.infrastructure.physics.fft_ops import ifft2c
 
             # Create model
@@ -231,7 +233,7 @@ class TestBatchInference:
             model.eval()
 
             # Create DC layer (eval mode → uses eval_noise_level)
-            dc_layer = DataConsistencyLayer(
+            dc_layer = NoiseSimulatingDataConsistency(
                 train_noise_level=0.01,
                 eval_noise_level=0.005,  # Lower noise at inference
                 noise_type="gaussian",
@@ -528,9 +530,9 @@ class TestInferencePreprocessingAlignment:
         Training: train_noise_level=0.01
         Inference: eval_noise_level=0.005 (lower, more realistic)
         """
-        from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+        from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.01,
             eval_noise_level=0.005,
             noise_type="gaussian",

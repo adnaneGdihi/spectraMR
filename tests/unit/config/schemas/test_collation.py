@@ -44,12 +44,18 @@ def test_default_construction() -> None:
 
 @pytest.mark.parametrize(
     "strategy",
-    ["image", "slab", "graph", "sequence", "mixed", "robust", "physics", "universal"],
+    ["image", "slab", "graph", "sequence", "mixed", "robust", "physics"],
 )
 def test_documented_strategies_accepted(strategy: str) -> None:
     """Each documented strategy literal is accepted."""
     cfg = CollationConfigSchema(strategy=strategy)
     assert cfg.strategy == strategy
+
+
+def test_retired_universal_strategy_rejected() -> None:
+    """``universal`` was removed 2026-08-09: CollateStrategyFactory has no such strategy."""
+    with pytest.raises(ValidationError):
+        CollationConfigSchema(strategy="universal")
 
 
 def test_none_strategy_accepted() -> None:

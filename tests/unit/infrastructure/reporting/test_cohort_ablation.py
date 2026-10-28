@@ -373,3 +373,71 @@ def test_generate_baseline_overlay_figures_end_to_end(tmp_path) -> None:
     )
     assert written["1"] is not None and written["1"].exists()
     assert (out_dir / "task1_with_baselines.png").exists()
+
+
+# ── run completion (#2532) ─────────────────────────────────────────────────────
+_ROW = [{"iteration": 100, "epoch": 2, "val_ssim": 0.6, "val_psnr": 22.0, "val_lpips": 0.5}]
+_OK, _CRASHED, _UNKNOWN = (
+    "mrixfields_b16_ok",
+    "mrixfields_b17_crashed",
+    "mrixfields_b18_no_summary",
+)
+
+
+def _status_cohort(root: Path) -> None:
+    """ok / crashed / no-summary; the crashed arm still holds an earlier attempt's metrics."""
+    ok = _make_arm(root, _OK, "1", _ROW)
+    (ok / "run_summary.json").write_text(json.dumps({"success": True}))
+    crashed = _make_arm(root, _CRASHED, "1", _ROW)
+    (crashed / "run_summary.json").write_text(
+        json.dumps({"success": False, "error_type": "RuntimeError", "error": "boom"})
+    )
+    _make_arm(root, _UNKNOWN, "1", _ROW)
+
+
+def test_discover_reads_each_arms_completion(tmp_path) -> None:
+    _status_cohort(tmp_path)
+    by = {a.arm: a.status.state for a in ca.discover_cohort_arms(tmp_path)}
+    assert by == {_OK: "ok", _CRASHED: "failed", _UNKNOWN: "unknown"}
+
+
+def test_crashed_arm_is_left_out_of_the_task_frame(tmp_path, caplog) -> None:
+    """PLANTED (#2532): red before the fix -- the frame took every arm with val rows."""
+    _status_cohort(tmp_path)
+    # Not vacuous: the crashed arm has real validation metrics the old path plotted.
+    assert ca.best_val_metrics(tmp_path / _CRASHED)
+    with caplog.at_level("INFO"):
+        frame = ca.build_task_frame(ca.discover_cohort_arms(tmp_path), "1")
+    assert set(frame["arm"]) == {_OK, _UNKNOWN}
+    assert f"run {_CRASHED}: crashed: RuntimeError (boom); excluded" in caplog.text
+    assert f"run {_UNKNOWN}: status unknown: no run_summary.json; kept and marked" in caplog.text
+
+
+def test_status_kwargs_mark_unknown_and_name_crashed(tmp_path) -> None:
+    _status_cohort(tmp_path)
+    kwargs = ca.status_kwargs(ca.discover_cohort_arms(tmp_path), "1")
+    assert kwargs == {
+        "run_notes": {_UNKNOWN: "status unknown: no run_summary.json"},
+        "excluded_runs": {_CRASHED: "crashed: RuntimeError"},
+    }
+    assert ca.status_kwargs(ca.discover_cohort_arms(tmp_path), "2") == {
+        "run_notes": {},
+        "excluded_runs": {},
+    }
+
+
+def test_figures_receive_the_status_marks(tmp_path, monkeypatch) -> None:
+    _status_cohort(tmp_path)
+    seen: dict = {}
+
+    def _plot(frame, out_path, **kwargs):
+        seen["arms"] = set(frame["arm"])
+        seen["run_notes"] = kwargs["run_notes"]
+        seen["excluded_runs"] = kwargs["excluded_runs"]
+        return out_path
+
+    monkeypatch.setattr(ca, "get_plotter", lambda name: _plot)
+    ca.generate_task_ablation_figures(tmp_path, tmp_path / "figs", tasks=("1",))
+    assert seen["arms"] == {_OK, _UNKNOWN}
+    assert set(seen["run_notes"]) == {_UNKNOWN}
+    assert set(seen["excluded_runs"]) == {_CRASHED}

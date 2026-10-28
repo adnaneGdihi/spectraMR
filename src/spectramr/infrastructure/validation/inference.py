@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
 from spectramr.infrastructure.validation.recommendations import (
     Recommendation,
     RecommendationLevel,
@@ -46,20 +47,25 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
 
 
 def _model_capabilities(config: Any) -> ModelCapabilities | None:
-    from spectramr.models.registry import MODEL_REGISTRY
+    """The configured model's declared capabilities, or None.
+
+    Delegates to :func:`get_model_capabilities`. This function used to carry
+    its own copy of that body -- the entry lookup, the ``isinstance`` check
+    and the all-fields-None "unannotated" sentinel -- which made it a second
+    owner of the sentinel's definition (non-negotiable 17). The two agreed
+    only because the copy iterated ``__dataclass_fields__`` dynamically; a
+    sentinel keyed on an explicit field list, in either copy, would have
+    silently diverged the moment a field was added.
+    """
+    from spectramr.models.registry import get_model_capabilities
 
     model = getattr(config, "model", None)
     if model is None:
         return None
     mt = getattr(model, "model_type", None)
-    if not mt or mt not in MODEL_REGISTRY:
+    if not mt:
         return None
-    caps = MODEL_REGISTRY[mt].get("capabilities")
-    if not isinstance(caps, ModelCapabilities):
-        return None
-    if all(getattr(caps, f) is None for f in caps.__dataclass_fields__):
-        return None
-    return caps
+    return get_model_capabilities(str(mt))
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +187,7 @@ def derive_tags(config: Any) -> list[Tag]:
     if adapters is not None:
         any_adapter = any(
             (getattr(adapters, h, None) or [])
-            for h in ("pre_model", "post_model", "pre_loss_pred", "pre_loss_target", "pre_metric")
+            for h in ("pre_model", "post_model", "pre_loss_target", "pre_metric")
         )
         if any_adapter:
             tags.append(
@@ -249,7 +255,7 @@ def derive_tags(config: Any) -> list[Tag]:
     sense_loss_names = {"sense_adjoint_l1", "sense_adjoint_consistency"}
     if losses is not None:
         all_loss_entries = []
-        for k in ("image_losses", "kspace_losses", "complex_losses"):
+        for k in LOSS_LIST_DOMAINS:
             all_loss_entries.extend(getattr(losses, k, None) or [])
         names = {getattr(e, "name", None) for e in all_loss_entries}
         if names & sense_loss_names:
@@ -354,6 +360,23 @@ def recommend_inverse_adapter(config: Any) -> list[Recommendation]:
     return out
 
 
+def contrast_id_consumer(config: Any) -> str | None:
+    """The strategy that reads ``contrast_idx`` itself (not via the models), or ``None``.
+
+    A strategy declares it with a ``consumes_contrast_id(config)`` classmethod: the
+    CycleBloch per-contrast sequence table renders physics from the id while its
+    generator and critic stay contrast-agnostic.
+    """
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    try:
+        strategy_cls = TrainingStrategyFactory().get_strategy_class(config)
+    except Exception:  # an unresolvable strategy is reported by check_strategy_registry
+        return None
+    consumes = getattr(strategy_cls, "consumes_contrast_id", None)
+    return strategy_cls.__name__ if callable(consumes) and consumes(config) else None
+
+
 def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
     """AUDIT-R002 / R003 — multi-contrast data and model alignment.
 
@@ -374,10 +397,23 @@ def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
 
     # Model side
     mt = getattr(model, "model_type", None)
-    from spectramr.models.registry import MODEL_REGISTRY
+    from spectramr.models.registry import MODEL_REGISTRY, model_supports
 
-    entry = MODEL_REGISTRY.get(mt) if mt else None
-    supports_contrast = bool(entry and entry.get("supports_contrast_conditioning", False))
+    # Read through ``model_supports``, not ``entry.get(...)``. This site used
+    # to reach past the helper into the registry entry's top-level keys, which
+    # is why a grep for the helper's callers did not find it -- and once the
+    # flag moved onto the nested ``ModelCapabilities`` (#1916), a top-level
+    # ``.get`` would have answered False for every model that declares it and
+    # raised this recommendation against 27 correctly-annotated models.
+    supports_contrast = (
+        bool(mt)
+        and mt in MODEL_REGISTRY
+        and model_supports(str(mt), "supports_contrast_conditioning")
+    )
+
+    # A strategy-side consumer reads the id for physics; neither hint below applies to it.
+    if mc_enabled and contrast_id_consumer(config):
+        return out
 
     if mc_enabled and not supports_contrast:
         out.append(
@@ -405,7 +441,7 @@ def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
         # (`BlochSignalEncoder`, reached via `multi_contrast.bloch_grounded` --
         # which already RAISES at load time when they are absent, see
         # `data.py::_validate_bloch_grounded`). Contrast-*id* conditioning
-        # (Pattern C: `contrast_idx` -> `nn.Embedding(n_contrasts, embed_dim)`,
+        # (Pattern C: `contrast_idx` -> `nn.Embedding(n_contrasts, ...)`,
         # e.g. `kspace_cold_diffusion`) embeds an INDEX and never reads
         # TR/TE/TI/FA, so for an id-conditioned arm the blanket form of this hint
         # asserted a fallback that does not happen and handed the user a
@@ -418,7 +454,6 @@ def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
         # applicability is now *computed* from the config instead of asserted,
         # and the paste-ready YAML is offered only when it would be read.
         bloch_grounded = bool(_get(data, "multi_contrast", "bloch_grounded", default=False))
-        embed_dim = _get(data, "multi_contrast", "embed_dim")
         id_conditioned = bool(supports_contrast and n_contrasts and not bloch_grounded)
         if id_conditioned:
             detail = (
@@ -426,7 +461,6 @@ def recommend_multi_contrast_alignment(config: Any) -> list[Recommendation]:
                 f"This arm looks contrast-ID conditioned: {mt!r} is registered "
                 "supports_contrast_conditioning=True, the arm declares "
                 f"n_contrasts={n_contrasts}"
-                + (f" / embed_dim={embed_dim}" if embed_dim else "")
                 + ", and multi_contrast.bloch_grounded is not set. That path "
                 "embeds a contrast INDEX and reads no TR/TE/TI/FA, so contrast "
                 "conditioning is already fully specified and declaring "
@@ -647,9 +681,7 @@ def recommend_explicit_kspace_image_adapter(config: Any) -> list[Recommendation]
     # Pattern: data is k-space, losses output_domain is image, no adapter
     has_image_losses = bool(getattr(losses, "image_losses", None) or [])
     adapters = getattr(config, "adapters", None)
-    has_explicit_chain = adapters is not None and (
-        getattr(adapters, "pre_loss_pred", None) or getattr(adapters, "pre_loss_target", None)
-    )
+    has_explicit_chain = adapters is not None and getattr(adapters, "pre_loss_target", None)
     if (
         domain_inferred == "kspace"
         and output_domain == "image"
@@ -669,12 +701,9 @@ def recommend_explicit_kspace_image_adapter(config: Any) -> list[Recommendation]
                     "transformation's side-effects."
                 ),
                 level=RecommendationLevel.HINT,
-                yaml_keys=("adapters.pre_loss_pred", "adapters.pre_loss_target"),
+                yaml_keys=("adapters.pre_loss_target",),
                 suggested_yaml=(
                     "adapters:\n"
-                    "  pre_loss_pred:\n"
-                    "    - name: ifft_kspace_to_image\n"
-                    "    - name: magnitude_from_complex\n"
                     "  pre_loss_target:\n"
                     "    - name: ifft_kspace_to_image\n"
                     "    - name: magnitude_from_complex\n"
@@ -744,7 +773,7 @@ def recommend_sense_loss_needs_sense_maps(config: Any) -> list[Recommendation]:
         return out
     sense_loss_names = {"sense_adjoint_l1", "sense_adjoint_consistency"}
     has_sense = False
-    for k in ("image_losses", "kspace_losses", "complex_losses"):
+    for k in LOSS_LIST_DOMAINS:
         for entry in getattr(losses, k, None) or []:
             if getattr(entry, "name", None) in sense_loss_names:
                 has_sense = True
@@ -786,11 +815,15 @@ def recommend_sense_loss_needs_sense_maps(config: Any) -> list[Recommendation]:
                     "physics.coil_sensitivity.precomputed_path",
                     "physics.coil_processing.estimation.method",
                 ),
+                # The method lives on coil_processing.estimation, the key the
+                # strategies read; coil_sensitivity.estimation_method has no reader (#872).
                 suggested_yaml=(
                     "physics:\n"
                     "  coil_sensitivity:\n"
                     "    enable_estimation: true\n"
-                    "    estimation_method: espirit\n"
+                    "  coil_processing:\n"
+                    "    estimation:\n"
+                    "      method: espirit\n"
                 ),
                 references=("src/infrastructure/physics/coil_sensitivity.py",),
             )

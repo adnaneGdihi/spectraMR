@@ -3,8 +3,10 @@ TASK III.2 – Data-IO SSOT fitness function.
 
 Enforces CLAUDE.md pitfall #11:
 
-    No ``torch.load``, ``h5py.File``, ``nib.load`` / ``nibabel.load``, or
-    ``pickle.load`` outside ``spectramr/data/``.
+    No ``torch.load``, ``h5py.File``, ``nib.load`` / ``nibabel.load``,
+    ``pickle.load`` or safetensors ``load_file`` / ``safe_open`` outside
+    ``spectramr/data/`` and the checkpoint codecs
+    (``spectramr/infrastructure/checkpointing/codecs/``).
 
 All file-to-tensor loading must go through the DataPipelineDirector and live
 under src/spectramr/data/.  Higher layers consume datasets via the director;
@@ -35,6 +37,10 @@ VIOLATIONS_FILE = Path(__file__).parent / "_known_violations.json"
 
 DATA_SSOT_PREFIX = "spectramr/data/"
 
+#: The one sanctioned home of checkpoint IO (gate option (b)): every checkpoint file is
+#: read and written by the codecs there, so this prefix is the whole exemption.
+CHECKPOINT_IO_PREFIX = "spectramr/infrastructure/checkpointing/codecs/"
+
 #: ``(module, attribute) -> reported call name``. The key is the name **bound in
 #: the scanned module**, so both ``import nibabel`` and ``import nibabel as nib``
 #: resolve; the value is the stable string recorded in the baseline.
@@ -44,6 +50,9 @@ DOTTED_CALLS: dict[tuple[str, str], str] = {
     ("nib", "load"): "nib.load",
     ("nibabel", "load"): "nib.load",
     ("pickle", "load"): "pickle.load",
+    ("safetensors", "safe_open"): "safetensors.safe_open",
+    ("safetensors.torch", "load_file"): "safetensors.load_file",
+    ("safetensors.numpy", "load_file"): "safetensors.load_file",
 }
 
 #: ``from <module> import <name>`` bindings that mean the same call. The regex
@@ -54,12 +63,20 @@ FROM_IMPORTS: dict[str, dict[str, str]] = {
     "nib": {"load": "nib.load"},
     "nibabel": {"load": "nib.load"},
     "pickle": {"load": "pickle.load"},
+    "safetensors.torch": {"load_file": "safetensors.load_file"},
+    "safetensors.numpy": {"load_file": "safetensors.load_file"},
+    "safetensors": {"safe_open": "safetensors.safe_open"},
 }
 
 #: Modules whose ``import <mod> as <alias>`` binding must be followed. Keyed on
 #: the *real* module name; ``nib`` is listed because ``DOTTED_CALLS`` also
 #: enumerates it as a head, so an ``import nib as x`` would otherwise escape.
-ALIASABLE_MODULES = frozenset({"torch", "h5py", "nib", "nibabel", "pickle"})
+ALIASABLE_MODULES = frozenset(
+    {
+        "torch", "h5py", "nib", "nibabel", "pickle",
+        "safetensors", "safetensors.torch", "safetensors.numpy",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,6 +108,12 @@ def _module_bindings(tree: ast.AST) -> dict[str, str]:
                     # scan caught that, not the plants — hence the plant below.
                     top = alias.name.split(".")[0]
                     out[top] = top
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            # ``from safetensors import torch as st`` binds a guarded submodule.
+            for alias in node.names:
+                full = f"{node.module}.{alias.name}"
+                if full in ALIASABLE_MODULES:
+                    out[alias.asname or alias.name] = full
     return out
 
 
@@ -159,8 +182,8 @@ def find_io_calls(source: str) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         dotted = _dotted_path(node.func)
-        if dotted is not None and len(dotted) == 2:
-            head, attr = dotted
+        if dotted is not None and len(dotted) >= 2:
+            head, *middle, attr = dotted
             if head in bindings:
                 real = bindings[head]
                 if real not in ALIASABLE_MODULES:
@@ -169,8 +192,10 @@ def find_io_calls(source: str) -> set[str]:
                 # Never imported in this module (re-export, injected name):
                 # fall back to the literal head rather than miss the call.
                 real = head
-            if (real, attr) in DOTTED_CALLS:
-                found.add(DOTTED_CALLS[(real, attr)])
+            # ``safetensors.torch.load_file`` names its module in the middle segments.
+            module = ".".join([real, *middle])
+            if (module, attr) in DOTTED_CALLS:
+                found.add(DOTTED_CALLS[(module, attr)])
         elif isinstance(node.func, ast.Name) and node.func.id in aliased:
             found.add(aliased[node.func.id])
     return found
@@ -183,8 +208,8 @@ def _scan_violations() -> list[dict[str, str]]:
         if "__pycache__" in str(py_file):
             continue
         rel = str(py_file.relative_to(REPO_ROOT / "src"))
-        if rel.startswith(DATA_SSOT_PREFIX):
-            continue  # data/ is the canonical home — always allowed
+        if rel.startswith((DATA_SSOT_PREFIX, CHECKPOINT_IO_PREFIX)):
+            continue  # data/ and the checkpoint codecs are the canonical IO homes
         try:
             source = py_file.read_text(encoding="utf-8")
         except OSError:
@@ -339,6 +364,32 @@ class TestDetectorIsNotVacuous:
         ]:
             assert expected in find_io_calls(stmt), f"{expected} never fires"
 
+    def test_plant_safetensors_load_file(self) -> None:
+        src = "from safetensors.torch import load_file\n\ndef f(p):\n    return load_file(p)\n"
+        assert find_io_calls(src) == {"safetensors.load_file"}
+
+    def test_plant_safetensors_safe_open(self) -> None:
+        src = "from safetensors import safe_open\n\ndef f(p):\n    return safe_open(p, 'pt')\n"
+        assert find_io_calls(src) == {"safetensors.safe_open"}
+
+    @pytest.mark.parametrize(
+        "src, expected",
+        [
+            ("import safetensors\nsafetensors.safe_open(p, 'pt')\n", "safetensors.safe_open"),
+            ("import safetensors.torch as st\nst.load_file(p)\n", "safetensors.load_file"),
+            ("import safetensors.torch\nsafetensors.torch.load_file(p)\n", "safetensors.load_file"),
+            ("from safetensors import torch as st\nst.load_file(p)\n", "safetensors.load_file"),
+            ("from safetensors.numpy import load_file\nload_file(p)\n", "safetensors.load_file"),
+        ],
+        ids=["module-safe_open", "aliased-submodule", "three-part-dotted", "from-submodule", "numpy-flavour"],
+    )
+    def test_plant_every_safetensors_spelling(self, src: str, expected: str) -> None:
+        assert find_io_calls(src) == {expected}
+
+    def test_safetensors_save_file_is_not_a_load(self) -> None:
+        src = "from safetensors.torch import save_file\n\ndef f(t, p):\n    save_file(t, p)\n"
+        assert find_io_calls(src) == set()
+
     # -- negative plants: these must NOT turn the gate red -------------------
 
     def test_prose_mentioning_a_call_does_not_fire(self) -> None:
@@ -394,6 +445,18 @@ class TestScanWalksAndExcludesDataLayer:
     def test_plant_inside_data_layer_is_exempt(self, tmp_path, monkeypatch) -> None:
         found = self._plant(tmp_path, monkeypatch)
         assert not [v for v in found if v["file"].startswith(DATA_SSOT_PREFIX)]
+
+    def test_plant_inside_codecs_is_exempt_and_beside_it_is_not(self, tmp_path, monkeypatch) -> None:
+        src = tmp_path / "src" / "spectramr"
+        codecs_dir = src / "infrastructure" / "checkpointing" / "codecs"
+        codecs_dir.mkdir(parents=True)
+        (codecs_dir / "planted.py").write_text("import torch\ntorch.load('x')\n")
+        (codecs_dir.parent / "planted.py").write_text("import torch\ntorch.load('x')\n")
+        monkeypatch.setattr("tests.architecture.test_ssot_data_io.REPO_ROOT", tmp_path)
+        monkeypatch.setattr("tests.architecture.test_ssot_data_io.SRC_ROOT", src)
+        found = {v["file"] for v in _scan_violations()}
+        assert "spectramr/infrastructure/checkpointing/planted.py" in found
+        assert not [f for f in found if f.startswith(CHECKPOINT_IO_PREFIX)]
 
 
 @pytest.mark.architecture

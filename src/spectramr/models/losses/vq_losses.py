@@ -5,6 +5,8 @@ This module implements loss functions specific to vector quantization
 and adversarial training for VQ-based models.
 """
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -27,7 +29,7 @@ class VQLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{VQ} = \\mathcal{L}_{recon} + \\| sg[z] - z_q \\|_2^2 + \beta \\| z - sg[z_q] \\|_2^2"""
+        \\mathcal{L}_{VQ} = \\mathcal{L}_{recon} + \\| sg[z] - z_q \\|_2^2 + \\beta \\| z - sg[z_q] \\|_2^2"""
 
     def __init__(
         self,
@@ -69,9 +71,12 @@ class VQLoss(nn.Module):
 
     def forward(
         self,
-        *args,
-        **kwargs,
-    ) -> tuple[torch.Tensor, dict] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        *args: torch.Tensor,
+        **kwargs: Any,
+    ) -> (
+        tuple[torch.Tensor, dict[str, float]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Compute VQ loss.
 
         Supports two APIs:
@@ -100,7 +105,7 @@ class VQLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # API detection: check number of positional arguments
-        if len(args) == 2:
+        if len(args) in (2, 3):
             # Simple API: (quantized, targets) or (quantized, targets, inputs)
             quantized = args[0]
             targets = args[1]
@@ -125,7 +130,7 @@ class VQLoss(nn.Module):
         quantized: torch.Tensor,
         targets: torch.Tensor,
         inputs: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Simple API: compute VQ loss from quantized embeddings.
 
         Args:
@@ -221,7 +226,7 @@ class VQGANLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{VQGAN} = \\mathcal{L}_{recon} + \\| sg[z] - z_q \\|_2^2 + \beta \\| z - sg[z_q] \\|_2^2 + \\lambda_{adv} \\mathcal{L}_{GAN}"""
+        \\mathcal{L}_{VQGAN} = \\mathcal{L}_{recon} + \\| sg[z] - z_q \\|_2^2 + \\beta \\| z - sg[z_q] \\|_2^2 + \\lambda_{adv} \\mathcal{L}_{GAN}"""
 
     def __init__(
         self,
@@ -264,7 +269,7 @@ class VQGANLoss(nn.Module):
         targets: torch.Tensor,
         quantized: torch.Tensor,
         latent_targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute VQGAN loss.
 
         Args:
@@ -291,16 +296,17 @@ class VQGANLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        loss_dict = {}
+        loss_dict: dict[str, float] = {}
 
         # Reconstruction loss (L1/L2)
         recon_loss = F.l1_loss(reconstructions, targets)
         total_loss = self.reconstruction_weight * recon_loss
         loss_dict["reconstruction_loss"] = recon_loss.item()
 
-        # VQ losses
-        codebook_loss = F.mse_loss(quantized.detach(), latent_targets)
-        commitment_loss = F.mse_loss(quantized, latent_targets.detach())
+        # Same routing as VQLoss: the codebook term moves the codebook vectors
+        # ``quantized``, the commitment term moves the encoder ``latent_targets``.
+        codebook_loss = F.mse_loss(quantized, latent_targets.detach())
+        commitment_loss = F.mse_loss(quantized.detach(), latent_targets)
         vq_loss = self.codebook_weight * codebook_loss + self.commitment_cost * commitment_loss
         total_loss = total_loss + vq_loss
         loss_dict.update(
@@ -353,7 +359,8 @@ class VQGANLoss(nn.Module):
         disc_fake = self.discriminator(reconstructions.detach())
         fake_loss = self.bce_loss(disc_fake, torch.zeros_like(disc_fake))
 
-        return real_loss + fake_loss
+        total: torch.Tensor = real_loss + fake_loss
+        return total
 
 
 def vq_reconstruction_loss(
@@ -372,7 +379,8 @@ def vq_reconstruction_loss(
         Reconstruction loss
 
     """
-    return resolve_elementary_loss(loss_type)(reconstructions, targets)
+    loss: torch.Tensor = resolve_elementary_loss(loss_type)(reconstructions, targets)
+    return loss
 
 
 def codebook_perplexity(encodings: torch.Tensor) -> torch.Tensor:

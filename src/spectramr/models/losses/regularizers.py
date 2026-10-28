@@ -63,6 +63,9 @@ class WaveletSparsityLoss(nn.Module):
             and penalising it shrinks the image.
     """
 
+    _lo: torch.Tensor
+    _hi: torch.Tensor
+
     def __init__(
         self,
         wavelet: str = "haar",
@@ -109,7 +112,7 @@ class WaveletSparsityLoss(nn.Module):
         x: torch.Tensor, h_row: torch.Tensor, h_col: torch.Tensor
     ) -> torch.Tensor:
         """Apply separable 1D filters along H and W with stride 2 (decimation)."""
-        b, c, h, w = x.shape
+        c = x.shape[1]
         # Build 2D kernel from outer product.
         k2d = torch.outer(h_row, h_col).to(dtype=x.dtype, device=x.device)
         k2d = k2d.view(1, 1, *k2d.shape).expand(c, 1, *k2d.shape).contiguous()
@@ -222,7 +225,7 @@ class PatchLowRankLoss(nn.Module):
         del target
         if torch.is_complex(prediction):
             prediction = prediction.abs()
-        b, c, h, w = prediction.shape
+        h, w = prediction.shape[-2:]
         ps = self.patch_size
         # Round H/W down to a multiple of patch_size.
         h_eff = (h // ps) * ps
@@ -236,7 +239,10 @@ class PatchLowRankLoss(nn.Module):
         if patches.shape[2] > self.max_patches:
             patches = patches[:, :, : self.max_patches, :]
         # Nuclear norm per (batch, channel) — torch.linalg.svdvals retains autograd.
-        sv = torch.linalg.svdvals(patches)
+        # The SVD kernels have no fp16/bf16 implementation, so AMP outputs are upcast.
+        if patches.dtype in (torch.float16, torch.bfloat16):
+            patches = patches.float()
+        sv: torch.Tensor = torch.linalg.svdvals(patches)
         return self.weight * sv.sum(dim=-1).mean()
 
 
@@ -253,7 +259,8 @@ class HermitianSymmetryLoss(nn.Module):
     This loss measures the mean-squared deviation from that property and
     is a valid prior whenever the underlying image is (close to) real.
 
-    Expects an even-sized H/W. If a dim is odd it is centre-cropped by 1.
+    Expects centred k-space (DC at index ``N // 2``, as :func:`fft2c` emits);
+    even and odd H/W are both paired exactly.
 
     Args:
         weight: scale factor.
@@ -287,16 +294,13 @@ class HermitianSymmetryLoss(nn.Module):
     def forward(self, prediction: torch.Tensor, target: torch.Tensor | None = None) -> torch.Tensor:
         del target
         k = self._to_complex(prediction)
-        # Centre-crop to even shape per spatial dim.
+        # With DC at index N // 2 (fft2c), the Hermitian partner of index i is
+        # N - i on an even axis (flip gives N-1-i, so roll by one) and N-1-i on
+        # an odd axis (flip alone); on an even axis index 0 is its own partner.
         h, w = k.shape[-2], k.shape[-1]
-        h_even = (h // 2) * 2
-        w_even = (w // 2) * 2
-        k = k[..., :h_even, :w_even]
-        # Hermitian partner of a CENTERED k-space sample at index i is index N-i
-        # (DC maps to itself). ``flip`` alone gives N-1-i, which is half a sample
-        # off for even N — so a perfectly real image would score nonzero. Roll by
-        # +1 after the flip to realign: roll(flip(k))[i] = k[N-i].
-        k_flip = torch.conj(torch.roll(torch.flip(k, dims=(-2, -1)), shifts=(1, 1), dims=(-2, -1)))
+        k_flip = torch.conj(
+            torch.roll(torch.flip(k, dims=(-2, -1)), shifts=(1 - h % 2, 1 - w % 2), dims=(-2, -1))
+        )
         diff = k - k_flip
         num = (diff.real.pow(2) + diff.imag.pow(2)).mean()
         if self.normalize:
@@ -325,14 +329,16 @@ class KspaceL1SparsityLoss(nn.Module):
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor | None = None) -> torch.Tensor:
         del target
+        # The floor only keeps sqrt'(0) finite; sqrt(floor) is what a zero sample
+        # scores, so it sits far below any |k|^2 a measurement carries.
         if torch.is_complex(prediction):
-            mag = (prediction.real.pow(2) + prediction.imag.pow(2)).clamp(min=1e-12).sqrt()
+            mag = (prediction.real.pow(2) + prediction.imag.pow(2)).clamp(min=1e-24).sqrt()
         else:
             # Treat 2*C real layout as complex magnitude.
             if prediction.dim() >= 4 and prediction.shape[1] % 2 == 0:
                 real = prediction[:, 0::2]
                 imag = prediction[:, 1::2]
-                mag = (real.pow(2) + imag.pow(2)).clamp(min=1e-12).sqrt()
+                mag = (real.pow(2) + imag.pow(2)).clamp(min=1e-24).sqrt()
             else:
                 mag = prediction.abs()
         if self.center_mask_radius > 0:
@@ -387,7 +393,7 @@ class HankelLowRankLoss(nn.Module):
     def forward(self, prediction: torch.Tensor, target: torch.Tensor | None = None) -> torch.Tensor:
         del target
         k = self._to_complex(prediction)
-        b, c, h, w = k.shape
+        h, w = k.shape[-2:]
         ks = self.kernel_size
         if h < ks or w < ks:
             return prediction.new_zeros(()).to(
@@ -400,7 +406,7 @@ class HankelLowRankLoss(nn.Module):
         rows = patches.contiguous().view(b2, c2, n_h * n_w, ks * ks)
         if rows.shape[2] > self.max_rows:
             rows = rows[:, :, : self.max_rows, :]
-        sv = torch.linalg.svdvals(rows)
+        sv: torch.Tensor = torch.linalg.svdvals(rows)
         return self.weight * sv.sum(dim=-1).mean()
 
 

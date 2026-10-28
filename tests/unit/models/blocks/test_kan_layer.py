@@ -7,6 +7,8 @@ needed for any assertion here.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -281,3 +283,70 @@ class TestKANMLP:
         loss.backward()
         assert x.grad is not None
         assert torch.isfinite(x.grad).all()
+
+
+# ── the grid fit must be identical on every rank ─────────────────────────────
+def test_the_sample_gather_is_a_passthrough_without_a_process_group():
+    """Single-process training must be unaffected by the distributed path."""
+    import torch as _t
+
+    from spectramr.models.blocks.kan_layer import _gather_samples_across_ranks
+
+    x = _t.randn(64, 4)
+    assert _gather_samples_across_ranks(x) is x
+
+
+def test_the_grid_update_fits_the_gathered_samples_not_the_local_shard():
+    """The rank-local fit is what splits `grid` from `spline_weight`.
+
+    ``update_grid_from_samples`` solves knots and coefficients together. Fitting
+    per-rank makes each rank solve a different pair, and DDP then broadcasts
+    ``grid`` (a persistent buffer) from rank 0 without re-broadcasting
+    ``spline_weight`` (a parameter) -- so every rank evaluates a gate function
+    that no rank actually fitted. Pinned by source because a real four-rank
+    process group is not available in a unit test.
+    """
+    import inspect
+
+    from spectramr.models.blocks import kan_layer
+
+    src = inspect.getsource(kan_layer.KANLayer.update_grid_from_samples)
+    assert "_gather_samples_across_ranks(x_flat)" in src, (
+        "the grid is fitted to the rank-local shard again"
+    )
+    gather = inspect.getsource(kan_layer._gather_samples_across_ranks)
+    assert "all_gather" in gather and "ReduceOp.MIN" in gather, (
+        "the gather must be shape-safe across ranks with unequal sample counts"
+    )
+
+
+def test_the_grid_still_moves_when_it_is_refitted():
+    """Guards the two checks above from passing on a no-op update."""
+    import torch as _t
+
+    from spectramr.models.blocks.kan_layer import KANLayer
+
+    _t.manual_seed(0)
+    layer = KANLayer(in_dim=4, out_dim=3, grid_size=5)
+    before = layer.grid.clone()
+    layer.update_grid_from_samples(_t.randn(256, 4) * 3.0)
+    assert not _t.equal(before, layer.grid)
+
+
+class TestKANGridRefitNonFiniteGuard:
+    """A non-finite least-squares solution must not reach the layer (step-4000 NaN)."""
+
+    def test_nonfinite_lstsq_solution_keeps_previous_grid_and_weights(self, monkeypatch):
+        layer = KANLayer(in_dim=3, out_dim=4, grid_size=5, spline_order=3)
+        old_grid = layer.grid.clone()
+        old_weight = layer.spline_weight.clone()
+
+        def _nan_lstsq(A, B):
+            return types.SimpleNamespace(solution=torch.full((A.shape[1], B.shape[1]), float("nan")))
+
+        monkeypatch.setattr(torch.linalg, "lstsq", _nan_lstsq)
+        layer.update_grid_from_samples(torch.randn(500, 3) * 3.0 + 5.0)
+
+        assert torch.equal(layer.grid, old_grid)
+        assert torch.equal(layer.spline_weight, old_weight)
+        assert torch.isfinite(layer(torch.randn(8, 3))).all()

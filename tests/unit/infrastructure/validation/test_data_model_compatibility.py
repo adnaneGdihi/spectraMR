@@ -83,7 +83,6 @@ def _annotate(model_type: str, **caps_kwargs):
         MODEL_REGISTRY[model_type] = {
             "class": object,
             "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(**caps_kwargs),
         }
     else:
@@ -129,7 +128,6 @@ class TestDataModelCompatibility:
             adapter_cfg = _SmallNamespace(
                 pre_model=[_SmallNamespace(name="slice_3d_to_2d", enabled=True, model_dump=lambda: {"name": "slice_3d_to_2d", "enabled": True})],
                 post_model=[],
-                pre_loss_pred=[],
                 pre_loss_target=[],
                 pre_metric=[],
             )
@@ -150,7 +148,6 @@ class TestDataModelCompatibility:
             MODEL_REGISTRY.pop("__test_unannot")
         MODEL_REGISTRY["__test_unannot"] = {
             "class": object, "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),  # all None
         }
         try:
@@ -209,7 +206,6 @@ class TestTargetDomainMatchesRegisteredOutputDomain:
         MODEL_REGISTRY["__td_unannot"] = {
             "class": object,
             "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),  # output_domain None
         }
         try:
@@ -352,7 +348,7 @@ class TestModelLossOutputDomain:
             r = ConfigHealthChecker().check_model_loss_output_domain(cfg)
             assert not r.passed and r.severity == "error"
             assert "kspace" in r.message and "image" in r.message
-            assert r.fix_hint and "pre_loss_pred" in r.fix_hint
+            assert r.fix_hint and "output_domain" in r.fix_hint
         finally:
             _unannotate("__test_oo_unbridged", was_test_only=True)
 
@@ -360,7 +356,6 @@ class TestModelLossOutputDomain:
         MODEL_REGISTRY.pop("__test_oo_unannot", None)
         MODEL_REGISTRY["__test_oo_unannot"] = {
             "class": object, "mode": "test",
-            "supports_contrast_conditioning": False,
             "capabilities": ModelCapabilities(),
         }
         try:

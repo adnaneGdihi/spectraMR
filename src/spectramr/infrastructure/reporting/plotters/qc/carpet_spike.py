@@ -73,7 +73,7 @@ def make(
     carpet = np.vstack(profiles)
     spikes_arr = np.asarray(spikes)
 
-    use_default_style("nature")
+    use_default_style()
     fig, (ax_c, ax_s) = plt.subplots(
         1,
         2,

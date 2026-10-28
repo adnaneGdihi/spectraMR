@@ -70,3 +70,26 @@ def test_ensemble_std_field_defaults_none_and_is_carried() -> None:
     std = torch.rand(1, 1, 4, 4)
     assert MetricContext(ensemble_std=std).has("ensemble_std")
     assert MetricContext.from_kwargs({"ensemble_std": std}).ensemble_std is std
+
+
+def test_pred_alt_field_defaults_none_and_is_carried() -> None:
+    """The second-repetition prediction rides the seam rep_variance reads."""
+    assert MetricContext().pred_alt is None
+    alt = torch.rand(1, 8, 4, 4)
+    assert MetricContext(pred_alt=alt).has("pred_alt")
+    assert MetricContext.from_kwargs({"pred_alt": alt}).pred_alt is alt
+
+
+def test_signal_domain_field_defaults_none_and_is_carried() -> None:
+    """The caller's statement of what the tensors are; None leaves the metric's default."""
+    assert MetricContext().signal_domain is None
+    assert MetricContext(signal_domain="kspace").signal_domain == "kspace"
+    assert MetricContext.from_kwargs({"signal_domain": "image"}).signal_domain == "image"
+
+
+def test_pred_kspace_field_defaults_none_and_is_carried() -> None:
+    """The prediction's coil k-space, which ndcr compares per coil (#2316)."""
+    assert MetricContext().pred_kspace is None
+    k = torch.zeros(1, 4, 8, 8, dtype=torch.complex64)
+    assert MetricContext(pred_kspace=k).has("pred_kspace")
+    assert MetricContext.from_kwargs({"pred_kspace": k}).pred_kspace is k

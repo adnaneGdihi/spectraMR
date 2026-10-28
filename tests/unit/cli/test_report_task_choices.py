@@ -78,3 +78,18 @@ def test_the_config_enum_agrees_with_both() -> None:
         f"{sorted(set(TASK_PRESETS) - set(enum_values))}"
     )
     assert enum_values == _cli_task_choices()
+
+
+def _cli_style_choices() -> list[str]:
+    src = APP.read_text()
+    m = re.search(r'"--style",\s*default=None,\s*(?:#[^\n]*\n\s*)*choices=\[(.*?)\]', src, re.S)
+    assert m, "could not locate the report --style choices list in cli/app.py"
+    return sorted(re.findall(r'"([a-z_]+)"', m.group(1)))
+
+
+def test_report_style_choices_equal_the_schema_enum() -> None:
+    """`--style` is written out for the same import-cost reason as `--task`; a
+    style the schema accepts but the CLI cannot select is the same unwired knob."""
+    from spectramr.config.schemas.enums import ReportStyle
+
+    assert _cli_style_choices() == sorted(s.value for s in ReportStyle)

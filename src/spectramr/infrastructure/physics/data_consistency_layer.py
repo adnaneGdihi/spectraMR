@@ -10,12 +10,13 @@ import logging
 import torch
 import torch.nn as nn
 
+from spectramr.infrastructure.physics.dc_mask import align_dc_mask
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 
 logger = logging.getLogger(__name__)
 
 
-class DataConsistencyLayer(nn.Module):
+class MaskedReplacementDataConsistency(nn.Module):
     """
     Physics-Informed Data Consistency Layer.
 
@@ -54,7 +55,7 @@ class DataConsistencyLayer(nn.Module):
         Returns:
             Corrected image [B, C, H, W]
 
-        forward method for DataConsistencyLayer.
+        forward method for MaskedReplacementDataConsistency.
 
         Executes PyTorch tensor operations.
 
@@ -92,30 +93,19 @@ class DataConsistencyLayer(nn.Module):
                 # Assuming this is used at "image-like" stages or C=2.
                 # If C > 2, we might verify if it's pairs.
                 raise ValueError(
-                    f"DataConsistencyLayer expects 2-channel (Re/Im) or Complex input, got {image.shape}"
+                    f"MaskedReplacementDataConsistency expects 2-channel (Re/Im) or Complex input, got {image.shape}"
                 )
 
         # Ensure mask is float for arithmetic (bool tensors don't support subtraction)
         if mask.dtype == torch.bool:
             mask = mask.float()
 
-        # Mask broadcastability guard. The k-space sampling mask is
-        # *coil-independent* by physics — the same Cartesian / radial
-        # pattern is acquired across every coil. Some upstream paths
-        # (e.g. data_consistency_layer.py callers via ``unrolled_*``
-        # generators) can hand the layer a mask shaped like the input
-        # complex tensor instead of [B, 1, H, W]. The 2026-05-10 cluster
-        # rerun saw shapes like k=[B, 8, H, W] with mask=[B, 4, H, W]
-        # which fails non-singleton-dim broadcast at line ``k * (1-m) +
-        # measured * m`` below.
-        #
-        # Resolution: collapse to a 1-channel mask when channel counts
-        # disagree. We use ``amax`` (logical OR over coil dim) so that
-        # a frequency is treated as "sampled" if ANY coil sampled it.
-        # This matches how multi-coil acquisitions actually work.
+        # A mask shaped like the interleaved input rather than [B, 1, H, W] does not
+        # broadcast against the complex blend below; ``align_dc_mask`` owns that
+        # reduction for every DC layer (the 2026-05-10 diff_varnet crash is its
+        # first entry).
         target_channels = k_guessed_complex.shape[1] if not is_complex else k_guessed.shape[1]
-        if mask.dim() >= 2 and mask.shape[1] != target_channels and mask.shape[1] != 1:
-            mask = mask.amax(dim=1, keepdim=True)
+        mask = align_dc_mask(mask, target_channels)
 
         # 2. Apply Consistency
         # For complex tensor:
@@ -143,18 +133,25 @@ class DataConsistencyLayer(nn.Module):
             k_guessed_shape = k_guessed_complex.shape
             measured_shape = measured_kspace_complex.shape
             mask_shape = mask.shape
+            # RuntimeError, not Exception: a non-broadcastable blend raises
+            # RuntimeError, while ``torch.utils.checkpoint`` signals the end of a
+            # recompute by raising ``_StopRecomputationError(Exception)`` THROUGH
+            # whatever user code is running. Catching that logged a [DC LAYER CRASH]
+            # per unrolled block per step on every checkpointed arm -- ten fabricated
+            # errors in the 2026-09-17 diff_varnet run, which completed normally.
             try:
                 k_corrected_complex = (
                     k_guessed_complex * (1.0 - mask) + measured_kspace_complex * mask
                 )
-            except Exception as e:
+            except RuntimeError:
                 logger.error(
                     "[DC LAYER CRASH] k_guessed_complex: %s, measured_kspace_complex: %s, mask: %s",
                     k_guessed_shape,
                     measured_shape,
                     mask_shape,
+                    exc_info=True,
                 )
-                raise e
+                raise
 
             # iFFT
             image_corrected_complex = ifft2c(k_corrected_complex)

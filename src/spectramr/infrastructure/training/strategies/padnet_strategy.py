@@ -9,10 +9,11 @@ Implements the physics-driven loop:
 4. Compute loss on final image
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_CALL
 from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
 from spectramr.models.losses.physics_informed_integration_loss import (
     PhysicsInformedLoss,
@@ -133,6 +134,23 @@ class PaDNetTrainingStrategy(DiffusionTrainingStrategy):
         - Knoll et al. (2020): Physics-Based Deep Learning
     """
 
+    #: Loss ownership (issue #1918). The physics loss module returns l2_image, an image-space L2 against the
+    #: target -- declared inline so the fold does not count it twice. Nothing
+    #: else from losses.image_losses reaches the objective: the hook returns the
+    #: physics module's dict and never calls super() or the fold.
+    inline_losses: ClassVar[frozenset[str]] = frozenset({"l2"})
+    folds_image_losses: ClassVar[bool] = False
+
+    # parallel_compat: Every training step calls generator.predict_q_maps, outside the wrapped
+    # forward, which the call declaration refuses under ddp; the parent's permission is not
+    # inherited.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("generator.predict_q_maps", OWNED_CALL),)
+        return (*super().owned_module_declarations(config), *own)
+
     #: PaDNet does NOT degrade its input inside the step, so the base contract
     #: holds and ``first_steps/input_prepared`` really is the model input:
     #: ``_compute_losses_impl`` hands ``input_batch`` to ``predict_q_maps``
@@ -243,8 +261,9 @@ class PaDNetTrainingStrategy(DiffusionTrainingStrategy):
         # `generate` in my previous implementation had a placeholder.
 
         # Let's call a method `predict_q_maps` which we will implement/ensure exists.
-        if hasattr(self.env.generator, "predict_q_maps"):
-            q_maps = self.env.generator.predict_q_maps(input_batch)
+        generator = self.inner_for_call(self.env.generator, "generator.predict_q_maps")
+        if hasattr(generator, "predict_q_maps"):
+            q_maps = generator.predict_q_maps(input_batch)
         else:
             # Fallback: Try to use encoder + diffusion UNet with t=0
             # This is a hack if the method doesn't exist.

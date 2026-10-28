@@ -156,8 +156,18 @@ node with `nvcc`:
 
 ```bash
 pip install -e '.[all]'
-pip install -e '.[mamba]' --no-build-isolation
+make install-mamba                   # NOT `pip install -e '.[mamba]'` -- see below
 ```
+
+The `mamba` extra goes through `scripts/install_mamba_extra.py` because the bare
+pip line builds a kernel that cannot run on a V100 and reports success:
+mamba-ssm and causal-conv1d download a prebuilt wheel unless `MAMBA_FORCE_BUILD`
+/ `CAUSAL_CONV1D_FORCE_BUILD` are set, their hardcoded `-gencode` list omits
+`sm_70` at every CUDA version, and `TORCH_CUDA_ARCH_LIST` is inert against a
+package that passes its own `arch=` flags. The script forces the source build,
+appends the gencode pairs through `NVCC_APPEND_FLAGS` (which nvcc itself reads),
+defaults to `7.0;8.9` for the clusters' Volta and Ada nodes, and verifies the
+result with `cuobjdump --list-elf` rather than trusting the flags.
 
 `[mri]` is the practical floor, not a convenience. The core install is a
 genuine subset and it is a small one: it registers **175** of the 586 models,

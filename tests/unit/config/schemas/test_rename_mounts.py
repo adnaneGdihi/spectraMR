@@ -73,6 +73,28 @@ class TestPlantedViolationsTurnTheAuditRed:
         assert "widget.old" in findings[0].detail, "name the orphaned record"
         assert "reject_renamed_keys" in findings[0].detail, "name what to mount"
 
+    def test_a_removal_with_no_mount_is_found(self) -> None:
+        """A removed key on an unmounted `extra="ignore"` block would vanish silently."""
+        from spectramr.config.schemas.removals import RemovalRecord
+
+        class Widget(BaseModel):
+            model_config = ConfigDict(extra="ignore")
+            keep: bool = True
+
+        class Root(BaseModel):
+            widget: Widget = Widget()
+
+        removals = {"widget.old": RemovalRecord("widget.old", "2026-10-04", "Gone.")}
+        findings = audit_mounts(Root, {}, allowed_inert={}, removals=removals)
+
+        assert _kinds(findings) == {("missing_mount", "widget", "raise")}
+        assert "widget.old" in findings[0].detail
+
+    def test_the_production_removals_are_all_mounted(self) -> None:
+        from spectramr.config.settings import TrainingSettings
+
+        assert not [f for f in audit_mounts(TrainingSettings) if f.kind == "missing_mount"]
+
     def test_a_mount_of_the_wrong_posture_does_not_cover_the_other(self) -> None:
         """A reject mount is not a fold mount.
 

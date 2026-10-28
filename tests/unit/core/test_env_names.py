@@ -62,3 +62,11 @@ class TestFacadeIntegrity:
     def test_registry_holds_no_accessors(self) -> None:
         """Names only -- a reader here would re-create the cycle the split broke."""
         assert all(n.isupper() for n in env_names.__all__)
+
+
+class TestDispatchSnapshotNames:
+    def test_the_drift_opt_in_and_its_handoff_are_registered(self) -> None:
+        """#2662: the dispatcher reads one and writes the other; both are advertised."""
+        for name in ("SPECTRAMR_DISPATCH_ALLOW_DRIFT", "SPECTRAMR_DISPATCH_SNAPSHOT_RECORD"):
+            assert name in env_names.__all__
+            assert name in env.names()

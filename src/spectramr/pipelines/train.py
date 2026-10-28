@@ -13,19 +13,23 @@ import csv
 import inspect
 import json
 import logging
+import itertools
 import math
 import os
 import time
 import traceback
 import weakref
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
-from tqdm import tqdm
+from spectramr.infrastructure.logging.progress import make_progress
+from spectramr.infrastructure.logging.sinks import resolve_run_dir
 
+from spectramr.core.metrics.reciprocal import is_reciprocal
 from spectramr.infrastructure.services.tensorboard_writer import TensorBoardWriter
 
 logger = logging.getLogger(__name__)
@@ -120,15 +124,27 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 from spectramr import bootstrap
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.metrics.output_sanity import measure_output_sanity
-from spectramr.data.batch_types import BatchAdapter, TrainingBatch
+from spectramr.core.module_utils import unwrap_model  # noqa: E402
+from spectramr.core.parameter_free import require_parameter_free_run  # noqa: E402
+from spectramr.core.wall_clock import resolve_yield_marker_path  # noqa: E402
+from spectramr.data.batch_types import (  # noqa: E402
+    BatchAdapter,
+    TargetlessSampleError,
+    TrainingBatch,
+    reject_targetless_samples,
+)
+from spectramr.data.collation.unpad import split_padded_batches  # noqa: E402
 from spectramr.domain.interfaces.service_interfaces import (
     ICheckpointService,
     ILoggingService,
     IMemoryOptimizationService,
     IMetricsService,
 )
-from spectramr.infrastructure.builders.directors import CheckpointDirector
+from spectramr.infrastructure.checkpointing.layout import CheckpointLayout  # noqa: E402
+from spectramr.infrastructure.checkpointing.payload import CONVERTER  # noqa: E402
+from spectramr.infrastructure.checkpointing.select import pre_v1_names, select  # noqa: E402
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
+from spectramr.infrastructure.distributed.state_io import state_io_of  # noqa: E402
 
 # Re-exported from the infrastructure layer (its canonical home) so existing call
 # sites — and the loss-schedule controller, which cannot import leftward from
@@ -142,7 +158,17 @@ from spectramr.infrastructure.training.builders.director import (
 from spectramr.infrastructure.training.mixed_precision import (  # noqa: E402
     resolve_amp_precision,
 )
+from spectramr.infrastructure.training.strategies.loss_folding import (  # noqa: E402
+    declares_inline_objective,
+)
 from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+from spectramr.infrastructure.training.validation_rows import (  # noqa: E402
+    ValidationBatchRows,
+    batch_identifiers,
+    expand_depth,
+    validation_batches_csv_for,
+    validation_csv_for,
+)
 from spectramr.infrastructure.validation.config_health_checker import (
     FATAL_HEALTH_CHECKS,
     validate_config_health,
@@ -154,6 +180,11 @@ from spectramr.infrastructure.validation.resolved_config_artifact import (  # no
 from spectramr.models.analysis.extensive_gradient_logger import ExtensiveGradientLogger
 from spectramr.models.stability.manager import StabilityManager
 from spectramr.pipelines.parallel import is_rank_zero, resolve_data_rank
+from spectramr.pipelines.validation_evidence import (  # noqa: E402
+    VALIDATION_FAILURE_SENTINEL,
+    ValidationTally,
+    validation_failure_reason,
+)
 from spectramr.shared.utils.seed_control import set_global_seed
 
 
@@ -192,7 +223,7 @@ def validation_can_fire(
     yields *zero* validation events, and the loop has no way to notice.
 
     That silence is expensive rather than merely untidy: validation is what
-    feeds early stopping and ``checkpoint_best.pt``. With no event, neither
+    feeds early stopping and the best checkpoint. With no event, neither
     mechanism ever runs, the unresolvable-monitor ``RuntimeError`` that is
     supposed to cap the cost of a typo'd monitor at one validation pass is
     unreachable (it lives *inside* an event), and the run still exits 0
@@ -249,23 +280,38 @@ def epoch_validation_can_fire(
     )
 
 
-def ema_should_update(iteration: int, update_frequency: int, warmup_steps: int = 0) -> bool:
-    """Whether to apply the EMA shadow-weight update on ``iteration``.
+def ema_should_update(
+    iteration: int,
+    update_frequency: int,
+    warmup_steps: int = 0,
+    gradient_accumulation_steps: int = 1,
+) -> bool:
+    """Whether to apply the EMA shadow-weight update after micro-batch ``iteration``.
 
-    Honors two previously-inert knobs (CLAUDE.md pitfall #15):
-    * ``ema.update_frequency`` — update on every ``update_frequency``-th step
-      (non-positive/missing → 1, i.e. every step);
-    * ``ema.warmup_steps`` — skip EMA updates for the first ``warmup_steps``
-      steps (the shadow holds its init value until then). Default 0 → no skip,
-      preserving the previous every-step behavior exactly.
+    The shadow tracks the weights, which change only at an optimizer step, so
+    the update fires on the accumulation boundary ``(iteration + 1) % gas == 0``
+    and both knobs count optimizer steps:
+
+    * ``ema.update_frequency`` — update on every ``update_frequency``-th
+      optimizer step (non-positive/missing → 1, i.e. every step);
+    * ``ema.warmup_steps`` — skip updates for the first ``warmup_steps``
+      optimizer steps (the shadow holds its init value until then).
+
+    Gating on the micro-batch instead blended the shadow ``gas`` times per
+    optimizer step, ``gas - 1`` of them onto unchanged weights, so the effective
+    decay was ``decay**gas`` on the 163 inprogress arms with accumulation.
 
     NOTE: the adaptive-EMA path consumes ``warmup_steps`` internally, so callers
     must pass ``warmup_steps=0`` there to avoid double-counting.
     """
-    if warmup_steps and iteration < warmup_steps:
+    gas = max(1, int(gradient_accumulation_steps))
+    if (iteration + 1) % gas != 0:
+        return False
+    step = iteration // gas
+    if warmup_steps and step < warmup_steps:
         return False
     freq = update_frequency if (update_frequency and update_frequency > 0) else 1
-    return iteration % freq == 0
+    return step % freq == 0
 
 
 #: Per-sample fields the Pattern-A validation seam may forward to a strategy's
@@ -277,6 +323,8 @@ _VALIDATION_FORWARD_FIELDS: tuple[str, ...] = (
     "trajectory_nominal",
     "field_strength",
     "field_strength_target",
+    "field_strength_t",
+    "field_strength_source_t",
     "contrast_id",
     # B-1.1 multi-source consensus: the travelling-volunteer tuple, so validation can
     # render the variance-reduced consensus mean over all source fields.
@@ -321,6 +369,137 @@ def select_validation_extra_fields(val_batch: Any, vs_params: Any) -> dict[str, 
         if _fk in vs_params and _fk in val_batch:
             out[_fk] = val_batch.get(_fk)
     return out
+
+
+#: Conditioning the field-conditioned strategies read off ``batch_context`` and
+#: raise without, which the capture would swallow into a missing image.
+_VISUAL_CONTEXT_FIELDS: tuple[str, ...] = (
+    "field_strength",
+    "field_strength_target",
+    "field_strength_t",
+    "field_strength_source_t",
+    "contrast_id",
+    "sources",
+)
+
+
+def visual_capture_inputs(
+    strategy: Any, input_batch: Any, target_batch: Any, val_batch: Any
+) -> tuple[Any, Any, dict[str, Any]]:
+    """``(input, target, batch_context)`` the validation image is rendered with.
+
+    A strategy that declares ``validation_batch_context`` renders on exactly what
+    its ``validation_step`` graded: the unprepared tensors plus the batch's
+    measurement, mask and coil maps. Without the context the EI multi-coil
+    operator and SSDU raise, and ``_prepare_validation_data`` would fold a
+    multi-coil input across its axes and misalign it from those maps (#2431).
+    Every other strategy keeps the prepared tensors and the bare context. The
+    tensors and the batch's conditioning fill only what the context leaves unset;
+    ``val_batch`` is a ``TrainingBatch`` or a dict, and both expose ``.get``.
+    """
+    hook = getattr(strategy, "validation_batch_context", None)
+    context = hook(input_batch, target_batch, val_batch) if callable(hook) else None
+    if context is None:
+        context = {"use_dc": False, "measured_kspace": None}
+        if hasattr(strategy, "_prepare_validation_data"):
+            prep = strategy._prepare_validation_data(val_batch, input_batch, target_batch, None)
+            if prep is not None:
+                input_batch, target_batch, _ = prep
+    context.setdefault("input", input_batch)
+    context.setdefault("target", target_batch)
+    for key in _VISUAL_CONTEXT_FIELDS:
+        value = val_batch.get(key) if hasattr(val_batch, "get") else None
+        if value is None and not isinstance(val_batch, dict):
+            value = getattr(val_batch, key, None)
+        if value is not None:
+            context.setdefault(key, value)
+    return input_batch, target_batch, context
+
+
+#: Checkpoint-discovery spellings accepted by ``--resume``. Anything else must
+#: be an existing file; a value that is neither raises rather than being read as
+#: a path that happens not to exist yet (non-negotiable 3).
+_RESUME_DISCOVERY_MODES = frozenset({"auto", "if-present"})
+
+
+def _discover_resume_checkpoint(run_dir: str | Path, logging_service: Any) -> str | None:
+    """The checkpoint ``auto`` / ``if-present`` resume from, or ``None``.
+
+    Pre-1.0 files are never selected. Beside a 1.0 file they are named in the run log,
+    because the module logger reaches only the dispatch ``.err`` (#2841).
+
+    Raises:
+        ConversionPendingError: A pre-1.0 conversion was interrupted (from ``select``).
+        FileNotFoundError: Only pre-1.0 files are present. Starting fresh would discard
+            an unconverted chain's progress, so both modes refuse (non-negotiable 3).
+    """
+    convert = f"python {CONVERTER} {run_dir}"
+    latest = select(run_dir, "latest")  # raises ConversionPendingError mid-conversion
+    legacy = pre_v1_names(run_dir)
+    if not legacy:
+        return str(latest) if latest else None
+    directory = CheckpointLayout.for_run(run_dir).directory
+    shown = ", ".join(legacy[:5]) + (f" and {len(legacy) - 5} more" if len(legacy) > 5 else "")
+    if latest is None:
+        raise FileNotFoundError(
+            f"{directory} holds only pre-1.0 checkpoint files ({shown}), which resume does "
+            f"not read. Convert the run, then resume again: {convert}"
+        )
+    logging_service.log_warning(
+        f"[Resume] {len(legacy)} pre-1.0 checkpoint file(s) in {directory} are not "
+        f"read: {shown}. Convert the run first: {convert}"
+    )
+    return str(latest)
+
+
+def _stamp_resume_record(run_dir: Path, record: dict[str, Any], logger_: Any = None) -> None:
+    """Record what the resume actually did, beside ``provenance.json``.
+
+    Appends rather than overwrites: a 120 h wall-clock chain produces one entry
+    per link, and the sequence of ``start_iteration`` values is what shows the
+    chain advanced instead of restarting. Fail-open — a stamp must never take
+    down a run that is otherwise ready to train.
+    """
+    try:
+        target = Path(run_dir) / "resume_history.json"
+        history = []
+        if target.exists():
+            loaded = json.loads(target.read_text())
+            history = loaded if isinstance(loaded, list) else [loaded]
+        record = {**record, "recorded_at": datetime.now().isoformat(timespec="seconds")}
+        history.append(record)
+        target.write_text(json.dumps(history, indent=2))
+        if logger_ is not None:
+            logger_.log_info(f"[Resume] Stamped {record['outcome']} -> {target}")
+    except Exception:  # pragma: no cover - a stamp never blocks training
+        logger.debug("resume record stamp failed", exc_info=True)
+
+
+def _write_yield_marker(run_dir: Path, result: dict[str, Any], logger_: Any = None) -> None:
+    """Tell the launcher this run stopped early and wants requeueing.
+
+    A file rather than an exit code, because a process-group arm yields inside a
+    ``torch.distributed.run`` worker whose status the launcher collapses. WHERE
+    the file goes is the launcher's decision, not ours — see
+    :func:`~spectramr.core.wall_clock.resolve_yield_marker_path`.
+    """
+    try:
+        target = resolve_yield_marker_path(run_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "resume_from_iteration": result.get("resume_from_iteration"),
+                    "iterations_completed": result.get("iterations_completed"),
+                    "yielded_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+            )
+        )
+        if logger_ is not None:
+            logger_.log_info(f"[WallClock] Wrote yield marker: {target}")
+    except Exception:  # pragma: no cover - a marker never blocks teardown
+        logger.debug("yield marker write failed", exc_info=True)
 
 
 def _determinism_from_config(config: Any) -> bool:
@@ -426,7 +605,7 @@ def _preprocess_validation_tensor(t: Any, config: Any) -> Any:
         # doubly dead: DataConfigSchema never declares `image_size` and is
         # extra="ignore", so hasattr was permanently False; and `migrate_legacy_sizes`
         # (data.py) already folds img_size / target_size / image_size into
-        # `patch_size`, which the branch above consumes. Re-declaring the key
+        # `patch_size`, which the branch above consumes. Redeclaring the key
         # would resurrect a spelling the migration exists to retire.
 
         if target_size is not None and (target_size[0] != H or target_size[1] != W):
@@ -483,6 +662,7 @@ def run_training_pipeline(
     env: Any | None = None,
     strategy: Any | None = None,
     allow_status: str | None = None,
+    validate_only: bool = False,
 ) -> dict[str, Any]:
     """Run the complete training pipeline using Strategy Pattern.
 
@@ -603,7 +783,9 @@ def run_training_pipeline(
         logger.warning("[Pipeline] WARNING: Config health check found non-fatal errors (see logs)")
 
     # Bootstrap Services
-    container = bootstrap.build_container(config, device=device)
+    container = bootstrap.build_container(
+        config, device=device, run_dir=resolve_run_dir(config, is_sanity_check)
+    )
 
     logging_service = container.resolve(ILoggingService)
     checkpoint_service = container.resolve(ICheckpointService)
@@ -693,6 +875,20 @@ def run_training_pipeline(
                     None,
                 ),
             }
+            # Who decided the level (cli / env / config / default), not only the number.
+            from spectramr.infrastructure.logging.log_policy import current_level, current_policy
+            from spectramr.infrastructure.logging.progress import resolve_progress_mode
+
+            _level = current_level()
+            if _level is not None:
+                _log_record["level"] = {"value": _level.name, "source": _level.source}
+            # Who logs, to which stream, and how progress shows, as resolved for this run.
+            _log_record["policy"] = {
+                **current_policy(),
+                "progress": resolve_progress_mode(config.logging),
+            }
+            _log_record["sinks_dir_source"] = getattr(logging_service, "sinks_dir_source", None)
+            _log_record["sinks"] = logging_service.sink_records()
             _relocated = getattr(logging_service, "log_dir_relocated_from", None)
             if _relocated:
                 _log_record["relocated_from"] = _relocated
@@ -724,7 +920,9 @@ def run_training_pipeline(
             pipeline = env
         else:
             director = TrainingEnvironmentDirector(config)
-            pipeline = director.build_environment()
+            pipeline = director.build_environment(
+                with_test_loader=validate_only or config.data.source.test_pass == "train_end"
+            )
 
         generator = pipeline.models.get("generator")
         optimizer_g = pipeline.optimizers.get("opt_g")
@@ -741,6 +939,7 @@ def run_training_pipeline(
         try:
             from spectramr.infrastructure.logging.provenance import (
                 count_parameters,
+                data_split_provenance,
                 describe_dataloader,
                 log_provenance,
             )
@@ -783,6 +982,20 @@ def run_training_pipeline(
                         **_plugin_record,
                     }
 
+                # Resolved compilation, for the same reason as the two above:
+                # the config says compile.enabled, only the build knows WHERE
+                # the wrap landed and whether it landed at all. `DDP(compile(m))`
+                # and `compile(DDP(m))` produce identical YAML and different
+                # runs, and the director was assembling this record and
+                # dropping it.
+                from spectramr.infrastructure.logging.provenance import (
+                    compile_provenance,
+                )
+
+                provenance["compile"] = compile_provenance(
+                    config, getattr(pipeline, "compile", None)
+                )
+
             if provenance:
                 # ``generator`` gates the PARAMETER COUNT only. It used to gate
                 # this whole block, so the in-process ``env=`` entry above (the
@@ -791,6 +1004,17 @@ def run_training_pipeline(
                 # mean every entry point, not just the CLI one.
                 if generator is not None:
                     provenance["model"] = count_parameters(generator)
+                    from spectramr.infrastructure.training.snapshot_provenance import (
+                        forward_noise_scope,
+                        mask_scope,
+                    )
+
+                    scope = mask_scope(config, generator)
+                    if scope is not None:
+                        provenance["mask_scope"] = scope
+                    noise = forward_noise_scope(generator)
+                    if noise is not None:
+                        provenance["forward_noise"] = noise
                 loaders = getattr(pipeline, "data_loaders", {}) or {}
                 # ``is not None``, not truthiness: a DataLoader defines
                 # ``__len__``, so an EMPTY loader is falsy and used to be
@@ -801,6 +1025,9 @@ def run_training_pipeline(
                     for split in ("train", "val", "test")
                     if loaders.get(split) is not None
                 }
+                _split = data_split_provenance(pipeline)
+                if _split is not None:
+                    provenance["data_split"] = _split
                 log_provenance(provenance, logger=logger)
         except Exception:  # pragma: no cover - provenance never blocks training
             logger.debug("run provenance banner failed", exc_info=True)
@@ -816,7 +1043,19 @@ def run_training_pipeline(
                 log_provenance(provenance, logger=logger)
         except Exception:  # pragma: no cover
             pass
-        return {"error": f"Training pipeline build failed: {exc}", "success": False}
+        return _record_failed_run(
+            config,
+            {
+                "error": f"Training pipeline build failed: {exc}",
+                "error_type": type(exc).__name__,
+                "success": False,
+            },
+            run_dir=resolve_run_dir(config, is_sanity_check),
+            write=is_rank_zero(config),
+            seed=seed,
+            provenance=provenance,
+            started_at=run_started_at,
+        )
 
     # 4. Extract pipeline properties directly (no adapter wrapper)
     device_obj = pipeline.device
@@ -876,37 +1115,54 @@ def run_training_pipeline(
     # Use the 'losses' property which consolidates losses_dict and single modules
     losses = pipeline.losses
 
-    if not losses:
+    # Reached only on the ``env=`` scripting path, which skips the director and so
+    # never runs ``LossBuilder.validate()``. Both readers ask the strategy the same
+    # question (NN17), so a strategy that declares it owns its objective inline is
+    # not warned about here either.
+    if not losses and not declares_inline_objective(type(strategy)):
         logging_service.log_warning("No losses were built by LossBuilder; training may fail.")
 
     # Legacy Gradient Logger (Pending refactor to proper service)
     # Using output root from logging service if accessible, or config
-    output_dir = "experiments/outputs"
-    if config.training and config.training.output_dir:
-        output_dir = config.training.output_dir
-
+    run_dir = resolve_run_dir(config, is_sanity_check)
+    output_dir = str(run_dir)
     if is_sanity_check:
-        # Prevent completely overwriting the real experiment output dir
-        output_dir = str(Path(output_dir) / "sanity_check")
         logging_service.log_info(f"🧪 SANITY CHECK MODE: Redirecting outputs to {output_dir}")
 
     # Construct paths map for local usage
     # Write directly to output_dir, not nested under run_name
-    run_dir = Path(output_dir)
     paths = {
         "run_output_dir": str(run_dir),
         "csv_log_file": str(run_dir / "logs" / "training_metrics.csv"),
         "log_dir": str(run_dir / "logs"),
     }
 
+    # Clear any yield marker from the PREVIOUS link of this chain before the
+    # run starts. A stale marker requeues a run that has already finished.
+    try:
+        resolve_yield_marker_path(run_dir).unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - a read-only dir fails louder below
+        logger.debug("could not clear the wall-clock yield marker", exc_info=True)
+
     # Ensure output directories exist
     try:
         (run_dir / "logs").mkdir(parents=True, exist_ok=True)
         (run_dir / "metrics").mkdir(parents=True, exist_ok=True)
-        (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        CheckpointLayout.for_run(run_dir).ensure()
         logging_service.log_info(f"Output directories created at: {run_dir}")
     except Exception as e:
         logging_service.log_warning(f"Failed to create output dirs at {run_dir}: {e}")
+
+    # A config-owned test partition is recorded on the first run and verified on every later one.
+    if not is_sanity_check and RankUtility.is_main_rank():
+        from spectramr.data.metadata.test_split_record import (
+            derived_test_split_record,
+            write_or_verify_test_split,
+        )
+
+        write_or_verify_test_split(
+            run_dir, derived_test_split_record(config.data, getattr(pipeline, "data_split", None))
+        )
 
     # Persist the run's provenance + the *resolved* config (post-defaults /
     # post-migration SSOT) as self-describing artifacts, so a bundle can be
@@ -1013,8 +1269,11 @@ def run_training_pipeline(
     # Placement is pinned on both sides. It must land AFTER stage 7, so every
     # module (generator, discriminator, strategy-owned heads) is already built
     # from the shared seed; and BEFORE stage 9, because checkpoint resume restores
-    # saved per-rank RNG state (`checkpoint_service.py::_restore_rng_state`) and a
-    # re-seed after that would throw the resumed stream away.
+    # the saved RNG state (`core/rng_state.py`, applied by
+    # `checkpointing.resume` on rank 0) and a re-seed after that would
+    # throw the resumed stream away. Rank 0 only: the checkpoint carries one
+    # process's streams, so the offset below is what keeps the other ranks
+    # drawing different augmentations after a resume.
     #
     # DataLoader workers inherit this for free: `core/worker_seeding.py::seed_worker`
     # derives from `torch.initial_seed()`, which is now rank-offset. Same
@@ -1032,67 +1291,125 @@ def run_training_pipeline(
         set_global_seed(seed, deterministic=_determinism_from_config(config), rank=_data_rank)
 
     # 9. Resume from Checkpoint (if requested)
+    #
+    # `auto` RAISES on an empty directory; `if-present` starts fresh instead.
+    # The chain spelling has to be the second one: every link of a wall-clock
+    # chain runs the identical command, so link 1 has nothing to resume from
+    # while links 2..N do — and softening `auto` would delete the only spelling
+    # that can still tell you your checkpoints went missing.
     start_iteration = 0
+    resumed_early_stopping: dict[str, Any] | None = None
+    _resume_record: dict[str, Any] = {}
+    # A declared parameter-free solver is graded, never trained or resumed.
+    try:
+        _parameter_free = require_parameter_free_run(
+            generator, validate_only=validate_only, resume=resume_path
+        )
+    except ValueError as e:
+        logging_service.log_error(f"[Parameter-free] {e}")
+        return _record_failed_run(
+            config,
+            {"error": str(e), "error_type": type(e).__name__, "success": False},
+            run_dir=run_dir,
+            write=_is_rank_zero,
+            seed=seed,
+            provenance=provenance,
+            started_at=run_started_at,
+        )
     if resume_path:
         try:
-            _resume_path = resume_path
-            if _resume_path == "auto":
-                # Auto-discover latest checkpoint from output dir
-                checkpoint_dir = str(Path(output_dir) / "checkpoints")
-                latest = checkpoint_service.find_latest_checkpoint(checkpoint_dir)
-                if latest is None:
+            _resume_mode = str(resume_path).strip()
+            _resume_path: str | None = _resume_mode
+
+            if _resume_mode in _RESUME_DISCOVERY_MODES:
+                checkpoint_dir = str(CheckpointLayout.for_run(output_dir).directory)
+                latest = _discover_resume_checkpoint(output_dir, logging_service)
+                if latest is None and _resume_mode == "auto":
                     raise FileNotFoundError(
-                        f"No checkpoint found in {checkpoint_dir} for auto-resume."
+                        f"No checkpoint found in {checkpoint_dir} for auto-resume: it "
+                        "holds no checkpoint of any version. Use --resume if-present to "
+                        "start fresh on an empty directory (the wall-clock chain spelling)."
                     )
-                _resume_path = str(latest)
-                logging_service.log_info(
-                    f"[Resume] Auto-discovered latest checkpoint: {_resume_path}"
+                _resume_path = str(latest) if latest else None
+            elif not Path(_resume_mode).exists():
+                # A typo resolves to neither a mode nor a file, and must raise
+                # rather than be read as a path (non-negotiable 3).
+                raise ValueError(
+                    f"--resume {_resume_mode!r} is neither an existing checkpoint "
+                    f"nor a known discovery mode "
+                    f"({', '.join(sorted(_RESUME_DISCOVERY_MODES))})."
                 )
 
-            # Use CheckpointDirector to restore all state. with_strategy lets the
-            # director also restore strategy-OWNED learnable modules/params (sfc
-            # heads, spin_sde diffusion param, ...) that live on the strategy, not
-            # on the generator — see section R design doc.
-            # with_parallel_runtime is what selects the checkpoint adapter, and
-            # a resume needs it for two distinct reasons. Loudly: a sharded
-            # strategy's best checkpoint holds no generic payload at all, so
-            # resuming from one without the adapter raises. Quietly, and worse:
-            # a PERIODIC checkpoint does carry the generic envelope, so the
-            # weights restore and the resume reports success -- while the ZeRO
-            # optimizer partitions in the tag directory beside it are never
-            # read, silently restarting a resumed run on a zeroed optimizer.
-            # `getattr(..., None)` mirrors training_loop.py's own resolution and
-            # keeps every single-process arm on DefaultCheckpointAdapter.
-            resume_director = CheckpointDirector(config)
-            resume_director.with_checkpoint_dir(
-                str(Path(output_dir) / "checkpoints")
-            ).with_pipeline(pipeline).with_strategy(strategy).with_parallel_runtime(
-                getattr(pipeline, "parallel", None)
-            )
-            success = resume_director.load_from(_resume_path)
-
-            if success:
-                start_iteration = resume_director._global_step
+            if _resume_path is None:
                 logging_service.log_info(
-                    f"[Resume] Restored from checkpoint: "
-                    f"epoch={resume_director._epoch}, step={start_iteration}"
+                    f"[Resume] No checkpoint under {output_dir}/checkpoints; "
+                    f"--resume {_resume_mode} starts this run FRESH at iteration 0."
                 )
-                if resume_director._counter_state:
-                    logging_service.log_info(
-                        f"[Resume] Counter state available: "
-                        f"step={resume_director._counter_state.get('current_step')}, "
-                        f"epoch={resume_director._counter_state.get('current_epoch')}"
-                    )
-            else:
-                logging_service.log_error(f"[Resume] Failed to load checkpoint: {_resume_path}")
-                return {
-                    "error": f"Failed to load checkpoint: {_resume_path}",
-                    "success": False,
+                _resume_record = {
+                    "declared": _resume_mode,
+                    "resolved_checkpoint": None,
+                    "outcome": "fresh",
+                    "start_iteration": 0,
                 }
+            else:
+                if _resume_mode in _RESUME_DISCOVERY_MODES:
+                    logging_service.log_info(
+                        f"[Resume] Discovered latest checkpoint: {_resume_path}"
+                    )
+
+                # The runtime selects the checkpoint adapter: without it a ZeRO run's
+                # optimizer partitions in the tag directory are never read and the resume
+                # still reports success.
+                resumed = checkpoint_service.resume(
+                    _resume_path,
+                    pipeline,
+                    strategy=strategy,
+                    parallel=getattr(pipeline, "parallel", None),
+                    config=config,
+                )
+                start_iteration = resumed.step
+                resumed_early_stopping = resumed.early_stopping
+                _resume_record = {
+                    "declared": _resume_mode,
+                    "resolved_checkpoint": _resume_path,
+                    "outcome": "restored",
+                    "start_iteration": start_iteration,
+                    "epoch": resumed.epoch,
+                    "checkpoint_reason": resumed.reason,
+                    "early_stopping": (
+                        None
+                        if resumed_early_stopping is None
+                        else "restored"
+                        if "wait_count" in resumed_early_stopping
+                        else "best seeded by the converter"
+                    ),
+                }
+                logging_service.log_info(
+                    f"[Resume] Restored from checkpoint: epoch={resumed.epoch}, "
+                    f"step={start_iteration} (written for {resumed.reason!r})"
+                )
         except Exception as e:
             logging_service.log_error(f"[Resume] Checkpoint load error: {e}")
             logger.error("Resume checkpoint load failed", exc_info=True)
-            return {"error": f"Resume failed: {e}", "success": False}
+            return _record_failed_run(
+                config,
+                {"error": f"Resume failed: {e}", "error_type": type(e).__name__, "success": False},
+                run_dir=run_dir,
+                write=_is_rank_zero,
+                seed=seed,
+                provenance=provenance,
+                started_at=run_started_at,
+            )
+
+    # A resume is a fact about the run that provenance.json cannot carry: it is
+    # written at stage 8, before this decision exists. Stamped here so a reader
+    # can tell a fresh link of a chain from a restored one (non-negotiable 8).
+    # Rank-gated: the stamper is a read-modify-write on one shared path, so an
+    # ungated call has every rank appending — four entries per link on a 4-rank
+    # arm, or a torn read that fails open and records nothing. The process-group
+    # arms are the ones that chain, so this is the production path.
+    if _resume_record and _is_rank_zero:
+        _stamp_resume_record(run_dir, _resume_record, logger_=logging_service)
 
     # 9b. TensorBoard — the run's single writer.
     #
@@ -1104,7 +1421,7 @@ def run_training_pipeline(
     # and the scalars interleave. A non-zero rank gets a writer that is falsy
     # and whose every method is a no-op, so the `if tb_writer:` guards at the
     # write sites keep their exact previous meaning.
-    tb_writer = TensorBoardWriter(
+    tb_writer = logging_service.open_tensorboard(
         run_dir,
         config.logging,
         is_rank_zero=_is_rank_zero,
@@ -1128,7 +1445,7 @@ def run_training_pipeline(
     from spectramr.pipelines.training_loop import TrainingLoop
 
     try:
-        result = TrainingLoop(
+        loop = TrainingLoop(
             strategy,
             pipeline,
             config,
@@ -1139,7 +1456,29 @@ def run_training_pipeline(
             checkpoint_service=checkpoint_service,
             metrics_service=metrics_service,
             is_sanity_check=is_sanity_check,
-        ).run(start_iteration=start_iteration)
+        )
+        if validate_only:
+            # One pass on the resumed weights, through the loop's own evaluate()
+            # so it grades exactly what an in-training validation would.
+            result = _validate_only_result(
+                loop,
+                paths,
+                start_iteration,
+                (_resume_record or {}).get("resolved_checkpoint")
+                or getattr(getattr(config, "model", None), "checkpoint_path", None),
+                logging_service,
+                parameter_free=_parameter_free,
+            )
+            _run_held_out_test_pass(
+                loop, pipeline, strategy, config, paths, result, is_sanity_check=is_sanity_check
+            )
+        else:
+            result = loop.run(
+                start_iteration=start_iteration, early_stopping_state=resumed_early_stopping
+            )
+            _run_held_out_test_pass(
+                loop, pipeline, strategy, config, paths, result, is_sanity_check=is_sanity_check
+            )
         if tb_writer:
             _write_hparams(tb_writer, config)
             tb_writer.close()
@@ -1154,6 +1493,17 @@ def run_training_pipeline(
             result["duration_sec"] = round(duration_sec, 2)
             if isinstance(iters, int) and iters > 0 and duration_sec > 0:
                 result["iterations_per_sec"] = round(iters / duration_sec, 3)
+            # The whole-run figure above includes setup and validation; this is the step loop alone.
+            loop_wait = result.get("loader_wait") or {}
+            if loop_wait.get("wall_s"):
+                result["train_iterations_per_sec"] = round(loop_wait["steps"] / loop_wait["wall_s"], 3)
+            if result.get("wall_clock_yield") and _is_rank_zero:
+                _write_yield_marker(run_dir, result, logger_=logging_service)
+
+        # Validation PNGs are written by a worker thread; the report below and
+        # the process teardown must both see them on disk. Covers the normal
+        # finish, a wall-clock yield and validate-only (all fall through here).
+        _drain_validation_images(metrics_service, logging_service)
 
         # ONE writer (#1685), and every write below it too. The sinks write
         # fixed, rank-independent paths (`report_cases/case_*.npz`,
@@ -1228,7 +1578,21 @@ def run_training_pipeline(
 
             # End-of-training reporting hook (per TODO/report_step).
             # Soft-fails by default so it cannot break a long run's wrap-up.
-            _maybe_run_reporting(config, run_dir=Path(paths["run_output_dir"]), logger_=logger)
+            #
+            # Skipped on a wall-clock yield for two reasons. It would draw the
+            # figure set of a FINISHED experiment from a model that is midway
+            # through one; and it runs inside the save margin, so a report long
+            # enough to reach the wall takes the launcher down with it before
+            # the requeue is ever issued.
+            if result.get("wall_clock_yield"):
+                logger.info(
+                    "[WallClock] Skipping end-of-training reporting: this run "
+                    "yielded and is not finished."
+                )
+            else:
+                _maybe_run_reporting(
+                    config, run_dir=Path(paths["run_output_dir"]), logger_=logger
+                )
 
         return result
 
@@ -1236,12 +1600,142 @@ def run_training_pipeline(
         import traceback
 
         error_msg = f"Critical Training Error: {e}\n{traceback.format_exc()}"
+        hint = _async_cuda_fault_hint(e)
+        if hint:
+            error_msg = f"{error_msg}\n{hint}"
         logging_service.log_error(error_msg)
         logger.error(error_msg, exc_info=True)
+        # The failure path must not return with PNG writes still in flight.
+        _drain_validation_images(metrics_service, logging_service)
         if tb_writer:
             _write_hparams(tb_writer, config)
             tb_writer.close()
-        return {"error": str(e), "success": False}
+        duration_sec = time.perf_counter() - run_start_perf
+        return _record_failed_run(
+            config,
+            {
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "success": False,
+                "training_time": _format_duration(duration_sec),
+                "duration_sec": round(duration_sec, 2),
+            },
+            run_dir=run_dir,
+            write=_is_rank_zero,
+            seed=seed,
+            provenance=provenance,
+            started_at=run_started_at,
+        )
+
+
+#: CUDA faults the driver reports on a LATER synchronisation than the launch that
+#: caused them. The traceback then names whichever op happened to sync, so the
+#: frame is evidence of nothing. ``device-side assert`` is included because its
+#: own message already says to set the variable; the rest never say so.
+_ASYNC_CUDA_FAULTS = (
+    "misaligned address",
+    "an illegal memory access",
+    "unspecified launch failure",
+    "device-side assert triggered",
+)
+
+
+def _async_cuda_fault_hint(exc: BaseException) -> str | None:
+    """Say that the traceback of an async CUDA fault points at the wrong frame.
+
+    Three ``kspace_cold_diffusion`` arms died with ``CUDA error: misaligned
+    address`` on the 2026-09-17 dispatch, all three blaming the same
+    ``ChannelAttention`` line -- which is simply where the next synchronisation
+    landed. Re-running unchanged reproduces the same useless frame, so the
+    operator needs the serialising flag named at the point of failure rather
+    than in a doc they have no reason to open.
+    """
+    text = str(exc)
+    if "CUDA error:" not in text and "AcceleratorError" not in type(exc).__name__:
+        return None
+    if not any(fault in text for fault in _ASYNC_CUDA_FAULTS):
+        return None
+    return (
+        "[async CUDA fault] The traceback above names the operation that "
+        "SYNCHRONISED, not the kernel that faulted -- CUDA reports these "
+        "asynchronously, so the frame is not the culprit and re-running "
+        "unchanged reproduces the same misdirection. Re-run this arm with "
+        "CUDA_LAUNCH_BLOCKING=1 to serialise launches and get a traceback that "
+        "names the real kernel. If it then lands somewhere else each time, "
+        "suspect the node: `cudnn.benchmark` re-autotunes per process, so the "
+        "algorithm selection -- and any alignment requirement it carries -- "
+        "varies run to run on identical config."
+    )
+
+
+def _write_validation_csv_row(val_csv_file: str, val_row: dict[str, Any]) -> None:
+    """Append one validation row, widening the header when new metric keys appear.
+
+    The unchanged-keys path reads only the header line; the rows are read and
+    the file rewritten only when the schema grows. Errors propagate (#713).
+    """
+    val_csv_path = Path(val_csv_file)
+    val_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not val_csv_path.exists() or val_csv_path.stat().st_size == 0
+
+    if write_header:
+        # First write — create file with header from current keys
+        all_fieldnames = list(val_row.keys())
+        with open(val_csv_file, "w", newline="") as _vf:
+            _vwriter = csv.DictWriter(
+                _vf, fieldnames=all_fieldnames, extrasaction="ignore"
+            )
+            _vwriter.writeheader()
+            _vwriter.writerow(val_row)
+    else:
+        # Append — read only the header line; rows are needed solely
+        # when the schema grows and the file is rewritten below.
+        with open(val_csv_file, newline="") as _rf:
+            existing_header = next(csv.reader(_rf), [])
+
+        new_keys = [k for k in val_row if k not in existing_header]
+        if new_keys:
+            # Schema expanded — rewrite with unified header
+            all_fieldnames = existing_header + new_keys
+            with open(val_csv_file, newline="") as _rf:
+                _rf.readline()  # skip old header
+                old_reader = csv.DictReader(_rf, fieldnames=existing_header)
+                existing_rows = list(old_reader)
+            with open(val_csv_file, "w", newline="") as _vf:
+                _vwriter = csv.DictWriter(
+                    _vf,
+                    fieldnames=all_fieldnames,
+                    extrasaction="ignore",
+                    restval="",
+                )
+                _vwriter.writeheader()
+                _vwriter.writerows(existing_rows)
+                _vwriter.writerow(val_row)
+        else:
+            # Same schema — simple append
+            with open(val_csv_file, "a", newline="") as _vf:
+                _vwriter = csv.DictWriter(
+                    _vf,
+                    fieldnames=existing_header,
+                    extrasaction="ignore",
+                    restval="",
+                )
+                _vwriter.writerow(val_row)
+
+
+def _drain_validation_images(metrics_service: Any, logging_service: Any) -> None:
+    """Finish queued validation PNG writes and stop the writer thread.
+
+    A write error only costs a picture (the previous synchronous path logged
+    and continued), so it is reported rather than raised.
+    """
+    shutdown = getattr(metrics_service, "shutdown_image_writer", None)
+    if not callable(shutdown):
+        return
+    try:
+        shutdown()
+    except Exception as exc:
+        logging_service.log_warning(f"Validation image save failed: {exc}")
 
 
 def _format_duration(seconds: float) -> str:
@@ -1255,45 +1749,58 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def _checkpoint_summary(config: Any, run_dir: Path) -> dict[str, Any]:
-    """Where the checkpoints went, and whether they are inside the bundle (#503).
+def _checkpoint_summary(run_dir: Path) -> dict[str, Any]:
+    """Where the checkpoints went, and what is there at the end of the run (#503).
 
-    exp_vf_01 retrieved a **present-but-empty** ``checkpoints/`` directory while
-    its log named two files it had written. Both facts were true: the arm's
-    ``checkpoint.checkpoint_dir`` pointed outside the collected run directory,
-    so the files existed on the cluster and the bundle never contained them.
+    The directory is the one every training-loop save writes,
+    ``<run_dir>/checkpoints``; no config key moves it (#1972, #2842).
 
-    An empty directory cannot distinguish that from "no checkpoint was ever
-    saved" -- and those need opposite responses (fix the sync vs fix the run).
-    Recording the resolved directory, whether it is inside ``run_dir``, and what
-    is actually there at the end makes the bundle answer it on its own.
+    exp_vf_01 retrieved a present-but-empty ``checkpoints/`` while its log named
+    files it had written; listing what is actually there lets the bundle say
+    whether anything was saved.
 
     Never raises: this is a diagnostic in a footer, and a stat() failure on a
     network filesystem must not cost the run its summary.
     """
-    out: dict[str, Any] = {
-        "dir": None,
-        "inside_run_dir": None,
-        "files": [],
-        "total_bytes": 0,
-    }
+    out: dict[str, Any] = {"dir": None, "files": [], "total_bytes": 0}
     try:
-        ckpt = getattr(config, "checkpoint", None)
-        raw = getattr(ckpt, "checkpoint_dir", None) if ckpt is not None else None
-        if raw is None:
-            return out
-        d = Path(raw).expanduser().resolve()
-        out["dir"] = str(d)
-        # The load-bearing flag. False means the files, if any, will not travel
-        # with the bundle -- which is the exp_vf_01 shape exactly.
-        out["inside_run_dir"] = d == run_dir.resolve() or run_dir.resolve() in d.parents
-        if d.is_dir():
-            files = sorted(p for p in d.glob("*.pt") if p.is_file())
-            out["files"] = [{"name": p.name, "bytes": p.stat().st_size} for p in files]
-            out["total_bytes"] = sum(f["bytes"] for f in out["files"])
+        layout = CheckpointLayout.for_run(run_dir.expanduser().resolve())
+        out["dir"] = str(layout.directory)
+        entries = sorted(layout.entries(), key=lambda e: e.path.name)
+        out["files"] = [{"name": e.path.name, "bytes": e.path.stat().st_size} for e in entries]
+        out["total_bytes"] = sum(f["bytes"] for f in out["files"])
     except Exception:
         pass
     return out
+
+
+def _record_failed_run(
+    config: Any,
+    result: dict[str, Any],
+    *,
+    run_dir: Path,
+    write: bool,
+    seed: int | None,
+    provenance: dict[str, Any] | None,
+    started_at: datetime | None,
+) -> dict[str, Any]:
+    """Write a failed run's summary over any previous run's, then return ``result``.
+
+    Without this a crashed re-run left the last completed run's ``success: true``
+    on disk, and triage read a dead arm as green (#182). ``write`` is the
+    rank-zero gate: the summary path is rank-invariant.
+    """
+    if write:
+        _emit_run_summary(
+            config,
+            run_dir=run_dir,
+            result=result,
+            seed=seed,
+            logger_=logger,
+            provenance=provenance,
+            started_at=started_at,
+        )
+    return result
 
 
 def _emit_run_summary(
@@ -1343,7 +1850,13 @@ def _emit_run_summary(
                 else None
             ),
             "seed": seed,
-            "success": (bool(result.get("success", True)) if isinstance(result, dict) else None),
+            # Never defaulted (#181): an absent or non-boolean flag is unknown,
+            # which is not success.
+            "success": (
+                result.get("success")
+                if isinstance(result, dict) and isinstance(result.get("success"), bool)
+                else None
+            ),
             "strategy_class": (
                 config.training.strategy_class if config.training is not None else None
             ),
@@ -1357,10 +1870,30 @@ def _emit_run_summary(
             "iterations_per_sec": (
                 result.get("iterations_per_sec") if isinstance(result, dict) else None
             ),
+            "train_iterations_per_sec": (
+                result.get("train_iterations_per_sec") if isinstance(result, dict) else None
+            ),
+            # Whole-run share of wall time spent waiting for a batch: the answer to
+            # "was the accelerator starved", with no profiler attached.
+            "loader_wait": (result.get("loader_wait") if isinstance(result, dict) else None),
             # --- metrics ----------------------------------------------------
             "best_metrics": (result.get("best_metrics") if isinstance(result, dict) else None),
+            # False when restore_best_weights was asked for and the restore failed:
+            # the final checkpoint then holds the last weights, not the best.
+            "best_weights_restored": (
+                result.get("best_weights_restored") if isinstance(result, dict) else None
+            ),
             "final_loss": (result.get("final_loss") if isinstance(result, dict) else None),
             "error": result.get("error") if isinstance(result, dict) else None,
+            "error_type": result.get("error_type") if isinstance(result, dict) else None,
+            "validation_events": (
+                result.get("validation_events") if isinstance(result, dict) else None
+            ),
+            "validation_events_with_finite_metric": (
+                result.get("validation_events_with_finite_metric")
+                if isinstance(result, dict)
+                else None
+            ),
             # --- traceability (provenance subset) ---------------------------
             "config_sha256": prov.get("config_sha256"),
             "git": prov.get("git"),
@@ -1375,26 +1908,22 @@ def _emit_run_summary(
             # (pitfall #15c); None for a plain ``spectramr train``.
             "launch": prov.get("launch") or None,
             # --- artifacts ---------------------------------------------------
-            # #503: an empty `checkpoints/` in a retrieved bundle read as "no
-            # checkpoint was saved" when the truth was "written outside the
-            # collected directory". Stated here so the bundle answers it alone.
-            "checkpoints": _checkpoint_summary(config, run_dir),
+            # #503: an empty `checkpoints/` in a retrieved bundle cannot say
+            # whether anything was saved; the listing lets the bundle answer it.
+            "checkpoints": _checkpoint_summary(run_dir),
         }
         ck = summary["checkpoints"]
-        if ck.get("dir") and ck.get("inside_run_dir") is False:
+        ckpt_cfg = getattr(config, "checkpoint", None)
+        # A validate-only run grades weights it loaded and never saves any.
+        if (
+            ck.get("dir")
+            and not ck.get("files")
+            and getattr(ckpt_cfg, "enabled", False)
+            and not (isinstance(result, dict) and result.get("validate_only"))
+        ):
             logger_.warning(
-                "Checkpoints were written OUTSIDE the run directory: %s (run_dir "
-                "is %s). They will not travel with a retrieved artifact bundle, "
-                "and the bundle's checkpoints/ will look empty as though nothing "
-                "was saved (#503). Point checkpoint.checkpoint_dir inside the run "
-                "directory, or collect that path explicitly.",
-                ck["dir"],
-                run_dir,
-            )
-        elif ck.get("dir") and not ck.get("files"):
-            logger_.warning(
-                "No checkpoint files found in %s at end of run. If the run "
-                "reported saving one, it went somewhere else (#503).",
+                "Checkpointing is enabled and no checkpoint file is in %s at the "
+                "end of the run (#503).",
                 ck["dir"],
             )
         path = run_dir / "run_summary.json"
@@ -1689,24 +2218,109 @@ def _evaluate_sanity_overfit(
 # ---------------------------------------------------------------------------
 
 
-def validation_csv_for(training_csv: str | Path) -> Path:
-    """Where the validation CSV lives, given the training CSV.
+def _run_held_out_test_pass(
+    loop: Any, pipeline: Any, strategy: Any, config: Any, paths: Any, result: Any, *, is_sanity_check: bool
+) -> None:
+    """Score ``data.source.test_index_path`` once the run has finished and stamp the result.
 
-    One derivation, because there are now two callers: `_run_validation` writes
-    the file, and `_summarise_best_metrics_from_csv` reads it to build
-    `final_metrics.best`. Two copies of a path rule is how a writer and a reader
-    end up pointing at different files while both look correct.
-
-    The name swap is preferred over `parent / "validation_metrics.csv"` so a run
-    that suffixed its training CSV keeps the pair together; the parent fallback
-    covers a training CSV that is not named `training_metrics*`.
+    Every rank takes part (the pass reduces across ranks); a yielded, failed or sanity run has no
+    final weights to grade, and a declared test set that cannot be scored raises rather than leave
+    a run that looks tested.
     """
-    training_csv = Path(training_csv)
-    if "training_metrics" in training_csv.name:
-        return training_csv.with_name(
-            training_csv.name.replace("training_metrics", "validation_metrics")
+    from spectramr.infrastructure.builders.directors.test_split import declares_test_set
+
+    if (
+        is_sanity_check
+        or not isinstance(result, dict)
+        or result.get("wall_clock_yield")
+        or result.get("success") is False
+        or not declares_test_set(config)
+    ):
+        return
+    if config.data.source.test_pass == "infer" and not result.get("validate_only"):
+        logger.info(
+            "[TestPass] data.source.test_pass=infer: the held-out test set is scored only by "
+            "`spectramr infer --test-split`, not at the end of training."
         )
-    return training_csv.parent / "validation_metrics.csv"
+        return
+    from spectramr.pipelines.test_pass import run_test_pass
+
+    summary = run_test_pass(
+        loop,
+        pipeline,
+        strategy,
+        config,
+        Path(paths["run_output_dir"]),
+        iteration=int(
+            result["resumed_step"] if result.get("validate_only") else result.get("iterations_completed") or 0
+        ),
+        weights=(
+            str(result["weights"])
+            if result.get("validate_only")
+            else "best" if result.get("best_weights_restored") else "final"
+        ),
+        weights_iteration=(
+            result["resumed_step"]
+            if result.get("validate_only")
+            else result.get("best_iteration") if result.get("best_weights_restored") else None
+        ),
+        write=RankUtility.is_main_rank(),
+    )
+    if summary is not None:
+        result["test_metrics"] = summary["metrics"]
+
+
+def _validate_only_result(
+    loop: Any,
+    output_paths: Any,
+    start_iteration: int,
+    weights: Any,
+    logging_service: Any,
+    *,
+    parameter_free: bool = False,
+) -> dict[str, Any]:
+    """One validation pass on resumed weights, written like an in-training pass.
+
+    Refuses to grade untrained weights: without a resolved checkpoint or a
+    declared ``model.checkpoint_path`` the pass would score the initialisation
+    and report success (non-negotiable 3). The one exception is a model that
+    declares itself parameter-free (:mod:`spectramr.core.parameter_free`): a
+    classical solver has no weights, and the pass grades the solver itself.
+    """
+    if parameter_free:
+        weights = weights or "none: parameter-free model"
+    if not weights:
+        raise ValueError(
+            "--validate-only needs weights to grade: pass --resume <checkpoint> "
+            "(a path, or 'auto' with checkpoints under the run's output_dir) or "
+            "declare model.checkpoint_path."
+        )
+    csv_file = None
+    if isinstance(output_paths, Mapping) and output_paths.get("csv_log_file"):
+        csv_file = output_paths["csv_log_file"]
+    metrics = loop.evaluate(iteration=start_iteration, epoch=0, csv_file=csv_file)
+    if logging_service:
+        logging_service.log_info(
+            f"[Validate-only] {len(metrics)} metrics at iteration {start_iteration} "
+            f"from {weights}; no optimizer step was taken."
+        )
+    # The same verdict the training loop applies: a pass that measured nothing
+    # has not graded the weights (#181).
+    tally = ValidationTally()
+    tally.record(metrics)
+    reason = validation_failure_reason(tally)
+    return {
+        "success": reason is None,
+        **({} if reason is None else {"error": reason}),
+        "validate_only": True,
+        "iterations_completed": 0,
+        # The step the loaded checkpoint carries; the passes are stamped with it, not with 0.
+        "resumed_step": int(start_iteration),
+        "best_metrics": dict(metrics),
+        "weights": str(weights),
+        "parameter_free": parameter_free,
+        **tally.as_result_fields(),
+    }
 
 
 def _column_higher_is_better(key: str) -> bool | None:
@@ -1944,57 +2558,174 @@ def _validation_batch_sample_count(val_batch, val_input, val_target):
     return None
 
 
-def _all_reduce_val_metrics(val_accum, val_weight, device):
-    """Sum per-rank validation accumulators across DDP ranks.
+def _accumulate_finite_metrics(val_accum, val_finite, val_seen, metrics, batch_n):
+    """Add one batch's metrics to the per-key running sums, skipping non-finite values.
+
+    Each key keeps its own finite weight, so one NaN slice drops out of that
+    column's mean instead of turning the whole column NaN for the pass (#2545).
+    ``val_seen`` counts the samples that emitted the key at all, so a key absent
+    from a batch is not reported as skipped. Tensor metrics stay on device
+    (``torch.where``, no Python test of a device value): a per-batch host sync is
+    what non-negotiable 9 forbids.
+    """
+    for k, v in metrics.items():
+        # A ratio metric is averaged on its unbiased, reciprocal scale (PAPER 5.3):
+        # a pass mean of per-slice N_eq is dominated by the low-signal slices whose
+        # corrected MSE is near zero. One owner of which metrics: core.metrics.reciprocal.RECIPROCAL.
+        if is_reciprocal(k):
+            v = torch.reciprocal(v.detach()) if isinstance(v, torch.Tensor) else _reciprocal(v)
+        if isinstance(v, torch.Tensor):
+            v = v.detach()
+            ok = torch.isfinite(v)
+            weighted = torch.where(ok, v * batch_n, torch.zeros_like(v))
+            weight = ok.to(torch.float32) * batch_n
+        else:
+            fv = float(v)
+            ok = math.isfinite(fv)
+            weighted = fv * batch_n if ok else 0.0
+            weight = float(batch_n) if ok else 0.0
+        val_accum[k] = val_accum.get(k, 0.0) + weighted
+        val_finite[k] = val_finite.get(k, 0.0) + weight
+        val_seen[k] = val_seen.get(k, 0.0) + float(batch_n)
+
+
+def _apply_monitor_coverage(avg_metrics, monitor_key, val_seen, val_samples) -> None:
+    """Stamp the share of samples the selection column was averaged over; < 1 is not selectable.
+
+    A batch that does not emit the monitor (a cascade mean that went ``_partial`` on it)
+    drops out of that column's mean without a word, so the pass would be ranked on a
+    subset of the batches every other pass and arm is ranked on. Such a pass reads
+    ``nan`` in the monitor and is named in the log instead.
+    """
+    coverage = val_seen.get(monitor_key, 0.0) / val_samples if val_samples else 0.0
+    avg_metrics["val_monitor_coverage"] = float(coverage)
+    if coverage < 1.0:
+        logger.warning(
+            "[VAL] the selection column '%s' was emitted by %.0f of %d validation samples; "
+            "the others reported only a partial value. This pass is not selectable "
+            "(the column reads nan).",
+            monitor_key,
+            val_seen.get(monitor_key, 0.0),
+            val_samples,
+        )
+        avg_metrics[monitor_key] = float("nan")
+
+
+def _reciprocal(value) -> float:
+    fv = float(value)
+    return math.inf if fv == 0.0 else 1.0 / fv
+
+
+def _pass_mean(key: str, v_sum, n_finite) -> float:
+    """One column's pass value: the finite mean, back on the metric's own scale.
+
+    A reciprocal metric was accumulated as ``1/value`` (``_accumulate_finite_metrics``),
+    so its pass value is ``1 / mean(1/value)``.
+    """
+    mean = _finite_mean(v_sum, n_finite)
+    return _reciprocal(mean) if is_reciprocal(key) else mean
+
+
+def _finite_mean(v_sum, n_finite) -> float:
+    """Per-key mean over the samples that were finite; NaN when none were.
+
+    An array-valued metric is averaged element-wise first and then over its
+    elements, as before the per-key weights existed.
+    """
+    if isinstance(v_sum, torch.Tensor) or isinstance(n_finite, torch.Tensor):
+        v_sum = torch.as_tensor(v_sum, dtype=torch.float64)
+        n_finite = torch.as_tensor(n_finite, dtype=torch.float64, device=v_sum.device)
+        mean = torch.where(
+            n_finite > 0, v_sum / n_finite.clamp_min(1e-12), torch.full_like(v_sum, math.nan)
+        )
+        return float(mean.mean().item())
+    return float(v_sum) / float(n_finite) if n_finite > 0 else math.nan
+
+
+def _skipped_samples(n_finite, n_seen) -> int:
+    """Samples that emitted a key but were non-finite; for an array metric, its worst element."""
+    if isinstance(n_finite, torch.Tensor):
+        n_finite = float(n_finite.detach().min().item()) if n_finite.numel() else 0.0
+    return max(0, round(float(n_seen) - float(n_finite)))
+
+
+def _all_reduce_val_metrics(val_accum, val_finite, val_seen, val_weight, device):
+    """Sum per-rank validation sums, per-key weights and sample counts across DDP ranks.
 
     Under DDP the validation loader is wrapped in a ``DistributedSampler``
     (:func:`spectramr.pipelines.parallel._apply_distributed_samplers`) which
-    *shards and pads* the val set, so each rank's ``val_accum`` / ``val_weight``
-    cover only its shard. Finalising ``v_sum / val_weight`` on the local shard
-    therefore reported a single padded shard's metric, and rank-0
-    early-stopping diverged from the true full-set value. Summing both the
-    metric running-sums and the sample count across ranks before dividing
-    yields the correct sample-weighted global mean.
+    *shards and pads* the val set, so each rank's sums cover only its shard.
+    Summing sums and weights across ranks before dividing yields the
+    sample-weighted global mean.
+
+    Every rank must issue the same collectives with the same vector length, or
+    the job hangs (#1323): a rank whose batches all raised holds no keys at all.
+    The ranks therefore first agree on the union of keys, then reduce
+    ``[sums..., finite weights..., seen weights..., sample count]`` as one
+    vector, with zeros for keys a rank never produced.
 
     No-op (returns the inputs unchanged) when ``torch.distributed`` is not
-    initialised — i.e. on the default single-process ``spectramr train`` path,
-    which is every run that does not go through the ``train-distributed``
-    torchrun entry point.
+    initialised, i.e. on every single-process ``spectramr train`` run.
 
     Args:
         val_accum: ``{metric_name: running_sum}`` where each sum is a float or
-            scalar/array tensor, already weighted by its batch's sample count.
-        val_weight: Total weight behind ``val_accum`` on this rank -- the number
-            of validation **samples**, not batches (issue #1347). This function
-            has always documented "the correct sample-weighted global mean"; it
-            is the caller that used to hand it a batch count.
-        device: Device for the all-reduce tensors (the model/pipeline device).
+            tensor, already weighted by its batch's sample count, non-finite
+            values excluded.
+        val_finite: ``{metric_name: finite_weight}``, the samples behind each sum.
+        val_seen: ``{metric_name: seen_weight}``, the samples that emitted the
+            key, finite or not. A key missing from either map reduces as 0.
+        val_weight: Validation **samples** on this rank (issue #1347).
+        device: Device for the all-reduce tensor (the model/pipeline device).
 
     Returns:
-        ``(reduced_accum, reduced_weight)`` with float-coerced sums.
+        ``(accum, finite, seen, weight)``, reduced. Under DDP an array-valued
+        sum is pooled over its elements, so its mean is the sample- and
+        element-pooled mean.
     """
     import torch.distributed as dist
 
     if not (dist.is_available() and dist.is_initialized()):
-        return val_accum, val_weight
+        return val_accum, val_finite, val_seen, val_weight
 
-    def _to_scalar(v):
+    gathered: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, sorted(val_accum))
+    keys = sorted({k for rank_keys in gathered for k in (rank_keys or ())})
+
+    def _scalar(v) -> torch.Tensor:
         if isinstance(v, torch.Tensor):
-            v = v.detach()
-            return float(v.item() if v.numel() == 1 else v.mean().item())
-        return float(v)
+            v = v.detach().to(device=device, dtype=torch.float64)
+            return v.reshape(()) if v.numel() == 1 else v.mean()
+        return torch.tensor(float(v), dtype=torch.float64, device=device)
 
-    count_t = torch.tensor([float(val_weight)], device=device)
-    dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+    entries = [_scalar(part.get(k, 0.0)) for part in (val_accum, val_finite, val_seen) for k in keys]
+    entries.append(_scalar(float(val_weight)))
+    reduced = torch.stack(entries)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    values = reduced.tolist()
+    n = len(keys)
 
-    # Stable key order so every rank reduces the same vector positions.
-    keys = sorted(val_accum.keys())
-    if keys:
-        sums = torch.tensor([_to_scalar(val_accum[k]) for k in keys], device=device)
-        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
-        val_accum = {k: sums[i].item() for i, k in enumerate(keys)}
+    def _segment(i):
+        return {k: values[i * n + j] for j, k in enumerate(keys)}
 
-    return val_accum, round(count_t.item())
+    return _segment(0), _segment(1), _segment(2), round(values[-1])
+
+
+def _resolve_val_monitor(pipeline, keys) -> tuple[str | None, str | None]:
+    """The configured early-stopping metric and the validation key it resolves to.
+
+    Uses the same alias candidates as the training loop, so the guard below
+    reads the column that selection will read.
+    """
+    es = getattr(getattr(pipeline, "config", None), "early_stopping", None)
+    if es is None or not getattr(es, "enabled", False):
+        return None, None
+    monitor = getattr(es, "metric", None)
+    if not isinstance(monitor, str) or not monitor:
+        return None, None
+    for cand in early_stop_monitor_candidates(monitor):
+        if cand in keys:
+            return monitor, cand
+    return monitor, None
 
 
 def _run_validation(
@@ -2007,9 +2738,18 @@ def _run_validation(
     metrics_service=None,
     tb_writer=None,  # TensorBoard writer for validation metrics
     csv_file=None,
+    split: str = "val",
 ):
-    """Run validation loop."""
+    """Run validation loop over ``data_loaders[split]`` (``"test"``: the held-out pass, never capped)."""
+    # Imported here: the reporting package pulls the plotting stack, which a
+    # training start should not pay for before validation runs.
+    from spectramr.infrastructure.reporting.cases.metric_sink import feed_from_validation_loop
+
     val_accum = {}
+    # Per key: the samples behind its sum (finite only) and the samples that
+    # emitted it at all; their difference is the skip count (#2545).
+    val_finite = {}
+    val_seen = {}
     val_count = 0
     # Epoch metrics are a SAMPLE-weighted mean, not a batch-weighted one
     # (issue #1347). ``val_count`` stays a batch count because the
@@ -2060,6 +2800,13 @@ def _run_validation(
 
     visual_samples: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
+    # Identity snapshot, not a clear: a strategy that sets these only in training (trajectory)
+    # must keep feeding the downstream override exactly as before.
+    _pre_visual_ids = (
+        id(getattr(strategy, "_last_visual_pred", None)),
+        id(getattr(strategy, "_last_visual_target", None)),
+    )
+
     logger.info(f"\n[Pipeline] Validating at iter {iteration}...")
     avg_metrics = {}
 
@@ -2078,65 +2825,38 @@ def _run_validation(
     _empty_cache_before_val = (
         getattr(_val_cfg, "empty_cache_before_validation", True) if _val_cfg is not None else True
     )
+    # Opt-in per-batch rows (validation.per_batch_rows): collected on the device
+    # through the loop and written once after it, beside the validation CSV.
+    # Every rank writes its own file (a sharded validation sees 1/N of the set
+    # per rank); no csv_file means no training CSV to sit beside.
+    batch_rows: ValidationBatchRows | None = None
+    # The held-out test pass always writes them: its report is per slice.
+    if csv_file is not None and (
+        split == "test" or bool(getattr(_val_cfg, "per_batch_rows", False))
+    ):
+        _rank = RankUtility.get_rank()
+        _rows_path = validation_batches_csv_for(csv_file)
+        if _rank:
+            _rows_path = _rows_path.with_name(f"validation_batches_rank{_rank}.csv")
+        batch_rows = ValidationBatchRows(_rows_path, iteration=iteration, epoch=epoch)
     if _empty_cache_before_val and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # [FIX] Swap in EMA weights for validation if available.
-    # CRITICAL: state_dict() returns *references* to live parameter tensors.
-    # The subsequent load_state_dict(compatible_state) calls
-    # `param.data.copy_(input)` in-place, which would overwrite the
-    # tensors that `original_state_dict` points to — silently destroying
-    # the saved training weights and making the post-validation restore
-    # a no-op. We must `.detach().clone()` to capture independent copies.
-    original_state_dict = None
     ema_active = getattr(pipeline, "ema", None) is not None
-    if ema_active:
-        logger.info("[VAL] Temporarily replacing generator weights with EMA shadow parameters...")
-        # Clone to CPU: avoids holding a third full copy of model weights
-        # in VRAM during validation (EMA already holds a shadow copy).
-        # load_state_dict() handles the CPU→GPU copy on restore.
-        original_state_dict = {
-            k: v.detach().cpu().clone() for k, v in pipeline.generator.state_dict().items()
-        }
-        # Filter EMA state dict to match current model shapes
-        # (channel_adapter may have been dynamically rebuilt during training)
-        ema_state = pipeline.ema.module.state_dict()
-        model_state = pipeline.generator.state_dict()
-        compatible_state = {}
-        for k, v in ema_state.items():
-            if k in model_state and model_state[k].shape == v.shape:
-                compatible_state[k] = v
-            elif k in model_state:
-                logger.warning(
-                    f"[VAL] EMA shape mismatch for '{k}': EMA={v.shape} vs model={model_state[k].shape}. Keeping model weights."
-                )
-        pipeline.generator.load_state_dict(compatible_state, strict=False)
-
     import contextlib
 
     @contextlib.contextmanager
     def _ema_swap_context():
-        try:
+        """Delegate to the swap SSOT, or do nothing when this arm has no EMA."""
+        if not ema_active:
             yield
-        finally:
-            if ema_active and original_state_dict is not None:
-                # Filter by shape compatibility before restoring — strict=False
-                # only ignores missing/unexpected keys, NOT shape mismatches.
-                # The channel_adapter may have been dynamically rebuilt during
-                # validation forward passes, changing its shape from what was
-                # captured in original_state_dict.
-                current_state = pipeline.generator.state_dict()
-                compatible_restore = {}
-                for k, v in original_state_dict.items():
-                    if k in current_state and current_state[k].shape == v.shape:
-                        compatible_restore[k] = v
-                    elif k in current_state:
-                        logger.warning(
-                            f"[VAL] Shape mismatch restoring '{k}': "
-                            f"saved={v.shape} vs current={current_state[k].shape}. Skipping."
-                        )
-                pipeline.generator.load_state_dict(compatible_restore, strict=False)
-                logger.info("[VAL] Restored generator weights from EMA parameters.")
+            return
+        # The swap goes through the strategy's state_io: under FSDP the live
+        # generator holds shards, so the shadow is loaded the way a checkpoint is.
+        with state_io_of(getattr(pipeline, "parallel", None)).swap_in(
+            pipeline.generator, pipeline.ema.module
+        ):
+            yield
 
     # Resolve a per-call validation cap. The two schema fields below were
     # silent orphans (declared in `validation.py` but never consumed) — a
@@ -2153,7 +2873,7 @@ def _run_validation(
 
     val_cfg = getattr(pipeline.config, "validation", None)
     _max_val_batches: int | None = None
-    if val_cfg is not None:
+    if val_cfg is not None and split == "val":
         _max_val_batches = val_cfg.loader.num_batches if val_cfg else None
         if _max_val_batches is None:
             # ``num_samples`` (legacy) → convert to a batch budget.
@@ -2177,25 +2897,34 @@ def _run_validation(
     # "has timesteps param" result by id() rather than re-introspecting per batch.
     _gen_timesteps_cache: dict[int, bool] = {}
     with _ema_swap_context(), torch.no_grad():
+        _val_loader = pipeline.data_loaders.get(split)
+        if _val_loader is None:
+            raise ValueError(f"No {split!r} data loader to run a {split} pass on.")
+        # The batch cap counts LOADER batches, so it applies before the splits
+        # below; `i` then counts what was scored without shortening the pass.
+        if _max_val_batches is not None:
+            _val_loader = itertools.islice(_val_loader, _max_val_batches)
+        # Volumes of unequal extent arrive zero-padded to the largest; scoring
+        # them per sample keeps fabricated slices out of the pass (collation.unpad).
+        _val_loader = split_padded_batches(_val_loader)
+        if batch_rows is not None:
+            # A whole-volume loader would make a row a volume; score its slices
+            # one at a time so a row is a slice (validation_rows.expand_depth).
+            _val_loader = expand_depth(_val_loader)
         for i, val_batch in enumerate(
-            tqdm(pipeline.data_loaders.get("val"), desc="Validating", leave=False)
+            make_progress(_val_loader, pipeline.config.logging, desc="Validating", leave=False)
         ):
-            if _max_val_batches is not None and i >= _max_val_batches:
-                logger.info(
-                    "[VAL] Stopping after %d batches (validation.num_validation_batches cap)",
-                    i,
-                )
-                break
             try:
                 # Prepare Batch
                 if not isinstance(val_batch, TrainingBatch) and isinstance(val_batch, dict):
                     val_batch = BatchAdapter.from_dict(val_batch, axes=_batch_axes)
+                reject_targetless_samples(val_batch, strategy=type(strategy).__name__)
 
                 if hasattr(val_batch, "to"):
-                    val_batch = val_batch.to(pipeline.device)
+                    val_batch = val_batch.to(pipeline.device, non_blocking=True)
                 elif isinstance(val_batch, dict):
                     val_batch = {
-                        k: v.to(pipeline.device) if isinstance(v, torch.Tensor) else v
+                        k: v.to(pipeline.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                         for k, v in val_batch.items()
                     }
 
@@ -2236,6 +2965,8 @@ def _run_validation(
                         _val_input = val_batch.get("input")
                         _val_target = val_batch.get("target")
 
+                _sink = getattr(strategy, "_per_case_metric_sink", None)
+                _sink_mark = getattr(_sink, "n_observed", 0)
                 # Dispatch based on strategy's validation_step signature
                 # (_vs_params resolved once before the loop — PIPE-3).
                 # Pattern A: (input_batch, target_batch, **kwargs) — 13 strategies
@@ -2285,6 +3016,15 @@ def _run_validation(
                     else:
                         metrics = strategy.validation_step(val_batch, batch_idx=i)
 
+                # A strategy that could not produce a prediction returns the sentinel instead of
+                # raising; it is a failed batch, not a scored one (#2750 counts every failure).
+                if isinstance(metrics, dict) and VALIDATION_FAILURE_SENTINEL in metrics:
+                    raise RuntimeError(
+                        f"validation_step returned the failure sentinel "
+                        f"{VALIDATION_FAILURE_SENTINEL!r} for batch {i}: the strategy produced "
+                        "no prediction to score."
+                    )
+
                 if capture_images and visual_samples is None:
                     input_batch, target_batch = _val_input, _val_target
                     if input_batch is not None and target_batch is not None:
@@ -2312,14 +3052,9 @@ def _run_validation(
                             was_training = generator.training
                             generator.eval()
                             try:
-                                # Preprocess input via strategy if available to handle
-                                # channel/shape mismatches (e.g. cold diffusion multi-coil)
-                                if hasattr(strategy, "_prepare_validation_data"):
-                                    prep = strategy._prepare_validation_data(
-                                        val_batch, input_batch, target_batch, None
-                                    )
-                                    if prep is not None:
-                                        input_batch, target_batch, _ = prep
+                                input_batch, target_batch, _batch_ctx = visual_capture_inputs(
+                                    strategy, input_batch, target_batch, val_batch
+                                )
 
                                 def _get_tensor_ref(obj):
                                     """Recursively find first tensor in dict/list/tuple."""
@@ -2337,50 +3072,20 @@ def _run_validation(
                                                 return ref
                                     return None
 
-                                # [FIX] Prefer strategy._validation_forward() over raw
-                                # generator(input_batch).  The strategy's method handles
-                                # batch context preparation (k-space masks, sensitivity
-                                # maps, channel adapters, etc.) that the raw call skips.
-                                if hasattr(strategy, "_validation_forward"):
-                                    _batch_ctx = {
-                                        "use_dc": False,
-                                        "measured_kspace": None,
-                                    }
-                                    # Field-conditioned strategies (the mrixfields
-                                    # field_* family: field_fno, field_bridge,
-                                    # koopman_field, confluence, …) read their
-                                    # conditioning (field_strength,
-                                    # field_strength_target, contrast_id, sources,
-                                    # input) from ``batch_context`` and RAISE when it
-                                    # is absent. With the bare ctx that exception is
-                                    # swallowed below (preds=None), so the validation
-                                    # IMAGE is silently dropped even though metrics
-                                    # computed fine via validation_step (the "metrics
-                                    # yes, image no" mrixfields symptom). Thread the
-                                    # batch's own conditioning + the prepared
-                                    # input/target through so _validation_forward can
-                                    # render. CLAUDE.md #9 / pitfall #16.
-                                    _batch_ctx["input"] = input_batch
-                                    _batch_ctx["target"] = target_batch
-                                    # NB: by here ``val_batch`` is a TrainingBatch
-                                    # (BatchAdapter.from_dict ran upstream), which
-                                    # parks every non-core key in ``.metadata`` and
-                                    # exposes it via ``.get()`` — dict does too — so
-                                    # duck-type on ``.get`` rather than isinstance
-                                    # (a getattr on the dataclass misses metadata).
-                                    for _ck in (
-                                        "field_strength",
-                                        "field_strength_target",
-                                        "contrast_id",
-                                        "sources",
-                                    ):
-                                        _cv = None
-                                        if hasattr(val_batch, "get"):
-                                            _cv = val_batch.get(_ck)
-                                        if _cv is None and not isinstance(val_batch, dict):
-                                            _cv = getattr(val_batch, _ck, None)
-                                        if _cv is not None:
-                                            _batch_ctx[_ck] = _cv
+                                # Both reassigned by this pass's validation_step: the override
+                                # below would discard a second forward, so skip it.
+                                _vp = getattr(strategy, "_last_visual_pred", None)
+                                _vt = getattr(strategy, "_last_visual_target", None)
+                                if (
+                                    _vp is not None
+                                    and _vt is not None
+                                    and id(_vp) != _pre_visual_ids[0]
+                                    and id(_vt) != _pre_visual_ids[1]
+                                ):
+                                    preds = None
+                                # The strategy's own forward, not a raw generator call: it
+                                # owns the masks, maps and adapters that call would skip.
+                                elif hasattr(strategy, "_validation_forward"):
                                     preds = strategy._validation_forward(input_batch, _batch_ctx)
                                     # Unpack common return formats
                                     if isinstance(preds, (tuple, list)):
@@ -2490,10 +3195,16 @@ def _run_validation(
                     # defect this weighting exists to remove.
                     batch_n = 1
                     val_unweighted_batches += 1
-                for k, v in metrics.items():
-                    val_accum[k] = val_accum.get(k, 0.0) + v * batch_n
+                _accumulate_finite_metrics(val_accum, val_finite, val_seen, metrics, batch_n)
+                feed_from_validation_loop(
+                    _sink, metrics, step=iteration, batch_index=i, observed_before=_sink_mark
+                )
                 val_count += 1
                 val_samples += batch_n
+                if batch_rows is not None:
+                    batch_rows.add(i, batch_n, batch_identifiers(val_batch, batch_n), metrics)
+            except TargetlessSampleError:
+                raise
             except Exception as e:
                 # F-VALBATCH-RATELIMIT / 2026-05-20 — when validation
                 # fails systematically (e.g. CSMNOOperator shape
@@ -2525,33 +3236,6 @@ def _run_validation(
                 _val_warn_count += 1
                 continue
 
-    # F36 / 2026-05-22 — fail loud when EVERY validation batch raised.
-    # Previously a systematic validation crash (shape/channel mismatch, OOM)
-    # was swallowed per-batch as a warning (see ~line 2040), validation
-    # returned empty metrics, no images were saved, and the run still exited
-    # 0 = PASS. That "green but image-less" outcome is the CLAUDE.md #10
-    # silent-failure class — smoke 20260521 had 36/41 PASS produce no
-    # validation images, each one a validation_step that crashed on every
-    # batch. If validation was attempted (_val_warn_count > 0) but not a
-    # single batch succeeded (val_count == 0), the run is broken: raise so the
-    # smoke gate records a FAIL with the first batch's traceback (already
-    # logged above) instead of shipping an image-less green run. Transient
-    # single-batch failures are unaffected — those leave val_count > 0.
-    if val_count == 0 and _val_warn_count > 0:
-        raise RuntimeError(
-            f"Validation produced zero successful batches: all "
-            f"{_val_warn_count} validation batch(es) raised an exception. A run "
-            f"cannot be considered passing when validation never executed — fix "
-            f"the validation forward path (model/strategy shape or channel "
-            f"mismatch) rather than letting the run exit green with no metrics "
-            f"and no validation images (CLAUDE.md #10).\n"
-            f"--- first validation-batch failure (root cause) ---\n"
-            f"{_first_val_failure.rstrip() or '(traceback unavailable)'}"
-        )
-
-    # Under DDP each rank validated only its (padded) DistributedSampler shard;
-    # sum the running-sums and counts across ranks so the finalized mean below
-    # reflects the FULL validation set, not one shard. No-op single-process.
     if val_unweighted_batches:
         logger.warning(
             "[VAL] %d of %d validation batch(es) carried no tensor with a batch "
@@ -2563,25 +3247,87 @@ def _run_validation(
             val_count,
         )
 
-    val_accum, val_samples = _all_reduce_val_metrics(
-        val_accum, val_samples, getattr(pipeline, "device", None)
+    if batch_rows is not None:
+        # Raises on a write failure for the same reason the validation CSV does:
+        # a run that promised per-slice rows and silently has none is worse than
+        # one that stops here.
+        _written = batch_rows.flush()
+        if logging_service:
+            logging_service.log_info(f"[VAL ROWS] Saved {_written} batch rows → {batch_rows.path}")
+    # Under DDP each rank validated only its (padded) DistributedSampler shard;
+    # sum across ranks so the means below cover the FULL validation set. Every
+    # rank reaches these collectives, including one whose batches all raised,
+    # because a rank that left early would hang its peers (#1323).
+    val_accum, val_finite, val_seen, val_samples = _all_reduce_val_metrics(
+        val_accum, val_finite, val_seen, val_samples, getattr(pipeline, "device", None)
     )
+    # A batch that raised is excluded from every mean below, so a deterministic
+    # per-batch refusal biases the metrics toward the batches that passed. The
+    # count is a column, present at 0, so an unbiased row is distinguishable.
+    batch_counts, _, _, _ = _all_reduce_val_metrics(
+        {"failed": float(_val_warn_count), "succeeded": float(val_count)},
+        {},
+        {},
+        0,
+        getattr(pipeline, "device", None),
+    )
+
+    # Any batch that raised fails the run (F36, CLAUDE.md #10), judged on the global counts so
+    # every rank raises together.
+    if batch_counts["failed"] > 0:
+        failed, attempted = round(batch_counts["failed"]), round(
+            batch_counts["failed"] + batch_counts["succeeded"]
+        )
+        lead = (
+            f"Validation produced zero successful batches: all {failed} validation batch(es) "
+            "raised an exception."
+            if batch_counts["succeeded"] == 0
+            else f"Validation lost {failed} of {attempted} batch(es) to an exception."
+        )
+        # A batch that raised is excluded from every metric, so a deterministic per-slice refusal
+        # biases the selection metric toward the slices that passed and moves it differently per arm.
+        raise RuntimeError(
+            f"{lead} A run cannot be considered passing when validation did not cover its set: "
+            "track the failure down and fix the validation forward path (shape or channel "
+            "mismatch, a refused sampler argument, OOM) rather than letting the run select a "
+            "checkpoint on the batches that survived (CLAUDE.md #10).\n"
+            "--- first validation-batch failure (root cause) ---\n"
+            f"{_first_val_failure.rstrip() or '(traceback unavailable)'}"
+        )
 
     if val_samples > 0:
         # Aggregate mean metrics — convert to Python scalars immediately to avoid
         # tensor string serialization in CSV (e.g. "tensor(0.24, device='cuda:0')")
+        # Each key is divided by its own finite weight, so a NaN slice or a key
+        # some batches never emitted no longer drags the column (#2545).
         avg_metrics = {}
+        skipped = {}
         for k, v_sum in val_accum.items():
-            v_avg = v_sum / val_samples
-            if isinstance(v_avg, torch.Tensor):
-                v_scalar = v_avg.detach()
-                avg_metrics[k] = float(
-                    v_scalar.item() if v_scalar.numel() == 1 else v_scalar.mean().item()
-                )
-            elif isinstance(v_avg, (int, float)):
-                avg_metrics[k] = float(v_avg)
-            else:
-                avg_metrics[k] = v_avg
+            n_finite = val_finite.get(k, 0.0)
+            avg_metrics[k] = _pass_mean(k, v_sum, n_finite)
+            skipped[k] = _skipped_samples(n_finite, val_seen.get(k, 0.0))
+        _skips = {k: n for k, n in skipped.items() if n > 0}
+        if _skips:
+            logger.warning(
+                "[VAL] Non-finite values left out of the mean, per metric (of %d "
+                "samples): %s. The per-slice NaNs stay in the batch rows.",
+                val_samples,
+                ", ".join(f"{k}={n}" for k, n in sorted(_skips.items())),
+            )
+        # The all-non-finite guard below misses a monitor column that is all NaN
+        # while psnr is finite. Warn here by name; the training loop raises once
+        # the monitor stays non-finite for `patience` validations.
+        _es_metric, _monitor_key = _resolve_val_monitor(pipeline, val_accum)
+        if _monitor_key is not None and not math.isfinite(avg_metrics[_monitor_key]):
+            logger.warning(
+                "[VAL] early_stopping.metric '%s' (column '%s') has no finite value "
+                "in this validation pass: %d of the %d samples that emitted it were "
+                "non-finite. Selection and early stopping cannot use this pass.",
+                _es_metric,
+                _monitor_key,
+                skipped[_monitor_key],
+                round(val_seen.get(_monitor_key, 0.0)),
+            )
 
         # [SSOT] Finalize summary metrics (FID, IS, etc.)
         # These metrics accumulate state during the loop and compute only once here
@@ -2611,12 +3357,23 @@ def _run_validation(
                 "A run cannot select a checkpoint from this: the monitor is NaN, "
                 "so `save_best` is skipped and early stopping never fires, and "
                 "the run would otherwise train to its full budget and exit 0 "
-                "with no checkpoint_best.pt.\n"
+                "with no best checkpoint.\n"
                 "Most likely the data honours neither the [0, 1] nor the [-1, 1] "
                 "normalization contract (#180) -- check the metrics log for a "
                 "NOT APPLICABLE line naming `data_range_unresolved`, and declare "
                 "`metrics.data_range` or normalize the pipeline output."
             )
+        # Stamped after the all-non-finite guard, which these finite counts would defeat.
+        avg_metrics["val_batches_failed"] = float(batch_counts["failed"])
+        avg_metrics["val_batches_attempted"] = float(
+            batch_counts["failed"] + batch_counts["succeeded"]
+        )
+        # Exact names, not `<metric>_skipped`: the direction resolver matches
+        # metric names as substrings, so `psnr_skipped` would rank as a psnr.
+        avg_metrics["val_samples_skipped_max"] = float(max(skipped.values(), default=0))
+        if _monitor_key is not None:
+            avg_metrics["val_monitor_samples_skipped"] = float(skipped[_monitor_key])
+            _apply_monitor_coverage(avg_metrics, _monitor_key, val_seen, val_samples)
 
         # Log results to console AFTER finalization so FID is included
         if logging_service:
@@ -2667,55 +3424,7 @@ def _run_validation(
             val_csv_file = str(validation_csv_for(csv_file))
             val_row = {"iteration": iteration, "epoch": epoch, **avg_metrics}
             try:
-                val_csv_path = Path(val_csv_file)
-                val_csv_path.parent.mkdir(parents=True, exist_ok=True)
-                write_header = not val_csv_path.exists() or val_csv_path.stat().st_size == 0
-
-                if write_header:
-                    # First write — create file with header from current keys
-                    all_fieldnames = list(val_row.keys())
-                    with open(val_csv_file, "w", newline="") as _vf:
-                        _vwriter = csv.DictWriter(
-                            _vf, fieldnames=all_fieldnames, extrasaction="ignore"
-                        )
-                        _vwriter.writeheader()
-                        _vwriter.writerow(val_row)
-                else:
-                    # Append — read existing header, merge with new keys
-                    with open(val_csv_file, newline="") as _rf:
-                        reader = csv.reader(_rf)
-                        existing_header = next(reader, [])
-                        existing_rows = list(csv.DictReader(_rf, fieldnames=existing_header))
-
-                    new_keys = [k for k in val_row if k not in existing_header]
-                    if new_keys:
-                        # Schema expanded — rewrite with unified header
-                        all_fieldnames = existing_header + new_keys
-                        with open(val_csv_file, newline="") as _rf:
-                            # Re-read to get all rows with original header
-                            _rf.readline()  # skip old header
-                            old_reader = csv.DictReader(_rf, fieldnames=existing_header)
-                            existing_rows = list(old_reader)
-                        with open(val_csv_file, "w", newline="") as _vf:
-                            _vwriter = csv.DictWriter(
-                                _vf,
-                                fieldnames=all_fieldnames,
-                                extrasaction="ignore",
-                                restval="",
-                            )
-                            _vwriter.writeheader()
-                            _vwriter.writerows(existing_rows)
-                            _vwriter.writerow(val_row)
-                    else:
-                        # Same schema — simple append
-                        with open(val_csv_file, "a", newline="") as _vf:
-                            _vwriter = csv.DictWriter(
-                                _vf,
-                                fieldnames=existing_header,
-                                extrasaction="ignore",
-                                restval="",
-                            )
-                            _vwriter.writerow(val_row)
+                _write_validation_csv_row(val_csv_file, val_row)
                 if logging_service:
                     logging_service.log_info(
                         f"[VAL CSV] Saved {len(avg_metrics)} metrics → {val_csv_file}"
@@ -2771,7 +3480,11 @@ def _run_validation(
                     "If that is a missing keyword-only argument, the strategy lacks "
                     "`_validation_forward` and fell through to the unconditional "
                     "`generator(input_batch)` fallback — implement it (see "
-                    "CrossFieldTranslationStrategy / FieldCocycleTranslationStrategy)."
+                    "CrossFieldTranslationStrategy / FieldCocycleTranslationStrategy). "
+                    "If it names a missing mask, measurement or coil maps, the forward "
+                    "needs the batch's own context: give the strategy a "
+                    "`validation_batch_context` (reconstruction strategies set "
+                    "`validates_on_batch_context = True`)."
                 )
         elif capture_images and visual_samples:
             _visual_capture_state(strategy)["misses"] = 0
@@ -3099,8 +3812,7 @@ def _run_validation(
                 # an undersampled target contrast. RSS-combining all
                 # channels here drowns the target's aliasing in the prior's
                 # clean energy → the rendered "input" looks unaccelerated.
-                # Match the convention from
-                # ``metrics_mixin._slice_to_target_contrast_single``: when
+                # When
                 # ``data.domain.target_channels`` is set and the input channel
                 # count is a multiple of it, slice to the LAST
                 # ``target_channels`` (the target contrast) before IFFT.

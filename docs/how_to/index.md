@@ -17,8 +17,8 @@ where these guides assume you already know where things live.
 
 ## The rules these guides encode
 
-Every guide follows the framework's non-negotiables, which are worth knowing
-before you start:
+Every guide follows the same framework rules, which are worth knowing before you
+start:
 
 - **Register, don't branch.** Components resolve through registries and the DI
   container, never an `if/elif` chain — see {doc}`index`.
@@ -29,7 +29,7 @@ before you start:
 - **Tests and docs land with the change.** Source and test files pair up in the
   same commit; `scripts/ci/check_test_paired_with_source.py` enforces it.
 
-For the reasoning behind each, see {doc}`../explanation/index`.
+For the reasoning behind each, see {doc}`../config_schema_reference`.
 
 ```{toctree}
 :maxdepth: 1

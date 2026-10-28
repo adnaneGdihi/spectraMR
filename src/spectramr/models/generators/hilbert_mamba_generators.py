@@ -40,6 +40,7 @@ from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
     resolution_agnostic_mode,
 )
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
@@ -48,37 +49,33 @@ logger = logging.getLogger(__name__)
 def _squeeze_volume_to_2d(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, tuple[int, ...] | None]:
-    """Squeeze 5D ``[B, C, D, H, W]`` volumes to 4D ``[B, C, H, W]``.
+    """Fold 5D ``[B, C, H, W, D]`` volumes into 4D ``[B*D, C, H, W]``.
 
-    TorchIO validation :class:`~torchio.SubjectsLoader` returns full 3D
-    volumes instead of 2D patches.  Generators built with :class:`Conv2d`
-    stems crash on the 5D input.  This helper transparently handles:
-
-    * ``[B, C, H, W, 1]`` — squeeze last dim (TorchIO 2D patch)
-    * ``[B, C, D, H, W]`` where ``D > 1`` — take middle slice
-    * ``[B, C, H, W]`` — no-op
+    TorchIO validation returns full volumes (depth last) instead of 2D
+    patches, and the Conv2d stems take 4D input. Every slice is scored by
+    the 2D generator, so depth folds into the batch. A trailing ``1`` (a
+    TorchIO 2D patch) is squeezed as before.
 
     Returns:
-        Tuple of (squeezed 4D tensor, original shape or ``None`` if no-op).
+        Tuple of (4D tensor, original shape or ``None`` if no-op).
     """
     if x.ndim == 5 and x.shape[-1] == 1:
         return x.squeeze(-1), x.shape
     if x.ndim == 5:
-        D = x.shape[2]
-        mid = D // 2
-        return x[:, :, mid].contiguous(), x.shape
+        b, c, h, w, d = x.shape
+        return x.permute(0, 4, 1, 2, 3).reshape(b * d, c, h, w), x.shape
     return x, None
 
 
 def _unsqueeze_to_volume(out: torch.Tensor, original_shape: tuple[int, ...] | None) -> torch.Tensor:
-    """Restore 5D shape if the input was squeezed by :func:`_squeeze_volume_to_2d`."""
+    """Unfold ``[B*D, C, H, W]`` back to ``[B, C, H, W, D]``; inverse of the fold."""
     if original_shape is None:
         return out
     if original_shape[-1] == 1:
         return out.unsqueeze(-1)
-    # Middle-slice case: expand prediction back to full volume depth
-    D = original_shape[2]
-    return out.unsqueeze(2).expand(-1, -1, D, -1, -1)
+    b, _, _, _, d = original_shape
+    _, c_out, h, w = out.shape
+    return out.reshape(b, d, c_out, h, w).permute(0, 2, 3, 4, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -243,413 +240,6 @@ class _ConvHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Method 1: CT-Mamba — Continuous-Time Discretization Resampling
-# ═══════════════════════════════════════════════════════════════════════
-
-
-@register_model(
-    name="ct_mamba",
-    training_mode="reconstruction",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    accepts_complex=False,
-    requires_paired_data=True,
-)
-class CTMamba(nn.Module):
-    """Continuous-Time Mamba with asymmetric encode/decode step sizes.
-
-    Encodes the ULF sequence at a coarse discretization step Δ_U and
-    decodes the HF output at a finer step Δ_H, exploiting the SSM's
-    continuous-time ODE foundation for natural multi-rate processing.
-
-    Math:
-        ḣ(t) = A h(t) + B x(t),  y(t) = C h(t)
-        Encode ULF with Δ_U = 1/L_U, decode HF with Δ_H = 1/L_H.
-
-    Args:
-        in_channels: Input channels (ULF).
-        out_channels: Output channels (HF).
-        d_model: Mamba model dimension.
-        num_layers: Number of Mamba blocks.
-        d_state: SSM state dimension.
-        linearization_mode: Linearization mode for Hilbert curve.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        d_model: int = 64,
-        num_layers: int = 4,
-        d_state: int = 16,
-        linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.stem = _ConvStem(in_channels, d_model)
-        self.linearize = _HilbertLinearize(mode=linearization_mode)
-        self.encoder = _MambaEncoder(d_model, num_layers, d_state)
-
-        # Learnable step-size parameters for asymmetric discretization
-        self.delta_encoder = nn.Parameter(torch.ones(d_model) * 1.0)
-        self.delta_decoder = nn.Parameter(torch.ones(d_model) * 0.5)
-
-        # Decoder: Mamba stack at fine resolution
-        self.decoder = _MambaEncoder(d_model, num_layers, d_state)
-        self.head = _ConvHead(d_model, out_channels)
-
-        logger.info(
-            "[CTMamba] d_model=%d, layers=%d, mode=%s",
-            d_model,
-            num_layers,
-            linearization_mode,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: ULF [B, C_in, H, W] → HF [B, C_out, H, W].
-
-        forward method for CTMamba.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        x, vol_shape = _squeeze_volume_to_2d(x)
-        feat = self.stem(x)
-        seq, shape = self.linearize(feat)  # [B, D, L]
-        seq = seq.permute(0, 2, 1)  # [B, L, D]
-
-        # Encode with coarse step modulation (clamp sigmoid to avoid vanishing)
-        seq = seq * torch.sigmoid(self.delta_encoder).clamp(min=0.01, max=0.99)
-        latent = self.encoder(seq)
-
-        # Decode with fine step modulation
-        latent = latent * torch.sigmoid(self.delta_decoder).clamp(min=0.01, max=0.99)
-        decoded = self.decoder(latent)
-
-        decoded = decoded.permute(0, 2, 1)  # [B, D, L]
-        out = self.linearize.reverse(decoded, shape)
-        out = self.head(out) + x[:, : self.head.proj[-1].out_channels]
-        return _unsqueeze_to_volume(out, vol_shape)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Method 2: FE-Mamba — Fractal Expansion Kronecker
-# ═══════════════════════════════════════════════════════════════════════
-
-
-@register_model(
-    name="fe_mamba",
-    training_mode="reconstruction",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    accepts_complex=False,
-    requires_paired_data=True,
-)
-class FEMamba(nn.Module):
-    """Fractal Expansion Mamba with Kronecker upsampling.
-
-    Exploits Hilbert's fractal self-similarity: one ULF voxel perfectly
-    maps to s^D contiguous HF sub-voxels.  A linear expansion matrix W
-    generates initial sub-voxel estimates, then Mamba smoothes boundaries.
-
-    Math:
-        z_{i·s^D + j} = W_j · x_i + b_j,  ∀ j ∈ {0…s^D-1}
-        ŷ = Mamba_dec(z)
-
-    Args:
-        in_channels: Input channels.
-        out_channels: Output channels.
-        d_model: Mamba model dimension.
-        num_layers: Number of Mamba blocks.
-        expansion_factor: Sub-pixel expansion factor per dimension.
-        linearization_mode: Linearization mode for Hilbert curve.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        d_model: int = 64,
-        num_layers: int = 4,
-        d_state: int = 16,
-        expansion_factor: int = 2,
-        linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.expansion_factor = expansion_factor
-        self.stem = _ConvStem(in_channels, d_model)
-        self.linearize = _HilbertLinearize(mode=linearization_mode)
-        # Separate linearizer for upscaled output to avoid cache pollution
-        self._up_linearize = _HilbertLinearize(mode=linearization_mode)
-
-        # Fractal expansion: each token → expansion_factor^2 tokens
-        expand_count = expansion_factor**2
-        self.expand_proj = nn.Linear(d_model, d_model * expand_count)
-
-        self.smoother = _MambaEncoder(d_model, num_layers, d_state)
-        self.head = _ConvHead(d_model, out_channels)
-
-        logger.info(
-            "[FEMamba] d_model=%d, expand=%d, mode=%s",
-            d_model,
-            expansion_factor,
-            linearization_mode,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: ULF [B, C_in, H, W] → HF [B, C_out, sH, sW].
-
-        forward method for FEMamba.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        x, vol_shape = _squeeze_volume_to_2d(x)
-        B, _, H, W = x.shape
-        s = self.expansion_factor
-        feat = self.stem(x)
-        seq, shape = self.linearize(feat)  # [B, D, L]
-        seq = seq.permute(0, 2, 1)  # [B, L, D]
-
-        # Fractal expansion: [B, L, D] → [B, L, D*s²] → [B, L*s², D]
-        expanded = self.expand_proj(seq)  # [B, L, D*s²]
-        expanded = expanded.reshape(B, -1, seq.shape[-1])  # [B, L*s², D]
-
-        # Smooth boundaries with Mamba
-        smoothed = self.smoother(expanded)
-        smoothed = smoothed.permute(0, 2, 1)  # [B, D, L*s²]
-
-        # Reverse at upscaled resolution (separate linearizer to avoid cache pollution)
-        up_shape = (H * s, W * s)
-        up_lin = self._up_linearize._get_linearizer(up_shape, x.device)
-        out = up_lin.reverse(smoothed)
-        out = self.head(out)
-
-        # Residual: bilinear upsample input to match output resolution
-        out_ch = self.head.proj[-1].out_channels
-        residual = F.interpolate(x[:, :out_ch], size=up_shape, mode="bilinear", align_corners=False)
-        out = out + residual
-        return _unsqueeze_to_volume(out, vol_shape)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Method 3: CRM-Mamba — Cross-Resolution Modulated
-# ═══════════════════════════════════════════════════════════════════════
-
-
-@register_model(
-    name="crm_mamba",
-    training_mode="reconstruction",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    accepts_complex=False,
-    requires_paired_data=True,
-)
-class CRMMamba(nn.Module):
-    """Cross-Resolution Modulated Mamba.
-
-    Generates HF sequences while dynamically conditioning the SSM
-    transition matrices on ULF structural context.  The discretization
-    step Δ_j at each HF position is modulated by its ULF parent state.
-
-    Math:
-        H^U = Mamba_enc(x)
-        Δ_j = Softplus(Linear(H^U_{⌊j/s^D⌋} + y_{j-1}))
-        h_j = Ā_j h_{j-1} + B̄_j x_j,  where Ā uses Δ_j
-
-    Args:
-        in_channels: Input channels.
-        out_channels: Output channels.
-        d_model: Mamba model dimension.
-        num_layers: Number of Mamba blocks per encoder/decoder.
-        linearization_mode: Linearization mode for Hilbert curve.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        d_model: int = 64,
-        num_layers: int = 4,
-        d_state: int = 16,
-        linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.stem = _ConvStem(in_channels, d_model)
-        self.linearize = _HilbertLinearize(mode=linearization_mode)
-        self.encoder = _MambaEncoder(d_model, num_layers, d_state)
-
-        # Cross-resolution modulation network
-        self.delta_modulator = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-        self.softplus = nn.Softplus()
-
-        self.decoder = _MambaEncoder(d_model, num_layers, d_state)
-        self.head = _ConvHead(d_model, out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: ULF [B, C_in, H, W] → HF [B, C_out, H, W].
-
-        forward method for CRMMamba.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        x, vol_shape = _squeeze_volume_to_2d(x)
-        feat = self.stem(x)
-        seq, shape = self.linearize(feat)
-        seq = seq.permute(0, 2, 1)  # [B, L, D]
-
-        # Encode ULF context
-        ulf_context = self.encoder(seq)  # [B, L, D]
-
-        # Cross-resolution modulation: concatenate context with input
-        combined = torch.cat([ulf_context, seq], dim=-1)  # [B, L, 2D]
-        delta_mod = self.softplus(self.delta_modulator(combined))  # [B, L, D]
-        delta_mod = delta_mod.clamp(max=10.0)  # Prevent unbounded multiplicative explosion
-
-        # Modulate and decode
-        modulated = seq * delta_mod
-        decoded = self.decoder(modulated)
-
-        decoded = decoded.permute(0, 2, 1)
-        out = self.linearize.reverse(decoded, shape)
-        out = self.head(out) + x[:, : self.head.proj[-1].out_channels]
-        return _unsqueeze_to_volume(out, vol_shape)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Method 4: HW-Mamba — Hilbert-Wavelet Spectral
-# ═══════════════════════════════════════════════════════════════════════
-
-
-@register_model(
-    name="hw_mamba",
-    training_mode="reconstruction",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    accepts_complex=False,
-    requires_paired_data=True,
-)
-class HWMamba(nn.Module):
-    """Hilbert-Wavelet Spectral Mamba.
-
-    Instead of predicting raw pixels, uses 1D DWT on the Hilbert-ordered
-    sequence.  Mamba predicts only the sparse high-frequency detail
-    coefficients, while the ULF directly provides low-frequency approx.
-
-    Math:
-        c_A, c_D = DWT(y)     # target decomposition
-        c_A ≈ x               # ULF approximates low-freq
-        ĉ_D = Mamba(x)        # predict detail coefficients
-        ŷ = IDWT(x, ĉ_D)
-
-    Args:
-        in_channels: Input channels.
-        out_channels: Output channels.
-        d_model: Mamba model dimension.
-        num_layers: Number of Mamba blocks.
-        wavelet_levels: Number of DWT decomposition levels (unused at
-            inference, included for config symmetry).
-        linearization_mode: Linearization mode for Hilbert curve.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        d_model: int = 64,
-        num_layers: int = 4,
-        d_state: int = 16,
-        wavelet_levels: int = 3,
-        linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.stem = _ConvStem(in_channels, d_model)
-        self.linearize = _HilbertLinearize(mode=linearization_mode)
-
-        # Detail predictor: Mamba predicts wavelet detail coefficients
-        self.detail_predictor = _MambaEncoder(d_model, num_layers, d_state)
-
-        # Learned wavelet-like decomposition (trainable 1D conv filters)
-        # Instead of fixed wavelet, we learn analysis/synthesis filters
-        self.analysis_low = nn.Conv1d(d_model, d_model, kernel_size=4, stride=2, padding=1)
-        self.analysis_high = nn.Conv1d(d_model, d_model, kernel_size=4, stride=2, padding=1)
-        self.synthesis = nn.ConvTranspose1d(
-            d_model * 2, d_model, kernel_size=4, stride=2, padding=1
-        )
-
-        self.head = _ConvHead(d_model, out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: ULF [B, C_in, H, W] → HF [B, C_out, H, W].
-
-        forward method for HWMamba.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        x, vol_shape = _squeeze_volume_to_2d(x)
-        feat = self.stem(x)
-        seq, shape = self.linearize(feat)  # [B, D, L]
-
-        # Analysis: decompose into approximate + detail
-        approx = self.analysis_low(seq)  # [B, D, L//2]
-        detail = self.analysis_high(seq)  # [B, D, L//2]
-
-        # Predict refined detail coefficients with Mamba
-        detail_input = detail.permute(0, 2, 1)  # [B, L//2, D]
-        refined_detail = self.detail_predictor(detail_input)
-        refined_detail = refined_detail.permute(0, 2, 1)  # [B, D, L//2]
-
-        # Synthesis: reconstruct with refined details
-        combined = torch.cat([approx, refined_detail], dim=1)  # [B, 2D, L//2]
-        reconstructed = self.synthesis(combined, output_size=seq.shape)  # [B, D, L]
-
-        out = self.linearize.reverse(reconstructed, shape)
-        out = self.head(out) + x[:, : self.head.proj[-1].out_channels]
-        return _unsqueeze_to_volume(out, vol_shape)
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # Method 5: MM-Mamba — Macro-Micro Nested
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -665,6 +255,7 @@ class HWMamba(nn.Module):
     output_domain="image",
     accepts_complex=False,
     requires_paired_data=True,
+    strict_kwargs=True,
 )
 class MMMamba(nn.Module):
     """Macro-Micro Nested Mamba for tractable 3D volumetric processing.
@@ -698,7 +289,6 @@ class MMMamba(nn.Module):
         block_size: int = 1024,
         d_state: int = 16,
         linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.block_size = block_size
@@ -782,6 +372,7 @@ class MMMamba(nn.Module):
     output_domain="image",
     accepts_complex=False,
     requires_paired_data=True,
+    strict_kwargs=True,
 )
 class MDIMamba(nn.Module):
     """Multi-Directional Isotropic Mamba.
@@ -823,7 +414,6 @@ class MDIMamba(nn.Module):
         num_directions: int = 4,
         d_state: int = 16,
         linearization_modes: list[str] | None = None,
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         # Resolve modes: user-specified or first K defaults
@@ -893,6 +483,7 @@ class MDIMamba(nn.Module):
     output_domain="image",
     accepts_complex=False,
     requires_paired_data=True,
+    strict_kwargs=True,
 )
 class TwoHalfDMamba(nn.Module):
     """2.5D Orthogonal Slice-to-Volume Mamba.
@@ -926,7 +517,6 @@ class TwoHalfDMamba(nn.Module):
         cross_plane_layers: int = 2,
         d_state: int = 16,
         linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.stem = _ConvStem(in_channels, d_model)
@@ -1027,6 +617,7 @@ class TwoHalfDMamba(nn.Module):
     output_domain="image",
     accepts_complex=False,
     requires_paired_data=True,
+    strict_kwargs=True,
 )
 class HLDMamba(nn.Module):
     """Hilbert Latent Diffusion Mamba — 1D noise predictor for diffusion.
@@ -1057,9 +648,11 @@ class HLDMamba(nn.Module):
         d_state: int = 16,
         time_embed_dim: int = 256,
         linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
+        num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS,
     ) -> None:
         super().__init__()
+        # The builder injects training.diffusion.timesteps, the range t is drawn from (#2442).
+        self.num_timesteps = int(num_timesteps)
         self.stem = _ConvStem(in_channels, d_model)
         self.linearize = _HilbertLinearize(mode=linearization_mode)
 
@@ -1108,7 +701,7 @@ class HLDMamba(nn.Module):
 
         # Inject timestep embedding (normalize to [0,1] to prevent large activations)
         if timesteps is not None:
-            t_norm = timesteps.float() / 1000.0  # Normalize assuming ~1000 max timesteps
+            t_norm = timesteps.float() / self.num_timesteps
             t_emb = self.time_mlp(t_norm.unsqueeze(-1))  # [B, D]
             seq = seq + t_emb.unsqueeze(1)  # broadcast across L
 
@@ -1116,154 +709,6 @@ class HLDMamba(nn.Module):
         decoded = decoded.permute(0, 2, 1)
         out = self.linearize.reverse(decoded, shape)
         out = self.head(out)
-        return _unsqueeze_to_volume(out, vol_shape)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Method 10: INR-Mamba — Implicit Neural Representation
-# ═══════════════════════════════════════════════════════════════════════
-
-
-class _FourierPosEnc(nn.Module):
-    """Fourier positional encoding for continuous coordinates."""
-
-    def __init__(self, d_model: int, num_freqs: int = 32) -> None:
-        super().__init__()
-        self.num_freqs = num_freqs
-        # Output dim: 1 (raw) + 2*num_freqs (sin+cos) = 1 + 2*num_freqs
-        self.out_dim = 1 + 2 * num_freqs
-        # Cap max exponent at 10 to prevent gradient overflow in sin/cos backprop.
-        # With num_freqs=32, linspace(0, 10, 32) gives max freq = 2^10 = 1024,
-        # so max |grad| through sin is ~1024*pi ≈ 3217, safe for float32.
-        max_exp = min(num_freqs - 1, 10)
-        freqs = 2.0 ** torch.linspace(0, max_exp, num_freqs)
-        self.register_buffer("freqs", freqs)
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """Encode scalar coordinates with Fourier features.
-
-        Args:
-            t: Coordinate tensor [...].
-
-        Returns:
-            Fourier features [..., 1 + 2*num_freqs].
-
-        forward method for _FourierPosEnc.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            t (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        t_unsq = t.unsqueeze(-1)  # [..., 1]
-        angles = t_unsq * self.freqs * math.pi  # [..., num_freqs]
-        return torch.cat([t_unsq, torch.sin(angles), torch.cos(angles)], dim=-1)
-
-
-@register_model(
-    name="inr_mamba",
-    training_mode="reconstruction",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    accepts_complex=False,
-    requires_paired_data=True,
-)
-class INRMamba(nn.Module):
-    """Implicit Neural Representation Mamba for continuous SR.
-
-    Mamba extracts a latent contextual sequence, then an MLP decodes
-    arbitrary continuous coordinates to intensities.  Allows any scaling
-    factor (1.4×, 2×, 4×, etc.) at inference without retraining.
-
-    Math:
-        Z = Mamba(x) ∈ R^{L_U × d}
-        For any coordinate p = (x,y,z):
-            t_p = H(p) ∈ [0, 1]  (continuous Hilbert scalar)
-            z_p = Interpolate(Z, t_p)
-            Intensity(p) = MLP(PosEnc(t_p), z_p)
-
-    Args:
-        in_channels: Input channels.
-        out_channels: Output channels.
-        d_model: Mamba model dimension.
-        num_layers: Mamba blocks for context extraction.
-        num_freqs: Fourier positional encoding frequencies.
-        linearization_mode: Linearization mode for Hilbert curve.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        d_model: int = 64,
-        num_layers: int = 4,
-        d_state: int = 16,
-        num_freqs: int = 32,
-        linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.stem = _ConvStem(in_channels, d_model)
-        self.linearize = _HilbertLinearize(mode=linearization_mode)
-        self.context_encoder = _MambaEncoder(d_model, num_layers, d_state)
-
-        self.pos_enc = _FourierPosEnc(d_model, num_freqs)
-        pos_dim = self.pos_enc.out_dim
-
-        # MLP: (z_p ∥ pos_enc(t_p)) → intensity
-        self.inr_mlp = nn.Sequential(
-            nn.Linear(d_model + pos_dim, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, out_channels),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: reconstruct at same resolution as input.
-
-        For arbitrary-scale SR, use ``query()`` directly.
-
-        forward method for INRMamba.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        x, vol_shape = _squeeze_volume_to_2d(x)
-        feat = self.stem(x)
-        seq, shape = self.linearize(feat)  # [B, D, L]
-        seq = seq.permute(0, 2, 1)  # [B, L, D]
-
-        # Extract context
-        context = self.context_encoder(seq)  # [B, L, D]
-
-        # Query at same positions (identity mapping for training)
-        B, L, D = context.shape
-        t = torch.linspace(0, 1, L, device=x.device).unsqueeze(0).expand(B, -1)
-        pos_features = self.pos_enc(t)  # [B, L, pos_dim]
-
-        combined = torch.cat([context, pos_features], dim=-1)  # [B, L, D+pos]
-        intensities = self.inr_mlp(combined)  # [B, L, C_out]
-        intensities = intensities.permute(0, 2, 1)  # [B, C_out, L]
-
-        out = self.linearize.reverse(intensities, shape)
-
-        # Residual: anchor untrained output near the input
-        out_ch = out.shape[1]
-        out = out + x[:, :out_ch]
         return _unsqueeze_to_volume(out, vol_shape)
 
 
@@ -1280,6 +725,7 @@ class INRMamba(nn.Module):
     output_domain="image",
     accepts_complex=False,
     requires_paired_data=True,
+    strict_kwargs=True,
 )
 class HilbertMambaUNet(nn.Module):
     """Hilbert-Mamba U-Net — encoder-decoder with skip connections.
@@ -1305,7 +751,6 @@ class HilbertMambaUNet(nn.Module):
         num_mamba_layers: int = 2,
         d_state: int = 16,
         linearization_mode: str = "hilbert_2d",
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         if features is None:
@@ -1425,13 +870,8 @@ class HilbertMambaUNet(nn.Module):
 
 
 __all__ = [
-    "CRMMamba",
-    "CTMamba",
-    "FEMamba",
     "HLDMamba",
-    "HWMamba",
     "HilbertMambaUNet",
-    "INRMamba",
     "MDIMamba",
     "MMMamba",
     "TwoHalfDMamba",

@@ -72,16 +72,19 @@ class PhysicsInformedLoss(nn.Module):
             if mask is not None:
                 if pred_kspace.ndim == 4 and mask.ndim == 3:
                     # k-space layout may carry real/imag in the last dim.
-                    if pred_kspace.shape[-1] == 2:
-                        m = mask.unsqueeze(-1)
-                    else:
-                        m = mask.unsqueeze(1)
+                    m = mask.unsqueeze(-1) if pred_kspace.shape[-1] == 2 else mask.unsqueeze(1)
                 else:
                     m = mask
                 diff = (pred_kspace - ref_kspace) * m
                 dc_loss = torch.norm(diff) ** 2
             else:
-                dc_loss = self.mse(pred_kspace, ref_kspace)
+                diff = pred_kspace - ref_kspace
+                # ``mse_loss`` has no complex kernel; |z|² is taken on (Re, Im).
+                dc_loss = (
+                    torch.view_as_real(diff).pow(2).sum(-1).mean()
+                    if diff.is_complex()
+                    else self.mse(pred_kspace, ref_kspace)
+                )
 
         # Placeholder for smoothness / TV / etc.
         reg_loss = torch.tensor(0.0, device=pred_image.device)

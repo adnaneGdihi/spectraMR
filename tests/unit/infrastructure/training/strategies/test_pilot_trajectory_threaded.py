@@ -1,52 +1,58 @@
-"""Regression: PILOT must CONSUME its learned trajectory in the recon forward.
+"""PILOT samples the image on its learned trajectory and feeds the UNet with it.
 
-2026-05-31 audit bug — ``PILOTStrategy`` added ``self._trajectory`` to
-``opt_g`` and added an ``L2``-style feasibility penalty on it, but never
-threaded it into the reconstruction forward. The parent
-(``ReconstructionMixin._prepare_batch_context_reconstruction``) sources the
-trajectory from the batch dict (``kwargs["batch"]["trajectory"]``) into
-``batch_context["trajectory"]``, which the NUFFT-adjoint recon path then
-consumes. Because PILOT never injected it, the trajectory received only the
-feasibility gradient and *no data gradient* — so it could never influence the
-output and the paradigm did not actually function.
-
-Fix: inject ``self._trajectory`` into the batch dict forwarded to ``super()``
-(mirroring ``GIRFAwareStrategy``'s waveform→trajectory injection). These tests
-drive ``_compute_losses_impl`` with a stubbed parent that captures the kwargs
-it receives, and assert the learned trajectory tensor reaches the parent's
-batch.
+The UNet input is the NUFFT of the image on the learned trajectory, adjointed with
+density compensation (cohort5 §2.7). The trajectory therefore shapes the data term. The
+torchkbnufft gradient with respect to the trajectory is unavailable, so the feasibility
+penalty is the only gradient the trajectory gets; that is reported, not hidden.
 """
 
 from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OwnedParameter
+from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.infrastructure.physics.implementations.nufft_operator import NUFFTOperator
+from spectramr.infrastructure.training.strategies import pilot_strategy as pilot_mod
 from spectramr.infrastructure.training.strategies.pilot_strategy import PILOTStrategy
 
 
-def _make_pilot(trajectory, *, codesign_enabled=False):
-    """Construct PILOTStrategy bypassing __init__ (no DI/env build needed).
+def _ns(**kw):
+    return types.SimpleNamespace(**kw)
 
-    Only the attributes ``_compute_losses_impl`` touches are set:
-    ``_trajectory`` and ``_codesign`` (the latter gates the feasibility term).
-    """
-    s = object.__new__(PILOTStrategy)
-    s.env = types.SimpleNamespace(generator=torch.nn.Identity())
-    s._trajectory = trajectory
-    s._codesign = types.SimpleNamespace(enabled=codesign_enabled)
+
+def _wire_sampling(s, n_shots, spp, im_size):
+    """The attributes ``_sampled_input`` reads, set the way ``__init__`` sets them."""
+    s._n_shots = n_shots
+    s._samples_per_shot = spp
+    s._im_size = im_size
+    s._nufft = NUFFTOperator(traj=s._omega(), im_size=im_size)
     return s
 
 
+def _make_pilot(trajectory, *, codesign_enabled=False):
+    """Construct PILOTStrategy bypassing __init__ (no DI/env build needed)."""
+    s = object.__new__(PILOTStrategy)
+    s.env = types.SimpleNamespace(generator=torch.nn.Identity())
+    s.device = torch.device("cpu")
+    s._trajectory = trajectory
+    s._owned_modules = {"_trajectory": OwnedParameter(trajectory)}
+    s._owned_wrappers = {}
+    s._codesign = types.SimpleNamespace(enabled=codesign_enabled)
+    n = trajectory.shape[0]
+    return _wire_sampling(s, 1, n, (4, 4))
+
+
 def _patch_parent_capture(monkeypatch, s, captured):
-    """Stub the immediate-parent ``_compute_losses_impl`` so ``super()`` returns
-    a sentinel dict and records the kwargs (incl. ``batch``) it was called with.
-    """
+    """Stub the immediate-parent ``_compute_losses_impl``; record its kwargs and input."""
     parent = type(s).__mro__[1]
 
     def _stub(self, input_batch=None, target_batch=None, epoch=0, **kw):
         captured.update(kw)
+        captured["input_batch"] = input_batch
         return {"loss_total": torch.zeros(())}
 
     monkeypatch.setattr(parent, "_compute_losses_impl", _stub, raising=False)
@@ -56,58 +62,67 @@ _LR = torch.randn(1, 2, 4, 4)
 _HR = torch.randn(1, 2, 4, 4)
 
 
-class TestPILOTTrajectoryThreaded:
-    def test_trajectory_injected_into_parent_batch(self, monkeypatch):
-        """KEY property: the learned trajectory tensor reaches the parent forward
-        via ``kwargs["batch"]["trajectory"]`` so the recon loss flows gradient
-        back into it."""
-        traj = torch.nn.Parameter(torch.randn(8, 2))
-        s = _make_pilot(traj)
-        captured: dict = {}
-        _patch_parent_capture(monkeypatch, s, captured)
-
-        out = s._compute_losses_impl(
-            input_batch=_LR, target_batch=_HR, epoch=0, batch={"x": _LR}
-        )
-
-        assert isinstance(out, dict)
-        assert "batch" in captured, "PILOT did not forward a batch dict to super()"
-        assert captured["batch"]["trajectory"] is s._trajectory, (
-            "learned trajectory must be the SAME tensor object the parent recon "
-            "forward consumes, so the data/recon loss gradient reaches it"
-        )
-
-    def test_existing_batch_keys_preserved(self, monkeypatch):
-        """Injection must not clobber other batch entries (copy-then-set)."""
-        traj = torch.nn.Parameter(torch.randn(8, 2))
-        s = _make_pilot(traj)
-        captured: dict = {}
-        _patch_parent_capture(monkeypatch, s, captured)
-
-        s._compute_losses_impl(
-            input_batch=_LR,
-            target_batch=_HR,
-            epoch=0,
-            batch={"measured_kspace": _LR, "mask": _HR},
-        )
-
-        forwarded = captured["batch"]
-        assert forwarded["trajectory"] is s._trajectory
-        assert forwarded["measured_kspace"] is _LR
-        assert forwarded["mask"] is _HR
-
-    def test_no_batch_dict_still_forwards_named(self, monkeypatch):
-        """No batch dict in kwargs → parent still invoked via the named
-        convention without crashing (graceful degradation)."""
-        traj = torch.nn.Parameter(torch.randn(8, 2))
-        s = _make_pilot(traj)
+class TestPILOTSampledInput:
+    def test_parent_receives_the_sampled_image_not_the_raw_input(self, monkeypatch):
+        s = _make_pilot(torch.nn.Parameter(torch.randn(8, 2) * 0.1))
         captured: dict = {}
         _patch_parent_capture(monkeypatch, s, captured)
 
         out = s._compute_losses_impl(input_batch=_LR, target_batch=_HR, epoch=0)
+
         assert isinstance(out, dict)
-        # Without a batch dict to thread through, no trajectory injection occurs.
-        assert "batch" not in captured
+        assert captured["input_batch"].shape == _LR.shape
+        assert not torch.allclose(captured["input_batch"], _LR), "the UNet saw the raw input"
+
+    def test_the_sampled_input_depends_on_the_trajectory(self):
+        s = _make_pilot(torch.nn.Parameter(torch.randn(8, 2) * 0.1))
+        a = s._sampled_input(_LR)
+        with torch.no_grad():
+            s._trajectory.add_(0.05)
+        b = s._sampled_input(_LR)
+        assert not torch.allclose(a, b), "moving the trajectory did not change the UNet input"
+
+    def test_validation_grades_the_same_sampled_input(self, monkeypatch):
+        s = _make_pilot(torch.nn.Parameter(torch.randn(8, 2) * 0.1))
+        seen: dict = {}
+        parent = PILOTStrategy.__mro__[1]
+
+        def _stub(self, input_batch, batch_context, **kw):
+            seen["x"] = input_batch
+            return input_batch
+
+        monkeypatch.setattr(parent, "_validation_forward", _stub, raising=False)
+        s._validation_forward(_LR, {})
+        assert torch.allclose(seen["x"], s._sampled_input(_LR))
+        assert not torch.allclose(seen["x"], _LR)
+
+
+class TestPILOTNufftRoundTrip:
+    def test_cartesian_trajectory_matches_fft2c(self):
+        """On a fully sampled Cartesian grid the NUFFT forward is fft2c (ortho)."""
+        n = 16
+        grid = torch.arange(-n // 2, n // 2, dtype=torch.float32) / n
+        ky, kx = torch.meshgrid(grid, grid, indexing="ij")
+        traj = torch.stack([kx.flatten(), ky.flatten()], dim=-1)
+        s = _wire_sampling(_make_pilot(torch.nn.Parameter(traj)), 1, n * n, (n, n))
+        image = torch.randn(1, 1, n, n, dtype=torch.complex64)
+
+        samples = s._nufft.forward(image) / n
+        reference = fft2c(image)[0, 0].flatten()
+        rel = (samples[0, 0] - reference).norm() / reference.norm()
+        assert rel.item() < 1e-3
+
+    def test_unit_dcf_adjoint_returns_the_image(self):
+        n = 16
+        grid = torch.arange(-n // 2, n // 2, dtype=torch.float32) / n
+        ky, kx = torch.meshgrid(grid, grid, indexing="ij")
+        traj = torch.stack([kx.flatten(), ky.flatten()], dim=-1)
+        s = _wire_sampling(_make_pilot(torch.nn.Parameter(traj)), 1, n * n, (n, n))
+        image = torch.randn(1, 1, n, n, dtype=torch.complex64)
+        samples = s._nufft.forward(image) / n
+        back = s._nufft.adjoint(samples, dcf=torch.ones(1, 1, n * n)) / n
+        rel = (back - image).norm() / image.norm()
+        assert rel.item() < 1e-3
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +146,7 @@ def _ns(**kw):
     return types.SimpleNamespace(**kw)
 
 
-def _make_pilot_via_init(monkeypatch, *, model_kwargs, codesign_enabled=False):
+def _make_pilot_via_init(monkeypatch, *, model_kwargs, codesign_enabled=False, fov_m=None):
     """Run the real ``PILOTStrategy.__init__`` body with a stub parent init.
 
     Only the attributes ``__init__`` reads are supplied:
@@ -148,10 +163,13 @@ def _make_pilot_via_init(monkeypatch, *, model_kwargs, codesign_enabled=False):
         enabled=codesign_enabled,
         feasibility_lambda=0.01,
         constraints=constraints,
+        field_of_view_m=fov_m,
     )
     config = _ns(
         model=_ns(model_kwargs=model_kwargs),
         acquisition=_ns(codesign=codesign),
+        data=_ns(sampling=_ns(patch_size=(256, 256, 1))),
+        undersampling=_ns(adaptive=_ns(mask_learning_rate=1e-4)),
     )
 
     def _stub_parent_init(self, *a, **k):
@@ -159,6 +177,8 @@ def _make_pilot_via_init(monkeypatch, *, model_kwargs, codesign_enabled=False):
         self.config = config
         self.device = torch.device("cpu")
         self.env = _ns(opt_g=None)
+        self._owned_modules = {}
+        self._owned_wrappers = {}
 
     monkeypatch.setattr(parent, "__init__", _stub_parent_init, raising=False)
     return PILOTStrategy()
@@ -218,7 +238,7 @@ class TestPILOTKnobsAreRead:
 # ``[n_shots, samples_per_shot, 2]`` and differences along the per-shot axis.
 
 
-def _make_pilot_for_penalty(traj, n_shots, samples_per_shot, *, feas_lambda=1.0):
+def _make_pilot_for_penalty(traj, n_shots, samples_per_shot, *, feas_lambda=1.0, limits=None):
     """Build a PILOTStrategy (bypassing __init__) wired for _feasibility_penalty.
 
     Constraints are set very low so that the inter-shot jump, if it leaked into
@@ -230,7 +250,7 @@ def _make_pilot_for_penalty(traj, n_shots, samples_per_shot, *, feas_lambda=1.0)
     s._trajectory = traj
     s._n_shots = n_shots
     s._samples_per_shot = samples_per_shot
-    constraints = _ns(
+    constraints = limits or _ns(
         gradient_max_mT_per_m=0.0001,  # ~0 mT/m → any gradient overshoots
         slew_rate_max_T_per_m_per_s=0.0001,
         gradient_dwell_us=10.0,
@@ -239,21 +259,75 @@ def _make_pilot_for_penalty(traj, n_shots, samples_per_shot, *, feas_lambda=1.0)
         enabled=True,
         feasibility_lambda=feas_lambda,
         constraints=constraints,
+        field_of_view_m=0.2,
     )
+    s._im_size = (256, 256)
+    s._fov_m = 0.2
     return s
+
+
+class TestPILOTFeasibilityPhysicalUnits:
+    """Penalty in T/m and T/m/s (cohort5 §2.7): the same trajectory moves in or out of limits."""
+
+    _LIMITS = _ns(
+        gradient_max_mT_per_m=40.0,
+        slew_rate_max_T_per_m_per_s=200.0,
+        gradient_dwell_us=4.0,
+    )
+
+    def test_a_static_trajectory_is_within_limits(self):
+        traj = torch.nn.Parameter(torch.zeros(2 * 64, 2))
+        s = _make_pilot_for_penalty(traj, 2, 64, limits=self._LIMITS)
+        assert s._feasibility_penalty().item() == 0.0
+
+    def test_a_trajectory_over_the_gradient_limit_is_penalised(self):
+        traj = torch.zeros(64, 2)
+        traj[32:, 0] = 0.5  # one jump of half the FOV in one dwell
+        s = _make_pilot_for_penalty(torch.nn.Parameter(traj), 1, 64, limits=self._LIMITS)
+        assert s._feasibility_penalty().item() > 0.0
+
+    def test_the_penalty_is_normalised_by_the_limits(self):
+        """Halving the limits raises the penalty, by a factor set by the limits."""
+        traj = torch.zeros(64, 2)
+        traj[32:, 0] = 0.5
+        loose = _make_pilot_for_penalty(torch.nn.Parameter(traj.clone()), 1, 64, limits=self._LIMITS)
+        tight = _make_pilot_for_penalty(
+            torch.nn.Parameter(traj.clone()),
+            1,
+            64,
+            limits=_ns(
+                gradient_max_mT_per_m=20.0,
+                slew_rate_max_T_per_m_per_s=100.0,
+                gradient_dwell_us=4.0,
+            ),
+        )
+        assert tight._feasibility_penalty().item() > loose._feasibility_penalty().item()
+
+
+class TestPILOTKnobs:
+    def test_nufft_is_required_and_raises_without_torchkbnufft(self, monkeypatch):
+        monkeypatch.setattr(pilot_mod, "TORCHKBNUFFT_AVAILABLE", False)
+        with pytest.raises(ImportError, match="torchkbnufft"):
+            _make_pilot_via_init(monkeypatch, model_kwargs={"n_shots": 2, "samples_per_shot": 8})
+
+    def test_codesign_without_a_field_of_view_raises(self, monkeypatch):
+        with pytest.raises(ValueError, match="field_of_view_m"):
+            _make_pilot_via_init(
+                monkeypatch,
+                model_kwargs={"n_shots": 2, "samples_per_shot": 8},
+                codesign_enabled=True,
+                fov_m=None,
+            )
 
 
 class TestPILOTFeasibilityShotBoundary:
     def test_reordering_shots_does_not_change_penalty(self):
         """The feasibility penalty must be invariant to the ORDER of shots.
 
-        Construction avoids float32 catastrophic cancellation: the two
-        trajectories are built from the SAME per-shot sample tensors, only the
-        concatenation order changes. Reordering leaves every within-shot diff
-        BIT-IDENTICAL but completely changes the inter-shot boundary pair. A
-        correct per-shot penalty (post-reshape) is therefore BIT-EXACT equal;
-        the pre-fix flat ``dim=0`` diff straddles the large inter-shot gap and
-        diverges wildly.
+        The two trajectories share their per-shot sample tensors, and only the
+        concatenation order changes. A correct per-shot penalty is invariant to that
+        order; the pre-fix flat ``dim=0`` diff straddles the inter-shot gap and
+        diverges by orders of magnitude.
         """
         spp = 16
         torch.manual_seed(0)
@@ -272,7 +346,9 @@ class TestPILOTFeasibilityShotBoundary:
 
         # Bit-exact: within-shot diffs are identical between orderings, and the
         # only difference (the ignored inter-shot pair) must contribute nothing.
-        assert penalty_ab == penalty_ba, (
+        # Relative tolerance: the penalty is now in physical units, so its magnitude is
+        # large and only float32 summation order differs between the two orderings.
+        assert penalty_ab == pytest.approx(penalty_ba, rel=1e-5), (
             "feasibility penalty changed when shots were reordered — the diff is "
             "still straddling the shot boundary (dim=0 flat bug). "
             f"[A,B]={penalty_ab} vs [B,A]={penalty_ba}"
@@ -319,3 +395,14 @@ class TestPILOTFeasibilityShotBoundary:
         out = s._feasibility_penalty()
         assert out.ndim == 0
         assert torch.isfinite(out)
+
+
+class TestPILOTTrajectoryGradient:
+    def test_a_reconstruction_loss_gives_the_trajectory_a_nonzero_gradient(self):
+        """The data term reaches the trajectory through the sampled input (§2.7 follow-up)."""
+        s = _make_pilot(torch.nn.Parameter(torch.randn(8, 2) * 0.1))
+        out = s._sampled_input(_LR)
+        loss = (out - _HR).pow(2).mean()
+        loss.backward()
+        assert s._trajectory.grad is not None
+        assert s._trajectory.grad.abs().sum().item() > 0.0

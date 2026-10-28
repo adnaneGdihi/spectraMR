@@ -16,6 +16,33 @@ from spectramr.infrastructure.training.step_executor import (
 )
 
 # ---------------------------------------------------------------------------
+# Loss fixtures
+# ---------------------------------------------------------------------------
+
+
+def _connected_loss(value: float) -> torch.Tensor:
+    """A scalar loss carrying a real ``grad_fn``.
+
+    Every closure below used to return ``torch.tensor(v, requires_grad=True)``,
+    which is a **leaf**: ``requires_grad`` is True but ``grad_fn`` is None and
+    there is no path to any parameter. ``backward()`` on one succeeds while
+    every gradient stays None -- the silent-no-op failure ``StepExecutor`` now
+    refuses to perform (#1952). A leaf fixture would therefore test the guard
+    instead of the behaviour each test names.
+
+    Multiplying by a constant attaches a ``MulBackward0`` node while preserving
+    the value exactly, including ``nan``/``inf`` -- so the non-finite tests
+    still carry the value they are about, now on a realistic loss rather than
+    on one no training step could produce.
+
+    The guard's own behaviour, and its ordering against the non-finite check,
+    are owned by ``test_backward_guard.py`` and are deliberately not
+    re-asserted here (NN17).
+    """
+    return torch.tensor(value, requires_grad=True) * 1.0
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -80,10 +107,8 @@ class TestStepExecutorInit:
 
 
 class TestSingleStep:
-    def test_single_closure_execution(
-        self, trainer, amp_policy, simple_model, simple_optimizer
-    ):
-        loss_val = torch.tensor(1.0, requires_grad=True)
+    def test_single_closure_execution(self, trainer, amp_policy, simple_model, simple_optimizer):
+        loss_val = _connected_loss(1.0)
         config: OptimizationStepConfig = {
             "optimizer": simple_optimizer,
             "closure": lambda: loss_val,
@@ -101,11 +126,9 @@ class TestSingleStep:
         assert kw["model"] is simple_model
         assert kw["perform_step"] is True
 
-    def test_dict_config_auto_wrapped(
-        self, trainer, amp_policy, simple_model, simple_optimizer
-    ):
+    def test_dict_config_auto_wrapped(self, trainer, amp_policy, simple_model, simple_optimizer):
         """A single dict (not list) should be auto-wrapped."""
-        loss_val = torch.tensor(0.5, requires_grad=True)
+        loss_val = _connected_loss(0.5)
         config = {
             "optimizer": simple_optimizer,
             "closure": lambda: loss_val,
@@ -129,8 +152,8 @@ class TestMultiStep:
         d_opt = torch.optim.SGD(d_model.parameters(), lr=0.01)
         g_opt = torch.optim.SGD(g_model.parameters(), lr=0.01)
 
-        d_loss = torch.tensor(0.5, requires_grad=True)
-        g_loss = torch.tensor(0.3, requires_grad=True)
+        d_loss = _connected_loss(0.5)
+        g_loss = _connected_loss(0.3)
 
         configs = [
             {
@@ -168,7 +191,7 @@ class TestGradientAccumulation:
         )
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
-        loss = torch.tensor(1.0, requires_grad=True)
+        loss = _connected_loss(1.0)
 
         config = {
             "optimizer": opt,
@@ -190,7 +213,7 @@ class TestGradientAccumulation:
         )
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
-        loss = torch.tensor(1.0, requires_grad=True)
+        loss = _connected_loss(1.0)
 
         config = {
             "optimizer": opt,
@@ -212,7 +235,7 @@ class TestGradientAccumulation:
         )
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.01)
-        raw_loss = torch.tensor(4.0, requires_grad=True)
+        raw_loss = _connected_loss(4.0)
 
         config = {
             "optimizer": opt,
@@ -237,7 +260,7 @@ class TestGradientClipping:
         self, trainer, amp_policy, simple_model, simple_optimizer
     ):
         clip_fn = MagicMock()
-        loss = torch.tensor(1.0, requires_grad=True)
+        loss = _connected_loss(1.0)
 
         config = {
             "optimizer": simple_optimizer,
@@ -258,7 +281,7 @@ class TestGradientClipping:
 
     def test_no_clip_fn_when_no_model(self, trainer, amp_policy, simple_optimizer):
         clip_fn = MagicMock()
-        loss = torch.tensor(1.0, requires_grad=True)
+        loss = _connected_loss(1.0)
 
         config = {
             "optimizer": simple_optimizer,
@@ -284,11 +307,9 @@ class TestGradientClipping:
 
 
 class TestEdgeCases:
-    def test_tuple_loss_unpacked(
-        self, trainer, amp_policy, simple_model, simple_optimizer
-    ):
+    def test_tuple_loss_unpacked(self, trainer, amp_policy, simple_model, simple_optimizer):
         """Closures returning (loss, aux_outputs) should unpack."""
-        loss = torch.tensor(1.0, requires_grad=True)
+        loss = _connected_loss(1.0)
         aux = {"some": "data"}
 
         config = {
@@ -302,10 +323,8 @@ class TestEdgeCases:
         assert "gen_loss" in result
         assert result["gen_loss"].item() == pytest.approx(1.0)
 
-    def test_default_name_when_missing(
-        self, trainer, amp_policy, simple_model, simple_optimizer
-    ):
-        loss = torch.tensor(1.0, requires_grad=True)
+    def test_default_name_when_missing(self, trainer, amp_policy, simple_model, simple_optimizer):
+        loss = _connected_loss(1.0)
         config = {
             "optimizer": simple_optimizer,
             "closure": lambda: loss,
@@ -345,7 +364,7 @@ class TestNonFiniteLossGuard:
         trainer = StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy)
         config = {
             "optimizer": simple_optimizer,
-            "closure": lambda: torch.tensor(float("nan"), requires_grad=True),
+            "closure": lambda: _connected_loss(float("nan")),
             "model": simple_model,
             "name": "gen",
         }
@@ -363,21 +382,72 @@ class TestNonFiniteLossGuard:
         trainer = StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy)
         config = {
             "optimizer": simple_optimizer,
-            "closure": lambda: torch.tensor(float("inf"), requires_grad=True),
+            "closure": lambda: _connected_loss(float("inf")),
             "model": simple_model,
             "name": "gen",
         }
         trainer.execute_step([config], epoch=0, global_step=0)  # no raise
         assert amp_policy.backward_and_step.called
 
-    def test_finite_loss_passes_fp32(
-        self, amp_helper, amp_policy, simple_model, simple_optimizer
+    @staticmethod
+    def _nan_step(trainer, simple_model, simple_optimizer) -> None:
+        config = {
+            "optimizer": simple_optimizer,
+            "closure": lambda: _connected_loss(float("nan")),
+            "model": simple_model,
+            "name": "gen",
+        }
+        trainer.execute_step([config], epoch=0, global_step=42)
+
+    def test_an_attached_monitor_records_instead_of_raising(
+        self, amp_helper, simple_model, simple_optimizer
     ):
+        """The training loop attaches a monitor: the guard then queues a device
+        flag and the loop stops on the verdict, so the step pays no host sync."""
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+        from spectramr.infrastructure.training.optimizers import AMPPolicy
+
+        amp_helper.scaler = None
+        policy = AMPPolicy(max_grad_norm=1.0, enable_gradient_clipping=False)
+        policy.backward_and_step = MagicMock()  # type: ignore[method-assign]
+        trainer = StepExecutor(amp_helper=amp_helper, amp_policy=policy)
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        trainer.nonfinite_monitor = monitor
+
+        self._nan_step(trainer, simple_model, simple_optimizer)
+
+        assert policy.backward_and_step.called
+        monitor.end_step(42)
+        verdict = monitor.resolve()
+        assert verdict is not None and verdict.iteration == 42 and verdict.names == ("gen",)
+
+    def test_the_fallback_for_a_policy_without_guard_loss_uses_the_same_rule(
+        self, amp_helper, simple_model, simple_optimizer
+    ):
+        """One owner: a policy object predating the ABC gets the default rule,
+        recording under a monitor and raising without one."""
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+
+        class _NoGuard:
+            backward_and_step = MagicMock()
+
+        amp_helper.scaler = None
+        trainer = StepExecutor(amp_helper=amp_helper, amp_policy=_NoGuard())
+        with pytest.raises(RuntimeError, match="Non-finite loss"):
+            self._nan_step(trainer, simple_model, simple_optimizer)
+
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        trainer.nonfinite_monitor = monitor
+        self._nan_step(trainer, simple_model, simple_optimizer)
+        monitor.end_step(42)
+        assert monitor.resolve().names == ("gen",)
+
+    def test_finite_loss_passes_fp32(self, amp_helper, amp_policy, simple_model, simple_optimizer):
         amp_helper.scaler = None
         trainer = StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy)
         config = {
             "optimizer": simple_optimizer,
-            "closure": lambda: torch.tensor(1.0, requires_grad=True),
+            "closure": lambda: _connected_loss(1.0),
             "model": simple_model,
             "name": "gen",
         }
@@ -399,6 +469,9 @@ class TestDDPNoSyncUnderAccumulation:
             super().__init__()
             self.linear = torch.nn.Linear(4, 4)
             self.entered = 0
+            self.active = False
+            #: ``active`` as observed at the moment the closure (the forward) ran.
+            self.active_at_forward: list[bool] = []
 
         def forward(self, x):
             return self.linear(x)
@@ -406,7 +479,11 @@ class TestDDPNoSyncUnderAccumulation:
         @contextlib.contextmanager
         def no_sync(self):
             self.entered += 1
-            yield
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
 
     def _run(self, amp_helper, amp_policy, steps: int, accumulation: int):
         model = self._SyncSpy()
@@ -421,7 +498,9 @@ class TestDDPNoSyncUnderAccumulation:
                 [
                     {
                         "optimizer": optimizer,
-                        "closure": lambda: torch.tensor(1.0, requires_grad=True),
+                        "closure": lambda: (
+                            model.active_at_forward.append(model.active) or _connected_loss(1.0)
+                        ),
                         "model": model,
                         "name": "gen",
                     }
@@ -431,12 +510,19 @@ class TestDDPNoSyncUnderAccumulation:
             )
         return model
 
-    def test_suppressed_on_every_micro_batch_but_the_boundary(
+    def test_suppressed_on_every_micro_batch_but_the_boundary(self, amp_helper, amp_policy):
+        model = self._run(amp_helper, amp_policy, steps=4, accumulation=4)
+        # steps 0,1,2 accumulate; step 3 is the boundary and must sync. Entered twice
+        # per accumulating micro-batch: around the forward (DDP) and around backward (FSDP).
+        assert model.entered == 6
+
+    def test_active_while_the_forward_runs_on_accumulating_micro_batches(
         self, amp_helper, amp_policy
     ):
+        """Planted: DDP arms its reducer when the forward runs, so ``no_sync`` entered only
+        around backward() is too late and every micro-batch still all-reduces."""
         model = self._run(amp_helper, amp_policy, steps=4, accumulation=4)
-        # steps 0,1,2 accumulate; step 3 is the boundary and must sync.
-        assert model.entered == 3
+        assert model.active_at_forward == [True, True, True, False]
 
     def test_never_suppressed_without_accumulation(self, amp_helper, amp_policy):
         """Every step is a boundary at accumulation=1, so no_sync must not fire
@@ -456,7 +542,7 @@ class TestDDPNoSyncUnderAccumulation:
             [
                 {
                     "optimizer": simple_optimizer,
-                    "closure": lambda: torch.tensor(1.0, requires_grad=True),
+                    "closure": lambda: _connected_loss(1.0),
                     "model": simple_model,
                     "name": "gen",
                 }
@@ -504,9 +590,7 @@ class TestAdoptStepPolicy:
     def _executor(self, accumulation: int = 4) -> StepExecutor:
         return StepExecutor(
             amp_helper=MagicMock(),
-            amp_policy=MagicMock(
-                owns_gradient_accumulation=False, owns_zero_grad=False
-            ),
+            amp_policy=MagicMock(owns_gradient_accumulation=False, owns_zero_grad=False),
             gradient_accumulation_steps=accumulation,
         )
 
@@ -514,9 +598,7 @@ class TestAdoptStepPolicy:
         ex = self._executor(accumulation=4)
         assert ex.gradient_accumulation_steps == 4
 
-        ex.adopt_step_policy(
-            MagicMock(owns_gradient_accumulation=True, owns_zero_grad=True)
-        )
+        ex.adopt_step_policy(MagicMock(owns_gradient_accumulation=True, owns_zero_grad=True))
 
         # The engine divides the loss and decides boundaries itself; running our
         # copy as well gives 1/N^2 scaling.
@@ -528,9 +610,7 @@ class TestAdoptStepPolicy:
 
     def test_plain_policy_leaves_accumulation_with_the_executor(self) -> None:
         ex = self._executor(accumulation=3)
-        ex.adopt_step_policy(
-            MagicMock(owns_gradient_accumulation=False, owns_zero_grad=False)
-        )
+        ex.adopt_step_policy(MagicMock(owns_gradient_accumulation=False, owns_zero_grad=False))
         assert ex.gradient_accumulation_steps == 3
         assert ex._policy_owns_accumulation is False
 

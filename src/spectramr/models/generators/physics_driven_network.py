@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.physics.integration import (
-    DataConsistencyLayer,
+    OperatorProjectionDataConsistency,
     create_physics_operator,
 )
 from spectramr.models.interfaces.models import IGenerator
@@ -101,9 +101,9 @@ class UnrolledPhysicsNetwork(nn.Module, IGenerator):
 
         # Soft DC with learnable or fixed parameter?
         # Standard MoDL uses conjugate gradient for DC step,
-        # but here we use the DataConsistencyLayer (POCS/Soft Projection)
+        # but here we use the OperatorProjectionDataConsistency (POCS/Soft Projection)
         # as a proximal operator approximation.
-        self.dc_layer = DataConsistencyLayer(
+        self.dc_layer = OperatorProjectionDataConsistency(
             self.operator, lambda_dc=1.0
         )  # Soft DC usually has lambda < 1.0 or handled inside
 
@@ -183,8 +183,8 @@ class UnrolledPhysicsNetwork(nn.Module, IGenerator):
             # Project x_reg onto measurement manifold
             if ref_kspace is not None and mask is not None:
                 # DC Layer expects [B, 2, H, W] or complex?
-                # DataConsistencyLayer forward: pred_image, ref_kspace, mask
-                # Check DataConsistencyLayer implementation integration.py lines 62:
+                # OperatorProjectionDataConsistency forward: pred_image, ref_kspace, mask
+                # Check OperatorProjectionDataConsistency implementation integration.py lines 62:
                 # pred_image: [B, H, W, 2] (complex last) or check format.
                 # integration.py docstring says [B, H, W, 2] but implementations vary.
                 # StandardUNet uses [B, C, H, W] (Channel first).

@@ -34,6 +34,7 @@ class FNOGenerator(nn.Module):
         modes2: int = 64,
         depth: int = 4,
         output_domain: str = "image",  # 'image' or 'kspace'
+        output_form: str = "complex",  # 'complex' ([Re,Im]) or 'magnitude' (1-ch |x|)
         **kwargs,
     ):
         """__init__.
@@ -46,6 +47,8 @@ class FNOGenerator(nn.Module):
             modes2 (int): Description.
             depth (int): Description.
             output_domain (str): Description.
+            output_form (str): ``complex`` emits [Re, Im] (out_channels=2);
+                ``magnitude`` emits |x| on image output (out_channels=1).
         """
         super().__init__()
 
@@ -55,6 +58,13 @@ class FNOGenerator(nn.Module):
                 modes1, modes2 = modes[0], modes[1]
 
         self.output_domain = output_domain
+        if output_form not in ("complex", "magnitude"):
+            raise ValueError(
+                f"FNOGenerator output_form must be 'complex' or 'magnitude'; got {output_form!r}."
+            )
+        if output_form == "magnitude" and output_domain != "image":
+            raise ValueError("FNOGenerator output_form='magnitude' requires output_domain='image'.")
+        self.output_form = output_form
 
         self.fc0 = nn.Linear(in_channels + 2, width)  # +2 for grid encoding
 
@@ -72,15 +82,13 @@ class FNOGenerator(nn.Module):
         # override: surface the constraint as an early TypeError if the
         # user declared a non-2 ``out_channels``, with the fix hint
         # naming the magnitude-extraction adapter.
-        if out_channels != 2:
+        expected_out = 1 if output_form == "magnitude" else 2
+        if out_channels != expected_out:
             raise ValueError(
-                f"FNOGenerator architecturally produces 2 channels "
-                f"(real, imag from the inverse FFT round-trip). YAML "
-                f"declared ``out_channels={out_channels}``, which is a "
-                f"silent contradiction (CLAUDE.md pitfall #9). Set "
-                f"``model.out_channels: 2`` in the YAML; if the loss / "
-                f"metric needs a 1-channel magnitude tensor declare "
-                f"``adapters.pre_loss_pred: [name: magnitude_from_complex]``."
+                f"FNOGenerator with output_form={output_form!r} emits {expected_out} "
+                f"channel(s); YAML declared ``out_channels={out_channels}`` "
+                f"(CLAUDE.md pitfall #9). Set ``model.out_channels: {expected_out}``, "
+                f"or ``model_kwargs.output_form`` to match."
             )
         self.fc2 = nn.Linear(128, 2)  # Architectural — see note above.
 
@@ -129,6 +137,13 @@ class FNOGenerator(nn.Module):
         return self.grid_cache[grid_key].expand(batchsize, -1, -1, -1)
 
     def forward(self, x, sensitivity_maps=None, **kwargs):
+        """Forward pass; applies the declared ``output_form`` head."""
+        out = self._forward_complex(x, sensitivity_maps=sensitivity_maps, **kwargs)
+        if self.output_form == "magnitude":
+            return torch.sqrt(out[:, 0:1] ** 2 + out[:, 1:2] ** 2)
+        return out
+
+    def _forward_complex(self, x, sensitivity_maps=None, **kwargs):
         """Forward pass with optional IFFT output.
 
         Args:

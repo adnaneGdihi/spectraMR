@@ -39,7 +39,7 @@ def create_gaussian_weight_3d(
             torch.Tensor: Description.
         """
         sigma = size * sigma_scale
-        coords = torch.arange(size, dtype=torch.float32) - (size - 1) / 2
+        coords = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2
         gauss = torch.exp(-(coords**2) / (2 * sigma**2))
         return gauss
 
@@ -51,8 +51,6 @@ def create_gaussian_weight_3d(
     weight = gd[:, None, None] * gh[None, :, None] * gw[None, None, :]
     weight = weight.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
 
-    if device is not None:
-        weight = weight.to(device)
 
     return weight
 
@@ -93,12 +91,18 @@ def sliding_window_inference(
     stride_w = max(1, int(pw * (1 - overlap)))
 
     # Pad input if needed to ensure full coverage
-    pad_d = (pd - (d - pd) % stride_d) % stride_d if d > pd else pd - d
-    pad_h = (ph - (h - ph) % stride_h) % stride_h if h > ph else ph - h
-    pad_w = (pw - (w - pw) % stride_w) % stride_w if w > pw else pw - w
+    # Enough that the last window ends on the padded edge: a remainder of (d - pd)
+    # modulo the stride needs (stride - remainder) more voxels, or the tail is never covered.
+    pad_d = (stride_d - (d - pd) % stride_d) % stride_d if d > pd else pd - d
+    pad_h = (stride_h - (h - ph) % stride_h) % stride_h if h > ph else ph - h
+    pad_w = (stride_w - (w - pw) % stride_w) % stride_w if w > pw else pw - w
 
     if pad_d > 0 or pad_h > 0 or pad_w > 0:
-        inputs = F.pad(inputs, (0, pad_w, 0, pad_h, 0, pad_d), mode="reflect")
+        # Reflection needs a pad shorter than the axis it mirrors.
+        fits = pad_d < d and pad_h < h and pad_w < w
+        inputs = F.pad(
+            inputs, (0, pad_w, 0, pad_h, 0, pad_d), mode="reflect" if fits else "replicate"
+        )
         _, _, d_pad, h_pad, w_pad = inputs.shape
     else:
         d_pad, h_pad, w_pad = d, h, w
@@ -158,10 +162,8 @@ def sliding_window_inference(
 
         # Accumulate predictions with weights
         for j, (dz, dy, dx) in enumerate(batch_locs):
-            if len(patches) == 1:
-                pred_patch = pred_batch
-            else:
-                pred_patch = pred_batch[j : j + 1]
+            # Patches were stacked along dim 0, each carrying the whole batch.
+            pred_patch = pred_batch[j * batch_size : (j + 1) * batch_size]
 
             output_buffer[:, :, dz : dz + pd, dy : dy + ph, dx : dx + pw] += (
                 pred_patch * patch_weight
@@ -205,11 +207,12 @@ def sliding_window_inference_2d(
     stride_w = max(1, int(pw * (1 - overlap)))
 
     # Pad if needed
-    pad_h = (ph - (h - ph) % stride_h) % stride_h if h > ph else ph - h
-    pad_w = (pw - (w - pw) % stride_w) % stride_w if w > pw else pw - w
+    pad_h = (stride_h - (h - ph) % stride_h) % stride_h if h > ph else ph - h
+    pad_w = (stride_w - (w - pw) % stride_w) % stride_w if w > pw else pw - w
 
     if pad_h > 0 or pad_w > 0:
-        inputs = F.pad(inputs, (0, pad_w, 0, pad_h), mode="reflect")
+        fits = pad_h < h and pad_w < w
+        inputs = F.pad(inputs, (0, pad_w, 0, pad_h), mode="reflect" if fits else "replicate")
         _, _, h_pad, w_pad = inputs.shape
     else:
         h_pad, w_pad = h, w
@@ -227,9 +230,12 @@ def sliding_window_inference_2d(
         """
         sigma_h = size_h * sigma_scale
         sigma_w = size_w * sigma_scale
-        gy = torch.exp(-((torch.arange(size_h) - (size_h - 1) / 2) ** 2) / (2 * sigma_h**2))
-        gx = torch.exp(-((torch.arange(size_w) - (size_w - 1) / 2) ** 2) / (2 * sigma_w**2))
-        return (gy[:, None] * gx[None, :]).to(device)
+        # Built on the target device: a host-built map costs a synchronising copy per call.
+        ys = torch.arange(size_h, dtype=torch.float32, device=device)
+        xs = torch.arange(size_w, dtype=torch.float32, device=device)
+        gy = torch.exp(-((ys - (size_h - 1) / 2) ** 2) / (2 * sigma_h**2))
+        gx = torch.exp(-((xs - (size_w - 1) / 2) ** 2) / (2 * sigma_w**2))
+        return gy[:, None] * gx[None, :]
 
     if mode == "gaussian":
         weight = gaussian_2d(ph, pw).unsqueeze(0).unsqueeze(0)

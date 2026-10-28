@@ -23,6 +23,7 @@ TrainingEnvironment.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -52,6 +53,10 @@ def _make_strategy(generator: Any = None) -> XFieldFMStrategy:
     strat.device = torch.device("cpu")  # type: ignore[attr-defined]
     strat.env = _FakeEnv(generator)  # type: ignore[attr-defined]
     strat._hypernet = None  # type: ignore[attr-defined]
+    # What BaseTrainingStrategy.__init__ sets up for owned modules (#2629).
+    strat.config = SimpleNamespace(parallel=None)  # type: ignore[attr-defined]
+    strat._owned_modules = {}  # type: ignore[attr-defined]
+    strat._owned_wrappers = {}  # type: ignore[attr-defined]
     return strat
 
 

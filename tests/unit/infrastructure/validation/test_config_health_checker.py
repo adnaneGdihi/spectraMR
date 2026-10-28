@@ -15,6 +15,8 @@ making the tests fragile to v6.0 schema evolution.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from types import SimpleNamespace
 from typing import Any
 
@@ -277,6 +279,20 @@ class TestVFComplexStackingDoubling:
         "spectramr.infrastructure.training.strategies."
         "distillation_strategy.ConcreteDistillationStrategy"
     )
+
+    def test_a_vf_arm_named_only_by_training_mode_also_doubles(self) -> None:
+        """The substring list read ``strategy_class`` only, so an arm that names
+        its strategy by ``training_mode`` was never doubled. The strategy class's
+        ``synthesises_model_input`` is read whichever rung resolves it."""
+        config = _make_config(
+            coil_processing_mode="rss_image",
+            in_channels=1,
+            out_channels=1,
+            target_channels=1,
+        )
+        config.training.training_mode = "virtual_fiducial"
+        errs = _errors(ConfigHealthChecker().check_domain_alignment(config))
+        assert any("in_channels=1" in e.message for e in errs)
 
     def test_rss_image_in2_out2_passes_under_distillation(self) -> None:
         config = _make_config(
@@ -647,6 +663,31 @@ def test_checkpoint_existence_missing_warns(tmp_path):
     assert res.severity == "warning"
     assert "nope.ckpt" in res.message
     assert "model.checkpoint_path" in res.yaml_keys
+
+
+def test_checkpoint_existence_reports_a_missing_distillation_teacher(tmp_path):
+    """The teacher is declared at training.distillation.teacher_checkpoint."""
+    cfg = SimpleNamespace(
+        training=SimpleNamespace(
+            distillation=SimpleNamespace(teacher_checkpoint=str(tmp_path / "teacher.pt"))
+        )
+    )
+    res = ConfigHealthChecker().check_checkpoint_existence(cfg)
+    assert not res.passed
+    assert "training.distillation.teacher_checkpoint" in res.yaml_keys
+
+
+def test_a_producer_built_teacher_is_deferred():
+    cfg = SimpleNamespace(
+        training=SimpleNamespace(
+            distillation=SimpleNamespace(
+                teacher_checkpoint="experiments/results/method_a/checkpoints/best.safetensors"
+            )
+        ),
+        checkpoint=SimpleNamespace(produced_by_arm="method_a"),
+    )
+    res = ConfigHealthChecker().check_checkpoint_existence(cfg)
+    assert res.passed and res.severity == "info"
 
 
 # VF campaign Phase 1b: produced_by_arm deferred campaign dependency (Option A,
@@ -1024,6 +1065,25 @@ class TestScientificMetadata:
         cfg = self._cfg(primary_metric="val_psnr_2x", validation_metrics=["psnr"])
         results = ConfigHealthChecker().check_scientific_metadata(cfg)
         assert any("declared" in r.message for r in results)
+
+    @pytest.mark.parametrize(
+        ("primary", "declared"),
+        [
+            ("val_hfen_mean", ["hfen"]),
+            ("val_hfen_vs_zf_mean", ["hfen"]),
+            ("val_robust_mri_psnr_mean_partial", ["robust_mri_psnr"]),
+            ("val_ensemble_std_mean", ["ensemble_std_mean"]),
+        ],
+    )
+    def test_cascade_aggregates_resolve_to_their_configured_metric(self, primary, declared) -> None:
+        cfg = self._cfg(primary_metric=primary, validation_metrics=declared)
+        results = ConfigHealthChecker().check_scientific_metadata(cfg)
+        assert all("not in validation.metrics" not in r.message for r in results)
+
+    def test_an_aggregate_of_an_unconfigured_metric_is_still_named(self) -> None:
+        cfg = self._cfg(primary_metric="val_nmse_vs_zf_mean", validation_metrics=["hfen"])
+        results = ConfigHealthChecker().check_scientific_metadata(cfg)
+        assert any("not in validation.metrics" in r.message for r in results)
 
     def test_prose_primary_metric_is_skipped(self) -> None:
         # A descriptive value (with spaces/parens) must not be flagged as not-emitted.
@@ -1706,6 +1766,19 @@ def test_fiducial_channels_widen_the_expected_stack() -> None:
     assert not ck.check_domain_alignment(_subvoxel_cfg(24, 8, marker_channels=True))[0].passed
 
 
+def test_forward_psf_channel_widens_the_expected_stack() -> None:
+    """VFU-01: the PSF |OTF| channel adds one, from the same helper the strategy uses."""
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    arm = require_repo_file("experiments/inprogress/vf_ulf/exp_vfulf_05_psf_measured_v1.yaml")
+    results = ConfigHealthChecker().check_domain_alignment(TrainingSettings.from_yaml(str(arm)))
+    assert results[0].passed, results[0].message
+    assert "forward-PSF channel = 25 channels" in results[0].message
+
+
 # ---------------------------------------------------------------------------
 # Marker relaxometry must bracket what it certifies (2026-07-26)
 # ---------------------------------------------------------------------------
@@ -1896,20 +1969,21 @@ class TestMetricNamesAreRegistered:
     a list entry naming one must be a startup error."""
 
     @staticmethod
-    def _settings(metrics: dict[str, Any]) -> Any:
+    def _settings(metrics: dict[str, Any], scoring_compute: list[str] | None = None) -> Any:
         from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
         from spectramr.config.settings import TrainingSettings
 
-        return TrainingSettings.settings_from_dict(
-            {
-                "config_version": CANONICAL_CONFIG_VERSION,
-                "model": {"model_type": "unet"},
-                "data": {"dataset_type": "image"},
-                "optimization": {},
-                "logging": {},
-                "metrics": metrics,
-            }
-        )
+        raw: dict[str, Any] = {
+            "config_version": CANONICAL_CONFIG_VERSION,
+            "model": {"model_type": "unet"},
+            "data": {"dataset_type": "image"},
+            "optimization": {},
+            "logging": {},
+            "metrics": metrics,
+        }
+        if scoring_compute is not None:
+            raw["validation"] = {"scoring": {"compute": scoring_compute}}
+        return TrainingSettings.settings_from_dict(raw)
 
     def test_a_flagless_registered_metric_is_accepted(self) -> None:
         """``brisque`` and ``auroc`` are registered with no ``compute_*`` flag,
@@ -1946,6 +2020,147 @@ class TestMetricNamesAreRegistered:
 
         src = inspect.getsource(ConfigHealthChecker.run_all_checks)
         assert "check_metric_names_are_registered" in src
+
+    def test_the_validation_scoring_surface_is_checked_too(self) -> None:
+        """PLANTED: a typo on the surface that actually grades the arm.
+
+        ``metrics.compute`` configures the TRAINING computer;
+        ``validation.scoring.compute`` configures the VALIDATION one, and the
+        mixin prefers the latter when non-empty. This check read only the first
+        until 2026-09-16, so an unregistered name here was not an error -- it was
+        a column that never appeared, on the surface carrying the arm's headline
+        numbers. Narrowing the check back to ``metrics.compute`` turns this red.
+        """
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute": ["psnr"]}, scoring_compute=["psnr", "fabrication_excesss"])
+        )
+        assert not r.passed
+        assert "fabrication_excesss" in r.message
+        assert r.severity == "error"
+        # The error has to name the key the reader must edit: pointing at
+        # metrics.compute for a validation.scoring.compute typo sends them to a
+        # list the name is not in.
+        assert r.yaml_keys == ["validation.scoring.compute"], r.yaml_keys
+
+    def test_the_registered_null_band_names_pass_on_both_surfaces(self) -> None:
+        """The cohort's instrumentation must be accepted, not merely unrejected."""
+        names = [
+            "ndcr",
+            "fabrication_excess",
+            "null_band_energy_deficit",
+            "nse_hall",
+            "eta_null",
+            "power_spectrum_consistency",
+        ]
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute": ["psnr"]}, scoring_compute=["psnr", *names])
+        )
+        assert r.passed, r.message
+        assert "validation.scoring.compute" in r.message
+
+    def test_both_surfaces_empty_is_skipped_not_passed_on_a_technicality(self) -> None:
+        r = ConfigHealthChecker().check_metric_names_are_registered(
+            self._settings({"compute_psnr": True}, scoring_compute=[])
+        )
+        assert r.passed and r.severity == "info"
+        assert "not used" in r.message
+        # Both surfaces named, so a reader of the skip knows which two lists were
+        # looked at -- the old message named only one and the other went unread.
+        assert "validation.scoring.compute" in r.message
+
+    # --- #2819: the audit and the runtime apply one rule to the validation list ---
+
+    _EMITTED = frozenset({"val_field_mse"})
+
+    @staticmethod
+    def _host_cls(emitted: frozenset[str], *, overrides_validation_step: bool) -> type:
+        """A strategy on ``MetricsMixin.validation_step`` or one that overrides it (#2838)."""
+        from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import MetricsMixin
+        from spectramr.models.capabilities import StrategyCapabilities
+
+        if overrides_validation_step:
+
+            class OverridingStrategy(MetricsMixin):
+                capabilities = StrategyCapabilities(emitted_metrics=emitted)
+
+                def validation_step(self, input_batch, target_batch, **kwargs):
+                    return {"val_loss": 0.0}
+
+            return OverridingStrategy
+
+        class MetricsPathStrategy(MetricsMixin):
+            capabilities = StrategyCapabilities(emitted_metrics=emitted)
+
+        return MetricsPathStrategy
+
+    @staticmethod
+    def _audit(scoring: list[str], host_cls: type, monkeypatch: Any) -> Any:
+        """The audit resolves ``host_cls`` exactly as it resolves a real arm's strategy."""
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        monkeypatch.setattr(TrainingStrategyFactory, "get_strategy_class", lambda _f, _s: host_cls)
+        return ConfigHealthChecker().check_metric_names_are_registered(
+            TestMetricNamesAreRegistered._settings({"compute_psnr": True}, scoring_compute=scoring)
+        )
+
+    @staticmethod
+    def _runtime_accepts(scoring: list[str], host_cls: type) -> bool:
+        try:
+            host_cls()._registry_backed_validation_metrics(scoring)
+        except ValueError:
+            return False
+        return True
+
+    @pytest.mark.parametrize(
+        ("scoring", "overrides", "accepted"),
+        [
+            (["val_loss", "psnr"], True, True),  # red before #2819: val_loss was "unregistered"
+            (["val_loss", "psnr"], False, False),  # red before #2838: that path never writes it
+            (["field_mse"], False, True),  # red before #2819: a declared emitted key
+            (["val_not_a_metric"], True, False),
+            (["psnr_4x"], True, False),  # the computer gets the name verbatim; no suffix strip
+        ],
+    )
+    def test_the_audit_rejects_exactly_what_the_runtime_rejects(
+        self, scoring: list[str], overrides: bool, accepted: bool, monkeypatch: Any
+    ) -> None:
+        """PLANTED: parity on a strategy that declares its emitted set."""
+        from spectramr.core.metrics import MetricsRegistry
+
+        assert not MetricsRegistry.is_registered("psnr_4x")
+        host_cls = self._host_cls(self._EMITTED, overrides_validation_step=overrides)
+        assert self._runtime_accepts(scoring, host_cls) is accepted
+        r = self._audit(scoring, host_cls, monkeypatch)
+        assert r.passed is accepted, r.message
+        if not accepted:
+            assert r.yaml_keys == ["validation.scoring.compute"]
+            assert host_cls.__name__ in r.message
+
+    def test_val_loss_passes_on_a_strategy_that_declares_nothing(self, monkeypatch: Any) -> None:
+        """The exp_promoted_kspace_inr shape: val_loss alone, KSpaceINR declares no emitted set."""
+        host_cls = self._host_cls(frozenset(), overrides_validation_step=True)
+        r = self._audit(["val_loss"], host_cls, monkeypatch)
+        assert r.passed, r.message
+
+    def test_val_loss_errors_on_the_metrics_mixin_path(self, monkeypatch: Any) -> None:
+        """PLANTED (#2838): ``MetricsMixin.validation_step`` returns only registry keys.
+
+        The MRF strategies take this path; ``val_loss`` there names a column that
+        never arrives, whether or not the strategy declares an emitted set.
+        """
+        host_cls = self._host_cls(frozenset(), overrides_validation_step=False)
+        r = self._audit(["val_loss"], host_cls, monkeypatch)
+        assert not r.passed and r.severity == "error"
+        assert "val_loss" in r.message
+
+    def test_an_unowned_name_still_errors_when_the_strategy_declares_nothing(
+        self, monkeypatch: Any
+    ) -> None:
+        """The audit stays stricter than the runtime's census-only log on silent strategies."""
+        host_cls = self._host_cls(frozenset(), overrides_validation_step=True)
+        r = self._audit(["val_loss", "val_not_a_metric"], host_cls, monkeypatch)
+        assert not r.passed and r.severity == "error"
+        assert "val_not_a_metric" in r.message and "val_loss" not in r.message
 
 
 class TestDeclaredKeysAreNotDiscarded:
@@ -2423,6 +2638,52 @@ class TestAccelerationPresentAdvisesTheCanonicalBlock:
             )
         )
         assert result.passed is True
+
+
+class TestAccelerationPresentAcceptsALoaderMaskProducer:
+    """A registry transform that emits the acquisition ``mask`` IS the undersampling.
+
+    CoNEX (``self_supervised/conex_*``) masks the input in the loader with
+    ``complementary_rep_masking``; an ``undersampling:`` block beside it would be
+    a second, unread owner. The exemption keys on the registry's ``produces``
+    declaration, so the planted cases below are the transforms that do NOT
+    produce ``mask`` and must not open it.
+    """
+
+    @staticmethod
+    def _arm(*transforms: str):
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                dataset_type="m4raw",
+                processing=SimpleNamespace(
+                    transforms=[SimpleNamespace(name=n, kwargs={}) for n in transforms]
+                ),
+            ),
+            undersampling=None,
+            workflow=SimpleNamespace(task="reconstruction"),
+        )
+
+    def test_the_mask_producer_satisfies_the_check(self) -> None:
+        result = ConfigHealthChecker().check_acceleration_present(
+            self._arm("complementary_rep_masking")
+        )
+        assert result.passed is True
+        assert "complementary_rep_masking" in result.message
+
+    @pytest.mark.parametrize(
+        "transforms",
+        [(), ("espirit_sensitivity",), ("foreground_mask",)],
+        ids=["none", "coil-maps-only", "a-mask-that-is-not-the-acquisition"],
+    )
+    def test_a_transform_that_emits_no_acquisition_mask_does_not(self, transforms) -> None:
+        result = ConfigHealthChecker().check_acceleration_present(self._arm(*transforms))
+        assert result.passed is False
+        assert result.severity == "error"
+
+    def test_a_dict_shaped_entry_is_read_too(self) -> None:
+        arm = self._arm()
+        arm.data.processing.transforms = [{"name": "complementary_rep_masking"}]
+        assert ConfigHealthChecker().check_acceleration_present(arm).passed is True
 
 
 # ---------------------------------------------------------------------------
@@ -3278,14 +3539,12 @@ class TestDCKnobsInertByMethod:
     def _config(model_kwargs=None, with_physics=True, **dc_overrides):
         from types import SimpleNamespace
 
-        dc = {
-            "enabled": True,
-            "method": "hard",
-            "weight": 1.0,
-            "train_noise_level": 0.01,
-            "eval_noise_level": 0.005,
-            "noise_type": "gaussian",
-        }
+        from spectramr.config.schemas.physics import DataConsistencyConfig
+
+        # The schema's own defaults: a restated copy kept the noise levels at
+        # 0.01 / 0.005 after the schema moved them to 0.0, and then read as declared.
+        dc = {field: info.default for field, info in DataConsistencyConfig.model_fields.items()}
+        dc.update({"enabled": True, "method": "hard"})
         dc.update(dc_overrides)
         return SimpleNamespace(
             model=SimpleNamespace(model_kwargs=dict(model_kwargs or {})),
@@ -3510,7 +3769,16 @@ class TestConditionOnInputDoublesTheInput:
 
 
 class TestNexTargetModeAcceptsThePair:
-    """``rep_pair`` is phase-aligned by construction, so it is a coherent NEX target."""
+    """Only ``complex_mean`` is the finding; every other Literal member is coherent.
+
+    The check used to enumerate the ACCEPTABLE modes, which made it a second
+    owner of ``data.target_mode``'s vocabulary. When ``r2r`` was added to the
+    schema Literal the list was not updated, so an r2r arm fell through to the
+    finding branch and was told it "declares data.target_mode: complex_mean
+    explicitly" -- a value it does not declare. These tests pin both halves of
+    that fix: the whole vocabulary is accepted, and the message names the mode
+    it actually read.
+    """
 
     @staticmethod
     def _cfg(mode: str):
@@ -3520,6 +3788,15 @@ class TestNexTargetModeAcceptsThePair:
             dataset_type="m4raw",
             target_mode=mode,
             nex_target_exclude_input=(mode == "rep_pair"),
+            # r2r is refused without a fixed validation reference (its own
+            # target is redrawn every __getitem__), so give it one.
+            val_target_mode="phase_aligned_mean" if mode in ("r2r", "nullspace_r2r") else None,
+            # r2r is ALSO refused unless the coils arrive uncombined: rss/svd
+            # take a magnitude, which turns the Gaussian residual Rician and
+            # breaks the second-moment decorrelation the mode rests on. The
+            # m4raw preset injects `svd`, so this has to be said out loud --
+            # exactly as the n2n cohort's arms say it.
+            coils={"processing_mode": "none"},
         )
         return SimpleNamespace(data=data)
 
@@ -3527,12 +3804,60 @@ class TestNexTargetModeAcceptsThePair:
         result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("rep_pair"))
         assert result.passed is True and "rep_pair" in result.message
 
+    def test_r2r_is_coherent(self) -> None:
+        """R2R builds both halves from ONE repetition, so it never averages."""
+        result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("r2r"))
+        assert result.passed is True
+        assert "r2r" in result.message
+
+    def test_every_declared_mode_but_complex_mean_is_coherent(self) -> None:
+        """The schema Literal is the vocabulary; this check owns only one member.
+
+        Reads the members off ``DataConfigSchema`` rather than restating them,
+        so a mode added to the Literal joins this test automatically instead of
+        silently becoming an unclassified value the check mislabels.
+        """
+        import typing
+
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        modes = set(typing.get_args(DataConfigSchema.model_fields["target_mode"].annotation))
+        assert "complex_mean" in modes and len(modes) >= 4, modes
+        for mode in sorted(modes - {"complex_mean"}):
+            result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg(mode))
+            assert result.passed is True, f"{mode} was reported as a finding"
+            assert mode in result.message
+
     def test_complex_mean_is_still_the_finding(self) -> None:
         """Planted violation."""
         result = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(
             self._cfg("complex_mean")
         )
         assert result.passed is False
+
+    def test_a_coherent_mode_never_carries_the_complex_mean_prose(self) -> None:
+        """The r2r symptom, pinned at the surface an owner actually reads.
+
+        SCOPE, measured rather than assumed: replacing the finding branch's
+        f-string with the old hardcoded "complex_mean" does NOT turn this red,
+        and no test can make it -- once the accept branch admits every mode but
+        ``complex_mean``, the finding branch is reachable ONLY with
+        ``mode == "complex_mean"``, so the derived name and the constant are
+        behaviourally identical. The f-string is kept as insurance against a
+        future narrowing of that branch, not because it is observable today.
+        What IS observable, and what a stale allowlist breaks, is this: a
+        coherent mode passes and its message carries none of the
+        complex-averaging prose.
+        """
+        finding = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(
+            self._cfg("complex_mean")
+        )
+        assert "declares data.target_mode: complex_mean explicitly" in finding.message
+        assert "cancels signal" in finding.message
+
+        passing = ConfigHealthChecker().check_m4raw_nex_target_mode_declared(self._cfg("r2r"))
+        assert "complex_mean" not in passing.message
+        assert "cancels signal" not in passing.message
 
 
 class TestSliceLevelRecordsQueueShape:
@@ -3624,3 +3949,807 @@ class TestSliceLevelRecordsQueueShape:
 
         src = inspect.getsource(ConfigHealthChecker.run_all_checks)
         assert "self.check_slice_level_records_queue_shape(config)" in src
+
+
+class TestMultiContrastModelSupport:
+    """``data.multi_contrast.enabled`` is checked against BOTH consumers.
+
+    Pattern C emits ``contrast_idx`` on every batch; any model that receives
+    the batch and does not declare ``supports_contrast_conditioning=True``
+    drops it silently. The check read only ``model.model_type`` until
+    2026-09-07, so ``experiment_11_sense_bridge_critic`` -- a contrast-aware
+    generator paired with a critic that declares the flag ``False`` -- audited
+    clean while doing exactly what the check forbids (#1931). Shape 3 below is
+    that arm; it is the reason this class exists.
+
+    Built from the REAL ``TrainingSettings`` rather than a ``SimpleNamespace``:
+    ``ModelComponentSchema.name`` defaults to ``""`` (not ``None``) and
+    ``ModelConfigSchema`` is ``extra="ignore"``, and both of those are
+    properties of the shipped schema that a stub would not reproduce -- shape
+    6 tests the first directly.
+    """
+
+    _MISSING = object()
+
+    @staticmethod
+    def _settings(
+        *,
+        model_type: str | None = "kspace_cold_diffusion",
+        critic: Any = _MISSING,
+        enabled: bool = True,
+    ) -> Any:
+        from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
+        from spectramr.config.settings import TrainingSettings
+
+        model: dict[str, Any] = {}
+        if model_type is not None:
+            model["model_type"] = model_type
+        if critic is not TestMultiContrastModelSupport._MISSING:
+            model["discriminator_component"] = {} if critic is None else {"name": critic}
+        return TrainingSettings.settings_from_dict(
+            {
+                "config_version": CANONICAL_CONFIG_VERSION,
+                "model": model,
+                "data": {
+                    "dataset_type": "m4raw",
+                    "multi_contrast": {"enabled": enabled},
+                },
+                "optimization": {},
+                "logging": {},
+            }
+        )
+
+    @staticmethod
+    def _check(settings: Any) -> Any:
+        return ConfigHealthChecker().check_multi_contrast_model_support(settings)
+
+    def test_disabled_multi_contrast_skips_even_with_an_unconditioned_critic(self) -> None:
+        """The gate is the opt-in flag, so the red set is exactly the arms that
+        asked for Pattern C -- not every arm that owns a critic."""
+        r = self._check(self._settings(critic="sense_bridge_patchgan", enabled=False))
+        assert r.passed and r.severity == "info"
+        assert "disabled" in r.message
+
+    def test_missing_model_type_is_rejected(self) -> None:
+        """PLANT (shape 1): the pre-existing shape, previously unplanted."""
+        r = self._check(self._settings(model_type=None))
+        assert not r.passed and r.severity == "error"
+        assert "model.model_type" in r.yaml_keys
+
+    def test_unconditioned_generator_is_rejected(self) -> None:
+        """PLANT (shape 2): ``unet`` is registered and declares the flag
+        ``False`` -- the shape the check has always caught."""
+        r = self._check(self._settings(model_type="unet"))
+        assert not r.passed and r.severity == "error"
+        assert "supports_contrast_conditioning" in r.message
+        assert r.yaml_keys == ["data.multi_contrast.enabled", "model.model_type"]
+
+    def test_unconditioned_critic_is_rejected(self) -> None:
+        """PLANT (shape 3): THE NEW SHAPE. A contrast-aware generator with an
+        unconditioned critic -- ``experiment_11_sense_bridge_critic`` exactly.
+        Before 2026-09-07 this returned ``passed=True``."""
+        r = self._check(self._settings(critic="sense_bridge_patchgan"))
+        assert not r.passed and r.severity == "error"
+        assert "sense_bridge_patchgan" in r.message
+        assert "model.discriminator_component.name" in r.yaml_keys
+        # The generator is fine, so it must NOT be blamed.
+        assert "model.model_type" not in r.yaml_keys
+
+    def test_both_consumers_are_reported_in_one_result(self) -> None:
+        """PLANT (shape 4): not first-failure-wins. A chain of early returns
+        would name the generator only, and the critic would be met on a second
+        audit run after the first fix."""
+        r = self._check(self._settings(model_type="unet", critic="sense_bridge_patchgan"))
+        assert not r.passed
+        assert "unet" in r.message and "sense_bridge_patchgan" in r.message
+        assert r.yaml_keys == [
+            "data.multi_contrast.enabled",
+            "model.model_type",
+            "model.discriminator_component.name",
+        ]
+
+    def test_critic_absent_from_the_registry_is_reported_not_inferred(self) -> None:
+        """PLANT (shape 5): ``patch_gan_discriminator`` is a real corpus critic
+        name (3 arms) that ``ModelFactory`` builds but ``MODEL_REGISTRY`` does
+        not carry, so no capability flag exists for it. Passing would infer
+        support from absence (non-negotiable 18); deferring would defer to
+        nobody, since ``check_model_registry`` reads ``model.model_type`` only.
+        The message must NOT claim the critic "does not declare" the flag."""
+        r = self._check(self._settings(critic="patch_gan_discriminator"))
+        assert not r.passed and r.severity == "error"
+        assert "cannot be established" in r.message
+        assert "does not declare" not in r.message
+        assert "model.discriminator_component.name" in r.yaml_keys
+
+    def test_a_declared_component_with_an_empty_name_is_treated_as_absent(self) -> None:
+        """PLANT (shape 6): ``ModelComponentSchema.name`` defaults to ``""``,
+        so ``discriminator_component: {}`` declares no critic. Testing
+        ``is None`` instead of falsiness would send this down the
+        absent-from-registry branch and fail an arm that owns no critic."""
+        r = self._check(self._settings(critic=None))
+        assert r.passed and r.severity == "info"
+        assert "no discriminator declared" in r.message
+
+    def test_no_critic_at_all_passes_when_the_generator_is_conditioned(self) -> None:
+        r = self._check(self._settings())
+        assert r.passed and r.severity == "info"
+
+    def test_a_contrast_aware_critic_passes(self) -> None:
+        """The check must be falsifiable in the passing direction too: without
+        this case it could reject every critic and stay green. No registered
+        discriminator declares the flag today (0 of 14 discriminator names in
+        ``MODEL_REGISTRY``, #1931), so the conditioned critic has to be planted. ``populate_model_registry`` is
+        additive and idempotent -- a planted entry survives it, and survives
+        ``force=True`` -- so the check's internal call cannot erase it."""
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        populate_model_registry()
+        entry = dict(MODEL_REGISTRY["sense_bridge_patchgan"])
+        # Plant into the NESTED capability -- since #1916 that is the only
+        # declaration surface, and a top-level key here would be ignored,
+        # making this plant vacuous (it would assert on an unaware critic).
+        entry["capabilities"] = replace(entry["capabilities"], supports_contrast_conditioning=True)
+        name = "_test_contrast_aware_critic"
+        MODEL_REGISTRY[name] = entry
+        try:
+            r = self._check(self._settings(critic=name))
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+        assert r.passed and r.severity == "info", r.message
+        assert name in r.message
+
+    def test_the_check_runs_inside_the_real_ladder(self) -> None:
+        """Wired behaviourally rather than by pinning source text: a
+        ``getsource`` substring is satisfiable by a comment, so it cannot tell
+        a called check from a mentioned one."""
+        report = ConfigHealthChecker().run_all_checks(
+            self._settings(critic="sense_bridge_patchgan")
+        )
+        named = [r for r in report.results if r.check_name == "multi_contrast_model_support"]
+        assert named, "check did not run inside run_all_checks"
+        assert not named[0].passed
+
+    @staticmethod
+    def _plant_critic(name: str, *, contrast_aware: bool) -> None:
+        """Copy a real discriminator entry under ``name``.
+
+        The copy is shallow, so it keeps the original ``role`` -- the key
+        ``_contrast_aware_critics`` now counts on (#1916 replaced its
+        ``IDiscriminator``/module-path union with the declared role). A plant
+        the census cannot tell from a genuine registration.
+        """
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        populate_model_registry()
+        entry = dict(MODEL_REGISTRY["sense_bridge_patchgan"])
+        entry["capabilities"] = replace(
+            entry["capabilities"], supports_contrast_conditioning=contrast_aware
+        )
+        MODEL_REGISTRY[name] = entry
+
+    def test_the_hint_names_a_contrast_aware_critic_when_one_exists(self) -> None:
+        """PLANT (shape 7): the hint's advice must track the registry.
+
+        With a conditioned critic registered, telling the user "there is no
+        drop-in replacement" is false -- and a hard-coded sentence cannot know.
+        """
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        name = "_test_hint_aware_critic"
+        self._plant_critic(name, contrast_aware=True)
+        try:
+            r = self._check(self._settings(critic="sense_bridge_patchgan"))
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+        assert not r.passed
+        assert name in r.fix_hint, r.fix_hint
+        assert "no registered discriminator declares" not in r.fix_hint
+
+    def test_the_denominator_is_counted_not_quoted(self) -> None:
+        """PLANT (shape 8): registering one more critic must move the count.
+
+        This is the assertion a constant cannot satisfy. The published number
+        was ``0 of 21`` while no registry held 21 -- it matched neither
+        ``MODEL_REGISTRY`` (14 discriminator names) nor ``ModelFactory``'s
+        separate registry (13). Pinning the *literal* would have re-frozen the
+        same defect, so pin the *delta* instead.
+
+        The test owns its own baseline. The ``(0 of N)`` sentence only renders
+        while **no** critic declares the flag; half 2 of #1931 registers one,
+        at which point the hint takes the ``available: [...]`` branch. Left
+        alone this test would then fail saying the census did not run -- false,
+        and misleading to whoever lands half 2 -- so it clears the flag on any
+        aware critic first and restores it in ``finally``.
+        """
+        import re
+
+        from spectramr.infrastructure.validation.config_health_checker import (
+            _contrast_aware_critics,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        def denominator(text: str | None) -> int:
+            assert text, "check produced no fix_hint at all (did the critic leg run?)"
+            m = re.search(r"\(0 of (\d+) discriminator names\)", text)
+            assert m, f"hint did not report a census: {text}"
+            return int(m.group(1))
+
+        populate_model_registry()
+        census = _contrast_aware_critics(MODEL_REGISTRY)
+        saved = {n: MODEL_REGISTRY[n] for n in census[0]}
+        for n, entry in saved.items():
+            MODEL_REGISTRY[n] = {
+                **entry,
+                "capabilities": replace(
+                    entry["capabilities"], supports_contrast_conditioning=False
+                ),
+            }
+
+        name = "_test_extra_unconditioned_critic"
+        try:
+            before = denominator(
+                self._check(self._settings(critic="sense_bridge_patchgan")).fix_hint
+            )
+            self._plant_critic(name, contrast_aware=False)
+            after = denominator(
+                self._check(self._settings(critic="sense_bridge_patchgan")).fix_hint
+            )
+        finally:
+            MODEL_REGISTRY.pop(name, None)
+            MODEL_REGISTRY.update(saved)
+        assert after == before + 1, f"{before} -> {after}: the count is not being recomputed"
+
+    @staticmethod
+    def _cycle_bloch(cycle_bloch: dict[str, Any]) -> Any:
+        from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
+        from spectramr.config.settings import TrainingSettings
+
+        return TrainingSettings.settings_from_dict(
+            {
+                "config_version": CANONICAL_CONFIG_VERSION,
+                "model": {"model_type": "unet"},
+                "data": {
+                    "dataset_type": "nifti_paired",
+                    "multi_contrast": {"enabled": True, "contrast_map": {"T2w": 0}},
+                },
+                "training": {
+                    "training_mode": "cycle_bloch",
+                    "strategy_class": "spectramr.infrastructure.training.strategies."
+                    "cycle_bloch_strategy.CycleBlochStrategy",
+                    "cycle_bloch": cycle_bloch,
+                },
+                "optimization": {},
+                "logging": {},
+            }
+        )
+
+    def test_a_strategy_that_renders_per_contrast_is_the_consumer(self) -> None:
+        """The CycleBloch sequence table reads contrast_idx in its physics; the
+        unconditioned generator never receives it, so nothing is dropped."""
+        r = self._check(
+            self._cycle_bloch(
+                {
+                    "backward_model": "ulf_forward",
+                    "tissue_field_tesla": 3.0,
+                    "sequences": {"T2w": {"tr_ms": 2000.0, "te_ms": 194.8, "flip_deg": 90.0}},
+                }
+            )
+        )
+        assert r.passed and "CycleBlochStrategy" in r.message
+
+    def test_the_same_strategy_without_a_table_is_still_rejected(self) -> None:
+        """PLANT: the exemption is the declared table, not the strategy class."""
+        r = self._check(
+            self._cycle_bloch(
+                {
+                    "backward_model": "ulf_forward",
+                    "tissue_field_tesla": 3.0,
+                    "ulf_tr_ms": 2000.0,
+                    "ulf_te_ms": 194.8,
+                    "ulf_flip_deg": 90.0,
+                }
+            )
+        )
+        assert not r.passed and r.severity == "error"
+
+
+class TestNoAllZeroReconstructionWeightWarning:
+    """``check_loss_weights`` was deleted in #1927. It warned "All major
+    reconstruction weights (L1, L2, Perceptual, SSIM) are 0.0!" by reading only
+    the legacy ``losses.reconstruction.lambda_*`` surface.
+
+    Two measurements condemned it:
+
+    * **It fired on 0 of 660 corpus arms.** ``lambda_l1`` and
+      ``lambda_perceptual`` both default to ``10.0``, so the all-zero condition
+      needs an author to write every lambda to zero by hand, and none does.
+    * **When it did fire, it was wrong.** Declaring the objective through
+      ``losses.image_losses`` while writing every legacy reconstruction lambda
+      to ``0.0`` is a legal config with a real objective — and it is exactly
+      the shape the check calls "no objective". Severity was ``warning`` and
+      ``audit`` is ``--strict`` by default (non-negotiable 4), so such an arm
+      would have failed its own pre-flight.
+
+    Note what the second bullet does **not** claim. A completed domain-list
+    migration does not produce that shape:
+    ``scripts/migrations/migrate_loss_lambdas_to_domain_lists.py`` **removes**
+    the legacy line rather than zeroing it (``lambda_perceptual`` is the one
+    unconditional ``DENY`` entry it keeps as written), and a removed key
+    resolves to the schema default ``10.0``. Measured on the corpus: all 60
+    migrated ``kspace_filling`` arms carry ``lambda_l1`` **absent**, so a
+    migrated arm cannot satisfy the all-zero condition at all. The check was
+    *silent* on the 506 domain-only arms, not wrong about them; reaching the
+    wrong state takes a hand-written all-zero legacy surface, which is what
+    the first test below builds.
+
+    So the check's only two states were *silent* and *wrong*. The
+    "does this arm have an objective at all?" invariant is real but has no
+    owner in the config layer, which cannot see what a strategy computes
+    inline; it is tracked against the ``inline_losses`` declaration work
+    (#1918).
+
+    The first test pins the emitted behaviour and stays meaningful whatever
+    mechanism a future author reaches for; the second is the tombstone.
+    """
+
+    @staticmethod
+    def _arm_with_objective_and_zeroed_legacy_lambdas() -> Any:
+        """An arm whose objective is declared ONLY through ``image_losses``,
+        with every legacy reconstruction lambda hand-written to ``0.0``.
+
+        This is *not* what the domain-list migration emits — that script
+        deletes the legacy lines, and a deleted key defaults back to ``10.0``.
+        It is the hand-written shape that made the deleted check fire.
+        """
+        import pathlib
+        import tempfile
+
+        import yaml
+
+        from spectramr.config.settings import TrainingSettings
+
+        src = require_repo_file(
+            "experiments/inprogress/kspace_filling/experiment_11_sense_bridge_critic.yaml"
+        )
+        raw = yaml.safe_load(src.read_text())
+        losses = raw.setdefault("losses", {})
+        losses["image_losses"] = [{"name": "l1", "weight": 1.0}]
+        recon = losses.setdefault("reconstruction", {})
+        # Every lambda the deleted check read, including its k-space escape hatch.
+        for field in (
+            "lambda_l1",
+            "lambda_l2",
+            "lambda_perceptual",
+            "lambda_ssim",
+            "lambda_complex_l1",
+            "lambda_complex_mse",
+            "lambda_sobolev_kspace",
+            "lambda_log_spectral",
+            "lambda_sense_adjoint_l1",
+            "lambda_kspace",
+            "lambda_frequency_domain",
+        ):
+            recon[field] = 0.0
+        tmp = pathlib.Path(tempfile.mkdtemp()) / "arm.yaml"
+        tmp.write_text(yaml.safe_dump(raw))
+        settings = TrainingSettings.from_yaml(str(tmp))
+        # The plant must survive the load: a resolved config is not a read
+        # config, and a silently-defaulted lambda would make this vacuous.
+        assert settings.losses.reconstruction.lambda_l1 == 0.0
+        assert settings.losses.reconstruction.lambda_perceptual == 0.0
+        assert [c.name for c in settings.losses.image_losses] == ["l1"]
+        return settings
+
+    def test_zeroed_legacy_surface_with_a_domain_objective_is_not_warned(self) -> None:
+        settings = self._arm_with_objective_and_zeroed_legacy_lambdas()
+        report = ConfigHealthChecker().run_all_checks(settings)
+        offenders = [
+            r
+            for r in report.results
+            if not r.passed and "major reconstruction weights" in (r.message or "")
+        ]
+        assert not offenders, (
+            "an arm declaring losses.image_losses=[l1] with the legacy "
+            "reconstruction lambdas zeroed HAS an objective; warning about it "
+            f"fails the arm's own --strict audit (NN4). Got: "
+            f"{[(r.check_name, r.severity, r.message) for r in offenders]}"
+        )
+
+    def test_the_deleted_check_is_not_resurrected(self) -> None:
+        assert not hasattr(ConfigHealthChecker, "check_loss_weights"), (
+            "check_loss_weights is back. It cannot answer 'does this arm have "
+            "an objective' from config alone — 25 of 34 empty-weight-table arms "
+            "declare inline_losses=frozenset() and 9 leave it None (undeclared), "
+            "so a config-layer re-base false-positives on all 34. The invariant "
+            "belongs with the strategy-side declaration work (#1918)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# reveal_attribution's preconditions live in three different top-level blocks.
+#
+# The schema validator sees only inside `validation.sampling`, so it catches the
+# sampler requirement and nothing else. Reverse mode is in `model`, the mask
+# family in `undersampling`, the domain in `model` again -- and this layer is
+# the one that may read all of them at once. Without it the arm audits clean,
+# trains, and raises at its FIRST validation; and because every failure here is
+# architecture-determined rather than data-dependent, EVERY batch raises,
+# `val_count` reaches 0, and the F36 guard escalates it to a run-level error.
+# ---------------------------------------------------------------------------
+
+
+class TestRevealAttributionPreconditions:
+    @staticmethod
+    def _cfg(
+        *,
+        reveal: bool = True,
+        mode: str | None = "replace_freeze_dc",
+        accel_type: str = "density_nested",
+        direction: str | None = "phase",
+        target_domain: str = "kspace",
+    ) -> Any:
+        kwargs: dict[str, Any] = {}
+        if mode is not None:
+            kwargs["reverse_sampling_mode"] = mode
+        # `model_type` and `data.dataset_type` are what `infer_output_domain`
+        # reads; a stub without them resolves to image and fires the domain
+        # branch on every case, which is how this helper first hid its own bug.
+        return SimpleNamespace(
+            validation=SimpleNamespace(sampling=SimpleNamespace(reveal_attribution=reveal)),
+            model=SimpleNamespace(
+                model_kwargs=kwargs,
+                model_type="kspace_cold_diffusion",
+                input_type="kspace",
+                target_domain=target_domain,
+            ),
+            data=SimpleNamespace(dataset_type="kspace"),
+            undersampling=SimpleNamespace(
+                acceleration_type=accel_type, mask_direction=direction
+            ),
+        )
+
+    def _run(self, cfg):
+        return ConfigHealthChecker().check_reveal_attribution_preconditions(cfg)
+
+    def test_off_is_not_this_check_s_business(self):
+        assert self._run(self._cfg(reveal=False)).passed
+
+    def test_a_well_formed_arm_passes(self):
+        assert self._run(self._cfg()).passed
+
+    def test_additive_is_refused(self):
+        """It rewrites the whole plane every step, so no step wrote a given bin."""
+        result = self._run(self._cfg(mode="additive"))
+        assert not result.passed
+        assert "reverse_sampling_mode" in result.message
+
+    def test_an_omitted_mode_is_refused_because_the_default_is_additive(self):
+        """The trap: an arm that says nothing gets the mode that cannot partition."""
+        result = self._run(self._cfg(mode=None))
+        assert not result.passed
+        assert "constructor default" in result.message
+
+    @pytest.mark.parametrize(
+        "family", ["poisson_disk", "variable_density_2d_gaussian", "radial", "spiral"]
+    )
+    def test_a_point_pattern_or_trajectory_is_refused(self, family):
+        result = self._run(self._cfg(accel_type=family))
+        assert not result.passed
+        assert "band of lines" in result.message
+
+    def test_a_direction_dependent_family_needs_its_direction(self):
+        """`density_nested` is line-structured only once mask_direction is set."""
+        assert self._run(self._cfg(direction=None)).passed is False
+        assert self._run(self._cfg(direction="phase")).passed is True
+
+    def test_an_image_domain_arm_is_refused(self):
+        """The band selector is a k-space line mask; on an image-domain arm it
+        would select image PIXELS and return a plausible number."""
+        result = self._run(self._cfg(target_domain="image"))
+        assert not result.passed
+        assert "image space" in result.message
+
+    def test_every_problem_is_reported_not_just_the_first(self):
+        """An arm with three wrong declarations should learn all three at once."""
+        result = self._run(self._cfg(mode="additive", accel_type="poisson_disk"))
+        assert not result.passed
+        assert "reverse_sampling_mode" in result.message
+        assert "band of lines" in result.message
+
+    def test_the_check_is_registered_in_run_all_checks(self):
+        """A check nobody calls is the non-negotiable-16 facade."""
+        import inspect
+
+        src = inspect.getsource(ConfigHealthChecker.run_all_checks)
+        assert "check_reveal_attribution_preconditions" in src
+
+
+def _cold_arm(**model_kwargs):
+    return SimpleNamespace(
+        model=SimpleNamespace(model_type="kspace_cold_diffusion", model_kwargs=model_kwargs)
+    )
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [
+        {"reverse_sampling_mode": "bogus"},
+        {"reverse_sampling_mode": "replace_freeze_dc", "reverse_refine_alpha": 0.5},
+        {"reverse_sampling_mode": "reveal_refine_dc"},
+        {"reverse_sampling_mode": "reveal_refine_dc", "reverse_refine_alpha": 1.5},
+        {"reverse_sampling_mode": "additive_normalized", "reverse_integrity_check": "warn"},
+        {"reverse_integrity_check": True},
+        {"reverse_sampling_mode": "support_ordered_dc"},
+        {"reverse_sampling_mode": "support_ordered_dc", "reverse_support_radius": 0},
+        {"reverse_sampling_mode": "replace_freeze_dc", "reverse_support_radius": 2},
+        {"reverse_sampling_mode": "replace_freeze_dc", "reverse_decay_envelope": "global"},
+        {"reverse_sampling_mode": "replace_freeze_dc", "reverse_projection": "grappa"},
+        {"reverse_sampling_mode": "additive", "reverse_projection": "spirit"},
+        {"reverse_sampling_mode": "replace_freeze", "reverse_decay_envelope": "per_sample"},
+        {
+            "reverse_sampling_mode": "replace_freeze_dc",
+            "reverse_dc_trust": "fitted_decay",
+            "reverse_decay_envelope": "per_sample",
+        },
+        {
+            "reverse_sampling_mode": "replace_freeze_dc",
+            "dc_method": "noise_adaptive",
+            "reverse_dc_trust": "fitted_decay",
+        },
+        {"timestep_embedding_scale": "horizon_bnd"},
+        {"timestep_embedding_scale": ""},
+        {"reverse_sampling_mode": "additive", "reverse_clip_ratio": 1.3},
+        {"reverse_clip_ratio": 1.3},
+        {"reverse_sampling_mode": "replace_freeze", "dc_method": "soft"},
+    ],
+)
+def test_reverse_sampling_declaration_refuses_planted_shapes(model_kwargs):
+    """Each shape the generator refuses at build is refused at load too."""
+    result = ConfigHealthChecker().check_reverse_sampling_declaration(_cold_arm(**model_kwargs))
+    assert not result.passed and result.severity == "error"
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [
+        {"reverse_sampling_mode": "replace_freeze_dc"},
+        {"reverse_sampling_mode": "reveal_refine_dc", "reverse_refine_alpha": 0.5},
+        {"reverse_sampling_mode": "additive_normalized", "reverse_integrity_check": "raise"},
+        {"reverse_integrity_check": "off"},
+        {},
+        {"reverse_sampling_mode": "support_ordered_dc", "reverse_support_radius": 3},
+        {"reverse_sampling_mode": "replace_freeze_dc", "reverse_projection": "joint_tv"},
+        {
+            "reverse_sampling_mode": "additive_normalized",
+            "dc_method": "noise_adaptive",
+            "reverse_decay_envelope": "batch_pooled",
+            "reverse_dc_trust": "fitted_decay",
+        },
+        {"timestep_embedding_scale": "unit_interval"},
+        {"timestep_embedding_scale": "integer"},
+        {"timestep_embedding_scale": "horizon_band"},
+        {"reverse_clip_ratio": 1.3, "reverse_integrity_check": "raise"},
+    ],
+)
+def test_reverse_sampling_declaration_accepts_legal_pairs(model_kwargs):
+    assert ConfigHealthChecker().check_reverse_sampling_declaration(_cold_arm(**model_kwargs)).passed
+
+
+def test_reverse_sampling_declaration_ignores_other_models():
+    config = SimpleNamespace(
+        model=SimpleNamespace(model_type="unet", model_kwargs={"reverse_sampling_mode": "bogus"})
+    )
+    assert ConfigHealthChecker().check_reverse_sampling_declaration(config).passed
+
+
+class TestALossThatAppliesTheForwardOperatorIsBridged:
+    """SSDU scores ``F S x_hat`` from an IMAGE prediction, so an image-output arm
+    lists it under ``kspace_losses`` with nothing in front. The check used to need
+    a ``pre_loss_pred`` adapter declaration that no strategy ever applied (#1777)."""
+
+    @staticmethod
+    def _losses(name: str):
+        from spectramr.config.schemas.loss import LossConfigSchema
+
+        return SimpleNamespace(
+            losses=LossConfigSchema(
+                kspace_losses=[{"name": name, "weight": 1.0}],
+                policy={"output_domain": "image"},
+            ),
+            adapters=None,
+        )
+
+    def test_the_ssdu_losses_declare_it(self) -> None:
+        from spectramr.infrastructure.validation.config_health_checker import (
+            _applies_forward_operator,
+        )
+
+        assert _applies_forward_operator("ssdu")
+        assert _applies_forward_operator("multi_mask_ssdu")
+        assert not _applies_forward_operator("masked_kspace_l2")
+        assert not _applies_forward_operator("not_a_registered_loss")
+
+    def test_ssdu_on_an_image_output_arm_passes(self) -> None:
+        checker = ConfigHealthChecker.__new__(ConfigHealthChecker)
+        results = checker.check_loss_domain_consistency(self._losses("ssdu"))
+        assert all(r.passed for r in results), [r.message for r in results]
+
+    def test_a_kspace_loss_that_does_not_is_still_an_error(self) -> None:
+        """The planted violation: an undeclared k-space loss on image output."""
+        checker = ConfigHealthChecker.__new__(ConfigHealthChecker)
+        results = checker.check_loss_domain_consistency(self._losses("masked_kspace_l2"))
+        assert any(not r.passed and r.severity == "error" for r in results)
+
+
+class TestMaskDirectionAxisDeclared:
+    """``mask_direction: phase`` needs ``data.acquisition`` at audit, not hours in (#2160)."""
+
+    @staticmethod
+    def _check(direction, axis):
+        acquisition = None if axis is None else SimpleNamespace(phase_encode_axis=axis)
+        config = SimpleNamespace(
+            undersampling=SimpleNamespace(mask_direction=direction),
+            data=SimpleNamespace(acquisition=acquisition),
+        )
+        return ConfigHealthChecker.__new__(ConfigHealthChecker).check_mask_direction_axis_declared(
+            config
+        )
+
+    @pytest.mark.parametrize("direction", ["phase", "readout"])
+    def test_an_undeclared_axis_is_an_error(self, direction) -> None:
+        """PLANTED: every M4Raw/fastMRI line-mask arm before #2160."""
+        result = self._check(direction, None)
+        assert not result.passed and result.severity == "error"
+        assert "measure_phase_encode_axis" in result.message
+
+    @pytest.mark.parametrize(
+        ("direction", "axis", "line"), [("phase", -1, "'x'"), ("phase", -2, "'y'"), ("x", None, "'x'")]
+    )
+    def test_a_resolvable_direction_passes_and_names_the_axis(self, direction, axis, line) -> None:
+        result = self._check(direction, axis)
+        assert result.passed and f"line_axis={line}" in result.message
+
+    def test_no_direction_is_nothing_to_check(self) -> None:
+        assert self._check(None, None).passed
+
+    def test_it_runs_in_the_full_report(self) -> None:
+        import inspect
+
+        assert "check_mask_direction_axis_declared(config)" in inspect.getsource(
+            ConfigHealthChecker
+        )
+
+
+class TestMaskDirectionIsRead:
+    """``mask_direction`` on a bin-wise family at base 1 reaches no reader (#1082)."""
+
+    @staticmethod
+    def _check(family, base, direction="phase", model_type="kspace_cold_diffusion"):
+        accel = {
+            "acceleration_type": family,
+            "base_acceleration": base,
+            "max_acceleration": 8.0,
+            "center_fraction": 0.08,
+        }
+        if direction is not None:
+            accel["mask_direction"] = direction
+        doc = {
+            "model": {"model_type": model_type},
+            "undersampling": accel,
+            "training": {"diffusion": {"timesteps": 4}},
+        }
+        config = SimpleNamespace(
+            undersampling=SimpleNamespace(mask_direction=direction, base_acceleration=base),
+            model_dump=lambda mode=None: doc,
+        )
+        return ConfigHealthChecker.__new__(ConfigHealthChecker).check_mask_direction_is_read(
+            config
+        )
+
+    @pytest.mark.parametrize("family", ["random", "radial", "variable_density"])
+    def test_a_binwise_family_at_base_one_is_an_error(self, family) -> None:
+        """PLANTED: the kspace_filling random/radial/variable_density arms before #1082."""
+        result = self._check(family, 1.0)
+        assert not result.passed and result.severity == "error"
+        assert "read by nothing" in result.message
+
+    def test_the_loader_reads_it_above_base_one(self) -> None:
+        assert self._check("random", 2.0).passed
+
+    @pytest.mark.parametrize("family", ["density_nested", "equispaced"])
+    def test_a_line_family_reads_it(self, family) -> None:
+        assert self._check(family, 1.0).passed
+
+    def test_the_verdict_does_not_need_the_phase_encode_axis(self) -> None:
+        """The process is built with the direction removed, so an undeclared axis
+        (the other check's error) cannot hide or fake this one."""
+        assert not self._check("random", 1.0, direction="phase").passed
+        assert self._check("density_nested", 1.0, direction="readout").passed
+
+    def test_unset_and_non_diffusion_arms_pass(self) -> None:
+        assert self._check("random", 1.0, direction=None).passed
+        assert self._check("random", 1.0, model_type="unet").passed
+
+    def test_it_runs_in_the_full_report(self) -> None:
+        import inspect
+
+        assert "check_mask_direction_is_read(config)" in inspect.getsource(ConfigHealthChecker)
+
+
+class TestDistributionHeadIsNotAChannelMismatch:
+    """A ``[mean, logvar]`` head is exempt only when its STRATEGY declares it (planted both ways)."""
+
+    _HET = (
+        "spectramr.infrastructure.training.strategies.heteroscedastic_gan_strategy."
+        "HeteroscedasticGANStrategy"
+    )
+    _GAN = "spectramr.infrastructure.training.strategies.gan.GANTrainingStrategy"
+
+    def _config(self, strategy_class: str) -> Any:
+        config = _make_config(
+            dataset_type="nifti_paired",
+            in_channels=1,
+            out_channels=2,
+            model_type="swinir",
+            strategy_class=strategy_class,
+        )
+        config.metrics = SimpleNamespace(compute_fid=True)
+        return config
+
+    def test_a_plain_gan_with_two_output_channels_still_fails_both_checks(self) -> None:
+        checker = ConfigHealthChecker()
+        config = self._config(self._GAN)
+        assert any("out_channels=2 MISMATCHES" in r.message for r in _errors(checker.check_domain_alignment(config)))
+        assert _errors(checker.check_metric_channel_compatibility(config))
+
+    def test_a_declared_distribution_head_passes_both(self) -> None:
+        checker = ConfigHealthChecker()
+        config = self._config(self._HET)
+        assert not any("out_channels" in r.message for r in _errors(checker.check_domain_alignment(config)))
+        assert _errors(checker.check_metric_channel_compatibility(config)) == []
+
+
+class TestLevyDenoiserWidensTheInput:
+    """`training.levy_denoising` feeds [y, x_t, log sigma_t]: loaded + out + 1 channels."""
+
+    @staticmethod
+    def _cfg(in_channels: int, *, levy: bool):
+        from spectramr.config.schemas.training.levy_denoising import (
+            LevyDenoisingTrainingConfigSchema,
+        )
+
+        return SimpleNamespace(
+            model=SimpleNamespace(
+                model_type="hermitian_fno", in_channels=in_channels, out_channels=1, model_kwargs={}
+            ),
+            data=SimpleNamespace(
+                dataset_type="nifti_paired",
+                coils=SimpleNamespace(processing_mode="rss", num_virtual_coils=None),
+                pairing=SimpleNamespace(single_contrast=True),
+                multi_contrast=SimpleNamespace(enabled=False),
+                domain=SimpleNamespace(target_channels=None),
+            ),
+            training=SimpleNamespace(
+                diffusion=None,
+                levy_denoising=LevyDenoisingTrainingConfigSchema(alpha=1.7) if levy else None,
+            ),
+            physics=None,
+        )
+
+    def test_three_input_channels_pass_with_the_denoiser(self) -> None:
+        results = ConfigHealthChecker().check_domain_alignment(self._cfg(3, levy=True))
+        assert _errors(results) == []
+        assert any("levy_denoising" in r.message for r in results)
+
+    def test_one_input_channel_fails_with_the_denoiser(self) -> None:
+        """Planted violation: the loader width alone, with the denoiser declared."""
+        results = ConfigHealthChecker().check_domain_alignment(self._cfg(1, levy=True))
+        assert [r.check_name for r in _errors(results)] == ["domain_alignment"]
+
+    def test_three_input_channels_fail_without_the_denoiser(self) -> None:
+        """Planted violation: the widened input with no block that widens it."""
+        results = ConfigHealthChecker().check_domain_alignment(self._cfg(3, levy=False))
+        assert [r.check_name for r in _errors(results)] == ["domain_alignment"]

@@ -39,11 +39,11 @@ from torch import nn
 
 from spectramr.models.registry import register_model
 
-# Import the interface
-try:
-    from spectramr.models.interfaces import IDiscriminator
-except ImportError:
-    IDiscriminator = nn.Module  # Fallback for compatibility
+# Imported hard. Under `except ImportError: IDiscriminator = nn.Module` the class
+# below silently changed base depending on whether a first-party import resolved --
+# present meant "not an nn.Module", absent meant "is one" -- so the same source
+# defined two different types and nothing reported which one you got (NN3, NN18).
+from spectramr.models.interfaces import IDiscriminator
 
 # Import PatchGAN as backbone
 try:
@@ -52,8 +52,12 @@ except ImportError:
     PatchGANDiscriminator = None
 
 
-@register_model(name="realesrgan_discriminator", training_mode="gan")
-class RealESRGANDiscriminator(IDiscriminator):
+# Real-ESRGAN's UNetDiscriminatorSN backbone -- a natural-image super-resolution critic
+# operating on real-valued magnitude images. No internal transform.
+@register_model(
+    role="discriminator", name="realesrgan_discriminator", training_mode="gan", input_domain="image"
+)
+class RealESRGANDiscriminator(IDiscriminator, nn.Module):
     """Thin wrapper around Real-ESRGAN's UNetDiscriminatorSN to adapt output
     to a scalar per-sample score compatible with existing training code.
 

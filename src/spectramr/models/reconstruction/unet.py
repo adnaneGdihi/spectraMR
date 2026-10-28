@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any
 
@@ -19,10 +19,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.infrastructure.physics.dc_settings import DC_SSOT_KEYS
 from spectramr.models.blocks.attention import CBAMSpatialAttention as SpatialAttention
 from spectramr.models.blocks.attention import ChannelAttention
 from spectramr.models.blocks.base import BaseGANBlock
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
+from spectramr.models.blocks.dense_skip import DenseSkipConnection
+from spectramr.models.blocks.embeddings import KANTimeEmbedding
 from spectramr.models.blocks.normalization import get_adaptive_groups
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.interfaces import IGenerator, LatentAccessMixin
 from spectramr.models.registry import register_model
 
@@ -40,6 +45,8 @@ class AttentionType(Enum):
     WAVELET_FREQ = "wavelet_freq"
     KERNELIZED = "kernelized"
     SPARSE = "sparse"
+    NULL_SPACE_DUAL_DOMAIN = "null_space_dual_domain"
+    HERMITIAN_NULL_SPACE = "hermitian_null_space"
 
 
 class NormalizationType(Enum):
@@ -167,6 +174,51 @@ class UNetConfig:
     output_activation: nn.Module | None = None
     time_dim: int | None = None
     z_dim: int | None = None  # Added for compatibility with ModelFactory injection
+    # Diffusion-denoiser options (the former EnhancedDeepDiffusionUNet); all default to off.
+    model_channels: int | None = None
+    channel_mult: tuple[int, ...] | None = None  # widths = model_channels * mult; sets depth
+    time_embedding_type: str = "sinusoidal"
+    num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS
+    learned_input_scale: bool = False  # chi-square variant: one learned scalar on the input
+    use_dense_skip: bool = False
+
+
+_TIME_EMBEDDING_TYPES = ("sinusoidal", "kan")
+
+
+def _refuse_unhonoured_features(declared: Any, config: UNetConfig) -> None:
+    """Raise when a declared ``features`` is not the width the network is about to build.
+
+    An int is the first-level width, doubling per level; a sequence is the widths themselves.
+    The builder always forwards ``features``, so a value equal to what is built is accepted.
+    """
+    if declared is None:
+        return
+    built = tuple(config.features[: config.depth + 1])
+    if isinstance(declared, int):
+        declared_widths = tuple(declared * 2**i for i in range(len(built)))
+    else:
+        declared_widths = tuple(declared)
+    if declared_widths != built:
+        raise ValueError(
+            f"features={declared!r} is not honoured: this UNet builds widths {built} "
+            "(set channel_mult/model_channels, or remove the key)."
+        )
+
+
+def _resolve_channel_mult(config: UNetConfig) -> UNetConfig:
+    """Turn ``model_channels`` x ``channel_mult`` into ``features``/``depth`` and a 4x time width."""
+    if config.channel_mult is None:
+        return config
+    if config.model_channels is None:
+        raise ValueError("channel_mult needs model_channels.")
+    features = tuple(config.model_channels * m for m in config.channel_mult)
+    return replace(
+        config,
+        features=features,
+        depth=len(features) - 1,
+        time_dim=config.time_dim if config.time_dim is not None else 4 * config.model_channels,
+    )
 
 
 class ConfigurableResidualBlock(BaseGANBlock):
@@ -373,7 +425,10 @@ class TimeAwareSequential(nn.Sequential):
             torch.Tensor: Description.
         """
         for module in self:
-            if isinstance(module, (ConfigurableResidualBlock, TimeInjectionBlock)):
+            if isinstance(
+                module,
+                (ConfigurableResidualBlock, TimeInjectionBlock, DenseSkipConnection, TimeAwareSequential),
+            ):
                 x = module(x, emb)
             else:
                 x = module(x)
@@ -416,10 +471,11 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
         """
         super().__init__()
 
+        declared_features = None
         if config is None:
             # Pop keys not in UNetConfig but passed by builder or diffusion wrappers
             kwargs.pop("acceleration_config", None)
-            kwargs.pop("features", None)
+            declared_features = kwargs.pop("features", None)
             kwargs.pop("base_channels", None)
             kwargs.pop("channel_multipliers", None)
             kwargs.pop("num_res_blocks", None)
@@ -428,14 +484,20 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             kwargs.pop("feature_dim", None)
             kwargs.pop("max_features", None)
             kwargs.pop("num_residual_blocks", None)
-            kwargs.pop("use_dc", None)
-            kwargs.pop("dc_method", None)
-            kwargs.pop("dc_weight", None)
+            # ``physics.data_consistency`` is forwarded into every **kwargs
+            # generator by ``generator_kwargs`` step 3c, unconditionally — the
+            # block is always present (schema default) and step 3c does not
+            # consult ``enabled``. UNet builds no DC layer, so it discards the
+            # whole set. Derive it from DC_SSOT_KEYS rather than restating it:
+            # a hand-copied subset is what broke here when the table grew the
+            # three noise keys and this list did not (non-negotiable 17).
+            for _dc_kwarg, _dc_field in DC_SSOT_KEYS:
+                kwargs.pop(_dc_kwarg, None)
             # Top-level model.* fields auto-forwarded by GeneratorBuilder.build()
             # since the May 2026 spec-card refactor — UNetConfig doesn't know
             # about them and the strict TypeError below otherwise breaks every
-            # ``standard_unet`` arm. Keep this pop-list aligned with the
-            # ``_SKIP`` set in src/infrastructure/builders/leaf/model_builders.py.
+            # ``standard_unet`` arm. Their owner is ``SKIP_MODEL_FIELDS`` in
+            # src/spectramr/infrastructure/builders/generator_contract.py.
             kwargs.pop("spatial_dims", None)
             kwargs.pop("input_type", None)
             kwargs.pop("output_type", None)
@@ -466,6 +528,15 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
                         f"Unexpected keyword argument '{key}' for UNetConfig",
                     )
             config = UNetConfig(**kwargs)
+        config = _resolve_channel_mult(config)
+        _refuse_unhonoured_features(declared_features, config)
+        if config.time_embedding_type not in _TIME_EMBEDDING_TYPES:
+            raise ValueError(
+                f"Unknown time_embedding_type {config.time_embedding_type!r}; "
+                f"valid: {_TIME_EMBEDDING_TYPES}"
+            )
+        if config.use_dense_skip and config.time_dim is None:
+            raise ValueError("use_dense_skip needs a time_dim (it is time-conditioned).")
         self.config = config
 
         assert isinstance(config.in_channels, int) and config.in_channels > 0
@@ -498,7 +569,9 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
         )
 
         # Time embedding MLP
-        if self.time_dim is not None:
+        if self.time_dim is not None and config.time_embedding_type == "kan":
+            self.time_mlp = KANTimeEmbedding(self.time_dim, config.num_timesteps)
+        elif self.time_dim is not None:
             self.time_mlp = nn.Sequential(
                 SinusoidalPositionEmbeddings(self.time_dim),
                 nn.Linear(self.time_dim, self.time_dim * 4),
@@ -507,6 +580,7 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             )
         else:
             self.time_mlp = None
+        self.noise_scale = nn.Parameter(torch.tensor(0.5)) if config.learned_input_scale else None
 
         # Generate descriptive name based on configuration
         name_parts = ["ConfigurableUNet"]
@@ -664,7 +738,14 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
                 ],
             )
 
+        if self.config.use_dense_skip:
+            layers.append(self._dense_skip(out_channels))
         return TimeAwareSequential(*layers)
+
+    def _dense_skip(self, channels: int) -> DenseSkipConnection:
+        return DenseSkipConnection(
+            channels, max(channels // 4, 1), 2, self.time_dim, self.config.dropout
+        )
 
     def _make_decoder_block(
         self,
@@ -742,8 +823,9 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             )
             conv_body = TimeAwareSequential(*conv_body_layers)
 
+        dense = [self._dense_skip(out_channels)] if self.config.use_dense_skip else []
         conv_block = TimeAwareSequential(*reduction_layers, conv_body)
-        return TimeAwareSequential(up, conv_block)
+        return TimeAwareSequential(up, conv_block, *dense)
 
     def _get_norm_layer(self, channels: int) -> nn.Module:
         """Get normalization layer based on type."""
@@ -788,6 +870,8 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
     def forward(
         self,
         x: torch.Tensor,
+        timesteps: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
         *,
         encoder_state: dict[str, torch.Tensor] | None = None,
         encoder_feature_maps: Iterable[torch.Tensor] | None = None,
@@ -827,6 +911,11 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
 
+        del cond  # accepted for the diffusion call signature (x, timesteps, cond)
+        if time is None:
+            time = timesteps
+        if self.noise_scale is not None:
+            x = x * self.noise_scale
         input_tensor = x
         input_height, input_width = input_tensor.shape[-2:]
 
@@ -836,10 +925,9 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             t_emb = self.time_mlp(time)
 
         # Contrast conditioning: additively fuse contrast embedding into time embedding for DECODER
-        contrast_emb = _kwargs.get("contrast_emb")
-        combined_emb = t_emb
-        if contrast_emb is not None:
-            combined_emb = (t_emb + contrast_emb) if t_emb is not None else contrast_emb
+        combined_emb = fuse_contrast_embedding(
+            t_emb, _kwargs.get("contrast_emb"), owner=type(self).__name__
+        )
 
         if encoder_state is not None:
             if encoder_feature_maps is None:

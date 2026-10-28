@@ -11,10 +11,42 @@ disables it locally.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 from torch import nn
+
+_logger = logging.getLogger(__name__)
+
+
+def _gather_samples_across_ranks(x_flat: torch.Tensor) -> torch.Tensor:
+    """Make every rank fit the grid to the same sample set.
+
+    ``update_grid_from_samples`` re-fits knots AND solves least-squares for the
+    matching coefficients. Run per-rank on a ``DistributedSampler`` shard, each
+    rank solves a different (grid, coefficient) pair; DDP then broadcasts
+    ``grid`` -- a persistent buffer -- from rank 0 while ``spline_weight`` is a
+    parameter that is not re-broadcast, so the pair that was solved together is
+    split apart and the gate function every rank evaluates is one nobody fitted.
+
+    Gathering here rather than broadcasting the result keeps the fit
+    deterministic and identical on every rank without depending on which rank
+    happens to be authoritative. Ranks are truncated to the global minimum count
+    so the all-gather is shape-safe.
+    """
+    dist = torch.distributed
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() < 2:
+        return x_flat
+    counts = torch.tensor([x_flat.shape[0]], device=x_flat.device)
+    dist.all_reduce(counts, op=dist.ReduceOp.MIN)
+    n = int(counts.item())
+    if n == 0:
+        return x_flat
+    local = x_flat[:n].contiguous()
+    buckets = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(buckets, local)
+    return torch.cat(buckets, dim=0)
 
 
 class KANLayer(nn.Module):
@@ -173,6 +205,7 @@ class KANLayer(nn.Module):
             x = x.to(self.spline_weight.device)
         # Flatten leading dims to a single sample axis.
         x_flat = x.reshape(-1, self.in_dim).float()
+        x_flat = _gather_samples_across_ranks(x_flat)
         if x_flat.shape[0] < self.grid_size + self.spline_order + 1:
             # Not enough samples to fit a useful grid — refuse silently
             # rather than producing a degenerate spline. Caller can detect
@@ -246,6 +279,17 @@ class KANLayer(nn.Module):
             return
 
         new_W = W_flat.T.reshape(self.out_dim, D, C).contiguous()
+        # CUDA lstsq is QR-only ('gels', full rank assumed) and returns NaN/Inf rather
+        # than raising when tied quantile knots make A rank-deficient, which the
+        # ``except`` above cannot see. A non-finite fit would NaN every later forward.
+        if not bool(torch.isfinite(new_W).all()):
+            self.grid.copy_(old_grid)
+            self._collected_samples.clear()
+            _logger.warning(
+                "[KANLayer] Grid refit produced a non-finite least-squares solution "
+                "(rank-deficient design matrix); keeping the previous grid and weights."
+            )
+            return
         # Replace spline_weight in-place to preserve optimizer state.
         self.spline_weight.data.copy_(new_W)
         # Buffer was consumed; clear it so the next collection cycle is fresh.

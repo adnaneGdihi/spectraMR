@@ -4,6 +4,7 @@ SSOT Pattern: All loss weighting and initialization centralized.
 """
 
 import logging
+from typing import Any
 
 import torch
 
@@ -22,15 +23,14 @@ class UnifiedMAELossComputer(BaseLossComputer):
     https://arxiv.org/abs/2111.06377
     """
 
-    def __init__(self, config, device: torch.device | str = "cpu"):
+    def __init__(self, config: Any, device: torch.device | str = "cpu"):
         """Initialize Unified MAE Loss Computer.
 
         Args:
             config: Configuration object with loss weights and settings.
             device: Device to place loss tensors on.
         """
-        super().__init__(config, device)
-        self._initialize_losses()
+        super().__init__(config, torch.device(device))
 
     def _initialize_losses(self) -> None:
         """Initialize loss components from config.
@@ -49,7 +49,7 @@ class UnifiedMAELossComputer(BaseLossComputer):
         target: torch.Tensor,
         epoch: int = 0,
         iteration: int = 0,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> LossOutput:
         """Standard compute method required by BaseLossComputer."""
         return self.compute_forward_loss(pred, target, **kwargs)
@@ -58,7 +58,7 @@ class UnifiedMAELossComputer(BaseLossComputer):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> LossOutput:
         """Compute MAE reconstruction loss (forward pass only, no backward).
 
@@ -103,12 +103,14 @@ class UnifiedMAELossComputer(BaseLossComputer):
             "l1_loss": weighted_l1,
         }
 
+        # Detached tensors, not ``float()``: two device syncs per step for a dict
+        # no training-path caller reads.
         return LossOutput(
             total=total_loss,
             components=components,
             metrics={
-                "reconstruction": float(mse_loss.detach()),
-                "l1": float(l1_loss.detach()),
+                "reconstruction": mse_loss.detach(),
+                "l1": l1_loss.detach(),
             },
         )
 
@@ -130,7 +132,7 @@ class UnifiedMAELossComputer(BaseLossComputer):
         """
         from spectramr.core.metrics.evaluation import EvaluationMetrics
 
-        eval_metrics = EvaluationMetrics(device=device, config=self.config)
+        eval_metrics = EvaluationMetrics(device=str(device), config=self.config)
         return eval_metrics.compute_all(pred, target)
 
 

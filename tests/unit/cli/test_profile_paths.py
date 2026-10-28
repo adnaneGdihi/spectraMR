@@ -141,6 +141,7 @@ def _manifest(tmp_path, **over):
         "config_path": CFG,
         "declared_output_dir": "experiments/results/exp_11",
         "device": "cuda",
+        "iterations": 100,
         "argv": ["python", "-m", "scalene", "run"],
         "scalene_version": "2.3.0",
     }
@@ -157,6 +158,7 @@ def test_manifest_records_every_mode(tmp_path):
         "mode": "cpu-only",
         "focus": "train-loop",
         "device": "cuda",
+        "iterations": 100,
     }
     assert m["scalene"]["mode_flags"] == ["--cpu-only"]
     assert m["scalene"]["profile_only"] == ["pipelines/training_loop.py"]
@@ -201,8 +203,8 @@ def test_manifest_provenance_is_fail_open(tmp_path, monkeypatch):
 def test_the_child_is_never_pointed_at_the_arms_real_results_dir(tmp_path):
     """The defect this fixed: `child_run_dir` used to BE `run_dir`.
 
-    A 300-iteration profiling run of experiment_11 wrote `checkpoints/`,
-    `checkpoint_best.pt`, metrics CSVs and TensorBoard events straight over the
+    A 300-iteration profiling run of experiment_11 wrote `checkpoints/`
+    (its best checkpoint among them), metrics CSVs and TensorBoard events straight over the
     arm's real results — and reported itself healthy while doing it.
     """
     paths = resolve_profile_paths("exp_11", "run-1", results_root=tmp_path / "results")
@@ -260,6 +262,7 @@ def test_manifest_records_where_the_child_actually_wrote(tmp_path):
         config_path=Path("a.yaml"),
         declared_output_dir="experiments/results/exp_11",
         device="cpu",
+        iterations=100,
         argv=["scalene"],
         scalene_version="2.3.0",
     )

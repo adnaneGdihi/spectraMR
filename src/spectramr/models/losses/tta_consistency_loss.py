@@ -27,6 +27,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -72,7 +74,7 @@ class TestTimeConsistencyLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
@@ -101,11 +103,9 @@ class TestTimeConsistencyLoss(nn.Module):
         while mask.dim() < y.dim():
             mask = mask.unsqueeze(0)
         mask = mask.to(y.real.dtype if y.is_complex() else y.dtype)
-        diff = (pred_k - y) * mask
-        if self.norm == "l1":
-            if diff.is_complex():
-                diff = torch.view_as_real(diff)
-            return diff.abs().mean()
+        diff: torch.Tensor = (pred_k - y) * mask
         if diff.is_complex():
             diff = torch.view_as_real(diff)
+        if self.norm == "l1":
+            return diff.abs().mean()
         return diff.pow(2).mean()

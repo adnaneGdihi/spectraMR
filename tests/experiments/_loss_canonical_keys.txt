@@ -5,27 +5,34 @@
 # canonicalises BOTH sides through canonical_loss_name(), so an alias change moves the
 # table key and the lookup key together and that test stays green -- while every consumer
 # resolving the OLD key now finds nothing declared (and weights.py RAISES). This pin makes
-# an alias mutation visible. Note `lambda_gp -> r1_regularization`: WGAN-GP's weight is
-# filed under R1's key today, because `gradient_penalty` is an alias of R1 (issue #191).
+# an alias mutation visible. `lambda_gp` files under `gradient_penalty` since ad8fb7d07 removed
+# the gradient_penalty -> R1 alias (#191); before that WGAN-GP's weight landed on R1's key.
 #
 # Regenerate deliberately, and co-edit the consumers, with:
 #   SPECTRAMR_UPDATE_LOSS_KEY_GOLDEN=1 pytest tests/experiments/test_loss_weight_no_op_migration.py
+background_suppression -> background_suppression
 beltrami_diagnostic -> beltrami_diagnostic
 beltrami_epi_residual -> beltrami_epi_residual
 bloch_equivariance_residual -> bloch_equivariance_residual
+bloch_signal_synthesis_consistency -> bloch_signal_synthesis_consistency
+cocycle_consistency -> cocycle_consistency
+coil_subspace_residual -> coil_subspace_residual
 complex_l1 -> complex_l1
 complex_mse -> complex_mse
 complex_spatial_gradient -> complex_spatial_gradient
 concomitant_phase_residual -> concomitant_phase_residual
 conformal_modulus -> conformal_modulus
+contrast_consistency -> contrast_consistency
 cubical_ph_w2 -> cubical_ph_w2
 data_consistency -> data_consistency
 diffusion_mse -> diffusion_mse
+evidential -> evidential
 field_flow_velocity -> field_flow_velocity
 fisher_rao_geodesic -> fisher_rao_geodesic
 focal_frequency_radial -> focal_frequency_radial
 frequency -> frequency
 frequency_domain -> frequency_domain_consistency
+frequency_weighted_l1_kspace -> frequency_weighted_l1_kspace
 frontdoor_criterion -> frontdoor_criterion
 gradient_domain_consistency -> gradient_domain_consistency
 heteroscedastic_ulf -> heteroscedastic_ulf
@@ -37,64 +44,78 @@ hrf_likelihood -> hrf_likelihood
 hyperelastic_jacobian -> hyperelastic_jacobian
 joint_multi_contrast_sparsity -> joint_multi_contrast_sparsity
 koopman_linearity -> koopman_linearity
+kspace_magnitude_phase -> kspace_magnitude_phase
 l1 -> l1
 l2 -> l2
 lambda_adv -> adversarial
+lambda_bloch_residual -> bloch_residual
 lambda_complex_l1 -> complex_l1
 lambda_complex_spatial_gradient -> complex_spatial_gradient
 lambda_cycle -> cycle_consistency
 lambda_cycle_adv -> cycle_adv
 lambda_cycle_bloch -> cycle_bloch
 lambda_diversity -> diversity
-lambda_gp -> r1_regularization
-lambda_hfen -> hfen
+lambda_domain -> domain
+lambda_gp -> gradient_penalty
 lambda_identity -> identity_preservation
+lambda_kl -> kl
 lambda_l1 -> l1
 lambda_log_spectral -> log_spectral
 lambda_magnitude_tv -> magnitude_tv
 lambda_marker -> marker_corruption
 lambda_mse -> l2
 lambda_nce -> nce
+lambda_patch_nce -> cut_patch_nce
 lambda_pde -> helmholtz_pde
 lambda_perceptual -> perceptual
+lambda_physics_constraint -> physics_constraint
 lambda_pinn_dc -> pinn_dc
+lambda_pre_dc_acquired -> pre_dc_acquired
 lambda_pre_dc_kspace -> pre_dc_kspace
 lambda_r1 -> r1
-lambda_se3_equivariance -> se3_equivariance_defect
+lambda_reconstruction -> reconstruction
 lambda_sense_adjoint_l1 -> sense_adjoint_l1
+lambda_snr_preserving -> snr_preserving
 lambda_sobolev_kspace -> sobolev_kspace
 lambda_ssim -> ssim
 lambda_style -> style
 lambda_unit_norm_coil -> unit_norm_coil
+latent_orthogonality -> latent_orthogonality
 lesion_weighted -> lesion_weighted
-levy_score_consistency -> levy_score_consistency
 log_spectral -> log_spectral
 lpips -> lpips
+masked_kspace_l2 -> masked_kspace_l2
 mind_ssc -> mind_ssc
 mmd_paired_distribution_match -> mmd_paired_distribution_match
 ms_ssim -> ms_ssim
 mse -> l2
+multifield_data_consistency -> multifield_data_consistency
 ncchi_consistency -> ncchi_consistency
 nll_bits_per_dim -> nll_bits_per_dim
+nufft_sample_consistency -> nufft_sample_consistency
+null_space_content -> null_space_content
 ood_gated_reconstruction -> ood_gated_reconstruction
 per_pair_consistency_residual -> per_pair_consistency_residual
 perceptual -> perceptual
 phase_smoothness_complex -> phase_smoothness_complex
 phase_stego_score -> phase_stego_score
+physics_equivariance -> physics_equivariance
 pisco_self_consistency -> pisco_self_consistency
 primary_ideal_membership -> primary_ideal_membership
 rectified_flow -> rectified_flow
-resetting_consistency -> resetting_consistency
 rician_consistency -> rician_consistency
+segmentation_dice -> segmentation_dice
 segmentation_equivariance -> segmentation_equivariance
 sense_adjoint_l1 -> sense_adjoint_l1
 sheaf_consistency -> sheaf_consistency
 sobel_edge -> sobel_edge
 sobolev_kspace -> sobolev_kspace
 soft_dtw -> soft_dtw
+spectral_band_split -> spectral_band_split
 spectral_radial_prior -> spectral_radial_prior
 spectral_triple_intertwining -> spectral_triple_intertwining
 ssdu -> ssdu
+ssdu_normalized -> ssdu_normalized
 ssim -> ssim
 stein_discrepancy -> stein_discrepancy
 teichmuller_geodesic -> teichmuller_geodesic

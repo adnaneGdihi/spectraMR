@@ -25,7 +25,8 @@ def _wide(n=20):
         {
             "case_id": [f"val_step{i}" for i in range(n)],
             "split": ["val"] * n,
-            "step": list(range(n)),
+            "step": [100] * n,
+            "batch_index": list(range(n)),
             "psnr": rng.normal(30, 2, n),
             "ssim": rng.uniform(0.7, 0.95, n),
         }
@@ -98,7 +99,8 @@ def _flat(n=8, value=48.71364215):
         {
             "case_id": [f"val_step{i}" for i in range(n)],
             "split": ["val"] * n,
-            "step": list(range(n)),
+            "step": [100] * n,
+            "batch_index": list(range(n)),
             "psnr": [value] * n,
         }
     )
@@ -206,3 +208,90 @@ class TestHasSpread:
         from spectramr.infrastructure.reporting.plotters.qc.group_strip import _has_spread
 
         assert _has_spread(np.asarray(vals, dtype=float)) is expected
+
+
+# ---------------------------------------------------------------------------
+# per_call_metrics.csv carries every validation PASS. A strip pooled across
+# passes draws the training trajectory as if it were spread across cases, and
+# pooling R2/R8/R32 draws three distributions as one.
+# ---------------------------------------------------------------------------
+
+
+def _passes():
+    """Two passes: an early one far from the late one, 6 calls each."""
+    rows = []
+    for step, centre in ((100, 10.0), (200, 30.0)):
+        for b in range(6):
+            rows.append(
+                {
+                    "case_id": f"val_step{step}",
+                    "split": "val",
+                    "step": step,
+                    "batch_index": b,
+                    "psnr": centre + 0.1 * b,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+class TestOnePassOnly:
+    def test_reads_the_last_pass_not_the_trajectory(self):
+        from spectramr.infrastructure.reporting.plotters.qc import group_strip
+
+        vals = group_strip._collect(pd.DataFrame(), _passes(), None)["psnr"][0]
+        assert vals.size == 6 and vals.min() >= 30.0
+
+    def test_reads_the_early_stopping_pass_when_the_run_recorded_one(self):
+        from spectramr.infrastructure.reporting.plotters.qc import group_strip
+
+        df = pd.DataFrame(
+            [
+                {"run_id": "r", "split": "val", "step": 100, "metric": "val_psnr", "value": 11.0},
+                {"run_id": "r", "split": "val", "step": 200, "metric": "val_psnr", "value": 9.0},
+                {
+                    "run_id": "r",
+                    "split": "final",
+                    "step": -1,
+                    "metric": "early_stopping_best_iteration",
+                    "value": 100.0,
+                },
+            ]
+        )
+        vals = group_strip._collect(df, _passes(), None)["psnr"][0]
+        assert vals.max() < 11.0
+
+    def test_the_aggregator_trajectory_alone_is_no_data(self, tmp_path):
+        df = pd.DataFrame(
+            [
+                {"split": "val", "step": s, "metric": "val_psnr", "value": float(s)}
+                for s in range(10)
+            ]
+        )
+        assert plotters.get("qc_group_strip")(df, tmp_path / "g.pdf", formats=("pdf",)) is None
+
+
+def test_accelerations_get_their_own_rows(tmp_path):
+    from spectramr.infrastructure.reporting.plotters.qc import group_strip
+
+    frame = pd.DataFrame(
+        [
+            {
+                "case_id": "c",
+                "split": "val",
+                "step": 1,
+                "batch_index": b,
+                "acceleration_level": r,
+                "heldout": False,
+                "psnr": 40.0 - r + 0.1 * b,
+            }
+            for r in (2.0, 8.0)
+            for b in range(5)
+        ]
+    )
+    series = group_strip._collect(pd.DataFrame(), frame, None)
+    assert set(series["psnr"][2]) == {2.0, 8.0}
+    assert "heldout" not in series
+    res = plotters.get("qc_group_strip")(
+        pd.DataFrame(), tmp_path / "g.pdf", per_call_df=frame, formats=("pdf",)
+    )
+    assert res is not None and res.exists()

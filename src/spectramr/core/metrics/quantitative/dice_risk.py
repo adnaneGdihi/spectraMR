@@ -2,11 +2,15 @@
 
 The challenge grades synthesis on SynthSeg-Dice over 14 deep grey-matter nuclei
 (:data:`~spectramr.core.metrics.quantitative.challenge_metrics.DGM_LABELS_14`).
-``synthseg_dice`` segments the prediction and target (pluggable backend — real
-SynthSeg on the cluster, a real label-Dice proxy locally) and returns the mean
-multi-class Dice; ``synthseg_dice_risk`` returns the complementary risk
-``1 - Dice`` that the Dice-risk RCPS certificate controls. Both are emitted at
-validation (so the headline structural metric is genuinely exercised, not a facade).
+``synthseg_dice`` segments the prediction and target with an injected segmenter
+or a declared ``segmenter_backend`` and returns the mean multi-class Dice;
+``synthseg_dice_risk`` returns the complementary risk ``1 - Dice`` that the
+Dice-risk RCPS certificate controls. With no segmenter both raise.
+
+The intensity-quantile bins (:class:`LabelDiceBackend`) are a structural-agreement
+proxy, not SynthSeg. They are registered under their own names,
+``intensity_quantile_dice_proxy`` and ``intensity_quantile_dice_risk_proxy``, so a
+column computed from them never carries the SynthSeg label.
 
 **14-label parity:** when ``segmenter_backend="synthseg"`` is requested and no
 explicit ``n_classes`` is given, :func:`_mean_dice` defaults to
@@ -17,10 +21,13 @@ nuclei.  The local ``label_dice`` proxy keeps ``n_classes=5``.  An explicit
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
 from spectramr.core.metrics.quantitative.challenge_metrics import DGM_LABELS_14
 from spectramr.core.metrics.quantitative.segmentation import (
+    ISegmenter,
     LabelDiceBackend,
     dice_score,
     get_segmenter,
@@ -37,18 +44,23 @@ _DEFAULT_N_CLASSES_BY_BACKEND: dict[str, int] = {
 }
 
 
-def _resolve_segmenter(kwargs: dict, n_classes: int):
+def _resolve_segmenter(kwargs: dict[str, object], n_classes: int) -> ISegmenter:
     """Use an injected segmenter (kwargs/context) or the local label-Dice proxy."""
     seg = kwargs.get("segmenter")
     if seg is not None:
-        return seg
+        return cast(ISegmenter, seg)
     backend = kwargs.get("segmenter_backend")
     if backend is not None:
         return get_segmenter(str(backend), n_classes=n_classes)
-    return LabelDiceBackend(n_classes=n_classes)
+    # No silent proxy (#1777 audit D11): the intensity-quantile proxy is not SynthSeg-Dice.
+    raise ValueError(
+        "synthseg_dice needs a segmenter: inject one or set segmenter_backend "
+        "('synthseg'). The intensity-quantile proxy is only available as "
+        "intensity_quantile_dice_proxy / intensity_quantile_dice_risk_proxy."
+    )
 
 
-def _mean_dice(prediction: torch.Tensor, target: torch.Tensor, kwargs: dict) -> float:
+def _mean_dice(prediction: torch.Tensor, target: torch.Tensor, kwargs: dict[str, object]) -> float:
     # Resolve backend-aware default BEFORE the explicit kwarg check so that an
     # explicit n_classes always wins (pitfall #15 — every knob read and validated).
     backend = kwargs.get("segmenter_backend")
@@ -63,7 +75,7 @@ def _mean_dice(prediction: torch.Tensor, target: torch.Tensor, kwargs: dict) -> 
     else:
         backend_key = None
         default_n_classes = 5
-    n_classes = int(kwargs.get("n_classes", default_n_classes))
+    n_classes = int(cast("int | str", kwargs.get("n_classes", default_n_classes)))
     segmenter = _resolve_segmenter(kwargs, n_classes)
     seg_p = segmenter.segment(prediction)
     seg_t = segmenter.segment(target)
@@ -114,4 +126,65 @@ class SynthSegDiceRiskMetric:
         return 1.0 - _mean_dice(prediction, target, kwargs)
 
 
-__all__ = ["DGM_LABELS_14", "SynthSegDiceMetric", "SynthSegDiceRiskMetric"]
+def _proxy_dice(prediction: torch.Tensor, target: torch.Tensor, kwargs: dict[str, object]) -> float:
+    """Mean Dice over intensity-quantile bins; refuses a request for a real segmenter."""
+    backend = kwargs.get("segmenter_backend")
+    if kwargs.get("segmenter") is not None or backend not in (None, "label_dice"):
+        raise ValueError(
+            "intensity_quantile_dice_proxy ignores segmenters; a segmenter was supplied "
+            f"(segmenter_backend={backend!r}). Score it with synthseg_dice instead."
+        )
+    n_classes = kwargs.get("n_classes", _DEFAULT_N_CLASSES_BY_BACKEND["label_dice"])
+    if isinstance(n_classes, bool) or not isinstance(n_classes, int) or n_classes < 2:
+        raise ValueError(f"n_classes must be an int >= 2, got {n_classes!r}.")
+    segmenter = LabelDiceBackend(n_classes=n_classes)
+    seg_p = segmenter.segment(prediction)
+    seg_t = segmenter.segment(target)
+    return float(dice_score(seg_p, seg_t, segmenter.n_classes).mean().item())
+
+
+@register_metric("intensity_quantile_dice_proxy")
+class IntensityQuantileDiceProxyMetric:
+    """Mean Dice over intensity-quantile bins (higher is better): a proxy, NOT SynthSeg-Dice."""
+
+    def __init__(self, device: object = None, **_: object) -> None:
+        self._device = device
+
+    @property
+    def name(self) -> str:
+        return "intensity_quantile_dice_proxy"
+
+    @property
+    def higher_is_better(self) -> bool:
+        return True
+
+    def __call__(self, prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> float:
+        return _proxy_dice(prediction, target, kwargs)
+
+
+@register_metric("intensity_quantile_dice_risk_proxy")
+class IntensityQuantileDiceRiskProxyMetric:
+    """``1 -`` the intensity-quantile Dice proxy (lower is better), NOT SynthSeg Dice-risk."""
+
+    def __init__(self, device: object = None, **_: object) -> None:
+        self._device = device
+
+    @property
+    def name(self) -> str:
+        return "intensity_quantile_dice_risk_proxy"
+
+    @property
+    def higher_is_better(self) -> bool:
+        return False
+
+    def __call__(self, prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> float:
+        return 1.0 - _proxy_dice(prediction, target, kwargs)
+
+
+__all__ = [
+    "DGM_LABELS_14",
+    "IntensityQuantileDiceProxyMetric",
+    "IntensityQuantileDiceRiskProxyMetric",
+    "SynthSegDiceMetric",
+    "SynthSegDiceRiskMetric",
+]

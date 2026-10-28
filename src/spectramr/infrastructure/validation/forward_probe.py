@@ -108,6 +108,19 @@ def _is_input_invariant(
     return d_diff < eps or (d_same >= eps and (d_diff / max(d_same, 1.0e-12)) < 1.5)
 
 
+def _principal_output(out: object) -> object:
+    """The tensor a forward's structured return leads with: first tuple item, first dict value.
+
+    Unwraps until a non-container remains, so ``(tissue_maps, mu, logvar)`` reaches the
+    first map rather than stopping at the dict.
+    """
+    while isinstance(out, tuple | dict):
+        if not out:
+            return out
+        out = out[0] if isinstance(out, tuple) else next(iter(out.values()))
+    return out
+
+
 def _coerce_probe_skip(raw: object) -> set[str]:
     """Normalise a model's ``synthetic_forward_probe_skip`` into a ``set``.
 
@@ -307,10 +320,7 @@ def _probe_sample_path(
         # not the model, are the likely cause) — never a probe failure.
         return True, f" | sample(): raised {type(exc).__name__}, not probed"
 
-    if isinstance(out, tuple):
-        out = out[0]
-    elif isinstance(out, dict):
-        out = next(iter(out.values()), None)
+    out = _principal_output(out)
     ndim = getattr(out, "ndim", None)
     if not isinstance(ndim, int):
         return True, " | sample(): non-tensor output, not probed"
@@ -907,7 +917,7 @@ def synthetic_forward_probe(
         #
         # That fabrication is invisible on most arms because the generator's own
         # DC path narrows a too-wide measurement before use -- but a backbone
-        # with an INTERNAL ``DataConsistencyLayer`` receives the kwarg verbatim
+        # with an INTERNAL ``MaskedReplacementDataConsistency`` receives the kwarg verbatim
         # and has no such narrowing. ``swin_diff_rec`` then died on
         # ``k_guessed=[2,4,H,W]`` vs ``measured=[2,8,H,W]`` (complex channels;
         # 4 == out_channels/2, 8 == in_channels), failing a healthy arm on a
@@ -922,12 +932,7 @@ def synthetic_forward_probe(
             forward_extra.setdefault(_k, _v)
 
     try:
-        y = model(x, **forward_extra) if forward_extra else model(x)
-        # Some models return tuples / dicts; pick the principal tensor.
-        if isinstance(y, tuple):
-            y = y[0]
-        elif isinstance(y, dict):
-            y = next(iter(y.values()))
+        y = _principal_output(model(x, **forward_extra) if forward_extra else model(x))
         if not isinstance(y, torch.Tensor):
             return ProbeResult(
                 passed=False,
@@ -1066,18 +1071,10 @@ def synthetic_forward_probe(
     # unconditional prior sampled from noise alone).
     if "input_invariant" not in _probe_skip:
         try:
-
-            def _principal(out: object) -> object:
-                if isinstance(out, tuple):
-                    return out[0]
-                if isinstance(out, dict):
-                    return next(iter(out.values()))
-                return out
-
             with torch.no_grad():
-                y_same = _principal(model(x, **forward_extra) if forward_extra else model(x))
+                y_same = _principal_output(model(x, **forward_extra) if forward_extra else model(x))
                 x2 = torch.randn_like(x)
-                y_diff = _principal(model(x2, **forward_extra) if forward_extra else model(x2))
+                y_diff = _principal_output(model(x2, **forward_extra) if forward_extra else model(x2))
             if (
                 isinstance(y_same, torch.Tensor)
                 and isinstance(y_diff, torch.Tensor)

@@ -25,9 +25,20 @@ from typing import Any
 __all__ = [
     "AcquisitionParams",
     "MissingAcquisitionParameter",
+    "acquisition_from_sidecar",
     "predicted_snr_delta_db",
     "read_acquisition_params",
 ]
+
+#: BIDS-style NIfTI sidecar keys. Times are seconds in the sidecar, milliseconds in
+#: :class:`AcquisitionParams`. A sidecar keyed differently (e.g. DICOM tags) raises.
+_SIDECAR_KEYS = {
+    "field_strength_t": "MagneticFieldStrength",
+    "tr_ms": "RepetitionTime",
+    "te_ms": "EchoTime",
+    "averages": "NumberOfAverages",
+    "bandwidth_hz_px": "PixelBandwidth",
+}
 
 
 class MissingAcquisitionParameter(ValueError):
@@ -122,6 +133,37 @@ def read_acquisition_params(header: Any) -> AcquisitionParams:
         tr_ms=tr,
         bandwidth_hz_px=bandwidth,
         averages=averages,
+    )
+
+
+def acquisition_from_sidecar(doc: Any) -> AcquisitionParams:
+    """Acquisition parameters from a NIfTI JSON sidecar (BIDS keys, see ``_SIDECAR_KEYS``).
+
+    Field strength is required; TR, TE, averages and bandwidth are optional, as in the
+    header reader. Raises :class:`MissingAcquisitionParameter` on an absent field
+    strength rather than returning a neutral record.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError(f"sidecar must be a JSON object; got {type(doc).__name__}")
+
+    def _num(key: str) -> float | None:
+        value = doc.get(key)
+        return None if value is None else float(value)
+
+    field = _num(_SIDECAR_KEYS["field_strength_t"])
+    if field is None:
+        raise MissingAcquisitionParameter(
+            f"sidecar has no {_SIDECAR_KEYS['field_strength_t']!r}; the field strength "
+            "the SNR prior depends on is unrecorded, and a guessed one would be a "
+            "fabrication."
+        )
+    tr_s, te_s = _num(_SIDECAR_KEYS["tr_ms"]), _num(_SIDECAR_KEYS["te_ms"])
+    return AcquisitionParams(
+        field_strength_t=field,
+        tr_ms=None if tr_s is None else tr_s * 1000.0,
+        te_ms=None if te_s is None else te_s * 1000.0,
+        averages=_num(_SIDECAR_KEYS["averages"]),
+        bandwidth_hz_px=_num(_SIDECAR_KEYS["bandwidth_hz_px"]),
     )
 
 

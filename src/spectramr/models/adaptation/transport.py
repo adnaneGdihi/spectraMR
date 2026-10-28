@@ -13,7 +13,12 @@ from torch import Tensor
 from spectramr.models.registry import register_model
 
 
-@register_model(name="wasserstein_discriminator", training_mode="gan")
+# ``input_domain`` is deliberately LEFT UNDECLARED (#1920). The 3-D conv stack below would
+# read as ``image``, but nothing in the tree instantiates this class -- the only reference
+# is ``transport.py``'s own function parameter -- so there is no call site to read the
+# intended input space off. Declaring one from the architecture alone would be inventing
+# a contract no caller has agreed to (NN18).
+@register_model(role="discriminator", name="wasserstein_discriminator", training_mode="gan")
 class WassersteinDiscriminator(nn.Module):
     """Critic network for estimating Wasserstein Distance."""
 

@@ -7,7 +7,6 @@ Author: spectraMR Research Team
 """
 
 import hashlib
-import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +14,9 @@ from typing import Any
 
 import torch
 
-from spectramr.infrastructure.di.di_container import resolve_service
 from spectramr.infrastructure.physics.fft_ops import ifft2c
-from spectramr.infrastructure.services import ICheckpointService, ILoggingService
-from spectramr.shared.utils.safe_io import safe_torch_load
+from spectramr.infrastructure.services import ILoggingService
+from spectramr.shared.utils.safe_io import atomic_save_torch, safe_torch_load
 
 
 @dataclass
@@ -64,7 +62,6 @@ class CoilSensitivityEstimationService:
         logging_service: ILoggingService | None,
         cache_dir: str | None = None,
         enable_cache: bool = True,
-        checkpoint_service: ICheckpointService | None = None,
     ):
         """Initialize the coil sensitivity estimation service.
 
@@ -72,7 +69,6 @@ class CoilSensitivityEstimationService:
             logging_service: Optional logging service for output
             cache_dir: Directory for caching sensitivity maps
             enable_cache: Whether to enable caching
-            checkpoint_service: Optional persistence service for caching
 
         """
         # TODO(coil): remove after migrating callers onto estimate_smaps.
@@ -87,38 +83,11 @@ class CoilSensitivityEstimationService:
         )
         self.logging_service = logging_service
         self.enable_cache = enable_cache
-        self._checkpoint_service = checkpoint_service
-        self._cache_warning_emitted = False
 
         if cache_dir is None:
             cache_dir = Path("cache/coil_sensitivity")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _get_checkpoint_service(self) -> ICheckpointService | None:
-        """Resolve the checkpoint service if available.
-
-        Note: Checkpoint service is optional. If not registered, this returns None.
-        """
-        if self._checkpoint_service is not None:
-            return self._checkpoint_service
-
-        if not self.enable_cache:
-            return None
-
-        # Try to resolve; service is optional so graceful failure is acceptable
-        try:
-            self._checkpoint_service = resolve_service(ICheckpointService)
-            return self._checkpoint_service
-        except Exception:
-            # Service not registered; caching will use filesystem only
-            if not self._cache_warning_emitted and self.logging_service:
-                self.logging_service.log(
-                    logging.WARNING,
-                    "CheckpointService not available; sensitivity map caching disabled",
-                )
-                self._cache_warning_emitted = True
-            return None
 
     def estimate_sensitivity_maps(
         self,
@@ -488,7 +457,7 @@ class CoilSensitivityEstimationService:
         param_str = f"{method}_{calibration_size}_{threshold}_{max_rank}_{shape_str}"
 
         # Create hash
-        hasher = hashlib.md5()
+        hasher = hashlib.md5(usedforsecurity=False)
         hasher.update(param_str.encode())
         hasher.update(sample_values.tobytes())
 
@@ -521,18 +490,17 @@ class CoilSensitivityEstimationService:
         """Save result to cache."""
         cache_path = self.cache_dir / f"{cache_key}.pt"
 
+        # The cache is a pickled result, not a model checkpoint, so it is written
+        # beside its reader in safe_io. Only I/O failures degrade to a warning (torch's
+        # zip writer reports a full disk as RuntimeError); a programming error must
+        # surface rather than silently disable the cache.
         try:
-            service = self._get_checkpoint_service()
-            if service is not None:
-                service.save_payload_to_path(result, cache_path)
-            else:
-                # Fallback: direct torch.save when no checkpoint service
-                torch.save(result, cache_path)
+            atomic_save_torch(result, cache_path)
             if self.logging_service:
                 self.logging_service.log_debug(
                     f"Saved coil sensitivity to cache: {cache_key}",
                 )
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             if self.logging_service:
                 self.logging_service.log_warning(f"Failed to save cache: {e}")
 

@@ -60,20 +60,42 @@ class PhysicalUnwarp(nn.Module):
 
     def __init__(
         self,
-        echo_spacing_s: float,
+        echo_spacing_s: float | None,
         n_pe_lines: int | None = None,
         pe_axis: str = "H",
         align_corners: bool = True,
+        shift_mode: str = "epi",
+        pixel_bandwidth_hz: float | None = None,
     ) -> None:
         super().__init__()
-        if echo_spacing_s <= 0:
-            raise ValueError(f"echo_spacing_s must be > 0, got {echo_spacing_s}")
         if pe_axis not in {"H", "W"}:
             raise ValueError(f"pe_axis must be 'H' or 'W', got {pe_axis!r}")
+        if shift_mode == "epi":
+            if echo_spacing_s is None or echo_spacing_s <= 0:
+                raise ValueError(
+                    "echo_spacing_s must be > 0 for shift_mode='epi', got " f"{echo_spacing_s!r}"
+                )
+        elif shift_mode == "readout":
+            if pixel_bandwidth_hz is None or pixel_bandwidth_hz <= 0:
+                raise ValueError(
+                    "shift_mode='readout' needs pixel_bandwidth_hz > 0, got "
+                    f"{pixel_bandwidth_hz!r}"
+                )
+        else:
+            raise ValueError(f"shift_mode must be 'epi' or 'readout', got {shift_mode!r}")
         self.echo_spacing_s = echo_spacing_s
         self.n_pe_lines = n_pe_lines
         self.pe_axis = pe_axis
         self.align_corners = align_corners
+        self.shift_mode = shift_mode
+        self.pixel_bandwidth_hz = pixel_bandwidth_hz
+
+    @property
+    def shift_axis(self) -> str:
+        """The axis the offset moves samples along: PE for 'epi', readout for 'readout'."""
+        if self.shift_mode == "epi":
+            return self.pe_axis
+        return "W" if self.pe_axis == "H" else "H"
 
     def forward(
         self,
@@ -114,25 +136,25 @@ class PhysicalUnwarp(nn.Module):
         # grid_sample expects (x, y, z) ordering on the last dim.
         grid = torch.stack([xx, yy, zz], dim=-1).unsqueeze(0).expand(B, -1, -1, -1, -1)
 
-        # Convert Hz offsets to fractional pixel shifts along PE axis.
-        delta_pe_pixels = self._zero_field(B, D, H, W, device, dtype)
+        # Hz offsets, summed, then converted to pixel shifts along the shift axis.
+        delta_hz = self._zero_field(B, D, H, W, device, dtype)
         if b0_hz is not None:
-            delta_pe_pixels = delta_pe_pixels + self._broadcast_field(b0_hz, B)
+            delta_hz = delta_hz + self._broadcast_field(b0_hz, B)
         if maxwell_hz is not None:
-            delta_pe_pixels = delta_pe_pixels + self._broadcast_field(maxwell_hz, B)
-        # Hz → pixel-shift: shift = f * ESP * Npe (the canonical EPI
-        # distortion formula). The result is in PE-axis pixel units.
-        n_pe = self.n_pe_lines if self.n_pe_lines is not None else (H if self.pe_axis == "H" else W)
-        delta_pe_pixels = delta_pe_pixels * (self.echo_spacing_s * n_pe)
-        # Convert pixel shift to normalised-coord shift.
-        if self.pe_axis == "H":
-            shift_norm = 2.0 * delta_pe_pixels / max(H - 1, 1)
-            grid = grid.clone()
-            grid[..., 1] = grid[..., 1] + shift_norm
-        else:  # W
-            shift_norm = 2.0 * delta_pe_pixels / max(W - 1, 1)
-            grid = grid.clone()
-            grid[..., 0] = grid[..., 0] + shift_norm
+            delta_hz = delta_hz + self._broadcast_field(maxwell_hz, B)
+        if self.shift_mode == "epi":
+            # shift = f * ESP * Npe (the canonical EPI distortion formula).
+            n_pe = self.n_pe_lines if self.n_pe_lines is not None else (H if self.pe_axis == "H" else W)
+            delta_px = delta_hz * (float(self.echo_spacing_s) * n_pe)
+        else:
+            # Readout model: a df offset moves a sample by df / pixel bandwidth.
+            delta_px = delta_hz / float(self.pixel_bandwidth_hz)
+        n_axis = H if self.shift_axis == "H" else W
+        shift_norm = 2.0 * delta_px / max(n_axis - 1, 1)
+        grid = grid.clone()
+        grid[..., 1 if self.shift_axis == "H" else 0] = (
+            grid[..., 1 if self.shift_axis == "H" else 0] + shift_norm
+        )
 
         # Apply the GNL displacement on top (already in normalised coords).
         if gnl_displacement is not None:

@@ -254,10 +254,10 @@ def load_presets(names: list[str], on_conflict: str = "error") -> SearchSpace:
 
 
 PRESETS: dict[str, dict[str, Any]] = {
-    # Plan §4.2 — the 14-dim search space for the KAN dual-domain headline.
+    # Plan §4.2's search space for the KAN dual-domain headline, less the
+    # log_spectral weight: the cohort no longer trains that term.
     "kan_dual_domain": {
         # Loss weights (log-uniform; complex_l1 anchor stays at 1.0)
-        "losses.kspace_losses[name=log_spectral].weight": ("loguniform", 0.01, 1.0),
         "losses.kspace_losses[name=sobolev_kspace].weight": ("loguniform", 0.005, 0.5),
         "losses.kspace_losses[name=complex_spatial_gradient].weight": ("loguniform", 0.05, 1.0),
         "losses.kspace_losses[name=sense_adjoint_l1].weight": ("loguniform", 0.05, 1.0),
@@ -276,7 +276,6 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
     # Loss-weights-only — useful for quickly tuning a fixed architecture.
     "loss_weights_only": {
-        "losses.kspace_losses[name=log_spectral].weight": ("loguniform", 0.01, 1.0),
         "losses.kspace_losses[name=sobolev_kspace].weight": ("loguniform", 0.005, 0.5),
         "losses.kspace_losses[name=complex_spatial_gradient].weight": ("loguniform", 0.05, 1.0),
         "losses.kspace_losses[name=sense_adjoint_l1].weight": ("loguniform", 0.05, 1.0),

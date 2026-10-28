@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Import from registry and implementations
 
 
-class DataConsistencyLayer(nn.Module):
+class OperatorProjectionDataConsistency(nn.Module):
     """Data consistency layer for reconstruction networks."""
 
     def __init__(self, operator: IForwardOperator, lambda_dc: float = 1.0):
@@ -75,7 +75,7 @@ class DataConsistencyLayer(nn.Module):
         Returns:
             Data-consistent image [B, H, W, 2]
 
-        forward method for DataConsistencyLayer.
+        forward method for OperatorProjectionDataConsistency.
 
         Executes PyTorch tensor operations.
 
@@ -607,14 +607,14 @@ class MRIReconstructionPipeline(nn.Module):
     def __init__(
         self,
         operator: IForwardOperator,
-        dc_layer: DataConsistencyLayer,
+        dc_layer: OperatorProjectionDataConsistency,
         coil_estimator: CoilSensitivityEstimator | None = None,
     ):
         """__init__.
 
         Args:
             operator (IForwardOperator): Description.
-            dc_layer (DataConsistencyLayer): Description.
+            dc_layer (OperatorProjectionDataConsistency): Description.
             coil_estimator (Optional[CoilSensitivityEstimator]): Description.
         """
         super().__init__()
@@ -693,9 +693,9 @@ def create_physics_operator(operator_type: str = "fft2d", **kwargs) -> IForwardO
 def create_dc_layer(
     operator: IForwardOperator,
     lambda_dc: float = 1.0,
-) -> DataConsistencyLayer:
+) -> OperatorProjectionDataConsistency:
     """Factory function for creating data consistency layers."""
-    return DataConsistencyLayer(operator, lambda_dc)
+    return OperatorProjectionDataConsistency(operator, lambda_dc)
 
 
 def create_coil_estimator(

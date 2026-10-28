@@ -143,20 +143,29 @@ class MultiCoilForwardOperator(nn.Module):
         self.bw_hz = bw_hz
         self.b0_units = b0_units
 
-        # Register as buffers (not parameters - not learned)
-        self.register_buffer("coil_sensitivities", coil_sensitivities)
-        self.register_buffer("mask", mask)
-        self.register_buffer("b0_map", b0_map)
-        self.register_buffer("t2_star_map", t2_star_map)
-        self.register_buffer("gradient_nonlinearity_map", gradient_nonlinearity_map)
+        # Buffers so they follow the module across devices, NOT persistent: the
+        # `set_*` methods assign each batch's maps and mask into them, and a
+        # persistent buffer would write the last training batch into the
+        # checkpoint and then fail a strict resume with unexpected keys.
+        self.register_buffer("coil_sensitivities", coil_sensitivities, persistent=False)
+        self.register_buffer("mask", mask, persistent=False)
+        self.register_buffer("b0_map", b0_map, persistent=False)
+        self.register_buffer("t2_star_map", t2_star_map, persistent=False)
+        self.register_buffer("gradient_nonlinearity_map", gradient_nonlinearity_map, persistent=False)
 
     def set_coil_sensitivities(self, coil_maps: torch.Tensor) -> None:
         """Update coil sensitivity maps.
 
         Args:
-            coil_maps: Complex tensor (num_coils, H, W)
+            coil_maps: Complex tensor ``(num_coils, H, W)`` shared by the batch, or
+                ``(B, num_coils, H, W)`` per sample -- what a loader delivers.
         """
         self.coil_sensitivities = coil_maps
+
+    def _batched_maps(self) -> torch.Tensor:
+        """The maps with a leading batch axis, whichever of the two shapes was set."""
+        maps = self.coil_sensitivities
+        return maps if maps.dim() == 4 else maps.unsqueeze(0)
 
     def set_mask(self, mask: torch.Tensor) -> None:
         """Update undersampling mask.
@@ -240,11 +249,8 @@ class MultiCoilForwardOperator(nn.Module):
             x = torch.complex(x[:, 0], x[:, 1]).unsqueeze(1)
 
         # Apply coil sensitivities: S·x -> (batch, num_coils, H, W)
-        if self.coil_sensitivities is not None:
-            # Broadcast: (batch, 1, H, W) * (num_coils, H, W) -> (batch, num_coils, H, W)
-            coil_images = x * self.coil_sensitivities.unsqueeze(0)
-        else:
-            coil_images = x
+        # (batch, 1, H, W) * (batch or 1, num_coils, H, W) -> (batch, num_coils, H, W)
+        coil_images = x * self._batched_maps() if self.coil_sensitivities is not None else x
 
         # ── B₀ / T₂* Physics ──────────────────────────────────────
         omega_eff = self._effective_b0()  # ΔB₀ + optional grad NL
@@ -358,7 +364,7 @@ class MultiCoilForwardOperator(nn.Module):
         # Combine coils using conjugate sensitivities
         if self.coil_sensitivities is not None:
             # S†: multiply by conjugate and sum over coils
-            sens_conj = self.coil_sensitivities.conj().unsqueeze(0)
+            sens_conj = self._batched_maps().conj()
             combined = (coil_images * sens_conj).sum(dim=1, keepdim=True)
         else:
             combined = coil_images.sum(dim=1, keepdim=True)
@@ -482,7 +488,7 @@ class NullSpaceProjection(nn.Module):
         return self.A.normal(x)
 
 
-class DataConsistencyLayer(nn.Module):
+class MultiCoilDataConsistency(nn.Module):
     """Data consistency layer for iterative reconstruction.
 
     Enforces that reconstruction is consistent with acquired k-space:
@@ -531,7 +537,7 @@ class DataConsistencyLayer(nn.Module):
         Returns:
             Data-consistent reconstruction (batch, 1, H, W) complex
 
-        forward method for DataConsistencyLayer.
+        forward method for MultiCoilDataConsistency.
 
         Executes PyTorch tensor operations.
 
@@ -545,6 +551,15 @@ class DataConsistencyLayer(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        # A real/imag-interleaved (B, 2, H, W) image leaves in the layout it came in:
+        # the next learned block is a real Conv2d, and a complex (B, 1, H, W) update
+        # subtracted from a real (B, 2, H, W) image broadcast into nonsense (#2327).
+        # k-space transforms stay float32/complex64: complex-half is experimental and lossy.
+        interleaved = not torch.is_complex(x)
+        if interleaved:
+            x = torch.complex(x[:, 0::2].float(), x[:, 1::2].float())
+        if not torch.is_complex(y):
+            y = torch.complex(y[:, 0::2].float(), y[:, 1::2].float())
         if self.mode == "soft":
             # Gradient step: x - λ·A†(Ax - y)
             residual = self.A.forward(x) - y
@@ -566,9 +581,14 @@ class DataConsistencyLayer(nn.Module):
 
         if return_residual:
             residual_norm = torch.norm(self.A.forward(x_dc) - y)
-            return x_dc, residual_norm
+            return (_interleave(x_dc) if interleaved else x_dc), residual_norm
 
-        return x_dc
+        return _interleave(x_dc) if interleaved else x_dc
+
+
+def _interleave(z: torch.Tensor) -> torch.Tensor:
+    """Complex ``(B, C, H, W)`` -> real ``(B, 2C, H, W)`` as ``[R0, I0, R1, I1, ...]``."""
+    return torch.view_as_real(z).permute(0, 1, 4, 2, 3).reshape(z.shape[0], -1, *z.shape[-2:])
 
 
 def create_radial_mask(
@@ -665,7 +685,7 @@ def create_cartesian_mask(
 
 
 __all__ = [
-    "DataConsistencyLayer",
+    "MultiCoilDataConsistency",
     "MultiCoilForwardOperator",
     "NullSpaceProjection",
     "create_cartesian_mask",

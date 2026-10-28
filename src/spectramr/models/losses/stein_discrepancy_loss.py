@@ -33,6 +33,9 @@ supplies the target score function and the flattening / batching glue.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 
@@ -91,8 +94,17 @@ class SteinDiscrepancyLoss(nn.Module):
         self.batch_chunks = int(batch_chunks)
         self.reduction = reduction
 
-    def _build_target_score_fn(self, target_flat: torch.Tensor):
+    def _build_target_score_fn(
+        self, target_flat: torch.Tensor
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
         r"""Empirical-Gaussian score :math:`s_p(x)=-\Sigma_t^{-1}(x-\mu_t)`.
+
+        :math:`\Sigma_t = U^\top U + \gamma I` with :math:`U` the ``(n, d)``
+        Bessel-scaled centred targets; the shrinkage keeps it invertible for
+        identical/degenerate samples. It is inverted through the Woodbury
+        identity :math:`\Sigma_t^{-1} = \gamma^{-1}(I - U^\top(\gamma I_n +
+        UU^\top)^{-1}U)`, an ``(n, n)`` solve: the dense ``(d, d)`` inverse
+        needs ~42 GB per chunk at ``d = 320^2``.
 
         Args:
             target_flat: ``(n, d)`` flattened target samples.
@@ -100,18 +112,17 @@ class SteinDiscrepancyLoss(nn.Module):
         Returns:
             Callable ``score_fn(x: (m, d)) -> (m, d)``.
         """
-        n, d = target_flat.shape
+        n = target_flat.shape[0]
         mu = target_flat.mean(dim=0, keepdim=True)  # (1, d)
-        centered = target_flat - mu
-        # Empirical covariance (Bessel-corrected) + diagonal shrinkage so the
-        # inverse exists even when target samples are identical/degenerate.
-        cov = centered.t() @ centered / max(n - 1, 1)  # (d, d)
-        eye = torch.eye(d, device=target_flat.device, dtype=target_flat.dtype)
-        cov = cov + self.target_score_reg * eye
-        precision = torch.linalg.inv(cov)  # (d, d) = Σ⁻¹
+        u = (target_flat - mu) / math.sqrt(max(n - 1, 1))  # (n, d)
+        gamma = self.target_score_reg
+        eye_n = torch.eye(n, device=target_flat.device, dtype=target_flat.dtype)
+        small = u @ u.t() + gamma * eye_n  # (n, n)
 
         def score_fn(x: torch.Tensor) -> torch.Tensor:
-            return -(x - mu) @ precision
+            xc = x - mu  # (m, d)
+            coeff: torch.Tensor = torch.linalg.solve(small, (xc @ u.t()).t()).t()  # (m, n)
+            return -(xc - coeff @ u) / gamma
 
         return score_fn
 
@@ -166,7 +177,9 @@ class SteinDiscrepancyLoss(nn.Module):
             return total / max(n_valid, 1)
         return total
 
-    def _differentiable_ksd2(self, samples: torch.Tensor, score_fn) -> torch.Tensor:
+    def _differentiable_ksd2(
+        self, samples: torch.Tensor, score_fn: Callable[[torch.Tensor], torch.Tensor]
+    ) -> torch.Tensor:
         r"""In-graph KSD² mirroring the metric's IMQ Stein-kernel U-statistic.
 
         Identical math to

@@ -2191,3 +2191,80 @@ def test_conftest_detector_flags_the_real_file_when_its_loader_is_dropped() -> N
     assert loader in shipped, f"plant is stale: {loader} no longer ships"
     offenders = _unshipped_conftest_imports(shipped - {loader}, repo_root)
     assert any(loader in o for o in offenders), f"detector missed the drop: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# The docs gate: a published page may not name a path the export does not carry
+#
+# Non-negotiable 16 -- existing capability, unwired. ``check_docs_paths_exist.py``
+# was written for this tree ("it bites hardest in an exported tree") and had never
+# once run against one. Its only callers were in the *published* pr-required.yml,
+# which triggers ``on: pull_request:``, and spectramr receives snapshots as direct
+# pushes to ``main`` (non-negotiable 21). The one lane that ran it could not fire
+# on the artifact it was written for.
+#
+# Both directions are planted. A gate watched only failing may be one that always
+# fails; a gate watched only passing is the vacuous green this repo has now hit
+# three times (an empty argv, a hard-coded scan root, a missing scan root).
+# --------------------------------------------------------------------------- #
+
+_DEAD_COMMAND_PAGE = "Rebuild the tables:\n\n.. code-block:: bash\n\n   python scripts/rebuild.py\n"
+
+
+def _with_docs(repo: Path, body: str, *also: str) -> None:
+    """Commit a docs page into the fixture, plus any file it cites."""
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "guide.rst").write_text(body)
+    staged = ["docs/guide.rst"]
+    for rel in also:
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/usr/bin/env python3\n")
+        staged.append(rel)
+    _git("add", *staged, cwd=repo)
+    _git("commit", "-qm", "docs", cwd=repo)
+
+
+def test_a_shipped_page_naming_a_dead_command_path_fails_the_export(
+    repo: Path, tmp_path: Path
+) -> None:
+    _with_docs(repo, _DEAD_COMMAND_PAGE)  # scripts/rebuild.py exists nowhere
+    proc = _export(repo, _allowlist(tmp_path, "docs/"), tmp_path / "out")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "scripts/rebuild.py" in proc.stdout
+    assert "COMMAND" in proc.stdout
+
+
+def test_the_same_page_is_clean_once_the_cited_file_ships(repo: Path, tmp_path: Path) -> None:
+    """The gate must be able to pass, or its failure says nothing."""
+    _with_docs(repo, _DEAD_COMMAND_PAGE, "scripts/rebuild.py")
+    proc = _export(repo, _allowlist(tmp_path, "docs/", "scripts/"), tmp_path / "out")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_a_page_citing_a_file_the_allowlist_denies_still_fails(repo: Path, tmp_path: Path) -> None:
+    """The shape only an export can exhibit, and the reason this runs here.
+
+    The cited file EXISTS in the private tree, so running the gate against the
+    checkout is green. It is not allowlisted, so the published page points at
+    nothing. No check that scans the working tree can see this -- which is why
+    the gate takes its root as an argument and why the call site is the export.
+    """
+    _with_docs(repo, _DEAD_COMMAND_PAGE, "scripts/rebuild.py")
+    assert (repo / "scripts" / "rebuild.py").is_file(), "the plant needs the file to exist privately"
+    proc = _export(repo, _allowlist(tmp_path, "docs/"), tmp_path / "out")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "scripts/rebuild.py" in proc.stdout
+    assert not (tmp_path / "out" / "scripts" / "rebuild.py").exists()
+
+
+def test_an_export_shipping_no_prose_says_so_rather_than_claiming_a_check(
+    repo: Path, tmp_path: Path
+) -> None:
+    """An export with no page has nothing to check, and must say which branch it
+    took. A silent skip is the vacuous green; an announced one is not. The shape
+    where docs were MEANT to ship and did not is owned by the dead-allowance
+    check instead -- every ``docs/`` allowance would read as dead (17)."""
+    proc = _export(repo, _allowlist(tmp_path, "src/"), tmp_path / "out")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "docs gate  : skipped" in proc.stdout

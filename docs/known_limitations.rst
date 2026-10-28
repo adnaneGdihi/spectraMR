@@ -12,39 +12,9 @@ it, because these counts drift.
 
 .. note::
 
-   This page is **hand-maintained**, not generated. Nothing recomputes it, so a
-   fixed limitation will linger here until someone deletes the entry. Each item
-   names a tracking issue; the issue, not this page, is the source of truth for
-   whether it is still open.
-
-Environment
-===========
-
-Most documented environment variables are read by nothing in this package
---------------------------------------------------------------------------
-
-:doc:`environment_variables` documents **71** variables in the ``SPECTRAMR_*`` /
-``SIM2RANK_*`` families. **48 of those names appear nowhere in the shipped
-package at all** -- 36 ``SIM2RANK_*`` belonging to the meta-evaluation batch
-pipeline, and 12 ``SPECTRAMR_*`` test- and CI-harness knobs. Nothing here can read
-them, so setting one has no effect.
-
-This is absence rather than inertness, and the distinction matters: the 48 are
-not knobs this package reads and ignores, they are knobs whose *reader* is a
-script that is not distributed. The remaining 23 names do appear in the package;
-that a name appears is not by itself proof it is read on any particular path, so
-treat the 23 as "possible" rather than "verified wired".
-
-The same is true one level up. The page's "Script-scoped variables" table has 110
-rows citing 28 distinct scripts, and 27 of those 28 are absent here. The rows are
-kept deliberately -- they record how the published results were produced -- but
-they are a description of the maintainers' cluster workflow, not an interface.
-
-To re-measure, from the root of a checkout::
-
-    grep -rhoE '\b(SPECTRAMR|SIM2RANK)_[A-Z0-9_]{2,}' docs | sort -u > /tmp/documented
-    grep -rhoE '\b(SPECTRAMR|SIM2RANK)_[A-Z0-9_]{2,}' src  | sort -u > /tmp/present
-    comm -23 /tmp/documented /tmp/present | wc -l      # -> 48
+   This page is **hand-maintained**, not generated. Nothing recomputes it, so an
+   entry can outlive the limitation it describes. Where an entry gives a command,
+   that command -- not this page -- is the current answer.
 
 Documentation
 =============
@@ -52,17 +22,25 @@ Documentation
 Commands in the documentation are checked against the tree, prose references are not
 -------------------------------------------------------------------------------------
 
-``scripts/ci/check_docs_paths_exist.py`` fails on any *pasteable* command in
-``docs/`` that names a repository path the tree does not contain, and the
-published tree passes it with zero findings. Prose references are reported by the
-same gate but do not fail it, and **342 of them remain**: sentences that cite a
-file for provenance -- "this knob is read at ``scripts/sim2rank/style.py``" --
-where the file is maintainer-side and not published.
+``scripts/ci/check_docs_paths_exist.py`` fails on any *pasteable* command that
+names a repository path this tree does not contain — across ``docs/`` and the
+root-level pages alike. This tree passes it with **zero command findings**, and
+building the distribution runs the same check, so a release cannot ship one.
 
-Those citations are accurate about where the code lives; they are simply not
-paths you can open in your own checkout. They were left rather than stripped
-because removing them would lose the provenance without gaining anything a reader
-can act on. To list them::
+Prose references are reported by the same gate, and do not block a release: the
+distribution build runs it as ``--commands-only``, which fails on commands alone.
+Run without that flag -- the form printed below -- it counts prose references too
+and exits nonzero, so a nonzero exit there is the report, not a broken tree.
+
+They fall in two classes. One is provenance: a sentence naming where a piece of
+code lives, accurate about the repository it lives in but not a path you can open
+in this one. Those were left rather than stripped, because removing them loses
+the provenance without giving a reader anything to act on. The other is a genuine
+gap -- a page describing a maintainer workflow whose helper script is not part of
+this distribution.
+
+So read a prose path as a pointer rather than as something you can run, and check
+it against the tree before relying on it. The gate prints the current list::
 
     python scripts/ci/check_docs_paths_exist.py
 
@@ -146,12 +124,12 @@ Twenty-one schema classes accept *any* key
 as an untyped extra field that nothing validates and nothing reads. A typo
 becomes a carried value rather than an error.
 
-One of them is open by design: ``TrainingSettings.metadata`` accepts any key
-because the corpus carries roughly 60 free-form ones (``note``, ``group``,
-``marker_source``, ...) that are prose for a human reader, and rejecting them
-would fail the config-load gate on most arms for no gain. Its ``status`` field
-is closed, which is the half that matters: a free-text status is how ~190 arms
-came to admit an unimplemented mechanism in words nothing read.
+One of them is open by design: ``TrainingSettings.metadata`` accepts any key,
+because configs carry free-form ones (``note``, ``group``, ``marker_source``,
+...) that are prose for a human reader, and rejecting them would fail the
+config-load gate for no gain. Its ``status`` field is closed, which is the half
+that matters: a free-text status lets an arm admit an unimplemented mechanism in
+words nothing reads.
 
 Twenty-one classes reachable from a config are ``extra="allow"``:
 
@@ -209,48 +187,27 @@ presets are named ``baseline_*.yaml``. The example in
 Do not build on this module. Load configuration from a YAML file instead, which
 is the path everything else uses.
 
-Tracked as issue #1563.
+Continuous integration runs a reduced lane
+------------------------------------------
 
-Continuous integration does not run
------------------------------------
+``.github/workflows/`` ships and executes: ``pr-required.yml`` fires on pull
+requests, and its blocking jobs are ``lint-diff``, ``guards``, ``hygiene``,
+``architecture``, ``unit-collect``, ``physics`` and ``security``, aggregated by
+``required`` -- the single context branch protection asks for. That list is
+pinned against the workflow file by ``tests/unit/ci/test_workflow_triggers.py``.
 
-``.github/workflows/`` ships and **does** execute here. This section previously said
-the opposite -- "none of it executes, GitHub Actions is disabled for this project" --
-which was true when this repository was created and is no longer: Actions is enabled,
-and ``pr-required.yml`` fires on real pull requests.
+The lane is smaller than the framework's checks would allow, because some of them
+have no subject here: a YAML-audit tier needs an experiment corpus this
+distribution does not ship (see below), and a gate that cannot see its subject is
+removed rather than left to report success.
 
-Its blocking jobs are ``lint-diff``, ``guards``, ``hygiene``, ``architecture``,
-``unit-collect``, ``physics`` and ``security``, aggregated by ``required`` -- the
-single context branch protection asks for.
+**Pushing a version tag publishes.** ``release.yml`` triggers on ``push:`` of a
+``v*`` tag and uploads to PyPI through Trusted Publishing. That is not a local,
+reversible act, and PyPI never re-issues a filename it has already seen. Push the
+commit first, confirm the lane is green, and tag only when you intend to release.
 
-That job set describes the lane published **here**, and it is not the private tree's
-copy of the same filename. The two differ in which jobs exist rather than in a value
-inside one: the private lane carries a YAML-audit tier that scans an experiment corpus
-this distribution does not ship, and reaches guard scripts that are not distributed
-either. Reading either lane's shape off the other is how the sentence this paragraph
-replaces came to advertise a YAML-audit tier that has never run in this repository,
-beside a guard-script count belonging to the other tree. The job list above is now
-pinned against the workflow file by ``tests/unit/ci/test_workflow_triggers.py``, in
-whichever of the two trees it is read.
-
-Read the correction rather than only the conclusion, because the retired sentence was
-load-bearing in one dangerous place: it described ``release.yml`` as "tag-triggered and
-equally inert, so a first publish needs ``python -m build && twine upload`` by hand".
-``release.yml`` triggers on ``push:`` of a ``v*`` tag and publishes to PyPI through
-Trusted Publishing. With Actions enabled, **pushing a version tag publishes** -- it is
-not a local, reversible act, and PyPI never re-issues a filename it has already seen.
-Push the commit first, confirm the lane is green, and tag only when you intend to
-release.
-
-Note which repository each statement is about. Actions is disabled on the private
-research repository, which is why ``make gate`` exists there: it *derives* the local
-lane by parsing ``pr-required.yml`` rather than restating it. That is a property of
-that tree, not of this one, and a claim carried across the two is how this section
-came to be wrong. ``tests/unit/ci/test_workflow_triggers.py`` takes the workflows as
-its subject in both.
-
-This is stated here rather than left to be inferred from a badge. Run the lane
-yourself:
+``make gate`` runs the same lane locally: it *derives* it by parsing
+``pr-required.yml`` rather than restating it, so the two cannot drift.
 
 .. code-block:: console
 
@@ -400,58 +357,28 @@ The experiment corpus is not published
 --------------------------------------
 
 
-The private research tree carries 647 experiment configurations under
-``experiments/inprogress/``. Those are not part of this release: they encode one
-site's data layout, cluster allocation and in-flight research arms, and several
-reference datasets whose licences do not permit redistribution of derived data.
+The experiment corpus this framework was developed against is not part of this
+release: those configurations encode one site's data layout and cluster
+allocation, and several reference datasets whose licences do not permit
+redistribution of derived data.
 
-What ships instead is a single file: ``experiments/templates/comprehensive_config_template.yaml``. **No exemplar arm ships at all** -- the
-template is the only worked configuration in the published tree, and it is a
-template rather than an arm that was run. Writing a new configuration against it
-is possible; reading a known-good arm that produced a published result is not.
+What ships is ``experiments/templates/comprehensive_config_template.yaml`` and
+three baseline arms under ``experiments/inprogress/``. The template is a template
+rather than an arm that was run: writing a new configuration against it is
+possible; reading a known-good arm that produced a published result is not.
 
-The two remaining files under ``experiments/templates/`` are withheld on purpose
-rather than overlooked: a template is *copied*, so one that does not parse is
-worse than an absent one -- the reader's first act inherits the defect. Both were
+The other files under ``experiments/templates/`` are withheld on purpose rather
+than overlooked: a template is *copied*, so one that does not parse is worse than
+an absent one -- the reader's first act inherits the defect. What ships was
 measured with ``spectramr audit``, not assumed.
-
-**Consequence:** a handful of test gates in the private tree exist to check that
-corpus, and cannot be meaningful without it. They are removed here rather than
-shipped, per the rule that a gate which can no longer see its subject is deleted,
-not left in to report success. The removed gates are:
-
-.. code-block:: text
-
-    tests/unit/config/test_dead_legacy_key_spellings.py
-    tests/unit/utils/test_config_load_baseline.py
-    tests/smoke/test_config_validation.py
-    tests/smoke/test_deep_config_integrity.py
-    tests/smoke/test_vf_smoke.py
-    tests/audit/test_experiment_yaml_syntax.py
-
-Leaving them in was measured, not assumed. Against an empty corpus they produce
-6 failures, 16 passes and 4 skips, and the empty input reaches them in three
-different shapes -- only one of which is silent:
-
-* an explicit anti-vacuity guard fires, e.g. *"cohort directory is empty -- the
-  guard would be vacuous"*. Loud, and the correct design.
-* ``@pytest.mark.parametrize`` over an empty list, which pytest reports as
-  ``got empty parameter set``. Skipped, and visible.
-* a ``for config_path in ALL_CONFIGS:`` loop **inside the test body**. The loop
-  never executes, no assertion runs, and the test passes. One file reports seven
-  green tests having validated nothing.
-
-The third shape is the reason these are removed rather than left to sort
-themselves out: it is indistinguishable from a real pass in any CI summary.
 
 Cluster and scheduler integration is unconfigured
 -------------------------------------------------
 
 
 The SLURM submission helpers generate batch scripts but ship with **no default
-account, partition or mail address**. This is deliberate. An earlier revision
-carried one site's allocation name as the default; a placeholder such as
-``--account=your-account`` would be worse than the leak, because SLURM rejects an
+account, partition or mail address**. This is deliberate. A placeholder such as
+``--account=your-account`` would be worse than an omission, because SLURM rejects an
 unknown account outright, whereas an omitted ``#SBATCH --account`` directive lets
 the scheduler apply the submitter's own default.
 
@@ -467,8 +394,8 @@ more specialised ones read quantities from the training batch that no shipped da
 pipeline emits -- ``T1_map``, ``brain_mask``, ``gradient_waveform``,
 ``resonance_params``, ``deformation_field`` and others.
 
-Measured with an internal batch-key census, not published with this release: **59**
-such keys, of which 55 have a read site in ``src/``. What happens when the key is
+A static census of the shipped source finds **59** such keys, of which 55 have a
+read site in ``src/``. What happens when the key is
 absent is not uniform, and the difference is the whole point:
 
 * **23** raise. The absence is loud, the run stops, and the message names the key.
@@ -483,8 +410,7 @@ emits those keys, which is a data-layer integration this release does not includ
 Treat those paradigms as reference implementations to build against, not as paths
 that run end to end on the shipped example arms.
 
-At least one case is worse than an inactive term, and is filed rather than fixed:
-the QSM pipeline substitutes an all-ones brain mask when none is supplied and runs
+At least one case is worse than an inactive term: the QSM pipeline substitutes an all-ones brain mask when none is supplied and runs
 three physics operators on it, which produces a susceptibility map that is undefined
 rather than approximate.
 
@@ -493,18 +419,17 @@ cannot distinguish a training batch from any other local named ``batch``, which 
 why it is a report and not a CI gate; and its own worst category -- a mechanism
 running on a fabricated value -- reads ``0`` while at least one instance exists,
 because it inspects only the default argument of ``.get()`` and not a fabrication in
-the following statement. Both the QSM case and the census blind spot have tracking
-issues.
+the following statement.
 
 Issue references in history and docstrings do not resolve
 ---------------------------------------------------------
 
 
 This repository begins at a single initial commit. Rationale comments throughout
-the source cite issue and pull-request numbers from the private tree in which the
-work was done -- roughly 386 distinct numbers across 585 files. Those numbers do
-not correspond to issues here, and GitHub will autolink ``#N`` to whatever issue
-or PR happens to hold that number in this repository.
+the source cite issue and pull-request numbers from the tracker the work was done
+in -- roughly 386 distinct numbers across 585 files. Those numbers do not
+correspond to issues here, and GitHub will autolink ``#N`` to whatever issue or PR
+happens to hold that number in this repository.
 
 They are kept rather than stripped because the surrounding sentence is usually the
 only record of *why* a non-obvious piece of code is shaped the way it is, and a

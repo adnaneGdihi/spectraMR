@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import math
 import pathlib
+import sys
+import types
 
 import pytest
 
@@ -181,6 +183,59 @@ def test_compute_ssim_map_genuine_nan_input_still_propagates():
     assert not torch.isfinite(out).all(), "a genuine NaN input must surface"
 
 
+def _phantom_on_background() -> torch.Tensor:
+    """A textured square on zero background covering 75 % of the slice (#2274)."""
+    g = torch.Generator().manual_seed(0)
+    x = torch.zeros(2, 1, 96, 96)
+    x[:, :, 24:72, 24:72] = torch.rand(2, 1, 48, 48, generator=g) * 0.8 + 0.1
+    return x
+
+
+class TestSSIMIdentityOnBackground:
+    """SSIM(x, x) is exactly 1 on flat background (#2274).
+
+    An extra ``+1e-8`` in the denominator was the size of ``C1*C2`` at
+    ``data_range=1`` (8.1e-8), so every flat window scored 0.89 against itself.
+    """
+
+    def test_map_is_one_on_flat_windows(self) -> None:
+        from spectramr.core.metrics.evaluation_metrics import compute_ssim_map, gaussian_kernel
+
+        x = _phantom_on_background()
+        window = gaussian_kernel(11, 1.5, torch.device("cpu"))
+        ssim_map = compute_ssim_map(x, x, window, 11, data_range=1.0)
+        assert torch.allclose(ssim_map, torch.ones_like(ssim_map), atol=1e-6)
+
+    def test_metric_is_one(self) -> None:
+        from spectramr.core.metrics.evaluation_metrics import SSIMMetric
+
+        x = _phantom_on_background()
+        assert float(SSIMMetric(data_range=1.0).compute_metric(x, x)) == pytest.approx(1.0, abs=1e-6)
+
+    def test_loss_is_zero(self) -> None:
+        from spectramr.models.losses.ssim_loss import MSSSIMLoss, SSIMLoss
+
+        x = _phantom_on_background()
+        assert float(SSIMLoss()(x, x)) <= 1e-6
+        assert float(MSSSIMLoss()(x, x)) <= 1e-6
+
+    def test_all_zero_pair_is_one_not_nan(self) -> None:
+        from spectramr.core.metrics.evaluation_metrics import SSIMMetric
+        from spectramr.models.losses.ssim_loss import SSIMLoss
+
+        z = torch.zeros(1, 1, 32, 32)
+        assert float(SSIMMetric().compute_metric(z, z)) == 1.0
+        assert float(SSIMLoss()(z, z)) == 0.0
+
+    def test_non_positive_data_range_raises(self) -> None:
+        from spectramr.core.metrics.evaluation_metrics import compute_ssim_map, gaussian_kernel
+
+        x = _phantom_on_background()
+        window = gaussian_kernel(11, 1.5, torch.device("cpu"))
+        with pytest.raises(ValueError, match="data_range must be > 0"):
+            compute_ssim_map(x, x, window, 11, data_range=0.0)
+
+
 def test_nrmse_normalizes_by_measured_target_range() -> None:
     """NRMSE must divide RMSE by the target's actual (max - min) range.
 
@@ -234,11 +289,15 @@ def test_torchmetrics_backbone_built_once_and_cached(
 
     _FakeBackbone.n_constructed = 0
     monkeypatch.setattr(em, "TORCHMETRICS_AVAILABLE", True)
-    # raising=False: when torchmetrics is not installed, the real backbone name
-    # was never bound at import time (it lives inside a guarded try-import), so
-    # the fake must be *created* on the module, not merely replaced. Injecting the
-    # fake is the whole point of this test (see the comment above the class).
-    monkeypatch.setattr(em, backbone_attr, _FakeBackbone, raising=False)
+    # The backbone is imported lazily from torchmetrics.image at construction, so
+    # a stand-in package in sys.modules is what the import resolves to (works
+    # whether or not torchmetrics is installed).
+    fake_image = types.ModuleType("torchmetrics.image")
+    setattr(fake_image, backbone_attr, _FakeBackbone)
+    fake_pkg = types.ModuleType("torchmetrics")
+    fake_pkg.image = fake_image
+    monkeypatch.setitem(sys.modules, "torchmetrics", fake_pkg)
+    monkeypatch.setitem(sys.modules, "torchmetrics.image", fake_image)
 
     metric = getattr(em, cls_name)()
     impl = metric._impl
@@ -246,8 +305,8 @@ def test_torchmetrics_backbone_built_once_and_cached(
     # Exactly one backbone was constructed at __init__ time.
     assert _FakeBackbone.n_constructed == 1
 
-    p = torch.zeros(1, 1, 8, 8)
-    t = torch.zeros(1, 1, 8, 8)
+    p = torch.zeros(1, 1, 176, 176)  # above ms_ssim's 161 px floor
+    t = torch.zeros(1, 1, 176, 176)
     metric.compute_metric(p, t)
     metric.compute_metric(p, t)
 
@@ -1018,3 +1077,48 @@ class TestPSNRIsGradedPerSample:
             and node.func.attr in {"item", "tolist", "cpu", "numpy"}
         ]
         assert syncs == [], f"host sync reintroduced into PSNR.compute_metric: {syncs}"
+
+
+def test_power_spectrum_radial_profile_matches_per_bin_loop() -> None:
+    """The scatter-based profile equals the per-bin, per-sample mask loop it replaced."""
+    import torch
+
+    from spectramr.core.metrics.evaluation_metrics import PowerSpectrumConsistency
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    torch.manual_seed(0)
+    m = PowerSpectrumConsistency(num_bins=12)
+    img = torch.randn(3, 2, 33, 40)
+    power = (torch.abs(fft2c(img)) ** 2).mean(dim=1)
+    H, W = img.shape[-2:]
+    cy, cx = H // 2, W // 2
+    yy, xx = torch.meshgrid(torch.arange(H) - cy, torch.arange(W) - cx, indexing="ij")
+    r = torch.sqrt(xx**2 + yy**2).float()
+    edges = torch.linspace(0, min(cy, cx), 13)
+    ref = torch.zeros(3, 12)
+    for i in range(12):
+        mask = (r >= edges[i]) & (r < edges[i + 1])
+        for b in range(3):
+            if mask.sum() > 0:
+                ref[b, i] = power[b][mask].mean()
+    torch.testing.assert_close(m.radial_profile(img), ref, rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 1, 64, 64), (1, 1, 128, 128), (1, 1, 192, 192, 16), (1, 1, 16, 192, 192)],
+)
+def test_ms_ssim_declares_images_below_the_scale_floor_not_applicable(shape) -> None:
+    from spectramr.core.metrics.outcome import MetricNotApplicableError, NotApplicableReason
+
+    ms_ssim = MetricsRegistry.get("ms_ssim")
+    x = torch.rand(*shape)
+    with pytest.raises(MetricNotApplicableError) as exc:
+        ms_ssim.compute_metric(x, x)
+    assert exc.value.reason == NotApplicableReason.IMAGE_TOO_SMALL_FOR_METRIC
+
+
+def test_ms_ssim_still_scores_a_large_enough_image() -> None:
+    ms_ssim = MetricsRegistry.get("ms_ssim")
+    x = torch.rand(1, 1, 176, 176)
+    assert float(ms_ssim.compute_metric(x, x)) == pytest.approx(1.0, abs=1e-4)

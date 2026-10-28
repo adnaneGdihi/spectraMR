@@ -100,6 +100,7 @@ def test_run_summary_folds_in_provenance_and_timing(tmp_path: Path) -> None:
         "training_time": "01:02:05",
         "duration_sec": 3725.0,
         "iterations_per_sec": 4.2,
+        "train_iterations_per_sec": 9.5,
         "final_loss": 0.12,
     }
     started = datetime(2026, 6, 11, 20, 5, 0).astimezone()
@@ -123,6 +124,7 @@ def test_run_summary_folds_in_provenance_and_timing(tmp_path: Path) -> None:
     assert parsed["duration"] == "01:02:05"
     assert parsed["duration_sec"] == 3725.0
     assert parsed["iterations_per_sec"] == 4.2
+    assert parsed["train_iterations_per_sec"] == 9.5
     assert parsed["final_loss"] == 0.12
     assert parsed["started_at"].startswith("2026-06-11T20:05:00")
     assert parsed["ended_at"]  # stamped at write time
@@ -249,3 +251,46 @@ def test_run_summary_soft_fails_on_bad_dir(tmp_path: Path) -> None:
         config, run_dir=bad_path, result={"success": True}, seed=0, logger_=logger_stub
     )
     assert warnings, "soft-fail must emit a warning so the issue is discoverable"
+
+
+def test_a_failed_best_weights_restore_is_stamped(tmp_path: Path) -> None:
+    """restore_best_weights that failed leaves the LAST weights in the final checkpoint;
+    the summary says so instead of the warning being the only record."""
+    from spectramr.pipelines.train import _emit_run_summary
+
+    logger_stub = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    config = SimpleNamespace(
+        logging=block_stub("logging", run_name="r"),
+        training=SimpleNamespace(strategy_class="x.Y"),
+        model=SimpleNamespace(model_type="m"),
+        metadata=None,
+    )
+    for restored in (True, False, None):
+        result = {"success": True, "best_weights_restored": restored}
+        _emit_run_summary(config, run_dir=tmp_path, result=result, seed=1, logger_=logger_stub)
+        parsed = json.loads((tmp_path / "run_summary.json").read_text())
+        assert parsed["best_weights_restored"] is restored
+
+
+@pytest.mark.parametrize("validate_only, warned", [(False, True), (True, False)])
+def test_empty_checkpoint_dir_warns_only_for_a_run_that_trains(
+    tmp_path: Path, validate_only: bool, warned: bool
+) -> None:
+    """#503 flags a training run that saved nothing; a validate-only run never saves."""
+    from spectramr.pipelines.train import _emit_run_summary
+
+    warnings: list[str] = []
+    logger_stub = SimpleNamespace(
+        info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a[0])
+    )
+    (tmp_path / "checkpoints").mkdir()
+    config = SimpleNamespace(
+        logging=block_stub("logging", run_name="r"),
+        training=SimpleNamespace(strategy_class="x.Y"),
+        model=SimpleNamespace(model_type="m"),
+        metadata=None,
+        checkpoint=SimpleNamespace(enabled=True),
+    )
+    result = {"success": True, "validate_only": validate_only}
+    _emit_run_summary(config, run_dir=tmp_path, result=result, seed=1, logger_=logger_stub)
+    assert any("#503" in w for w in warnings) is warned

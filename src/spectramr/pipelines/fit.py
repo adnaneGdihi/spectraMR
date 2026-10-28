@@ -190,8 +190,6 @@ _PARADIGM_ALIASES: dict[str, str] = {
     # Exact ``DiffusionTrainingStrategy`` class.
     "flow_matching": "diffusion",
     "rectified_flow": "diffusion",
-    "fisher_rao_flow": "diffusion",
-    "levy_diffusion": "diffusion",
     "resetting_diffusion": "diffusion",
     "tissue_diffusion_pretrain": "diffusion",
     # Distinct subclasses with a byte-identical ``training.diffusion`` contract

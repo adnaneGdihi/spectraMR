@@ -18,6 +18,9 @@ class MockGenerator(nn.Module):
         self.enc_c = MagicMock(return_value=torch.randn(1, 4, 32, 32))
         self.enc_s = MagicMock()
         self.gen = MagicMock(return_value=torch.randn(1, 1, 32, 32))
+        # validation decodes through decode_tissue(content, condition_style(style, label)).
+        self.decode_tissue = MagicMock(return_value=torch.randn(1, 1, 32, 32))
+        self.condition_style = MagicMock(side_effect=lambda s, label: s)
         self.reparameterize = MagicMock(return_value=torch.randn(1, 4, 1, 1))
 
     def forward(self, x):
@@ -46,6 +49,7 @@ def test_validation_step_vae_tuple_handling(tmp_path):
 
     # Mock State and Generator
     mock_self.env.generator = MockGenerator(use_vae=True)
+    mock_self.inner_for_call = lambda model, name: model  # single-process (#2629)
     mu = torch.randn(1, 4, 1, 1)
     logvar = torch.randn(1, 4, 1, 1)
     mock_self.env.generator.enc_s.return_value = (mu, logvar)
@@ -92,8 +96,8 @@ def test_validation_step_vae_tuple_handling(tmp_path):
     # 4. Assertions
     model = mock_self.env.generator
     assert model.reparameterize.called
-    assert model.gen.called
-    args, _ = model.gen.call_args
+    assert model.decode_tissue.called
+    args, _ = model.decode_tissue.call_args
     assert torch.is_tensor(args[1]), "Generator received tuple instead of tensor"
     print("--- Passed test_validation_step_vae_tuple_handling ---")
 

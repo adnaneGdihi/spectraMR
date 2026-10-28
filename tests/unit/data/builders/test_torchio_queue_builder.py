@@ -10,6 +10,7 @@ import pytest
 import torch
 import torchio as tio
 
+from spectramr.data.builders.prefetching_queue import PrefetchingQueue
 from spectramr.data.builders.torchio_queue_builder import (
     TorchIOQueueBuilder,
     TorchIOQueueConfig,
@@ -744,3 +745,93 @@ class TestTrainQueueZeroBatchGuard:
             "the guard never consulted len() -- this test would pass with the "
             "zero-batch guard removed entirely"
         )
+
+
+# ── #2673: the train queue's subject loader prefetches one refill ─────────────
+
+
+class TestTrainQueueSubjectPrefetch:
+    """``build_train_queue`` must return a queue whose live subject loader carries
+    the resolved ``prefetch_factor``. The planted case swaps in the plain
+    ``tio.Queue`` (torch's default of 2) and shows the same check turns red."""
+
+    @staticmethod
+    def _dataset() -> tio.SubjectsDataset:
+        return tio.SubjectsDataset(
+            [tio.Subject(image=tio.ScalarImage(tensor=torch.rand(1, 8, 8, 1))) for _ in range(6)]
+        )
+
+    @staticmethod
+    def _config(**overrides) -> TorchIOQueueConfig:
+        # 16 / 2 = 8 subjects per refill over 2 workers -> auto resolves to 4.
+        base = {
+            "queue_length": 16,
+            "samples_per_volume": 2,
+            "patch_size": (4, 4, 1),
+            "batch_size": 2,
+            "num_workers": 2,
+        }
+        return TorchIOQueueConfig(**{**base, **overrides})
+
+    @staticmethod
+    def _assert_subject_prefetch(queue: tio.Queue, expected: int) -> None:
+        iterator = queue._subjects_iterable
+        try:
+            assert isinstance(queue, PrefetchingQueue), type(queue).__name__
+            assert iterator._prefetch_factor == expected
+        finally:
+            iterator._shutdown_workers()
+
+    def test_train_queue_subject_loader_gets_resolved_prefetch(self):
+        queue, _ = TorchIOQueueBuilder.build_train_queue(self._dataset(), self._config())
+        assert queue.subject_prefetch == 4
+        self._assert_subject_prefetch(queue, 4)
+
+    def test_explicit_subject_prefetch_reaches_the_loader(self):
+        queue, _ = TorchIOQueueBuilder.build_train_queue(
+            self._dataset(), self._config(subject_prefetch=3)
+        )
+        self._assert_subject_prefetch(queue, 3)
+
+    def test_zero_workers_passes_no_prefetch(self):
+        queue, _ = TorchIOQueueBuilder.build_train_queue(
+            self._dataset(), self._config(num_workers=0)
+        )
+        assert isinstance(queue, PrefetchingQueue)
+        assert queue.subject_prefetch is None
+        assert queue._subjects_iterable._num_workers == 0
+
+    def test_planted_plain_tio_queue_fails_the_check(self, monkeypatch):
+        import spectramr.data.builders.torchio_queue_builder as builder_mod
+
+        def plain_queue(*args, subject_prefetch, **kwargs):
+            return tio.Queue(*args, **kwargs)
+
+        monkeypatch.setattr(builder_mod, "PrefetchingQueue", plain_queue)
+        queue, _ = TorchIOQueueBuilder.build_train_queue(self._dataset(), self._config())
+        assert queue._subjects_iterable._prefetch_factor == 2
+        with pytest.raises(AssertionError):
+            self._assert_subject_prefetch(queue, 4)
+
+    def test_resolution_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="spectramr.data.builders.torchio_queue_builder"):
+            queue, _ = TorchIOQueueBuilder.build_train_queue(self._dataset(), self._config())
+        queue._subjects_iterable._shutdown_workers()
+        assert "declared='auto', resolved=4 per worker x 2 worker(s)" in caplog.text
+
+    @pytest.mark.parametrize("bad", ["fast", 0, True])
+    def test_config_rejects_unknown_subject_prefetch(self, bad):
+        with pytest.raises(ValueError, match="subject_prefetch"):
+            TorchIOQueueConfig(subject_prefetch=bad)
+
+    def test_from_training_config_threads_subject_prefetch(self):
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        default = TorchIOQueueConfig.from_training_config(DataConfigSchema())
+        explicit = TorchIOQueueConfig.from_training_config(
+            DataConfigSchema(sampling={"subject_prefetch": 6})
+        )
+        assert default.subject_prefetch == "auto"
+        assert explicit.subject_prefetch == 6

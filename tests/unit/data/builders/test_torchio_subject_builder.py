@@ -770,3 +770,56 @@ class TestBuilderDoesNotNormalize:
         }
         subject = b.build({"primary_path": "k.h5"})
         assert torch.allclose(subject["kspace_scale"], torch.tensor(1.0))
+
+
+class TestFastMRIImageDomainCropOrPad:
+    """``data.processing.image_domain_crop_or_pad`` reaches the served k-space."""
+
+    @staticmethod
+    def _builder(primary: dict, size=(8, 8)) -> FastMRISubjectBuilder:
+        io = MagicMock()
+        io.load.return_value = primary
+        return FastMRISubjectBuilder(primary_io=io, image_domain_crop_or_pad=size)
+
+    @staticmethod
+    def _oversampled_kspace() -> torch.Tensor:
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        torch.manual_seed(0)
+        image = torch.complex(torch.randn(3, 16, 12), torch.randn(3, 16, 12))
+        return image, fft2c(image)
+
+    def test_the_input_and_target_carry_the_centre_of_the_image(self):
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        image, kspace = self._oversampled_kspace()
+        subject = self._builder({"kspace": kspace}).build(
+            {"primary_path": "file_brain_AXT2_0.h5", "slice_index": 0}
+        )
+
+        served = subject["kspace"].data
+        assert served.shape == (3, 8, 8, 1)
+        torch.testing.assert_close(
+            ifft2c(served[..., 0]), image[:, 4:12, 2:10], atol=1e-5, rtol=1e-5
+        )
+        assert torch.equal(subject["target"].data, served)
+
+    def test_an_image_record_is_refused(self):
+        with pytest.raises(ValueError, match="served an image"):
+            self._builder({"data": torch.randn(16, 12)}).build({"primary_path": "x.h5"})
+
+    def test_a_stored_mask_is_refused(self):
+        _, kspace = self._oversampled_kspace()
+        builder = self._builder({"kspace": kspace, "mask": torch.ones(12)})
+        with pytest.raises(ValueError, match="stored sampling mask"):
+            builder.build({"primary_path": "x.h5", "slice_index": 0})
+
+    def test_a_malformed_size_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="image_domain_crop_or_pad"):
+            self._builder({}, size=(8,))
+
+    def test_the_dataset_hands_the_size_to_its_builder(self):
+        from spectramr.data.datasets.universal_dataset import UniversalMRIDataset
+
+        dataset = UniversalMRIDataset(index=[], image_domain_crop_or_pad=(320, 320))
+        assert dataset.subject_builder.image_domain_crop_or_pad == (320, 320)

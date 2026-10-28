@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch as _torch
@@ -16,9 +17,11 @@ import yaml as _yaml
 
 from spectramr.cli.app import build_parser, main, predict
 from spectramr.config.overrides import apply_overrides
+from spectramr.config.schemas.logging import LoggingConfigSchema
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.execution_ledger import ExecutionLedger
 from spectramr.models.registry import register_model as _register_model
+from tests.fixtures.run_state_files import write_run_state
 from tests.unit.config.test_settings import _minimal_config
 
 
@@ -211,6 +214,34 @@ def test_predict_with_config_delegates_to_ssot(monkeypatch):
     assert captured["device"] == "cpu"
 
 
+def test_predict_forwards_the_acceleration_rung(monkeypatch):
+    """``--acceleration`` parses and reaches the pipeline (#2883, non-negotiable 8)."""
+    from spectramr.cli.app import build_parser
+
+    args = build_parser().parse_args(
+        ["predict", "--model", "best.pt", "--input", "data/", "--acceleration", "4"]
+    )
+    assert args.acceleration == 4.0
+    assert build_parser().parse_args(["predict", "-m", "m.pt", "-i", "x"]).acceleration is None
+
+    captured = {}
+    monkeypatch.setattr(
+        "spectramr.pipelines.infer.run_inference_pipeline",
+        lambda **kwargs: captured.update(kwargs) or {"status": "ok"},
+        raising=True,
+    )
+    ns = _argparse.Namespace(
+        model=_Path("best.pt"),
+        input=_Path("data/"),
+        output=_Path("out/"),
+        config=_minimal_config_path(),
+        device="cpu",
+        acceleration=4.0,
+    )
+    assert predict(ns) == 0
+    assert captured["acceleration"] == 4.0
+
+
 def test_predict_runs_the_inference_preamble(monkeypatch):
     """``predict``'s docstring claimed parity with ``infer``; it had none of it.
 
@@ -289,12 +320,30 @@ def test_export_onnx_branch_dispatches_through_onnxexporter(monkeypatch, tmp_pat
     real_sample = torch.zeros(1, 1, 8, 8)
     model = torch.nn.Conv2d(1, 1, 3, padding=1)
 
-    monkeypatch.setattr("torch.load", lambda *a, **k: {"model": model}, raising=True)
+    class _Builder:
+        def __init__(self, config, device):
+            pass
+
+        def build_generator(self):
+            return self
+
+        def validate(self):
+            return self
+
+        def build(self):
+            return {"generator": model}
+
     monkeypatch.setattr(
-        "spectramr.config.settings.TrainingSettings.from_yaml",
-        lambda *a, **k: object(),
+        "spectramr.infrastructure.validation.inference_settings.resolve_inference_settings",
+        lambda *a, **k: (SimpleNamespace(logging=LoggingConfigSchema()), {}),
         raising=True,
     )
+    monkeypatch.setattr(
+        "spectramr.infrastructure.training.builders.model_builder.ModelBuilder",
+        _Builder,
+        raising=True,
+    )
+    ckpt = write_run_state(tmp_path / "best.pt", {"generator": model.state_dict()})
     monkeypatch.setattr(
         "spectramr.shared.utils.data_utils.get_sample_batch",
         lambda *a, **k: real_sample,
@@ -315,7 +364,7 @@ def test_export_onnx_branch_dispatches_through_onnxexporter(monkeypatch, tmp_pat
 
     monkeypatch.setattr("spectramr.exports.onnx.ONNXExporter", _SpyExporter, raising=True)
 
-    ns = _argparse.Namespace(model=tmp_path / "best.pt", format="onnx", config=tmp_path / "c.yaml")
+    ns = _argparse.Namespace(model=ckpt, format="onnx", config=tmp_path / "c.yaml")
     rc = app.export(ns)
 
     assert rc == 0
@@ -455,14 +504,14 @@ logging: {}
 
 
 # ---------------------------------------------------------------------------
-# export() model construction — routed onto ModelBuilder + resolve_state_dict.
+# export() model construction — routed onto ModelBuilder + checkpointing.weights().
 #
 # `export` used to read `checkpoint.get("model", checkpoint)` and bail with
 #
 #     "Error: Checkpoint contains state_dict, not model. Cannot export."
 #
 # on anything that was not a pickled nn.Module. That is every ordinary training
-# checkpoint this repo writes (`checkpoint_director` emits `{"generator": ...}`),
+# checkpoint this repo writes (the weights sit under a `generator` part),
 # so the verb did not work on the artifacts it exists to consume. `--config` is
 # `required=True`, so the architecture was available the whole time.
 #
@@ -520,20 +569,37 @@ class TestExportBuildsTheModelTheConfigDeclares:
             raising=True,
         )
 
-    def _run(self, monkeypatch, tmp_path, payload):
+    @staticmethod
+    def _weights_calls(src: str) -> list[tuple[object, object]]:
+        """``(part, policy)`` of every ``weights(...)`` call, read off the AST."""
+        import ast
+
+        calls = []
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "weights":
+                part = node.args[1].value if len(node.args) > 1 else None
+                policy = next((k.value.value for k in node.keywords if k.arg == "policy"), None)
+                calls.append((part, policy))
+        return calls
+
+    def test_export_loads_the_generator_part_exactly(self) -> None:
+        """An export ships the trained generator, all of it: neither the EMA shadow nor a partial load."""
+        app_py = _Path(__file__).resolve().parents[3] / "src" / "spectramr" / "cli" / "app.py"
+        assert self._weights_calls(app_py.read_text()) == [("generator", "exact")]
+
+    def _run(self, monkeypatch, tmp_path, models):
         import argparse as _ap
 
         import spectramr.cli.app as app
 
         calls: dict = {}
         self._spy_exporter(monkeypatch, calls)
-        ckpt = tmp_path / "checkpoint_best.pt"
-        _torch.save(payload, ckpt)
+        ckpt = write_run_state(tmp_path / "best.pt", models)
         rc = app.export(_ap.Namespace(model=ckpt, format="onnx", config=self._arm(tmp_path)))
         return rc, calls
 
-    def test_a_generator_envelope_exports(self, monkeypatch, tmp_path):
-        """The envelope `checkpoint_director` actually writes (#1310)."""
+    def test_a_run_state_exports(self, monkeypatch, tmp_path):
+        """The file the training writer produces: its ``generator`` part is exported."""
         ref = _ExportWitness(in_channels=3, out_channels=3)
         rc, calls = self._run(monkeypatch, tmp_path, {"generator": ref.state_dict()})
 
@@ -580,61 +646,25 @@ class TestExportBuildsTheModelTheConfigDeclares:
 
         assert rc == 1
         assert "model" not in calls, "a partially-loaded model reached the exporter"
-        # The REASON matters: the pre-fix code also returned 1 here, but only
-        # because it refused every non-pickled checkpoint. Naming the missing
-        # key is what proves the load was attempted and rejected on its merits.
+        # Naming the missing key proves the load was attempted and rejected on its
+        # merits, not refused for some other reason.
         assert any("conv.bias" in r.getMessage() for r in caplog.records), (
             f"the refusal did not name the missing key: {[r.getMessage() for r in caplog.records]}"
         )
 
-    def test_an_unrecognised_envelope_is_refused(self, monkeypatch, tmp_path, caplog):
-        """Zero overlap raises in `resolve_state_dict` — no fifth reader guesses."""
+    def test_a_file_without_a_generator_is_refused(self, monkeypatch, tmp_path, caplog):
+        """Only the generator is exported; another part is never substituted for it."""
         import logging
 
         caplog.set_level(logging.ERROR, logger="spectramr.cli.app")
-        rc, calls = self._run(monkeypatch, tmp_path, {"totally": {"unrelated": 1}})
+        ref = _ExportWitness(in_channels=3, out_channels=3)
+        rc, calls = self._run(monkeypatch, tmp_path, {"discriminator": ref.state_dict()})
 
         assert rc == 1
         assert "model" not in calls
-        # Same discrimination as above: the shared reader's own words, not the
-        # blanket "Cannot export" the pre-fix code emitted for everything.
-        assert any("shares zero parameter names" in r.getMessage() for r in caplog.records), (
+        assert any("has no part 'generator'" in r.getMessage() for r in caplog.records), (
             f"the refusal came from somewhere else: {[r.getMessage() for r in caplog.records]}"
         )
-
-    def test_a_pickled_module_is_used_as_is(self, monkeypatch, tmp_path):
-        """Branch order: older exports hold a module, and must not be rebuilt."""
-        import argparse as _ap
-
-        import spectramr.cli.app as app
-
-        calls: dict = {}
-        self._spy_exporter(monkeypatch, calls)
-
-        built = {"n": 0}
-
-        def _no_build(*a, **k):
-            built["n"] += 1
-            raise AssertionError("a pickled module must not be rebuilt")
-
-        monkeypatch.setattr(
-            "spectramr.infrastructure.training.builders.model_builder.ModelBuilder.__init__",
-            _no_build,
-            raising=True,
-        )
-        pickled = _ExportWitness(in_channels=3, out_channels=3)
-        _torch.nn.init.constant_(pickled.conv.weight, 0.125)
-        ckpt = tmp_path / "legacy.pt"
-        _torch.save({"model": pickled}, ckpt)
-
-        rc = app.export(_ap.Namespace(model=ckpt, format="onnx", config=self._arm(tmp_path)))
-
-        assert built["n"] == 0, "the pickled module was rebuilt from the config"
-        assert rc == 0
-        # `torch.load` returns a copy, so identity cannot hold -- what must hold
-        # is that the exported module IS the checkpoint's, weights and all.
-        assert type(calls["model"]) is _ExportWitness
-        assert _torch.equal(calls["model"].conv.weight, pickled.conv.weight)
 
 
 # --------------------------------------------------------------------------
@@ -753,3 +783,198 @@ def test_bulk_audit_builds_the_same_report_as_the_single_arm_audit(tmp_path, mon
     args = argparse.Namespace(config=tmp_path, json=False, strict=True, exclude=None, probe=False)
     app._audit_bulk(args)
     assert seen == [str(arm)]
+
+
+# ------------------------------------------------------------- --val-batches
+
+
+class TestValBatchesFlag:
+    """``--val-batches`` on the two verbs that run a training-time validation.
+
+    The flag is sugar for an override, and the lowering happens once in
+    ``_dispatch_training`` -- so these assert the *observable* result (what lands
+    in ``args.override``), not that a helper was called.
+    """
+
+    @pytest.mark.parametrize("verb", ["train", "sanity_check"])
+    def test_both_training_verbs_accept_it(self, verb):
+        args = build_parser().parse_args(
+            [verb, "--config", "c.yaml", "--val-batches", "2"]
+        )
+        assert args.val_batches == 2
+
+    @pytest.mark.parametrize("verb", ["train", "sanity_check"])
+    def test_it_defaults_to_none_so_a_plain_run_is_unchanged(self, verb):
+        args = build_parser().parse_args([verb, "--config", "c.yaml"])
+        assert args.val_batches is None
+
+    def _dispatch(self, monkeypatch, argv):
+        """Parse ``argv`` and run the dispatcher with the bootstrap stubbed out."""
+        import spectramr.main as _main
+
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            _main, "train_command", lambda a: seen.update(override=a.override)
+        )
+        monkeypatch.setattr(
+            _main, "sanity_check_command", lambda a: seen.update(override=a.override)
+        )
+        args = build_parser().parse_args(argv)
+        args.func(args)
+        return seen["override"]
+
+    @pytest.mark.parametrize(
+        ("verb", "flag"), [("train", "--val-batches"), ("sanity_check", "--val-batches")]
+    )
+    def test_dispatch_lowers_it_onto_the_key_the_framework_reads(
+        self, monkeypatch, verb, flag
+    ):
+        overrides = self._dispatch(
+            monkeypatch, [verb, "--config", "c.yaml", flag, "3"]
+        )
+        assert overrides == ["validation.loader.num_batches=3"]
+
+    def test_it_composes_with_an_unrelated_override(self, monkeypatch):
+        overrides = self._dispatch(
+            monkeypatch,
+            ["train", "--config", "c.yaml", "-O", "training.max_iterations=5",
+             "--val-batches", "1"],
+        )
+        assert overrides == [
+            "training.max_iterations=5",
+            "validation.loader.num_batches=1",
+        ]
+
+    def test_without_the_flag_no_override_is_invented(self, monkeypatch):
+        assert self._dispatch(monkeypatch, ["train", "--config", "c.yaml"]) is None
+
+    def test_conflicting_with_an_explicit_override_raises(self, monkeypatch):
+        with pytest.raises(ValueError, match=r"conflicts with the override"):
+            self._dispatch(
+                monkeypatch,
+                ["train", "--config", "c.yaml",
+                 "-O", "validation.loader.num_batches=9", "--val-batches", "1"],
+            )
+
+    def test_the_override_it_emits_survives_the_real_loader(self):
+        """The lowering is only worth anything if `apply_overrides` accepts it."""
+        settings = TrainingSettings(**_minimal_config())
+        updated = apply_overrides(settings, ["validation.loader.num_batches=2"])
+        assert updated.validation.loader.num_batches == 2
+
+
+def test_train_parser_accepts_validate_only_and_the_dispatcher_forwards_it(monkeypatch):
+    """``--validate-only`` is a train flag that reaches ``main.train_command`` as a bool."""
+    import spectramr.cli.app as app
+    import spectramr.main as main_mod
+
+    ns = build_parser().parse_args(["train", "--config", "a.yaml", "--validate-only"])
+    assert ns.validate_only is True
+    assert build_parser().parse_args(["train", "--config", "a.yaml"]).validate_only is False
+
+    seen = {}
+    monkeypatch.setattr(main_mod, "train_command", lambda args: seen.update(vars(args)))
+    monkeypatch.setattr(main_mod, "sanity_check_command", lambda args: None)
+    assert app._dispatch_training(ns, is_sanity_check=False) == 0
+    assert seen["validate_only"] is True
+
+
+def test_train_distributed_parser_accepts_validate_only_and_forwards_it(monkeypatch):
+    """The sharded arms launch through ``train-distributed``; the flag must reach it too."""
+    import spectramr.cli.app as app
+    import spectramr.pipelines.distributed as distributed_mod
+
+    ns = build_parser().parse_args(["train-distributed", "--config", "a.yaml", "--validate-only"])
+    assert ns.validate_only is True
+    seen = {}
+    monkeypatch.setattr(
+        distributed_mod,
+        "run_distributed_training",
+        lambda **kw: seen.update(kw) or {"success": True},
+    )
+    assert app.train_distributed(ns) == 0
+    assert seen["validate_only"] is True and seen["config_path"] == "a.yaml"
+
+
+class TestTrainDistributedExitCode:
+    """The pipeline reports most failures by returning ``success=False``, not by raising.
+
+    ``train_distributed`` used to discard the result and return 0, so under ``torchrun`` a
+    resume that found no checkpoint or a pipeline that refused to build exited 0 and a Slurm
+    script went on to report "Training completed". ``spectramr train`` already applied the rule.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, result):
+        import spectramr.cli.app as app
+        import spectramr.pipelines.distributed as distributed_mod
+
+        ns = build_parser().parse_args(["train-distributed", "--config", "a.yaml"])
+        monkeypatch.setattr(distributed_mod, "run_distributed_training", lambda **kw: result)
+        return app.train_distributed(ns)
+
+    def test_a_successful_result_exits_zero(self, monkeypatch):
+        assert self._run(monkeypatch, {"success": True}) == 0
+
+    def test_planted_a_failed_result_exits_nonzero(self, monkeypatch, caplog):
+        """The probe run: 'Resume failed' was returned, not raised, and exited 0."""
+        with caplog.at_level("ERROR"):
+            code = self._run(
+                monkeypatch, {"success": False, "error": "Resume failed: no checkpoint found"}
+            )
+        assert code == 1
+        assert "no checkpoint found" in caplog.text
+
+    @pytest.mark.parametrize("result", [None, {}, {"success": 1}, {"success": "yes"}, "ok"])
+    def test_only_an_explicit_true_is_success(self, monkeypatch, result):
+        """An absent or truthy-but-not-True flag is unknown, not a pass (#181)."""
+        assert self._run(monkeypatch, result) == 1
+
+
+@pytest.mark.parametrize("torchrun", [False, True])
+def test_infer_test_split_runs_a_validate_only_pass_on_the_checkpoint(monkeypatch, tmp_path, torchrun):
+    """`infer --test-split` is the route a `test_pass: infer` arm's test set is scored by."""
+    import spectramr.cli.app as app
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(app, "train", lambda a: seen.update(entry="train", args=a) or 0)
+    monkeypatch.setattr(app, "train_distributed", lambda a: seen.update(entry="dist", args=a) or 0)
+    if torchrun:
+        monkeypatch.setenv("WORLD_SIZE", "1")
+    else:
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+    arm = tmp_path / "arm.yaml"
+    arm.write_text(
+        _yaml.safe_dump(
+            {
+                "training": {"output_dir": "experiments/results/arm"},
+                "metrics": {"output_dir": "experiments/results/arm/metrics"},
+            }
+        )
+    )
+    run_dir = tmp_path / "campaigns" / "c" / "arm"
+    ckpt = run_dir / "checkpoints" / "step_00000010.safetensors"
+    args = build_parser().parse_args(
+        ["infer", "--checkpoint", str(ckpt), "--config", str(arm), "--test-split"]
+    )
+    assert args.func(args) == 0
+    assert seen["entry"] == ("dist" if torchrun else "train")
+    run = seen["args"]
+    assert run.validate_only and run.resume == str(ckpt) and run.config == str(arm)
+    routed = dict(o.split("=", 1) for o in run.override)
+    assert routed["training.output_dir"] == str(run_dir)
+    assert routed["metrics.output_dir"] == str(run_dir / "metrics")
+
+
+def test_infer_test_split_refuses_without_a_config():
+    args = build_parser().parse_args(["infer", "--checkpoint", "c.safetensors", "--test-split"])
+    with pytest.raises(SystemExit, match="needs --config"):
+        args.func(args)
+
+
+def test_infer_test_split_refuses_a_checkpoint_outside_a_run(tmp_path):
+    args = build_parser().parse_args(
+        ["infer", "--checkpoint", str(tmp_path / "c.safetensors"), "-c", "a.yaml", "--test-split"]
+    )
+    with pytest.raises(SystemExit, match="checkpoints/"):
+        args.func(args)

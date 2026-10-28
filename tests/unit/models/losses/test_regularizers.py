@@ -47,3 +47,32 @@ def test_hermitian_loss_is_differentiable() -> None:
     loss = HermitianSymmetryLoss(normalize=False)(kspace)
     loss.backward()
     assert real_image.grad is not None
+
+
+@pytest.mark.parametrize("shape", [(15, 15), (15, 16), (16, 17), (16, 16)])
+def test_real_image_kspace_is_hermitian_on_odd_and_even_axes(shape: tuple[int, int]) -> None:
+    """An odd axis pairs i with N-1-i (a plain flip); cropping it to even shifted DC."""
+    real_image = torch.randn(2, 1, *shape, generator=torch.Generator().manual_seed(0))
+    loss = HermitianSymmetryLoss(normalize=True)(fft2c(real_image))
+    assert loss.item() < 1e-10
+
+
+def test_patch_low_rank_accepts_half_precision_amp_outputs() -> None:
+    """The SVD has no fp16 kernel; a half input is upcast rather than raising."""
+    from spectramr.models.losses.regularizers import PatchLowRankLoss
+
+    x = torch.rand(1, 1, 16, 16, generator=torch.Generator().manual_seed(0))
+    loss_fn = PatchLowRankLoss(patch_size=4)
+    torch.testing.assert_close(loss_fn(x.half()), loss_fn(x.half().float()))
+
+
+def test_kspace_l1_sparsity_of_zero_kspace_is_zero_with_finite_gradient() -> None:
+    """The magnitude floor keeps the gradient finite without biasing the value."""
+    from spectramr.models.losses.regularizers import KspaceL1SparsityLoss
+
+    for x in (torch.zeros(2, 2, 8, 8), torch.zeros(2, 1, 8, 8, dtype=torch.complex64)):
+        x.requires_grad_(True)
+        out = KspaceL1SparsityLoss()(x)
+        out.backward()
+        assert out.item() < 1e-10
+        assert x.grad is not None and torch.isfinite(torch.view_as_real(x.grad) if x.is_complex() else x.grad).all()

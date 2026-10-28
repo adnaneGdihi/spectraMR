@@ -168,7 +168,10 @@ class RiemannianMRFDiffusionStrategy(BaseTrainingStrategy):
                 "operation is wanted it should be a declared config mode, not "
                 "an accident of a missing dict key."
             )
-        self._declare_model_input({"theta_noisy": theta_noisy, "sigma": sigma})
+        self._declare_model_input(
+            {"theta_noisy": theta_noisy, "sigma": sigma},
+            extra={"model_input_key": "theta_noisy"},
+        )
         score = self.generator_model(theta_noisy, sigma, fingerprint)
         target_score = -noise / sigma.view(-1, 1).clamp_min(1e-6)
         loss = F.mse_loss(score, target_score)

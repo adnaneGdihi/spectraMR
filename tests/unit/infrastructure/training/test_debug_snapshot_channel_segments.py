@@ -92,7 +92,7 @@ def _phantom_and_maps() -> tuple[torch.Tensor, torch.Tensor]:
             for cx, cy in centres
         ]
     ).unsqueeze(0)
-    # `_estimate_smaps_cached` RSS-normalises the maps; keep that, it is what
+    # `_estimate_smaps_from_acs` RSS-normalises the maps; keep that, it is what
     # pins the image-domain half at O(1) while compressed k-space sits near 0.
     maps = maps / torch.sqrt((maps.abs() ** 2).sum(1, keepdim=True) + 1e-8)
     return brain, maps
@@ -392,7 +392,17 @@ def _render_calls(monkeypatch) -> list[tuple[torch.Tensor, bool, bool]]:
         seen.append((t, in_kspace, log_scaled))
         return real(t, in_kspace=in_kspace, authoritative=authoritative, log_scaled=log_scaled)
 
+    import spectramr.infrastructure.training.snapshot_coil_maps as scm
+
+    real_grid = scm.render_coil_map_grid
+
+    # Coil-map segments render through the per-coil grid, with the same flags.
+    def _grid_spy(t, *, in_kspace=False, log_scaled=False):
+        seen.append((t, in_kspace, log_scaled))
+        return real_grid(t, in_kspace=in_kspace, log_scaled=log_scaled)
+
     monkeypatch.setattr(ds, "_render_image_preview", _spy)
+    monkeypatch.setattr(scm, "render_coil_map_grid", _grid_spy)
     return seen
 
 

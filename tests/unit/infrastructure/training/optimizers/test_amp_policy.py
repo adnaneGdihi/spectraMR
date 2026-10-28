@@ -157,3 +157,75 @@ class TestItDelegatesRatherThanReimplements:
 
         src = inspect.getsource(AMPPolicy.should_use_amp)
         assert "bool(config.optimization.precision.enabled)" not in src
+
+
+class TestAStepThatTrainsNothingRaises:
+    """#2309: the pre-backward guard reads only ``loss.grad_fn``, so a severed
+    loss that went through one more op reached backward and stepped nothing.
+    Each shape below is a planted violation the post-backward check must catch.
+    """
+
+    class _Helper:
+        scaler = None
+
+        @staticmethod
+        def get_autocast_context():
+            import contextlib
+
+            return contextlib.nullcontext()
+
+    def _run(self, make_loss, *, gas: int = 1, steps: int = 1):
+        import torch
+
+        from spectramr.infrastructure.training.optimizers.amp_policy import AMPPolicy
+        from spectramr.infrastructure.training.step_executor import StepExecutor
+
+        model = torch.nn.Linear(3, 1)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        executor = StepExecutor(self._Helper(), AMPPolicy(), gradient_accumulation_steps=gas)
+        for step in range(steps):
+            executor.execute_step(
+                {"optimizer": opt, "closure": lambda: make_loss(model), "model": model, "name": "g"},
+                epoch=0,
+                global_step=step,
+            )
+        return model
+
+    @staticmethod
+    def _severed_leaf():
+        import torch
+
+        return torch.tensor(1.0, requires_grad=True)
+
+    def test_a_weighted_severed_leaf_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(RuntimeError, match="received a gradient"):
+            self._run(lambda m: self._severed_leaf() * 0.5)
+
+    def test_a_python_sum_over_a_severed_leaf_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(RuntimeError, match="received a gradient"):
+            self._run(lambda m: sum([self._severed_leaf()]))
+
+    def test_it_raises_at_the_accumulation_boundary(self) -> None:
+        import pytest
+
+        with pytest.raises(RuntimeError, match="received a gradient"):
+            self._run(lambda m: self._severed_leaf() * 0.5, gas=2, steps=2)
+
+    def test_a_connected_loss_steps(self) -> None:
+        import torch
+
+        torch.manual_seed(0)
+        start = torch.nn.Linear(3, 1).weight.detach().clone()
+        torch.manual_seed(0)
+        model = self._run(lambda m: (m(torch.ones(2, 3)) ** 2).mean(), steps=3)
+        assert not torch.allclose(model.weight.detach(), start)
+
+    def test_a_zero_weighted_connected_loss_is_not_a_severed_one(self) -> None:
+        """A weight of 0 still reaches every parameter: zero gradients, not none."""
+        import torch
+
+        self._run(lambda m: 0.0 * (m(torch.ones(2, 3)) ** 2).mean(), steps=2)

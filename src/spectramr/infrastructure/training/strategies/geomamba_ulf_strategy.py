@@ -42,6 +42,10 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
+from spectramr.infrastructure.physics.ulf_unwarp import UlfUnwarp
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.loss_folding import declared_loss_weights
 
@@ -56,6 +60,17 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
     :attr:`spectramr.infrastructure.training.strategy_factory.TrainingStrategyFactory.STRATEGY_CLASS_PATHS`
     under the short name ``"geomamba_ulf"``.
     """
+
+    # parallel_compat: The uncertainty weights are an owned module, built in __init__ when
+    # enabled and run via call_owned. The SFC linearizer broadcasts rank 0's curve itself.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        geo = getattr(getattr(config, "training", None), "geomamba_ulf", None)
+        on = bool(getattr(getattr(geo, "uncertainty", None), "enabled", False))
+        own = (("_uncertainty_loss", OWNED_MODULE),) if on else ()
+        return (*super().owned_module_declarations(config), *own)
 
     #: Loss ownership (cohort review 2026-09-03). The three terms are computed
     #: here, and nothing else declared on ``losses.image_losses`` reaches the
@@ -99,6 +114,12 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         self._topology_warmup_epochs = (
             int(getattr(topo_cfg, "warmup_epochs", 0)) if topo_cfg is not None else 0
         )
+        # The declared PH knobs; _get_ph_loss builds the loss from them.
+        self._topology_cfg = topo_cfg
+        self._topology_provenance: dict[str, Any] = {}
+        # Physical unwarp of the input. Built only when the block is declared, so an
+        # arm without it trains as before.
+        self._ulf_unwarp = self._build_ulf_unwarp(geo_cfg)
 
         # Lazy-construct the topology losses on first use to defer any
         # gudhi/POT import cost (and to make the strategy importable
@@ -137,6 +158,7 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
             )
             if self.device is not None:
                 self._uncertainty_loss = self._uncertainty_loss.to(self.device)
+            self.register_owned_module("_uncertainty_loss", self._uncertainty_loss)
             # Register the learnable per-contrast log-sigma weights with opt_g
             # so the P2 uncertainty weighting actually trains (it was created
             # but never moved to device nor handed to any optimizer).
@@ -146,6 +168,23 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
                 new_params = [p for p in self._uncertainty_loss.parameters() if p not in existing]
                 if new_params:
                     opt.add_param_group({"params": new_params, "lr": 1e-3})
+
+    @staticmethod
+    def _build_ulf_unwarp(geo_cfg: Any) -> UlfUnwarp | None:
+        """Build the unwarp from ``training.geomamba_ulf.unwarp`` when it is declared."""
+        if geo_cfg is None or "unwarp" not in getattr(geo_cfg, "model_fields_set", ()):
+            return None
+        return UlfUnwarp(geo_cfg.unwarp)
+
+    def _prepare_input(self, input_batch: torch.Tensor, batch: Any) -> torch.Tensor:
+        """The model's input after the physical unwarp.
+
+        The one place the unwarp is applied. Validation must call it too, so
+        training and validation see the same correction.
+        """
+        if self._ulf_unwarp is None:
+            return input_batch
+        return self._ulf_unwarp.apply(input_batch, batch)
 
     def _apply_metric_sfc_config(self, geo_cfg: Any) -> None:
         """Push ``config.training.geomamba_ulf.metric_sfc`` onto the generator.
@@ -161,8 +200,16 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         if metric_cfg is None:
             return
         model = getattr(self.env, "generator", None)
-        model = getattr(model, "module", model)  # unwrap DDP/EMA if present
+        model = unwrap_model(model)
         if model is None or not hasattr(model, "sfc_beta"):
+            # The block is default-filled; only an arm that wrote it expects it to act.
+            if "metric_sfc" in getattr(geo_cfg, "model_fields_set", ()):
+                raise ValueError(
+                    "training.geomamba_ulf.metric_sfc is declared, but the generator "
+                    f"{type(model).__name__} has no metric space-filling curve "
+                    "(no `sfc_beta`), so nothing would apply it (#1752). Remove the "
+                    "block or use a model with a metric SFC linearizer."
+                )
             return
         model.sfc_beta = float(getattr(metric_cfg, "beta", model.sfc_beta))
         model.sfc_smoothing_sigma = float(
@@ -194,7 +241,7 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         contrast_id = self._extract_contrast_id(batch, input_batch)
 
         prediction = model(
-            input_batch,
+            self._prepare_input(input_batch, batch),
             mask=mask,
             contrast_id=contrast_id,
         )
@@ -203,7 +250,8 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         # (P2) or vanilla foreground-masked L1 (v0/P0+P1 default).
         losses: dict[str, torch.Tensor] = {}
         if self._uncertainty_loss is not None:
-            loss_recon = self._uncertainty_loss(
+            loss_recon = self.call_owned(
+                "_uncertainty_loss",
                 prediction,
                 target_batch,
                 mask=mask,
@@ -237,29 +285,60 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
             losses["loss_cubical_ph_w2"] = loss_ph
             g_total_loss = g_total_loss + effective_ph_w2 * loss_ph
 
-        # Optional: Beltrami diagnostic on a 2-channel (u, v) residual. An
-        # undeclared or zero weight skips the term entirely (it is not logged).
+        # Optional: Beltrami on the model's displacement field. The head must be on:
+        # the old check on a 2-channel intensity output was never reachable.
         effective_beltrami = self._lambda_beltrami * warmup
         if effective_beltrami > 0:
-            if prediction.shape[1] != 2:
-                # The diagnostic reads a 2-channel (u, v) map; a 1-channel output
-                # cannot carry it. This used to be a silent skip, so every arm that
-                # declared the term at out_channels=1 advertised a regulariser that
-                # never computed (abl_beltrami_active, cohort review 2026-09-03).
+            displacement = getattr(unwrap_model(model), "last_displacement", None)
+            if displacement is None:
                 raise ValueError(
-                    "beltrami_diagnostic is weighted "
-                    f"{self._lambda_beltrami} but the model emits {prediction.shape[1]} "
-                    "channel(s); the diagnostic needs a 2-channel (u, v) map. Delete the "
-                    "entry or use a 2-channel head."
+                    f"beltrami_diagnostic is weighted {self._lambda_beltrami} but the model "
+                    "produced no displacement field. Set model.model_kwargs.displacement_head: "
+                    "true, or delete the beltrami_diagnostic entry."
                 )
-            bel_loss_module = self._get_beltrami_loss()
-            if bel_loss_module is not None:
-                loss_bel = bel_loss_module(prediction, target_batch)
-                losses["loss_beltrami_diagnostic"] = loss_bel
-                g_total_loss = g_total_loss + effective_beltrami * loss_bel
+            loss_bel = self._get_beltrami_loss()(prediction, displacement=displacement)
+            losses["loss_beltrami_diagnostic"] = loss_bel
+            g_total_loss = g_total_loss + effective_beltrami * loss_bel
 
         losses["g_total_loss"] = g_total_loss
         return losses
+
+    @torch.no_grad()
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Score the volume with its own contrast and brain mask, as training does.
+
+        FiLM and the foreground SFC both read the contrast and the mask, so the
+        default validation (which passes neither) scores a different model.
+        """
+        computer = self.validation_metrics_computer
+        if not computer.get_metric_names():
+            return {}
+        batch = batch_data if batch_data is not None else {}
+        input_batch = input_batch.to(self.device, non_blocking=True)
+        target_batch = target_batch.to(self.device, non_blocking=True)
+        mask = self._extract_mask(batch, input_batch)
+        contrast_id = self._extract_contrast_id(batch, input_batch)
+        if contrast_id is None and self._film_n_contrasts > 1:
+            raise ValueError(
+                "GeoMambaULF validation needs each volume's contrast_id/contrast_idx: "
+                f"film.n_contrasts={self._film_n_contrasts} and the batch carries neither. "
+                "Defaulting to contrast 0 would score the wrong FiLM parameters."
+            )
+        generator = self.env.generator
+        generator.eval()
+        output = generator(
+            self._prepare_input(input_batch, batch), mask=mask, contrast_id=contrast_id
+        )
+        metrics = self._score_validation_output(output, target_batch)
+        generator.train()
+        return metrics
 
     def _topology_warmup_factor(self, epoch: int) -> float:
         """Linear 0 → 1 ramp over the first ``warmup_epochs`` epochs."""
@@ -276,11 +355,32 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         if self._ph_loss is not None:
             return self._ph_loss
         try:
+            from spectramr.config.schemas.training.geomamba_ulf import TopologyConfig
             from spectramr.models.losses.cubical_ph_w2_loss import (
                 CubicalPHWassersteinLoss,
             )
 
-            self._ph_loss = CubicalPHWassersteinLoss()
+            topo = self._topology_cfg if self._topology_cfg is not None else TopologyConfig()
+            self._ph_loss = CubicalPHWassersteinLoss(
+                homology_dims=tuple(topo.ph_dimensions),
+                wasserstein_p=topo.wasserstein_p,
+                stratify_subvolumes=topo.stratify_subvolumes,
+            )
+            # Declared and applied side by side, so a reader can see a dropped knob.
+            self._topology_provenance = {
+                "cubical_ph_w2": {
+                    "declared": {
+                        "ph_dimensions": list(topo.ph_dimensions),
+                        "wasserstein_p": topo.wasserstein_p,
+                        "stratify_subvolumes": topo.stratify_subvolumes,
+                    },
+                    "applied": {
+                        "homology_dims": list(self._ph_loss.homology_dims),
+                        "wasserstein_p": self._ph_loss.wasserstein_p,
+                        "stratify_subvolumes": self._ph_loss.stratify_subvolumes,
+                    },
+                }
+            }
             return self._ph_loss
         except ImportError as exc:
             # Fail loud, do NOT warn-and-skip. This method is reached only when
@@ -297,6 +397,14 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
                 "set the cubical_ph_w2 weight to 0 to disable the PH term."
             ) from exc
 
+    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+        """Stamp the resolved PH knobs (pitfall 15) into the first-steps snapshot."""
+        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra.update(self._topology_provenance)
+        if self._ulf_unwarp is not None:
+            extra["unwarp"] = self._ulf_unwarp.provenance()
+        return extra
+
     def _get_beltrami_loss(self) -> torch.nn.Module | None:
         if self._beltrami_loss is not None:
             return self._beltrami_loss
@@ -310,7 +418,7 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
     @staticmethod
     def _extract_mask(batch: dict[str, Any], input_batch: torch.Tensor) -> torch.Tensor | None:
         for key in ("foreground_mask", "mask", "brain_mask"):
-            mask = batch.get(key)
+            mask = read_batch_field(batch, key)
             if mask is None:
                 continue
             if hasattr(mask, "data"):  # TorchIO Image-like
@@ -329,9 +437,7 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
         # ``contrast_id`` silently dropped the ``contrast_idx`` key the loaders
         # do emit, collapsing the model to the same (gamma, beta) for every
         # contrast. (nifti_paired emits neither yet — backlog item.)
-        cid = batch.get("contrast_id")
-        if cid is None:
-            cid = batch.get("contrast_idx")
+        cid = read_batch_field(batch, "contrast_id", "contrast_idx")
         if cid is None:
             return None
         if isinstance(cid, torch.Tensor):

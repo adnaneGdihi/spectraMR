@@ -32,11 +32,13 @@ plumbing) lives in the strategy.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.losses.mmd_loss import check_bandwidth_mode, pooled_gaussian_kernel_sum
 from spectramr.models.losses.registry import register_loss
 
 # Bounds in raw physical units (ms / ms / unitless).
@@ -83,7 +85,7 @@ class TissueParameterPhysicsConstraint(nn.Module):
         return (below.pow(2) + above.pow(2)).mean()
 
     def forward(
-        self, prediction: torch.Tensor, target: torch.Tensor | None = None, **kwargs
+        self, prediction: torch.Tensor, target: torch.Tensor | None = None, **kwargs: Any
     ) -> torch.Tensor:
         """Compute the constraint penalty.
 
@@ -127,7 +129,7 @@ class TissueParameterPriorSmoothness(nn.Module):
         self.weight = weight
 
     def forward(
-        self, prediction: torch.Tensor, target: torch.Tensor | None = None, **kwargs
+        self, prediction: torch.Tensor, target: torch.Tensor | None = None, **kwargs: Any
     ) -> torch.Tensor:
         if prediction.ndim < 4:
             raise ValueError(
@@ -147,66 +149,55 @@ class TissueParameterPriorSmoothness(nn.Module):
 class MMDPairedDistributionMatch(nn.Module):
     """Multi-kernel RBF MMD between two image distributions.
 
-    By default the MMD is computed in raw pixel space averaged over
-    spatial dimensions — this is sufficient for the calibration
-    backprop (PMPS Phase-2) when no foundation-model feature extractor
-    is wired. A future revision will let the caller pass in a VGG-style
-    feature extractor as a constructor arg.
+    By default the MMD is computed on flattened raw pixels; a
+    ``feature_extractor`` module passed to the constructor replaces them.
+    Under ``bandwidth_mode="median"`` (default) each bandwidth multiplies the
+    median pairwise distance of the pooled batch, so the kernel stays
+    informative at any image size; ``"absolute"`` uses the values as feature-space
+    distances, which on raw pixels collapse MMD to the constant ``2/B`` (#2277).
 
     The kernel bandwidth set follows Gretton et al. 2012: a
     multi-bandwidth (RBF) kernel is more robust to scale mismatch than
-    any single bandwidth. The MMD estimator is the unbiased U-statistic.
+    any single bandwidth. The estimator is the biased V-statistic
+    (diagonal kept), which stays defined for the two-sample calibration
+    batches this loss is used with.
     """
 
     def __init__(
         self,
         bandwidths: Sequence[float] = (0.5, 1.0, 2.0, 4.0),
         feature_extractor: nn.Module | None = None,
+        bandwidth_mode: str = "median",
     ) -> None:
         super().__init__()
         if not bandwidths:
             raise ValueError("bandwidths must be a non-empty sequence.")
-        self.register_buffer(
-            "_bandwidths",
-            torch.tensor(list(bandwidths), dtype=torch.float32),
-            persistent=False,
-        )
+        if any(b <= 0 for b in bandwidths):
+            raise ValueError(f"bandwidths must all be > 0; got {tuple(bandwidths)}")
+        self.bandwidths = tuple(float(b) for b in bandwidths)
+        self.bandwidth_mode = check_bandwidth_mode(bandwidth_mode)
         self.feature_extractor = feature_extractor  # may be None
 
     def _flatten_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.feature_extractor is not None:
-            feats = self.feature_extractor(x)
-        else:
-            feats = x
+        feats: torch.Tensor = self.feature_extractor(x) if self.feature_extractor is not None else x
         # Flatten (B, C, H, W) → (B, C*H*W) so MMD operates on per-sample
         # feature vectors.
         return feats.reshape(feats.shape[0], -1)
 
-    def _kernel_sum(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # Pairwise squared distances.
-        # x: (n, d), y: (m, d) → (n, m) distances.
-        xx = (x * x).sum(dim=1, keepdim=True)
-        yy = (y * y).sum(dim=1, keepdim=True)
-        d2 = xx + yy.t() - 2.0 * (x @ y.t())
-        d2 = d2.clamp_min(0.0)
-        # Average over bandwidths.
-        bws = self._bandwidths.to(d2.device, dtype=d2.dtype)
-        bws = bws.view(-1, 1, 1)
-        # k(x, y) = mean_b exp(-d2 / (2 b^2))
-        k = torch.exp(-d2.unsqueeze(0) / (2.0 * bws.pow(2))).mean(dim=0)
-        return k
-
-    def forward(self, prediction: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, prediction: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
         """MMD^2 between ``prediction`` and ``target`` mini-batches."""
         if prediction.ndim != 4 or target.ndim != 4:
             raise ValueError("MMDPairedDistributionMatch expects (B, C, H, W) tensors.")
         x = self._flatten_features(prediction)
         y = self._flatten_features(target)
-        k_xx = self._kernel_sum(x, x).mean()
-        k_yy = self._kernel_sum(y, y).mean()
-        k_xy = self._kernel_sum(x, y).mean()
-        # Unbiased estimator drops the diagonal; here we use the biased
-        # form for batch-size stability (small calibration batches).
+        n = x.shape[0]
+        kernel = pooled_gaussian_kernel_sum(x, y, self.bandwidths, self.bandwidth_mode)
+        kernel = kernel / len(self.bandwidths)
+        k_xx = kernel[:n, :n].mean()
+        k_yy = kernel[n:, n:].mean()
+        k_xy = kernel[:n, n:].mean()
         return (k_xx + k_yy - 2.0 * k_xy).clamp_min(0.0)
 
 
@@ -226,7 +217,9 @@ class PerPairConsistencyResidual(nn.Module):
             raise ValueError(f"norm must be 'l1' or 'l2'; got '{norm}'.")
         self.norm = norm
 
-    def forward(self, prediction: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, prediction: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
         if self.norm == "l1":
             return (prediction - target).abs().mean()
         return (prediction - target).pow(2).mean()

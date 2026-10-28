@@ -1,4 +1,4 @@
-.PHONY: format test test-all cov-unit cov-full test-coverage test-missing clean train predict eda eda-dry-run help install-topology env-show check-deps check-deps-imports test-precommit test-pr test-nightly test-release test-release-suite test-mutation diagnostics diagnostics-fast skill-health reachable dev-health gate
+.PHONY: format test test-all cov-unit cov-full test-coverage test-missing clean train predict eda eda-dry-run help install-topology install-mamba env-show check-deps check-deps-imports test-precommit test-pr test-nightly test-release test-release-suite test-mutation diagnostics diagnostics-fast skill-health reachable dev-health gate
 
 # -----------------------------------------------------------------------------
 # Environment-variable loading.
@@ -32,6 +32,7 @@ help:
 	@echo "make clean       - Remove pycache and temp files"
 	@echo "make train       - Train with default config (override: CONFIG=path/to.yaml; loads .env if present)"
 	@echo "make env-show    - Print every framework env var + its current value"
+	@echo "make install-mamba      - Build the mamba CUDA kernels for Volta+Ada (ARCH_LIST=7.0;8.9)"
 	@echo "make check-deps         - Verify declared deps are installed & version-correct (EXTRAS=mri,viz)"
 	@echo "make check-deps-imports - As above, plus import each (catches installed-but-unimportable)"
 	@echo "make eda-dry-run - Dataset EDA: cards + coverage only (no voxel load)"
@@ -39,18 +40,20 @@ help:
 	@echo "make eda-quick   - Dataset EDA with a small sample budget (2/dataset)"
 	@echo "make eda-dataset - Dataset EDA for a subset (DATASETS='id1 id2 ...')"
 	@echo "make gate        - Run the blocking PR lane locally (PASS/FAIL/UNRUNNABLE)"
-	@echo "make diagnostics      - Refresh diagnostics bundles (md summary + fresh forensics png)"
-	@echo "make diagnostics-fast - Refresh diagnostics bundles, logs/audit/metrics only (no forensics)"
+	@echo "make diagnostics      - Every diagnostic pass + the compiled bundle"
+	@echo "                        (snapshots, mosaics, forensics, Tier-0/1 audit, Tier-2 probe)"
+	@echo "make diagnostics-fast - Same minus the slow passes (no forensics/probe/mosaic)"
+	@echo "                        Selectors: ROOT=<tree> OUT=<bundle> COHORT='vf kspace_filling'"
 
 # Activate .venv when it exists (local dev) and stay silent when it does not (CI).
 # A hosted runner has no .venv, and an unconditional `. .venv/bin/activate &&` kills
 # the recipe on its first line -- `make test-nightly` never reached pytest.
 VENV := [ -f .venv/bin/activate ] && . .venv/bin/activate || true;
 
-# ruff format is the formatter SSOT: it is what .pre-commit-config.yaml runs and what
-# the pr-required lint gate checks against. black used to be invoked here despite
-# being declared in no extra of pyproject.toml, so the two fought over every file a
-# commit touched.
+# ruff format is the formatter SSOT: it is what the added-line gate checks an ADDED
+# file against, in the pre-commit hook and in pr-required alike. black used to be
+# invoked here despite being declared in no extra of pyproject.toml, so the two fought
+# over every file a commit touched.
 format:
 	ruff check --fix src/ tests/ || true
 	ruff format src/ tests/
@@ -206,13 +209,17 @@ train:
 # -- an inference run against a silently-wrong directory is worse than a stopped
 # one, and `predict` cannot guess what the reader wants reconstructed.
 INPUT ?=
+# The weights: MODEL=<checkpoint file>, or RUN=<run_dir>, whose best checkpoint (else its
+# latest step, of any format) is chosen by the one selection rule, resolve_checkpoint.
+MODEL ?=
+RUN ?=
 predict:
 	@test -n "$(INPUT)" || { echo "make predict needs INPUT=<dir-or-file>, e.g. make predict INPUT=path/to/kspace/"; exit 2; }
-	python -m spectramr.cli predict --config $(CONFIG) --model $(MODEL) --input $(INPUT)
-
-# Where `predict` looks for weights. Was hardcoded to checkpoints/best.pt, which
-# the training loop only writes once a run has completed.
-MODEL ?= checkpoints/best.pt
+	@test -n "$(MODEL)$(RUN)" || { echo "make predict needs MODEL=<checkpoint file> or RUN=<run_dir>"; exit 2; }
+	@model="$(MODEL)"; \
+	if [ -z "$$model" ]; then model="$$(python -m spectramr.cli.resolve_checkpoint "$(RUN)/checkpoints")" || exit 2; fi; \
+	echo python -m spectramr.cli predict --config $(CONFIG) --model "$$model" --input $(INPUT); \
+	python -m spectramr.cli predict --config $(CONFIG) --model "$$model" --input $(INPUT)
 
 benchmark:
 	python -m spectramr.cli benchmark --suite standard
@@ -247,21 +254,24 @@ eda-clean:
 	@echo "Cleaning EDA results..."
 	rm -rf experiments/results
 
-# Diagnostics bundles: tests_experiments/diagnostics (local dispatch) +
-# <cluster>_diagnostics (downloaded cluster tree, if present). `diagnostics`
-# always re-renders forensics (contact-sheet PNGs) so the md+png are current;
-# `diagnostics-fast` skips the (slower) image pass and only refreshes
-# logs/audit/run_summary/validation_metrics evidence. See
-# docs/validation_image_audit.rst#diagnostics_targetable_tree.
-#
-# Invoked by its own executable path (shebang-resolved by the kernel), NOT
-# `bash <path>` — the .env-loading block above mangles Make's exported PATH
-# for recipe shells (a pre-existing bug: `include .env` parses .env's bash
-# `export VAR=$(pwd)` syntax as Make syntax, where `$(pwd)`/`$VAR` mean
-# something different, corrupting PATH to "ART_TOOLBOX_PATH:ATH"), so a bare
-# `bash` lookup fails inside a recipe even though PATH looks fine outside `make`.
+# Diagnostics bundles. `diagnostics` runs every pass; `diagnostics-fast` drops
+# the three slow ones (forensics, Tier-2 probe, validation mosaic). Both are
+# invoked by the script's own executable path, NOT `bash <path>`: the .env block
+# above corrupts the PATH Make exports to recipe shells, so a bare `bash` lookup
+# fails inside a recipe even though PATH looks fine outside `make`.
+# See docs/validation_image_audit.rst#diagnostics_make_targets.
+
+# Empty by default, so a bare `make diagnostics` still refreshes the known trees.
+# COHORT takes inprogress names or aliases, resolved by scripts/cohort_membership.py.
+#   make diagnostics ROOT=sabine_tests_experiments OUT=sabine_diagnostics
+#   make diagnostics-fast COHORT="mamba geomamba"
+ROOT ?=
+OUT ?=
+COHORT ?=
+DIAG_ARGS := $(if $(ROOT),--root $(ROOT)) $(if $(OUT),--out $(OUT)) $(if $(COHORT),--cohort $(COHORT))
+
 diagnostics:
-	./scripts/ci/refresh_diagnostics.sh
+	./scripts/ci/refresh_diagnostics.sh $(DIAG_ARGS)
 
 # --- developer-loop health checks -------------------------------------------
 # Both are cheap, local, and exit non-zero on a finding, so they compose:
@@ -313,7 +323,7 @@ gate:
 	@$(PYTHON) scripts/ci/run_required_locally.py $(GATE_ARGS)
 
 diagnostics-fast:
-	./scripts/ci/refresh_diagnostics.sh --no-forensics
+	./scripts/ci/refresh_diagnostics.sh --no-forensics --no-probe --no-mosaic $(DIAG_ARGS)
 
 # Install cubical persistent homology + Wasserstein-2 backends
 # (gudhi, POT) used by the GeoMamba-ULF topology losses.
@@ -325,6 +335,14 @@ diagnostics-fast:
 # rather than pointing back at this command.
 install-topology:
 	pip install -e ".[topology]"
+
+# The `mamba` extra, built for the archs the clusters actually run. NOT the bare
+# `pip install -e '.[mamba]'`: upstream downloads a prebuilt wheel whose gencode
+# list has no sm_70, so a V100 dies at the first kernel launch while the install
+# reports success. The script forces a source build, appends the gencode flags
+# through nvcc itself, and reads the arch list back off the built .so.
+install-mamba:
+	@$(PYTHON) scripts/install_mamba_extra.py $(if $(ARCH_LIST),--arch-list "$(ARCH_LIST)",)
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 

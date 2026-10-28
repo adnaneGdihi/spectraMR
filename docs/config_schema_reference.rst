@@ -11,34 +11,6 @@ Every training run is driven by a single YAML file loaded once via
 loading the object is **frozen** (Pydantic ``frozen=True``) — no
 downstream code may mutate it.
 
-.. note::
-
-   **Why ``1.0`` comes after ``6.x``.** The number restarts at ``1.0``
-   deliberately. The 5.x/6.x lineage numbered a schema that no longer exists —
-   the 15-phase block decomposition rebuilt the layout underneath those names,
-   and nothing ever branched on the version anyway: it is validated, bound onto
-   ``run.config_version``, and read by no consumer. A version that gates nothing
-   but keeps incrementing is a changelog pretending to be a contract. ``1.0``
-   names the schema as it now is, once.
-
-   ``6.0`` and ``6.1`` were briefly *accepted at the door and folded* to ``1.0``
-   so the corpus could migrate gradually. That fold was removed on 2026-08-08:
-   ``LEGACY_CONFIG_VERSIONS`` is now an empty frozenset and a legacy declaration
-   **raises**. If you are holding an older file, migrate the *keys* first, then
-   set the version:
-
-   .. code-block:: bash
-
-      python scripts/ci/migrate_config_keys.py <file> --apply --all-versions
-      # then edit the file: config_version: '1.0'
-
-   ``--all-versions`` is not optional here: without it the key migrator skips
-   any file the loader rejects — which is every file that still declares a
-   legacy version — and reports "no retired keys found" while exiting 0.
-
-   Do the two in that order. The key migration is what makes the file loadable;
-   the version line on its own only changes which error you get.
-
 .. contents:: Table of Contents
    :depth: 2
    :local:
@@ -96,26 +68,12 @@ Top-Level Structure
    audit:          { ... }      # AuditConfigSchema (Tier-3 KSD defensibility)
    mrf:            { ... }      # MRFConfigSchema (MR-fingerprinting metadata)
 
-   # ---- deprecated (accepted to keep legacy YAMLs loading) ----
-   diffusion:      { ... }      # legacy top-level — set training.diffusion instead
-   artifacts:      { ... }      # legacy top-level — set training.output_dir instead
-
 .. note::
 
-   **``acceleration:`` is now ``undersampling:``** (phase 11). The old name meant
-   two unrelated things — the MRI k-space *acceleration factor* (what the block's
-   26 real fields configure) and *compute* acceleration — so a reader could not
-   tell which sense a key belonged to. The legacy spelling still loads: a ROOT
-   fold moves the whole block before any sub-model is built. It is gone from
-   Python, so read ``config.undersampling``.
+   Compute settings — mixed precision, compilation, gradient checkpointing and
+   gradient accumulation — are configured under ``optimization:``, not here.
 
-   Five compute knobs still sit in the block and are all **inert** —
-   ``mixed_precision``, ``use_compile``, ``use_gradient_checkpointing``,
-   ``gradient_accumulation_steps`` (each duplicating a live ``optimization.*``
-   field) and ``use_distributed`` (which has no equivalent — ``parallel:`` has no
-   boolean gate). They stay flat so their inertness stays visible; issue #680.
-
-   **``enforce_nested`` (added 2026-08).** Cold diffusion's forward process is
+   **``enforce_nested``.** Cold diffusion's forward process is
    ``x_t = M_t * x_0`` and assumes the masks are *nested* — k-space is only ever
    removed as ``t`` grows, never added. Several families break that by re-drawing
    their pattern per timestep instead of truncating one fixed ranking, and the
@@ -131,11 +89,11 @@ Top-Level Structure
      timestep's **own raw draw** kept, rather than training on a degenerate
      cascade. The denominator is the raw draw, deliberately, and not the
      continuous ``1 / declared_R``: Cartesian families quantise in whole k-space
-     lines, so no realised fraction can ever equal a continuous target and the
-     guard used to fire on sub-line rounding -- which made ``nested_tolerance:
-     1.0`` unsatisfiable even for families that nest perfectly. Against the raw
-     draw, ``1.0`` is the meaningful strict setting: *enforcement must be a
-     no-op*. Whether a family's raw draw honours its declared ``R`` is a
+     lines, so no realised fraction can ever equal a continuous target, and a
+     continuous denominator makes the guard fire on sub-line rounding -- which
+     leaves ``nested_tolerance: 1.0`` unsatisfiable even for families that nest
+     perfectly. Against the raw draw, ``1.0`` is the meaningful strict setting:
+     *enforcement must be a no-op*. Whether a family's raw draw honours its declared ``R`` is a
      separate question, answered by ``declared_ladder_defects``.
      Measured at 256² with the default ``0.5``:
      ``radial``, ``spiral`` and ``multi_mask`` raise (``equispaced`` raises only
@@ -151,28 +109,36 @@ Top-Level Structure
 
    Default ``false``, so every existing run is byte-identical until it opts in.
 
+   **ACS floor and per-sample masks on the fixed-ranking point families.**
+   ``random_cartesian`` and ``variable_density`` (with
+   ``fractional_variable_density``) rank k-space once and take the top-K at each
+   rung. Both place a centred disc of ``min_center_fraction`` of k-space
+   (``center_fraction`` when no floor is declared) at the head of that ranking,
+   so the disc is fully sampled at every rung whose budget covers it, and both
+   raise at construction on a declared ``min_center_fraction`` above
+   ``1 / max_acceleration``. ``mask_seed`` is part of the cached ranking on
+   these families and on ``nested`` and ``density_nested``, so
+   ``enable_dynamic_mask: true`` redraws per sample; on ``variable_density`` the
+   seed only breaks ties within an equal-radius shell, so per-sample masks differ
+   by a few boundary bins, and ``density_nested`` is the family whose draw is
+   genuinely random. The two pattern families also differ in kind:
+   ``random_cartesian`` has a flat periphery and ``variable_density`` a radially
+   decaying one, and both select individual ``(k_y, k_x)`` bins, so neither
+   samples whole phase-encode lines the way ``equispaced`` does.
+
 .. note::
 
    **Default hygiene: a disabled block must not carry sub-flags that default ON.**
    When a block's own gate is ``enabled: false``, a sub-flag defaulting ``true``
    misdescribes the run in the resolved config, and enabling the parent silently
-   buys every such flag. ``tests/unit/config/test_default_hygiene.py`` enforces
-   this for every schema class, walked live.
-
-   Five existing fields are recorded as ratcheted exceptions rather than flipped,
-   because flipping them is a behaviour change and not a tidy-up:
-   ``DataConsistencyConfig.enable_acs_replacement`` (594 arms enable the parent
-   without it), ``DigitalTwinConfig.enable_motion`` / ``enable_b0`` /
-   ``enable_b1`` (9 arms), and ``FSDPConfigSchema.use_orig_params`` (``True`` is
-   torch's own recommended FSDP setting). Shrink that list; never grow it.
+   buys every such flag. This holds for every schema class.
 
 The full list of accepted top-level keys lives on
 :class:`spectramr.config.settings.TrainingSettings`. See
 ``src/spectramr/config/schemas/templates/v1.0_reference.yaml`` — the single
 canonical, round-trip-tested reference template, with inline
-``# options:`` comments for every constrained field. It replaced the
-``v6.0``/``v6.1`` pair: two references are two SSOTs, and those two had
-diverged by 404 documented paths.
+``# options:`` comments for every constrained field. It is the only reference
+template: two references would be two SSOTs.
 
 .. note::
 
@@ -181,39 +147,15 @@ diverged by 404 documented paths.
    nested value") and, when supplied, propagates into ``model.model_domain`` /
    ``model.target_domain`` (the fields the strategies actually consume) and
    **raises** on a genuine conflict with an explicit nested value. Prefer
-   setting only ``model.model_domain`` (or ``model.target_domain``). The default
-   is deliberately ``None`` rather than ``"image"``: ``main.apply_overrides``
-   round-trips the config through ``model_dump()`` → reconstruct, and a
-   materialized ``"image"`` default used to be read back and wrongly flagged as
-   conflicting with a nested ``"kspace"`` — which broke every non-image
-   experiment under ``--override`` (smoke-test regression, 2026-05-29). Keeping
-   the default ``None`` makes that round-trip idempotent.
-
-.. note::
-
-   **Schema currency for ``experiments/inprogress/``.** ``1.0`` is the only
-   accepted version, and the corpus is migrating to it *plus* a ``workflow:``
-   block, opportunistically: any ``inprogress/`` YAML opened during a task is
-   brought to ``config_version: '1.0'`` with a declared regime × task before that
-   task ends. Note the audit's deliberate asymmetry — an **absent** ``workflow:``
-   is advisory, a **wrong** one is a hard error (a ``STUB``-maturity regime, or a
-   task the regime does not support), so never guess: bump the version alone and
-   leave ``workflow:`` off if the regime is unclear. The bump by itself is only
-   bookkeeping — ``config_version`` is validated then deleted in
-   ``TrainingSettings.from_yaml`` and nothing branches on it; the ``workflow:``
-   block is what activates the axis / spatial-rank / signal-domain /
-   component-regime checks. ``active/``, ``validated/``, ``campaigns/`` and the
-   deferred ``config_version: '5.0'`` corpus are out of scope. See ``CLAUDE.md``,
-   "Keep ``inprogress/`` YAMLs at current schema".
+   setting only ``model.model_domain`` (or ``model.target_domain``). The default is
+   ``None`` ("unspecified"), which keeps ``--override`` round-trips idempotent.
 
 .. note::
 
    The experiment name lives **under** ``logging:``, not at the top level.
-   Earlier revisions of the reference templates surfaced it at the top level,
-   but ``TrainingSettings`` is ``extra="forbid"``, so a top-level
-   ``experiment_name`` makes the YAML unloadable. Since phase 10b its canonical
-   path is ``logging.identity.experiment``; the flat ``logging.experiment_name``
-   still loads and is folded into place.
+   ``TrainingSettings`` is ``extra="forbid"``, so a top-level
+   ``experiment_name`` makes the YAML unloadable. Its path is
+   ``logging.identity.experiment``.
 
 Python access:
 
@@ -221,7 +163,7 @@ Python access:
 
    from spectramr.config.settings import TrainingSettings
 
-   cfg = TrainingSettings.from_yaml("experiments/training/my.yaml")
+   cfg = TrainingSettings.from_yaml("experiments/<paradigm>/<your-arm>.yaml")
 
    # ✅ CORRECT: nested access, at the depth the schema actually has
    cfg.training.training_mode
@@ -232,12 +174,6 @@ Python access:
    # ❌ FORBIDDEN: flat aliases, never on the schema
    cfg.lr                           # AttributeError
    cfg.lambda_l1                    # AttributeError
-
-   # ❌ ALSO WRONG: a `fold` rename is a YAML/override courtesy, not an attribute.
-   # These two spellings are accepted in a YAML file and by ``-O``, and are
-   # relocated during validation -- but nothing binds them on the object.
-   cfg.optimization.learning_rate   # AttributeError
-   cfg.data.batch_size              # AttributeError
 
 
 ---
@@ -289,6 +225,7 @@ what representation comes out.*
        patch_size: [320, 320, 1]
        samples_per_volume: 8
        queue_length: 200
+       subject_prefetch: auto    # subjects each queue worker loads ahead; or an int >= 1
        enable_slab_mode: false
        enable_slice_2d: false
        num_synthetic_samples: 10
@@ -296,7 +233,8 @@ what representation comes out.*
      loader:                     # how they reach the GPU
        batch_size: 4
        num_workers: 4
-       persistent_workers: false
+       persistent_workers: true  # default; forced off for 0-worker and single-pass loaders
+       reserved_cores: 2         # worker ceiling = max(1, cpus_per_rank - reserved_cores)
        prefetch_factor: 2
        pin_memory: true
 
@@ -304,6 +242,7 @@ what representation comes out.*
        enable_kspace_normalization: false
        kspace_percentile: 0.99   # a FRACTION, not a percent
        kspace_scale_domain: kspace
+       kspace_scale_reference: target   # or input: measure the scale on what deployment sees
        enable_log_scaling: false
        log_scaling_center_fraction: 0.25
        normalization_type: none
@@ -338,25 +277,15 @@ what representation comes out.*
        cortex_flatten_grid: false
        glm_design_matrix: false
 
-.. note::
-
-   **The old flat spellings still load.**  ``data.batch_size``,
-   ``data.contrasts``, ``data.patch_size`` and the rest are ``fold`` records in
-   :mod:`spectramr.config.schemas.renames`: a ``mode="before"`` validator MOVES
-   the key to its canonical home at parse time rather than raising, so an
-   unmigrated arm is unaffected.  There is no forwarding property — the read
-   side is canonical only.  ``--override data.batch_size=8`` is translated the
-   same way.
-
-.. warning::
-
-   This section previously documented ``in_channels``, ``out_channels``,
-   ``contrast``, ``train_manifest`` and ``val_manifest`` as ``data:`` keys.
-   **None of them are fields on ``DataConfigSchema``** and none ever fold to
-   one — they were doc-only inventions.  ``data.contrast`` in particular is not
-   the singular of ``data.pairing.contrasts``; the nearest real fields are
-   ``data.input_contrast`` / ``data.target_contrast``, which are
-   ``ContrastConfigSchema`` *normalization* specs, not filters.
+``sampling.subject_prefetch`` is the ``prefetch_factor`` of the loader that feeds
+subjects to the training ``tio.Queue``. A refill needs
+``ceil(queue_length / samples_per_volume)`` subjects, and torch's default of 2 per
+worker leaves most of them to load while the GPU waits (#2673). ``auto`` sizes it
+to one refill, ``ceil(ceil(queue_length / samples_per_volume) / num_workers)``,
+never below 2. The value changes how many subjects are in flight, not which are
+drawn or their order. It costs host RAM of ``(prefetch - 2) x num_workers`` whole
+subjects over the old default. The resolved value is logged at build as
+``[QUEUE] Train queue subject prefetch: declared=..., resolved=...``.
 
 Naming inside ``pairing:`` is deliberately un-prefixed.  ``contrasts`` is **not**
 renamed to ``input_contrasts``, because singular-vs-plural would be the only
@@ -424,7 +353,7 @@ field validator:
    :header-rows: 1
    :widths: 22 20 58
 
-   * - ``coil_processing_mode``
+   * - ``data.coils.processing_mode``
      - ``in_channels``
      - Notes
    * - ``rss``
@@ -569,167 +498,34 @@ Five named sub-blocks, plus the scheduler keys that are still flat:
 ``enable_fragmentation_mitigation``, ``cleanup_interval``,
 ``enable_batch_size_optimization``, ``safety_margin``. Diagnostics only.
 
-.. admonition:: The flat spellings still load, and are being drained
+.. admonition:: A declared scheduler family is honoured with or without a dict
    :class: note
 
-   ``optimization.learning_rate`` and its 34 siblings are ``fold`` records in
-   :mod:`spectramr.config.schemas.renames`: a ``mode="before"`` validator moves
-   each into its sub-block, so an unmigrated arm keeps loading. They are gone
-   from Python — ``config.optimization.learning_rate`` raises ``AttributeError``.
-   ``scripts/ci/check_no_legacy_config_keys.py`` prints how many remain; when a
-   record reaches zero its posture flips to ``raise`` and the shim is deleted.
+   ``optimization.lr_scheduler_strategy: cosine`` resolves on its own. Its
+   period defaults to the number of steps the main scheduler takes in the run:
+   ``training.max_iterations // gradient.accumulation_steps`` optimizer steps,
+   less ``warmup_steps``. An epoch-bounded run (``max_iterations: -1``) must
+   declare ``T_max``. A ``scheduler:`` dict is only needed to *parameterise*
+   the family.
 
-Verifying a drain
------------------
+   The cosine is ``MonotoneCosineLR``: closed form in the step count, held at
+   ``eta_min`` past ``T_max``, and on resume it keeps the configured ``T_max``
+   and ``eta_min`` rather than the checkpoint's, so a run resumed under a longer
+   budget continues its decay instead of restarting it.
 
-The countdown above decides when a record is promoted, so a drain has to be
-verified before it is believed. ``scripts/ci/verify_config_migration.py`` runs
-three legs against a baseline ref (``HEAD`` by default, ``--ref origin/dev`` for a
-whole PR):
-
-**(i) it still constructs.** Every touched config loads. Reuses
-``check_experiment_configs_load.load_failure``.
-
-**(ii) the resolved document is unchanged.** ``TrainingSettings.from_yaml(p)
-.model_dump(mode="json")`` at the ref vs the working tree must deep-diff empty.
-
-   This is a *total* oracle for a fold-posture rename rather than a sample: the
-   fold validator already performs the migration at parse time, so a correct text
-   migration is by definition a no-op on the resolved document. It also subsumes
-   the ``metrics.compute`` check, since identical resolved dumps imply identical
-   extracted metric sets.
-
-**(iii) the diff is in scope.** ``git diff --unified=0`` may only add or remove
-lines belonging to the records actually run. Lines whose content appears on both
-sides are *moves* and always pass — a whole-block rename reindents every
-descendant, and a multi-line value travels with its key.
-
-The three legs do not overlap, and each has a change only it can catch:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 46 22 32
-
-   * - change
-     - loads?
-     - caught by
-   * - a moved value was altered
-     - yes
-     - legs (ii) and (iii)
-   * - key renamed under an ``extra="forbid"`` block
-     - **no**
-     - leg (i)
-   * - key smuggled into an ``extra="ignore"`` block
-     - yes
-     - **leg (iii) only**
-
-The last row is why leg (iii) is not redundant: an ignored key is dropped before
-the model exists, so the resolved document is identical and leg (ii) is blind to
-it by construction.
-
-.. admonition:: A clean tree passes leg (ii) vacuously
-   :class: warning
-
-   With nothing to compare, the deep-diff is empty and the script would report
-   success having checked nothing. So it prints how many files it compared and
-   how many it skipped with the reason, and ``--require-changes`` turns
-   "compared nothing" into an error. Pass it whenever verifying an actual drain.
-
-   The ordering this forces is easy to get wrong: verify on the **dirty working
-   tree, before committing**. Commit first and the default ``--ref HEAD``
-   compares the tree to itself, reports green, and has compared zero files.
-
-Drained cohorts
----------------
-
-``kspace_filling`` — 58 arms, drained 2026-08-02 (3999 keys; 0 skipped, 0
-unparseable, 0 unsupported). Verified with all three legs against the pre-drain
-commit: 58/58 construct, 58 resolved documents deep-diff empty, 1892 lines moved
-unchanged. The cohort's ``metrics.compute`` drain landed separately on
-2026-07-31, and no rename record targets ``metrics.*``, so the two migrations
-cannot fold into one another.
-
-Two things a drain does that the legs cannot all see, worth checking by hand
-first:
-
-* a ``superseded_by`` record *deletes* a declared key
-  (``validation.validation_batch_size``). Leg (i) still loads and leg (iii) sees
-  a legal key name, so only leg (ii) can catch it. Before draining, confirm
-  every arm declaring the superseded key also declares the winner — otherwise
-  the drop reverts that arm to the schema default and
-  ``_resolve_batch_size_duplicate`` never had a short form to adjudicate.
-* a record whose canonical path lands inside a block an *earlier* migration
-  produced folds the migration into its own output. Grep the canonical paths
-  against the previous drain's destination before running.
-
-Staying drained is pinned by
-``tests/unit/config/test_kspace_filling_cohort_drained.py``. Its third check —
-keys authored under a paradigm block that the block's schema does not declare —
-compares against ``model_fields``, **not** against the resolved document.
-``TrainingStrategyConfigSchema`` and its paradigm sub-blocks are
-``extra="allow"``, so a misspelt knob is accepted, carried into the resolved
-dump, and therefore looks authored in provenance while no strategy reads it.
-"Authored but absent from the resolved document" — the formulation that looks
-right — returns nothing for exactly that defect. Each check ships with a control
-that injects the defect it exists to catch.
-
-.. admonition:: Never guard a moved field with the OLD name
-   :class: warning
-
-   A rename is invisible to attribute-grep wherever the field name is held as a
-   **string**. ``getattr(cfg, "batch_size", 4)`` and ``hasattr(cfg,
-   "batch_size")`` keep compiling and keep running; the first silently returns
-   its default and the second silently returns ``False``. Phase 9a shipped with
-   the value reads moved and the guards left behind —
-
-   .. code-block:: python
-
-      data_config.loader.batch_size if hasattr(data_config, "batch_size") else 1
-
-   — which pinned training to ``batch_size=1`` for every arm, disabled gradient
-   accumulation, gradient checkpointing and memory monitoring, and computed the
-   federated-DP sample rate from a fallback. Nothing went red.
-
-   These fields are **declared**, so a defensive wrapper can never help: the
-   ``AttributeError`` is the signal that names the problem. Read the canonical
-   path directly.
-   ``tests/unit/config/schemas/test_renames.py::TestNoStringKeyedReadsOfFoldedNames``
-   ASTs ``src/`` for any ``getattr``/``hasattr`` keyed on a folded legacy leaf,
-   with a self-checking allowlist for receivers that carry the name legitimately.
-
-.. admonition:: A declared scheduler family is honoured with or without a dict (#662)
-   :class: note
-
-   **Fixed 2026-08-08.** ``resolve_scheduler_spec`` used to return ``None`` —
-   *no scheduler at all* — whenever ``optimization.scheduler`` was absent,
-   before it ever read ``lr_scheduler_strategy``. 531 arms declared a strategy
-   with no ``scheduler:`` dict and therefore trained at a constant LR while
-   their config said ``cosine``; nothing warned, because ``None`` is also how
-   "no scheduler wanted" is spelled.
-
-   ``optimization.lr_scheduler_strategy: cosine`` alone now resolves, with the
-   period defaulting to ``training.max_iterations``. A ``scheduler:`` dict is
-   only needed to *parameterise* the family.
-
-   The distinction that keeps this safe is **declared vs defaulted**: the field
-   carries ``default="cosine"``, so every resolved config presents a family
-   name. Only a name in ``model_fields_set`` is honoured — 305 arms declare
-   neither key and must keep resolving to no scheduler.
-
-   The scheduler group stays flat for now, but the fold is no longer *blocked*:
-   declaring a strategy and folding it into ``scheduler.type`` finally mean the
-   same thing.
+   The field carries ``default="cosine"``, so every resolved config presents a
+   family name. Only a name you actually declared is honoured — declare neither
+   key and the run resolves to no scheduler.
 
 .. admonition:: A warmup-bearing name must declare a warmup length
    :class: warning
 
    ``warmup_cosine``, ``warmup`` and ``linear_warmup`` name two things: a decay
    family and a warmup. The alias table resolves only the decay half — the
-   warmup comes from the wrapper that ``warmup_steps`` selects — so declaring
-   one of these without ``warmup_steps`` used to drop the warmup silently. 16
-   arms asked for ``warmup_cosine`` and got plain cosine annealing. It now
-   raises: declare ``optimization.warmup_steps`` (or ``scheduler.warmup_steps``)
-   above zero, or name the decay family (``cosine``) directly.
+   warmup comes from the wrapper that ``warmup_steps`` selects — so one of
+   these names without a warmup length **raises**. Declare
+   ``optimization.warmup_steps`` (or ``scheduler.warmup_steps``) above zero,
+   or name the decay family (``cosine``) directly.
 
 .. admonition:: AMP + NaN Gradients
    :class: warning
@@ -771,9 +567,7 @@ that injects the defect it exists to catch.
        along with the budget it replaced (``sanity-check mode (forced;
        overrides the 30000 from …)``). Without that attribution a log showing
        ``5000`` could not distinguish an operator's ``-O …=5000`` from the
-       mode's hardcoded 5000 -- which is not a hypothetical: it is how a 4-GPU
-       run of ``experiment_11_attention_none`` became unreadable after the fact
-       on 2026-08-21. The banner deliberately does **not** claim the operator
+       mode's hardcoded 5000. The banner deliberately does **not** claim the operator
        typed the override: ``main.py`` injects overrides of its own and the
        smoke dispatcher injects ``training.max_iterations=<cap>``, all by the
        same route. Its claim is the one that matters -- *this value did not
@@ -781,11 +575,11 @@ that injects the defect it exists to catch.
    * - ``iteration_budget_scope``
      - ``"per_rank"``
      - How ``max_iterations`` is read under ``world_size > 1``. ``per_rank``
-       (the default, and the historical behaviour) means **every rank runs the
+       (the default) means **every rank runs the
        full count** -- data parallelism buys effective batch, not a shorter
        run, so a 4-GPU launch costs ~4x the GPU-hours for ~1x the wall-clock.
        ``global`` would divide the bound by ``world_size`` and currently
-       **raises**: nothing shards the stream (issue #1163), and dividing the
+       **raises**: nothing shards the stream, and dividing the
        bound silently reshapes every iteration-keyed schedule (the diffusion
        curriculum, the EMA horizon, the validation cadence).
    * - ``log_interval``
@@ -832,7 +626,7 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
 
    losses:
      policy:                       # how the objective is ASSEMBLED, not which terms
-       output_domain: image        # image | complex_image | kspace
+       output_domain: image        # image | complex_image | kspace | latent
        exclude_defaults: []        # e.g. ['mse'] drops the paradigm's implicit MSE
      image_losses:
        - name: l1
@@ -865,6 +659,12 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    * - ``kspace``
      - ``kspace_losses`` + ``complex_losses``
      - Image losses skipped
+   * - ``latent``
+     - ``latent_losses``
+     - Post-encoder losses. **No bridge exists into a latent** — the encoder that
+       would produce one is a learned map, not a transform — so this row is the
+       only one whose Active Lists column is exclusive. Declaring
+       ``latent_losses`` alongside a kspace/image output raises.
 
 **LossComponentConfig fields:**
 
@@ -896,11 +696,8 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
 
 .. note::
 
-   ``output_domain`` and ``disable_default_losses`` moved into ``policy:``
-   (phase 10d). Both flat spellings still load and are folded into place, but
-   they are gone from Python — read ``config.losses.policy.output_domain``.
-   ``losses:`` is otherwise sixteen loss-family blocks, so a loose scalar beside
-   them read as if it might be a seventeenth; neither of these is a family.
+   ``output_domain`` and ``disable_default_losses`` live in ``policy:`` — read
+   ``config.losses.policy.output_domain``.
 
    ``disable_default_losses`` becomes ``exclude_defaults`` rather than being
    inverted to ``enable_default_losses``. The naming rule forbids a negated
@@ -908,17 +705,6 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    meaningless, since ``enable_default_losses: ['mse']`` would read as "enable
    ONLY mse", the opposite of a filter. ``exclude_`` states the sense with
    nothing to invert.
-
-.. warning::
-
-   Three further loose scalars stay flat because nothing reads them and no arm
-   sets them: ``normalize_losses``, ``clip_loss_value`` and ``loss_scaling``
-   (issue #676). ``loss_scaling`` looks referenced only because
-   ``MixedPrecisionConfig`` has an unrelated field of the same name.
-
-   ``lambda_deep_supervision`` also stays flat, but for the opposite reason: it
-   is live and already correctly placed — a loss **weight**, and
-   ``lambda_<term>`` directly on ``losses:`` is the ratified spelling.
 
 ---
 
@@ -963,12 +749,6 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
        ``enabled`` and ``method``. Needs the ``mask`` dataset of an HDF5 input
        and a k-space input route; raises when either is missing. See
        :doc:`running_pipelines`.
-   * - ``data_consistency.acs_mask_center_fraction``
-     - ``0.08``
-     - ACS center fraction
-   * - ``data_consistency.enable_acs_replacement``
-     - ``true``
-     - Hard-replace ACS lines at validation
    * - ``kspace.enforce_hermitian_symmetry``
      - ``true``
      - Conjugate symmetry for real output
@@ -1000,8 +780,6 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    ``**kwargs`` (e.g. :class:`~spectramr.models.generators.kspace_cold_diffusion_generator.KSpaceColdDiffusionGenerator`)
    are also reconciled — the contract inspector adds a ``"**kwargs"``
    sentinel for generators that accept arbitrary keyword arguments.
-   Regression: ``tests/unit/infrastructure/training/builders/test_dc_config_unification.py``.
-   See ``TODO/backlog_unify_dc_config.md`` for migration plan.
 
 
 ---
@@ -1019,33 +797,44 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    * - ``enabled``
      - ``true``
      - Enable checkpoint saving
-   * - ``checkpoint_dir``
-     - ``"./checkpoints"``
-     - Save directory
    * - ``save_interval``
      - ``1000``
      - Save every N steps
    * - ``keep_last_n``
      - ``5``
-     - Retain last N checkpoints
-   * - ``keep_best_n``
-     - ``3``
-     - Retain best N by metric
+     - After every step save, keep the N highest-step checkpoints
+       (``step_NNNNNNNN.<format>``, every format of a step counted once) in
+       ``<training.output_dir>/checkpoints`` and delete the older ones. ``best.<format>``
+       and any other file are never touched, and neither are steps above the save that
+       triggered the sweep. Must be ``>= 1``. Under DeepSpeed each pruned step's ZeRO tag
+       directory (``checkpoints/deepspeed/<model>/step_NNNNNNNN``) is deleted with it; the
+       ``best`` tag, the tag DeepSpeed's ``latest`` file names, and any directory not
+       spelled like a step tag are kept. If the tag just written is not visible from rank
+       0 (node-local storage), nothing is deleted and a warning is logged.
    * - ``best_metric_name``
      - ``"val_psnr"``
      - Metric for best-checkpoint selection
    * - ``best_metric_mode``
      - ``"max"``
      - ``max`` (PSNR/SSIM) or ``min`` (LPIPS/MSE)
-   * - ``pretrained_path``
-     - ``null``
-     - Load weights at start
-   * - ``resume_training``
-     - ``false``
-     - Resume iteration counter
+   * - ``load_optimizer_state``
+     - ``true``
+     - On resume, restore the optimizers (including each multi-stage
+       ``stage:<name>`` optimizer and the DeepSpeed engine's own). ``false`` restarts
+       them from the configured values.
+   * - ``load_scheduler_state``
+     - ``true``
+     - On resume, restore the LR schedulers
    * - ``format``
      - ``"safetensors"``
-     - ``safetensors`` (preferred) or ``pth``
+     - File format of every checkpoint the run writes: ``safetensors`` (no pickle),
+       ``pt`` or ``pth`` (the same ``torch.save`` container). A resume reads each file in
+       whatever format it has. See :doc:`checkpointing`.
+   * - ``async_write``
+     - ``false``
+     - Write checkpoint files and apply ``keep_last_n`` on a background thread; the
+       state is copied to CPU on the training thread first. A failed write still stops
+       the run, at the next save or at the end of training. See :doc:`checkpointing`.
    * - ``produced_by_arm``
      - ``null``
      - Name of the upstream campaign arm that builds this arm's declared
@@ -1064,13 +853,11 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    **The whole** ``checkpoint:`` **block is optional.** A config that omits it
    receives a default ``CheckpointConfigSchema`` (every sub-field above is
    defaulted), so :func:`spectramr.bootstrap.build_container` builds a working
-   checkpoint service rather than aborting. Prior to 2026-06-20 the root field
-   defaulted to ``None`` and ``build_container`` raised
-   ``config.checkpoint is required but not provided`` — which silently blocked
-   the entire 28-arm ``mrixfields2026`` cohort (none of those configs declare a
-   ``checkpoint:`` block, while kspace_filling 14/14 and the VF arms all do).
-   Declare the block only to override the defaults (e.g. a per-arm
-   ``checkpoint_dir`` or ``best_metric_name``).
+   checkpoint store rather than aborting.
+   Declare the block only to override the defaults (e.g. ``save_interval``).
+   Checkpoints are always written to ``<training.output_dir>/checkpoints``; the
+   retired ``checkpoint_dir`` and its ``save_dir`` alias are refused at load
+   (#2842).
 
 
 ---
@@ -1106,6 +893,9 @@ diffusion-only ``sampling``. Every value below is the live schema default.
        primary: psnr                     # early stopping / model selection
        domain: null                      # 'image' | 'kspace' | null to auto-detect
        output_transform: null            # 'ifft_magnitude' | 'ifft_mag_combine' | 'fft'
+       coil_manifold_projection: false   # project a k-space output onto s s^H before scoring; needs coil maps
+       measurement_maps: off             # 'off' | 'metrics': kspace_cold_diffusion only; adds val_<m>_measmaps scored with maps from the masked measurement
+       recorrupted_inference: null       # R2R arms only: {samples: J, alpha | angle_deg}; score the mean over J recorruptions
        enable_image_metrics: true
 
      visualization:
@@ -1128,23 +918,13 @@ diffusion-only ``sampling``. Every value below is the live schema default.
          n_features: 5
          interval_validations: 4
 
-     # inert — declared, read by nothing (see below)
-     validation_dir: null
-     enable_validation_augmentation: false
-     validation_metric: loss
-     use_training_loss: true
-     num_visualizations: 4
-     visualization_dir: ./visualizations
-
      empty_cache_before_validation: true
 
 ``validation.cascade.levels`` is the acceleration ladder the cascading
 validation sweep evaluates — one pass per rung, each written as its own row of
 ``validation_metrics.csv`` (``acceleration_level`` / ``timestep`` as values)
-and as flat ``val_<metric>_<R>x`` columns. It was a module constant until
-#1394, so an arm could widen ``undersampling.acceleration_range`` for training
-while validation stayed pinned at 2/8/32. Leave it ``null`` for the default
-ladder; every arm in the corpus does, so nothing moves unless it is declared.
+and as flat ``val_<metric>_<R>x`` columns. Leave it ``null`` for the default
+ladder.
 
 Levels are deduplicated and sorted ascending, and an integral rung stays an
 ``int`` so ``val_psnr_2x`` does not become ``val_psnr_2.0x`` — the L4 gate and
@@ -1152,8 +932,7 @@ the accel-gap stamp look those names up and do not raise on a miss. An empty
 ladder, a rung below 1x, a non-finite value and a boolean are all **refused at
 load time**. Under ``undersampling.schedule_type: step`` a rung outside
 ``undersampling.acceleration_range`` has no timestep inverse and is skipped at
-runtime; ``spectramr audit`` warns before the launch. See
-:ref:`validation-cascade-levels`.
+runtime; ``spectramr audit`` warns before the launch.
 
 .. warning::
 
@@ -1163,7 +942,7 @@ runtime; ``spectramr audit`` warns before the launch. See
    sibling intervals (``logging.intervals.log`` and
    ``metrics.train_metric_interval``), it has **no** unconditional
    first/last-iteration force, so an interval above the budget produces *zero*
-   validation events: early stopping never evaluates, no ``checkpoint_best.pt``
+   validation events: early stopping never evaluates, no best checkpoint
    is written, and the run still exits reporting success.
    ``_execute_training_loop`` therefore rejects that combination at startup with
    a ``ConfigurationError``, unless ``on_epoch`` supplies events instead.
@@ -1186,54 +965,18 @@ runtime; ``spectramr audit`` warns before the launch. See
 
 .. note::
 
-   The flat spellings still load. ``eval_interval``, ``val_batch_size``,
-   ``compute_image_metrics`` and the rest are folded onto their canonical paths
-   at parse time, so an unmigrated arm is unaffected — but they are gone from
-   Python, so read ``config.validation.schedule.interval_steps``, never
-   ``config.validation.eval_interval``.
+   Read the canonical paths: ``config.validation.schedule.interval_steps`` for
+   the cadence and ``config.validation.loader.batch_size`` for the batch size.
+   The metric block is named ``scoring``.
 
-   The metric block is called ``scoring`` rather than the obvious ``metrics``
-   because ``validation.metrics`` is itself one of the retired keys, and the fold
-   matches on the key name alone. A block named ``metrics`` would make that key
-   mean both the old scalar and its own destination — so a legacy arm would break
-   depending on where the author happened to write it, and a migrated arm writing
-   ``metrics: {compute: [...]}`` would have the whole block folded into itself.
-
-   Two pairs were merged rather than moved:
-
-   * ``eval_interval`` and ``frequency_steps`` were one cadence with one default.
-     58 arms declared both and none disagreed, so both fold to
-     ``schedule.interval_steps`` — which also carries 58 arms' previously-unread
-     ``frequency_steps`` into the training loop for the first time.
-   * ``val_batch_size`` and ``validation_batch_size`` were one number read by two
-     builders that preferred *different* spellings, and 86 arms declared both
-     with 74 disagreeing. Both now fold to ``loader.batch_size``, with the short
-     form winning as both field descriptions always documented.
-
-.. warning::
-
-   **Nine keys are declared and read by nothing.** They stay flat instead of
-   being given a tidy home, because a tidy home implies a knob works:
-
-   * ``enabled`` — 1006 arms set it, 8 to ``false``, and validation runs
-     regardless: the training loop gates on the *presence* of the block, never on
-     this flag (issue #673).
-   * ``split`` — 388 arms set it; the fraction that actually partitions the
-     corpus is ``data.split.validation_fraction`` (issue #673).
-   * ``validation_dir``, ``enable_validation_augmentation``, ``validation_metric``,
-     ``use_training_loss``, ``num_visualizations``, ``visualization_dir`` — tracked
-     by ``KNOWN_UNCONSUMED`` in ``tests/unit/config/test_schema_key_consumption.py``.
-
-   ``validation_metric`` names the same idea as ``scoring.primary`` but was
-   deliberately **not** merged into it: the defaults differ (``'loss'`` vs
-   ``'psnr'``), so folding would silently repoint the 53 arms that set it.
+.. note::
 
    ``empty_cache_before_validation`` is the one live ungrouped scalar. It calls
    ``torch.cuda.empty_cache()`` before each validation pass to free the training
    allocator pool (training usually holds most of VRAM; the EMA weight-swap
    transiently doubles parameter memory). Default ``true`` preserves the OOM-safe
    behavior; set ``false`` on memory-headroom runs to avoid the allocator re-grow
-   cost on the next train step (wasted-compute audit PIPE-2).
+   cost on the next train step.
 
 
 ---
@@ -1241,9 +984,10 @@ runtime; ``spectramr audit`` warns before the launch. See
 ``logging:`` — LoggingConfigSchema
 ====================================
 
-Seven sub-blocks: *what the run is called* (``identity``), *where lines go*
-(``sinks``), *how often* (``intervals``), plus ``images``, ``tracking``,
-``snapshots`` and ``report_cases``. Every value below is the live schema default.
+Nine sub-blocks: *what the run is called* (``identity``), *where lines go*
+(``sinks``), *how often* (``intervals``), *which ranks write* (``distributed``),
+*how progress shows* (``progress``), plus ``images``, ``tracking``, ``snapshots``
+and ``report_cases``. Every value below is the live schema default.
 
 .. code-block:: yaml
 
@@ -1258,8 +1002,18 @@ Seven sub-blocks: *what the run is called* (``identity``), *where lines go*
        level: info                     # debug | info | warning | error | critical
        silent: false
        to_console: true
+       console_stream: split           # split | stdout | stderr  (split: INFO to stdout, WARNING+ to stderr)
        to_file: true
        dir: ./logs
+
+     distributed:                      # what the ranks of a torchrun launch write
+       console_ranks: rank0            # rank0 | all
+       secondary_level: error          # floor on ranks != 0 when console_ranks is rank0
+       file_ranks: rank0               # rank0 | all (all: <name>.rank<N>.log per rank)
+
+     progress:                         # a bar on a TTY, one tracking line per N iterations in the log
+       mode: auto                      # auto | bar | lines | off
+       log_every_n_iterations: 1500
 
      intervals:                        # every-N-steps cadences
        log: 100
@@ -1292,76 +1046,36 @@ Seven sub-blocks: *what the run is called* (``identity``), *where lines go*
        enabled: true
        subdir: report_cases
 
-     # wandb_project / wandb_entity: DEFERRED -- read by nothing, and a non-null
-     # value now RAISES (issue #675). `null` (shown here) is the only accepted
-     # declaration of either.
+     # wandb_project / wandb_entity: a non-null value RAISES; `null` (shown
+     # here) is the only accepted declaration of either.
      wandb_project: null
      wandb_entity: null
-     # inert — declared, read by nothing (see below)
-     log_weights: false
-     log_activations: false
-     log_validation_graphs: true
-     save_images_per_epoch: 4
-     progress_bar_enabled: true
-     progress_bar_on_warning: true
-     progress_bar_no_progress: false
-
-     log_gradients: false              # live, but its group-mates are not
+     log_gradients: false
 
 .. note::
 
-   The flat spellings still load and are folded into place, but they are gone
-   from Python: read ``config.logging.intervals.log``, never
-   ``config.logging.log_interval``.
+   Read the canonical path ``config.logging.intervals.log``.
 
-   The debug block is ``snapshots``, not the flat key's own name
-   ``debug_snapshots``: a destination sub-block may not share a retired leaf
-   name, or a migrated arm writing ``debug_snapshots: {enabled: true}`` would
-   have that block folded into itself.
+   The debug block is named ``snapshots``.
 
 .. warning::
 
-   **Ten keys are declared and read by nothing.** Nine are tracked by
-   ``KNOWN_UNCONSUMED`` in ``tests/unit/config/test_schema_key_consumption.py``
-   and stay flat rather than being given a tidy home that would imply they work:
-   ``wandb_project`` (96 arms, measured after the 41-arm ``inprogress`` drain --
-   issue #675), ``wandb_entity`` (32, same measurement), ``log_weights`` (112),
-   ``log_activations`` (112), ``log_validation_graphs`` (1059),
-   ``save_images_per_epoch`` (882), and the three ``progress_bar_*`` flags (752 /
-   31 / 31). ``log_gradients`` is the tenth entry in the flat list but is the
-   opposite case — it **is** read; it stays flat only because both of its
-   group-mates are inert, leaving no group to join.
+   **There is no Weights & Biases integration.** ``wandb_project`` and
+   ``wandb_entity`` are the only fields that could configure one, and a
+   non-null value **raises** — leave them unset or explicitly ``null``.
+   Runs log to TensorBoard.
 
-   Note the consequence for W&B: ``wandb_project`` and ``wandb_entity`` are the
-   only fields that could configure it, and neither is read. Unlike the other
-   eight, though, they are not silently accepted: a non-null value now RAISES
-   (issue #675, ``LoggingConfigSchema._refuse_deferred_wandb``) — only an
-   unset field or an explicit ``null`` constructs.
-
-.. warning::
-
-   **``logging:`` is ``extra="ignore"``, and 26 phantom keys are silently
-   discarded across 1154 declarations** — see issue #675. The two largest are
-   ``project_name`` (419 arms) and ``enable_wandb`` (417 arms); neither exists,
-   so those arms get TensorBoard regardless. Several others are one edit away
-   from a real field — ``log_level`` (62 arms) for ``sinks.level``,
-   ``console_logging`` / ``file_logging`` (20 each) for ``sinks.to_console`` /
-   ``to_file``, ``log_frequency`` (63) for ``intervals.log``. They were **not**
-   absorbed by phase 10b: wiring ``enable_wandb`` would switch ~416 arms to a
-   backend that needs credentials the cluster jobs do not have, which is an
-   owner decision rather than a side effect of a readability refactor.
+   ``logging:`` is ``extra="ignore"``, so a key it does not declare is
+   **silently discarded** rather than rejected. Check a logging key against
+   the block above before relying on it: ``sinks.level``, ``sinks.to_console``,
+   ``sinks.to_file`` and ``intervals.log`` are the real spellings of the four
+   most commonly guessed wrong.
 
 
 ---
 
 ``ema:`` — EMAConfigSchema
 ============================
-
-.. admonition:: Breaking Change (v5.1)
-   :class: warning
-
-   Legacy aliases (``enable_ema``, ``ema_decay``, ``ema_update_frequency``)
-   removed. Use primary field names below.
 
 .. list-table::
    :header-rows: 1
@@ -1514,47 +1228,39 @@ Dry-run before allocating GPU:
 
 .. code-block:: bash
 
-   spectramr train --config experiments/training/my.yaml --dry-run
+   spectramr train --config experiments/<paradigm>/<your-arm>.yaml --dry-run
 
-The ``ConfigHealthChecker`` validates:
+This resolves your config and runs the health checks without allocating a GPU or
+reading the dataset. The checks cover:
 
-1. ``model.in_channels`` matches ``data.coil_processing_mode``
-2. ``losses.policy.output_domain`` matches populated loss lists
-3. ``config_version`` present and in ``ACCEPTED_CONFIG_VERSIONS`` — which is
-   exactly ``{'1.0'}``; ``LEGACY_CONFIG_VERSIONS`` emptied on 2026-08-08, so
-   "accepted" and "current" now name the same thing (see the schema-currency
-   note above)
-4. All manifest paths exist on disk
-5. ``physics.data_consistency.enabled`` in reconstruction modes
+- **Required sections are present.**
+- **The model resolves.** ``model.model_type`` names a registered model, and
+  that model can actually be constructed from the ``model_kwargs`` you gave it.
+- **The strategy resolves.** ``training.training_mode`` names a registered
+  training strategy.
+- **Domains line up.** ``model.in_channels`` is consistent with
+  ``data.coils.processing_mode`` and the dataset type, and
+  ``losses.policy.output_domain`` matches the loss lists you populated.
+- **Loss weights are sane** — no all-zero weighting, no weight on a loss list
+  that is empty.
+- **Physics is coherent.** In reconstruction modes, this is where an arm that
+  never enforces ``physics.data_consistency.enabled`` is flagged.
+
+Warnings are errors here: ``audit`` is ``--strict`` by default and a warning
+exits non-zero. Fix the warning rather than suppressing it — see
+:doc:`audit_ladder_user_guide`.
 
 **CLI overrides** (without editing YAML):
 
 .. code-block:: bash
 
-   spectramr train --config my.yaml \
-       --override "optimization.learning_rate=5e-5" \
+   spectramr train --config experiments/<paradigm>/<your-arm>.yaml \
+       --override "optimization.optimizer.learning_rate=5e-5" \
        --override "data.batch_size=16"
 
-Both spellings work. ``optimization.learning_rate`` above is a ``fold`` record
-whose canonical path is ``optimization.optimizer.learning_rate``;
-:func:`spectramr.config.schemas.renames.canonical_override_path` translates the
-legacy path before the write, so the two forms are interchangeable exactly as
-they are in YAML.
-
-.. admonition:: Why the translation is needed at all
-   :class: note
-
-   ``apply_overrides`` re-validates a **complete** ``model_dump()`` — not
-   ``exclude_unset``, because provenance must stamp defaulted knobs (pitfall
-   #15c). So the canonical key is *always* present with its default, and writing
-   the legacy spelling beside it looked to the fold validator like two spellings
-   that disagree, which it rejects. That rejection is right for a YAML document,
-   where both keys were authored and only a human can say which was meant, and
-   wrong here, where one of the two is an artefact of the dump.
-
-   ``raise``-posture records are deliberately **not** translated: they fall
-   through untranslated so the owning block still produces the error naming the
-   replacement, rather than being silently rewritten into a key that works.
+An override takes the same dotted path the key has in YAML, and is applied
+before validation — so an override that produces an invalid config fails the
+same way an invalid YAML file would, rather than at first use.
 
 
 ---
@@ -1564,9 +1270,6 @@ References
 
 1. Pydantic V2 Documentation — https://docs.pydantic.dev/latest/
 
-2. Schema source: ``src/spectramr/config/schemas/`` (45 files)
-
-3. Settings entry: ``src/spectramr/config/settings.py::TrainingSettings.from_yaml``
 
 .. _naming-convention:
 
@@ -1574,32 +1277,25 @@ Naming convention (enforced)
 ----------------------------
 
 A reader cannot skim a config whose keys follow no rule. These ratify the
-plurality already present in the schema rather than imposing a new style — the
-census behind them covered 1,888 unique field names across 295 classes.
+plurality already present in the schema rather than imposing a new style.
 
-=====================  =========================  ================================
-Kind                   Rule                       Basis
-=====================  =========================  ================================
-Boolean switch         ``enable_<thing>``         165, vs 20 ``use_*`` / 4 ``*_enabled``
-A block's own gate     bare ``enabled``           reserved; never a feature flag
-Count                  ``num_<thing>``            36, vs 30 ``n_*``
-Loss weight            ``lambda_<term>``          148, vs 40 ``*_weight``; matches the papers
-Registry selector      ``<thing>_type``           30, vs 16 ``_mode`` / 8 ``_strategy``
-Fraction in [0, 1]     ``<thing>_fraction``       12, vs 5 ``*_ratio``
-Path                   ``_path`` file, ``_dir`` directory, ``_root`` tree root  16-16 split; decide by what it points at
-Negation               forbidden                  invert the sense instead
-=====================  =========================  ================================
+=====================  ========================================================
+Kind                   Rule
+=====================  ========================================================
+Boolean switch         ``enable_<thing>``
+A block's own gate     bare ``enabled`` — never a feature flag
+Count                  ``num_<thing>``
+Loss weight            ``lambda_<term>``
+Registry selector      ``<thing>_type``
+Fraction in [0, 1]     ``<thing>_fraction``
+Path                   ``_path`` file, ``_dir`` directory, ``_root`` tree root
+Negation               forbidden — invert the sense instead
+=====================  ========================================================
 
-``tests/unit/config/test_naming_convention.py`` enforces the mechanically
-decidable rules. Today's violators are grandfathered in
-``KNOWN_NAMING_EXCEPTIONS`` so the gate is green immediately and can only shrink;
-**new fields get no such grace, and the list must not be added to.**
-
-Two rules are documented but deliberately not gated. *Registry selector* cannot
-be separated from a genuine mode by name alone (``bidirectional_mode`` really is
-a mode), and *path* is a 16-16 split that depends on what the value points at.
-Gating either on the name would produce false failures, which is how a ratchet
-gets switched off.
+Two of these cannot be decided from a name alone, so follow them by hand: a
+registry selector is not always distinguishable from a genuine mode
+(``bidirectional_mode`` really is a mode), and whether a path names a file, a
+directory or a tree root depends on what it points at.
 
 One acquisition tuple, one definition
 =====================================
@@ -1610,31 +1306,6 @@ include_concomitant}`` — is declared **once**, as
 ``spectramr.config.schemas.training.pmps.AcquisitionParam`` is an alias of it, kept so
 ``fixed_protocols`` and the module's ``__all__`` are unchanged for callers.
 
-It was not always one. ``pmps.py`` redeclared the class with the same eight fields,
-the same types and the same defaults — except ``contrast_type``:
-
-=========================  ===================================================
-``data.py``                ``spin_echo | inversion_recovery | gradient_echo |
-                           diffusion_weighted | ssfp | mprage``
-``training/pmps.py``       ``spin_echo | gradient_echo | inversion_recovery |
-                           ssfp | mprage``
-=========================  ===================================================
-
-So the *identical* acquisition dict validated as a ``data:`` entry and was **rejected**
-as a PMPS protocol. Nothing announced the divergence; the two agreed on every field a
-reader would think to compare. This is pitfall #13b's shape — one concept, two
-resolvers, silently disagreeing — expressed in schemas rather than loss weights.
-
-The data-layer schema was elected because it is the wider of the two (narrowing would
-invalidate the four configs declaring ``diffusion_weighted``) and because ``pmps.py``'s
-own dispatch test already imported it rather than the local copy.
-
-``tests/unit/config/schemas/training/test_pmps.py`` pins the **election, not the field
-list**: it asserts ``AcquisitionParam is AcquisitionParamsSchema``. A faithful
-re-declaration would satisfy any field-by-field comparison on the day it is written and
-drift on the day either side changes, which is precisely what happened — only identity
-catches it.
-
 .. note::
 
    Ten acquisition-named constructs exist across the codebase, five of them config
@@ -1643,6 +1314,4 @@ catches it.
    ``AcquisitionMetadataConfigSchema`` configures the metadata *loader*;
    ``AcquisitionParamsConfig`` in ``physics.py`` is a tighter 4-field SPGR descriptor
    using ``tr_ms``/``field_strength_t`` rather than ``TR``/``B0``). Before adding an
-   eleventh, check whether one of these is the construct you want — issue #828 asked for
-   a new shared ``AcquisitionVector`` and the shared schema turned out to already exist,
-   twice.
+   eleventh, check whether one of these is the construct you want.

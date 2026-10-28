@@ -45,6 +45,7 @@ __all__ = [
     "list_transforms",
     "register_transform",
     "transforms_producing",
+    "transforms_without_effect",
 ]
 
 
@@ -65,12 +66,16 @@ class RegisteredTransform:
             those chains was dead at link 0 because the transform had no way
             to be constructed.
         requires: Subject keys that must already exist for it to do work.
+        modifies: Subject keys it rewrites in place without adding them. Kept
+            apart from ``produces`` so an in-place edit of ``input`` cannot
+            pass for a producer of a key some consumer reads.
     """
 
     name: str
     cls: type
     produces: tuple[str, ...] = ()
     requires: tuple[str, ...] = field(default=("input",))
+    modifies: tuple[str, ...] = ()
 
 
 TRANSFORM_REGISTRY: dict[str, RegisteredTransform] = {}
@@ -81,6 +86,7 @@ def register_transform(
     *,
     produces: tuple[str, ...] = (),
     requires: tuple[str, ...] = ("input",),
+    modifies: tuple[str, ...] = (),
 ):
     """Class decorator registering a transform under ``name``.
 
@@ -89,6 +95,7 @@ def register_transform(
         produces: Subject keys the transform adds (see
             :class:`RegisteredTransform`).
         requires: Subject keys it reads.
+        modifies: Subject keys it rewrites in place.
 
     Raises:
         ValueError: If ``name`` is already registered by a different class.
@@ -113,6 +120,7 @@ def register_transform(
             cls=cls,
             produces=tuple(produces),
             requires=tuple(requires),
+            modifies=tuple(modifies),
         )
         return cls
 
@@ -177,3 +185,15 @@ def transforms_producing(key: str) -> tuple[str, ...]:
     this strategy reads?".
     """
     return tuple(sorted(n for n, e in TRANSFORM_REGISTRY.items() if key in e.produces))
+
+
+def transforms_without_effect(
+    table: dict[str, RegisteredTransform] | None = None,
+) -> tuple[str, ...]:
+    """Names that declare neither a key they add nor a key they rewrite.
+
+    Such a transform cannot be shown to have fired. ``table`` is injectable so
+    the check can be tested against a planted entry.
+    """
+    src = TRANSFORM_REGISTRY if table is None else table
+    return tuple(sorted(n for n, e in src.items() if not (e.produces or e.modifies)))

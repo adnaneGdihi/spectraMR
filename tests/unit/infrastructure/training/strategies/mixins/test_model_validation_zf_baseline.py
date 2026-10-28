@@ -18,14 +18,14 @@ from spectramr.infrastructure.training.strategies.mixins.model_validation import
 
 
 class _Computer:
-    """Records the ``only`` subset it was asked for; returns a fixed psnr/hfen."""
+    """Records the ``only`` subset it was asked for; returns fixed psnr/ssim/hfen."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[int, ...], tuple[str, ...] | None]] = []
 
     def compute(self, pred, target, *, only=None, **_kw):
         self.calls.append((tuple(pred.shape), tuple(only) if only else None))
-        return {"psnr": 20.0, "hfen": 0.5}
+        return {"psnr": 20.0, "ssim": 0.6, "hfen": 0.5}
 
 
 class _Host(ModelValidationMixin):
@@ -37,15 +37,19 @@ def _identity_transform(pred, target, _cfg):
     return pred, target
 
 
-def test_baseline_grades_the_input_on_the_two_cheap_metrics_only() -> None:
-    """The fires-test: ``val_zf_*`` appears, computed from the INPUT, on psnr/hfen."""
+def test_baseline_grades_the_input_on_its_three_metrics() -> None:
+    """The fires-test: ``val_zf_*`` appears, computed from the INPUT, on psnr/ssim/hfen.
+
+    SSIM joined the baseline when the EI arms began selecting on ``val_ssim``
+    against it (8a14b7ed7, #2601).
+    """
     host = _Host()
     computer = _Computer()
     x = torch.rand(2, 1, 8, 8)
     y = torch.rand(2, 1, 8, 8)
     out = host._zero_filled_baseline_metrics(x, y, computer, _identity_transform, None)
-    assert out == {"val_zf_psnr": 20.0, "val_zf_hfen": 0.5}
-    assert computer.calls == [((2, 1, 8, 8), ("psnr", "hfen"))]
+    assert out == {"val_zf_psnr": 20.0, "val_zf_ssim": 0.6, "val_zf_hfen": 0.5}
+    assert computer.calls == [((2, 1, 8, 8), ("psnr", "ssim", "hfen"))]
 
 
 def test_five_d_input_is_flattened_like_the_target() -> None:

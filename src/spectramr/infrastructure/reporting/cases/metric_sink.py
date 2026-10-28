@@ -28,6 +28,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
+from spectramr.core.metrics.scalar_transfer import fuse_to_host
+
 logger = logging.getLogger(__name__)
 
 #: Identity columns, in the order they are written. Declared rather than
@@ -66,6 +71,9 @@ class PerCallMetricSink:
         #: numbers in the frame, so nothing in the DataFrame can tell them apart
         #: afterwards.
         self._context_keys: set[str] = set()
+        #: Every row ever observed; unlike ``n_rows`` it does not stop at
+        #: ``max_rows``, so a caller can tell whether a call added one.
+        self.n_observed = 0
 
     @property
     def n_rows(self) -> int:
@@ -128,6 +136,7 @@ class PerCallMetricSink:
             if isinstance(v, (int, float)):
                 row[str(k)] = float(v)
         self._rows.append(row)
+        self.n_observed += 1
         if len(self._rows) > self.max_rows:
             self._rows.pop(0)
 
@@ -157,3 +166,56 @@ class PerCallMetricSink:
         frame.to_csv(out, index=False)
         logger.info("per-case metrics: wrote %d rows to %s", len(frame), out)
         return out
+
+
+_SKIPPED_DEVICE_KEYS: set[str] = set()
+
+
+def feed_from_validation_loop(
+    sink: PerCallMetricSink | None,
+    metrics: Mapping[str, Any],
+    *,
+    step: int,
+    batch_index: int,
+    observed_before: int,
+) -> bool:
+    """Record a validation batch the strategy did not record itself (#2500).
+
+    The sink is attached to every strategy, but only the strategies whose image
+    logging calls ``feed_report_case_recorder`` ever fed it, so most paradigms
+    (reconstruction among them) wrote no ``per_call_metrics.csv``. The training
+    loop calls this after each ``validation_step``: when the strategy already
+    observed a row for the batch (``n_observed`` moved past ``observed_before``)
+    nothing is added, so no batch is counted twice. Single-element tensors, on
+    any device, are fetched together in one transfer (``val_loss`` arrives on the
+    device); a multi-element tensor is skipped.
+    """
+    if sink is None or not sink.enabled or sink.n_observed > observed_before:
+        return False
+    scalars: dict[str, float] = {}
+    tensors: dict[str, torch.Tensor] = {}
+    for key, value in (metrics or {}).items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float, np.generic)):
+            scalars[str(key)] = float(value)
+        elif isinstance(value, torch.Tensor) and value.numel() == 1 and not value.is_complex():
+            tensors[str(key)] = value
+        elif isinstance(value, torch.Tensor) and key not in _SKIPPED_DEVICE_KEYS:
+            _SKIPPED_DEVICE_KEYS.add(key)
+            logger.warning(
+                "per_call_metrics: %r is a multi-element or complex tensor and is not "
+                "recorded per call; return a scalar to record it",
+                key,
+            )
+    if tensors:
+        scalars.update(zip(tensors, fuse_to_host(list(tensors.values())), strict=True))
+    if not scalars:
+        return False
+    sink.observe(
+        case_id=f"val_step{int(step)}",
+        metrics=scalars,
+        step=int(step),
+        context={"batch_index": int(batch_index)},
+    )
+    return True

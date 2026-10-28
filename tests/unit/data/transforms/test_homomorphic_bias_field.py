@@ -149,3 +149,56 @@ def test_reconstruct_additive_in_log_domain() -> None:
     out = reconstruct_from_log_components(a, b)
     expected = torch.exp(a + b)
     assert torch.allclose(out, expected)
+
+
+# ---------------------------------------------------------------------------
+# HomomorphicBiasFieldCorrection (in-place, registry-reachable)
+# ---------------------------------------------------------------------------
+
+
+def _biased_disk(size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """A uniform disk times a smooth multiplicative ramp, shape (1, H, W, 1)."""
+    yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+    disk = (((yy - size / 2) ** 2 + (xx - size / 2) ** 2) < (size / 2.5) ** 2).float()
+    bias = torch.exp(0.6 * (xx.float() / size - 0.5))
+    return (disk * bias)[None, ..., None], disk.bool()[None, ..., None]
+
+
+def test_correction_flattens_a_multiplicative_ramp_on_the_input_only() -> None:
+    from spectramr.data.transforms.homomorphic_bias_field import HomomorphicBiasFieldCorrection
+
+    biased, disk = _biased_disk()
+    target = torch.rand_like(biased)
+    subject = tio.Subject(
+        input=tio.ScalarImage(tensor=biased.clone(), affine=np.eye(4)),
+        target=tio.ScalarImage(tensor=target.clone(), affine=np.eye(4)),
+    )
+    out = HomomorphicBiasFieldCorrection(smoothness=4.0, kernel_size=15)(subject)
+
+    def cv(x: torch.Tensor) -> float:
+        inside = x[disk]
+        return float(inside.std() / inside.mean())
+
+    assert cv(out["input"].data) < 0.5 * cv(biased)
+    assert torch.equal(out["input"].data[~disk], biased[~disk])
+    assert torch.equal(out["target"].data, target)
+    applied = out["input_log_bias"].data
+    assert torch.allclose(out["input"].data * torch.exp(applied), biased, atol=1e-5)
+
+
+def test_correction_is_reachable_from_yaml_by_name() -> None:
+    from spectramr.data.transforms.homomorphic_bias_field import HomomorphicBiasFieldCorrection
+    from spectramr.data.transforms.registry import build_transform, get_transform
+
+    assert get_transform("homomorphic_bias_correction").cls is HomomorphicBiasFieldCorrection
+    built = build_transform("homomorphic_bias_correction", smoothness=6.0, kernel_size=21)
+    assert isinstance(built, HomomorphicBiasFieldCorrection)
+
+
+def test_correction_refuses_what_it_cannot_correct() -> None:
+    from spectramr.data.transforms.homomorphic_bias_field import HomomorphicBiasFieldCorrection
+
+    with pytest.raises(ValueError, match="foreground_fraction"):
+        HomomorphicBiasFieldCorrection(foreground_fraction=0.0)
+    with pytest.raises(KeyError, match="no 'input' image"):
+        HomomorphicBiasFieldCorrection()(_make_subject(torch.rand(1, 8, 8, 1)))

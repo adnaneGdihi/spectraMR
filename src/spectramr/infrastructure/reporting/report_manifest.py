@@ -30,6 +30,7 @@ def write_report_manifest(
     metadata: RunMetadata,
     captions: dict | None = None,
     figure_reasons: dict | None = None,
+    runs: list[dict] | None = None,
 ) -> Path:
     """Write ``report_manifest.json`` under ``out_dir`` and return its path.
 
@@ -40,6 +41,10 @@ def write_report_manifest(
     crashed, and the two need different responses from whoever reads this file.
     Optional so existing callers are unaffected; absent reasons simply omit the
     key rather than inventing one.
+
+    ``runs`` lists the runs the report read, each with its completion state
+    (:meth:`.run_status.RunStatus.to_dict`) and whether it was ``included``,
+    so a crashed arm left out of a comparison is recorded rather than absent.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -83,7 +88,9 @@ def write_report_manifest(
                     "sha256": _sha256(path),
                 }
             )
-    manifest = {"provenance": metadata.to_dict(), "artifacts": artifacts}
+    manifest: dict = {"provenance": metadata.to_dict(), "artifacts": artifacts}
+    if runs is not None:
+        manifest["runs"] = runs
     path = out_dir / "report_manifest.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return path

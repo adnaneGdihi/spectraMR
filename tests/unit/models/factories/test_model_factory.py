@@ -519,3 +519,222 @@ class TestCreateClassmethod:
         config = SimpleNamespace(model=SimpleNamespace(in_channels=2, out_channels=2))
         with pytest.raises(TypeError, match="needs a model type"):
             ModelFactory.create(config)
+
+
+class TestRoleDeclaredNotGuessed:
+    """``ModelRegistry`` buckets on the declared role (#1932).
+
+    It used to guess with ``issubclass(cls, IDiscriminator)`` and fall through
+    to ``# Default to generator for backward compatibility``. Only 10 of the
+    framework's discriminators subclass that interface, so 9 more landed in the
+    generator bucket and ``create_discriminator`` reported each as "not
+    registered" -- a live build failure for any GAN arm naming one of them.
+    """
+
+    def test_every_discriminator_named_model_is_in_the_discriminator_bucket(self):
+        """Name-heuristic oracle, independent of the mechanism it checks.
+
+        This deliberately does NOT ask the registry how it classified anything;
+        it asks whether a model *called* a discriminator can be *built* as one.
+        A test written against ``role`` would pass for any consistent wiring,
+        including a wiring that files everything as a generator.
+        """
+        from spectramr.models.factories.model_factory import ModelRegistry
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        populate_model_registry()
+        registry = ModelRegistry()
+        named = {
+            n
+            for n in MODEL_REGISTRY
+            if any(tok in n for tok in ("discriminator", "critic", "patchgan"))
+        }
+        assert named, "name heuristic matched nothing -- the oracle is vacuous"
+        misfiled = sorted(named - set(registry._discriminators))
+        assert misfiled == [], (
+            f"{len(misfiled)} discriminator-named models are in the generator "
+            f"bucket, so create_discriminator() reports them as not "
+            f"registered: {misfiled}"
+        )
+
+    def test_the_nine_formerly_misfiled_discriminators_are_reachable(self):
+        """The exact names #1932 reports, pinned so a regression names itself."""
+        from spectramr.models.factories.model_factory import ModelRegistry
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        registry = ModelRegistry()
+        for name in (
+            "domain_discriminator",
+            "frequency_domain_discriminator",
+            "kan_discriminator",
+            "kspace_discriminator",
+            "ldm_latent_discriminator",
+            "ldm_multiscale_latent_discriminator",
+            "ldm_patch_latent_discriminator",
+            "stargan_v2_discriminator",
+            "wasserstein_discriminator",
+        ):
+            assert registry.has_discriminator(name), (
+                f"{name!r} is not in the discriminator bucket; "
+                f"create_discriminator({name!r}) would raise ModelCreationError"
+            )
+
+    def test_registration_stamps_the_role(self):
+        from spectramr.models.registry import MODEL_REGISTRY, register_model
+
+        backup = dict(MODEL_REGISTRY)
+        MODEL_REGISTRY.clear()
+        try:
+            register_model(name="g", training_mode="gan")(type("G", (), {}))
+            register_model(name="d", training_mode="gan", role="discriminator")(
+                type("D", (), {})
+            )
+            assert MODEL_REGISTRY["g"]["role"] == "generator"
+            assert MODEL_REGISTRY["d"]["role"] == "discriminator"
+        finally:
+            MODEL_REGISTRY.clear()
+            MODEL_REGISTRY.update(backup)
+
+    def test_idiscriminator_subclass_without_role_raises_at_registration(self):
+        """The default must not be able to go silently wrong.
+
+        A class that implements the discriminator interface but is filed as a
+        generator is always a mistake. Registration refuses it, where the fix
+        is one keyword away -- rather than letting create_discriminator report
+        the name as unregistered much later.
+        """
+        import torch.nn as nn
+
+        from spectramr.models.interfaces import IDiscriminator
+        from spectramr.models.registry import MODEL_REGISTRY, register_model
+
+        backup = dict(MODEL_REGISTRY)
+        MODEL_REGISTRY.clear()
+        try:
+
+            class _Critic(IDiscriminator, nn.Module):
+                def forward(self, x):
+                    return x
+
+                def discriminate(self, x):
+                    return x
+
+                def get_feature_maps(self, x):
+                    return [x]
+
+            with pytest.raises(ValueError, match="role='discriminator'"):
+                register_model(name="oops", training_mode="gan")(_Critic)
+
+            # and it registers cleanly once it declares the role
+            register_model(name="fine", training_mode="gan", role="discriminator")(
+                _Critic
+            )
+            assert MODEL_REGISTRY["fine"]["role"] == "discriminator"
+        finally:
+            MODEL_REGISTRY.clear()
+            MODEL_REGISTRY.update(backup)
+
+    def test_undeclared_discriminator_lands_in_generators_and_cannot_be_built(self):
+        """Characterization of the residue, NOT a regression detector.
+
+        This test passes on both refs by construction and was watched doing
+        so: a class that neither subclasses IDiscriminator nor declares a
+        role lands in ``_generators`` before AND after #1932, because the
+        ``role="generator"`` signature default is deliberate (declaring a
+        role on all 602 register_model sites is a mechanical rewrite this
+        change refuses to make). So a green here is not evidence #1932 is
+        fixed -- the four sibling tests are, and they were watched red.
+
+        What it pins is the exact boundary of what the fix can see. The
+        detectable shape -- IDiscriminator subclass, no role -- raises at
+        registration; this undetectable one is why that guard exists. The
+        observable failure is not an error but a wrong bucket, and then
+        ``create_discriminator`` reporting a registered name as unregistered.
+        """
+        from spectramr.models.factories.model_factory import ModelRegistry
+        from spectramr.models.registry import MODEL_REGISTRY, register_model
+
+        backup = dict(MODEL_REGISTRY)
+        MODEL_REGISTRY.clear()
+        try:
+            register_model(name="silent_critic", training_mode="gan")(
+                type("SilentCritic", (), {})
+            )
+            registry = ModelRegistry()
+            assert "silent_critic" in registry._generators
+            assert not registry.has_discriminator("silent_critic")
+        finally:
+            MODEL_REGISTRY.clear()
+            MODEL_REGISTRY.update(backup)
+
+
+@pytest.mark.parametrize("embed_type", ["kan", "simple_kan"])
+def test_the_time_conditioned_wrapper_hands_its_horizon_to_the_kan_code(embed_type):
+    """PLANTED (#2442): both KAN creators dropped the wrapper's max_timesteps."""
+    import torch.nn as nn
+
+    from spectramr.models.factories.model_factory import TimeConditionedWrapper
+
+    wrapper = TimeConditionedWrapper(
+        nn.Identity(), time_embed_dim=16, max_timesteps=29, time_embed_type=embed_type
+    )
+    embedding = wrapper.time_embedding
+    horizon = getattr(embedding, "num_timesteps", None) or embedding.fourier_kan.max_positions
+    assert horizon == 29
+
+
+def test_enhanced_deep_unet_builds_the_configurable_unet():
+    # Meta device: construction only, no weights allocated.
+    import torch
+
+    from spectramr.models.factories.model_factory import ModelFactory
+    from spectramr.models.reconstruction.unet import UNet
+
+    with torch.device("meta"):
+        model = ModelFactory().create_generator(
+            "enhanced_deep_unet", in_channels=1, out_channels=1, model_channels=16, channel_mult=(1, 2)
+        )
+    assert type(model) is UNet
+    assert model.features == (16, 32)
+    assert model.config.use_dense_skip and model.config.dropout == 0.1
+
+
+def test_strict_target_raises_on_a_declared_key_it_cannot_accept():
+    """register_model(strict_kwargs=True): a declared model_kwargs key must not vanish."""
+    from spectramr.models.errors import ModelCreationError
+
+    ExecutionLedger.begin_run()
+    with pytest.raises(ModelCreationError, match="sampler_steps"):
+        _filter_kwargs_to_signature(
+            {"in_channels": 2, "sampler_steps": 25},
+            Narrow,
+            logger_=logger,
+            site="test",
+            declared=frozenset({"sampler_steps"}),
+            strict=True,
+        )
+
+
+def test_strict_target_ignores_undeclared_forwarded_fields():
+    """Top-level model.* fields are forwarded opportunistically; they must not raise."""
+    ExecutionLedger.begin_run()
+    out = _filter_kwargs_to_signature(
+        {"in_channels": 2, "dropout": 0.1},
+        Narrow,
+        logger_=logger,
+        site="test",
+        declared=frozenset({"in_channels"}),
+        strict=True,
+    )
+    assert out == {"in_channels": 2}
+
+
+def test_pimn_kwargs_are_not_silently_filtered() -> None:
+    """experiment_41 declared ``hidden_channels`` and the mapper dropped it without a
+    word. PIMN takes no such parameter, so the key must reach the build and be refused."""
+    from spectramr.models.factories.model_factory import ParameterMapper
+
+    mapped = ParameterMapper().map_generator_params("pimn", hidden_channels=64, num_iterations=3)
+    assert mapped["hidden_channels"] == 64

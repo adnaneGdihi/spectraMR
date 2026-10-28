@@ -217,8 +217,7 @@ def test_every_arm_declares_a_loss(arm: Path) -> None:
     ``losses:`` block. ``exp_vf_07`` was the lone arm with none, so its
     LossBuilder built nothing and the pipeline aborted with "No losses were
     built" (smoke 2026-06-15) — a crash the schema cannot catch because the key
-    is optional. NOTE: the error message says "objectives section" but the real
-    schema key is ``losses:`` (``objectives`` is a free-text label)."""
+    is optional."""
     doc = _yaml.load(arm.read_text())
     losses = doc.get("losses") if isinstance(doc, dict) else None
     assert _has_enabled_loss(losses), (

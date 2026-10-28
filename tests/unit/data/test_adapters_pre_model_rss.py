@@ -57,7 +57,7 @@ def test_adapter_chain_builder_accepts_pre_model_chain() -> None:
     step.model_dump = lambda: {"name": "rss_coils_to_magnitude", "enabled": True}
     adapters_cfg = SimpleNamespace(
         pre_model=[step],
-        post_model=[], pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+        post_model=[], pre_loss_target=[], pre_metric=[],
     )
     chains = AdapterChainBuilder(adapters_cfg).build()
     assert "pre_model" in chains
@@ -79,7 +79,7 @@ def test_pre_model_chain_collapses_four_channel_to_one_channel() -> None:
     step.model_dump = lambda: {"name": "rss_coils_to_magnitude", "enabled": True}
     adapters_cfg = SimpleNamespace(
         pre_model=[step],
-        post_model=[], pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+        post_model=[], pre_loss_target=[], pre_metric=[],
     )
     chain = AdapterChainBuilder(adapters_cfg).build()["pre_model"]
 
@@ -110,7 +110,7 @@ def test_pre_model_chain_is_identity_on_single_channel() -> None:
     step.model_dump = lambda: {"name": "rss_coils_to_magnitude", "enabled": True}
     adapters_cfg = SimpleNamespace(
         pre_model=[step],
-        post_model=[], pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+        post_model=[], pre_loss_target=[], pre_metric=[],
     )
     chain = AdapterChainBuilder(adapters_cfg).build()["pre_model"]
 
@@ -119,59 +119,16 @@ def test_pre_model_chain_is_identity_on_single_channel() -> None:
     assert torch.equal(x, y), "rss_coils_to_magnitude on 1-ch input must be identity"
 
 
-# ---------------------------------------------------------------------------
-# Audit-2026-05-14 E18 — ``rss_coils_to_magnitude`` at ``pre_loss_pred``
-# ---------------------------------------------------------------------------
-#
-# Before the fix, ``insertion_points`` only listed ``pre_model``,
-# ``pre_loss_target`` and ``pre_metric``. Several YAMLs in
-# ``experiments/inprogress/`` declare the adapter at
-# ``adapters.pre_loss_pred`` — those failed loud with
-# ``Pipeline failed: Adapter 'rss_coils_to_magnitude' is not allowed
-# at hook 'pre_loss_pred'``. The RSS reduction is a side-effect-free
-# squashing of arbitrary-channel real tensors to single-channel
-# magnitude — equally valid at any prediction hook (model output side
-# AND target side). Restriction was an unintended omission.
-
-
-def test_rss_coils_to_magnitude_advertises_pre_loss_pred() -> None:
-    """E18 regression: ``pre_loss_pred`` is now a valid insertion point."""
-    caps = get_adapter_capabilities("rss_coils_to_magnitude")
-    assert caps is not None
-    assert "pre_loss_pred" in caps.insertion_points, (
-        "rss_coils_to_magnitude must list pre_loss_pred (audit-2026-05-14 "
-        "E18). Without this hook, YAMLs that declare the adapter at "
-        "``adapters.pre_loss_pred`` fail loud at AdapterChainBuilder. "
-        f"Got insertion_points={caps.insertion_points}"
-    )
-
-
-def test_adapter_chain_builder_accepts_pre_loss_pred_chain() -> None:
-    """E18 regression: builder accepts the adapter under the new hook."""
-    step = SimpleNamespace(name="rss_coils_to_magnitude", enabled=True)
-    step.model_dump = lambda: {"name": "rss_coils_to_magnitude", "enabled": True}
-    adapters_cfg = SimpleNamespace(
-        pre_model=[], post_model=[],
-        pre_loss_pred=[step],
-        pre_loss_target=[], pre_metric=[],
-    )
-    chains = AdapterChainBuilder(adapters_cfg).build()
-    assert "pre_loss_pred" in chains
-    assert len(chains["pre_loss_pred"]) == 1
-    instance = chains["pre_loss_pred"][0]
-    assert type(instance) is get_adapter("rss_coils_to_magnitude")
-
-
-def test_rss_coils_to_magnitude_lists_all_four_hooks() -> None:
+def test_rss_coils_to_magnitude_lists_its_hooks() -> None:
     """Pin the canonical hook set so future edits surface intent.
 
-    The four supported hooks are: ``pre_model``, ``pre_loss_pred``,
-    ``pre_loss_target``, ``pre_metric``. ``post_model`` is intentionally
-    NOT listed (RSS-then-model-output would lose channel information).
+    The supported hooks are: ``pre_model``, ``pre_loss_target``,
+    ``pre_metric``. ``post_model`` is intentionally NOT listed
+    (RSS-then-model-output would lose channel information).
     """
     caps = get_adapter_capabilities("rss_coils_to_magnitude")
     assert caps is not None
-    expected = {"pre_model", "pre_loss_pred", "pre_loss_target", "pre_metric"}
+    expected = {"pre_model", "pre_loss_target", "pre_metric"}
     assert set(caps.insertion_points) == expected, (
         f"rss_coils_to_magnitude insertion_points drifted: "
         f"got {set(caps.insertion_points)}, expected {expected}"
@@ -208,7 +165,7 @@ def test_magnitude_from_complex_pre_model_chain_takes_magnitude() -> None:
     step.model_dump = lambda: {"name": "magnitude_from_complex", "enabled": True}
     adapters_cfg = SimpleNamespace(
         pre_model=[step],
-        post_model=[], pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+        post_model=[], pre_loss_target=[], pre_metric=[],
     )
     chain = AdapterChainBuilder(adapters_cfg).build()["pre_model"]
 

@@ -22,12 +22,13 @@ References (numbers match the plan):
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.conformal_geometry import (
     LinearBeltramiSolver,
     enforce_beltrami_constraint,
@@ -59,6 +60,18 @@ class BeltramiMotionCorrectionStrategy(BaseTrainingStrategy):
     fixed reference for the data-consistency residual.
     """
 
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
+
+    # parallel_compat: mu_head is an owned module, DDP-wrapped and run via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: object) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("mu_head", OWNED_MODULE),)
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "beltrami_motion_correction", None)
@@ -75,9 +88,9 @@ class BeltramiMotionCorrectionStrategy(BaseTrainingStrategy):
         )
         if self.device is not None:
             self.mu_head = self.mu_head.to(self.device)
-        # Register the mu-head (the strategy's only learnable component) with
-        # opt_g so it actually trains; previously it was a private attr left
-        # on CPU and handed to no optimizer.
+        # The mu-head is the strategy's only learnable component: register it for
+        # DDP, then put its parameters on opt_g so it actually trains.
+        self.register_owned_module("mu_head", self.mu_head)
         opt = getattr(self.env, "opt_g", None)
         if opt is not None:
             existing = {p for g in opt.param_groups for p in g["params"]}
@@ -96,7 +109,7 @@ class BeltramiMotionCorrectionStrategy(BaseTrainingStrategy):
         gs = self.grid_size
         moving = F.interpolate(input_batch, size=(gs, gs), mode="bilinear", align_corners=False)
         fixed = F.interpolate(target_batch, size=(gs, gs), mode="bilinear", align_corners=False)
-        raw = self.mu_head(moving)
+        raw = self.call_owned("mu_head", moving)
         mu = enforce_beltrami_constraint(torch.complex(raw[:, 0], raw[:, 1]), k_max=self.k_max)
         phi = self.solver(mu).phi
         warped = _warp_with_phi(moving, phi)
@@ -121,6 +134,10 @@ class CorticalConformalReconStrategy(BaseTrainingStrategy):
     only the conformal-curvature consistency loss as an additional
     regulariser.
     """
+
+    # parallel_compat: Builds no parameters (the old note described the Beltrami mu_head); the
+    # generator runs only through its wrapped forward.
+    parallel_compat = frozenset({"replicated"})
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)

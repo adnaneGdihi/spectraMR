@@ -47,6 +47,9 @@ Section 2 / §10a of ``docs/multi_contrast.md``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any, ClassVar
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,7 +85,7 @@ class BlochConsistencyLoss(nn.Module):
             taken from the metadata supplied in ``context["acquisition_params"]``.
     """
 
-    _NORM_FNS = {
+    _NORM_FNS: ClassVar[dict[str, Callable[..., torch.Tensor]]] = {
         "l1": F.l1_loss,
         "l2": F.mse_loss,
         "smooth_l1": F.smooth_l1_loss,
@@ -105,8 +108,8 @@ class BlochConsistencyLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
-        **kwargs,
+        context: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if context is None:
             raise ValueError(

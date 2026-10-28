@@ -486,6 +486,52 @@ class TestKSpaceNormalizationScaleDomain:
         assert torch.allclose(out["kspace_scale"], expected, rtol=1e-4)
         assert torch.allclose(out["kspace"].data, stacked / expected, rtol=1e-4, atol=1e-6)
 
+    def test_the_source_contrast_takes_its_own_scale(self) -> None:
+        """A 10x brighter source leaves the target's scale and values untouched (#2452)."""
+        import torchio as tio
+
+        from spectramr.data.transforms.normalization import KSpaceNormalizationTransform
+
+        torch.manual_seed(4)
+        target = torch.randn(2, 8, 8, 1) * 30
+        source = torch.randn(2, 8, 8, 1) * 30
+        transform = KSpaceNormalizationTransform(percentile=0.95, log_scaling=False)
+
+        def run(src: torch.Tensor) -> tio.Subject:
+            return transform(
+                tio.Subject(
+                    kspace=tio.ScalarImage(tensor=target.clone()),
+                    input=tio.ScalarImage(tensor=target.clone()),
+                    kspace_source=tio.ScalarImage(tensor=src.clone()),
+                )
+            )
+
+        dim, bright = run(source), run(source * 10)
+        assert torch.equal(dim["kspace_scale"], bright["kspace_scale"])
+        assert torch.equal(dim["kspace"].data, bright["kspace"].data)
+        # Each contrast lands on its own unit range, so the source is scale-free too.
+        assert torch.allclose(dim["kspace_source"].data, bright["kspace_source"].data, rtol=1e-5)
+        own = transform.spec.compute_scale(source, channel_dim=0)
+        assert torch.allclose(dim["kspace_source"].data, source / own, rtol=1e-5)
+
+    def test_the_second_repetition_shares_the_input_scale(self) -> None:
+        """``input_alt`` is the input's sibling repetition; one scale for both.
+
+        Unlisted, it was served raw beside a normalized input -- ~22x larger on
+        arm G's config -- so the model was graded on an input far off its range.
+        """
+        import torchio as tio
+
+        from spectramr.data.transforms.normalization import KSpaceNormalizationTransform
+
+        torch.manual_seed(3)
+        raw = {k: torch.randn(2, 8, 8, 1) * 30 for k in ("kspace", "input", "input_alt")}
+        subject = tio.Subject(**{k: tio.ScalarImage(tensor=v.clone()) for k, v in raw.items()})
+        out = KSpaceNormalizationTransform(log_scaling=False)(subject)
+        scale = out["kspace_scale"]
+        assert torch.allclose(out["input_alt"].data * scale, raw["input_alt"], rtol=1e-4)
+        assert torch.allclose(out["input"].data * scale, raw["input"], rtol=1e-4)
+
 
 class TestImageDomainScaleAxes:
     """The image-domain scale must FFT over (H, W), whatever the layout.
@@ -613,6 +659,33 @@ class TestKSpaceNormalizationSpec:
 
         with pytest.raises(ValueError, match="scale_domain"):
             KSpaceNormalizationSpec(scale_domain="parseval")
+
+    @pytest.mark.parametrize(
+        ("normalize", "log_scaling", "expected"),
+        [(True, True, True), (False, True, False), (True, False, False), (False, False, False)],
+    )
+    def test_log_compressed_needs_both_knobs(self, normalize, log_scaling, expected):
+        """#2353: ``normalize`` is a no-op when disabled, so ``log_scaling`` alone
+        compresses nothing and a reader that trusted it would ``expm1`` raw k-space."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        spec = KSpaceNormalizationSpec.from_data_config(
+            dict(self.CFG, normalize_kspace=normalize, log_scaling=log_scaling)
+        )
+        assert spec.log_compressed is expected
+
+    def test_log_compressed_agrees_with_what_normalize_does(self):
+        """The predicate is pinned to the behaviour, not to the flag values."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        x = torch.randn(1, 4, 8, 8) * 50
+        for normalize in (True, False):
+            spec = KSpaceNormalizationSpec.from_data_config(
+                dict(self.CFG, normalize_kspace=normalize, log_scaling=True)
+            )
+            out, scale = spec.normalize(x, channel_dim=1)
+            linear = x / scale
+            assert (not torch.allclose(out, linear)) is spec.log_compressed
 
 
 # ---------------------------------------------------------------------------
@@ -1268,3 +1341,363 @@ class TestKSpaceNormalizationSurvivesPatchExtraction:
         assert float(patch["input"].data.abs().max()) == pytest.approx(
             float(normalized["input"].data.abs().max())
         )
+
+
+class TestAcsScaleDomain:
+    """``scale_domain='acs'`` reads only the band every rung acquires, so the
+    scale the dataloader stamps from the fully sampled reference is the scale
+    inference computes from the undersampled measurement."""
+
+    #: The cohort's R=32 rung at 256x256: the 5-line core plus 3 random lines.
+    TOP_RUNG_ROWS = (72, 110, 126, 127, 128, 129, 130, 148)
+
+    @staticmethod
+    def _kspace() -> torch.Tensor:
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        g = torch.Generator().manual_seed(0)
+        axis = torch.linspace(-1, 1, 256)
+        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+        image = (xx**2 + yy**2 < 0.6).float() * (1 + 0.3 * torch.rand(256, 256, generator=g))
+        k = fft2c(image.to(torch.complex64).unsqueeze(0))
+        return torch.stack([k.real, k.imag], dim=1).reshape(2, 256, 256).unsqueeze(-1)
+
+    def _undersampled(self, k: torch.Tensor) -> torch.Tensor:
+        mask = torch.zeros(256, dtype=torch.bool)
+        mask[list(self.TOP_RUNG_ROWS)] = True
+        return k * mask.view(1, 256, 1, 1)
+
+    def test_the_band_is_centred_on_the_dc_row(self) -> None:
+        from spectramr.data.transforms.normalization import acs_band_rows
+
+        assert acs_band_rows(256, 0.02) == slice(126, 131)
+        assert acs_band_rows(256, 0.0001) == slice(128, 129)
+
+    @pytest.mark.parametrize(
+        ("width", "band"),
+        # int(W*f) would give 120:140 and 125:146: a line short, and offset by one.
+        [(260, slice(120, 141)), (270, slice(124, 146))],
+    )
+    def test_the_band_width_rounds_as_the_masks_do(self, width: int, band: slice) -> None:
+        from spectramr.data.transforms.normalization import acs_band_rows
+
+        assert acs_band_rows(width, 0.08) == band
+
+    def test_a_zero_floor_lets_a_zero_fraction_mean_no_band(self) -> None:
+        from spectramr.data.transforms.normalization import acs_band_rows
+
+        rows = acs_band_rows(256, 0.0, min_lines=0)
+        assert rows.stop - rows.start == 0
+
+    def test_acs_is_in_the_one_advertised_domain_set(self) -> None:
+        from spectramr.data.transforms.normalization import (
+            KSPACE_SCALE_DOMAINS,
+            KSpaceNormalizationTransform,
+        )
+
+        assert "acs" in KSPACE_SCALE_DOMAINS
+        # A second, narrower class-level set would misstate what the transform accepts.
+        assert not hasattr(KSpaceNormalizationTransform, "SCALE_DOMAINS")
+        transform = KSpaceNormalizationTransform(
+            scale_domain="acs", center_fraction=0.08, phase_encode_axis=-1
+        )
+        assert transform.spec.scale_domain == "acs"
+
+    @pytest.mark.parametrize(
+        ("domain", "fraction", "log_scaling"),
+        [("image", None, False), ("kspace", 0.25, True)],
+    )
+    def test_only_the_acs_scale_survives_undersampling(
+        self, domain: str, fraction: float | None, log_scaling: bool
+    ) -> None:
+        """On this phantom ``image`` moves 1.7 % and the k-space patch 3.7x."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        k, u = self._kspace(), self._undersampled(self._kspace())
+        acs = KSpaceNormalizationSpec(
+            enabled=True,
+            percentile=0.95,
+            scale_domain="acs",
+            center_fraction=0.02,
+            phase_encode_axis=-2,
+        )
+        other = KSpaceNormalizationSpec(
+            enabled=True,
+            percentile=0.95,
+            scale_domain=domain,
+            center_fraction=fraction,
+            log_scaling=log_scaling,
+        )
+        assert torch.equal(acs.compute_scale(k), acs.compute_scale(u))
+        assert not torch.allclose(other.compute_scale(k), other.compute_scale(u), rtol=1e-3)
+
+    def test_a_band_wider_than_the_acquired_core_is_not_invariant(self) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        k = self._kspace()
+        wide = KSpaceNormalizationSpec(
+            enabled=True,
+            percentile=0.95,
+            scale_domain="acs",
+            center_fraction=0.25,
+            phase_encode_axis=-2,
+        )
+        assert not torch.equal(wide.compute_scale(k), wide.compute_scale(self._undersampled(k)))
+
+    def test_batched_layout_matches_the_torchio_layout(self) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        k = self._kspace()
+        spec = KSpaceNormalizationSpec(
+            enabled=True, scale_domain="acs", center_fraction=0.02, phase_encode_axis=-2
+        )
+        batched = k.squeeze(-1).unsqueeze(0)
+        assert torch.allclose(spec.compute_scale(k), spec.compute_scale(batched, channel_dim=1))
+
+    @pytest.mark.parametrize("fraction", [None, 0.0, 1.5])
+    def test_acs_without_a_band_raises(self, fraction: float | None) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        with pytest.raises(ValueError, match="scale_domain='acs'"):
+            KSpaceNormalizationSpec(
+                scale_domain="acs", center_fraction=fraction, phase_encode_axis=-2
+            )
+
+    def test_acs_without_a_phase_encode_axis_raises(self) -> None:
+        """The band runs along the phase-encode axis; there is no default (#2160)."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        with pytest.raises(ValueError, match="phase_encode_axis"):
+            KSpaceNormalizationSpec(scale_domain="acs", center_fraction=0.02)
+
+    @staticmethod
+    def _column_case() -> tuple[torch.Tensor, torch.Tensor]:
+        """40x64 ``(C, H, W, D)`` k-space and its column-undersampled copy: the
+        6-column core around DC plus three outer columns."""
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        g = torch.Generator().manual_seed(1)
+        yy, xx = torch.meshgrid(torch.linspace(-1, 1, 40), torch.linspace(-1, 1, 64), indexing="ij")
+        image = (xx**2 + yy**2 < 0.6).float() * (1 + 0.3 * torch.rand(40, 64, generator=g))
+        k = fft2c(image.to(torch.complex64).unsqueeze(0))
+        k = torch.stack([k.real, k.imag], dim=1).reshape(2, 40, 64).unsqueeze(-1)
+        keep = torch.zeros(64, dtype=torch.bool)
+        keep[[5, 29, 30, 31, 32, 33, 34, 50]] = True
+        return k, k * keep.view(1, 1, 64, 1)
+
+    def test_the_band_follows_a_column_phase_encode_axis(self) -> None:
+        """M4Raw / fastMRI brain: the mask keeps columns, so the band must be columns."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        k, u = self._column_case()
+        columns = KSpaceNormalizationSpec(
+            enabled=True, scale_domain="acs", center_fraction=0.05, phase_encode_axis=-1
+        )
+        assert torch.equal(columns.compute_scale(k), columns.compute_scale(u))
+        batched = k.squeeze(-1).unsqueeze(0)
+        assert torch.allclose(columns.compute_scale(k), columns.compute_scale(batched, channel_dim=1))
+
+    def test_a_row_band_on_column_undersampled_data_is_not_invariant(self) -> None:
+        """PLANTED: the pre-#2160 band (always rows) under a column mask."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        k, u = self._column_case()
+        rows = KSpaceNormalizationSpec(
+            enabled=True, scale_domain="acs", center_fraction=0.05, phase_encode_axis=-2
+        )
+        assert not torch.equal(rows.compute_scale(k), rows.compute_scale(u))
+
+    def test_the_axis_is_read_from_data_acquisition(self) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        data = {
+            "processing": {
+                "enable_kspace_normalization": True,
+                "kspace_percentile": 0.99,
+                "enable_log_scaling": False,
+                "kspace_scale_domain": "acs",
+                "log_scaling_center_fraction": 0.02,
+            },
+            "acquisition": {"phase_encode_axis": -1, "acquired_pe_lines": "measured"},
+        }
+        assert KSpaceNormalizationSpec.from_data_config(data).phase_encode_axis == -1
+
+
+class TestKSpaceScaleReference:
+    """``scale_reference`` picks the subject image the scale is measured on.
+
+    The fixture's input is 10x dimmer than its target, so a test that read the
+    wrong image would see a 10x different scale rather than pass by coincidence.
+    """
+
+    @staticmethod
+    def _subject(*keys: str) -> tuple[tio.Subject, dict[str, torch.Tensor]]:
+        torch.manual_seed(7)
+        target = torch.randn(2, 8, 8, 1) * 30
+        raw = {
+            "kspace": target,
+            "target": target * 2.0,
+            "input": target * 0.1 + torch.randn(2, 8, 8, 1),
+            "input_alt": target * 0.1 + torch.randn(2, 8, 8, 1),
+        }
+        raw = {k: raw[k] for k in keys}
+        subject = tio.Subject(**{k: tio.ScalarImage(tensor=v.clone()) for k, v in raw.items()})
+        return subject, raw
+
+    @staticmethod
+    def _transform(reference: str | None = None):
+        from spectramr.data.transforms.normalization import KSpaceNormalizationTransform
+
+        kwargs = {} if reference is None else {"scale_reference": reference}
+        return KSpaceNormalizationTransform(percentile=0.95, log_scaling=False, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("keys", "expected_ref"),
+        [
+            (("kspace", "target", "input"), "kspace"),
+            (("target", "input"), "target"),
+            (("input",), "input"),
+        ],
+        ids=["kspace-first", "target-before-input", "input-only-still-falls-through"],
+    )
+    def test_target_reproduces_the_historical_order(
+        self, keys: tuple[str, ...], expected_ref: str
+    ) -> None:
+        """The default and the explicit value both keep the pre-knob reference."""
+        for reference in (None, "target"):
+            subject, raw = self._subject(*keys)
+            transform = self._transform(reference)
+            out = transform(subject)
+            expected = transform.spec.compute_scale(raw[expected_ref], channel_dim=0)
+            assert torch.equal(out["kspace_scale"], expected)
+
+    def test_input_scales_every_image_by_the_inputs_quantile(self) -> None:
+        subject, raw = self._subject("kspace", "input", "input_alt")
+        transform = self._transform("input")
+        out = transform(subject)
+        expected = transform.spec.compute_scale(raw["input"], channel_dim=0)
+        assert torch.equal(out["kspace_scale"], expected)
+        target_scale = transform.spec.compute_scale(raw["kspace"], channel_dim=0)
+        assert not torch.allclose(expected, target_scale, rtol=0.5)
+        for key in ("kspace", "input", "input_alt"):
+            assert torch.allclose(out[key].data * expected, raw[key], rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize("reference", ["target", "input"])
+    def test_a_published_measurement_sets_the_input_scale_and_is_never_served(
+        self, reference: str
+    ) -> None:
+        """``input`` recorrupted as ``y + a*z`` with ``a*z`` large; ``y`` published.
+
+        Under "input" the scale is ``y``'s; under "target" the key is ignored.
+        Either way it is removed, so it never reaches a batch.
+        """
+        from spectramr.data.transforms.normalization import MEASURED_INPUT_KEY
+
+        subject, raw = self._subject("kspace", "input")
+        measured = raw["input"].clone()
+        recorrupted = measured + 500.0 * torch.randn_like(measured)
+        subject["input"].set_data(recorrupted.clone())
+        subject.add_image(tio.ScalarImage(tensor=measured.clone()), MEASURED_INPUT_KEY)
+        transform = self._transform(reference)
+        out = transform(subject)
+        ref = measured if reference == "input" else raw["kspace"]
+        assert torch.equal(out["kspace_scale"], transform.spec.compute_scale(ref, channel_dim=0))
+        y_az = transform.spec.compute_scale(recorrupted, channel_dim=0)
+        assert not torch.allclose(out["kspace_scale"], y_az, rtol=0.5)
+        assert MEASURED_INPUT_KEY not in out
+        assert torch.allclose(out["input"].data * out["kspace_scale"], recorrupted, rtol=1e-4)
+
+    def test_only_an_input_referenced_normalizer_consumes_the_measurement(self) -> None:
+        """The dataset publishes the key on this answer, so it must not over-claim."""
+        from spectramr.data.transforms.normalization import consumes_measured_input
+
+        assert consumes_measured_input(tio.Compose([tio.Lambda(lambda x: x), self._transform("input")]))
+        assert consumes_measured_input(self._transform("input"))
+        assert not consumes_measured_input(self._transform("target"))
+        assert not consumes_measured_input(tio.Compose([tio.Lambda(lambda x: x)]))
+        assert not consumes_measured_input(None)
+
+    def test_input_without_an_input_image_raises_by_name(self) -> None:
+        """PLANTED: no silent fall-through to the target (pitfall #9)."""
+        subject, _ = self._subject("kspace", "target")
+        with pytest.raises(KeyError, match=r"kspace_scale_reference.*'input'"):
+            self._transform("input")(subject)
+
+    def test_an_unknown_reference_is_rejected(self) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        with pytest.raises(ValueError, match="Unknown scale_reference"):
+            self._transform("kspace")
+        with pytest.raises(ValueError, match="Unknown scale_reference"):
+            KSpaceNormalizationSpec(scale_reference="measured")
+
+    def test_the_resolver_reads_the_declared_reference(self) -> None:
+        """A stored config predating the knob resolves to what it trained under."""
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        processing = {
+            "enable_kspace_normalization": True,
+            "kspace_percentile": 0.99,
+            "enable_log_scaling": False,
+            "kspace_scale_domain": "image",
+            "log_scaling_center_fraction": 0.25,
+        }
+        stored = KSpaceNormalizationSpec.from_data_config({"processing": processing})
+        assert stored.scale_reference == "target"
+        declared = {**processing, "kspace_scale_reference": "input"}
+        spec = KSpaceNormalizationSpec.from_data_config({"processing": declared})
+        assert spec.scale_reference == "input"
+
+
+class TestTheAcsWindowScaleSurvivesA2DMask:
+    """The sweep's Poisson-disc and radial masks keep a 20 x 20 window, not whole lines."""
+
+    @staticmethod
+    def _scene() -> tuple[torch.Tensor, torch.Tensor]:
+        from spectramr.data.transforms.rep_mask_patterns import calibration_region
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        gen = torch.Generator().manual_seed(3)
+        image = torch.zeros(4, 64, 64, 1, dtype=torch.complex64)
+        image[:, 16:48, 20:44] = torch.complex(torch.rand(4, 32, 24, 1, generator=gen), torch.rand(4, 32, 24, 1, generator=gen))
+        kspace = fft2c(image.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        mask = (torch.rand(64, 64, generator=gen) < 0.15) | calibration_region(64, 64, 0.125)
+        return kspace, kspace * mask[None, :, :, None]
+
+    def _spec(self, domain: str):
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        return KSpaceNormalizationSpec(
+            enabled=True, percentile=0.95, scale_domain=domain, center_fraction=0.125,
+            phase_encode_axis=-1,
+        )
+
+    def test_the_window_scale_is_the_same_on_the_reference_and_the_mask(self) -> None:
+        full, masked = self._scene()
+        spec = self._spec("acs_window")
+        assert torch.equal(spec.compute_scale(full), spec.compute_scale(masked))
+
+    def test_the_line_band_is_not(self) -> None:
+        """Planted: whole phase-encode lines are not inside a 2-D mask."""
+        full, masked = self._scene()
+        band = self._spec("acs")
+        assert not torch.allclose(band.compute_scale(full), band.compute_scale(masked), rtol=1e-3)
+
+    def test_the_masks_and_the_scale_share_one_window(self) -> None:
+        from spectramr.data.transforms.normalization import acs_window
+        from spectramr.data.transforms.rep_mask_patterns import calibration_region
+
+        for h, w, f in ((256, 256, 0.08), (255, 200, 0.1), (64, 64, 0.0)):
+            n = round(w * f)
+            old = torch.zeros(h, w, dtype=torch.bool)
+            if n:
+                old[h // 2 - n // 2 : h // 2 - n // 2 + n, w // 2 - n // 2 : w // 2 - n // 2 + n] = True
+            assert torch.equal(calibration_region(h, w, f), old)
+            rows, cols = acs_window(h, w, f)
+            assert (rows.stop - rows.start, cols.stop - cols.start) == (n, n)
+
+    def test_acs_window_without_a_fraction_raises(self) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        with pytest.raises(ValueError, match="acs_window"):
+            KSpaceNormalizationSpec(enabled=True, scale_domain="acs_window", center_fraction=None)

@@ -62,6 +62,27 @@ class TestVQVAETrainingStrategy:
         env.config.optimization.precision.dtype = "float32"
         env.config.model.model_type = "vqvae"
         env.model_type = "vqvae"
+        # These are loss-composition tests; training metrics are a separate
+        # subject with their own suite. Turn that path off through the switch
+        # the schema provides, rather than leaving MagicMocks to decide it
+        # (#1922). Two mock reads sit on the way in and neither is benign:
+        #   * `_compute_training_metrics` evaluates `train_metric_interval > 0`,
+        #     which raises `TypeError: '>' not supported between instances of
+        #     'MagicMock' and 'int'` -- the reported failure;
+        #   * `VQVAETrainingStrategy._compute_losses_impl` takes the step from
+        #     `getattr(self.env, "step", 0)`, so a mock there makes the throttle
+        #     evaluate `mock % 100 == 0` -> False. Pinning ONLY the interval
+        #     turns the crash into a silent skip: the tests go green having
+        #     never entered the path they cross.
+        # `enable_tracking=False` is the designed opt-out and returns before
+        # either read, so the skip is a decision rather than mock arithmetic.
+        # `env.step` is pinned to 0 to match the producer: the real
+        # `builders.environment.TrainingEnvironment` declares no `step` field at
+        # all (0 assignments to `env.step` under `infrastructure/training/`), so
+        # production always takes that `getattr` default. A MagicMock inventing
+        # an attribute production does not have is the opposite of a fixture.
+        env.config.metrics.enable_tracking = False
+        env.step = 0
 
         return env
 
@@ -192,9 +213,7 @@ class TestVQVAETrainingStrategy:
         # Mock validation metrics computer
         mock_computer = MagicMock()
         mock_computer.compute.return_value = {"psnr": 30.0}
-        strategy._get_validation_metrics_computer = MagicMock(
-            return_value=mock_computer
-        )
+        strategy._get_validation_metrics_computer = MagicMock(return_value=mock_computer)
 
         # Execute
         metrics = strategy.validation_step(batch, input_batch, target_batch)

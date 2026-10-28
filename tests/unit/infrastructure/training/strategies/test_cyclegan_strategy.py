@@ -51,6 +51,7 @@ def minimal_cyclegan_config() -> TrainingSettings:
 
 def _make_strategy(config: TrainingSettings) -> CycleGANTrainingStrategy:
     strat = CycleGANTrainingStrategy.__new__(CycleGANTrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = config
     strat.env = types.SimpleNamespace(
         generator=None,
@@ -204,6 +205,7 @@ def test_setup_models_amp_configures_extra_nets(
     the strategy-owned ``gen_ba`` / ``disc_a`` must be AMP-configured inside
     ``setup_models`` too."""
     strat = CycleGANTrainingStrategy.__new__(CycleGANTrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = minimal_cyclegan_config
     strat.env = types.SimpleNamespace(
         generator=None,
@@ -215,9 +217,7 @@ def test_setup_models_amp_configures_extra_nets(
     )
     strat.device = torch.device("cpu")
     configured: list = []
-    strat.amp_helper = types.SimpleNamespace(
-        configure_model_for_amp=lambda m: configured.append(m)
-    )
+    strat.amp_helper = types.SimpleNamespace(configure_model_for_amp=lambda m: configured.append(m))
     strat.setup_models()
     assert strat.gen_ba in configured and strat.disc_a in configured
 
@@ -241,12 +241,10 @@ def test_g_closure_exposes_plain_metric_names(
     metrics = strat._last_step_metrics
     assert {"cycle", "identity", "adv_g", "adv_d", "g_total_loss"} <= set(metrics)
     # No legacy ``g_``-prefixed component keys leak through.
-    assert not any(
-        key in ("g_cycle", "g_identity", "g_adv_g", "g_adv_d") for key in metrics
-    )
-    # Component metrics are plain floats (routed through ``_handle_anomalies``).
+    assert not any(key in ("g_cycle", "g_identity", "g_adv_g", "g_adv_d") for key in metrics)
+    # Component metrics are scalar device tensors (routed through ``_handle_anomalies``).
     assert all(
-        isinstance(metrics[key], float)
+        isinstance(metrics[key], torch.Tensor) and metrics[key].ndim == 0
         for key in ("cycle", "identity", "adv_g", "g_total_loss")
     )
     # The D-closure's metric survives the G-closure ``update``.
@@ -255,3 +253,238 @@ def test_g_closure_exposes_plain_metric_names(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _cg_cfg_with_image_losses(image_losses: list[dict]) -> TrainingSettings:
+    return TrainingSettings(
+        data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 2},
+        model={"model_type": "cyclegan_generator", "in_channels": 1, "out_channels": 1},
+        optimization={"learning_rate": 2e-4},
+        logging={},
+        losses={
+            "gan": {"lambda_cycle": 10.0, "lambda_identity": 0.5},
+            "image_losses": image_losses,
+            "policy": {"output_domain": "image"},
+        },
+    )
+
+
+def test_cyclegan_band_split_source_term_fires_through_compute() -> None:
+    """Band-split low-band consistency to the input rides on the CycleGAN total."""
+    from spectramr.models.losses.spectral_band_split_loss import SpectralBandSplitLoss
+
+    def cfg(w: float) -> TrainingSettings:
+        return _cg_cfg_with_image_losses(
+            [
+                {
+                    "name": "spectral_band_split",
+                    "weight": w,
+                    "role": "source",
+                    "kwargs": {"center_fraction": 0.15, "lambda_low": 1.0, "lambda_high": 0.0},
+                }
+            ]
+        )
+
+    strat = _make_strategy(cfg(1.0))
+    strat.env.losses = {
+        "spectral_band_split": SpectralBandSplitLoss(lambda_low=1.0, lambda_high=0.0)
+    }
+    torch.manual_seed(0)
+    out = strat._compute_losses_impl(_batch())
+    band = out["loss_spectral_band_split"]
+    assert torch.isfinite(band) and band > 0
+    # Same call: the total is the CycleGAN terms plus the source-role term.
+    cyc = 10.0 * out["cycle"] + 0.5 * out["identity"]
+    assert torch.allclose(out["g_total_loss"], out["adv_g"] + cyc + band, atol=1e-5)
+
+
+def _make_b0_strategy(config: TrainingSettings) -> CycleGANTrainingStrategy:
+    from spectramr.models.generators.b0_hypernetwork import B0ConditionedGenerator
+
+    strat = CycleGANTrainingStrategy.__new__(CycleGANTrainingStrategy)
+
+    strat._owned_modules, strat._owned_wrappers = {}, {}
+    strat.config = config
+    strat.env = types.SimpleNamespace(
+        generator=B0ConditionedGenerator(1, 1, ngf=8, n_blocks=1, hidden_dim=32),
+        discriminator=None,
+        losses={},
+        opt_g=None,
+        opt_d=None,
+        schedulers={},
+    )
+    strat.device = torch.device("cpu")
+    strat.setup_models()
+    return strat
+
+
+def _b0_batch(field_t: float = 3.0, field_s: float = 0.064) -> dict:
+    return {
+        "input": torch.rand(2, 1, 64, 64),
+        "target": torch.rand(2, 1, 64, 64),
+        "field_strength_t": torch.full((2,), field_t),
+        "field_strength_source_t": torch.full((2,), field_s),
+    }
+
+
+def test_b0_fields_fire_through_compute_and_reach_both_hypernetworks(
+    minimal_cyclegan_config: TrainingSettings,
+) -> None:
+    strat = _make_b0_strategy(minimal_cyclegan_config)
+    batch = _b0_batch()
+    losses = strat._compute_losses_impl(
+        input_batch=batch["input"], target_batch=batch["target"], epoch=0, batch=batch
+    )
+    losses["g_total_loss"].backward()
+    assert strat.gen_ab.hyper_network.heads[0].weight.grad.abs().sum() > 0
+    assert strat.gen_ba.hyper_network.heads[0].weight.grad.abs().sum() > 0
+
+
+def test_b0_compute_without_field_stamp_raises(
+    minimal_cyclegan_config: TrainingSettings,
+) -> None:
+    strat = _make_b0_strategy(minimal_cyclegan_config)
+    batch = _b0_batch()
+    del batch["field_strength_t"]
+    with pytest.raises(ValueError, match="requires field_strength"):
+        strat._compute_losses_impl(
+            input_batch=batch["input"], target_batch=batch["target"], epoch=0, batch=batch
+        )
+
+
+def test_step_fields_fallback_is_used_when_no_batch_is_passed(
+    minimal_cyclegan_config: TrainingSettings,
+) -> None:
+    strat = _make_b0_strategy(minimal_cyclegan_config)
+    batch = _b0_batch()
+    strat._step_fields = strat._fields_from(batch)
+    losses = strat._compute_losses_impl(input_batch=batch["input"], target_batch=batch["target"])
+    assert torch.isfinite(losses["g_total_loss"])
+
+
+def test_validation_forward_routes_output_field(
+    minimal_cyclegan_config: TrainingSettings,
+) -> None:
+    strat = _make_b0_strategy(minimal_cyclegan_config)
+    x = torch.rand(2, 1, 16, 16)
+    out_3t = strat._validation_forward(x, batch_context={"field_strength_t": torch.full((2,), 3.0)})
+    out_ulf = strat._validation_forward(
+        x, batch_context={"field_strength_t": torch.full((2,), 0.064)}
+    )
+    assert (out_3t - out_ulf).abs().max() > 1e-6
+    with pytest.raises(ValueError, match="requires field_strength"):
+        strat._validation_forward(x, batch_context={})
+
+
+def test_validation_step_declares_and_forwards_field_seam(
+    minimal_cyclegan_config: TrainingSettings,
+) -> None:
+    import inspect
+
+    from spectramr.pipelines.train import select_validation_extra_fields
+
+    strat = _make_b0_strategy(minimal_cyclegan_config)
+    seen: list[dict] = []
+    strat._validation_forward = lambda inp, ctx=None, **kw: seen.append(ctx) or inp
+    batch = _b0_batch()
+    extra = select_validation_extra_fields(
+        batch, tuple(inspect.signature(strat.validation_step).parameters)
+    )
+    assert "field_strength_t" in extra and "field_strength_source_t" in extra
+    strat.validation_step(batch["input"], batch["target"], **extra)
+    assert torch.equal(seen[0]["field_strength_t"], batch["field_strength_t"])
+
+
+def _domain_cfg() -> TrainingSettings:
+    return TrainingSettings(
+        data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 2},
+        model={"model_type": "cyclegan_generator", "in_channels": 1, "out_channels": 1},
+        optimization={"learning_rate": 2e-4},
+        logging={},
+        training={"strategy_class": "cyclegan"},
+        losses={
+            "gan": {
+                "lambda_cycle": 10.0,
+                "lambda_identity": 0.5,
+                "lambda_domain": 0.5,
+                "domain_grl": {"enabled": True},
+            }
+        },
+    )
+
+
+def test_grl_reverses_encoder_gradient_and_keeps_classifier_gradient() -> None:
+    """Encoder grads from the domain term are -1 x the plain classifier grads (alpha = 1);
+    classifier grads are identical with and without the reversal."""
+    import torch.nn.functional as F
+
+    strat = _make_strategy(_domain_cfg())
+    head = strat.domain_head
+    head.classifier.eval()  # Dropout off, so both passes see the same function
+    enc = list(strat.gen_ab.model[: strat.gen_ab._anatomy_split].parameters())
+    cls = list(head.classifier.parameters())
+    _, z_a = strat.gen_ab.forward_with_anatomy(torch.rand(2, 1, 32, 32))
+    _, z_b = strat.gen_ab.forward_with_anatomy(torch.rand(2, 1, 32, 32))
+    term, _ = strat._domain_term(z_a, z_b)
+    z = torch.cat([z_a, z_b])
+    labels = torch.cat([z.new_zeros(2, 1), z.new_ones(2, 1)])
+    plain = head.loss_weight * F.binary_cross_entropy_with_logits(head.classifier(z), labels)
+    g_enc = torch.autograd.grad(term, enc, retain_graph=True)
+    g_enc_plain = torch.autograd.grad(plain, enc, retain_graph=True)
+    for g, p in zip(g_enc, g_enc_plain, strict=True):
+        assert torch.allclose(g, -p, atol=1e-6)
+    g_cls = torch.autograd.grad(term, cls, retain_graph=True)
+    g_cls_plain = torch.autograd.grad(plain, cls)
+    for g, p in zip(g_cls, g_cls_plain, strict=True):
+        assert torch.allclose(g, p, atol=1e-6)
+
+
+def test_domain_head_trains_through_the_production_g_step() -> None:
+    """train_step's generator closure carries the domain term in g_total and grads reach
+    the classifier (opt_g) and the encoder."""
+    strat = _make_strategy(_domain_cfg())
+    strat.env.opt_g = torch.optim.Adam(
+        list(strat.gen_ab.parameters()) + list(strat.gen_ba.parameters()), lr=1e-4
+    )
+    strat.env.opt_d = torch.optim.Adam(
+        list(strat.disc_a.parameters()) + list(strat.disc_b.parameters()), lr=1e-4
+    )
+    strat._register_owned_params()
+    opt_ids = {id(p) for g in strat.env.opt_g.param_groups for p in g["params"]}
+    assert {id(p) for p in strat.domain_head.parameters()} <= opt_ids
+
+    configs = strat.train_step(_batch(), epoch=0, iteration=1)
+    g_cfg = next(c for c in configs if c["name"] == "generator")
+    g_cfg["closure"]().backward()
+    m = strat._last_step_metrics
+    base = m["adv_g"] + 10.0 * m["cycle"] + 0.5 * m["identity"]
+    assert torch.allclose(m["g_total_loss"], base + m["loss_domain"], atol=1e-5)
+    head_params = list(strat.domain_head.parameters())
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in head_params)
+    enc = strat.gen_ab.model[: strat.gen_ab._anatomy_split]
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in enc.parameters())
+
+
+def test_domain_head_state_is_checkpointed() -> None:
+    strat = _make_strategy(_domain_cfg())
+    assert "domain_head" in strat.strategy_state_dict()["modules"]
+
+
+def test_domain_grl_on_a_generator_without_a_tap_raises() -> None:
+    from spectramr.models.generators.b0_hypernetwork import B0ConditionedGenerator
+
+    strat = CycleGANTrainingStrategy.__new__(CycleGANTrainingStrategy)
+
+    strat._owned_modules, strat._owned_wrappers = {}, {}
+    strat.config = _domain_cfg()
+    strat.env = types.SimpleNamespace(
+        generator=B0ConditionedGenerator(1, 1, ngf=8, n_blocks=1, hidden_dim=32),
+        discriminator=None,
+        losses={},
+        opt_g=None,
+        opt_d=None,
+        schedulers={},
+    )
+    strat.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="bottleneck tap"):
+        strat.setup_models()

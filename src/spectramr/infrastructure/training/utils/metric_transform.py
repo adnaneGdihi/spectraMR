@@ -35,6 +35,26 @@ magnitude of an image. The declaration is a copy-paste from a k-space sibling,
 not an intent, and the honest response to 146 arms naming a non-existent
 transform is to say so (pitfall #9), not to guess which one they meant.
 
+**``ifft_target_magnitude`` is the one asymmetric transform.** Every other name
+treats prediction and target alike, which is right only when both live in one
+domain. An image-domain network over a k-space loader (the ``self_supervised``
+EI arms) predicts an image while its target is the fully sampled k-space; with no
+transform the auto-``magnitude`` gate scored the image against ``|k|``, whose
+maximum is the DC sample at the grid centre (#2325), and ``ifft_magnitude`` would
+take the Fourier magnitude of the image instead. This one brings only the target
+to the image domain (:func:`kspace_rss_magnitude`) and takes the prediction's
+magnitude (:func:`image_magnitude`). It is declared, never inferred: whether a
+target is k-space is not recoverable from the config on every route.
+
+**``sense_magnitude`` needs the batch's coil maps.** It scores
+:math:`|\\hat S^H F^H \\cdot|` with unit-normalised maps instead of the RSS image:
+the target is always the SENSE combination of its multi-coil k-space, a coil
+k-space prediction is combined the same way, and a single-image prediction (EI,
+SSDU) is taken as it is. The combine is owned by
+:func:`spectramr.core.metrics.sense_image_metrics.sense_scoring_pair`, which the
+``sense_psnr``/``sense_ssim`` metrics also call; with no maps it raises rather
+than falling back to RSS.
+
 Precedence for the value that runs, highest first:
 
 1. an explicit name handed in by the caller (``diffusion.py`` resolves its own);
@@ -61,6 +81,8 @@ from __future__ import annotations
 import logging
 from typing import Any, NamedTuple
 
+import torch
+
 from spectramr.infrastructure.training.strategies.mixins.utils import (
     _get_config_value,
     _scoring_leaf,
@@ -74,7 +96,9 @@ IMPLEMENTED_METRIC_TRANSFORMS: frozenset[str] = frozenset(
     {
         "ifft_magnitude",
         "ifft_sense_adjoint",
+        "ifft_target_magnitude",
         "magnitude",
+        "sense_magnitude",
     }
 )
 
@@ -211,10 +235,48 @@ def declared_metric_transforms(
     )
 
 
+def image_magnitude(image: torch.Tensor) -> torch.Tensor:
+    """``[B, 1, H, W]`` magnitude of an image tensor, root-sum-of-squares over channels.
+
+    Complex channels are taken as they are; an even real channel count is read as
+    real/imag-interleaved complex channels (the layout every recon network emits);
+    a single real channel is already a magnitude.
+    """
+    if not torch.is_complex(image) and image.shape[1] > 1:
+        if image.shape[1] % 2 != 0:
+            raise ValueError(
+                f"image_magnitude: {image.shape[1]} real channels cannot be paired "
+                "into real/imag complex channels."
+            )
+        image = torch.complex(image[:, 0::2], image[:, 1::2])
+    return image.abs().pow(2).sum(dim=1, keepdim=True).sqrt()
+
+
+def kspace_rss_magnitude(kspace: torch.Tensor) -> torch.Tensor:
+    """``[B, 1, H, W]`` root-sum-of-squares image of multi-coil k-space.
+
+    Pairs real/imag-interleaved channels into complex coils, moves each coil to
+    the image domain through the physics SSOT, and RSS-combines. One coil gives
+    its magnitude. An odd real channel count has no coil layout and raises.
+    """
+    from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+    if not torch.is_complex(kspace):
+        if kspace.shape[1] % 2 != 0:
+            raise ValueError(
+                f"kspace_rss_magnitude: {kspace.shape[1]} real channels are not a "
+                "real/imag-interleaved coil stack, so they cannot be k-space."
+            )
+        kspace = torch.complex(kspace[:, 0::2], kspace[:, 1::2])
+    return image_magnitude(ifft2c(kspace))
+
+
 __all__ = [
     "IMPLEMENTED_METRIC_TRANSFORMS",
     "MetricTransformResolution",
     "canonical_metric_transform",
     "declared_metric_transforms",
+    "image_magnitude",
+    "kspace_rss_magnitude",
     "resolve_metric_transform",
 ]

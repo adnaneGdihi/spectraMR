@@ -169,3 +169,35 @@ def test_the_registered_name_still_resolves_to_this_class() -> None:
     populate_model_registry()
     entry = MODEL_REGISTRY.get("neural_ode")
     assert entry is not None, "model 'neural_ode' left the registry"
+
+
+def _depth_model(mode: str) -> NeuralODEGenerator:
+    torch.manual_seed(0)
+    return NeuralODEGenerator(in_channels=1, out_channels=1, features=8, depth_mode=mode)
+
+
+def test_an_unknown_depth_mode_raises() -> None:
+    with pytest.raises(ValueError, match="depth_mode='ode'"):
+        NeuralODEGenerator(features=8, depth_mode="ode")
+
+
+def test_the_fixed_depth_control_is_a_resnet_of_untied_blocks() -> None:
+    fixed = _depth_model("fixed")
+    assert fixed.ode_func is None and len(fixed.residual_blocks) == mod._STEPS
+    ode = _depth_model("continuous")
+    assert ode.residual_blocks is None
+    per_block = sum(p.numel() for p in ode.ode_func.parameters())
+    extra = sum(p.numel() for p in fixed.parameters()) - sum(p.numel() for p in ode.parameters())
+    assert extra == (mod._STEPS - 1) * per_block
+
+
+def test_the_two_depth_modes_compute_different_maps() -> None:
+    x = torch.rand(1, 1, 8, 8)
+    with torch.no_grad():
+        a, b = _depth_model("continuous")(x), _depth_model("fixed")(x)
+    assert a.shape == b.shape == x.shape and not torch.allclose(a, b)
+
+
+def test_the_fixed_control_refuses_a_time_query() -> None:
+    with pytest.raises(ValueError, match="no continuous time"):
+        _depth_model("fixed")(torch.rand(1, 1, 8, 8), t_eval=torch.tensor([0.5]))

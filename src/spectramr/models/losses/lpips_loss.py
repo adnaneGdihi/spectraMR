@@ -1,19 +1,19 @@
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
+
+from spectramr.models.losses.metrics_aware_loss import MetricsAwareLossMixin
+from spectramr.models.losses.registry import register_loss
 
 logger = logging.getLogger(__name__)
 
 # Optional import for LPIPS
 try:
-    import lpips as _lpips_available
+    import lpips as _lpips_available  # type: ignore[import-untyped]
 except ImportError:
-    _lpips_available = None  # type: ignore
-
-
-from spectramr.models.losses.metrics_aware_loss import MetricsAwareLossMixin
-from spectramr.models.losses.registry import register_loss
+    _lpips_available = None
 
 
 @register_loss(name="lpips", aliases=["LPIPSLoss"], domain="image")
@@ -26,6 +26,10 @@ class LPIPSLoss(MetricsAwareLossMixin, nn.Module):
 
     Pre-trained AlexNet backbone. Do NOT use with k-space [B, 2, H, W].
     Input auto-converted to RGB if necessary.
+
+    The LPIPS network is a frozen metric: its parameters never take gradients
+    and it stays in eval mode whatever mode the owning module is put in, since
+    ``lpips.LPIPS`` carries dropout on its linear heads.
     """
 
     def __init__(self, net: str = "alex", verbose: bool = False, compute_metrics: bool = False):
@@ -40,7 +44,15 @@ class LPIPSLoss(MetricsAwareLossMixin, nn.Module):
         if _lpips_available is None:
             raise ImportError("lpips package is not installed. Please install it to use LPIPSLoss.")
         self.loss_fn = _lpips_available.LPIPS(net=net, verbose=verbose)
+        self.loss_fn.requires_grad_(False)
+        self.loss_fn.eval()
         self.compute_metrics_flag = compute_metrics
+
+    def train(self, mode: bool = True) -> "LPIPSLoss":
+        """Set this module's mode while keeping the LPIPS network in eval mode."""
+        super().train(mode)
+        self.loss_fn.eval()
+        return self
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -60,7 +72,7 @@ class LPIPSLoss(MetricsAwareLossMixin, nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        loss_value = self.loss_fn(pred, target).mean()
+        loss_value: torch.Tensor = self.loss_fn(pred, target).mean()
         if self.compute_metrics_flag:
             metrics = self.compute_metrics(pred, target, loss_value)
             return loss_value, metrics
@@ -71,7 +83,7 @@ class LPIPSLoss(MetricsAwareLossMixin, nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute LPIPS-specific metrics."""
         # Ensure inputs are in [-1, 1] range for LPIPS
@@ -95,8 +107,9 @@ class LPIPSLoss(MetricsAwareLossMixin, nn.Module):
 
 
 def create_lpips_loss(net: str = "alex", verbose: bool = False) -> nn.Module:
-    """Factory to create LPIPS loss, falling back or raising error."""
-    if _lpips_available is None:
-        logger.warning("lpips not available, returning L1Loss as fallback.")
-        return nn.L1Loss()
+    """Build :class:`LPIPSLoss`; raises ImportError when ``lpips`` is not installed.
+
+    An L1 stand-in would train a different objective under the LPIPS name
+    (non-negotiable 3), so a missing package is reported, never substituted.
+    """
     return LPIPSLoss(net=net, verbose=verbose)

@@ -44,7 +44,7 @@ def test_package_dir_is_this_repos_own_checkout() -> None:
     it with a real one.
     """
     this_repo_root = Path(__file__).resolve().parents[3]
-    assert PACKAGE_DIR == this_repo_root / "src" / "spectramr", (
+    assert this_repo_root / "src" / "spectramr" == PACKAGE_DIR, (
         f"key_reachability.PACKAGE_DIR ({PACKAGE_DIR}) does not sit under this "
         f"test file's own repo root ({this_repo_root}) -- the reachability "
         "analysis would be scanning a different checkout's source tree "
@@ -234,3 +234,112 @@ class TestAmbiguityResolvesToReachable:
 
         for name in ("FieldBridgeStrategy", "RecoverabilityVIBStrategy"):
             assert class_liveness(name).live, name
+
+
+class TestAccessorMediatedReads:
+    """`external_reads` (#1925), and the four ways it could be wrong.
+
+    The index matches a read by finding the field name as a source *token*.
+    `build_loss_weight_table` names none of the 112 paths it reads -- it builds
+    every name at runtime from `LAMBDA_SECTIONS` and `model_fields_set` -- so 52
+    of them look identical to "nothing reads this". That is the case
+    `ReadEvidence.NO_READ_FOUND`'s own docstring says a human must read the
+    consumer before acting on; `external_reads` is how that reading is carried
+    back in.
+
+    Every plant below is a *measured* case on this checkout, not a constructed
+    one, so each is also a live pin on the shape it names.
+    """
+
+    #: The path #1925 was filed about: fully wired through `losses.physics`, and
+    #: named by no token anywhere in the tree.
+    TOKENLESS = "losses.physics.lambda_bloch_residual"
+
+    #: Same LEAF as `TOKENLESS`, under a prefix the accessor never receives --
+    #: `config_health_checker` hands it the root `config.losses`. 54 paths have
+    #: this shape. It is the mutation-killer: key the lookup on
+    #: `dotted_path.rsplit(".", 1)[-1]` and this one goes green.
+    SAME_LEAF_OTHER_PREFIX = "training.multi.stages.stage_config.loss.physics.lambda_bloch_residual"
+
+    #: In the accessor's read set AND read by a live token elsewhere.
+    ALSO_LIVE = "losses.gan.lambda_adv"
+
+    #: Real read sites, every one of them dead. Sits in the gate's own
+    #: `UNREACHABLE_READ` ledger, so it is a pinned example of the shape.
+    DEAD_SITES = "ema.stability_threshold"
+
+    @staticmethod
+    def _map():
+        from spectramr.models.losses.weights import accessor_read_paths
+
+        return accessor_read_paths()
+
+    def test_without_the_map_the_tokenless_read_is_invisible(self) -> None:
+        """The bug, pinned. Delete `external_reads` and this is the whole story."""
+        verdict = is_key_reachable(self.TOKENLESS)
+        assert not verdict.reachable
+        assert verdict.evidence is ReadEvidence.NO_READ_FOUND
+        assert verdict.sites == ()
+
+    def test_the_map_turns_it_into_an_accessor_read(self) -> None:
+        verdict = is_key_reachable(self.TOKENLESS, external_reads=self._map())
+        assert verdict.reachable
+        assert verdict.evidence is ReadEvidence.ACCESSOR_READ
+        assert "build_loss_weight_table" in verdict.reason
+
+    def test_the_same_leaf_under_another_prefix_stays_unread(self) -> None:
+        """Keyed by full path, never by leaf.
+
+        This is the assertion that dies if anyone "simplifies" the lookup to
+        match the leaf, the way the token index above legitimately does.
+        """
+        assert self.SAME_LEAF_OTHER_PREFIX.endswith(self.TOKENLESS.rsplit(".", 1)[-1])
+        verdict = is_key_reachable(self.SAME_LEAF_OTHER_PREFIX, external_reads=self._map())
+        assert not verdict.reachable
+        assert verdict.evidence is ReadEvidence.NO_READ_FOUND
+
+    def test_a_live_token_read_outranks_the_declaration(self) -> None:
+        """Order decides the evidence, never `reachable`.
+
+        A call graph is stronger evidence than a declaration, so a path that is
+        both must report the call graph. Swap the two checks and this goes
+        `ACCESSOR_READ` -- reachable either way, but the verdict stops naming the
+        site a maintainer would go read.
+        """
+        assert self.ALSO_LIVE in self._map()
+        verdict = is_key_reachable(self.ALSO_LIVE, external_reads=self._map())
+        assert verdict.reachable
+        assert verdict.evidence is ReadEvidence.LIVE_READ
+        assert verdict.sites
+
+    def test_the_declaration_outranks_dead_token_reads(self) -> None:
+        """The shape no real path in the loss map has, so it is injected.
+
+        A key with real-but-dead sites that an accessor also reads IS read. Check
+        the map *after* the dead-sites case and this answers `NO_LIVE_READ` --
+        "every read is dead" -- which is false. `sites` must survive: the ledger
+        tests ask whether an entry really has read sites, and losing them here
+        would refile the key under the wrong ledger section.
+        """
+        before = is_key_reachable(self.DEAD_SITES)
+        assert before.evidence is ReadEvidence.NO_LIVE_READ and before.sites
+
+        after = is_key_reachable(self.DEAD_SITES, external_reads={self.DEAD_SITES: "a probe"})
+        assert after.reachable
+        assert after.evidence is ReadEvidence.ACCESSOR_READ
+        assert after.sites == before.sites
+
+    def test_the_map_is_honoured_rather_than_hardcoded(self) -> None:
+        """A fabricated path proves the parameter is read, not a baked-in list."""
+        fake = "nothing.in.this.tree.spells_this_leaf_name"
+        assert is_key_reachable(fake).evidence is ReadEvidence.NO_READ_FOUND
+        verdict = is_key_reachable(fake, external_reads={fake: "a fabricated accessor"})
+        assert verdict.reachable
+        assert verdict.evidence is ReadEvidence.ACCESSOR_READ
+        assert "a fabricated accessor" in verdict.reason
+
+    def test_omitting_the_map_changes_nothing(self) -> None:
+        """The parameter is additive: every existing caller keeps its verdict."""
+        for key in (self.TOKENLESS, self.ALSO_LIVE, self.DEAD_SITES):
+            assert is_key_reachable(key) == is_key_reachable(key, external_reads=None)
+            assert is_key_reachable(key) == is_key_reachable(key, external_reads={})

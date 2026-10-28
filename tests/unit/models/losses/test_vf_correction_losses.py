@@ -98,3 +98,16 @@ class TestSuperResolutionConsistencyLoss:
         loss = loss_fn(hr, hr, lr_frames=lr, shifts=shifts)
         loss.backward()
         assert hr.grad is not None
+
+
+def test_an_integer_hr_shift_samples_whole_pixels() -> None:
+    """align_corners=True puts one HR pixel at 2 / (W - 1); 2 / W sampled 0.875 px."""
+    from spectramr.models.losses.vf_correction_losses import SuperResolutionConsistencyLoss
+
+    img = torch.arange(64, dtype=torch.float64).view(1, 1, 8, 8)
+    shifted = img.roll(-1, dims=-1)
+    shifted[..., -1] = img[..., -1]  # border padding repeats the last column
+    loss = SuperResolutionConsistencyLoss(upscale_factor=1)(
+        img, img, lr_frames=shifted, shifts=torch.tensor([[0.0, 1.0]], dtype=torch.float64)
+    )
+    assert loss.item() == pytest.approx(0.0, abs=1e-9)

@@ -30,6 +30,7 @@ Reference:
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -54,7 +55,8 @@ def _build_log_kernel(
     Returns:
         Normalised LoG kernel ``(1, 1, K, K)``.
     """
-    assert kernel_size % 2 == 1, "kernel_size must be odd"
+    if kernel_size % 2 != 1:
+        raise ValueError(f"kernel_size must be odd, got {kernel_size}")
     half = kernel_size // 2
     coords = torch.arange(-half, half + 1, dtype=torch.float32, device=device)
     y, x = torch.meshgrid(coords, coords, indexing="ij")
@@ -113,6 +115,8 @@ class HFENLoss(nn.Module):
         reduction: ``'mean'`` or ``'sum'`` across batch.
     """
 
+    log_kernel: Tensor
+
     def __init__(
         self,
         kernel_size: int = 15,
@@ -121,6 +125,10 @@ class HFENLoss(nn.Module):
         reduction: str = "mean",
     ) -> None:
         super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"reduction must be 'mean', 'sum' or 'none', got {reduction!r}")
+        self.kernel_size = kernel_size
+        self.sigma = sigma
         self.normalize = normalize
         self.reduction = reduction
 
@@ -131,12 +139,14 @@ class HFENLoss(nn.Module):
 
     def _apply_log(self, x: Tensor) -> Tensor:
         """Apply LoG filter to each channel independently."""
-        B, C, H, W = x.shape
+        if x.dim() != 4:
+            raise ValueError(f"HFEN expects [B, C, H, W] after depth folding, got {tuple(x.shape)}")
+        channels = x.shape[1]
         # Group conv: apply same kernel to each channel
-        kernel = self.log_kernel.expand(C, 1, -1, -1)
-        return F.conv2d(x, kernel, padding=self.pad, groups=C)
+        kernel = self.log_kernel.to(dtype=x.dtype).expand(channels, 1, -1, -1)
+        return F.conv2d(x, kernel, padding=self.pad, groups=channels)
 
-    def forward(self, pred: Tensor, target: Tensor, **kwargs) -> Tensor:
+    def forward(self, pred: Tensor, target: Tensor, **kwargs: Any) -> Tensor:
         """Compute HFEN.
 
         Args:
@@ -163,16 +173,13 @@ class HFENLoss(nn.Module):
             pred = pred.permute(0, 4, 1, 2, 3).reshape(b * d, c, h, w)
             target = target.permute(0, 4, 1, 2, 3).reshape(b * d, c, h, w)
 
-        # Handle 2-channel real/imag stacking
-        if not pred.is_complex() and pred.shape[1] % 2 == 0 and pred.shape[1] >= 2:
-            # Compute per-channel, treating each as independent
-            pass  # Standard conv works on each channel
-
         log_pred = self._apply_log(pred)
         log_target = self._apply_log(target)
 
-        # Per-sample L2 error
-        diff_norm = torch.sqrt(((log_pred - log_target) ** 2).sum(dim=(1, 2, 3)) + 1e-8)
+        # Per-sample L2 error. The floor under the root only keeps sqrt'(0) finite;
+        # sqrt(floor) is what HFEN(x, x) scores, so it must stay negligible.
+        diff_sq = ((log_pred - log_target) ** 2).sum(dim=(1, 2, 3))
+        diff_norm = diff_sq.clamp_min(1e-20).sqrt()
 
         if self.normalize:
             target_norm = torch.sqrt((log_target**2).sum(dim=(1, 2, 3)) + 1e-8)
@@ -187,8 +194,10 @@ class HFENLoss(nn.Module):
         return hfen
 
     def extra_repr(self) -> str:
-        sigma = self.log_kernel.shape[-1] // 2  # approximate
-        return f"normalize={self.normalize}, reduction='{self.reduction}'"
+        return (
+            f"kernel_size={self.kernel_size}, sigma={self.sigma}, "
+            f"normalize={self.normalize}, reduction='{self.reduction}'"
+        )
 
 
 __all__ = ["HFENLoss"]

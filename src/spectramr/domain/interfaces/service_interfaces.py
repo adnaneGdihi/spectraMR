@@ -47,6 +47,7 @@ class ILoggingService(ABC):
             +log_info(message)
             +log_warning(message)
             +log_error(message)
+            +log_critical(message)
             +log_debug(message)
         }
     ```
@@ -64,6 +65,21 @@ class ILoggingService(ABC):
     @abstractmethod
     def get_logger(self, name: str) -> stdlib_logging.Logger:
         """Get a logger instance."""
+
+    @abstractmethod
+    def open_tensorboard(
+        self,
+        run_dir: Any,
+        logging_config: Any,
+        *,
+        is_rank_zero: bool = True,
+        start_iteration: int = 0,
+    ) -> Any:
+        """Open the run's TensorBoard writer as a registered sink and return it."""
+
+    @abstractmethod
+    def sink_records(self) -> list[dict[str, Any]]:
+        """Every registered sink as ``{name, enabled, path}``, for provenance."""
 
     @abstractmethod
     def log_info(
@@ -94,6 +110,21 @@ class ILoggingService(ABC):
         extra: dict[str, Any] | None = None,
     ) -> None:
         """Log an error message."""
+
+    @abstractmethod
+    def log_critical(
+        self,
+        message: str,
+        model_type: str = "",
+        epoch: int = -1,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Log a critical message: a condition that stops the run.
+
+        Abstract rather than a default shim because an implementation that silently
+        lacked this rung is exactly how the training loop's divergence tripwire spent
+        its life raising ``AttributeError`` instead of halting (#2254).
+        """
 
     @abstractmethod
     def log_debug(
@@ -228,33 +259,6 @@ class IDeviceManager(ABC):
 IDeviceService = IDeviceManager
 
 
-class ICheckpointManager(ABC):
-    """Interface for model checkpoint management."""
-
-    @abstractmethod
-    def save_checkpoint(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        epoch: int,
-        **kwargs,
-    ) -> None:
-        """Save a model checkpoint."""
-
-    @abstractmethod
-    def load_checkpoint(
-        self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        **kwargs,
-    ) -> dict[str, Any] | None:
-        """Load a model checkpoint."""
-
-    @abstractmethod
-    def list_checkpoints(self) -> list:
-        """list available checkpoints."""
-
-
 class IMetricsService(ABC):
     """Interface for metrics collection and reporting."""
 
@@ -299,7 +303,7 @@ class I3DGenerator(ABC):
         self,
         input_data: torch.Tensor | str,
         output_format: str = "gaussian",
-        **kwargs,
+        **kwargs: Any,
     ) -> TensorDict:
         """Generate 3D assets from input data."""
 
@@ -308,7 +312,7 @@ class I3DGenerator(ABC):
         self,
         prompt: str,
         output_format: str = "gaussian",
-        **kwargs,
+        **kwargs: Any,
     ) -> TensorDict:
         """Generate 3D assets from a text prompt.
 
@@ -323,7 +327,7 @@ class I3DGenerator(ABC):
         self,
         image: torch.Tensor,
         output_format: str = "gaussian",
-        **kwargs,
+        **kwargs: Any,
     ) -> TensorDict:
         """Generate 3D assets from 2D images."""
 
@@ -341,7 +345,7 @@ class IMedical3DGenerator(ABC):
         condition_image: torch.Tensor,
         target_resolution: tuple[int, int, int],
         conditioning_axis: int = 2,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Generate 3D MRI volumes from 2D conditioning images."""
 
@@ -350,7 +354,7 @@ class IMedical3DGenerator(ABC):
         self,
         input_2d: torch.Tensor,
         reconstruction_params: dict[str, Any],
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Reconstruct 3D volumes from 2D inputs."""
 

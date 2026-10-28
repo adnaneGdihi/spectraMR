@@ -25,6 +25,34 @@ from spectramr.infrastructure.validation.recommendations import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _drop_fake_registrations():
+    """Remove this module's ``__test_*`` registrations after every test.
+
+    ``_make_config`` registers into ``MODEL_REGISTRY``, which is PROCESS-GLOBAL
+    and which ``populate_model_registry()`` cannot repair -- the
+    ``_REGISTRY_POPULATED`` latch makes a second call a no-op, so a clear is
+    permanent for the session. Without this teardown the fakes outlive the
+    module and every later test file in the same process sees them.
+
+    That is not hypothetical: ``object`` has no ``forward``, so the honour
+    census in test_contrast_conditioned_sense_bridge.py raised
+    ``AttributeError`` on the leaked entry and three of its tests were red
+    whenever this file was collected first -- which ``pytest tests/unit/`` does,
+    since ``infrastructure`` sorts before ``models``. They passed in isolation,
+    so it read as flakiness. See #1961.
+    """
+    from spectramr.models.registry import MODEL_REGISTRY
+
+    before = {n for n in MODEL_REGISTRY if n.startswith("__test_")}
+    try:
+        yield
+    finally:
+        for name in [n for n in MODEL_REGISTRY if n.startswith("__test_")]:
+            if name not in before:
+                MODEL_REGISTRY.pop(name, None)
+
+
 class _NS:
     """Tiny attribute namespace stand-in for the audit's defensive getattr."""
 
@@ -46,10 +74,14 @@ def _make_config(
     # conditioning (needs none) and Bloch physics conditioning (needs them) --
     # the same class of stub-vs-production gap the `sampling.patch_size` note
     # below records.
-    embed_dim=None,
     bloch_grounded=False,
     model_type="cfg_unet",
-    supports_contrast=False,
+    # Three-state since #1916: True declares support, False is a positive
+    # claim that the model ignores the contrast id, and None means nobody
+    # said. ``model_supports`` answers False for the latter two alike, so the
+    # R003 polarity tests below are insensitive to that distinction; a test
+    # that needs it must pass None explicitly rather than rely on the default.
+    supports_contrast=None,
     model_kwargs=None,
     losses_output_domain="image",
     image_losses=(),
@@ -63,26 +95,39 @@ def _make_config(
     physics_kspace_enabled=False,
     task="reconstruction",
 ):
-    # Optionally register a fake model with capabilities.
-    from spectramr.models.capabilities import ModelCapabilities
-    from spectramr.models.registry import MODEL_REGISTRY
+    # Optionally register a fake model, THROUGH THE REAL PRODUCER.
+    #
+    # This used to hand-build the entry dict, and in doing so carried a
+    # top-level ``supports_contrast_conditioning`` beside a nested
+    # ``ModelCapabilities`` that had no such field -- reproducing inside the
+    # fixture the exact two-owner split #1916 deleted from production. The
+    # tests passed because fixture and reader agreed on the same wrong owner,
+    # so they could not have caught the split and did not.
+    #
+    # A fixture that builds its own entry cannot notice when the producer's
+    # shape changes. Going through ``register_model`` means it always has
+    # whatever shape production writes -- including the ``role`` key (#1932),
+    # which nothing here had to be told about.
+    #
+    # ``object`` is not an ``IDiscriminator``, so the default
+    # ``role="generator"`` is correct and the registration guard stays quiet.
+    # Re-registration across tests is fine: same class, non-empty caps.
+    from spectramr.models.registry import register_model
+
     if model_type and model_type.startswith("__test_"):
-        MODEL_REGISTRY[model_type] = {
-            "class": object,
-            "mode": training_mode,
-            "supports_contrast_conditioning": supports_contrast,
-            "capabilities": ModelCapabilities(
-                spatial_dims=(2, 3),
-                input_domain="image",
-                output_domain="image",
-            ),
-        }
+        register_model(
+            name=model_type,
+            training_mode=training_mode,
+            spatial_dims=(2, 3),
+            input_domain="image",
+            output_domain="image",
+            supports_contrast_conditioning=supports_contrast,
+        )(object)
 
     mc = _NS(
         enabled=multi_contrast_enabled,
         n_contrasts=n_contrasts,
         acquisition_params=acquisition_params,
-        embed_dim=embed_dim,
         bloch_grounded=bloch_grounded,
     )
     data = _NS(
@@ -240,6 +285,31 @@ class TestMultiContrastRecommendations:
         assert "AUDIT-R003" not in codes
         assert "AUDIT-R010" not in codes
 
+    @pytest.mark.parametrize("table", [True, False])
+    def test_a_strategy_side_consumer_silences_r002_and_r003(self, monkeypatch, table):
+        """CycleBloch's sequence table reads the id in physics; without a table it does not."""
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.training.strategies.cycle_bloch_strategy import (
+            CycleBlochStrategy,
+        )
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        monkeypatch.setattr(
+            TrainingStrategyFactory, "get_strategy_class", lambda self, cfg: CycleBlochStrategy
+        )
+        cfg = _make_config(
+            model_type="__test_no_contrast",
+            supports_contrast=False,
+            multi_contrast_enabled=True,
+            n_contrasts=3,
+        )
+        cfg.training = SimpleNamespace(
+            cycle_bloch=SimpleNamespace(sequences={"T2w": object()} if table else None)
+        )
+        codes = {r.code for r in recommend_multi_contrast_alignment(cfg)}
+        assert ({"AUDIT-R002", "AUDIT-R003"} & codes) == (set() if table else {"AUDIT-R002", "AUDIT-R003"})
+
     def test_r010_exempts_mrixfields_native_contrast(self):
         # The mrixfields dataset emits a per-sample contrast_id natively (no
         # data.multi_contrast block needed), so a contrast-conditioned model
@@ -277,7 +347,6 @@ class TestMultiContrastRecommendations:
             supports_contrast=True,
             multi_contrast_enabled=True,
             n_contrasts=3,
-            embed_dim=128,
             acquisition_params=None,
         )
         rec = next(
@@ -296,7 +365,6 @@ class TestMultiContrastRecommendations:
         # The computed facts must be in the message, or "no action needed" is an
         # assertion the reader cannot check.
         assert "n_contrasts=3" in rec.detail
-        assert "embed_dim=128" in rec.detail
 
     def test_r003_still_offers_the_yaml_when_bloch_grounded_reads_the_params(self):
         """Half 2 — over-suppression guard. Same config, `bloch_grounded` on."""
@@ -305,7 +373,6 @@ class TestMultiContrastRecommendations:
             supports_contrast=True,
             multi_contrast_enabled=True,
             n_contrasts=3,
-            embed_dim=128,
             bloch_grounded=True,
             acquisition_params=None,
         )
@@ -431,7 +498,6 @@ class TestInverseAdapter:
         adapters = _NS(
             pre_model=[_NS(name="slice_3d_to_2d", enabled=True)],
             post_model=[],
-            pre_loss_pred=[],
             pre_loss_target=[],
             pre_metric=[],
         )
@@ -444,7 +510,7 @@ class TestInverseAdapter:
         adapters = _NS(
             pre_model=[_NS(name="slice_3d_to_2d", enabled=True)],
             post_model=[_NS(name="gather_2d_to_3d", enabled=True)],
-            pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+            pre_loss_target=[], pre_metric=[],
         )
         cfg = _make_config(adapters=adapters)
         assert recommend_inverse_adapter(cfg) == []

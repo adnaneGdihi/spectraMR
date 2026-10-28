@@ -82,6 +82,37 @@ def test_sensing_margin_errors_when_fully_sampled():
     assert not r.passed and r.severity == "error"
 
 
+def _m4raw_route(**mask_kwargs) -> _Config:
+    """An EI arm on the M4Raw route: the schema's acceleration defaults stay at 4."""
+    from types import SimpleNamespace
+
+    from spectramr.config.schemas.data import TransformSpecSchema
+
+    cfg = _Config(acceleration_factor=4.0)
+    cfg.undersampling = _Accel(base_acceleration=4.0)
+    spec = TransformSpecSchema(name="complementary_rep_masking", **mask_kwargs)
+    cfg.data = SimpleNamespace(processing=SimpleNamespace(transforms=[spec]))
+    return cfg
+
+
+def test_sensing_margin_reads_the_complementary_mask_rate():
+    r = _checker().check_ei_sensing_margin(_m4raw_route(kwargs={"acceleration": 4.0}))
+    assert r.passed and "4.0" in r.message
+
+
+def test_sensing_margin_fails_a_planted_fully_sampled_complementary_mask():
+    """Planted: R=1 beside the schema's 4.0 defaults used to pass vacuously."""
+    r = _checker().check_ei_sensing_margin(_m4raw_route(kwargs={"acceleration": 1.0}))
+    assert not r.passed and r.severity == "error"
+    assert r.yaml_keys == ["data.processing.transforms[complementary_rep_masking].acceleration"]
+
+
+def test_sensing_margin_reads_a_flat_kwarg_and_the_transform_default():
+    assert not _checker().check_ei_sensing_margin(_m4raw_route(acceleration=1.0)).passed
+    defaulted = _checker().check_ei_sensing_margin(_m4raw_route())
+    assert defaulted.passed and "2.0" in defaulted.message  # ComplementaryRepMasking's own default
+
+
 # --- check_ei_robust_key_matches_correction ----------------------------------
 def test_robust_key_not_applicable_when_mode_is_plain_ei():
     r = _checker().check_ei_robust_key_matches_correction(

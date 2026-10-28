@@ -5,7 +5,7 @@ This provides a single, platform-independent entry point for all operations.
 
 Usage:
     python -m spectramr.cli train --config experiments/active/dummy_gan.yaml
-    python -m spectramr.cli predict --config run.yaml --model checkpoints/best.pt --input data/test/
+    python -m spectramr.cli predict --config run.yaml --model checkpoints/best.safetensors --input data/test/
     python -m spectramr.cli benchmark --suite standard
     python -m spectramr.cli list-features --module all --format markdown
 """
@@ -22,8 +22,19 @@ from spectramr.core.compute_device import (
     AcceleratorRequiredError,
     resolve_torch_device,
 )
+from spectramr.cli.val_batches import (
+    add_val_batches_argument,
+    resolve_val_batches_overrides,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_log_level(settings: Any) -> None:
+    """Apply a loaded config's log level; lazy so ``--help`` stays torch-free."""
+    from spectramr.infrastructure.logging.log_policy import apply_logging_config
+
+    apply_logging_config(settings.logging)
 
 
 def _dispatch_training(args: argparse.Namespace, *, is_sanity_check: bool) -> int:
@@ -43,9 +54,6 @@ def _dispatch_training(args: argparse.Namespace, *, is_sanity_check: bool) -> in
     just skip the redundant re-parse. ``main.__common_train_setup`` reads
     ``args.{config, device, dry_run, override, seed, resume}``.
     """
-    if getattr(args, "debug", False):
-        logging.getLogger("spectramr").setLevel(logging.DEBUG)
-
     # Normalize the attribute surface the main.py bootstrap expects, so a
     # missing optional flag is a documented default, never an AttributeError.
     args.dry_run = bool(getattr(args, "dry_run", False))
@@ -53,6 +61,12 @@ def _dispatch_training(args: argparse.Namespace, *, is_sanity_check: bool) -> in
     args.seed = getattr(args, "seed", None)
     args.override = getattr(args, "override", None)
     args.resume = getattr(args, "resume", None)
+    args.validate_only = bool(getattr(args, "validate_only", False))
+    # `--val-batches` is sugar for an override, resolved here rather than in each
+    # subparser so `train` and `sanity_check` cannot drift apart on it.
+    args.override = resolve_val_batches_overrides(
+        args.override, getattr(args, "val_batches", None)
+    )
 
     from spectramr.main import sanity_check_command, train_command
 
@@ -184,11 +198,46 @@ def ablation(args: argparse.Namespace) -> int:
 
 def infer(args: argparse.Namespace) -> int:
     """Run inference via the SSOT inference pipeline (delegates to main.py)."""
+    if getattr(args, "test_split", False):
+        return _infer_test_split(args)
     args.output = getattr(args, "output", None)
     from spectramr.main import infer_command
 
     infer_command(args)
     return 0
+
+
+def _infer_test_split(args: argparse.Namespace) -> int:
+    """Score ``data.source.test_index_path`` on ``--checkpoint``: a validate-only run plus the test pass.
+
+    Under torchrun (sharded arms) it takes the distributed entry, as their training did.
+    """
+    if args.config is None:
+        raise SystemExit("infer --test-split needs --config: the arm declares the test manifest.")
+    checkpoint = Path(args.checkpoint)
+    if checkpoint.parent.name != "checkpoints":
+        raise SystemExit(
+            f"infer --test-split: {checkpoint} is not under a run's checkpoints/ directory, so "
+            "the run its test results belong to is unknown."
+        )
+    import yaml
+
+    from spectramr.cli.manifest_dispatch import _run_dir_overrides
+
+    # The results go into the checkpoint's own run, not the YAML's standalone output_dir.
+    cfg = yaml.safe_load(Path(args.config).read_text()) or {}
+    routed = _run_dir_overrides(checkpoint.parent.parent, cfg)
+    run_args = argparse.Namespace(
+        config=str(args.config),
+        resume=str(checkpoint),
+        validate_only=True,
+        device=getattr(args, "device", None),
+        override=[a for a in routed if a != "--override"],
+        backend=None,
+    )
+    if "WORLD_SIZE" in os.environ:
+        return train_distributed(run_args)
+    return train(run_args)
 
 
 def infer_dataset(args: argparse.Namespace) -> int:
@@ -218,13 +267,23 @@ def train_distributed(args: argparse.Namespace) -> int:
     # (cache root, thread isolation, CUDA alloc — before ``import torch``).
     import spectramr.main  # noqa: F401  (side-effect import)
     from spectramr.pipelines.distributed import run_distributed_training
+    from spectramr.pipelines.result_status import failure_reason
 
-    run_distributed_training(
+    result = run_distributed_training(
         config_path=args.config,
         backend=args.backend,
         resume_path=args.resume,
         overrides=args.override,
+        validate_only=bool(getattr(args, "validate_only", False)),
     )
+    # The pipeline reports most failures by RETURNING success=False, not by raising, and this
+    # handler used to return 0 whatever it said: a resume that found no checkpoint, or a
+    # pipeline that refused to build, exited 0 under torchrun and a Slurm script went on to
+    # report "Training completed". `spectramr train` already applies this rule.
+    reason = failure_reason(result)
+    if reason is not None:
+        logger.error("Distributed training pipeline reported failure: %s", reason)
+        return 1
     return 0
 
 
@@ -267,7 +326,7 @@ def predict(args: argparse.Namespace) -> int:
                 "checkpoint) unless the checkpoint's run directory holds resolved_config.json, "
                 "which predict then rebuilds the settings from (#1379); the deprecated "
                 "config-less InferencePipeline is no longer wired. E.g. `spectramr predict "
-                "--config run.yaml --model best.pt --input data/`."
+                "--config run.yaml --model best.safetensors --input data/`."
             )
             return 2
 
@@ -303,6 +362,8 @@ def predict(args: argparse.Namespace) -> int:
                 device=str(device),
                 from_yaml=from_yaml,
                 settings=settings,
+                acceleration=getattr(args, "acceleration", None),
+                contrast_idx=getattr(args, "contrast_idx", None),
             )
         logger.info(f"Inference complete: {result}")
         return 0
@@ -380,55 +441,27 @@ def benchmark(args: argparse.Namespace) -> int:
 
 def export(args: argparse.Namespace) -> int:
     """Export model to ONNX/TorchScript."""
-    from collections.abc import Mapping
-
     import torch
 
     logger.info(f"Exporting model: {args.model}")
     logger.info(f"Format: {args.format}")
 
     try:
-        from spectramr.config.settings import TrainingSettings
-        from spectramr.core.module_utils import resolve_state_dict
+        from spectramr.infrastructure.checkpointing.restore import weights
         from spectramr.infrastructure.training.builders.model_builder import ModelBuilder
+        from spectramr.infrastructure.validation.inference_settings import (
+            resolve_inference_settings,
+        )
         from spectramr.shared.utils.data_utils import get_sample_batch
 
-        # ``--config`` is required, so the arm's architecture is always
-        # knowable. That is what makes the branch below possible: a checkpoint
-        # holding parameters rather than a pickled module used to be refused
-        # outright --
-        #
-        #     "Error: Checkpoint contains state_dict, not model. Cannot export."
-        #
-        # -- which is every ordinary training checkpoint this repo writes, so
-        # `export` did not work on the artifacts it exists to consume. Nothing
-        # was missing except the architecture, and the config carries it.
-        config = TrainingSettings.from_yaml(str(args.config))
-        checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
-        pickled = checkpoint.get("model") if isinstance(checkpoint, Mapping) else None
-
-        if isinstance(pickled, torch.nn.Module):
-            model = pickled
-        else:
-            model = (
-                ModelBuilder(config, torch.device("cpu"))
-                .build_generator()
-                .validate()
-                .build()["generator"]
-            )
-            # strict=True here, unlike the warm-start and campaign-evaluation
-            # readers: an export is a frozen artifact handed to another runtime,
-            # so a partially-loaded model would ship random weights inside a
-            # file that looks authoritative. `resolve_state_dict` has already
-            # raised on an unrecognised envelope; strict catches the rest.
-            model.load_state_dict(
-                resolve_state_dict(
-                    checkpoint,
-                    model.state_dict().keys(),
-                    source=str(args.model),
-                ),
-                strict=True,
-            )
+        config, _source = resolve_inference_settings(args.config, args.model)
+        _apply_log_level(config)
+        model = (
+            ModelBuilder(config, torch.device("cpu")).build_generator().validate().build()["generator"]
+        )
+        # exact: an export is a frozen artifact for another runtime, so a partial load
+        # would ship random weights inside an authoritative-looking file.
+        weights(args.model, "generator", model, policy="exact")
 
         model.eval()
 
@@ -723,6 +756,7 @@ def _audit_report(config_path: str, config: Any) -> Any:
     validation-metric and strategy-dispatch witnesses): 647 arms reported clean on
     checks the single-arm audit fails them on (2026-09-03). One builder, two callers.
     """
+    from spectramr.infrastructure.validation.audit_waivers import apply_audit_waivers
     from spectramr.infrastructure.validation.config_health_checker import (
         HealthCheckReport,
     )
@@ -737,6 +771,10 @@ def _audit_report(config_path: str, config: Any) -> Any:
 
     subject = WitnessSubject.for_audit(config_path=config_path, settings=config)
     verdicts = run_witnesses(subject, tiers=frozenset({Tier.T0, Tier.T1}))
+    # An arm may acknowledge a warning its own physics makes unfixable, by name and
+    # in writing, rather than the whole run reaching for --allow-warnings. Applied
+    # here so both audit surfaces and the exit code see the same report.
+    verdicts = apply_audit_waivers(verdicts, subject.raw_config)
     return HealthCheckReport(results=[verdict_to_health_result(v) for v in verdicts])
 
 
@@ -758,6 +796,7 @@ def _audit_one(args: argparse.Namespace, config_path: str) -> int:
 
     try:
         config = TrainingSettings.from_yaml(config_path)
+        _apply_log_level(config)
     except Exception as exc:
         record = {
             "tier": 0,
@@ -1237,15 +1276,37 @@ def campaign_submit(args: argparse.Namespace) -> int:
     # --only is a comma-separated list. --include / --exclude are repeatable
     # `key=value` selectors (key in {name, role, tag.<key>}).
     only = [s for raw in (args.only or []) for s in raw.split(",") if s]
-    orchestrator = CampaignOrchestrator(
-        base_dir=base_dir,
-        dry_run=args.dry_run,
-        resume=args.resume,
-        only=only,
-        include=args.include or [],
-        exclude=args.exclude or [],
-        where=getattr(args, "where", "slurm") or "slurm",
-    )
+    # --slurm is `key=value`, repeatable. Split once from the left so a value
+    # containing '=' survives; the orchestrator owns key/type validation.
+    slurm_overrides: dict[str, str] = {}
+    for raw in getattr(args, "slurm", None) or []:
+        if "=" not in raw:
+            logger.error(f"Invalid --slurm {raw!r}: expected 'key=value' form.")
+            return 1
+        key, value = raw.split("=", 1)
+        slurm_overrides[key.strip()] = value.strip()
+    # --time is sugar for --slurm time=...; two spellings of one value must agree.
+    if getattr(args, "time", None) is not None:
+        if slurm_overrides.get("time", args.time) != args.time:
+            logger.error("Conflicting --time and --slurm time=...; pass one.")
+            return 1
+        slurm_overrides["time"] = args.time
+    try:
+        orchestrator = CampaignOrchestrator(
+            base_dir=base_dir,
+            dry_run=args.dry_run,
+            resume=args.resume,
+            fresh=args.fresh,
+            only=only,
+            include=args.include or [],
+            exclude=args.exclude or [],
+            where=getattr(args, "where", "slurm") or "slurm",
+            slurm_overrides=slurm_overrides,
+            array_concurrency=getattr(args, "concurrency", None),
+        )
+    except ValueError as e:
+        logger.error(f"Campaign submission failed: {e}")
+        return 1
     try:
         state = orchestrator.submit_campaign(str(args.config))
         print(state.summary_table())
@@ -1444,7 +1505,7 @@ def hpo_cmd(args: argparse.Namespace) -> int:
     Returns 0 on success, 1 on failure.
     """
     from spectramr.application.use_cases.hpo_use_case import HPORequest, HPOUseCase
-    from spectramr.infrastructure.logging import LoggingService
+    from spectramr.infrastructure.services.logging_service import LoggingServiceFactory
     from spectramr.pipelines.hpo_search_spaces import (
         enumerate_schema_paths,
         list_presets,
@@ -1527,7 +1588,7 @@ def hpo_cmd(args: argparse.Namespace) -> int:
         search_space_dict=search_space_dict,
     )
 
-    logging_service = LoggingService()
+    logging_service = LoggingServiceFactory.create_unconfigured()
     use_case = HPOUseCase(logging_service)
     response = use_case.execute(request)
 
@@ -1555,6 +1616,96 @@ def hpo_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _metric_flags(args: argparse.Namespace) -> dict:
+    """``--metrics`` / ``--phases`` / ``--max-panels`` / ``--train-window`` as keyword arguments."""
+    out: dict = {}
+    if getattr(args, "metrics", None):
+        out["metrics"] = (
+            "all" if args.metrics == "all" else [m.strip() for m in args.metrics.split(",") if m.strip()]
+        )
+    if getattr(args, "phases", None):
+        out["phases"] = tuple(p.strip() for p in args.phases.split(",") if p.strip())
+    out["max_panels"] = getattr(args, "max_panels", 12)
+    out["train_window"] = getattr(args, "train_window", 50)
+    return out
+
+
+def _report_compare(args: argparse.Namespace, kwargs: dict) -> int:
+    """``report --compare``: the cross-run report over the arms under --exp-dir."""
+    from spectramr.infrastructure.reporting.comparison import generate_comparison
+
+    runs = list(args.arms) if args.arms else [args.exp_dir]
+    labels = [s.strip() for s in args.labels.split(",")] if args.labels else None
+    out_dir = args.exp_dir / (args.out_subdir or "comparison")
+    result = generate_comparison(
+        runs,
+        out_dir,
+        labels=labels,
+        baseline=args.baseline,
+        view=args.view,
+        style=kwargs.get("style", "nature"),
+        formats=tuple(kwargs.get("formats", ("pdf", "png"))),
+        dpi=kwargs.get("dpi", 600),
+        html_report=kwargs.get("html_report", True),
+        **_metric_flags(args),
+    )
+    n_fig = sum(1 for v in result["figures"].values() if v is not None)
+    print(f"Compared {len(result['arms'])} arms: {', '.join(result['arms'])}")
+    print(f"Wrote {n_fig} figure(s) to {result['out_dir']}")
+    print(f"Summary: {result['summary']}")
+    if result.get("html") is not None:
+        print(f"HTML report: {result['html']}")
+    return 0
+
+
+def _report_contrasts(args: argparse.Namespace) -> int:
+    """``report --contrasts``: one self-contained folder per declared comparison."""
+    from spectramr.infrastructure.reporting.comparison.contrast_folder import write_contrasts
+    from spectramr.infrastructure.reporting.comparison.contrasts import load_contrast_set
+
+    only = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else None
+    if args.contrasts is not None and args.contrast_pairs is not None:
+        print("error: give --contrasts (a file) or --contrast-pairs (a cohort), not both")
+        return 2
+    if args.contrasts is not None:
+        contrast_set, out_root = load_contrast_set(args.contrasts), args.out_root
+    else:
+        from spectramr.infrastructure.reporting.comparison.cohort_contrasts import cohort_contrasts
+
+        if args.exp_dir is None:
+            print("error: --contrast-pairs reads the cohort at --exp-dir")
+            return 2
+        contrast_set = cohort_contrasts(
+            args.exp_dir, mode=args.contrast_pairs, baseline=args.baseline, view=args.view
+        )
+        out_root = args.out_root or args.exp_dir / "contrasts"
+    if out_root is None:
+        print("error: --contrasts needs --out-root, the directory the contrast folders go in")
+        return 2
+    flags = _metric_flags(args)
+    if "metrics" in flags:
+        every = flags["metrics"] == "all"
+        contrast_set = contrast_set.model_copy(
+            update={"metrics": None if every else tuple(flags["metrics"])}
+        )
+    results = write_contrasts(
+        contrast_set,
+        out_root,
+        only=only,
+        phases=flags.get("phases"),
+        train_window=flags["train_window"],
+        max_panels=flags["max_panels"],
+        results_root=args.results_root,
+        style=args.style or "nature",
+        html_report=True if args.html is None else args.html,
+    )
+    for r in results:
+        print(f"{r.name}: {len(r.arms)} arms vs {r.baseline}, {r.n_tests} test(s) -> {r.folder}")
+        for u in r.unavailable:
+            print(f"  not tested: {u['variant']} on {u['metric']}: {u['reason']}")
+    return 0
+
+
 def report(args: argparse.Namespace) -> int:
     """Generate canonical figures + tables for an experiment output dir.
 
@@ -1566,7 +1717,21 @@ def report(args: argparse.Namespace) -> int:
     """
     from spectramr.infrastructure.reporting import generate_report
 
+    if getattr(args, "contrasts", None) is not None or getattr(args, "contrast_pairs", None):
+        return _report_contrasts(args)
+    if args.exp_dir is None:
+        print("error: --exp-dir is required (it is optional only with --contrasts)")
+        return 2
     exp_dir: Path = args.exp_dir
+    if getattr(args, "catalog", False):
+        from spectramr.infrastructure.reporting.catalog import render_catalog
+
+        res = render_catalog(exp_dir, style=args.style or "nature")
+        n_ok = sum(1 for v in res["figures"].values() if v is not None)
+        print(f"Catalog: {n_ok}/{len(res['figures'])} figures from built-in examples -> {exp_dir}")
+        for fid, why in sorted(res["reasons"].items()):
+            print(f"  {fid}: {why}")
+        return 0 if n_ok == len(res["figures"]) else 1
     if not exp_dir.exists():
         print(f"error: experiment dir does not exist: {exp_dir}")
         return 2
@@ -1589,6 +1754,7 @@ def report(args: argparse.Namespace) -> int:
         from spectramr.config.settings import TrainingSettings
 
         settings = TrainingSettings.from_yaml(str(args.config))
+        _apply_log_level(settings)
         rep = getattr(settings, "reporting", None)
         if rep is not None:
             _v = lambda x: getattr(x, "value", x)  # noqa: E731 — enum→str unwrap
@@ -1643,6 +1809,13 @@ def report(args: argparse.Namespace) -> int:
         kwargs["interactive"] = args.interactive
     if getattr(args, "figures", None):
         kwargs["figures"] = [f.strip() for f in args.figures.split(",") if f.strip()]
+
+    if getattr(args, "style", None) is not None:
+        kwargs["style"] = args.style
+    kwargs["view"] = getattr(args, "view", "selected")
+
+    if getattr(args, "compare", False):
+        return _report_compare(args, kwargs)
 
     # Batch mode: --exp-dir is a cohort root; report every run under it and
     # write a linking report_index.html. Per-run failures don't abort the batch.
@@ -2191,6 +2364,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print full tracebacks on error (or set SPECTRAMR_DEBUG=1).",
     )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        metavar="LEVEL",
+        help="Log level for this run: debug, info, warning, error or critical. Beats "
+        "SPECTRAMR_LOG_LEVEL and the config's logging.sinks.level.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Doctor command — environment / wiring diagnostics (cluster pre-flight).
@@ -2250,7 +2430,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint. Path to file or 'auto' for latest.",
+        help=(
+            "Resume from checkpoint: a path, 'auto' (latest; raises if none), "
+            "or 'if-present' (latest, else start fresh — the wall-clock chain spelling)."
+        ),
     )
     train_parser.add_argument(
         "--allow-status",
@@ -2263,6 +2446,18 @@ def build_parser() -> argparse.ArgumentParser:
             "it is stamped into provenance. Without it such an arm refuses to launch."
         ),
     )
+    train_parser.add_argument(
+        "--validate-only",
+        dest="validate_only",
+        action="store_true",
+        help=(
+            "Run ONE validation pass on the weights --resume (or model.checkpoint_path) "
+            "loads, write it to the run's validation CSVs, and exit without an optimizer "
+            "step. Refuses to run without weights to grade, unless the model declares "
+            "itself parameter-free (a classical solver), which is graded as is."
+        ),
+    )
+    add_val_batches_argument(train_parser)
     train_parser.set_defaults(func=train)
 
     # Sanity check command
@@ -2300,8 +2495,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint. Path to file or 'auto' for latest.",
+        help=(
+            "Resume from checkpoint: a path, 'auto' (latest; raises if none), "
+            "or 'if-present' (latest, else start fresh — the wall-clock chain spelling)."
+        ),
     )
+    add_val_batches_argument(sanity_parser)
     sanity_parser.set_defaults(func=sanity_check)
 
     # Ablation command — baseline + one variant per --vary override, with an
@@ -2367,6 +2566,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Take the input roster from the paired manifest's held-out test "
             "split (the unpaired-ULF cohort) instead of --input. Requires "
             "data.source.paired_manifest_path in the config."
+        ),
+    )
+    infer_parser.add_argument(
+        "--test-split",
+        action="store_true",
+        help=(
+            "Score the arm's held-out test set (data.source.test_index_path) on --checkpoint "
+            "and write test/final_eval.json under the run; the route for test_pass: infer arms."
         ),
     )
     infer_parser.add_argument(
@@ -2458,7 +2665,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=str,
         default=None,
-        help="Resume from checkpoint (path or 'auto')",
+        help="Resume from checkpoint (path, 'auto', or 'if-present')",
     )
     dist_parser.add_argument(
         "--backend",
@@ -2475,6 +2682,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="KEY=VALUE",
         help="Override config values",
+    )
+    dist_parser.add_argument(
+        "--validate-only",
+        dest="validate_only",
+        action="store_true",
+        help=(
+            "Run ONE validation pass on the weights --resume loads and exit without an "
+            "optimizer step; the sharded arms (deepspeed) re-score a checkpoint this way."
+        ),
     )
     dist_parser.set_defaults(func=train_distributed)
 
@@ -2510,6 +2726,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-yaml",
         action="store_true",
         help="Read the settings from --config even when resolved_config.json exists beside --model.",
+    )
+    predict_parser.add_argument(
+        "--acceleration",
+        type=float,
+        default=None,
+        help=(
+            "Cold diffusion: degrade each fully sampled input to the rung for this R over "
+            "its acquired lines and sample from that rung, as validation does. An input "
+            "carrying a 'mask' dataset keeps its mask; R then sets only the start timestep."
+        ),
+    )
+    predict_parser.add_argument(
+        "--contrast-idx",
+        type=int,
+        default=None,
+        help=(
+            "Contrast id for a kspace_cold_diffusion checkpoint trained with num_contrasts > 0. "
+            "Default: the contrast keyword in each file name (M4Raw T1/T2/FLAIR/PD, or the "
+            "arm's data.multi_contrast.contrast_map). A missing id raises."
+        ),
     )
     predict_parser.set_defaults(func=predict)
 
@@ -2696,7 +2932,21 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("config", type=Path, help="Path to campaign YAML")
     cs.add_argument("--base-dir", type=Path, default=None, help="Project root directory")
     cs.add_argument("--dry-run", action="store_true", help="Validate without submitting")
-    cs.add_argument("--resume", action="store_true", help="Resume experiments from checkpoints")
+    cs_resume = cs.add_mutually_exclusive_group()
+    cs_resume.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue a prior submission: skip arms it completed or still runs, "
+        "and resume every submitted arm from its latest checkpoint.",
+    )
+    cs_resume.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start every arm at iteration 0; requeued array links still resume "
+        "their own run. Array arms with checkpoints already in their output dir "
+        "are refused. With neither flag, array arms run --prod, which resumes any "
+        "checkpoint present, and per-arm/container arms start fresh.",
+    )
     cs.add_argument(
         "--where",
         default="slurm",
@@ -2728,6 +2978,37 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="key=value",
         help="Exclude selector (same syntax as --include; repeatable).",
+    )
+    cs.add_argument(
+        "--slurm",
+        action="append",
+        default=None,
+        metavar="key=value",
+        help=(
+            "SLURM resource override (repeatable), applied on top of the "
+            "campaign's slurm_defaults and any per-arm override: e.g. "
+            "--slurm gpus=4 --slurm cpus_per_task=32. Keys are the "
+            "slurm_defaults fields (partition, time, mem, cpus_per_task, "
+            "gpus, nodes, ntasks, mail_type); an unknown key raises. Set "
+            "gpus here rather than in the YAML — under a sharded strategy "
+            "the world size also sets the effective batch."
+        ),
+    )
+    cs.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Array arms: max tasks running at once (the %%N of --array). "
+            "Overrides the campaign's array_concurrency."
+        ),
+    )
+    cs.add_argument(
+        "--time",
+        default=None,
+        metavar="HH:MM:SS",
+        help="Wall-clock limit per job (per array task), e.g. 48:00:00. Same as --slurm time=...",
     )
     cs.set_defaults(func=campaign_submit)
 
@@ -2761,6 +3042,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between SLURM polls (default: 300 = 5 min)",
     )
     cw.set_defaults(func=campaign_watch)
+
+    from spectramr.cli.campaign_infer import attach as _attach_campaign_infer
+
+    _attach_campaign_infer(campaign_sub)
 
     # ── hpo ─────────────────────────────────────────────────────────────
     hpo_parser = subparsers.add_parser(
@@ -2912,10 +3197,10 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--exp-dir",
         "-e",
-        required=True,
+        default=None,
         type=Path,
         help="Experiment output directory (containing logs/training_metrics.csv), "
-        "or a cohort root when --recursive is given.",
+        "or a cohort root when --recursive is given. Required except with --contrasts.",
     )
     report_parser.add_argument(
         "--recursive",
@@ -2964,9 +3249,9 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--figures",
         default=None,
-        help="Comma-separated figure ids to render. Default: ALL applicable "
-        "figures — the report command is the plotting SSOT and data-less "
-        "figures soft-skip. e.g. --figures fig_1_2_learning_curves,qc_group_strip",
+        help="Comma-separated figure ids to render. Default: the --task preset "
+        "plus the QC figures; data-less figures are skipped with a recorded "
+        "reason. e.g. --figures fig_1_2_learning_curves,qc_group_strip",
     )
     report_parser.add_argument(
         "--out-subdir",
@@ -3008,6 +3293,113 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Include (--qc) or skip (--no-qc) the QC figures. "
         "Default: on (or the config's reporting.qc_figures).",
+    )
+    report_parser.add_argument(
+        "--style",
+        default=None,
+        # Must equal the ReportStyle enum; written out for the same import-cost
+        # reason as --task, and pinned by test_report_command.
+        choices=["ieee", "nature", "poster", "slides"],
+        help="House style: nature (default), ieee, poster or slides "
+        "(or the config's reporting.style).",
+    )
+    report_parser.add_argument(
+        "--catalog",
+        action="store_true",
+        help="Render every registered figure and table from built-in synthetic examples "
+        "into --exp-dir (created if missing), to see what the report can draw.",
+    )
+    report_parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Cross-run report: compare every run under --exp-dir (or the --arms list) "
+        "and write mosaics, per-case error bars, curves and a results table to "
+        "<exp-dir>/comparison/.",
+    )
+    report_parser.add_argument(
+        "--arms",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="With --compare: the run directories to compare, in order "
+        "(default: every run discovered under --exp-dir).",
+    )
+    report_parser.add_argument(
+        "--labels",
+        default=None,
+        help="With --compare: comma-separated arm labels, one per arm "
+        "(default: run names with their shared prefix/suffix removed).",
+    )
+    report_parser.add_argument(
+        "--baseline",
+        default=None,
+        help="With --compare: the arm label the others are tested against.",
+    )
+    report_parser.add_argument(
+        "--view",
+        default="selected",
+        choices=["selected", "final", "common"],
+        help="Which validation pass every table, error bar and image is read at: the "
+        "early-stopping pass (selected, default), the last pass (final), or, with "
+        "--compare, the last pass every arm reached (common; a single run reads its last).",
+    )
+    report_parser.add_argument(
+        "--metrics",
+        default=None,
+        help="With --compare or --contrasts: 'all' (every metric any phase logged) or a "
+        "comma-separated list of base names (psnr, nmse, cjv, ...). --compare's default "
+        "is its headline panels; contrast folders default to all.",
+    )
+    report_parser.add_argument(
+        "--phases",
+        default=None,
+        help="Comma-separated subset of val,train,test (test = inference results). "
+        "Default: all three.",
+    )
+    report_parser.add_argument(
+        "--max-panels",
+        type=int,
+        default=12,
+        help="Metric panels per figure; more metrics continue in <figure>_2, _3, ...",
+    )
+    report_parser.add_argument(
+        "--train-window",
+        type=int,
+        default=50,
+        help="Training rows averaged (the last N at or before the selected pass).",
+    )
+    report_parser.add_argument(
+        "--contrasts",
+        type=Path,
+        default=None,
+        help="A contrast file (YAML): each declared comparison is rendered alone into "
+        "<out-root>/<name>/ with its figures, tables, CSV data and paired statistics. "
+        "The file owns the checkpoint view.",
+    )
+    report_parser.add_argument(
+        "--contrast-pairs",
+        choices=["vs_baseline", "pairs"],
+        default=None,
+        help="Contrast folders for every arm under --exp-dir, with no file: each arm "
+        "against --baseline (Holm-corrected together), or every pair of arms. "
+        "--out-root defaults to <exp-dir>/contrasts.",
+    )
+    report_parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=None,
+        help="With --contrasts: the directory that receives one folder per contrast.",
+    )
+    report_parser.add_argument(
+        "--only",
+        default=None,
+        help="With --contrasts: comma-separated contrast names to (re)write.",
+    )
+    report_parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=None,
+        help="With --contrasts: overrides the file's results_root for relative run paths.",
     )
     report_parser.set_defaults(func=report)
 
@@ -3277,7 +3669,7 @@ def build_parser() -> argparse.ArgumentParser:
         "extra",
         nargs="*",
         help="Passthrough args for the verb after a '--' separator "
-        "(e.g. ... -- --checkpoint best.pt --input d/ --output o/ for infer).",
+        "(e.g. ... -- --checkpoint best.safetensors --input d/ --output o/ for infer).",
     )
     launch_parser.set_defaults(func=launch)
 
@@ -3365,10 +3757,8 @@ def main(argv: list[str] | None = None) -> int:
             in-process ``LocalBackend`` (``spectramr launch --where local``) can
             drive any verb without spawning a subprocess.
     """
-    # NB: ``bootstrap_console_logging()`` is deferred to AFTER ``parse_args`` +
-    # the help guard below (importing the logging service pulls torch
-    # transitively, so calling it here would defeat the torch-free ``--help`` /
-    # usage-error path). See the startup-budget regression test.
+    # NB: ``configure_entry`` is deferred to AFTER ``parse_args`` + the help guard below,
+    # to keep the torch-free ``--help`` / usage-error path. See the startup-budget test.
     parser = build_parser()
     args = parser.parse_args(argv)
     # ``subparsers = ... required=True`` already enforces that a
@@ -3381,24 +3771,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    # F-LOG-COLOR round 12 (2026-05-17): install the colored console handler on
-    # the root logger before the subcommand handler runs (idempotent; a no-op
-    # when already present). Pre-fix, only ``hpo`` instantiated
-    # ``LoggingService`` so train/audit/predict/sanity_check/campaign fell back
-    # to Python's plain ``lastResort`` handler. Deferred to AFTER argument
-    # parsing so ``--help`` / usage errors stay torch-free (the logging service
-    # pulls torch transitively). Idempotent; real commands load torch anyway.
-    from spectramr.infrastructure.logging import bootstrap_console_logging
-    from spectramr.infrastructure.logging.rank_console import quiet_secondary_ranks
+    # ``log_policy`` owns the console handler and the level (``--log-level`` >
+    # ``SPECTRAMR_LOG_LEVEL`` > config), including the secondary-rank floor that keeps
+    # a torchrun launch from logging every startup line N times. Deferred past
+    # ``parse_args`` so ``--help`` / usage errors stay torch-free.
+    from spectramr.infrastructure.logging.log_policy import configure_entry
 
-    bootstrap_console_logging()
-
-    # torchrun runs N independent interpreters, so every INFO emitted before the
-    # process group exists lands in the job log N times. ``setup_distributed``
-    # applies this same clamp, but only after the config has loaded and the
-    # backend resolved -- too late for the startup lines. Apply it here, off the
-    # rank torchrun exported before the process started. No-op single-process.
-    quiet_secondary_ranks()
+    try:
+        configure_entry(
+            getattr(args, "log_level", None) or ("debug" if getattr(args, "debug", False) else None)
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # The dispatched command will (for heavy verbs) now pull torch + the model
     # registry — tens of seconds cold. Signal that up front so the entry point

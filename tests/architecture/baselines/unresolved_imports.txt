@@ -8,10 +8,6 @@
 # This baseline only ever shrinks. Never regenerate it to make the gate green
 # (CLAUDE.md non-negotiable 20).
 #
-#
-# --- open defects, tracked in #1642 -------------------------------------
-# physics_builder: the ImportError is caught, logged as a WARNING, and training
-# continues with parallel imaging declared but NO coil-sensitivity estimator.
-src/spectramr/infrastructure/training/builders/physics_builder.py:159 from spectramr.infrastructure.physics.coil_sensitivity import ESPIRiTSensitivity
-# trellis: registers fine, raises at construction — advertised but unbuildable.
-src/spectramr/models/trellis/sparse_structure_flow.py:211 from spectramr.models.blocks.trellis_transformer import ModulatedTransformerCrossBlock
+# No open entries: the two that #1642 tracked (physics_builder's dead ESPIRiTSensitivity
+# import, removed with its dead route; the trellis block imported from the wrong module)
+# are fixed, so the baseline is empty.

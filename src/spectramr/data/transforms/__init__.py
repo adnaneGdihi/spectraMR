@@ -4,8 +4,11 @@
 # this registry exists to end. Import them here, unconditionally, and keep this
 # list in sync when adding a config-declarable transform.
 # (Same maintenance contract as data/adapters/__init__.py.)
+from . import complementary_rep_masking as _complementary_rep_masking  # noqa: F401
+from . import espirit_sensitivity as _espirit_sensitivity  # noqa: F401
 from . import foreground_mask_extractor as _foreground_mask_extractor  # noqa: F401
 from . import graph_transform as _graph_transform  # noqa: F401
+from . import hardware_unwarp as _hardware_unwarp  # noqa: F401
 from . import homomorphic_bias_field as _homomorphic_bias_field  # noqa: F401
 from . import joint_rotation as _joint_rotation  # noqa: F401
 from . import phase_residual as _phase_residual  # noqa: F401
@@ -13,6 +16,8 @@ from . import qmap_ulf_operator_transform as _qmap_ulf_operator_transform  # noq
 from . import scout_acquisition as _scout_acquisition  # noqa: F401
 from . import slab_transforms as _slab_transforms  # noqa: F401
 from . import slice_profile as _slice_profile  # noqa: F401
+from . import svd_coil_compression as _svd_coil_compression  # noqa: F401
+from . import synthetic_marker as _synthetic_marker  # noqa: F401
 from . import synthetic_ulf_simulator as _synthetic_ulf_simulator  # noqa: F401
 from .benchmarking_degradations import (
     B1TransmitInhomogeneity,

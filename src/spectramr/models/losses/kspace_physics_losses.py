@@ -5,10 +5,36 @@ Implements frequency-weighted losses that account for k-space spectral propertie
 (1/f decay) and enforce high-frequency reconstruction accuracy.
 """
 
+import math
+from collections.abc import Callable, Sequence
+from itertools import pairwise
+
 import torch
 import torch.nn as nn
 
 from spectramr.models.losses.registry import register_loss
+
+VALID_REDUCTIONS: frozenset[str] = frozenset({"mean", "sum", "none"})
+#: Ring edges as fractions of the Nyquist radius ``min(H, W) / 2`` (the PR1 ring rule).
+DEFAULT_RING_EDGES: tuple[float, ...] = (1 / 8, 1 / 4, 1 / 2, 3 / 4)
+
+
+def check_reduction(reduction: str, owner: str) -> None:
+    """Raise at construction on an unknown reduction instead of at the first step."""
+    if reduction not in VALID_REDUCTIONS:
+        raise ValueError(
+            f"Unknown reduction {reduction!r} for {owner}. Valid: {sorted(VALID_REDUCTIONS)}."
+        )
+
+
+def _fold_depth_into_batch(x: torch.Tensor) -> torch.Tensor:
+    """``[B, C, D, H, W]`` -> ``[B*D, C, H, W]``, keeping each slice's channels together.
+
+    A bare ``reshape`` would interleave C with D, so the real/imag channel pairs
+    of a stacked tensor would pair two depth slices instead.
+    """
+    b, c, d, h, w = x.shape
+    return x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
 
 
 @register_loss("frequency_weighted_l1_kspace")
@@ -26,11 +52,8 @@ class FrequencyWeightedL1Loss(nn.Module):
     Args:
         height (int): Height of k-space data.
         width (int): Width of k-space data.
-        alpha (float): Weighting exponent. Controls aggressiveness of high-frequency
-                      emphasis. Default=2.0 empirically balances robustness.
-                      - alpha=1.0: Linear scaling with radius
-                      - alpha=2.0: Quadratic scaling (recommended)
-                      - alpha=3.0: Aggressive high-frequency emphasis
+        alpha (float): Slope of the linear radial weight ``1 + alpha * r``; the
+                      map is then rescaled to unit mean. Default=2.0.
         reduction (str): 'mean', 'sum', or 'none'. Default='mean'.
 
     Shape:
@@ -62,20 +85,90 @@ class FrequencyWeightedL1Loss(nn.Module):
         width: int = 256,
         alpha: float = 2.0,
         reduction: str = "mean",
-    ):
+        profile: str = "linear",
+        ring_edges: Sequence[float] | None = None,
+        ring_gain: Sequence[float] | None = None,
+        ring_gain_outside: float | None = None,
+    ) -> None:
         """Initialize FrequencyWeightedL1Loss.
 
         Note: height and width are optional defaults. The loss will dynamically
         adapt to input tensor shapes during forward pass.
+
+        ``profile='ring_band'`` replaces the linear ramp with equal total weight per
+        ring: ring ``r`` carries total weight ``ring_gain[r]`` spread over its bins, and
+        every bin outside the rings forms one group of total ``ring_gain_outside``.
+        Groups are counted on the full grid, as the linear map is, and the map is then
+        renormalised to unit mean. A per-bin weight for the outside group would make
+        the low band ~N_ring times heavier than a ring bin's weight (or starve it),
+        so it is a group total instead.
         """
         super().__init__()
+        check_reduction(reduction, "frequency_weighted_l1_kspace")
+        if profile not in _PROFILE_BUILDERS:
+            raise ValueError(
+                f"Unknown profile {profile!r} for frequency_weighted_l1_kspace. "
+                f"Valid: {sorted(_PROFILE_BUILDERS)}."
+            )
         self.default_height = height
         self.default_width = width
         self.alpha = alpha
         self.reduction = reduction
+        self.profile = profile
+        self.ring_edges: tuple[float, ...] | None = None
+        self.ring_gain: tuple[float, ...] | None = None
+        self.ring_gain_outside: float | None = None
+        if profile == "ring_band":
+            self._configure_rings(ring_edges, ring_gain, ring_gain_outside)
+        elif any(v is not None for v in (ring_edges, ring_gain, ring_gain_outside)):
+            raise ValueError(
+                "ring_edges, ring_gain and ring_gain_outside apply only to profile: ring_band."
+            )
 
         # Cache for dynamically computed weight maps (keyed by (H, W))
-        self._weight_map_cache: dict = {}
+        self._weight_map_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+    def _configure_rings(
+        self,
+        ring_edges: Sequence[float] | None,
+        ring_gain: Sequence[float] | None,
+        ring_gain_outside: float | None,
+    ) -> None:
+        """Validate and store the ring-band geometry and gains (raises on any bad value)."""
+        edges = tuple(float(e) for e in (DEFAULT_RING_EDGES if ring_edges is None else ring_edges))
+        if len(edges) < 2 or edges[0] < 0 or any(b <= a for a, b in pairwise(edges)):
+            raise ValueError(f"ring_edges must be >= 2 strictly increasing values >= 0: {edges}")
+        n_rings = len(edges) - 1
+        gains = tuple(1.0 for _ in range(n_rings)) if ring_gain is None else tuple(ring_gain)
+        gains = tuple(float(g) for g in gains)
+        outside = 1.0 if ring_gain_outside is None else float(ring_gain_outside)
+        if len(gains) != n_rings:
+            raise ValueError(f"ring_gain needs one value per ring ({n_rings}), got {len(gains)}")
+        if any(not (math.isfinite(g) and g >= 0) for g in (*gains, outside)):
+            raise ValueError(f"ring gains must be finite and >= 0: {gains}, outside={outside}")
+        if sum(gains) + outside <= 0:
+            raise ValueError("ring_band needs at least one positive gain")
+        self.ring_edges = edges
+        self.ring_gain = gains
+        self.ring_gain_outside = outside
+
+    def _ring_band_map(self, height: int, width: int) -> torch.Tensor:
+        """Unit-mean ``(1, 1, H, W)`` map giving each ring equal total weight per ``ring_gain``."""
+        assert self.ring_edges is not None and self.ring_gain is not None
+        assert self.ring_gain_outside is not None
+        ky = torch.arange(height, dtype=torch.float64) - height // 2
+        kx = torch.arange(width, dtype=torch.float64) - width // 2
+        nyquist = min(height, width) / 2.0
+        rho = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2) / nyquist
+        edges = torch.tensor(self.ring_edges, dtype=torch.float64)
+        n_rings = len(self.ring_edges) - 1
+        # bucketize gives 0 below the first edge and n_rings at or beyond the last one.
+        ring = torch.bucketize(rho, edges, right=True) - 1
+        slot = torch.where((ring >= 0) & (ring < n_rings), ring, torch.full_like(ring, n_rings))
+        gains = torch.tensor((*self.ring_gain, self.ring_gain_outside), dtype=torch.float64)
+        counts = torch.bincount(slot.flatten(), minlength=n_rings + 1).to(torch.float64)
+        raw = gains[slot] / counts.clamp_min(1.0)[slot]
+        return (raw / raw.mean()).to(torch.float32)[None, None]
 
     def _get_weight_map(
         self,
@@ -99,17 +192,18 @@ class FrequencyWeightedL1Loss(nn.Module):
             torch.Tensor: Weight map shape (1, 1, height, width).
         """
         cache_key = (height, width)
+        # Ensure weights are always real, matching precision of input
+        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
 
-        # Return cached weight map if available and on correct device
+        # Return cached weight map if available on the right device AND precision:
+        # a float64 map cached by a complex128 call would silently promote later losses.
         if cache_key in self._weight_map_cache:
             cached = self._weight_map_cache[cache_key]
-            if cached.device == device:
+            if cached.device == device and cached.dtype == real_dtype:
                 return cached
 
         # Compute new weight map
-        weight_map = self._create_frequency_weight_map(height, width, self.alpha)
-        # Ensure weights are always real, matching precision of input
-        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
+        weight_map = _PROFILE_BUILDERS[self.profile](self, height, width)
         weight_map = weight_map.to(device=device, dtype=real_dtype)
 
         # Cache it
@@ -166,6 +260,7 @@ class FrequencyWeightedL1Loss(nn.Module):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
+        acquired: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute frequency-weighted L1 loss.
@@ -173,6 +268,10 @@ class FrequencyWeightedL1Loss(nn.Module):
         Args:
             pred (torch.Tensor): Predicted k-space, shape (B, 2*C, H, W) or (B, C, H, W) for complex.
             target (torch.Tensor): Target k-space, same shape as pred.
+            acquired (torch.Tensor, optional): ``[B, 1, H, W]`` plane of the lines the
+                scanner wrote. When given, the never-acquired lines (exact zeros in the
+                target, ~24 % of an M4Raw plane and ~32 % of this map's weight) carry no
+                weight and the mean runs over the acquired bins only.
 
         Returns:
             torch.Tensor: Loss value (scalar or per-sample depending on reduction).
@@ -185,11 +284,12 @@ class FrequencyWeightedL1Loss(nn.Module):
 
         # Handle both 4D (B,C,H,W) and 5D (B,C,D,H,W) tensors.
         # For 5D inputs (volumetric/multi-slice), collapse depth into batch.
-        original_shape = pred.shape
         if pred.dim() == 5:
-            B, C, D, H, W = pred.shape
-            pred = pred.reshape(B * D, C, H, W)
-            target = target.reshape(B * D, C, H, W)
+            depth = pred.shape[2]
+            pred = _fold_depth_into_batch(pred)
+            target = _fold_depth_into_batch(target)
+            if acquired is not None:
+                acquired = acquired.repeat_interleave(depth, dim=0)
         elif pred.dim() == 4:
             pass  # Already (B, C, H, W)
         else:
@@ -201,36 +301,46 @@ class FrequencyWeightedL1Loss(nn.Module):
 
         # Handle both stacked real/imag [B, 2*C, H, W] and complex tensors
         if pred.is_complex():
-            # Convert complex to magnitude for weighting (phase-neutral)
-            pred_magnitude = torch.abs(pred)
-            target_magnitude = torch.abs(target)
-            unweighted_loss = torch.nn.functional.l1_loss(
-                pred_magnitude, target_magnitude, reduction="none"
-            )
+            # Modulus of the complex DIFFERENCE, as in the formula: ||pred| - |target||
+            # would score a k-space phase ramp (an image shift) as a perfect match.
+            unweighted_loss = torch.abs(pred - target)
         else:
             # Stacked real/imag: [B, 2*C, H, W]
             unweighted_loss = torch.nn.functional.l1_loss(pred, target, reduction="none")
 
         # Apply frequency weights: broadcast weight_map [1, 1, H, W] to loss [B, C, H, W]
+        if acquired is not None:
+            weight_map = weight_map * acquired.to(device=pred.device, dtype=weight_map.dtype)
         weighted_loss = unweighted_loss * weight_map
 
-        # Apply reduction
         if self.reduction == "mean":
+            if acquired is not None:
+                count = acquired.to(weighted_loss.dtype).expand_as(weighted_loss).sum()
+                return weighted_loss.sum() / count.clamp_min(1.0)
             return weighted_loss.mean()
-        elif self.reduction == "sum":
+        if self.reduction == "sum":
             return weighted_loss.sum()
-        elif self.reduction == "none":
-            return weighted_loss
-        else:
-            raise ValueError(f"Unknown reduction: {self.reduction}")
+        return weighted_loss
 
     def extra_repr(self) -> str:
         """Return extra representation string."""
         return (
             f"default_height={self.default_height}, default_width={self.default_width}, "
-            f"alpha={self.alpha}, reduction='{self.reduction}', "
+            f"alpha={self.alpha}, reduction='{self.reduction}', profile='{self.profile}', "
             f"(dynamically adapts to input shape)"
         )
+
+
+def _linear_profile(loss: FrequencyWeightedL1Loss, height: int, width: int) -> torch.Tensor:
+    """The radial ramp ``1 + alpha * r`` renormalised to unit mean (the original map)."""
+    return loss._create_frequency_weight_map(height, width, loss.alpha)
+
+
+#: Weight-map builders keyed by ``profile``; an unknown name is rejected at construction.
+_PROFILE_BUILDERS: dict[str, Callable[[FrequencyWeightedL1Loss, int, int], torch.Tensor]] = {
+    "linear": _linear_profile,
+    "ring_band": FrequencyWeightedL1Loss._ring_band_map,
+}
 
 
 @register_loss("sobolev_kspace")
@@ -246,10 +356,12 @@ class SobolevKSpaceLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SobolevKSpace} = \\mathbb{E}_{k_x, k_y} \\left[ (1 + k_x^2 + k_y^2)^{s/2} | \\hat{k} - k | \right]
+        \\mathcal{L}_{SobolevKSpace} = \\mathbb{E}_{k_x, k_y} \\left[ (1 + k_x^2 + k_y^2)^{s/2} | \\hat{k} - k | \\right]
     """
 
-    def __init__(self, order: float = 2.0, reduction: str = "mean"):
+    def __init__(
+        self, order: float = 2.0, reduction: str = "mean", restrict_to_acquired: bool = False
+    ):
         """Fourier-domain Sobolev loss of order ``order``.
 
         Args:
@@ -263,11 +375,16 @@ class SobolevKSpaceLoss(nn.Module):
                 Immutable after construction — the weight-map cache is keyed on
                 shape alone.
             reduction: Reduction passed to the underlying magnitude penalty.
+            restrict_to_acquired: Score only the lines the scanner wrote, so the never-acquired
+                zero lines do not dilute the mean. Off by default: it moves the loss scale of
+                every arm that already declares this loss.
         """
         super().__init__()
+        check_reduction(reduction, "sobolev_kspace")
+        self.restrict_to_acquired = bool(restrict_to_acquired)
         self.order = float(order)
         self.reduction = reduction
-        self._weight_map_cache = {}
+        self._weight_map_cache: dict[tuple[int, int], torch.Tensor] = {}
 
     def _get_weight_map(
         self, height: int, width: int, device: torch.device, dtype: torch.dtype
@@ -283,9 +400,10 @@ class SobolevKSpaceLoss(nn.Module):
             torch.Tensor: Description.
         """
         cache_key = (height, width)
+        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
         if cache_key in self._weight_map_cache:
             cached = self._weight_map_cache[cache_key]
-            if cached.device == device:
+            if cached.device == device and cached.dtype == real_dtype:
                 return cached
 
         # Create meshgrid with frequencies normalized to [-1, 1]
@@ -303,13 +421,17 @@ class SobolevKSpaceLoss(nn.Module):
         weight = (1.0 + xx**2 + yy**2) ** (self.order / 2.0)
 
         weight_map = weight.unsqueeze(0).unsqueeze(0)
-        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
         weight_map = weight_map.to(device=device, dtype=real_dtype)
 
         self._weight_map_cache[cache_key] = weight_map
         return weight_map
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        acquired: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """forward.
 
         Args:
@@ -337,13 +459,15 @@ class SobolevKSpaceLoss(nn.Module):
 
         # Handle both 4D (B,C,H,W) and 5D (B,C,D,H,W) tensors.
         if pred.dim() == 5:
-            B, C, D, H, W = pred.shape
-            pred = pred.reshape(B * D, C, H, W)
-            target = target.reshape(B * D, C, H, W)
+            depth = pred.shape[2]
+            pred = _fold_depth_into_batch(pred)
+            target = _fold_depth_into_batch(target)
+            if acquired is not None:
+                acquired = acquired.repeat_interleave(depth, dim=0)
         elif pred.dim() != 4:
             raise RuntimeError(f"Expected 4D or 5D tensor, got {pred.dim()}D: {pred.shape}")
 
-        batch_size, channels, height, width = pred.shape
+        height, width = pred.shape[-2], pred.shape[-1]
         weight_map = self._get_weight_map(height, width, pred.device, pred.dtype)
 
         if pred.is_complex():
@@ -356,22 +480,23 @@ class SobolevKSpaceLoss(nn.Module):
                 diff_reshaped = diff.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
                 diff_complex = torch.view_as_complex(diff_reshaped).permute(0, 3, 1, 2)
                 diff_mag = torch.abs(diff_complex)
-                # Ensure weight_map broadcasts to C // 2
             else:
                 diff_mag = torch.abs(pred - target)
 
-        # Handle broadcasting if needed due to complex casting
-        if diff_mag.shape[1] * 2 == pred.shape[1] and pred.ndim == 4 and not pred.is_complex():
-            # We went from C to C/2 channels
-            pass
-
         weighted_loss = diff_mag * weight_map
+
+        if self.restrict_to_acquired:
+            if acquired is None:
+                raise ValueError(
+                    "sobolev_kspace has restrict_to_acquired=True but no `acquired` plane reached it."
+                )
+            plane = acquired.to(device=weighted_loss.device, dtype=weighted_loss.dtype)
+            weighted_loss = weighted_loss * plane
+            if self.reduction == "mean":
+                return weighted_loss.sum() / plane.expand_as(weighted_loss).sum().clamp_min(1.0)
 
         if self.reduction == "mean":
             return weighted_loss.mean()
-        elif self.reduction == "sum":
+        if self.reduction == "sum":
             return weighted_loss.sum()
-        elif self.reduction == "none":
-            return weighted_loss
-        else:
-            raise RuntimeError(f"Unknown reduction: {self.reduction}")
+        return weighted_loss

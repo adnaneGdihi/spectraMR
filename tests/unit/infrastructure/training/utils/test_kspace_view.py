@@ -89,15 +89,25 @@ class TestItIsANoOpWhenNotCompressed:
         assert torch.equal(decompress_for_view(x, log_scaled=True), x)
 
 
+def _cfg(*, normalize: bool, log_scaling: bool):
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+    processing = DataProcessingConfigSchema(
+        enable_kspace_normalization=normalize, enable_log_scaling=log_scaling
+    )
+    return types.SimpleNamespace(data=types.SimpleNamespace(processing=processing))
+
+
 class TestFlagResolution:
     @pytest.mark.parametrize("enabled", [True, False])
     def test_reads_the_nested_ssot_path(self, enabled):
-        cfg = types.SimpleNamespace(
-            data=types.SimpleNamespace(
-                processing=types.SimpleNamespace(enable_log_scaling=enabled)
-            )
-        )
-        assert log_scaling_enabled(cfg) is enabled
+        assert log_scaling_enabled(_cfg(normalize=True, log_scaling=enabled)) is enabled
+
+    def test_log_scaling_without_normalization_is_not_compressed(self):
+        """#2353: the compression runs inside the k-space normalization, so
+        ``enable_log_scaling`` alone leaves k-space linear. Answering True here
+        ``expm1``s a spectrum that was never compressed."""
+        assert log_scaling_enabled(_cfg(normalize=False, log_scaling=True)) is False
 
     def test_absent_block_defaults_to_false(self):
         """False is the safe direction: render what you were given, rather than
@@ -268,3 +278,40 @@ class TestASpuriousDecompressionIsRefused:
         assert torch.allclose(
             recovered, physical, rtol=1e-2, atol=1e-2 * float(physical.abs().max())
         )
+
+
+class TestDecompressScoredAgainst:
+    """One decision, taken on the reference, applied to every scored tensor."""
+
+    @staticmethod
+    def _compressed(seed: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(seed)
+        return torch.log1p(torch.rand(1, 4, 8, 8, generator=g) * 50.0)
+
+    def test_a_decompressed_reference_decompresses_every_other_tensor(self) -> None:
+        from spectramr.infrastructure.training.utils.kspace_view import (
+            decompress_scored_against,
+        )
+
+        ref, pred = self._compressed(0), self._compressed(1)
+        pred[..., 0, 0] = 40.0  # past the ceiling: judged alone it would stay compressed
+        out_ref, out = decompress_scored_against(
+            ref, {"pred": pred, "none": None}, log_scaled=True
+        )
+        from spectramr.data.transforms.normalization import decompress_kspace_log
+
+        torch.testing.assert_close(out_ref, decompress_kspace_log(ref, channel_dim=1))
+        torch.testing.assert_close(out["pred"], decompress_kspace_log(pred, channel_dim=1))
+        assert out["none"] is None
+
+    @pytest.mark.parametrize("log_scaled", [False, True])
+    def test_a_reference_left_as_is_leaves_every_other_tensor_as_is(self, log_scaled) -> None:
+        """Not log-scaled, or a reference that was never compressed: nothing moves."""
+        from spectramr.infrastructure.training.utils.kspace_view import (
+            decompress_scored_against,
+        )
+
+        ref = self._compressed(2) if not log_scaled else torch.rand(1, 4, 8, 8) * 100.0
+        pred = self._compressed(3)
+        out_ref, out = decompress_scored_against(ref, {"pred": pred}, log_scaled=log_scaled)
+        assert out_ref is ref and out["pred"] is pred

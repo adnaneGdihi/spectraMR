@@ -41,12 +41,29 @@ from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spectramr.models.blocks.film_mamba_block import FiLMMambaBlock
 from spectramr.models.blocks.metric_sfc import MetricSFCLinearizer
 from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_world_size() -> int:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _broadcast_from_rank0(tensor: torch.Tensor) -> torch.Tensor:
+    import torch.distributed as dist
+
+    tensor = tensor.clone()
+    dist.broadcast(tensor, src=0)
+    return tensor
 
 
 @register_model(
@@ -102,6 +119,7 @@ class GeoMambaUNet(nn.Module):
         sfc_smoothing_sigma: float = 1.0,
         sfc_connectivity: int = 26,
         sfc_cache_dir: str | None = "cache/metric_sfc",
+        displacement_head: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -127,6 +145,17 @@ class GeoMambaUNet(nn.Module):
 
         self.input_proj = nn.Conv3d(in_channels, d_model, kernel_size=1)
         self.output_proj = nn.Conv3d(d_model, out_channels, kernel_size=1)
+        # Optional geometric branch: a zero-initialised 1x1x1 head predicts a
+        # normalised (x, y, z) displacement, and the output is resampled through it.
+        self.displacement_head_enabled = bool(displacement_head)
+        self.displacement_head: nn.Conv3d | None = None
+        if self.displacement_head_enabled:
+            self.displacement_head = nn.Conv3d(d_model, 3, kernel_size=1)
+            nn.init.zeros_(self.displacement_head.weight)
+            nn.init.zeros_(self.displacement_head.bias)
+        # Set by forward: the displacement in voxel units, (B, 3, D, H, W) in (x, y, z)
+        # order, or None when the head is off.
+        self.last_displacement: torch.Tensor | None = None
 
         self.contrast_embedding = nn.Embedding(n_contrasts, contrast_dim)
 
@@ -152,6 +181,8 @@ class GeoMambaUNet(nn.Module):
         # assigned here (see _resolve_linearizer) so all later forwards hit the
         # early-return — no per-step cache-key GPU sync.
         self._linearizer: MetricSFCLinearizer | None = linearizer
+        # Restores a lazily built curve from a checkpoint before the strict load.
+        self.register_load_state_dict_pre_hook(self._restore_linearizer_from_state)
 
     # ------------------------------------------------------------------
     # Forward
@@ -212,6 +243,11 @@ class GeoMambaUNet(nn.Module):
 
         # Project to output channels.
         out = self.output_proj(restored)
+        self.last_displacement = None
+        if self.displacement_head is not None:
+            out, self.last_displacement = self._warp_by_displacement(
+                out, self.displacement_head(restored), (D, H, W)
+            )
 
         # Final R: paste the original input back into background voxels
         # of the predicted volume, ensuring the network's reconstruction
@@ -225,6 +261,34 @@ class GeoMambaUNet(nn.Module):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _warp_by_displacement(
+        out: torch.Tensor, disp_norm: torch.Tensor, shape: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resample ``out`` through ``identity + disp``; return the warp and the displacement in voxels."""
+        B = out.shape[0]
+        D, H, W = shape
+        zz, yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, D, device=out.device, dtype=out.dtype),
+            torch.linspace(-1.0, 1.0, H, device=out.device, dtype=out.dtype),
+            torch.linspace(-1.0, 1.0, W, device=out.device, dtype=out.dtype),
+            indexing="ij",
+        )
+        identity = torch.stack([xx, yy, zz], dim=-1).unsqueeze(0).expand(B, -1, -1, -1, -1)
+        disp_grid = disp_norm.permute(0, 2, 3, 4, 1)  # (B, D, H, W, 3), (x, y, z)
+        warped = F.grid_sample(
+            out,
+            identity + disp_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        # A normalised step of 2 spans (n - 1) voxels on each axis.
+        scale = torch.tensor(
+            [(W - 1) / 2.0, (H - 1) / 2.0, (D - 1) / 2.0], device=out.device, dtype=out.dtype
+        ).view(1, 3, 1, 1, 1)
+        return warped, disp_norm * scale
 
     def _resolve_linearizer(
         self,
@@ -260,30 +324,60 @@ class GeoMambaUNet(nn.Module):
         )
         mask_3d = mask[0, 0] if mask.ndim == 5 else mask
 
-        # Build ONCE from the first batch and cache on ``self._linearizer`` so
-        # every later forward hits the early-return above. The old per-forward
-        # ``dict`` keyed on ``int(mask.sum().item())`` + ``mask.cpu().numpy()``
-        # did a host GPU-sync EVERY step (a training-loop-perf violation), and
-        # the strategy never injects a linearizer so it fired on every step.
-        # A fixed first-batch permutation is also the intended design —
-        # MetricSFCLinearizer is built around a stationary coregistered template
-        # / cohort mean, not a per-batch curve.
+        # Build ONCE from the first batch and keep it: the curve is a fixed
+        # template-bound permutation, persisted with the weights (see
+        # _install_linearizer) so a fresh model reloads the same order.
+        if _distributed_world_size() > 1:
+            # Every replica must share rank 0's curve.
+            template = _broadcast_from_rank0(template.detach())
+            mask_3d = _broadcast_from_rank0(mask_3d.detach())
+        self._install_linearizer(template.detach(), mask_3d.detach(), device=volume.device)
+        assert self._linearizer is not None
+        logger.info(
+            "[GeoMambaUNet] built lazy MetricSFCLinearizer (shape=%s, fg=%d)",
+            self._linearizer.spatial_shape,
+            self._linearizer.n_foreground,
+        )
+        return self._linearizer
+
+    def _install_linearizer(
+        self, template: torch.Tensor, mask_3d: torch.Tensor, *, device: torch.device
+    ) -> None:
+        """Build the curve, move its index buffers to ``device`` once, and persist its inputs."""
         linearizer = MetricSFCLinearizer(
-            intensity_volume=template.detach(),
-            mask=mask_3d.detach(),
+            intensity_volume=template,
+            mask=mask_3d,
             beta=self.sfc_beta,
             smoothing_sigma=self.sfc_smoothing_sigma,
             connectivity=cast(Literal[6, 18, 26], self.sfc_connectivity),
             cache_dir=self.sfc_cache_dir,
-        )
-        # Registers the linearizer (and its buffers) as a submodule.
+        ).to(device)
+        # Persistent so state_dict carries the inputs needed to rebuild the curve.
+        self.register_buffer("_linearizer_template", template.to(device).clone())
+        self.register_buffer("_linearizer_mask", mask_3d.to(device).clone())
         self._linearizer = linearizer
-        logger.info(
-            "[GeoMambaUNet] built lazy MetricSFCLinearizer (shape=%s, fg=%d)",
-            linearizer.spatial_shape,
-            linearizer.n_foreground,
+
+    def _restore_linearizer_from_state(
+        self, module: nn.Module, state_dict: dict[str, Any], prefix: str, *args: Any
+    ) -> None:
+        """Rebuild the stored curve before the strict load so its buffers match."""
+        t_key = prefix + "_linearizer_template"
+        if t_key not in state_dict:
+            if self._linearizer is None and any(
+                k.startswith(prefix + "_linearizer.") for k in state_dict
+            ):
+                raise ValueError(
+                    "checkpoint carries MetricSFC buffers but no '_linearizer_template'; "
+                    "it predates the persisted curve. Re-train or re-export it."
+                )
+            return
+        # A checkpoint's curve wins over any injected linearizer.
+        device = next(self.parameters()).device
+        self._install_linearizer(
+            state_dict[t_key].detach().to(device),
+            state_dict[prefix + "_linearizer_mask"].detach().to(device),
+            device=device,
         )
-        return linearizer
 
     @staticmethod
     def _broadcast_mask(mask: torch.Tensor, B: int, D: int, H: int, W: int) -> torch.Tensor:

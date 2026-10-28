@@ -48,7 +48,20 @@ class ConformalCertificateConfig(BaseModel):
     n_calibration: int = Field(
         default=500,
         ge=10,
-        description="Calibration-set size lower bound.",
+        description=(
+            "Calibration images drawn from the subject-split calibration half. The run "
+            "raises when the cohort holds fewer; the realised count is stamped."
+        ),
+    )
+    foreground_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Foreground mask: a target pixel scores only when |target| exceeds this fraction "
+            "of its image's peak magnitude. None (default) scores every pixel, background "
+            "included; the M4Raw certification arms declare 0.05."
+        ),
     )
     output_artefact: str | None = Field(
         default=None,
@@ -75,7 +88,17 @@ class CHDCertificateConfig(BaseModel):
     enabled: bool = Field(default=False)
     beta: float = Field(default=0.05, gt=0.0, lt=1.0)
     delta: float = Field(default=0.001, gt=0.0, lt=1.0)
-    n_calibration: int = Field(default=500, ge=10)
+    n_calibration: int = Field(
+        default=500,
+        ge=10,
+        description="Calibration images for the threshold fit (same subject split as R1).",
+    )
+    foreground_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        lt=1.0,
+        description="Foreground mask on the |pred - target| scores; None (default) keeps every pixel.",
+    )
     output_artefact: str | None = Field(default=None)
 
 
@@ -150,7 +173,7 @@ class DiceRiskCertificateConfig(BaseModel):
             "enabled: a Dice-risk certificate over an uninitialised/untrained model "
             "is scientifically meaningless (pitfall #20), so run_calibration raises "
             "if this is unset. Point it at the synthesis arm's "
-            "<output_dir>/checkpoints/best.pt."
+            "<output_dir>/checkpoints/best.<format>."
         ),
     )
     output_artefact: str | None = Field(default=None)
@@ -199,6 +222,23 @@ class CertificationConfigSchema(BaseModel):
         default_factory=DiceRiskCertificateConfig,
     )
     badge: ValidationBadgeConfig = Field(default_factory=ValidationBadgeConfig)
+
+    @model_validator(mode="after")
+    def _reject_uncomputable_certificates(self) -> CertificationConfigSchema:
+        """Refuse, at load, the certificates whose inputs no source produces yet."""
+        if self.pathology_recall.enabled:
+            raise ValueError(
+                "certification.pathology_recall is not computable: no lesion detector "
+                "produces the empirical_recall it certifies (missing lesion detector, #3041). "
+                "Keep the arm needs_implementation and set enabled: false."
+            )
+        if self.pac_bayes.enabled:
+            raise ValueError(
+                "certification.pac_bayes is not computable: no KL(Q||P) estimator exists "
+                "for the posterior (missing KL(Q||P) estimator, #3041). Keep the arm "
+                "needs_implementation and set enabled: false."
+            )
+        return self
 
 
 __all__ = [

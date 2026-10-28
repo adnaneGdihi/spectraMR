@@ -12,6 +12,7 @@ from torch.amp import GradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
+from spectramr.core.parameter_free import declares_parameter_free
 from spectramr.infrastructure.builders.context import (
     BuilderContext,
     accepts_builder_context,
@@ -214,6 +215,8 @@ class OptimizationBuilder(Builder):
         self._optimizer_specs: dict[str, Any] = {}
         self._schedulers: dict[str, _LRScheduler] = {}
         self._scaler: GradScaler | None = None
+        #: A declared parameter-free generator gets no optimizer; empty is then valid.
+        self._parameter_free = False
 
     def build_optimizers(self) -> "OptimizationBuilder":
         """Create optimizers for each trainable model.
@@ -319,6 +322,12 @@ class OptimizationBuilder(Builder):
                 if main_model is None:
                     main_model = next(iter(self._models.values()))
 
+                if declares_parameter_free(main_model):
+                    # A classical solver: nothing to optimise, so no opt_g and no
+                    # scheduler. train.py admits such a run only under --validate-only.
+                    self._parameter_free = True
+                    logger.info("Generator is parameter-free: no optimizer built.")
+                    return self
                 optimizer = self._create_optimizer(main_model, opt_config, role="generator")
                 self._optimizers["opt_g"] = optimizer
                 logger.info(
@@ -448,7 +457,7 @@ class OptimizationBuilder(Builder):
         strategy (a ``NativeScaler``, or a ``ComplexGradScaler`` for complex
         arms) -- a different object, of a different class.
 
-        The consequence was not a leaked allocation: ``CheckpointDirector``
+        The consequence was not a leaked allocation: the checkpoint writer
         persisted ``scaler_state`` from the unused one, so every fp16 checkpoint
         carried an untouched scale of 65536 and a zero growth-tracker while the
         live scale was silently dropped. On resume the run re-converged its loss
@@ -457,7 +466,7 @@ class OptimizationBuilder(Builder):
         so the checkpoint looked complete.
 
         Kept as a no-op rather than deleted because it is a documented step of
-        the public builder chain; ``CheckpointDirector._resolve_scaler`` is now
+        the public builder chain; ``checkpointing.capture.resolve_scaler`` is now
         the single reader.
         """
         return self
@@ -522,7 +531,7 @@ class OptimizationBuilder(Builder):
         Raises:
             ValueError: If no optimizers created
         """
-        if not self._optimizers:
+        if not self._optimizers and not self._parameter_free:
             raise ValueError("No optimizers created")
 
         logger.info("Optimization validation passed")
@@ -542,7 +551,7 @@ class OptimizationBuilder(Builder):
         Raises:
             ValueError: If validation fails
         """
-        if not self._optimizers:
+        if not self._optimizers and not self._parameter_free:
             raise ValueError("No optimizers created. Call build_optimizers() first.")
 
         return self._optimizers, self._schedulers, self._scaler

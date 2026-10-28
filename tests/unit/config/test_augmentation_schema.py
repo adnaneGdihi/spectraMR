@@ -39,6 +39,5 @@ class TestAugmentationConfigSchema:
             AugmentationConfigSchema(elastic_alpha=-1)
 
     def test_extra_fields(self):
-        # extra="ignore"
-        schema = AugmentationConfigSchema(extra_field="value")
-        assert not hasattr(schema, "extra_field")
+        with pytest.raises(ValidationError):
+            AugmentationConfigSchema(extra_field="value")

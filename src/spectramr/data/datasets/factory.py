@@ -10,7 +10,7 @@ from typing import Any
 from torch.utils.data import Dataset
 
 from spectramr.config.settings import TrainingSettings
-from spectramr.data.split_utils import split_index
+from spectramr.data.split_utils import record_split_key, split_index_grouped
 from spectramr.domain.entities.data.dataset_registry import DatasetRegistry
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,9 @@ def create_dataset(name: str, config: TrainingSettings, **kwargs: Any) -> Datase
                                 # which disagreed with the SSOT's round(n*f)
                                 # (n=25, f=0.1: 2 vs 3 validation items).
                                 val_split = config.data.split.validation_fraction
-                                train_part, val_part = split_index(full_index, val_split)
+                                train_part, val_part = split_index_grouped(
+                                    full_index, val_split, key=record_split_key
+                                )
                                 by_split = {"train": train_part, "val": val_part}
                                 if split not in by_split:
                                     raise ValueError(

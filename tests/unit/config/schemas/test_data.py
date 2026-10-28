@@ -7,14 +7,45 @@ single authoritative knob every live loader path reads, and the deprecated
 under ``extra="forbid"``.
 """
 
+from typing import ClassVar
+
 import pytest
 from pydantic import ValidationError
 
 from spectramr.config.schemas.data import (
+    DataPairingConfigSchema,
     DataConfigSchema,
     DataLoaderConfigSchema,
     MRIxFieldsDataConfigSchema,
 )
+
+
+class TestRescaleRangeIsRefused:
+    """``data.processing.rescale_range`` is read by nothing (#2739).
+
+    ``minmax`` and ``percentile`` take their output range from
+    ``normalization_kwargs.out_range``; 30 arms declared ``rescale_range: [-1, 1]`` with
+    ``data_range: 2.0`` and trained on (0, 1), so their PSNR read about 6 dB high.
+    """
+
+    def test_the_nested_spelling_raises_and_names_the_knob_that_is_read(self) -> None:
+        with pytest.raises(ValidationError, match=r"normalization_kwargs\.out_range"):
+            DataConfigSchema(
+                processing={"normalization_type": "minmax", "rescale_range": [-1.0, 1.0]}
+            )
+
+    def test_the_legacy_top_level_spelling_raises_too(self) -> None:
+        with pytest.raises(ValidationError, match="rescale_range"):
+            DataConfigSchema(rescale_range=[-1.0, 1.0])
+
+    def test_an_arm_that_does_not_declare_it_loads(self) -> None:
+        cfg = DataConfigSchema(
+            processing={
+                "normalization_type": "minmax",
+                "normalization_kwargs": {"out_range": [-1.0, 1.0]},
+            }
+        )
+        assert cfg.processing.normalization_kwargs["out_range"] == [-1.0, 1.0]
 
 
 class TestPrefetchFold:
@@ -115,6 +146,13 @@ class TestTargetMode:
         cfg = DataConfigSchema(nex_target_exclude_input=True, nex_fallback="all_reps")
         assert cfg.nex_fallback == "all_reps"
 
+    def test_nex_registration_defaults_to_none(self):
+        assert DataConfigSchema().nex_registration == "none"
+
+    def test_nex_registration_unknown_value_rejected(self):
+        with pytest.raises(ValidationError):
+            DataConfigSchema(nex_registration="affine")
+
     def test_nex_fallback_unknown_value_rejected(self):
         with pytest.raises(ValidationError):
             DataConfigSchema(nex_target_exclude_input=True, nex_fallback="warn")
@@ -174,18 +212,40 @@ class TestKSpaceScaleDomain:
     def test_defaults_to_kspace(self):
         assert DataConfigSchema().processing.kspace_scale_domain == "kspace"
 
-    def test_accepts_image(self):
-        assert (
-            DataConfigSchema(
-                processing={"kspace_scale_domain": "image"}
-            ).processing.kspace_scale_domain
-            == "image"
-        )
+    def test_accepts_every_domain_the_normalizer_implements(self):
+        """The schema Literal and ``KSPACE_SCALE_DOMAINS`` must not drift: a
+        domain the transform implements but the schema rejects is unreachable."""
+        from spectramr.data.transforms.normalization import KSPACE_SCALE_DOMAINS
+
+        assert "acs_window" in KSPACE_SCALE_DOMAINS  # the 2-D masks' calibration window
+        for domain in KSPACE_SCALE_DOMAINS:
+            processing = {"kspace_scale_domain": domain}
+            assert DataConfigSchema(processing=processing).processing.kspace_scale_domain == domain
 
     def test_rejects_unknown_domain(self):
         """Closed enum — a typo must fail at load time, not degrade silently."""
         with pytest.raises(ValidationError):
             DataConfigSchema(processing={"kspace_scale_domain": "parseval"})
+
+
+class TestKSpaceScaleReference:
+    """``kspace_scale_reference`` picks the subject image the scale is measured on."""
+
+    def test_defaults_to_the_historical_target_order(self):
+        assert DataConfigSchema().processing.kspace_scale_reference == "target"
+
+    def test_the_literal_matches_the_transforms_advertised_set(self):
+        from spectramr.data.transforms.normalization import KSPACE_SCALE_REFERENCES
+
+        for reference in KSPACE_SCALE_REFERENCES:
+            processing = {"kspace_scale_reference": reference}
+            parsed = DataConfigSchema(processing=processing).processing
+            assert parsed.kspace_scale_reference == reference
+
+    def test_rejects_unknown_reference_at_load(self):
+        """PLANTED: a typo fails at load, not as a silent target-first scale."""
+        with pytest.raises(ValidationError):
+            DataConfigSchema(processing={"kspace_scale_reference": "kspace"})
 
 
 class TestNormalizationTypeLiteral:
@@ -808,3 +868,668 @@ class TestSliceLevelRecords:
             DataConfigSchema(dataset_type="kspace", slice_level_records=False).slice_level_records
             is False
         )
+
+
+class TestR2RTargetMode:
+    """``target_mode: 'r2r'`` and the two nonlinearities that silently break it.
+
+    R2R's guarantee is second-moment: ``Cov(y + a z, y - z/a) = 0``, which makes
+    the L1/L2 minimiser the CLEAN image even though no clean image is ever shown.
+    That identity survives LINEAR maps (``Cov(A a, A b) = A Cov(a, b) A^H``) and
+    dies under a nonlinearity -- SILENTLY, because the loss still falls. So both
+    nonlinear stages in this pipeline raise here rather than degrade (NN#3).
+    """
+
+    def test_r2r_is_in_the_target_mode_vocabulary(self):
+        assert (
+            DataConfigSchema(target_mode="r2r", val_target_mode="phase_aligned_mean").target_mode
+            == "r2r"
+        )
+
+    def test_r2r_alpha_defaults_to_one(self):
+        """alpha=1 splits the noise evenly: 2*Sigma into each half."""
+        assert (
+            DataConfigSchema(target_mode="r2r", val_target_mode="phase_aligned_mean").r2r_alpha
+            == 1.0
+        )
+
+    def test_r2r_alpha_is_accepted_under_r2r(self):
+        assert (
+            DataConfigSchema(
+                target_mode="r2r", r2r_alpha=0.5, val_target_mode="phase_aligned_mean"
+            ).r2r_alpha
+            == 0.5
+        )
+
+    @pytest.mark.parametrize("bad_alpha", [0.0, -1.0])
+    def test_non_positive_alpha_is_refused(self, bad_alpha):
+        """alpha appears as ``1/alpha`` in the target, so 0 is not a limit."""
+        with pytest.raises(ValidationError):
+            DataConfigSchema(
+                target_mode="r2r", r2r_alpha=bad_alpha, val_target_mode="phase_aligned_mean"
+            )
+
+    @pytest.mark.parametrize("other_mode", ["complex_mean", "phase_aligned_mean", "rep_pair"])
+    def test_alpha_declared_under_another_mode_is_refused(self, other_mode):
+        """An unread knob is a defect, not a harmless extra (NN#8)."""
+        with pytest.raises(ValidationError, match="r2r_alpha"):
+            DataConfigSchema(target_mode=other_mode, r2r_alpha=2.0)
+
+    def test_alpha_declared_with_no_mode_at_all_is_refused(self):
+        with pytest.raises(ValidationError, match="r2r_alpha"):
+            DataConfigSchema(r2r_alpha=2.0)
+
+    def test_r2r_without_a_validation_reference_is_refused(self):
+        """An r2r validation target is a fresh random image every epoch.
+
+        PSNR against it measures the noise draw, and ``track_best_metric`` would
+        checkpoint whichever epoch drew kindest. The knob is not optional under
+        r2r, so the schema names it rather than defaulting (NN#3).
+        """
+        with pytest.raises(ValidationError, match="val_target_mode"):
+            DataConfigSchema(target_mode="r2r")
+
+    def test_r2r_with_leave_one_out_is_accepted(self):
+        """Pins a DELETED guard: this combination used to raise, and must not.
+
+        ``nex_target_exclude_input`` is ONE knob shared by both splits. Under
+        r2r the training split never averages -- but the VALIDATION split runs
+        ``val_target_mode`` (a real averaging mode), and leave-one-out there is
+        what keeps the input repetition out of its own reference. Refusing the
+        pair made the whole cohort's arm A unconstructible.
+        """
+        cfg = DataConfigSchema(
+            target_mode="r2r",
+            val_target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+        )
+        assert cfg.nex_target_exclude_input is True
+        assert cfg.val_target_mode == "phase_aligned_mean"
+
+    def test_val_target_mode_defaults_to_none(self):
+        """None means "serve the training mode to both splits"."""
+        assert DataConfigSchema().val_target_mode is None
+
+    def test_val_target_mode_cannot_be_r2r(self):
+        """Excluded at the TYPE level: a redrawn target is not a metric reference."""
+        with pytest.raises(ValidationError):
+            DataConfigSchema(target_mode="r2r", val_target_mode="r2r")
+
+    @pytest.mark.parametrize("train_mode", ["complex_mean", "phase_aligned_mean", "rep_pair"])
+    def test_val_target_mode_is_readable_under_every_training_mode(self, train_mode):
+        """It is not an r2r-only knob.
+
+        Holding ONE val reference fixed across a cohort is what makes the arms
+        comparable, so every arm declares it -- not just the r2r one.
+        """
+        extra = {"nex_target_exclude_input": True} if train_mode == "rep_pair" else {}
+        cfg = DataConfigSchema(
+            target_mode=train_mode, val_target_mode="phase_aligned_mean", **extra
+        )
+        assert cfg.val_target_mode == "phase_aligned_mean"
+        assert cfg.target_mode == train_mode
+
+    @pytest.mark.parametrize("mode", ["rss", "magnitude", "svd"])
+    def test_nonlinear_coil_combine_is_refused_under_r2r(self, mode):
+        """``|.|`` maps the Gaussian residual to Rician: E[target] != x.
+
+        This is the guard that matters most in practice -- ``dataset_type: m4raw``
+        injects ``coils.processing_mode: svd`` through a preset, so an r2r arm
+        that does not say ``none`` explicitly gets a nonlinear combine it never
+        asked for.
+        """
+        with pytest.raises(ValidationError, match="processing_mode"):
+            DataConfigSchema(
+                target_mode="r2r",
+                coils={"processing_mode": mode},
+                val_target_mode="phase_aligned_mean",
+            )
+
+    def test_linear_coil_path_is_accepted_under_r2r(self):
+        cfg = DataConfigSchema(
+            target_mode="r2r",
+            coils={"processing_mode": "none"},
+            val_target_mode="phase_aligned_mean",
+        )
+        assert cfg.coils.processing_mode == "none"
+
+    def test_log_scaling_is_refused_under_r2r(self):
+        """``log1p`` on magnitude breaks decorrelation the same way a modulus does."""
+        with pytest.raises(ValidationError, match="enable_log_scaling"):
+            DataConfigSchema(
+                target_mode="r2r",
+                coils={"processing_mode": "none"},
+                processing={"enable_log_scaling": True},
+                val_target_mode="phase_aligned_mean",
+            )
+
+    @pytest.mark.parametrize("mode", ["complex_mean", "phase_aligned_mean", "rep_pair"])
+    def test_the_linearity_guards_do_not_fire_for_other_modes(self, mode):
+        """The guards are r2r-scoped: every other arm keeps its nonlinear stages.
+
+        Without this, the change would be a corpus-wide break dressed as a new
+        feature -- most M4Raw arms DO use a magnitude coil combine.
+        """
+        extra = {"nex_target_exclude_input": True} if mode == "rep_pair" else {}
+        cfg = DataConfigSchema(
+            target_mode=mode,
+            coils={"processing_mode": "rss"},
+            processing={"enable_log_scaling": True},
+            **extra,
+        )
+        assert cfg.target_mode == mode
+
+
+_NULLSPACE = {
+    "target_mode": "nullspace_r2r",
+    "val_target_mode": "phase_aligned_mean",
+    "coils": {"processing_mode": "none"},
+}
+
+
+class TestNullspaceR2RTargetMode:
+    """``nullspace_r2r``: the coil-split R2R and its two scoped knobs."""
+
+    def test_it_is_in_the_vocabulary_with_the_symmetric_defaults(self):
+        cfg = DataConfigSchema(**_NULLSPACE)
+        assert cfg.target_mode == "nullspace_r2r"
+        assert cfg.r2r_split_angle_deg == 45.0
+        assert cfg.r2r_whitening == "committed"
+
+    @pytest.mark.parametrize("whitening", ["none", "committed", "self_calibrated"])
+    def test_every_whitener_is_accepted(self, whitening):
+        assert DataConfigSchema(**_NULLSPACE, r2r_whitening=whitening).r2r_whitening == whitening
+
+    def test_an_unknown_whitener_raises(self):
+        with pytest.raises(ValidationError, match="r2r_whitening"):
+            DataConfigSchema(**_NULLSPACE, r2r_whitening="diagonal")
+
+    @pytest.mark.parametrize("angle", [0.0, 90.0, -10.0, 135.0])
+    def test_an_angle_outside_the_open_quarter_turn_raises(self, angle):
+        with pytest.raises(ValidationError, match="r2r_split_angle_deg"):
+            DataConfigSchema(**_NULLSPACE, r2r_split_angle_deg=angle)
+
+    @pytest.mark.parametrize("knob", [("r2r_split_angle_deg", 30.0), ("r2r_whitening", "none")])
+    @pytest.mark.parametrize("mode", ["r2r", "phase_aligned_mean", "complex_mean"])
+    def test_its_knobs_are_refused_under_any_other_mode(self, knob, mode):
+        """Unread knobs are defects (NN#8), even at their default values."""
+        name, value = knob
+        extra = {"val_target_mode": "phase_aligned_mean"} if mode == "r2r" else {}
+        with pytest.raises(ValidationError, match=name):
+            DataConfigSchema(target_mode=mode, **{name: value}, **extra)
+
+    def test_r2r_alpha_and_covariance_source_are_refused_under_it(self):
+        """The split draws no z; its Sigma is chosen by r2r_whitening instead."""
+        with pytest.raises(ValidationError, match="r2r_alpha"):
+            DataConfigSchema(**_NULLSPACE, r2r_alpha=1.0)
+        with pytest.raises(ValidationError, match="r2r_covariance_source"):
+            DataConfigSchema(**_NULLSPACE, r2r_covariance_source="self_calibrated")
+
+    def test_it_needs_a_fixed_validation_reference(self):
+        with pytest.raises(ValidationError, match="val_target_mode"):
+            DataConfigSchema(target_mode="nullspace_r2r", coils={"processing_mode": "none"})
+
+    @pytest.mark.parametrize("mode", ["rss", "svd"])
+    def test_a_coil_combine_is_refused(self, mode):
+        with pytest.raises(ValidationError, match="processing_mode"):
+            DataConfigSchema(**{**_NULLSPACE, "coils": {"processing_mode": mode}})
+
+    def test_log_scaling_is_refused(self):
+        with pytest.raises(ValidationError, match="enable_log_scaling"):
+            DataConfigSchema(**_NULLSPACE, processing={"enable_log_scaling": True})
+
+
+class TestEmitAlternateInput:
+    """Read only where an m4raw split averages repetitions (NN#8)."""
+
+    def test_accepted_where_the_validation_split_averages(self):
+        cfg = DataConfigSchema(dataset_type="m4raw", **_NULLSPACE, emit_alternate_input=True)
+        assert cfg.emit_alternate_input is True
+
+    @pytest.mark.parametrize(
+        ("kwargs", "reason"),
+        [
+            ({"dataset_type": "kspace"}, "never builds it"),
+            (
+                {"dataset_type": "m4raw", "use_repetitions": False},
+                "loads only the first repetition",
+            ),
+            (
+                {
+                    "dataset_type": "m4raw",
+                    "target_mode": "rep_pair",
+                    "nex_target_exclude_input": True,
+                },
+                "neither split averages",
+            ),
+        ],
+    )
+    def test_refused_wherever_it_would_be_unread(self, kwargs, reason):
+        with pytest.raises(ValidationError, match=reason):
+            DataConfigSchema(**kwargs, emit_alternate_input=True)
+
+    def test_off_by_default(self):
+        assert DataConfigSchema().emit_alternate_input is False
+
+
+_MAPS = {"dataset_type": "m4raw", **_NULLSPACE, "pairing": {"single_contrast": True}}
+
+
+class TestCoilMapsReferenceRoot:
+    """``coil_maps_reference_root`` (#2664): scoring maps, same route as the training store."""
+
+    def test_accepted_on_the_route_that_reads_it(self):
+        cfg = DataConfigSchema(**_MAPS, coil_maps_reference_root="databases/m4raw/coil_maps")
+        assert cfg.coil_maps_reference_root == "databases/m4raw/coil_maps"
+        assert DataConfigSchema().coil_maps_reference_root is None
+
+    @pytest.mark.parametrize(
+        "override",
+        [{"dataset_type": "kspace"}, {"pairing": {"single_contrast": False}}],
+        ids=["another-dataset", "cross-contrast"],
+    )
+    def test_refused_off_the_m4raw_single_contrast_route(self, override):
+        with pytest.raises(ValidationError, match="coil_maps_reference_root holds maps"):
+            DataConfigSchema(**{**_MAPS, **override}, coil_maps_reference_root="x")
+
+
+class TestCoilMapsRoot:
+    """``coil_maps_root``/``coil_maps_missing``: read by the m4raw single-contrast loader only."""
+
+    def test_accepted_on_the_route_that_reads_it(self):
+        cfg = DataConfigSchema(
+            **_MAPS, coil_maps_root="databases/m4raw/coil_maps", coil_maps_missing="estimate"
+        )
+        assert cfg.coil_maps_root == "databases/m4raw/coil_maps"
+        assert cfg.coil_maps_missing == "estimate"
+
+    def test_off_by_default_and_raise_on_a_miss(self):
+        cfg = DataConfigSchema()
+        assert cfg.coil_maps_root is None and cfg.coil_maps_missing == "raise"
+
+    def test_the_missing_policy_without_a_root_is_unread(self):
+        with pytest.raises(ValidationError, match="coil_maps_missing is read only"):
+            DataConfigSchema(**_MAPS, coil_maps_missing="estimate")
+
+    def test_the_recipe_and_acs_width_are_accepted_with_a_root(self):
+        cfg = DataConfigSchema(
+            **_MAPS, coil_maps_root="x", coil_maps_recipe="input_repetition", coil_maps_acs_size=20
+        )
+        assert cfg.coil_maps_recipe == "input_repetition" and cfg.coil_maps_acs_size == 20
+        default = DataConfigSchema()
+        assert default.coil_maps_recipe == "all_reps_mean" and default.coil_maps_acs_size is None
+
+    @pytest.mark.parametrize(
+        "knob", [{"coil_maps_recipe": "input_repetition"}, {"coil_maps_acs_size": 20}]
+    )
+    def test_the_recipe_and_acs_width_without_a_root_are_unread(self, knob):
+        with pytest.raises(ValidationError, match=f"{next(iter(knob))} is read only"):
+            DataConfigSchema(**_MAPS, **knob)
+
+    @pytest.mark.parametrize(
+        "knob", [{"coil_maps_recipe": "all_reps_median"}, {"coil_maps_acs_size": 0}]
+    )
+    def test_an_illegal_recipe_or_acs_width_raises(self, knob):
+        with pytest.raises(ValidationError, match=next(iter(knob))):
+            DataConfigSchema(**_MAPS, coil_maps_root="x", **knob)
+
+    def test_an_unknown_missing_policy_raises(self):
+        with pytest.raises(ValidationError, match="coil_maps_missing"):
+            DataConfigSchema(**_MAPS, coil_maps_root="x", coil_maps_missing="recompute")
+
+    @pytest.mark.parametrize(
+        "override",
+        [{"dataset_type": "kspace"}, {"pairing": {"single_contrast": False}}],
+        ids=["other_dataset", "cross_contrast"],
+    )
+    def test_refused_where_nothing_reads_it(self, override):
+        with pytest.raises(ValidationError, match="coil_maps_root is read only"):
+            DataConfigSchema(**{**_MAPS, **override}, coil_maps_root="x")
+
+    def test_a_coil_combine_is_refused(self):
+        with pytest.raises(ValidationError, match="PHYSICAL coils"):
+            DataConfigSchema(
+                dataset_type="m4raw",
+                target_mode="phase_aligned_mean",
+                pairing={"single_contrast": True},
+                coils={"processing_mode": "rss"},
+                coil_maps_root="x",
+            )
+
+
+_SELF_CAL_R2R = {
+    "target_mode": "r2r",
+    "val_target_mode": "phase_aligned_mean",
+    "coils": {"processing_mode": "none"},
+    "r2r_covariance_source": "self_calibrated",
+}
+
+
+class TestNoiseFitSupportPolicy:
+    """Read only where a per-scan Sigma_n is fitted (NN#8)."""
+
+    def test_band_by_default(self):
+        assert DataConfigSchema().noise_fit_support_policy == "band"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [_SELF_CAL_R2R, {**_NULLSPACE, "r2r_whitening": "self_calibrated"}],
+        ids=["r2r_self_calibrated", "nullspace_self_calibrated_whitener"],
+    )
+    def test_accepted_where_a_sigma_is_fitted(self, kwargs):
+        assert (
+            DataConfigSchema(**kwargs, noise_fit_support_policy="acs").noise_fit_support_policy
+            == "acs"
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {
+                "target_mode": "r2r",
+                "val_target_mode": "phase_aligned_mean",
+                "coils": {"processing_mode": "none"},
+            },
+            _NULLSPACE,
+            {"target_mode": "phase_aligned_mean"},
+        ],
+        ids=["committed_r2r", "committed_whitener", "averaging"],
+    )
+    def test_refused_where_no_sigma_is_fitted(self, kwargs):
+        with pytest.raises(ValidationError, match="noise_fit_support_policy is read only"):
+            DataConfigSchema(**kwargs, noise_fit_support_policy="band")
+
+    def test_an_unknown_policy_raises(self):
+        with pytest.raises(ValidationError, match="noise_fit_support_policy"):
+            DataConfigSchema(**_SELF_CAL_R2R, noise_fit_support_policy="whole")
+
+
+class TestImageDomainCropOrPad:
+    """fastMRI's 640-row k-space is resized to 320 x 320 through its image."""
+
+    def test_unset_by_default(self):
+        from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+        assert DataProcessingConfigSchema().image_domain_crop_or_pad is None
+
+    def test_a_height_width_pair_is_accepted(self):
+        from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+        cfg = DataProcessingConfigSchema(image_domain_crop_or_pad=[320, 320])
+        assert cfg.image_domain_crop_or_pad == (320, 320)
+
+    @pytest.mark.parametrize("value", [[320], [320, 320, 1], [0, 320], [320, -8]])
+    def test_a_malformed_size_raises(self, value):
+        from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+        with pytest.raises(ValidationError, match="image_domain_crop_or_pad"):
+            DataProcessingConfigSchema(image_domain_crop_or_pad=value)
+
+
+class TestSourceLayout:
+    """``pairing.source_layout`` is read only by the M4Raw cross-contrast route."""
+
+    def test_default_is_stacked(self) -> None:
+        assert DataConfigSchema().pairing.source_layout == "stacked"
+
+    @pytest.mark.parametrize("layout", ["separate", "target_only"])
+    def test_accepted_on_the_cross_contrast_route(self, layout) -> None:
+        cfg = DataConfigSchema(
+            dataset_type="m4raw",
+            pairing={"single_contrast": False, "source_layout": layout},
+        )
+        assert cfg.pairing.source_layout == layout
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"dataset_type": "m4raw", "pairing": {"single_contrast": True}},
+            {"dataset_type": "kspace", "pairing": {"single_contrast": False}},
+        ],
+        ids=["single-contrast", "other-dataset"],
+    )
+    def test_separate_elsewhere_is_an_unread_knob(self, data) -> None:
+        data = {**data, "pairing": {**data["pairing"], "source_layout": "separate"}}
+        with pytest.raises(ValueError, match="source_layout"):
+            DataConfigSchema(**data)
+
+    def test_unknown_layout_raises(self) -> None:
+        with pytest.raises(ValueError):
+            DataConfigSchema(dataset_type="m4raw", pairing={"source_layout": "interleaved"})
+
+
+class TestCrossContrastPairing:
+    """``pairing.cross_contrast_source``/``cross_contrast_targets`` choose the m4raw pairs."""
+
+    def test_t2_guided_flair_is_accepted(self) -> None:
+        cfg = DataConfigSchema(
+            dataset_type="m4raw",
+            pairing={
+                "single_contrast": False,
+                "cross_contrast_source": "T2",
+                "cross_contrast_targets": ["FLAIR"],
+            },
+        )
+        assert cfg.pairing.cross_contrast_source == "T2"
+
+    def test_the_manifest_filters_keep_their_meaning(self) -> None:
+        """``contrasts`` filters manifest records on the single-contrast route (n2n, conex)."""
+        cfg = DataConfigSchema(
+            dataset_type="m4raw", pairing={"single_contrast": True, "contrasts": ["T1", "T2"]}
+        )
+        assert cfg.pairing.contrasts == ["T1", "T2"]
+
+    @pytest.mark.parametrize(
+        "pairing",
+        [
+            {"single_contrast": True, "cross_contrast_source": "T2"},
+            {"single_contrast": True, "cross_contrast_targets": ["FLAIR"]},
+        ],
+        ids=["source", "targets"],
+    )
+    def test_single_contrast_route_reads_neither(self, pairing) -> None:
+        with pytest.raises(ValueError, match="cross-contrast route"):
+            DataConfigSchema(dataset_type="m4raw", pairing=pairing)
+
+    @pytest.mark.parametrize("targets", [[], ["T2"]], ids=["empty", "source-as-target"])
+    def test_targets_must_exclude_the_source(self, targets) -> None:
+        with pytest.raises(ValueError, match="exclude"):
+            DataConfigSchema(
+                dataset_type="m4raw",
+                pairing={
+                    "single_contrast": False,
+                    "cross_contrast_source": "T2",
+                    "cross_contrast_targets": targets,
+                },
+            )
+
+    def test_unknown_contrast_raises(self) -> None:
+        with pytest.raises(ValueError):
+            DataConfigSchema(
+                dataset_type="m4raw",
+                pairing={"single_contrast": False, "cross_contrast_source": "PD"},
+            )
+
+
+class TestSubjectPrefetch:
+    """``data.sampling.subject_prefetch`` (#2673): "auto" or an int >= 1, else raise."""
+
+    def test_default_is_auto(self) -> None:
+        assert DataConfigSchema().sampling.subject_prefetch == "auto"
+
+    def test_explicit_int_is_kept(self) -> None:
+        assert DataConfigSchema(sampling={"subject_prefetch": 6}).sampling.subject_prefetch == 6
+
+    @pytest.mark.parametrize("bad", ["AUTO", "fast", "3", True, 0, -2, 2.5])
+    def test_unknown_values_raise(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="subject_prefetch"):
+            DataConfigSchema(sampling={"subject_prefetch": bad})
+
+    def test_per_mode_spelling_is_rejected(self) -> None:
+        # The knob lives only under data.sampling; a per-mode copy would be unread.
+        with pytest.raises(ValidationError, match="subject_prefetch"):
+            DataConfigSchema(modes={"train": {"sampler": {"subject_prefetch": 4}}})
+
+
+class TestInputRepetition:
+    """``data.input_repetition``: rotate the M4Raw training input across repetitions."""
+
+    _HONOURED: ClassVar[dict] = {
+        "dataset_type": "m4raw",
+        "target_mode": "phase_aligned_mean",
+        "pairing": {"single_contrast": True},
+    }
+
+    def test_default_is_first(self) -> None:
+        assert DataConfigSchema().input_repetition == "first"
+
+    def test_random_is_accepted_where_the_loader_rotates(self) -> None:
+        cfg = DataConfigSchema(**self._HONOURED, input_repetition="random")
+        assert cfg.input_repetition == "random"
+
+    def test_unknown_value_raises(self) -> None:
+        with pytest.raises(ValidationError, match="input_repetition"):
+            DataConfigSchema(**self._HONOURED, input_repetition="last")
+
+    @pytest.mark.parametrize(
+        ("override", "fragment"),
+        [
+            ({"dataset_type": "kspace"}, "one acquisition per slice"),
+            ({"target_mode": "complex_mean"}, "not phase_aligned_mean"),
+            ({"use_repetitions": False}, "use_repetitions: false"),
+            ({"pairing": {"single_contrast": False}}, "cross-contrast"),
+            ({"nex_target_exclude_input": True}, "leave-one-out"),
+            ({"coil_maps_root": "/maps"}, "coil maps"),
+        ],
+    )
+    def test_random_raises_where_it_would_go_unread(self, override, fragment) -> None:
+        with pytest.raises(ValidationError, match=fragment):
+            DataConfigSchema(**{**self._HONOURED, **override}, input_repetition="random")
+
+
+_SINGLE = {"dataset_type": "m4raw", "pairing": {"single_contrast": True}}
+
+
+class TestN2NPairing:
+    """``n2n_pairing``: each pairing names the training target_mode it draws from."""
+
+    @pytest.mark.parametrize(
+        ("pairing", "kwargs"),
+        [
+            (
+                "ordered",
+                {
+                    "target_mode": "r2r",
+                    "val_target_mode": "phase_aligned_mean",
+                    "coils": {"processing_mode": "none"},
+                },
+            ),
+            ("ordered", {**_NULLSPACE}),
+            ("random_pair", {"target_mode": "rep_pair", "nex_target_exclude_input": True}),
+            (
+                "one_vs_rest_mean",
+                {"target_mode": "phase_aligned_mean", "nex_target_exclude_input": True},
+            ),
+        ],
+    )
+    def test_accepted_with_the_target_it_draws_from(self, pairing, kwargs):
+        cfg = DataConfigSchema(**{**_SINGLE, **kwargs}, n2n_pairing=pairing)
+        assert cfg.n2n_pairing == pairing
+
+    # One planted violation per rule the validator enforces.
+    @pytest.mark.parametrize(
+        ("kwargs", "reason"),
+        [
+            (
+                {
+                    "dataset_type": "kspace",
+                    "target_mode": "rep_pair",
+                    "nex_target_exclude_input": True,
+                },
+                "never publishes a repetition stack",
+            ),
+            ({**_SINGLE, "use_repetitions": False}, "loads only the first repetition"),
+            (
+                {
+                    "dataset_type": "m4raw",
+                    "pairing": {"single_contrast": False},
+                    "target_mode": "rep_pair",
+                    "nex_target_exclude_input": True,
+                },
+                "only the single-contrast route",
+            ),
+            (
+                {**_SINGLE, "target_mode": "phase_aligned_mean", "nex_target_exclude_input": True},
+                "draws from what target_mode",
+            ),
+        ],
+    )
+    def test_refused_where_it_would_be_unread(self, kwargs, reason):
+        with pytest.raises(ValidationError, match=reason):
+            DataConfigSchema(**kwargs, n2n_pairing="random_pair")
+
+    def test_the_mean_of_the_others_needs_leave_one_out(self):
+        with pytest.raises(ValidationError, match="nex_target_exclude_input"):
+            DataConfigSchema(
+                **_SINGLE, target_mode="phase_aligned_mean", n2n_pairing="one_vs_rest_mean"
+            )
+
+    def test_an_unknown_pairing_is_refused(self):
+        with pytest.raises(ValidationError):
+            DataConfigSchema(**_SINGLE, target_mode="rep_pair", n2n_pairing="bogus")
+
+    def test_off_by_default(self):
+        assert DataConfigSchema().n2n_pairing is None
+
+
+class TestNexShiftStoreKnobs:
+    """``nex_shift_root`` / ``nex_shifts_missing`` (#2977): read only by a registering run."""
+
+    def test_a_store_with_registration_is_accepted(self) -> None:
+        cfg = DataConfigSchema(
+            nex_registration="translation", nex_shift_root="databases/m4raw/nex_shifts"
+        )
+        assert cfg.nex_shifts_missing == "raise"
+        assert DataConfigSchema().nex_shift_root is None
+
+    def test_a_store_without_registration_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="nex_registration: translation"):
+            DataConfigSchema(nex_shift_root="databases/m4raw/nex_shifts")
+
+    def test_a_missing_policy_without_a_store_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="nex_shifts_missing"):
+            DataConfigSchema(nex_registration="translation", nex_shifts_missing="estimate")
+
+    def test_an_unknown_policy_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            DataConfigSchema(
+                nex_registration="translation", nex_shift_root="x", nex_shifts_missing="skip"
+            )
+
+
+class TestNoiseCovarianceStoreKnobs:
+    """``noise_covariance_root`` / ``noise_covariance_missing`` (#3117): read only where Sigma_n is fitted."""
+
+    def test_a_store_on_a_self_calibrated_arm_is_accepted(self) -> None:
+        cfg = DataConfigSchema(**_SELF_CAL_R2R, noise_covariance_root="databases/m4raw/noise_covariance")
+        assert cfg.noise_covariance_missing == "raise"
+        assert DataConfigSchema().noise_covariance_root is None
+
+    def test_a_store_where_nothing_fits_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="noise_covariance_root holds"):
+            DataConfigSchema(noise_covariance_root="databases/m4raw/noise_covariance")
+
+    def test_a_missing_policy_without_a_store_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="noise_covariance_missing is read only"):
+            DataConfigSchema(**_SELF_CAL_R2R, noise_covariance_missing="fit")
+
+    def test_an_unknown_policy_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            DataConfigSchema(
+                **_SELF_CAL_R2R, noise_covariance_root="x", noise_covariance_missing="estimate"
+            )
+class TestPairingUnpairedTrainingSchema:
+    def test_disjoint_without_unpaired_training_raises(self):
+        with pytest.raises(ValidationError, match="disjoint_subjects"):
+            DataPairingConfigSchema(disjoint_subjects=True)
+        assert DataPairingConfigSchema(unpaired_training=True, disjoint_subjects=True)

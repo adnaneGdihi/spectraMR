@@ -144,6 +144,7 @@ _VERB_REQUIRED_EXTRAS = {
     "infer": ("--checkpoint", "c.pt", "--input", "in/"),
     "hpo": ("--model-type", "unet"),
     "experiment": ("--experiment", "e1"),
+    "profile": (),
 }
 
 

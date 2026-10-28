@@ -25,6 +25,8 @@ inner optimizer before delegating (:meth:`Lookahead._sync_hyperparams_to_inner`)
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
+from typing import Any, overload
 
 import torch
 from torch.optim import Optimizer
@@ -37,7 +39,7 @@ class Lookahead(Optimizer):
     Reference: https://arxiv.org/abs/1907.08610
     """
 
-    def __init__(self, optimizer, la_steps=5, la_alpha=0.5):
+    def __init__(self, optimizer: Optimizer, la_steps: int = 5, la_alpha: float = 0.5) -> None:
         """__init__.
 
         Args:
@@ -63,8 +65,10 @@ class Lookahead(Optimizer):
             group_copy["params"] = list(group["params"])  # Copy the params list
             param_groups_copy.append(group_copy)
 
-        # Initialize the base Optimizer with copied param_groups
-        super().__init__(param_groups_copy, optimizer.defaults)
+        # A copy of the defaults: the update below would otherwise write
+        # la_steps/la_alpha into the inner optimizer's dict, and from there into
+        # every group it adds.
+        super().__init__(param_groups_copy, dict(optimizer.defaults))
 
         self.state = defaultdict(dict)
         self.fast_state = self.optimizer.state
@@ -72,8 +76,15 @@ class Lookahead(Optimizer):
         self.defaults.update({"la_steps": la_steps, "la_alpha": la_alpha})
         for group in self.param_groups:
             group["counter"] = 0
+        self._pushed = [self._hyperparams(group) for group in self.param_groups]
+        self._constructed = True
 
-    def _update_slow(self, group):
+    @staticmethod
+    def _hyperparams(group: dict[str, Any]) -> dict[str, Any]:
+        """The group entries the sync may push inward, as the objects now held."""
+        return {k: v for k, v in group.items() if k not in ("params", "counter")}
+
+    def _update_slow(self, group: dict[str, Any]) -> None:
         """_update_slow.
 
         Args:
@@ -91,7 +102,13 @@ class Lookahead(Optimizer):
             slow += self.la_alpha * (p.data - slow)
             p.data.copy_(slow)
 
-    def step(self, closure=None):
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """step.
 
         Args:
@@ -100,7 +117,7 @@ class Lookahead(Optimizer):
             Any: Description.
         """
         self._sync_hyperparams_to_inner()
-        loss = self.optimizer.step(closure)
+        loss: float | None = self.optimizer.step(closure)
         for group in self.param_groups:
             if group["counter"] == 0:
                 self._update_slow(group)
@@ -122,22 +139,32 @@ class Lookahead(Optimizer):
         Lookahead's own bookkeeping (``counter``) out of the inner optimizer,
         and picks up ANY scheduler write -- lr, weight_decay, momentum, betas --
         not just the ones we thought to enumerate.
-        """
-        for outer, inner in zip(self.param_groups, self.optimizer.param_groups):
-            for key, value in outer.items():
-                # `params` is the tensor list (identity matters); `counter` is
-                # Lookahead-private and meaningless to the inner optimizer.
-                if key in ("params", "counter"):
-                    continue
-                if key in inner:
-                    inner[key] = value
 
-    def state_dict(self):
+        Only entries the wrapper has *reassigned* since the last push are
+        copied, detected by object identity (a scheduler writes a new value, it
+        does not mutate the old one). Copying every shared key overwrote group
+        state the inner optimizer advances itself: schedule-free's ``k`` and
+        ``weight_sum`` stayed at 1 and 1e-4, and its ``train_mode`` was reset to
+        the stale ``False`` before every step.
+        """
+        for outer, inner, pushed in zip(
+            self.param_groups, self.optimizer.param_groups, self._pushed, strict=True
+        ):
+            for key, value in self._hyperparams(outer).items():
+                if key in inner and pushed.get(key) is not value:
+                    inner[key] = value
+                    pushed[key] = value
+
+    def state_dict(self) -> dict[str, Any]:
         """state_dict.
 
         Returns:
             Any: Description.
         """
+        # The saved groups are the inner optimizer's, which see a scheduler
+        # write only at the next step(); unsynced, a resume restored the LR from
+        # one scheduler step earlier and a recursive schedule kept that offset.
+        self._sync_hyperparams_to_inner()
         fast_state_dict = self.optimizer.state_dict()
         # Save slow parameters by parameter index within each group
         slow_state = {}
@@ -160,7 +187,7 @@ class Lookahead(Optimizer):
             "counters": counters,
         }
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # Load fast state into inner optimizer
         """load_state_dict.
 
@@ -229,8 +256,10 @@ class Lookahead(Optimizer):
                 group["counter"] = saved_counters[idx]
             elif "counter" not in group:
                 group["counter"] = 0
+        # The inner optimizer loaded the same group values above.
+        self._pushed = [self._hyperparams(group) for group in self.param_groups]
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         """Forward the schedule-free ``train()``/``eval()`` mode API inward.
 
         Schedule-free optimizers keep an averaged sequence separate from the
@@ -261,15 +290,25 @@ class Lookahead(Optimizer):
                 return hook
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
-    def add_param_group(self, param_group):
-        """add_param_group.
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """Add a group to the inner optimizer and mirror it here.
 
-        Args:
-            param_group (Any): Description.
-        Returns:
-            Any: Description.
+        Only the inner optimizer steps, so a group added to the wrapper alone
+        was never trained: 29 strategies register their own parameters this way
+        (``strategies/base.py``). ``Optimizer.__init__`` also routes the initial
+        groups through this method, before ``_constructed`` is set; those are
+        already in the inner optimizer and are only mirrored.
         """
-        param_group["counter"] = 0
-        # Don't call the inner optimizer's add_param_group to avoid conflicts
-        # Just add to our own param_groups
-        super().add_param_group(param_group)
+        if not self.__dict__.get("_constructed", False):
+            param_group["counter"] = 0
+            super().add_param_group(param_group)
+            return
+        self.optimizer.add_param_group(
+            {k: v for k, v in param_group.items() if k != "counter"}
+        )
+        added = self.optimizer.param_groups[-1]
+        mirror = dict(added)
+        mirror["params"] = list(added["params"])
+        mirror["counter"] = 0
+        super().add_param_group(mirror)
+        self._pushed.append(self._hyperparams(self.param_groups[-1]))

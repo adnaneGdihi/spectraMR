@@ -2,7 +2,8 @@
 
 Targets ``spectramr.models.losses.spectral_loss``. ``L1`` between log-magnitude
 spectra; works on both k-space and image inputs (FFT applied unless
-``skip_fft=True``).
+``skip_fft=True``). The input is never decompressed, so ``log1p``-compressed
+k-space is compressed a second time.
 """
 
 from __future__ import annotations
@@ -124,6 +125,24 @@ def test_gradient_flows() -> None:
     loss(pred, target).backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
+
+
+def test_log1p_compressed_kspace_is_compressed_a_second_time() -> None:
+    """The docstring's claim: no decompression, so the term scores log(1 + log1p(m))."""
+    from spectramr.data.transforms.normalization import compress_kspace_log
+
+    torch.manual_seed(0)
+    raw_pred = 30.0 * torch.randn(1, 2, 16, 16, dtype=torch.complex64)
+    raw_target = 30.0 * torch.randn(1, 2, 16, 16, dtype=torch.complex64)
+    pred = compress_kspace_log(raw_pred, channel_dim=1)
+    target = compress_kspace_log(raw_target, channel_dim=1)
+
+    value = LogSpectralLoss(eps=1.0, skip_fft=True)(pred, target)
+
+    twice = torch.log1p(torch.log1p(raw_pred.abs())) - torch.log1p(torch.log1p(raw_target.abs()))
+    once = torch.log1p(raw_pred.abs()) - torch.log1p(raw_target.abs())
+    assert value == pytest.approx(float(twice.abs().mean()), rel=1e-4)
+    assert value != pytest.approx(float(once.abs().mean()), rel=1e-2)
 
 
 # ---------------------------------------------------------------------------

@@ -7,13 +7,14 @@ for paired training without acquiring real ULF scans.
 
 Composed degradations (in physically-meaningful order):
 
-1. **B0 inhomogeneity** — applies geometric EPI-style distortion
-   along the phase-encode axis (mirrors the existing 2D helper in
+1. **B0 inhomogeneity** — applies geometric distortion along the
+   readout axis (``sequence="spin_warp"``, default) or the phase-encode
+   axis (``sequence="epi"``) (mirrors the existing 2D helper in
    :mod:`spectramr.data.datasets.low_field_simulation`, generalised to 3D).
 2. **Maxwell concomitant distortion** — when ``field_strength_t`` is
    below ~1 T, adds the concomitant frequency offset from
    :mod:`spectramr.infrastructure.physics.maxwell_concomitant` and warps
-   the volume by the implied PE-axis pixel shift.
+   the volume by the implied pixel shift along the same axis.
 3. **T2* blurring** — Gaussian smoothing whose σ scales with
    :math:`1/B_0` (ULF has shorter T2* and lower readout bandwidth
    in practice; longer effective sample acquisition produces blur).
@@ -45,6 +46,7 @@ import torch.nn.functional as F
 import torchio as tio
 
 from spectramr.data.transforms.registry import register_transform
+from spectramr.infrastructure.physics.degradations.blocks.volume_warp import warp_volume
 from spectramr.infrastructure.physics.maxwell_concomitant import (
     maxwell_concomitant_field_hz,
 )
@@ -76,29 +78,22 @@ def _smooth_b0_field(
     return field
 
 
-def _apply_pe_axis_shift(
+# warp_volume displacement channels are (dz, dy, dx).
+_SHIFT_CHANNEL = {"H": 1, "W": 2}
+
+
+def _apply_axis_shift(
     volume: torch.Tensor,
     shift_pixels: torch.Tensor,
-    pe_axis: Literal["H", "W"] = "H",
+    axis: Literal["H", "W"] = "H",
 ) -> torch.Tensor:
-    """Warp a (B, C, D, H, W) volume by a per-voxel PE-axis pixel shift."""
+    """Warp a (B, C, D, H, W) volume by a per-voxel pixel shift along ``axis``."""
     if volume.ndim != 5:
         raise ValueError(f"Expected (B,C,D,H,W); got {tuple(volume.shape)}")
     B, C, D, H, W = volume.shape
-    device = volume.device
-    dtype = volume.dtype
-    zz, yy, xx = torch.meshgrid(
-        torch.linspace(-1.0, 1.0, D, device=device, dtype=dtype),
-        torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype),
-        torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype),
-        indexing="ij",
-    )
-    grid = torch.stack([xx, yy, zz], dim=-1).unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
-    if pe_axis == "H":
-        grid[..., 1] = grid[..., 1] + 2.0 * shift_pixels / max(H - 1, 1)
-    else:
-        grid[..., 0] = grid[..., 0] + 2.0 * shift_pixels / max(W - 1, 1)
-    return F.grid_sample(volume, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    disp = torch.zeros(B, 3, D, H, W, device=volume.device, dtype=volume.dtype)
+    disp[:, _SHIFT_CHANNEL[axis]] = shift_pixels
+    return warp_volume(volume, disp, padding_mode="border")
 
 
 def _gaussian_blur_3d(volume: torch.Tensor, sigma: float, kernel_size: int = 5) -> torch.Tensor:
@@ -128,7 +123,7 @@ def _add_rician_noise(volume: torch.Tensor, target_snr_db: float) -> torch.Tenso
     return torch.sqrt((volume + noise_real).pow(2) + noise_imag.pow(2))
 
 
-@register_transform("simulate_ulf_from_hf", requires=("target",))
+@register_transform("simulate_ulf_from_hf", requires=("target",), modifies=("input",))
 class SimulateULFFromHF(tio.Transform):
     """Synthesize a paired ULF image from an HF source image.
 
@@ -156,6 +151,9 @@ class SimulateULFFromHF(tio.Transform):
         t2_star_blur_sigma: σ in voxels for the isotropic 3D
             Gaussian that mimics T2*-induced blurring at ULF.
         pe_axis: phase-encode direction, ``"H"`` or ``"W"``.
+        sequence: ``"spin_warp"`` (default) displaces off-resonance along
+            readout (the in-plane axis other than ``pe_axis``); ``"epi"``
+            displaces along ``pe_axis``.
         keep_source: keep the original HF image in the subject under
             its original name. Almost always True (the strategy
             consumes it as ``target``).
@@ -175,6 +173,7 @@ class SimulateULFFromHF(tio.Transform):
         voxel_size_mm: tuple[float, float, float] = (1.0, 1.0, 1.0),
         t2_star_blur_sigma: float = 0.7,
         pe_axis: Literal["H", "W"] = "H",
+        sequence: Literal["spin_warp", "epi"] = "spin_warp",
         keep_source: bool = True,
         include: Sequence[str] | None = None,
         exclude: Sequence[str] | None = None,
@@ -184,6 +183,10 @@ class SimulateULFFromHF(tio.Transform):
         super().__init__(include=include, exclude=exclude, copy=copy, **kwargs)
         if field_strength_t <= 0:
             raise ValueError(f"field_strength_t must be > 0; got {field_strength_t}")
+        if pe_axis not in ("H", "W"):
+            raise ValueError(f"pe_axis must be 'H' or 'W'; got {pe_axis!r}")
+        if sequence not in ("spin_warp", "epi"):
+            raise ValueError(f"sequence must be 'spin_warp' or 'epi'; got {sequence!r}")
         self.source_image = source_image
         self.output_image = output_image
         self.field_strength_t = float(field_strength_t)
@@ -194,26 +197,44 @@ class SimulateULFFromHF(tio.Transform):
         self.voxel_size_mm = tuple(voxel_size_mm)
         self.t2_star_blur_sigma = float(t2_star_blur_sigma)
         self.pe_axis: Literal["H", "W"] = pe_axis
+        self.sequence: Literal["spin_warp", "epi"] = sequence
         self.keep_source = bool(keep_source)
+        # TorchIO's reproducibility contract: these land in the subject history.
+        self.args_names = (
+            "source_image",
+            "output_image",
+            "field_strength_t",
+            "target_snr_db",
+            "b0_distortion_strength",
+            "enable_maxwell",
+            "gradient_amplitudes_mT_per_m",
+            "voxel_size_mm",
+            "t2_star_blur_sigma",
+            "pe_axis",
+            "sequence",
+            "keep_source",
+        )
+
+    @property
+    def _shift_axis(self) -> Literal["H", "W"]:
+        """In-plane axis along which off-resonance displaces signal."""
+        if self.sequence == "epi":
+            return self.pe_axis
+        return "W" if self.pe_axis == "H" else "H"
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         if self.source_image not in subject:
-            logger.warning(
-                "[SimulateULFFromHF] source image '%s' missing from subject; "
-                "skipping ULF simulation.",
-                self.source_image,
+            raise KeyError(
+                f"[SimulateULFFromHF] source image {self.source_image!r} missing from subject"
             )
-            return subject
 
         source = subject[self.source_image]
         # TorchIO image data is (C, W, H, D) — convert to (1, C, D, H, W) for 3D ops.
         data = source.data
         if data.ndim != 4:
-            logger.warning(
-                "[SimulateULFFromHF] expected 4D (C,W,H,D) tensor; got %s — skipping.",
-                tuple(data.shape),
+            raise ValueError(
+                f"[SimulateULFFromHF] expected 4D (C,W,H,D) tensor; got {tuple(data.shape)}"
             )
-            return subject
         C, W, H, D = data.shape
         vol = data.permute(0, 3, 2, 1).unsqueeze(0).contiguous()  # (1, C, D, H, W)
 
@@ -238,20 +259,17 @@ class SimulateULFFromHF(tio.Transform):
             subject.remove_image(self.source_image)
         return subject
 
-    # ------------------------------------------------------------------
-    # Internal: per-step degradations
-    # ------------------------------------------------------------------
-
     def _simulate(self, vol: torch.Tensor) -> torch.Tensor:
         """Apply the (B0 → Maxwell → T2* → Rician) chain."""
         device = vol.device
         D, H, W = vol.shape[-3:]
 
-        # 1. B0 inhomogeneity (EPI-style PE-axis shift).
+        axis = self._shift_axis
+        # 1. B0 inhomogeneity (shift along readout for spin-warp, PE for EPI).
         if self.b0_distortion_strength > 0:
             b0_norm = _smooth_b0_field((D, H, W), device=device)
-            shift_pixels = b0_norm * self.b0_distortion_strength * (H if self.pe_axis == "H" else W)
-            vol = _apply_pe_axis_shift(vol, shift_pixels, pe_axis=self.pe_axis)
+            shift_pixels = b0_norm * self.b0_distortion_strength * (H if axis == "H" else W)
+            vol = _apply_axis_shift(vol, shift_pixels, axis=axis)
 
         # 2. Maxwell concomitant — only meaningful below ~1 T.
         if self.enable_maxwell and self.field_strength_t < 1.0:
@@ -268,7 +286,7 @@ class SimulateULFFromHF(tio.Transform):
             # absolute scale via ``training.geomamba_ulf.unwarp``.
             denom = mx_hz.abs().max().clamp_min(1e-6)
             mx_shift = (mx_hz / denom) * 0.3
-            vol = _apply_pe_axis_shift(vol, mx_shift, pe_axis=self.pe_axis)
+            vol = _apply_axis_shift(vol, mx_shift, axis=axis)
 
         # 3. T2* blurring.
         vol = _gaussian_blur_3d(vol, sigma=self.t2_star_blur_sigma)

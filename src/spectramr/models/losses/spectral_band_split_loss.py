@@ -57,15 +57,19 @@ def _build_frequency_mask(
     yy, xx = torch.meshgrid(y, x, indexing="ij")
     r = torch.sqrt(xx**2 + yy**2)
 
-    if band == "low":
-        mask = (r <= cutoff_r).float()
-    else:
-        mask = (r > cutoff_r).float()
+    if band not in ("low", "high"):
+        raise ValueError(f"band must be 'low' or 'high', got {band!r}")
+    mask = (r <= cutoff_r).float() if band == "low" else (r > cutoff_r).float()
 
     return mask.unsqueeze(0).unsqueeze(0)
 
 
-@register_loss(name="spectral_band_split", aliases=["band_split"], domain="kspace")
+@register_loss(
+    name="spectral_band_split",
+    aliases=["band_split"],
+    domain="kspace",
+    compatible_with=["image"],
+)
 class SpectralBandSplitLoss(nn.Module):
     r"""Frequency-selective loss splitting k-space into anatomy and texture bands.
 
@@ -90,11 +94,15 @@ class SpectralBandSplitLoss(nn.Module):
         high_loss_type: str = "l1",
     ) -> None:
         super().__init__()
+        if high_loss_type not in ("l1", "l2"):
+            raise ValueError(f"high_loss_type must be 'l1' or 'l2', got {high_loss_type!r}")
+        if not 0.0 < center_fraction < 1.0:
+            raise ValueError(f"center_fraction must lie in (0, 1), got {center_fraction!r}")
         self.center_fraction = center_fraction
         self.lambda_low = lambda_low
         self.lambda_high = lambda_high
         self.high_loss_type = high_loss_type
-        self._mask_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._mask_cache: dict[tuple[tuple[int, int], str], tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _get_masks(
         self,
@@ -168,7 +176,7 @@ class SpectralBandSplitLoss(nn.Module):
             else:
                 loss_high = high_residual.abs().mean()
         else:
-            loss_high = torch.tensor(0.0, device=device)
+            loss_high = loss_low.new_zeros(())
 
         total = self.lambda_low * loss_low + self.lambda_high * loss_high
 

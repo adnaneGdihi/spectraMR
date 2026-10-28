@@ -1,16 +1,19 @@
 """Early stopping service for training monitoring.
 
 This service monitors validation metrics and stops training when no improvement
-is seen for a configured number of validation checks. The service is iteration-based,
-not epoch-based, for finer control during long training runs.
+is seen for a configured number of validation passes. The training loop calls
+:meth:`EarlyStoppingService.update` on every validation pass, so the check cadence
+is the validation cadence; there is no separate early-stopping interval.
 """
 
 import logging
 import math
 from collections.abc import Callable
+from typing import Any
 
 from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
 from spectramr.config.schemas.enums import MetricMode  # re-exported (see __all__)
+from spectramr.infrastructure.services.metric_keys import early_stop_monitor_candidates
 from spectramr.infrastructure.training.plateau_monitor import PlateauMonitor
 
 logger = logging.getLogger(__name__)
@@ -61,7 +64,6 @@ class EarlyStoppingService:
         self.patience_min_iterations = config.patience_min_iterations
         self.mode = config.mode
         self.min_delta = config.min_delta
-        self.check_interval = config.check_interval
 
         self._assert_mode_matches_metric_direction()
 
@@ -82,7 +84,7 @@ class EarlyStoppingService:
             f"patience={self.patience}, "
             f"min_iterations={self.patience_min_iterations}, "
             f"mode={self.mode.value}, "
-            f"min_delta={self.min_delta}, check_interval={self.check_interval}"
+            f"min_delta={self.min_delta}"
         )
 
     @property
@@ -139,17 +141,6 @@ class EarlyStoppingService:
             "`mode`, or -- if the metric's declared direction is the wrong one -- "
             "fix it in core/metrics/metric_directions.py so every consumer agrees."
         )
-
-    def should_check(self, iteration: int) -> bool:
-        """Check if early stopping should be evaluated at this iteration.
-
-        Args:
-            iteration: Current training iteration
-
-        Returns:
-            True if early stopping should be checked at this iteration
-        """
-        return iteration > 0 and iteration % self.check_interval == 0
 
     def update(self, metric_value: float, iteration: int) -> None:
         """Update early stopping monitor with new metric value.
@@ -218,6 +209,61 @@ class EarlyStoppingService:
         self.stop_signal = False
         logger.info("Early stopping state reset")
 
+    def state_dict(self) -> dict[str, Any]:
+        """What a resume needs to continue selection where the run left it.
+
+        Without it a resumed service starts at best = ±inf, so its first
+        validation always "improves" and overwrites the best checkpoint
+        whatever the metric (#2304).
+        """
+        return {
+            "monitor": self.monitor,
+            "mode": self.mode.value,
+            "best_value": self.best_value,
+            "best_iteration": self.best_iteration,
+            "wait_count": self.wait_count,
+            "stop_signal": self.stop_signal,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore :meth:`state_dict`, or seed the best from a best-checkpoint record.
+
+        A record carrying only ``monitor``, ``best_value`` and ``best_iteration``
+        comes from a best checkpoint written before this state was saved;
+        it seeds the best and leaves the patience count at 0.
+
+        Raises:
+            ValueError: the record tracks a different metric or direction. Its
+                best was measured on another scale, so comparing against it would
+                select on a number this run does not monitor.
+        """
+        # A best-checkpoint record names the val_metrics key the monitor resolved
+        # to (``hfen_mean_2x`` for ``val_hfen_mean``), not the configured one.
+        accepted = (
+            {self.monitor} if "mode" in state else set(early_stop_monitor_candidates(self.monitor))
+        )
+        if state.get("monitor") not in accepted or state.get("mode", self.mode.value) != (
+            self.mode.value
+        ):
+            raise ValueError(
+                f"The resumed checkpoint's early-stopping state tracks "
+                f"{state.get('monitor')!r} ({state.get('mode', 'mode unrecorded')}), but "
+                f"this run monitors {self.monitor!r} ({self.mode.value}). Restore the "
+                "original early_stopping.metric/mode, or start the run fresh without --resume."
+            )
+        self._monitor.best_value = float(state["best_value"])
+        self._monitor.best_iteration = int(state["best_iteration"])
+        self._monitor.wait_count = int(state.get("wait_count", 0))
+        self.stop_signal = bool(state.get("stop_signal", False))
+        logger.info(
+            "Early stopping resumed: best %s=%.6f at iteration %d, wait %d/%d",
+            self.monitor,
+            self.best_value,
+            self.best_iteration,
+            self.wait_count,
+            self.patience,
+        )
+
     def get_state(self) -> dict:
         """Get current state for logging.
 
@@ -231,7 +277,6 @@ class EarlyStoppingService:
             "patience": self.patience,
             "patience_min_iterations": self.patience_min_iterations,
             "min_delta": self.min_delta,
-            "check_interval": self.check_interval,
             "best_value": self.best_value,
             "best_iteration": self.best_iteration,
             "wait_count": self.wait_count,

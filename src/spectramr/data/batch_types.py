@@ -5,28 +5,10 @@ import torch
 
 from spectramr.config.schemas.enums import Axis
 
-#: Every spelling the codebase uses for per-coil sensitivity maps, mapped onto
-#: the one canonical field (audit C11).
-#:
-#: There were FIVE, split across the boundary with nothing reconciling them: the
-#: data layer produces ``sensitivity`` (``torchio_subject_builder``), while
-#: consumers ask for ``sensitivity_maps`` (10 files), ``coil_sensitivities``
-#: (5), ``smaps`` (3) and ``coil_maps`` (1). Because ``BatchAdapter`` files
-#: every non-core key into ``metadata`` verbatim, a consumer's ``in`` check
-#: simply answered False — so a SENSE term guarded by one ran coil-blind rather
-#: than failing (pitfall #16).
-#:
-#: The table lives HERE, at the one boundary every batch crosses, rather than as
-#: a per-consumer rename: 19 consumer files keep their own spelling and the
-#: reconciliation has a single home. ``coil_maps`` is canonical because
-#: ``sensitivity`` alone is ambiguous with the physics sense-of-the-word.
-COIL_MAP_ALIASES: tuple[str, ...] = (
-    "coil_maps",
-    "sensitivity",
-    "sensitivity_maps",
-    "coil_sensitivities",
-    "smaps",
-)
+#: Re-exported from ``core.coil_map_names``, the one owner. It moved there so the
+#: loss-kwarg boundary could reconcile the same five spellings -- ``models/``
+#: cannot import ``data/``, so a table here could serve only one of the two.
+from spectramr.core.coil_map_names import COIL_MAP_ALIASES
 
 
 @dataclass
@@ -49,7 +31,9 @@ class TrainingBatch:
     """
 
     input: torch.Tensor  # The model input (e.g., undersampled k-space or LR image)
-    target: torch.Tensor  # The ground truth (e.g., full k-space, HR image)
+    # The ground truth (e.g., full k-space, HR image). ``None`` only for a
+    # repetition-stack batch (``kspace_reps``), whose strategy forms the target.
+    target: torch.Tensor | None
     mask: torch.Tensor | None = None  # Sampling mask (if applicable)
     # Per-coil sensitivity maps. First-class rather than a metadata entry because
     # they travelled under five names and every consumer's presence check missed
@@ -416,7 +400,11 @@ class BatchAdapter:
         # ALSO duplicated into metadata under its original name.
         core_keys = {"input", "target", "mask", *COIL_MAP_ALIASES}
 
-        if "input" not in batch_data or "target" not in batch_data:
+        # A Noise2Noise batch carries the repetition stack in place of a target;
+        # NoiseToNoiseStrategy draws the target from it. Any other batch without
+        # a target is still a producer error.
+        has_stack = "kspace_reps" in batch_data and "target" not in batch_data
+        if "input" not in batch_data or ("target" not in batch_data and not has_stack):
             raise ValueError(
                 f"BatchAdapter requires canonical keys ('input', 'target'). "
                 f"Got keys: {list(batch_data.keys())}. "
@@ -453,7 +441,33 @@ class BatchAdapter:
             coil_maps=coil_maps,
             axes=axes,
             input=_extract_tio(batch_data["input"]),
-            target=_extract_tio(batch_data["target"]),
+            target=None if has_stack else _extract_tio(batch_data["target"]),
             mask=_extract_tio(batch_data.get("mask")),
             metadata={k: v for k, v in batch_data.items() if k not in core_keys},
         )
+
+
+class TargetlessSampleError(ValueError):
+    """A supervised step was handed a sample that has no target."""
+
+
+def reject_targetless_samples(batch: Any, *, strategy: str) -> None:
+    """Raise when a supervised step is handed samples that have no target.
+
+    ``UniversalMRIDataset`` stamps ``has_target=False`` on unpaired manifest
+    records. An absent flag means a paired sample, so the common path is one
+    dict lookup and no device sync. Runs on the CPU batch, before ``.to()``.
+    """
+    if isinstance(batch, TrainingBatch):
+        flags = batch.metadata.get("has_target")
+    elif isinstance(batch, dict):
+        flags = batch.get("has_target")
+    else:
+        return
+    if flags is None or bool(torch.as_tensor(flags).all()):
+        return
+    raise TargetlessSampleError(
+        f"{strategy} received a batch holding samples with no target (unpaired ULF "
+        "records, has_target=False). Set data.pairing.allow_unpaired: false for this "
+        "arm, or declare unpaired_training if the strategy consumes unpaired samples."
+    )

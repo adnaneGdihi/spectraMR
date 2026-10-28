@@ -96,27 +96,76 @@ def test_citation_version_reads_quoted_and_bare_forms(line: str) -> None:
     assert bd.citation_version(f"cff-version: 1.2.0\n{line}\n") == "0.1.0"
 
 
+RELEASED_CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-08-31\n"
+
+
 def test_versions_that_all_agree_produce_no_complaint() -> None:
-    assert (
-        bd.version_disagreements(
-            dict.fromkeys(["wheel", "__init__.py", "CHANGELOG.md", "CITATION.cff"], "0.1.0")
-        )
-        == []
-    )
+    others = dict.fromkeys(["__init__.py", "CITATION.cff"], "0.1.0")
+    assert bd.version_disagreements("0.1.0", others, RELEASED_CHANGELOG) == []
 
 
-@pytest.mark.parametrize("stale", ["__init__.py", "CHANGELOG.md", "CITATION.cff"])
+@pytest.mark.parametrize("stale", ["__init__.py", "CITATION.cff"])
 def test_any_single_stale_version_source_is_named(stale: str) -> None:
-    versions = dict.fromkeys(["wheel", "__init__.py", "CHANGELOG.md", "CITATION.cff"], "0.1.0")
-    versions[stale] = "0.0.9"
-    problems = bd.version_disagreements(versions)
+    others = dict.fromkeys(["__init__.py", "CITATION.cff"], "0.1.0")
+    others[stale] = "0.0.9"
+    problems = bd.version_disagreements("0.1.0", others, RELEASED_CHANGELOG)
     assert len(problems) == 1 and problems[0].startswith(f"{stale}: ")
 
 
 def test_an_unreadable_version_is_a_failure_not_a_pass() -> None:
     """A regex that stops matching must not read as agreement."""
-    versions = {"wheel": "0.1.0", "CHANGELOG.md": None}
-    assert bd.version_disagreements(versions) == ["CHANGELOG.md: unreadable"]
+    problems = bd.version_disagreements("0.1.0", {"CITATION.cff": None}, RELEASED_CHANGELOG)
+    assert problems == ["CITATION.cff: unreadable"]
+
+
+def test_an_unreadable_reference_is_a_failure_not_a_pass() -> None:
+    """A wheel filename the regex stops matching must not compare as agreement."""
+    problems = bd.version_disagreements(None, {"CITATION.cff": "0.1.0"}, RELEASED_CHANGELOG)
+    assert problems == ["reference version: unreadable"]
+
+
+# --------------------------------------------------------------------------
+# the CHANGELOG is judged by SHAPE, because a release and a dev build state
+# themselves there differently. One planted violation per shape the rule takes.
+# --------------------------------------------------------------------------
+DEV_CHANGELOG = (
+    "# Changelog\n\n## [Unreleased]\n\n### Added\n- a thing\n\n## [0.1.2] - 2026-09-01\n"
+)
+
+
+def test_a_dev_build_agrees_with_an_open_unreleased_section() -> None:
+    """The shape that made `nightly` unbuildable: 0.1.3.dev1 beside a 0.1.2 heading.
+
+    `bump_version.py nightly` writes no heading for a dev build, so equality
+    against the newest heading rejected every tree it had just written correctly.
+    """
+    assert bd.changelog_disagreement(DEV_CHANGELOG, "0.1.3.dev1") is None
+
+
+def test_a_dev_build_without_an_unreleased_section_is_named() -> None:
+    assert "no '## [Unreleased]' section" in str(
+        bd.changelog_disagreement("## [0.1.2] - 2026-09-01\n", "0.1.3.dev1")
+    )
+
+
+def test_a_dev_build_of_an_already_released_version_is_named() -> None:
+    """0.1.2.dev4 beside a dated [0.1.2] is a build of a version that shipped."""
+    assert "already has a dated heading" in str(
+        bd.changelog_disagreement(DEV_CHANGELOG, "0.1.2.dev4")
+    )
+
+
+def test_a_release_whose_heading_is_stale_is_named() -> None:
+    assert bd.changelog_disagreement(DEV_CHANGELOG, "0.1.3") == "newest heading '0.1.2' != '0.1.3'"
+
+
+def test_a_release_with_no_dated_heading_at_all_is_named() -> None:
+    """`[Unreleased]` alone satisfies a dev build and must not satisfy a release."""
+    assert "no released heading" in str(bd.changelog_disagreement("## [Unreleased]\n", "0.1.3"))
+
+
+def test_a_release_that_matches_the_newest_heading_agrees() -> None:
+    assert bd.changelog_disagreement(DEV_CHANGELOG, "0.1.2") is None
 
 
 # --------------------------------------------------------------------------
@@ -147,6 +196,7 @@ def _fake_repo(
     payload: dict[str, bytes] | None = None,
     sdist_extra: tuple[str, ...] = (),
     allowlist: str | None = "src/\nscripts/\npyproject.toml\n",
+    changelog: str | None = None,
 ) -> Path:
     pkg = tmp / "src" / "spectramr"
     (pkg / "cli").mkdir(parents=True)
@@ -154,7 +204,9 @@ def _fake_repo(
     (pkg / "cli" / "app.py").write_text("def main() -> int:\n    return 0\n")
     if typed:
         (pkg / "py.typed").write_text("")
-    (tmp / "CHANGELOG.md").write_text(f"## [Unreleased]\n\n## [{version}] - 2026-08-31\n")
+    (tmp / "CHANGELOG.md").write_text(
+        changelog if changelog is not None else f"## [Unreleased]\n\n## [{version}] - 2026-08-31\n"
+    )
     (tmp / "CITATION.cff").write_text(f'cff-version: 1.2.0\nversion: "{version}"\n')
     (tmp / "pyproject.toml").write_text(
         '[project]\nname = "spectramr"\n\n[project.scripts]\nspectramr = "spectramr.cli.app:main"\n'
@@ -258,6 +310,29 @@ def test_main_fails_when_the_changelog_version_is_stale(tmp_path: Path, no_twine
     (tmp_path / "CHANGELOG.md").write_text("## [Unreleased]\n\n## [0.0.9] - 2026-01-01\n")
     assert bd.main(["--repo", str(tmp_path), "--check-only", str(dist)]) == 1
     assert "version disagreement" in capsys.readouterr().out
+
+
+def test_main_accepts_a_dev_series_tree(tmp_path: Path, no_twine, capsys) -> None:
+    """The lane `.github/workflows/dev-publish.yml` builds from. Was exit 1.
+
+    A call site that still compared the newest heading by string would fail here
+    while every helper test above stayed green -- which is how this shipped.
+    """
+    dist = _fake_repo(
+        tmp_path,
+        version="0.1.3.dev7",
+        changelog="## [Unreleased]\n\n### Added\n- a thing\n\n## [0.1.2] - 2026-09-01\n",
+    )
+    assert bd.main(["--repo", str(tmp_path), "--check-only", str(dist)]) == 0
+    assert "OK --" in capsys.readouterr().out
+
+
+def test_main_fails_a_dev_tree_whose_unreleased_section_was_deleted(
+    tmp_path: Path, no_twine, capsys
+) -> None:
+    dist = _fake_repo(tmp_path, version="0.1.3.dev7", changelog="## [0.1.2] - 2026-09-01\n")
+    assert bd.main(["--repo", str(tmp_path), "--check-only", str(dist)]) == 1
+    assert "no '## [Unreleased]' section" in capsys.readouterr().out
 
 
 def test_main_fails_when_the_console_script_names_a_missing_module(

@@ -1,10 +1,8 @@
 .. _tutorial_05_custom_loss:
 
 ================================================
-Tutorial 05: Building a Custom Loss Function
+Tutorial 5: Building a Custom Loss Function
 ================================================
-
-**Difficulty:** Intermediate | **Time:** ~2 hours | **GPU:** 8GB+ VRAM
 
 In this tutorial you will build a production-grade custom loss function
 from scratch, register it with the framework's loss registry, and use it
@@ -318,7 +316,6 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
        enabled: true
        dtype: bfloat16
    checkpoint:
-     checkpoint_dir: checkpoints/tutorial_05
      save_interval: 5000
      best_metric_name: val_psnr
      best_metric_mode: max
@@ -389,32 +386,16 @@ our frequency-weighted version:
    print(f"FreqW HFEN:    {hfen(pred_freqw, targets):.4f}")
    # Lower HFEN = better edge preservation
 
-Expected results on FastMRI knee:
+To measure what the weighting buys you, train the same arm three times —
+changing only ``gamma`` and keeping ``seed`` fixed — and compare the three
+runs' ``final_metrics.json``. Declare ``hfen`` in ``metrics.compute``
+alongside ``psnr`` and ``ssim``, because it is the metric that responds to
+edge preservation; PSNR alone will not show the effect you are looking for.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 25 20 20 20 15
-
-   * - Loss
-     - PSNR ↑
-     - SSIM ↑
-     - HFEN ↓
-     - Notes
-   * - L1 only
-     - 34.2 dB
-     - 0.912
-     - 0.148
-     - Baseline
-   * - L1 + FreqW (γ=2)
-     - 33.8 dB
-     - 0.918
-     - 0.121
-     - Better edges, slight PSNR cost
-   * - L1 + FreqW (γ=5)
-     - 32.9 dB
-     - 0.921
-     - 0.109
-     - Best edges, reduced PSNR
+Expect the weighting to trade the three against each other rather than
+improve all of them: emphasising high frequencies sharpens edges (HFEN
+falls) at some cost in PSNR. The size of that trade depends on your corpus
+and acceleration factor, so read it off your own runs.
 
 
 Key Takeaways

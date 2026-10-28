@@ -63,7 +63,7 @@ import math
 from typing import Any
 
 import torch
-import torch.nn.functional as F  # noqa: N812 - universal PyTorch idiom
+import torch.nn.functional as F
 
 from spectramr.core.metrics.context import MetricContext, resolve_context
 from spectramr.core.metrics.nr_texture import _as_magnitude_2d, _param

@@ -14,8 +14,8 @@ from typing import Any
 import torch
 
 from spectramr.config.settings import TrainingSettings
-from spectramr.core.module_utils import resolve_state_dict
 from spectramr.infrastructure.builders.leaf.optimizer_builders import OptimizerBuilder
+from spectramr.infrastructure.checkpointing.restore import weights
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,11 @@ def _config_path_label(config_path: Path | None) -> str:
 
 #: Split name -> the loader the director actually produces for it.
 #:
-#: The director yields exactly ``(train_loader, val_loader)``; there is no held-out
-#: test loader yet (``data.test_split`` is declared by 467 arms and read by nothing
-#: -- issue #665). So ``test`` resolves to the VALIDATION loader, and the metadata
-#: says so via ``split_resolved`` rather than letting a test-set number pass as
-#: something it is not.
+#: The director yields exactly ``(train_loader, val_loader)``; the held-out test loader of an
+#: arm that declares ``data.source.test_index_path`` is built by the training environment and
+#: scored by ``pipelines/test_pass.py``, not through here. So ``test`` resolves to the
+#: VALIDATION loader, and the metadata says so via ``split_resolved`` rather than letting a
+#: test-set number pass as something it is not.
 _SPLIT_TO_LOADER: dict[str, str] = {
     "train": "train",
     "val": "val",
@@ -146,31 +146,21 @@ def make_model(
     logger.info(f"Creating model: {config.model.model_type}")
     from spectramr.infrastructure.training.builders.model_builder import ModelBuilder
 
-    model = ModelBuilder(config, device_obj).build_generator().validate().build()["generator"]
+    # Without a checkpoint of its own, the model is warm-started as training would be
+    # (stage-1 VAE, model.checkpoint_path): scripted callers hand it straight to fit.
+    model = (
+        ModelBuilder(config, device_obj, warm_start=not checkpoint_path)
+        .build_generator()
+        .validate()
+        .build()["generator"]
+    )
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model created: {num_params} parameters")
 
-    # Load checkpoint if provided
     if checkpoint_path:
         logger.info(f"Loading checkpoint: {checkpoint_path}")
-        if not Path(checkpoint_path).exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
-            # Was the narrowest checkpoint reader in the repo: it knew only
-            # "model_state_dict", fell through to loading the whole envelope,
-            # and -- unlike infer's -- never stripped wrapper prefixes either,
-            # so a compiled/DDP checkpoint failed here too. One SSOT now.
-            model.load_state_dict(
-                resolve_state_dict(
-                    checkpoint, model.state_dict().keys(), source=str(checkpoint_path)
-                )
-            )
-            logger.info("Weights loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            raise
+        weights(checkpoint_path, "generator", model, policy="exact")
+        logger.info("Weights loaded successfully")
 
     metadata = {
         "config_path": _config_path_label(config_path),
@@ -340,7 +330,9 @@ def make_dataloader(
     director = DataPipelineDirector(config)
     if num_workers is None:
         num_workers = config.data.loader.num_workers
-    train_loader, val_loader = director.build_dataloaders(num_workers=num_workers, device=device)
+    train_loader, val_loader = director.build_dataloaders(
+        num_workers=num_workers, device=device, persistent_workers=False
+    )
 
     dataloader = train_loader if loader_key == "train" else val_loader
     if dataloader is None:

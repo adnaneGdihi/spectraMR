@@ -4,15 +4,15 @@ This module provides analytic coordinate generators for Non-Uniform FFT (NUFFT)
 workflows. Unlike Cartesian masks (binary grids), these generate continuous
 float coordinates in [-π, π] for NUFFT operators.
 
-[ARCHITECTURE FIX] Issue 8: Separating Mask Generation from Trajectory Generation
-- Masks: Binary grids for Cartesian undersampling (sampling.py)
-- Trajectories: Continuous coordinates for NUFFT (this module)
+Binary Cartesian masks live in ``sampling.py``; this module owns the continuous
+coordinates.
 
 References:
 - Jackson et al., "Selection of a convolution function for Fourier inversion" TMI 1991
 - Pipe & Menon, "Sampling Density Compensation in MRI" MRM 1999
 """
 
+import math
 from typing import Final, Literal
 
 import torch
@@ -23,6 +23,11 @@ import torch
 #: served by the Cartesian mask path rather than by NUFFT.
 NON_CARTESIAN_TRAJECTORIES: Final[tuple[str, ...]] = ("radial", "golden_angle", "spiral", "epi")
 TRAJECTORY_TYPES: Final[tuple[str, ...]] = ("cartesian", *NON_CARTESIAN_TRAJECTORIES)
+
+#: Full-circle golden angle pi*(3 - sqrt(5)) ~= 137.508 deg between spiral interleaves, which
+#: span 2*pi. Radial spokes span pi and take pi*(sqrt(5) - 1)/2 ~= 111.246 deg; each constant
+#: is wrong for the other family.
+SPIRAL_GOLDEN_ANGLE: Final[float] = math.pi * (3.0 - math.sqrt(5.0))
 
 
 class TrajectoryFactory:
@@ -106,6 +111,7 @@ class TrajectoryFactory:
         max_slew: float = 150.0,  # T/m/s
         dt: float = 4e-6,  # Dwell time (4µs)
         device: torch.device = torch.device("cpu"),
+        golden_angle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate Archimedean spiral trajectory with slew-rate limiting.
 
@@ -125,6 +131,8 @@ class TrajectoryFactory:
             max_slew: Maximum slew rate (T/m/s)
             dt: Dwell time (seconds)
             device: Target device
+            golden_angle: Rotate interleave ``a`` by ``a * SPIRAL_GOLDEN_ANGLE`` rather than
+                ``2*pi*a / num_arms``, so the first ``k`` arms do not depend on ``num_arms``.
 
         Returns:
             Tuple of (trajectory, dcf)
@@ -135,24 +143,19 @@ class TrajectoryFactory:
         if samples_per_arm is None:
             samples_per_arm = 2 * N
 
-        # [PHYSICS FIX] Transition time from slew-limited to gradient-limited regime
-        # T_s = G_max / S_max (seconds)
+        # Slew-limited to gradient-limited transition time, T_s = G_max / S_max (seconds).
         T_s = (max_grad * 1e-3) / max_slew  # Convert mT/m to T/m
 
         # Number of samples in transition region
         n_transition = int(T_s / dt)
         n_transition = max(1, min(n_transition, samples_per_arm // 4))  # Cap at 25% of arm
 
-        # Time parameter [0, 1]
         t = torch.linspace(0, 1, samples_per_arm, device=device)
 
-        # [PHYSICS FIX] Piecewise radius growth
-        # Region 1: Slew-limited (quadratic growth) r ~ t^2
-        # Region 2: Gradient-limited (linear growth)  r ~ t
+        # Piecewise radius: r ~ t^2 while slew-limited, then r ~ t while gradient-limited.
         t_transition = n_transition / samples_per_arm
 
         if variable_density:
-            # Variable density with slew-rate transition
             r = torch.where(
                 t < t_transition,
                 # Quadratic growth (constant slew) - smoother start
@@ -166,12 +169,10 @@ class TrajectoryFactory:
 
         theta = t * 2 * torch.pi * num_turns
 
-        all_kx = []
-        all_ky = []
-        all_dcf = []
+        all_kx, all_ky, all_dcf = [], [], []
 
         for arm in range(num_arms):
-            arm_angle = arm * 2 * torch.pi / num_arms
+            arm_angle = arm * SPIRAL_GOLDEN_ANGLE if golden_angle else arm * 2 * torch.pi / num_arms
             kx = r * torch.cos(theta + arm_angle)
             ky = r * torch.sin(theta + arm_angle)
             all_kx.append(kx)

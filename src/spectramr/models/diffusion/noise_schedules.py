@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -252,6 +251,8 @@ class BaseNoiseSchedule(ABC):
 
     def plot_schedule(self, save_path: str | None = None):
         """Plot the noise schedule"""
+        import matplotlib.pyplot as plt  # deferred: ~0.5 s at import
+
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
 
         timesteps = np.arange(self.num_timesteps)
@@ -629,6 +630,8 @@ class NoiseScheduleManager:
 
     def compare_schedules(self, save_path: str | None = None):
         """Compare all available schedules"""
+        import matplotlib.pyplot as plt  # deferred: ~0.5 s at import
+
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         axes = axes.flatten()
 

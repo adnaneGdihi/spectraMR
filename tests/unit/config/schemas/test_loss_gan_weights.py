@@ -62,3 +62,17 @@ class TestGANLossTranslationWeights:
         )
         assert c.lambda_cycle == 0.0
         assert c.lambda_diversity == 0.0
+
+
+class TestDomainGRLBlock:
+    """``losses.gan.domain_grl`` is a strict nested block (the parent ignores unknown keys)."""
+
+    def test_default_is_disabled(self):
+        assert GANLossesConfig().domain_grl.enabled is False
+
+    def test_enabled_loads(self):
+        assert GANLossesConfig(domain_grl={"enabled": True}).domain_grl.enabled is True
+
+    def test_unknown_key_raises(self):
+        with pytest.raises(ValidationError):
+            GANLossesConfig(domain_grl={"enabled": True, "alpha": 0.5})

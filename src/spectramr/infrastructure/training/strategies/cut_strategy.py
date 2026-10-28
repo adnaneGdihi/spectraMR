@@ -42,10 +42,10 @@ import logging
 from typing import Any
 
 import torch
-
-logger = logging.getLogger(__name__)
 import torch.nn as nn
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 
@@ -56,6 +56,7 @@ from spectramr.infrastructure.training.strategies.cyclegan_strategy import (
     _lsgan_d_loss,
     _lsgan_g_loss,
 )
+from spectramr.infrastructure.training.strategies.loss_folding import unpaired_source_terms
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
 )
@@ -73,6 +74,8 @@ from spectramr.models.generators.cycle_gan import (  # noqa: F401
 from spectramr.models.losses.cut_contrastive_loss import CUTPatchNCELoss
 from spectramr.models.registry import get_model_class
 
+logger = logging.getLogger(__name__)
+
 
 class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     """Single-generator Contrastive Unpaired Translation (CUT).
@@ -83,9 +86,17 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     params on the generator optimizer so the PatchNCE head trains with ``G``.
     """
 
+    # parallel_compat: The NCE loss (its projection heads) is an owned module, built and wrapped
+    # in __init__ on every rank, and called through forward_of.
+    parallel_compat = frozenset({"replicated"})
+
     #: How many encoder ResnetBlocks contribute a NCE feature scale (the "early
     #: resblocks" of the CUT encoder half — the deeper blocks are decoder-adjacent).
     _max_encoder_resblocks: int = 2
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("nce_loss", OWNED_MODULE))
 
     def _setup_strategy_specific_components(self) -> None:
         """Build/resolve the generator, discriminator and NCE loss (called from
@@ -144,6 +155,14 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         # Eagerly instantiate the NCE sampler's lazy heads so their params exist
         # for optimizer registration NOW (see method docstring — CLAUDE.md #16).
         self._materialize_nce_heads(in_ch)
+        # The env models are wrapped by the parallel backend; everything built here is owned.
+        # The heads must all exist now: DDP reduces only the parameters it saw at the wrap.
+        if self.generator is not primary_gen:
+            self.register_owned_module("generator", self.generator)
+        if self.discriminator is not primary_disc:
+            self.register_owned_module("discriminator", self.discriminator)
+        self.register_owned_module("nce_loss", self.nce_loss)
+        self._nce_head_count = len(self.nce_loss.sampler.heads)
         self._register_owned_params()
 
     def _materialize_nce_heads(self, in_ch: int) -> None:
@@ -236,7 +255,7 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         fallback, CLAUDE.md #9) if the generator is not a ``.model``-Sequential
         ResNet — CUT's content-preservation hypothesis is defined on that encoder.
         """
-        model = getattr(self.generator, "model", None)
+        model = getattr(unwrap_model(self.generator), "model", None)
         if not isinstance(model, nn.Sequential):
             raise TypeError(
                 "CUTTrainingStrategy encoder-feature hooks require a "
@@ -270,7 +289,7 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             for submod in self._encoder_submodules()
         ]
         try:
-            out = self.generator(x)
+            out = self.forward_of("generator")(x)
         finally:
             for handle in handles:
                 handle.remove()
@@ -346,8 +365,8 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         y, feat_source = self._forward_with_feats(real_a)
         feat_translated = self._encode_features(y)
 
-        adv_g = _lsgan_g_loss(self.discriminator(y))
-        nce = self.nce_loss(
+        adv_g = _lsgan_g_loss(self.forward_of("discriminator")(y))
+        nce = self.forward_of("nce_loss")(
             y,
             real_a,
             context={
@@ -355,9 +374,19 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
                 "feat_translated": feat_translated,
             },
         )
+        if len(self.nce_loss.sampler.heads) != self._nce_head_count:
+            raise RuntimeError(
+                "CUT PatchNCE built a projection head after construction; it is in neither "
+                "opt_g nor the DDP wrapper, so it would never train. Its encoder feature "
+                "widths must match the warm-up in _materialize_nce_heads."
+            )
 
         g_total = adv_g + lambda_nce * nce
-        return {"g_total_loss": g_total, "adv_g": adv_g, "nce": nce}
+        # Declared ``role: source`` image losses (e.g. MIND-SSC) lock structure to the input.
+        extra, components = unpaired_source_terms(self, y, real_a)
+        if extra is not None:
+            g_total = g_total + extra
+        return {"g_total_loss": g_total, "adv_g": adv_g, "nce": nce, **components}
 
     # ------------------------------------------------------------------ #
     # Two-optimizer alternating step (D on discriminator, G on generator + NCE head)
@@ -390,9 +419,10 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
 
         def d_closure() -> torch.Tensor:
             self.discriminator.requires_grad_(True)
+            disc = self.forward_of("discriminator")
             with torch.no_grad():
-                y = self.generator(real_a)
-            d_loss = _lsgan_d_loss(self.discriminator(real_b), self.discriminator(y))
+                y = self.forward_of("generator")(real_a)
+            d_loss = _lsgan_d_loss(disc(real_b), disc(y))
             with torch.no_grad():
                 self._last_step_metrics["d_total_loss"] = d_loss.detach()
             return d_loss

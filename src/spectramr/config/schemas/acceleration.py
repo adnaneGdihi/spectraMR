@@ -7,6 +7,8 @@ This schema is imported and embedded in training/base.py::BaseTrainingConfigSche
 as the "acceleration" field, making it part of the unified training configuration.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 from .enums import AccelerationSchedule
@@ -44,6 +46,19 @@ class AdaptiveAccelerationConfig(BaseModel):
         default=1.0,
         ge=0.0,
         description="Weight on the |E[mask] - target_rate| penalty.",
+    )
+    budget: Literal["soft", "hard_topk"] = Field(
+        default="soft",
+        description=(
+            "Eval-time mask. 'soft' keeps the lines with sigmoid(logit) > 0.5, which can keep "
+            "none at a low target_rate. 'hard_topk' keeps the round(target_rate * W) highest "
+            "logits, so validation spends the same budget the training mask targets."
+        ),
+    )
+    mask_learning_rate: float = Field(
+        default=1e-3,
+        gt=0.0,
+        description="Learning rate of the mask logits (LOUPE) or trajectory (PILOT).",
     )
 
     class _AnnealConfig(BaseModel):
@@ -177,9 +192,11 @@ class AccelerationConfigSchema(BaseModel):
             "addition. Enforcement intersects the cascade, so it can only remove "
             "samples: a family that re-draws heavily collapses and raises rather "
             "than silently training on a degenerate mask. Applies to the "
-            "fixed-seed cascade only -- enable_dynamic_mask deliberately varies "
-            "the pattern per sample and falls through unenforced. Default False "
-            "keeps every existing run byte-identical."
+            "fixed-seed cascade only (validation, predict and the reverse loops; "
+            "training too when enable_dynamic_mask is off). With "
+            "enable_dynamic_mask on, the training draws vary per sample and run "
+            "unenforced; provenance records the applied scope under mask_scope. "
+            "Default False keeps every existing run byte-identical."
         ),
     )
     nested_tolerance: float = Field(
@@ -199,11 +216,6 @@ class AccelerationConfigSchema(BaseModel):
             "KSpaceUndersamplingProcess.declared_ladder_defects."
         ),
     )
-    line_axis: str | None = Field(
-        default="y",
-        description="Axis for line-based sampling (y or x)",
-    )
-
     # Pattern-specific parameters
     density_power: float = Field(
         default=2.0,
@@ -278,7 +290,12 @@ class AccelerationConfigSchema(BaseModel):
             "Random seed for reproducible mask generation. None is not unseeded: the "
             "k-space process falls back to 42 (models/diffusion/kspace_process.py) and "
             "the loader-side MaskGenerator is deterministic, so an unset seed is "
-            "reproducible but undocumented; the effective seed is logged at setup."
+            "reproducible but undocumented; the effective seed is logged at setup. "
+            "Scope: the seed of the fixed-seed cascade (validation, predict, the "
+            "reverse loops, and training when enable_dynamic_mask is off). With "
+            "enable_dynamic_mask on, each training sample draws a fresh seed from "
+            "the global RNG instead; provenance records the applied scope under "
+            "mask_scope."
         ),
     )
     train_identity_rung: bool = Field(
@@ -342,7 +359,7 @@ class AccelerationConfigSchema(BaseModel):
     )
     use_gradient_checkpointing: bool | None = Field(
         default=None,
-        description="DEPRECATED: Use optimization.enable_gradient_checkpointing instead.",
+        description="DEPRECATED: Use optimization.gradient.enable_checkpointing instead.",
     )
 
     # ============================================================
@@ -392,6 +409,20 @@ class AccelerationConfigSchema(BaseModel):
         ):
             return False
         return not self.enable_dynamic_mask
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_line_axis(cls, data: object) -> object:
+        # `undersampling.line_axis` was a second, unread spelling of which axis a
+        # line mask removes; the block is extra="ignore", so without this a
+        # declared value would vanish silently (#2160).
+        if isinstance(data, dict) and "line_axis" in data:
+            raise ValueError(
+                "undersampling.line_axis is retired and was never read. Declare the "
+                "dataset's data.acquisition.phase_encode_axis and an "
+                "undersampling.mask_direction (phase/readout, or the raw axis x/y)."
+            )
+        return data
 
     @model_validator(mode="before")
     @classmethod

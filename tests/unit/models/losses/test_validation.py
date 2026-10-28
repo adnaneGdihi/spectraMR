@@ -89,3 +89,12 @@ def test_nan_diagnostics_are_debug_gated(monkeypatch, caplog) -> None:
         loss(pred, target)
     assert calls["count"] > 0, "DEBUG level must re-enable the NaN diagnostics"
     assert any("NaN detected in prediction" in rec.getMessage() for rec in caplog.records)
+
+
+def test_the_wrapper_keeps_the_forward_identity() -> None:
+    """``kwargs_accepted_by`` reads the signature through ``__wrapped__``."""
+    import inspect
+
+    fwd = _L1.forward
+    assert fwd.__name__ == "forward"
+    assert list(inspect.signature(fwd).parameters) == ["self", "pred", "target"]

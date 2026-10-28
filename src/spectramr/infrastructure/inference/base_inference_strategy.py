@@ -10,10 +10,23 @@ import torch
 from torch import nn
 
 from spectramr.config.schemas.enums import TrainingModeTypes
-from spectramr.core.module_utils import strip_wrapper_prefixes
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.checkpointing.restore import (
+    CheckpointPartMissingError,
+    read_part,
+    weights,
+)
 from spectramr.infrastructure.inference.predict_data_consistency import (
     PredictDataConsistency,
 )
+
+
+def _has_ema(checkpoint_path: str) -> bool:
+    try:
+        read_part(checkpoint_path, "ema")
+    except CheckpointPartMissingError:
+        return False
+    return True
 
 
 class BaseInferenceStrategy(ABC):
@@ -45,6 +58,11 @@ class BaseInferenceStrategy(ABC):
     #   GeoMamba ULF (position-aware)                            → False (verify)
     #   SSL pretrain                                             → False (no inference)
     supports_grid_tiling: bool = False
+
+    #: Whether ``infer`` applies the arm's k-space normalisation itself. When
+    #: False the predict pipeline normalises (#2581); a strategy that also did
+    #: would divide twice, so exactly one of the two owns it per strategy.
+    owns_kspace_normalization: bool = False
 
     def __init__(
         self,
@@ -189,11 +207,17 @@ class BaseInferenceStrategy(ABC):
         # kwarg only the projection reads must not reach ``run_inference``.
         # ``mask`` stays: it is already in the strategies' kwarg vocabulary.
         measured_kspace = kwargs.pop("measured_kspace", None)
+        # A scale measured over the whole volume by a strategy that owns the
+        # normalisation (``volume_kspace_scale``); only its preprocessing reads it.
+        kspace_scale = kwargs.pop("kspace_scale", None)
         if self.predict_dc is not None:
             self.predict_dc.begin()
 
         # Preprocess
-        processed_input = self.preprocess_input(input_tensor, **kwargs)
+        if kspace_scale is None:
+            processed_input = self.preprocess_input(input_tensor, **kwargs)
+        else:
+            processed_input = self.preprocess_input(input_tensor, kspace_scale=kspace_scale, **kwargs)
 
         # Run inference
         raw_output = self.run_inference(processed_input, **kwargs)
@@ -245,65 +269,12 @@ class BaseInferenceStrategy(ABC):
         return self.predict_dc.provenance()
 
     def load_checkpoint(self, checkpoint_path: str, **kwargs) -> None:
-        """Load model checkpoint.
-
-        Args:
-            checkpoint_path: Path to checkpoint file
-            **kwargs: Additional loading parameters
-        """
-        # [FIX] Handle safetensors
-        if checkpoint_path.endswith(".safetensors"):
-            try:
-                from safetensors.torch import load_file
-
-                tensors = load_file(checkpoint_path, device=self.device.type)
-
-                # Unflatten logic (similar to CheckpointService)
-                model_state_dict = {}
-                for key, value in tensors.items():
-                    if key.startswith("model_state_dict_"):
-                        # Remove prefix "model_state_dict_"
-                        nested_key = key[17:]
-                        model_state_dict[nested_key] = value
-                    elif not key.startswith("_meta_") and not key.startswith(
-                        "optimizer_state_dict"
-                    ):
-                        # Fallback: assume flat model weights if not prefixed
-                        # But strict check might fail if mixed.
-                        # For CheckpointService created files, prefixed keys are standard.
-                        pass
-
-                # If we found reconstructed keys, use them. Strip wrapper
-                # prefixes too: a compiled/DDP run's flattened safetensors keys
-                # read "model_state_dict__orig_mod.conv.weight", so removing the
-                # 17-char container prefix above still leaves "_orig_mod.".
-                if model_state_dict:
-                    self.model.load_state_dict(strip_wrapper_prefixes(model_state_dict))
-                else:
-                    # Fallback or maybe the model was saved flat
-                    self.model.load_state_dict(strip_wrapper_prefixes(tensors))
-
-            except ImportError:
-                # Should not happen if training worked, but good to report
-                raise ImportError("safetensors library required to load .safetensors checkpoints")
-        else:
-            # Default implementation - can be overridden for multi-component models
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-
-            # ``self.model`` is bare here, so strip any wrapper prefixes the
-            # training run's compile/DDP/FSDP wrappers baked into the keys.
-            if "model_state_dict" in checkpoint:
-                # Standard CheckpointService format (v5.0)
-                self.model.load_state_dict(strip_wrapper_prefixes(checkpoint["model_state_dict"]))
-            elif "generator_state_dict" in checkpoint:
-                # Multi-component checkpoint (e.g., GAN)
-                self.model.load_state_dict(
-                    strip_wrapper_prefixes(checkpoint["generator_state_dict"])
-                )
-            else:
-                # Single-component checkpoint or raw state dict
-                self.model.load_state_dict(strip_wrapper_prefixes(checkpoint))
-
+        """Load the run's EMA weights when it kept them (``use_ema``, default on), else
+        its generator; strict, into the bare model."""
+        part = (
+            "ema" if self.config.get("use_ema", True) and _has_ema(checkpoint_path) else "generator"
+        )
+        weights(checkpoint_path, part, unwrap_model(self.model), policy="exact")
         self.model.eval()
 
     def get_strategy_info(self) -> dict[str, Any]:

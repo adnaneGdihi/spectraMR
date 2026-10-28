@@ -191,6 +191,11 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     # Monitor `val_field_abs_bias` instead.
     "val_field_abs_bias": False,  # |mean(pred - field)| → 0 is the goal
     "val_chamfer": False,  # Chamfer distance
+    # The guarded selection composite (strategies/selection_rules.py): a penalised
+    # ring-NRMSE ratio, lower is better. The guard flag is 1.0 when a guard trips.
+    "guarded_ring_fidelity_mean": False,
+    "guarded_ring_fidelity_mean_partial": False,
+    "selection_guard_tripped": False,
     "val_t1_mape": False,  # mean absolute percentage error
     # conformal coverage / certificates — higher is better (coverage → 1 - alpha)
     "coverage_at_alpha": True,
@@ -209,6 +214,15 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     #     SPECTRA array without crashing. Higher is better.
     "val_kspace_consistency_tta": False,
     "kspace_consistency_tta": False,
+    # Disentanglement readings of DisentangledTrainingStrategy.finalize_validation
+    # (core/metrics/disentanglement.py): a style code should predict the contrast, a content
+    # code should not (leak = accuracy - chance), and a swap should return the content and
+    # the style it was given (relative error 0). `val_style_contrast_chance` and
+    # `val_probe_split_by_subject` are references, not quantities to optimise: undeclared.
+    "val_style_contrast_acc": True,
+    "val_content_contrast_leak": False,
+    "val_swap_content_distance": False,
+    "val_swap_style_distance": False,
     "entropy": False,
     "perplexity": False,
     "hallucination_rate": False,
@@ -359,9 +373,8 @@ def metric_higher_is_better(key: str) -> bool:
     :data:`NON_REGISTRY_METRIC_DIRECTIONS` or set ``direction:`` explicitly on
     the metric spec.
 
-    This is the single resolver shared by the metrics tracker, the checkpoint
-    retention policy (``keep_best_n``), early stopping and the campaign
-    leaderboard ranker.
+    This is the single resolver shared by the metrics tracker, early stopping
+    and the campaign leaderboard ranker.
     """
     kl = key.lower()
 

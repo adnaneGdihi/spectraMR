@@ -1753,3 +1753,13 @@ def test_multi_field_refuses_volume_slice_mode() -> None:
     """cat(dim=0) over M volumes is [M,H,W,D] -- the 5-D shape no strategy consumes."""
     with pytest.raises(ValueError, match="slice_mode='volume' is not supported"):
         _mf(slice_mode="volume")
+
+
+def test_every_non_pair_policy_has_a_loader_that_exists() -> None:
+    """``__getitem__`` routes the three multi-* policies through a table of method names."""
+    from spectramr.data.datasets.mrixfields_dataset import MRIxFieldsPairedDataset
+
+    table = MRIxFieldsPairedDataset._GETITEM_BY_POLICY
+    assert set(table) == {"multi_source", "multi_contrast", "multi_field"}
+    for method in table.values():
+        assert callable(getattr(MRIxFieldsPairedDataset, method))

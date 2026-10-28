@@ -160,6 +160,31 @@ class TestLAMB:
         # Zero gradient + decoupled decay still moves the weight.
         assert p.item() != pytest.approx(1.0)
 
+    @pytest.mark.parametrize("steps", [1, 10])
+    def test_the_trust_ratio_sets_the_step_to_lr_times_the_weight_norm(self, steps: int) -> None:
+        """The ratio rescales the update to ``||w||``, so a bias correction left
+        outside it survived as a warmup: 0.32 of this step at t=1, 0.15 at t=10."""
+        torch.manual_seed(0)
+        p = nn.Parameter(torch.randn(8, 8))
+        opt = LAMB([p], lr=1e-3, clamp_value=1e9)
+        for _ in range(steps):
+            before = p.detach().clone()
+            p.grad = torch.randn(8, 8)
+            opt.step()
+        ratio = (p.detach() - before).norm() / (1e-3 * before.norm())
+        assert ratio.item() == pytest.approx(1.0, rel=1e-4)
+
+    def test_a_complex_parameter_moves_along_its_gradient(self) -> None:
+        """``addcmul_(g, g)`` squares a complex gradient: a purely imaginary one
+        gave a negative second moment and moved the real part."""
+        p = nn.Parameter(torch.tensor([1.0 + 1.0j]))
+        opt = LAMB([p], lr=0.1)
+        p.grad = torch.tensor([1.0j])
+        opt.step()
+        assert p.detach().real.item() == pytest.approx(1.0)
+        assert p.detach().imag.item() < 1.0
+        assert (opt.state[p]["exp_avg_sq"] >= 0).all()
+
     def test_rejects_sparse_gradients_loudly(self) -> None:
         p = nn.Parameter(torch.zeros(3))
         opt = LAMB([p])
@@ -193,6 +218,14 @@ class TestLion:
     def test_defaults_match_the_paper_not_adam(self) -> None:
         opt = Lion([nn.Parameter(torch.zeros(1))])
         assert opt.param_groups[0]["betas"] == (0.9, 0.99)
+
+    def test_a_complex_parameter_is_signed_per_component(self) -> None:
+        """``sign_()`` raised NotImplementedError on a complex tensor."""
+        p = nn.Parameter(torch.tensor([1.0 + 1.0j]))
+        opt = Lion([p], lr=0.1, weight_decay=0.0)
+        p.grad = torch.tensor([1.0j])
+        opt.step()
+        assert torch.allclose(p.detach(), torch.tensor([1.0 + 0.9j]))
 
 
 class TestLookahead:
@@ -234,8 +267,10 @@ class TestLookahead:
 
         model = nn.Linear(4, 2)
         cfg = OptimizationConfigSchema(
-            optimizer_type="sgd",
-            lookahead={"enabled": True, "sync_period": 4, "alpha": 0.3},
+            optimizer={
+                "type": "sgd",
+                "lookahead": {"enabled": True, "sync_period": 4, "alpha": 0.3},
+            },
         )
         opt = build_optimizer_from_spec(resolve_optimizer_spec(cfg, model=model), model)
         assert isinstance(opt, Lookahead)
@@ -389,3 +424,74 @@ class TestInRepoOptimizersDoNotSyncTheHost:
         p.grad = torch.zeros(4, 4)
         opt.step()
         assert torch.isfinite(p).all()
+
+
+class TestStepReturnsTheClosureLoss:
+    """``step(closure)`` evaluates the closure once and returns its loss, as the
+    typed ``Optimizer.step`` overloads promise; ``step()`` returns ``None``."""
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda p: LAMB(p, lr=0.1),
+            lambda p: Lion(p, lr=0.1),
+            lambda p: Lookahead(torch.optim.SGD(p, lr=0.1), la_steps=2),
+        ],
+        ids=["lamb", "lion", "lookahead"],
+    )
+    def test_closure_loss_is_returned(self, factory) -> None:
+        p = nn.Parameter(torch.tensor([2.0]))
+        opt = factory([p])
+        calls: list[int] = []
+
+        def closure() -> float:
+            calls.append(1)
+            opt.zero_grad()
+            loss = (p**2).sum()
+            loss.backward()
+            return float(loss)
+
+        assert opt.step(closure) == pytest.approx(4.0)
+        assert calls == [1]
+        p.grad = torch.ones(1)
+        assert opt.step() is None
+
+
+class TestStepRecordsNoAutogradHistory:
+    """``step()`` updates parameters and state under ``torch.no_grad()``; a
+    graph recorded there would grow every step and hold every old tensor."""
+
+    @pytest.mark.parametrize(
+        "factory", [lambda p: LAMB(p, lr=0.1), lambda p: Lion(p, lr=0.1)], ids=["lamb", "lion"]
+    )
+    def test_state_and_parameters_carry_no_graph(self, factory) -> None:
+        p = nn.Parameter(torch.tensor([2.0, -1.0]))
+        opt = factory([p])
+        p.grad = torch.tensor([0.5, 0.5])
+        opt.step()
+        assert all(not t.requires_grad for t in opt.state[p].values() if torch.is_tensor(t))
+        assert p.grad_fn is None
+
+
+def test_lion_multi_tensor_step_matches_per_parameter_reference() -> None:
+    """The foreach path equals the per-parameter update, incl. a complex parameter."""
+    torch.manual_seed(0)
+    lr, (b1, b2), wd = 0.01, (0.9, 0.99), 0.1
+    base = [torch.randn(4, 3), torch.randn(5), torch.randn(2, 2, dtype=torch.complex64)]
+    ref = [p.clone() for p in base]
+    ref_avg = [torch.zeros_like(torch.view_as_real(p) if p.is_complex() else p) for p in ref]
+    live = [p.clone().requires_grad_() for p in base]
+    opt = Lion(live, lr=lr, betas=(b1, b2), weight_decay=wd)
+    for _ in range(3):
+        grads = [torch.randn_like(p) for p in base]
+        for p, g in zip(live, grads, strict=True):
+            p.grad = g.clone()
+        opt.step()
+        for p, g, avg in zip(ref, grads, ref_avg, strict=True):
+            pr = torch.view_as_real(p) if p.is_complex() else p
+            gr = torch.view_as_real(g) if g.is_complex() else g
+            pr.mul_(1 - lr * wd)
+            pr.add_(avg.mul(b1).add(gr, alpha=1 - b1).sign_(), alpha=-lr)
+            avg.mul_(b2).add_(gr, alpha=1 - b2)
+    for a, b in zip(live, ref, strict=True):
+        torch.testing.assert_close(a.detach(), b)

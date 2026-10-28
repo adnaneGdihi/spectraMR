@@ -3,7 +3,6 @@
 Tests verify that:
 1. DC layer uses target-contrast channels (last N) not source-prior (first N)
 2. Single-contrast experiments are unaffected (no truncation needed)
-3. Asymmetric masking in kspace.py preserves source channels
 """
 
 import torch
@@ -118,53 +117,3 @@ class TestDCCrossContrastChannelAlignment:
         assert (
             aligned_mask.mean().item() < 0.5
         ), "Target mask should be sparse (undersampled)"
-
-
-class TestAsymmetricMaskWithTargetChannels:
-    """Verify asymmetric masking uses target_channels from config."""
-
-    def test_source_channels_fully_sampled(self) -> None:
-        """Source (T1) channels should always have mask=1.0."""
-        B, H, W = 2, 64, 64
-        C_source = 8  # T1 channels
-        C_target = 8  # T2 channels
-        C_total = C_source + C_target
-
-        # Simulate mask for all channels (initially sparse)
-        mask = torch.zeros(B, C_total, H, W)
-        mask[:, :, ::4, :] = 1.0  # Every 4th line
-
-        # Apply asymmetric logic (using target_channels = 8)
-        target_ch = C_target
-        if C_total > target_ch:
-            C_src = C_total - target_ch
-            mask[:, :C_src, ...] = 1.0  # Force source to fully sampled
-
-        # Verify: source channels are all 1.0
-        assert (
-            mask[:, :C_source] == 1.0
-        ).all(), "Source channels must be fully sampled (mask=1.0)"
-
-        # Verify: target channels are still sparse
-        assert (
-            mask[:, C_source:].mean().item() < 0.5
-        ), "Target channels should remain sparse (undersampled)"
-
-    def test_single_contrast_no_asymmetric_masking(self) -> None:
-        """Single-contrast (exp 11): no asymmetric masking applied."""
-        B, H, W = 2, 64, 64
-        C_total = 2  # Single contrast
-        target_ch = 2  # target_channels == C_total
-
-        mask = torch.zeros(B, C_total, H, W)
-        mask[:, :, ::4, :] = 1.0
-        original_mask = mask.clone()
-
-        # Asymmetric logic should NOT trigger
-        if target_ch is not None and C_total > target_ch:
-            C_src = C_total - target_ch
-            mask[:, :C_src] = 1.0
-
-        assert torch.equal(
-            mask, original_mask
-        ), "Single-contrast mask should be unmodified"

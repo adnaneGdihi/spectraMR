@@ -221,6 +221,23 @@ class _StyleConditionedModel(torch.nn.Module):
         return h * (1.0 + scale)
 
 
+class _TissueTupleModel(torch.nn.Module):
+    """Returns ``(tissue_maps, mu, logvar)`` like ``disentangled_mri`` in tissue mode.
+
+    The principal tensor sits two levels down (tuple, then dict); the strategy renders
+    the image from the maps, so the probe validates the first map.
+    """
+
+    def __init__(self, in_channels: int = 1, out_channels: int = 1, **kwargs: Any):
+        super().__init__()
+        self.rho = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.t1 = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor]:
+        mu = x.mean(dim=(1, 2, 3)).unsqueeze(1)
+        return {"rho": self.rho(x), "t1": self.t1(x)}, mu, torch.zeros_like(mu)
+
+
 @pytest.fixture
 def _patch_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """Register the test models against the lazy registry import.
@@ -237,6 +254,7 @@ def _patch_registry(monkeypatch: pytest.MonkeyPatch) -> None:
         "raising": _RaisingForwardModel,
         "contrast_cond": _ContrastConditionedModel,
         "style_cond": _StyleConditionedModel,
+        "tissue_tuple": _TissueTupleModel,
     }
 
     def _fake_get_model_class(name: str) -> Any:
@@ -253,6 +271,11 @@ def test_probe_passes_on_well_formed_model(_patch_registry: None) -> None:
     assert result.passed
     assert result.category == "forward_pass_shape"
     assert result.elapsed_seconds >= 0.0
+
+
+def test_probe_unwraps_a_tuple_holding_a_dict_of_maps(_patch_registry: None) -> None:
+    result = synthetic_forward_probe(_cfg(model_type="tissue_tuple"), device="cpu", backward=True)
+    assert result.passed, result.message
 
 
 def test_probe_fails_on_unregistered_model(_patch_registry: None) -> None:
@@ -1069,7 +1092,10 @@ def _ssot_witness_config(log_scaling: bool = True):
         data={
             "sampling": {"patch_size": [16, 16]},
             "loader": {"batch_size": 1},
-            "processing": {"enable_log_scaling": log_scaling},
+            "processing": {
+                "enable_kspace_normalization": log_scaling,
+                "enable_log_scaling": log_scaling,
+            },
         },
         undersampling={"enabled": True},
         physics={
@@ -1136,7 +1162,7 @@ class TestProbeConstructsTheModelTrainingBuilds:
 #
 # The gap was invisible for a year because the generator's own DC path narrows
 # a too-wide measurement before using it. Only a backbone with an INTERNAL
-# ``DataConsistencyLayer`` -- which receives the kwarg verbatim -- can see it,
+# ``MaskedReplacementDataConsistency`` -- which receives the kwarg verbatim -- can see it,
 # so ``_MeasurementWidthModel`` raises on the mismatch the way that DC does.
 # These assert at the CALL SITE (through ``synthetic_forward_probe``), not on a
 # helper: a helper-only pin would score the real defect green.
@@ -1166,7 +1192,7 @@ class _MeasurementWidthModel(torch.nn.Module):
         type(self).seen_forward_width = int(x.shape[1])
         out = self.conv(x)
         if kspace_measured is not None and kspace_measured.shape[1] != out.shape[1]:
-            # Stands in for DataConsistencyLayer's broadcast against the
+            # Stands in for MaskedReplacementDataConsistency's broadcast against the
             # prediction -- the crash swin_diff_rec died on.
             raise RuntimeError(
                 f"measurement width {kspace_measured.shape[1]} does not match "

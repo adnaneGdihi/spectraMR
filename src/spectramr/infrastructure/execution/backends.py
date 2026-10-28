@@ -101,6 +101,16 @@ class ResourceSpec:
     #: a manifest of arms (the SSOT replacement for the hand-written array
     #: ``.sbatch`` files).
     array: str | None = None
+    #: Allow SLURM to re-run this job. Required for wall-clock chaining: the run
+    #: yields a margin before its allocation ends and asks to be requeued, which
+    #: SLURM refuses outright without this. ``False`` (default) emits no
+    #: directive, so every existing caller and the campaign golden stay
+    #: byte-identical.
+    requeue: bool = False
+    #: ``--open-mode``. ``"append"`` goes with :attr:`requeue`: a requeued task
+    #: otherwise TRUNCATES its predecessor's ``.out``, destroying the record of
+    #: why the previous link stopped. ``None`` (default) emits no directive.
+    open_mode: str | None = None
 
     def __post_init__(self) -> None:
         if self.gpus < 0:
@@ -377,6 +387,12 @@ class SlurmBackend:
             lines.append(f"#SBATCH --array={resources.array}")
         if resources.partition:
             lines.append(f"#SBATCH --partition={resources.partition}")
+        # After --partition and before the mail lines; the committed .sbatch
+        # headers are regenerated from this order and compared line by line.
+        if resources.requeue:
+            lines.append("#SBATCH --requeue")
+        if resources.open_mode:
+            lines.append(f"#SBATCH --open-mode={resources.open_mode}")
         if mail_type:
             lines.append(f"#SBATCH --mail-type={mail_type}")
         if mail_user:

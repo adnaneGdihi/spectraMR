@@ -129,7 +129,7 @@ class TestLookaheadResumePreservesParamGroups:
 
     Multi-group is the common case here -- ~25 strategies call
     ``add_param_group`` on ``opt_g`` -- and the checkpoint path reaches this
-    (``checkpoint_director`` saves and loads the same wrapper object).
+    (``checkpointing.capture`` and ``resume`` save and load the same wrapper object).
     """
 
     @staticmethod
@@ -336,3 +336,94 @@ class TestScheduleFreeModeApiReachesTheInnerOptimizer:
         bare = Lookahead.__new__(Lookahead)
         with pytest.raises(AttributeError):
             _ = bare.train
+
+
+class _CountingSGD(torch.optim.SGD):
+    """SGD that advances per-group state in ``step`` and has a train/eval mode.
+
+    Stands in for schedule-free, which keeps ``k``, ``weight_sum`` and
+    ``train_mode`` in its param groups and refuses to step in eval mode.
+    """
+
+    def __init__(self, params, lr: float = 0.1) -> None:
+        super().__init__(params, lr=lr)
+        for group in self.param_groups:
+            group["k"] = 0
+            group["train_mode"] = False
+
+    def train(self) -> None:
+        for group in self.param_groups:
+            group["train_mode"] = True
+
+    def eval(self) -> None:
+        for group in self.param_groups:
+            group["train_mode"] = False
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            if not group["train_mode"]:
+                raise RuntimeError("not in train mode")
+            group["k"] += 1
+        return super().step(closure)
+
+
+class TestLookaheadKeepsTheInnerOptimizerWhole:
+    """The sync, a late parameter group and a save must not desynchronise the pair."""
+
+    def test_a_group_added_after_construction_is_trained(self) -> None:
+        model = _tiny_model()
+        extra = torch.nn.Parameter(torch.ones(3))
+        inner = torch.optim.SGD(model.parameters(), lr=0.1)
+        wrapper = Lookahead(inner, la_steps=5, la_alpha=0.5)
+
+        wrapper.add_param_group({"params": [extra], "lr": 0.1})
+        extra.grad = torch.ones(3)
+        wrapper.step()
+
+        assert any(extra is p for g in inner.param_groups for p in g["params"])
+        assert torch.allclose(extra.detach(), torch.full((3,), 0.9))
+        assert len(wrapper.param_groups) == len(inner.param_groups) == 2
+
+    def test_group_state_the_inner_optimizer_advances_is_not_reset(self) -> None:
+        model = _tiny_model()
+        inner = _CountingSGD(model.parameters(), lr=0.1)
+        wrapper = Lookahead(inner, la_steps=5, la_alpha=0.5)
+
+        wrapper.train()
+        for _ in range(3):
+            _one_step(model, wrapper)
+
+        assert inner.param_groups[0]["train_mode"] is True
+        assert inner.param_groups[0]["k"] == 3
+
+    def test_a_scheduler_write_still_reaches_the_inner_optimizer(self) -> None:
+        model = _tiny_model()
+        inner = _CountingSGD(model.parameters(), lr=0.1)
+        wrapper = Lookahead(inner, la_steps=5, la_alpha=0.5)
+        scheduler = torch.optim.lr_scheduler.StepLR(wrapper, step_size=1, gamma=0.5)
+
+        wrapper.train()
+        _one_step(model, wrapper)
+        scheduler.step()
+        _one_step(model, wrapper)
+
+        assert inner.param_groups[0]["lr"] == pytest.approx(0.05)
+        assert inner.param_groups[0]["k"] == 2
+
+    def test_state_dict_carries_the_latest_scheduler_write(self) -> None:
+        model = _tiny_model()
+        inner = torch.optim.AdamW(model.parameters(), lr=0.1)
+        wrapper = Lookahead(inner, la_steps=5, la_alpha=0.5)
+        scheduler = torch.optim.lr_scheduler.StepLR(wrapper, step_size=1, gamma=0.5)
+
+        _one_step(model, wrapper)
+        scheduler.step()
+
+        assert wrapper.state_dict()["param_groups"][0]["lr"] == pytest.approx(0.05)
+
+    def test_lookahead_defaults_do_not_leak_into_the_inner_optimizer(self) -> None:
+        inner = torch.optim.SGD(_tiny_model().parameters(), lr=0.1)
+        Lookahead(inner, la_steps=5, la_alpha=0.5)
+
+        assert "la_steps" not in inner.defaults
+        assert "la_alpha" not in inner.defaults

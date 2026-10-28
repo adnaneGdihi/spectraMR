@@ -3,9 +3,9 @@
 Canonical import path for all logging functionality. Re-exports from
 their current source locations to provide a unified public API:
 
-- ``LoggingService`` / ``ComprehensiveLoggingService`` — structured text + TensorBoard
+- ``LoggingService`` — structured console + file logging
 - ``MetricsTracker`` — CSV metrics, validation image saving (``IMetricsService``)
-- ``TrainingLogDelegate`` — async non-blocking loss CSV writer
+- ``sinks`` — the run's sink registry (file, TensorBoard, metric and loss CSVs)
 - ``LoggingServiceFactory`` — factory for config-driven logger creation
 
 Usage::
@@ -17,7 +17,7 @@ Note: Uses lazy ``__getattr__`` to avoid circular imports with
 """
 
 from .banners import banner, phase  # re-exported via __all__
-from .progress import smart_progress  # re-exported via __all__
+from .progress import make_progress  # re-exported via __all__
 from .provenance import (
     collect_run_provenance,
     count_parameters,
@@ -35,38 +35,18 @@ from .provenance import (
 
 def __getattr__(name: str):
     """Lazy imports to break circular dependency with services.__init__."""
-    if name in (
-        "LoggingService",
-        "ComprehensiveLoggingService",
-        "LoggingServiceFactory",
-        "create_logging_service",
-    ):
+    if name in ("LoggingService", "LoggingServiceFactory"):
         from spectramr.infrastructure.services.logging_service import (
-            ComprehensiveLoggingService,
             LoggingService,
             LoggingServiceFactory,
-            create_logging_service,
         )
 
-        _exports = {
-            "LoggingService": LoggingService,
-            "ComprehensiveLoggingService": ComprehensiveLoggingService,
-            "LoggingServiceFactory": LoggingServiceFactory,
-            "create_logging_service": create_logging_service,
-        }
-        return _exports[name]
+        return {"LoggingService": LoggingService, "LoggingServiceFactory": LoggingServiceFactory}[name]
 
     if name == "MetricsTracker":
         from spectramr.infrastructure.services.metrics_tracker import MetricsTracker
 
         return MetricsTracker
-
-    if name == "TrainingLogDelegate":
-        from spectramr.infrastructure.services.persistence.training_log_delegate import (
-            TrainingLogDelegate,
-        )
-
-        return TrainingLogDelegate
 
     if name == "ColoredConsoleFormatter":
         from spectramr.infrastructure.services.logging_service import (
@@ -76,9 +56,16 @@ def __getattr__(name: str):
         return ColoredConsoleFormatter
 
     if name == "bootstrap_console_logging":
-        from spectramr.infrastructure.services.logging_service import (
-            bootstrap_console_logging,
-        )
+        try:
+            from spectramr.infrastructure.services.logging_service import (
+                bootstrap_console_logging,
+            )
+        except ImportError as exc:
+            # A failing transitive import (e.g. a torch version mismatch) would
+            # otherwise surface as "cannot import name bootstrap_console_logging".
+            raise ImportError(
+                f"bootstrap_console_logging unavailable: logging_service failed to import ({exc})"
+            ) from exc
 
         return bootstrap_console_logging
 
@@ -92,25 +79,22 @@ def __getattr__(name: str):
 # ``from ... import *`` (#6 of the 2026-06-19 logging-duplication audit).
 __all__ = [
     "ColoredConsoleFormatter",
-    "ComprehensiveLoggingService",
     "LoggingService",
     "LoggingServiceFactory",
     "MetricsTracker",
-    "TrainingLogDelegate",
     "banner",
     "bootstrap_console_logging",
     "collect_run_provenance",
     "count_parameters",
     "cpu_resources",
-    "create_logging_service",
     "format_provenance_lines",
     "git_provenance",
     "gpu_resources",
     "log_provenance",
+    "make_progress",
     "memory_resources",
     "node_resources",
     "phase",
     "runtime_environment",
-    "smart_progress",
     "torch_runtime",
 ]

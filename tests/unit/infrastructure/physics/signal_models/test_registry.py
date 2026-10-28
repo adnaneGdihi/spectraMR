@@ -134,7 +134,7 @@ def test_the_registry_contract_has_no_adjoint() -> None:
     """The whole reason this registry is separate from OperatorRegistry.
 
     An OperatorRegistry entry promises adjoint(), and generic callers
-    (DataConsistencyLayer, FISTAMBIRSolver, NullSpaceProjection) consume that
+    (OperatorProjectionDataConsistency, FISTAMBIRSolver, NullSpaceProjection) consume that
     promise assuming <Ax,y> = <x,A'y>. These maps are nonlinear and have none, so
     the contract must not offer a slot where a fake could be supplied.
     """

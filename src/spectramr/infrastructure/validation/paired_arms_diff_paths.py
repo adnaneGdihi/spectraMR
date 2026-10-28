@@ -36,6 +36,11 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "metadata.baseline",
         "metadata.negative_result_plan",
         "metadata.secondary_metrics",
+        # Read as a pair with `metadata.baseline`, already exempt above: it names
+        # the direction the hypothesis predicts ('comparable' / 'ceiling' /
+        # 'floor'), so it differs by construction wherever the arms differ at all.
+        "metadata.expected_outcome",
+        "metadata.status",
         "metadata.audit_waivers",
         "metadata.tags.type",
         "metadata.tags.domain",
@@ -44,6 +49,19 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "training.input_domain",
         "training.output_domain",
         "training.output_dir",
+        # The equivariance-ablation factor. At 0 the objective reduces exactly to
+        # measurement-consistency-only reconstruction, which is the control the
+        # self_supervised cohort is read against; the treatment sets 1.0.
+        "training.equivariant_imaging.alpha_equivariance",
+        "training.equivariant_imaging.group",
+        "training.equivariant_imaging.n_group_samples",
+        "training.equivariant_imaging.multicoil_operator",
+        "training.equivariant_imaging.measurement_target",
+        "training.equivariant_imaging.split_seed",
+        "training.strategy_class",
+        "training.training_mode",
+        "training.ssdu.noise_std_estimate",
+        "training.ssdu.noise_std_source",
         "training.diffusion.degradation",
         "training.diffusion.enforce_output_range",
         "training.diffusion.enable_proximal_dc",
@@ -72,21 +90,40 @@ DEFAULT_DIFF_PATHS: frozenset[str] = frozenset(
         "adapters",
         "losses.policy.output_domain",
         "losses.kspace_losses",
+        "losses.complex_losses",
         "physics.kspace.enable_kspace_recon",
         "physics.kspace.data_range",
         "physics.kspace.max_magnitude",
         "data.domain.output",
         "data.collation.log_strategy_selection",
         "data.collation",
+        # The NEX-target ablation factor. Before these two the list carried three
+        # `data.*` paths and none was a target mode, so no repetition-target
+        # ablation could pass however cleanly it was built -- the n2n cohort
+        # varies exactly these and was reported as three spurious diffs.
+        # `r2r_alpha` rides with it: it is read only under `target_mode: r2r`, so
+        # it is absent on every arm that does not select that mode.
+        "data.target_mode",
+        "data.r2r_alpha",
+        "data.r2r_covariance_source",
+        "data.r2r_split_angle_deg",
+        "data.r2r_whitening",
+        "data.emit_alternate_input",
+        "data.processing.transforms",
+        "data.coil_maps_root",
+        "data.coil_maps_missing",
+        "data.coil_maps_recipe",
+        "data.coil_maps_acs_size",
+        "data.noise_fit_support_policy",
         "acceleration.center_fraction",
         "acceleration.min_center_fraction",
         "metrics.transform",
         "metrics.compute_kspace_error",
         "metrics.output_dir",
         "validation.scoring.output_transform",
+        "validation.scoring.coil_manifold_projection",
+        "validation.scoring.recorrupted_inference",
         "validation.scoring.compute",
-        "checkpoint.save_dir",
-        "checkpoint.checkpoint_dir",
         "logging.sinks.dir",
         "logging.identity.experiment",
         "logging.identity.run",

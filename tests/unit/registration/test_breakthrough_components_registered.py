@@ -172,21 +172,13 @@ _VF_PARM_MODES = [
 
 
 @pytest.mark.parametrize("mode", _VF_PARM_MODES)
-def test_vf_parm_mode_registered_in_strategy_paths_and_constraints(mode: str) -> None:
-    """VF-smoke-2026-05-25 regression.
-
-    The four "P-arm" breakthrough strategies (B-1..B-4) were in
-    ``STRATEGY_CLASS_PATHS`` but missing from ``TRAINING_MODE_CONSTRAINTS``
-    and ``VALID_TRAINING_MODES``. Tier-0/1 audit passed, but the runtime
-    ``training_mode_compatibility`` validator rejected the config at
-    startup with ``Unknown training mode: <mode>``. Pin all three surfaces
-    so the gap cannot reopen.
-    """
+def test_vf_parm_mode_registered_in_strategy_paths_and_modes(mode: str) -> None:
+    """VF-smoke-2026-05-25 regression: the four "P-arm" breakthrough strategies
+    (B-1..B-4) must stay in both ``STRATEGY_CLASS_PATHS`` and ``VALID_TRAINING_MODES``."""
     check = (
         "from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory; "
-        "from spectramr.config.validation_constants import VALID_TRAINING_MODES, TRAINING_MODE_CONSTRAINTS; "
+        "from spectramr.config.validation_constants import VALID_TRAINING_MODES; "
         f"assert {mode!r} in TrainingStrategyFactory.STRATEGY_CLASS_PATHS, 'missing from STRATEGY_CLASS_PATHS'; "
-        f"assert {mode!r} in TRAINING_MODE_CONSTRAINTS, 'missing from TRAINING_MODE_CONSTRAINTS'; "
         f"assert {mode!r} in VALID_TRAINING_MODES, 'missing from VALID_TRAINING_MODES'"
     )
     rc, out = _run_cold(check)
@@ -205,12 +197,10 @@ def test_training_modes_include_breakthrough_aliases() -> None:
         "'tropical_quantitative_maps','frontdoor_scanner']"
     )
     check = (
-        "from spectramr.config.validation_constants import VALID_TRAINING_MODES, TRAINING_MODE_CONSTRAINTS; "
+        "from spectramr.config.validation_constants import VALID_TRAINING_MODES; "
         f"aliases = {aliases}; "
         "missing_modes = [a for a in aliases if a not in VALID_TRAINING_MODES]; "
-        "missing_constr = [a for a in aliases if a not in TRAINING_MODE_CONSTRAINTS]; "
-        "assert not missing_modes, f'missing from modes: {missing_modes}'; "
-        "assert not missing_constr, f'missing from constraints: {missing_constr}'"
+        "assert not missing_modes, f'missing from modes: {missing_modes}'"
     )
     rc, out = _run_cold(check)
     assert rc == 0, f"cold import failed for training-mode constants:\n{out}"

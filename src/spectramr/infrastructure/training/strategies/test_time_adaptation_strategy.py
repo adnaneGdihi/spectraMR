@@ -3,6 +3,7 @@ from typing import Any, final
 import torch
 
 from spectramr.domain.exceptions import ConfigurationError
+from spectramr.infrastructure.training.backward_guard import ensure_backward_ready
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 
@@ -131,7 +132,8 @@ class TttAdaptationStrategy(BaseTrainingStrategy):
             env (Optional[TrainingEnvironment]): Description.
         """
         super().__init__(env=env, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         # Get TTT parameters from config
@@ -198,6 +200,10 @@ class TttAdaptationStrategy(BaseTrainingStrategy):
                 loss = losses["g_total_loss"]
 
                 # Inner loop steps manually; the Trainer only owns the final one.
+                # Which means these N-1 backwards bypass ``StepExecutor`` and so
+                # bypass its pre-backward guards -- the graph check is called
+                # here explicitly rather than duplicated (#1952, NN17).
+                ensure_backward_ready(loss, name="ttt_adaptation_inner", global_step=step)
                 loss.backward()
                 self.env.opt_g.step()
 

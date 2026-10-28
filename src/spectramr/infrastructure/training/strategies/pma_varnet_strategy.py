@@ -8,7 +8,7 @@ DigitalTwinSimulator using the unified M4 Objective Loss.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -28,6 +28,11 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
     Leverages the Digital Twin Simulator to generate physical corruptions,
     then tasks the VarNet with inverting the physics using Operator_A_m4.
     """
+
+    # PMAGlobalLoss is computed here, weighted by losses.reconstruction.lambda_*; no list entry
+    # is read, so an empty builder stack is the design and a declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     def __init__(
         self,
@@ -160,6 +165,8 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
             marker_prior=marker_prior,
         )
 
+        self._last_prediction = reconstructed.detach()
+        self._last_target = joint_clean
         return {
             "g_total_loss": total_loss,
             "loss_pma_global": total_loss.detach(),
@@ -186,15 +193,10 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
         attribute 'shape'`` across 4 experiments (PMA + JFE-VarNet
         cohort). See TODO/audit/smoke_audit_20260521.md §F3.
 
-        Determinism is provided by ``initialize_accelerator`` (see
-        ``performance.md``); the validation path is a ``no_grad``
-        forward through the deterministic ``DigitalTwinSimulator``
-        (zero stochastic ops) and the VarNet generator, so no ad-hoc
-        ``torch.manual_seed`` reseed is needed — and reseeding the
-        global RNG every val step would clobber the accelerator's
-        seeding contract. If controlled randomness is ever introduced
-        here, scope a local ``torch.Generator`` (cf. ``jepa_strategy``
-        / ``ssdu_strategy``) rather than reseeding global RNG.
+        The twin draws its SNR, motion and undersampling mask from the global RNG,
+        which ``initialize_accelerator`` seeds from ``run.seed``. Validation does
+        not reseed it, since that would clobber the accelerator's seeding contract;
+        controlled randomness here should use a local ``torch.Generator``.
         """
         input_batch, target_batch = self._unpack_batch(val_batch)
         # #1190: calling ``_compute_losses_impl`` directly bypasses the
@@ -211,7 +213,14 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
                 step=batch_idx,
             ),
         ):
-            return self._compute_losses_impl(input_batch, target_batch, epoch=0)
+            out = self._compute_losses_impl(input_batch, target_batch, epoch=0)
+        # The arms select on ``val_psnr``; grade the reconstruction against the
+        # objective's own target (anatomy plus corner fiducials), on magnitudes,
+        # through the registry metrics computer (#1774).
+        computer = self._get_validation_metrics_computer(self.config)
+        computed = computer.compute(self._last_prediction.abs(), self._last_target.abs())
+        out.update({f"val_{name}": value for name, value in computed.items()})
+        return out
 
 
 __all__ = ["ConcretePMAVarNetStrategy"]

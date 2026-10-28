@@ -102,12 +102,130 @@ class TestAccelerationConfig:
         assert "acceleration_config" not in resolve_generator_kwargs(_config(), model_cls=_Explicit)
 
 
-class TestKspaceLogScaled:
-    def _cfg(self, enable, model_kwargs=None):
+class _AccelAndKwargs:
+    """``acceleration_config`` and ``phase_encode_axis`` named (the cold-diffusion shape)."""
+
+    def __init__(self, acceleration_config=None, phase_encode_axis=None, **kwargs):
+        pass
+
+
+class TestPhaseEncodeAxis:
+    """``data.acquisition.phase_encode_axis`` reaches the generator beside its block (#2160)."""
+
+    @staticmethod
+    def _cfg(direction="phase", axis=-1, model_kwargs=None):
+        acquisition = None if axis is None else SimpleNamespace(phase_encode_axis=axis)
         return _config(
             model_kwargs,
-            data=SimpleNamespace(processing=SimpleNamespace(enable_log_scaling=enable)),
+            undersampling=SimpleNamespace(mask_direction=direction),
+            data=SimpleNamespace(acquisition=acquisition, processing=None),
         )
+
+    def test_injected_for_a_line_mask_arm(self) -> None:
+        kwargs = resolve_generator_kwargs(self._cfg(), model_cls=_AccelAndKwargs)
+        assert kwargs["phase_encode_axis"] == -1
+
+    @pytest.mark.parametrize(
+        ("cfg", "cls"),
+        [({"axis": None}, _AccelAndKwargs), ({}, _Explicit), ({}, _VarKwargsOnly)],
+        ids=["undeclared", "not_named", "var_kwargs_only"],
+    )
+    def test_not_injected_where_nothing_reads_it(self, cfg, cls) -> None:
+        assert "phase_encode_axis" not in resolve_generator_kwargs(self._cfg(**cfg), model_cls=cls)
+
+    def test_the_cold_diffusion_generator_names_it(self) -> None:
+        """The production consumer, resolved without building it."""
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        kwargs = resolve_generator_kwargs(self._cfg(), model_cls=KSpaceColdDiffusionGenerator)
+        assert kwargs["phase_encode_axis"] == -1
+
+    def test_a_contradicting_model_kwargs_copy_raises(self) -> None:
+        with pytest.raises(ValueError, match="phase_encode_axis"):
+            resolve_generator_kwargs(
+                self._cfg(model_kwargs={"phase_encode_axis": -2}), model_cls=_AccelAndKwargs
+            )
+
+
+class _NamesHorizon:
+    """Names ``num_timesteps`` (the KSpaceColdDiffusion shape) and nothing else."""
+
+    def __init__(self, num_timesteps=None, **kwargs):
+        pass
+
+
+class TestDiffusionHorizon:
+    """``training.diffusion.timesteps`` is the horizon the strategy samples t from."""
+
+    def _cfg(self, horizon, model_kwargs=None):
+        diffusion = SimpleNamespace(timesteps=horizon, sampler=None)
+        return _config(model_kwargs, training=SimpleNamespace(diffusion=diffusion))
+
+    def test_injected_when_model_kwargs_omit_it(self) -> None:
+        """PLANTED: experiment_40 declares only training.diffusion.timesteps=28 and
+        resolved no horizon, so its generator fell back to 1000."""
+        kwargs = resolve_generator_kwargs(self._cfg(28), model_cls=_NamesHorizon)
+        assert kwargs["num_timesteps"] == 28
+
+    @pytest.mark.parametrize("key", ["timesteps", "num_timesteps"])
+    def test_an_agreeing_copy_reaches_the_named_horizon(self, key: str) -> None:
+        """PLANTED (#2440): x_diffusion's ``timesteps`` copy fell into **kwargs and
+        left its horizon unset."""
+        kwargs = resolve_generator_kwargs(self._cfg(29, {key: 29}), model_cls=_NamesHorizon)
+        assert kwargs["num_timesteps"] == 29
+        assert "timesteps" not in kwargs
+
+    @pytest.mark.parametrize("key", ["timesteps", "num_timesteps"])
+    def test_a_disagreeing_copy_raises(self, key: str) -> None:
+        with pytest.raises(ValueError, match=f"model_kwargs.{key}=1000 disagrees"):
+            resolve_generator_kwargs(self._cfg(29, {key: 1000}), model_cls=_NamesHorizon)
+
+    def test_not_injected_when_constructor_does_not_name_it(self) -> None:
+        kwargs = resolve_generator_kwargs(self._cfg(28), model_cls=_VarKwargsOnly)
+        assert "num_timesteps" not in kwargs
+
+
+class _NamesSteps:
+    """Names ``sampling_steps`` as KSpaceColdDiffusionGenerator does."""
+
+    def __init__(self, sampling_steps=None, **kwargs):
+        pass
+
+
+class TestSamplingSteps:
+    """``training.diffusion.sampling_steps`` is the reverse budget validation resolves (#566)."""
+
+    def _cfg(self, steps, model_kwargs=None):
+        diffusion = SimpleNamespace(timesteps=None, sampler=None, sampling_steps=steps)
+        return _config(model_kwargs, training=SimpleNamespace(diffusion=diffusion))
+
+    def test_injected_when_model_kwargs_omit_it(self) -> None:
+        """PLANTED: experiment_11_attention_none declared 20 and the generator ran its literal 50."""
+        assert resolve_generator_kwargs(self._cfg(20), model_cls=_NamesSteps)["sampling_steps"] == 20
+
+    def test_a_disagreeing_copy_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"model_kwargs\.sampling_steps=50 disagrees"):
+            resolve_generator_kwargs(self._cfg(20, {"sampling_steps": 50}), model_cls=_NamesSteps)
+
+    def test_an_undeclared_block_value_injects_nothing(self) -> None:
+        kwargs = resolve_generator_kwargs(self._cfg(None, {"sampling_steps": 7}), model_cls=_NamesSteps)
+        assert kwargs["sampling_steps"] == 7
+
+    def test_not_injected_when_constructor_does_not_name_it(self) -> None:
+        kwargs = resolve_generator_kwargs(self._cfg(20), model_cls=_VarKwargsOnly)
+        assert "sampling_steps" not in kwargs
+
+
+class TestKspaceLogScaled:
+    def _cfg(self, enable, model_kwargs=None, *, normalize=True):
+        from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+        processing = DataProcessingConfigSchema(
+            enable_kspace_normalization=normalize, enable_log_scaling=enable
+        )
+        return _config(model_kwargs, data=SimpleNamespace(processing=processing))
 
     def test_piped_from_the_data_block(self) -> None:
         kwargs = resolve_generator_kwargs(self._cfg(True), model_cls=_Explicit)
@@ -124,6 +242,19 @@ class TestKspaceLogScaled:
         with pytest.raises(ValueError, match="same fact"):
             resolve_generator_kwargs(
                 self._cfg(False, {"kspace_log_scaled": True}), model_cls=_Explicit
+            )
+
+    def test_log_scaling_without_normalization_pipes_false(self) -> None:
+        """#2353: without the k-space normalization nothing is compressed, so the
+        magnitude ceilings must bound physical, not log, units."""
+        kwargs = resolve_generator_kwargs(self._cfg(True, normalize=False), model_cls=_Explicit)
+        assert kwargs["kspace_log_scaled"] is False
+
+    def test_declaration_trusting_the_bare_flag_raises(self) -> None:
+        with pytest.raises(ValueError, match="same fact"):
+            resolve_generator_kwargs(
+                self._cfg(True, {"kspace_log_scaled": True}, normalize=False),
+                model_cls=_Explicit,
             )
 
     def test_missing_data_block_leaves_kwarg_unset(self) -> None:

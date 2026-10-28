@@ -12,9 +12,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
+
+
+#: ``model_kwargs.conditioning`` vocabulary of :class:`RectifiedFlowGenerator`.
+CONDITIONING_MODES = ("none", "global", "spatial")
 
 
 class MeasurementEncoder(nn.Module):
@@ -233,6 +237,9 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
     where z_t = (1-t)*x_0 + t*x_1 (linear interpolation)
     """
 
+    #: Read by ``FlowMatchingStrategy``: ``forward(z_t, t=..., condition=...)`` is the velocity.
+    conditional_velocity = True
+
     def __init__(
         self,
         in_channels: int = 2,
@@ -240,6 +247,7 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
         features: list[int] = [64, 128, 256, 512],
         context_dim: int = 512,
         flow_steps: int = 10,
+        conditioning: str = "global",
         **kwargs,
     ):
         """__init__.
@@ -250,35 +258,76 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
             features (list[int]): Description.
             context_dim (int): Description.
             flow_steps (int): Description.
+            conditioning: how the velocity sees the condition y (the ULF image):
+                ``global`` (a pooled embedding of y, the historical design),
+                ``spatial`` (that embedding plus y concatenated to z_t), or
+                ``none`` (no condition: a noise-only prior). Anything else raises.
         """
         super().__init__()
+        if conditioning not in CONDITIONING_MODES:
+            raise ValueError(
+                f"rectified_flow conditioning={conditioning!r}; expected one of {CONDITIONING_MODES}."
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.flow_steps = flow_steps
+        self.conditioning = conditioning
+        self.context_dim = context_dim
 
         # Measurement encoder
-        self.measurement_encoder = MeasurementEncoder(
-            in_channels=in_channels,
-            context_dim=context_dim,
-            features=features[:3] if len(features) >= 3 else features,
+        self.measurement_encoder = (
+            None
+            if conditioning == "none"
+            else MeasurementEncoder(
+                in_channels=in_channels,
+                context_dim=context_dim,
+                features=features[:3] if len(features) >= 3 else features,
+            )
         )
 
         # Velocity network
         self.velocity_net = VelocityNetwork(
-            in_channels=in_channels,
+            in_channels=2 * in_channels if conditioning == "spatial" else in_channels,
             out_channels=out_channels,
             features=features,
             context_dim=context_dim,
         )
 
         # Physics: Data Consistency
-        self.dc_layer = DataConsistencyLayer()
+        self.dc_layer = NoiseSimulatingDataConsistency()
+
+    def condition_context(self, like: torch.Tensor, condition: torch.Tensor | None) -> torch.Tensor:
+        """The ``[B, context_dim]`` code of y; zeros under ``conditioning: none``."""
+        if self.measurement_encoder is None:
+            return like.new_zeros(like.shape[0], self.context_dim)
+        if condition is None:
+            raise ValueError(
+                f"rectified_flow conditioning={self.conditioning!r} needs the condition y."
+            )
+        return self.measurement_encoder(condition)
+
+    def velocity(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        condition: torch.Tensor | None,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``v_theta(z_t, t, y)``; pass ``context`` to reuse one encoding across ODE steps."""
+        if context is None:
+            context = self.condition_context(z_t, condition)
+        if self.conditioning == "spatial":
+            z_t = torch.cat([z_t, condition], dim=1)
+        return self.velocity_net(z_t, t, context)
 
     def forward(
         self,
         x: torch.Tensor,
         measurement: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
+        *,
+        t: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass - either training or inference.
@@ -300,6 +349,11 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        if t is not None:
+            # Training: the velocity at the interpolant, through the module's forward
+            # so a DDP wrapper's hooks still run.
+            return self.velocity(x, t, condition)
+
         # [FIX] Alias for strategy compatibility
         if measurement is None:
             measurement = kwargs.get("kspace_measured") or kwargs.get("measured_kspace")
@@ -310,9 +364,6 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
         else:
             measurement_for_cond = measurement
 
-        # Encode measurement
-        context = self.measurement_encoder(measurement_for_cond)
-
         # ODE solve (Euler method)
         # If training (x is target), we usually just return velocity for loss.
         # But this forward implementation seems to do generation?
@@ -321,10 +372,11 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
 
         z = torch.randn_like(x)  # Start from noise
         dt = 1.0 / self.flow_steps
+        context = self.condition_context(x, measurement_for_cond)
 
         for step in range(self.flow_steps):
             t = torch.full((x.shape[0],), step * dt, device=x.device)
-            v = self.velocity_net(z, t, context)
+            v = self.velocity(z, t, measurement_for_cond, context)
             z = z + v * dt
 
             # Physics Correction (Manifold Constraint)
@@ -366,11 +418,8 @@ class RectifiedFlowGenerator(nn.Module, IGenerator):
         # Target velocity (straight line)
         target_velocity = x_1 - x_0
 
-        # Encode measurement
-        context = self.measurement_encoder(measurement)
-
         # Predict velocity
-        pred_velocity = self.velocity_net(z_t, t, context)
+        pred_velocity = self.velocity(z_t, t, measurement)
 
         # MSE loss
         loss = F.mse_loss(pred_velocity, target_velocity)

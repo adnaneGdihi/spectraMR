@@ -90,6 +90,20 @@ class TrainingEnvironment:
     #: needs a sharding-correct gradient clip), and what to stamp into provenance.
     parallel: Any | None = None
 
+    #: What compilation actually did, per model: the stage it ran at and the
+    #: resolved mode/backend. Empty when the arm asked for eager. Declared vs
+    #: applied is the distinction that matters -- the config says what was
+    #: asked for, this says what happened, and `DDP(compile(m))` and
+    #: `compile(DDP(m))` are indistinguishable without it.
+    compile: Any | None = None
+
+    #: Models converted to channels-last and how many parameters each, or empty.
+    memory_format: Any | None = None
+
+    #: The applied data partition (``DataPipelineDirector.split_provenance``), or
+    #: ``None`` when the route records none.
+    data_split: dict[str, Any] | None = None
+
     @classmethod
     def from_components(
         cls,
@@ -157,22 +171,22 @@ class TrainingEnvironment:
 
     @property
     def optimizer_g(self) -> torch.optim.Optimizer | None:
-        """Alias for opt_g — required by CheckpointDirector interface."""
+        """Alias for opt_g — read by ``checkpointing.capture``."""
         return self.opt_g
 
     @property
     def optimizer_d(self) -> torch.optim.Optimizer | None:
-        """Alias for opt_d — required by CheckpointDirector interface."""
+        """Alias for opt_d — read by ``checkpointing.capture``."""
         return self.opt_d
 
     @property
     def scheduler_g(self) -> Any | None:
-        """Access generator scheduler — required by CheckpointDirector interface."""
+        """Access generator scheduler — read by ``checkpointing.capture``."""
         return self.schedulers.get("opt_g") or self.schedulers.get("main")
 
     @property
     def scheduler_d(self) -> Any | None:
-        """Access discriminator scheduler — required by CheckpointDirector interface."""
+        """Access discriminator scheduler — read by ``checkpointing.capture``."""
         return self.schedulers.get("opt_d")
 
     @property

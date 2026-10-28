@@ -42,6 +42,8 @@ References
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,7 +69,7 @@ class SegmentationEquivarianceLoss(nn.Module):
             Default True — the canonical cycle-consistency convention.
     """
 
-    _DISTANCES = {"kl", "l1", "l2"}
+    _DISTANCES: ClassVar[frozenset[str]] = frozenset({"kl", "l1", "l2"})
 
     def __init__(
         self,
@@ -88,8 +90,8 @@ class SegmentationEquivarianceLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
-        **kwargs,
+        context: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if context is None or "segmenter" not in context:
             raise ValueError(
@@ -100,10 +102,15 @@ class SegmentationEquivarianceLoss(nn.Module):
 
         anchor_input = target  # the source-domain image
         translated_input = prediction  # the generator's output
-        anchor_logits = segmenter(anchor_input)
+        # A detached anchor needs no graph: building one only to discard it costs
+        # a full segmenter's worth of saved activations every step.
+        anchor_logits: torch.Tensor
         if self.detach_anchor:
-            anchor_logits = anchor_logits.detach()
-        translated_logits = segmenter(translated_input)
+            with torch.no_grad():
+                anchor_logits = segmenter(anchor_input)
+        else:
+            anchor_logits = segmenter(anchor_input)
+        translated_logits: torch.Tensor = segmenter(translated_input)
 
         if anchor_logits.shape != translated_logits.shape:
             raise ValueError(

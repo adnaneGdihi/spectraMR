@@ -40,3 +40,30 @@ def test_a_patch_the_decoder_cannot_render_is_refused() -> None:
         torch.no_grad(),
     ):
         model(torch.rand(2, 1, 32, 32))
+
+
+def _small(**kw) -> VAE:
+    torch.manual_seed(0)
+    return VAE(in_channels=1, out_channels=1, latent_dim=8, hidden_dims=(8, 8, 8), **kw).eval()
+
+
+def test_the_deterministic_comparator_decodes_the_mean() -> None:
+    model = _small(deterministic=True)
+    x = torch.rand(2, 1, 16, 16)
+    with torch.no_grad():
+        recon, mu, _ = model(x)
+        again, _, _ = model(x)
+        torch.testing.assert_close(recon, again)
+        torch.testing.assert_close(recon, model.decode(mu))
+
+
+def test_the_variational_default_samples() -> None:
+    model = _small()
+    x = torch.rand(2, 1, 16, 16)
+    with torch.no_grad():
+        assert not torch.allclose(model(x)[0], model(x)[0])
+
+
+def test_a_non_bool_deterministic_raises() -> None:
+    with pytest.raises(TypeError, match="deterministic must be a bool"):
+        _small(deterministic="yes")

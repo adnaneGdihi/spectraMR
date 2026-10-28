@@ -11,6 +11,11 @@ from typing import Any
 
 import torch
 
+from spectramr.core.metrics.complex_input import as_phase_bearing
+from spectramr.core.metrics.data_range_contract import (
+    DataRangeContractError,
+    QuantileScaleContract,
+)
 from spectramr.core.metrics.metric_directions import metric_higher_is_better
 from spectramr.core.metrics.outcome import (
     MetricContractError,
@@ -105,6 +110,7 @@ class ValidationMetricsComputer:
         device: str = "cpu",
         domain: str = "image",
         data_range: float | None = None,
+        scale_contract: QuantileScaleContract | None = None,
     ):
         """Initialize the validation metrics computer.
 
@@ -113,11 +119,14 @@ class ValidationMetricsComputer:
             device: Device for metric computation.
             domain: "image" or "kspace". Passed to metrics for domain-aware computation.
             data_range: Explicit data range override (e.g. 2.0). If None, metrics use their defaults.
+            scale_contract: The percentile scale the data path declares, handed to
+                the metrics that resolve an image ``data_range`` when none is declared.
         """
         self.config = config or ValidationMetricsConfig.from_dict(None)
         self.device = device
         self.domain = domain
         self.data_range = data_range
+        self.scale_contract = scale_contract
 
         # Build metric lookup for quick access
         self._metric_specs: dict[str, MetricSpec] = {
@@ -229,6 +238,7 @@ class ValidationMetricsComputer:
         targets: torch.Tensor,
         *,
         only: Collection[str] | None = None,
+        complex_pair: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Compute the configured validation metrics.
@@ -236,6 +246,12 @@ class ValidationMetricsComputer:
         Args:
             predictions: Model predictions [B, C, H, W]
             targets: Ground truth targets [B, C, H, W]
+            complex_pair: The phase-preserving ``(prediction, target)`` the
+                metric transform produced before taking ``abs()``. Metrics
+                registered ``requires_complex`` are scored on it; every other
+                metric on ``predictions``/``targets``. When ``None`` the
+                phase-sensitive metrics fall back to ``predictions``/``targets``
+                and raise :class:`PhaseBlindInputError` if those carry no phase.
             only: Restrict this call to the named subset of the *configured*
                 specs. ``None`` (the default) runs every enabled spec, i.e.
                 the historical behaviour. This is an INTERSECTION, never a
@@ -274,6 +290,11 @@ class ValidationMetricsComputer:
         # Ensure tensors are on correct device and detached
         predictions = predictions.detach().to(self.device)
         targets = targets.detach().to(self.device)
+        phase_source = (
+            (predictions, targets)
+            if complex_pair is None
+            else (complex_pair[0].detach().to(self.device), complex_pair[1].detach().to(self.device))
+        )
 
         # Add domain context to kwargs for metrics that support it
         compute_kwargs = {**kwargs, "domain": self.domain}
@@ -281,12 +302,22 @@ class ValidationMetricsComputer:
         # Add data_range if configured (overrides metric default)
         if self.data_range is not None:
             compute_kwargs["data_range"] = self.data_range
+        if self.scale_contract is not None:
+            compute_kwargs["scale_contract"] = self.scale_contract
 
         for spec in self.config.metrics:
             if not spec.enabled:
                 continue
             if only is not None and spec.name not in only:
                 continue
+
+            # Outside the ``try``: a phase metric fed a magnitude image is a
+            # wiring defect, and the broad handler below would turn it into NaN.
+            if MetricsRegistry.requires_complex(spec.name):
+                metric_preds = as_phase_bearing(spec.name, phase_source[0], "prediction")
+                metric_targets = as_phase_bearing(spec.name, phase_source[1], "target")
+            else:
+                metric_preds, metric_targets = predictions, targets
 
             try:
                 # Use SSOT registry with caching
@@ -305,7 +336,7 @@ class ValidationMetricsComputer:
                 # BROADCAST the log-variance channel into the error, returning a finite,
                 # plausible, meaningless score (pitfall #18).
                 pred_for_metric = self._align_prediction(
-                    metric_inst, predictions, targets, spec.name
+                    metric_inst, metric_preds, metric_targets, spec.name
                 )
 
                 # [SSOT] Check if metric is stateful/summary-based (e.g., FID)
@@ -320,7 +351,7 @@ class ValidationMetricsComputer:
                             metric_inst.update,
                             metric_inst.update,
                             pred_for_metric,
-                            targets,
+                            metric_targets,
                             compute_kwargs,
                             slot="update",
                         )
@@ -331,7 +362,7 @@ class ValidationMetricsComputer:
                             metric_inst,
                             getattr(metric_inst, "forward", metric_inst),
                             pred_for_metric,
-                            targets,
+                            metric_targets,
                             compute_kwargs,
                             slot="call",
                         )
@@ -345,7 +376,7 @@ class ValidationMetricsComputer:
                         metric_inst,
                         getattr(metric_inst, "forward", metric_inst),
                         pred_for_metric,
-                        targets,
+                        metric_targets,
                         compute_kwargs,
                         slot="call",
                     )
@@ -429,6 +460,10 @@ class ValidationMetricsComputer:
                     )
                 self.last_not_applicable[spec.name] = na.reason
                 metrics[spec.name] = float("nan")
+            except DataRangeContractError:
+                # A ValueError, but not the shape mismatch the branch below
+                # rewraps every ValueError as; keep its type and message.
+                raise
             except ValueError as e:
                 # F-METRICFAIL / 2026-05-20 — a ValueError from a metric
                 # is virtually always a shape/dtype mismatch between
@@ -633,6 +668,7 @@ def create_validation_metrics_computer(
     device: str = "cpu",
     domain: str = "image",
     data_range: float | None = None,
+    scale_contract: QuantileScaleContract | None = None,
 ) -> ValidationMetricsComputer:
     """Factory function to create ValidationMetricsComputer from various config types.
 
@@ -645,6 +681,7 @@ def create_validation_metrics_computer(
         device: Device for computation
         domain: "image" or "kspace". Passed to metrics for domain-aware computation.
         data_range: Explicit data range override.
+        scale_contract: Declared percentile scale, see ``ValidationMetricsComputer``.
 
     Returns:
         Configured ValidationMetricsComputer instance
@@ -686,5 +723,9 @@ def create_validation_metrics_computer(
             metrics_config = ValidationMetricsConfig.from_dict(None)
 
     return ValidationMetricsComputer(
-        metrics_config, device=device, domain=domain, data_range=data_range
+        metrics_config,
+        device=device,
+        domain=domain,
+        data_range=data_range,
+        scale_contract=scale_contract,
     )

@@ -1,7 +1,6 @@
 import logging
 from pathlib import Path
 
-from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.compute_device import resolve_torch_device
 from spectramr.data.metadata.path_resolver import PathResolver
@@ -22,17 +21,13 @@ from spectramr.infrastructure.di.di_container import (
     register_service,
 )
 from spectramr.infrastructure.logging import (
-    ComprehensiveLoggingService,
-    LoggingService,
     LoggingServiceFactory,
     MetricsTracker,
 )
 
 # Factories
-from spectramr.infrastructure.services.checkpoint_service import (
-    CheckpointService,
-    CheckpointServiceFactory,
-)
+from spectramr.infrastructure.checkpointing.facade import CheckpointStore
+from spectramr.infrastructure.logging.sinks import resolve_run_dir
 from spectramr.infrastructure.services.device_manager import DeviceManager
 
 # Phase 4: Additional Services (Memory)
@@ -44,21 +39,6 @@ from spectramr.infrastructure.validation.config_validation import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_checkpoint_config(config: TrainingSettings) -> CheckpointConfigSchema:
-    """Return the checkpoint config, defaulting to ``CheckpointConfigSchema()``.
-
-    The root ``checkpoint:`` block is optional (``settings.py`` defaults it via
-    ``default_factory``). A config that omits it — or explicitly sets
-    ``checkpoint: null`` — must still build a working checkpoint service rather
-    than aborting the whole run at container-build time. Pre-2026-06-20,
-    ``build_container`` raised ``config.checkpoint is required but not provided``
-    here, which silently blocked the entire 28-arm ``mrixfields2026`` cohort
-    (every config omits the block). See
-    ``TODO/audit/run_debug_kspace_vf_mrixfields_20260617.md``.
-    """
-    return config.checkpoint or CheckpointConfigSchema()
 
 
 def _validate_data_availability_at_startup(config: TrainingSettings) -> None:
@@ -151,6 +131,7 @@ def build_container(
     device: str | None = None,
     *,
     pipeline: str = "train",
+    run_dir: str | Path | None = None,
 ) -> DIContainer:
     """
     Bootstrap the Dependency Injection container with strict validation.
@@ -236,27 +217,20 @@ def build_container(
     if config.logging is None:
         raise ValueError("config.logging is required but not provided")
 
+    run_dir = run_dir or resolve_run_dir(config, pipeline == "sanity_check")
     logging_service = LoggingServiceFactory.create(
-        config.logging, model_type=config.model.model_type
+        config.logging, model_type=config.model.model_type, run_dir=run_dir
     )
     register_service(ILoggingService, logging_service)
-    register_service(LoggingService, logging_service)
-    # Also register by concrete type for backward compatibility
-    register_service(ComprehensiveLoggingService, logging_service)
 
     # 3. Artifact Root & Checkpoints
     # config.logging.log_dir is standard Pydantic (required)
     artifact_root = Path(config.logging.sinks.dir)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    # Checkpoint Service Factory
-    # The root ``checkpoint:`` block is optional; resolve a default when it is
-    # absent/None (see ``_resolve_checkpoint_config``) instead of aborting the
-    # container build — the old ``raise`` blocked the whole mrixfields2026
-    # cohort, none of whose configs declare a ``checkpoint:`` block.
-    checkpoint_service = CheckpointServiceFactory.create(_resolve_checkpoint_config(config))
-    register_service(ICheckpointService, checkpoint_service)
-    register_service(CheckpointService, checkpoint_service)
+    # One checkpoint owner (infrastructure.checkpointing); the store is stateless, so
+    # the root ``checkpoint:`` block being absent does not stop the container build.
+    register_service(ICheckpointService, CheckpointStore())
 
     # 4. Metrics
     # Use MetricsTracker directly as per new architecture
@@ -290,7 +264,7 @@ def build_container(
     logging_service.log_info(
         f"[Bootstrap] Metrics image saving: save_images={save_images} "
         f"(validation.enable_visualization={config.validation.visualization.enabled if config.validation else False}, "
-        f"logging.save_validation_images={config.logging.images.save_validation if True else False}, "
+        f"logging.save_validation_images={config.logging.images.save_validation}, "
         f"logging.log_validation_images={config.logging.images.log_validation})"
     )
 
@@ -305,6 +279,8 @@ def build_container(
     # MetricsTracker now properly implements IMetricsService interface
     register_service(IMetricsService, metrics_service)
     register_service(MetricsTracker, metrics_service)
+    logging_service.attach_artifact_sink("metrics_csv", lambda: metrics_service.validation_csv)
+    logging_service.attach_artifact_sink("loss_csv", lambda: metrics_service.training_csv)
 
     # ========== PHASE 4: Additional Services Registration ==========
 

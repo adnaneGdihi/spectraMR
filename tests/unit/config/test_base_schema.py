@@ -2,7 +2,6 @@ import pytest
 from pydantic import ValidationError
 
 from spectramr.config.schemas.base import (
-    ArtifactConfig,
     BiophysicalFlowObjectiveConfig,
     DiffusionObjectiveConfig,
     DomainAdaptationObjectiveConfig,
@@ -192,23 +191,11 @@ class TestBaseSchemas:
         # Defaults to None when omitted.
         assert SSLConfigSchema().multi_contrast_contrastive is None
 
-    def test_artifact_config(self):
-        # ``persistent_root`` is the sole surviving field — the previous
-        # runtime_root / sync_interval_minutes / sync_on_failure fields
-        # were removed 2026-05-19 (no runtime consumers; see the docstring
-        # on ArtifactConfig).
-        schema = ArtifactConfig(persistent_root="./experiments/results")
-        assert schema.persistent_root == "./experiments/results"
-        # Default is preserved.
-        assert ArtifactConfig().persistent_root == "./experiments"
-        # extra="forbid" rejects the removed fields so re-introducing them
-        # via stale YAMLs fails loudly at load time.
-        with pytest.raises(ValidationError):
-            ArtifactConfig(runtime_root="/tmp/whatever")
-        with pytest.raises(ValidationError):
-            ArtifactConfig(sync_interval_minutes=30)
-        with pytest.raises(ValidationError):
-            ArtifactConfig(sync_on_failure=True)
+    def test_the_artifact_schema_is_gone(self):
+        """`artifacts` was removed (#698): the key is refused at load, so no schema models it."""
+        from spectramr.config.schemas import base
+
+        assert not hasattr(base, "ArtifactConfig")
 
     def test_services_config_schema(self):
         schema = ServicesConfigSchema(enable_logging=False)

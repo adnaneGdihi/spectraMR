@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import torch
 
-from spectramr.data.adapters.fourier import FFTImageToKspace, IFFTKspaceToImage
+from spectramr.data.adapters.fourier import (
+    FFTImageToKspace,
+    IFFTKspaceToImage,
+    KSpaceToRealImagInterleave,
+)
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 
 
@@ -61,3 +65,19 @@ def test_fourier_adapter_roundtrip_recovers_real_interleaved_image():
     img_real = torch.cat([img.real, img.imag], dim=1)
     recon = IFFTKspaceToImage()(FFTImageToKspace()(img_real))
     assert torch.allclose(recon, img, atol=1e-4)
+
+
+def test_kspace_to_real_imag_interleave_doubles_channels_in_re_im_order():
+    z = torch.complex(torch.arange(4.0).view(1, 1, 2, 2), torch.ones(1, 1, 2, 2))
+    out = KSpaceToRealImagInterleave()(z)
+    assert out.shape == (1, 2, 2, 2)
+    assert torch.equal(out[:, 0], z.real[:, 0])
+    assert torch.equal(out[:, 1], z.imag[:, 0])
+
+
+def test_kspace_to_real_imag_interleave_rejects_real_input():
+    import pytest
+
+    with pytest.raises(ValueError, match="complex k-space"):
+        KSpaceToRealImagInterleave()(torch.zeros(1, 1, 2, 2))
+

@@ -330,3 +330,74 @@ class TestTheCacheKeyIsTheResolvedTypeNotTheSpelling:
         gen.generate_batch_masks(2, steps, (H, W), 4, pattern="uniform_cartesian")
         assert after_first == 1
         assert len(gen._mask_tables._tables) == 1
+
+
+def test_the_mask_generator_requires_its_horizon():
+    """PLANTED (#2443): a 1000-rung default stood in for every caller's T."""
+    with pytest.raises(TypeError, match="num_timesteps"):
+        KSpaceMaskGenerator()  # type: ignore[call-arg]
+    assert KSpaceMaskGenerator(num_timesteps=29).num_timesteps == 29
+
+
+class TestAppliedRecord:
+    """What a strategy-side mask actually used, for the snapshot provenance."""
+
+    def test_names_the_resolved_family_and_the_forwarded_parameters(self) -> None:
+        gen = KSpaceMaskGenerator(
+            num_timesteps=T,
+            default_pattern="random",
+            accelerator_kwargs={
+                "base_acceleration": 2.0,
+                "max_acceleration": 16.0,
+                "center_fraction": 0.08,
+                "min_center_fraction": 0.04,
+                "seed": 7,
+                "acceleration_schedule": "cosine",
+            },
+        )
+        record = gen.applied_record()
+        assert record["pattern"] == "random"
+        assert record["family"] == "random_cartesian"
+        assert record["acceleration"] == [2.0, 16.0]
+        assert record["center_fraction"] == 0.08
+        assert record["min_center_fraction"] == 0.04
+        assert record["acceleration_schedule"] == "cosine"
+        assert record["mask_seed"] == 7
+
+    def test_an_explicit_pattern_replaces_the_unused_default(self) -> None:
+        """The graph strategy passes its pattern on every call; ``linear`` is
+        only the constructor default and must not be reported."""
+        gen = KSpaceMaskGenerator(num_timesteps=T, accelerator_kwargs={"seed": 1})
+        record = gen.applied_record("random")
+        assert (record["pattern"], record["family"]) == ("random", "random_cartesian")
+
+    def test_unforwarded_values_and_a_null_seed_are_stated(self) -> None:
+        gen = KSpaceMaskGenerator(num_timesteps=T, accelerator_kwargs={"seed": None})
+        record = gen.applied_record()
+        assert record["acceleration"] == "<accelerator default>"
+        assert record["center_fraction"] == "<accelerator default>"
+        assert record["mask_seed"] == "None: global RNG, redrawn per call"
+
+    def test_reading_the_record_builds_no_accelerator(self) -> None:
+        """The first snapshot precedes the first mask; reading must not build one."""
+        gen = _generator("cpu")
+        gen.applied_record()
+        assert gen._accelerators == {}
+
+    def test_a_step_ladder_is_recorded_beside_its_endpoints(self) -> None:
+        """exp_11's ladder [2, 4, 8, 10, 12, 16, 32] is not the range [2, 32]."""
+        ladder = [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]
+        gen = KSpaceMaskGenerator(
+            num_timesteps=T,
+            accelerator_kwargs={
+                "base_acceleration": 2.0,
+                "max_acceleration": 32.0,
+                "acceleration_schedule": "step",
+                "acceleration_range": ladder,
+                "density_power": 1.6,
+            },
+        )
+        record = gen.applied_record()
+        assert record["acceleration_range"] == ladder
+        assert record["density_power"] == 1.6
+        assert "schedule_power" not in record

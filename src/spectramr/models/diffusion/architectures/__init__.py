@@ -39,24 +39,6 @@ if importlib.util.find_spec(".enhanced_kan_unet", __name__):
     except ImportError:
         pass
 
-try:
-    # EnhancedDeepDiffusionUNet is now in this package (architectures)
-    from .enhanced_deep_unet import EnhancedDeepDiffusionUNet
-
-    __all__.append("EnhancedDeepDiffusionUNet")
-except ImportError:
-    # Provide a minimal stub to prevent import errors during discovery.
-    class EnhancedDeepDiffusionUNet:  # type: ignore
-        """Lightweight placeholder used only for import compatibility."""
-
-        def __init__(self, *args, **kwargs):  # pragma: no cover
-            """__init__."""
-            raise RuntimeError(
-                "EnhancedDeepDiffusionUNet is unavailable in this build.",
-            )
-
-    __all__.append("EnhancedDeepDiffusionUNet")
-
 if importlib.util.find_spec(".kan_unet", __name__):
     try:
         from . import kan_unet as _kan_unet

@@ -8,7 +8,7 @@ def simulate_differentiable_epg_fse(
     excitation_fa: torch.Tensor,
     refocusing_fa: torch.Tensor,
     echo_train_length: int = 16,
-    te_spacing: float = 10.0,
+    te_spacing: float | torch.Tensor = 10.0,
 ) -> torch.Tensor:
     """
     Simulates transverse magnetization via Differentiable Extended Phase Graph (EPG)
@@ -21,7 +21,8 @@ def simulate_differentiable_epg_fse(
         excitation_fa: Excitation flip angle in degrees [B, 1, H, W] or scalar
         refocusing_fa: Refocusing flip angle in degrees [B, 1, H, W] or scalar
         echo_train_length: Number of echoes in the train (ETL)
-        te_spacing: Time between echoes in ms (Echo Spacing)
+        te_spacing: Time between echoes in ms (Echo Spacing); a ``[B, 1, 1, 1]`` tensor
+            gives each row its own spacing, broadcast against the tissue maps.
 
     Returns:
         signal: Generated magnitude signal at the effective TE.

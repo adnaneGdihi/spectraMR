@@ -262,3 +262,55 @@ def test_contrast_id_threaded_train_and_sampling() -> None:
         op_kwargs={"blur_cutoff": 0.5}, n_steps=1, guidance_weight=0.0, contrast_id=cid,
     )
     assert seen["cid"] is cid  # mechanism-guided sampler threads it
+
+
+def test_field_lowpass_threads_contrast_id_to_the_shared_operator() -> None:
+    from spectramr.infrastructure.training.strategies.ulf_lowpass_operator import (
+        UlfLowpassOperator,
+    )
+
+    op = UlfLowpassOperator(axis_cutoffs={0: (0.15, 0.15), 1: (2.0, 2.0)})
+    y = torch.rand(1, 1, 16, 16)
+    kw = {
+        "alphas_cumprod": _acp(),
+        "forward_op": resolve_forward_operator("field_lowpass"),
+        "op_kwargs": {"forward_op": op},
+        "n_steps": 5,
+        "guidance_weight": 5.0,
+    }
+    torch.manual_seed(0)
+    a = refiner_sample(_StubEps(), y, torch.tensor([3.0]), contrast_id=torch.tensor([0]), **kw)
+    torch.manual_seed(0)
+    b = refiner_sample(_StubEps(), y, torch.tensor([3.0]), contrast_id=torch.tensor([1]), **kw)
+    assert not torch.allclose(a, b)
+
+
+def _refiner_setup(gr_cfg: GenerativeRefinerConfig, ulf_lowpass):
+    import types
+
+    from spectramr.infrastructure.training.strategies.generative_refiner_strategy import (
+        GenerativeRefinerStrategy,
+    )
+
+    strat = object.__new__(GenerativeRefinerStrategy)
+    strat._verify_strategy_config = lambda **_: None
+    strat.config = types.SimpleNamespace(
+        training=types.SimpleNamespace(generative_refiner=gr_cfg, ulf_lowpass=ulf_lowpass),
+        data=None,
+    )
+    strat._setup_strategy_specific_components()
+    return strat
+
+
+def test_field_lowpass_setup_requires_ulf_lowpass_and_wiener_does_not() -> None:
+    from spectramr.config.schemas.training.ulf_lowpass import UlfLowpassConfig
+
+    with pytest.raises(ValueError, match=r"training\.ulf_lowpass"):
+        _refiner_setup(GenerativeRefinerConfig(forward_operator="field_lowpass"), None)
+    wiener = _refiner_setup(GenerativeRefinerConfig(forward_operator="wiener_band"), None)
+    assert "forward_op" not in wiener._gr_op_kwargs
+    lowpass = _refiner_setup(
+        GenerativeRefinerConfig(forward_operator="field_lowpass"),
+        UlfLowpassConfig(cutoff_mode="constant", blur_cutoff=0.4),
+    )
+    assert lowpass._gr_op_kwargs["forward_op"].constant == 0.4

@@ -155,9 +155,9 @@ def test_forward_does_no_discarded_work_on_the_step_path() -> None:
     """
     import ast
     import inspect
+    import textwrap
 
-    source = inspect.getsource(VectorQuantizer.forward)
-    tree = ast.parse(ast.unparse(ast.parse(inspect.cleandoc(source))))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(VectorQuantizer.forward)))
     discarded = [
         node
         for node in ast.walk(tree)
@@ -171,3 +171,56 @@ def test_forward_does_no_discarded_work_on_the_step_path() -> None:
     entropy = q.get_codebook_entropy()
     assert isinstance(entropy, float)
     assert entropy >= 0.0
+
+
+def _reference_forward(q: VectorQuantizer, z: torch.Tensor):
+    """The pre-fix lookup: a broadcast ``(z - e)**2`` that holds an (N, K, D) tensor."""
+    z_flat = z.view(-1, q.embedding_dim)
+    distances = ((z_flat.unsqueeze(1) - q.embeddings.unsqueeze(0)) ** 2).sum(2)
+    indices = distances.argmin(dim=1)
+    return indices, q.embeddings[indices].view(z.shape)
+
+
+def test_lookup_matches_the_broadcast_formula() -> None:
+    """The matmul expansion picks the same codes, and the same quantized tensor."""
+    torch.manual_seed(0)
+    q = VectorQuantizer(num_embeddings=64, embedding_dim=16).eval()
+    q.embeddings.copy_(torch.randn(64, 16))
+    z = torch.randn(4, 16, 8, 8)
+    quantized, _, indices = q(z)
+    ref_indices, ref_quantized = _reference_forward(q, z)
+    assert torch.equal(indices, ref_indices)
+    assert torch.allclose(quantized, ref_quantized.detach() + (z - z).detach(), atol=1e-6)
+
+
+def test_lookup_never_materialises_the_pairwise_difference_tensor() -> None:
+    """The planted violation for the 32 GiB OOM: no op may output an (N, K, D)-sized tensor."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _LargestOutput(TorchDispatchMode):
+        def __init__(self) -> None:
+            super().__init__()
+            self.largest = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for t in out if isinstance(out, (tuple, list)) else (out,):
+                if isinstance(t, torch.Tensor):
+                    self.largest = max(self.largest, t.numel())
+            return out
+
+    k, d = 64, 16
+    q = VectorQuantizer(num_embeddings=k, embedding_dim=d).eval()
+    z = torch.randn(2, d, 8, 8)
+    n = z.numel() // d
+    with _LargestOutput() as spy:
+        q(z)
+    assert spy.largest < n * k * d, "an (N, K, D) intermediate came back"
+
+
+def test_training_update_still_moves_the_codebook() -> None:
+    q = VectorQuantizer(num_embeddings=8, embedding_dim=4).train()
+    before = q.embeddings.clone()
+    q(torch.randn(2, 4, 4, 4))
+    assert not torch.equal(before, q.embeddings)
+    assert torch.isfinite(q.embeddings).all()

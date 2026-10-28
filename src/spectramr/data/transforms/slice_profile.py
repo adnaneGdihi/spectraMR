@@ -40,7 +40,6 @@ sequences yielding arbitrary magnetisation vectors. Magn Reson Med 1989;
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -49,79 +48,18 @@ import torch.nn.functional as F
 import torchio as tio
 
 from spectramr.data.transforms.registry import register_transform
+from spectramr.infrastructure.physics.degradations.blocks.slice_physics import (
+    slice_profile_kernel,
+)
 
 __all__ = ["SliceProfileTransform"]
 
 
-# Hand-tuned SLR profile — 33-tap symmetric kernel from a canonical
-# 90°-pulse SLR design (BW * T = 4). Cached as a constant so we don't
-# pull in scipy.signal at import time.
-_SLR_KERNEL_33 = (
-    -0.0014,
-    -0.0028,
-    -0.0027,
-    0.0011,
-    0.0083,
-    0.0151,
-    0.0150,
-    0.0035,
-    -0.0177,
-    -0.0392,
-    -0.0469,
-    -0.0306,
-    0.0085,
-    0.0623,
-    0.1209,
-    0.1700,
-    0.1908,
-    0.1700,
-    0.1209,
-    0.0623,
-    0.0085,
-    -0.0306,
-    -0.0469,
-    -0.0392,
-    -0.0177,
-    0.0035,
-    0.0150,
-    0.0151,
-    0.0083,
-    0.0011,
-    -0.0027,
-    -0.0028,
-    -0.0014,
-)
-
-
-def _sinc_gauss_kernel(fwhm_voxels: float, length: int) -> np.ndarray:
-    """Apodised sinc profile, FWHM specified in voxels along the z axis."""
-    half = (length - 1) / 2.0
-    x = np.arange(length, dtype=np.float64) - half
-    sigma = fwhm_voxels / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-    sinc = np.sinc(x / max(fwhm_voxels, 1e-3))
-    gauss = np.exp(-(x**2) / (2.0 * sigma**2))
-    k = sinc * gauss
-    k = k - k.mean()
-    k = k + abs(k.min())  # ensure non-negative
-    return k / k.sum()
-
-
-def _gauss_kernel(fwhm_voxels: float, length: int) -> np.ndarray:
-    half = (length - 1) / 2.0
-    x = np.arange(length, dtype=np.float64) - half
-    sigma = fwhm_voxels / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-    k = np.exp(-(x**2) / (2.0 * sigma**2))
-    return k / k.sum()
-
-
-def _slr_kernel() -> np.ndarray:
-    return np.array(_SLR_KERNEL_33, dtype=np.float64)
-
-
+# Profile names this transform accepts -> slice_physics kernel kinds.
 _PROFILE_FNS = {
-    "sinc_gauss": _sinc_gauss_kernel,
-    "gauss": _gauss_kernel,
-    "shinnar_le_roux": lambda *_: _slr_kernel(),
+    "sinc_gauss": "sinc_gauss",
+    "gauss": "gauss",
+    "shinnar_le_roux": "slr",
 }
 
 
@@ -148,7 +86,7 @@ def _convolve_along_axis(
     return out.to(data.dtype)
 
 
-@register_transform("slice_profile")
+@register_transform("slice_profile", modifies=("input", "target"))
 class SliceProfileTransform(tio.Transform):
     r"""Apply a physically realistic slice-profile blur + decimation.
 
@@ -206,8 +144,9 @@ class SliceProfileTransform(tio.Transform):
             z_spacing = float(spacing[self.z_axis - 1]) if self.z_axis >= 1 else 1.0
             fwhm_voxels = max(self.slice_thickness_mm / max(z_spacing, 1e-3), 1.0)
 
-            kernel_fn = _PROFILE_FNS[self.profile]
-            kernel = kernel_fn(fwhm_voxels, self.kernel_length)
+            kernel = slice_profile_kernel(
+                _PROFILE_FNS[self.profile], fwhm_voxels, self.kernel_length
+            )
             blurred = _convolve_along_axis(data, kernel, self.z_axis)
 
             if self.decimate:

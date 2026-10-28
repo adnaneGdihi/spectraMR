@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (  # noqa: E402
+from spectramr.infrastructure.physics.degradations import (  # noqa: E402
     apply_degradation,
     degrade_pulsatile_motion,
     degrade_slice_thickness_pve,

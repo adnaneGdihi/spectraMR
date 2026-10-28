@@ -103,3 +103,63 @@ class TestSoftDTWLoss:
 
         available = list_available()
         assert "soft_dtw" in available
+
+
+def _cellwise_soft_dtw(pred: torch.Tensor, target: torch.Tensor, gamma: float) -> torch.Tensor:
+    """The per-cell double loop the anti-diagonal sweep replaced."""
+    b, n, m = pred.shape[0], pred.shape[1], target.shape[1]
+    dist = torch.cdist(pred, target, p=2.0).pow(2)
+    r = torch.full((b, n + 1, m + 1), float("inf"), dtype=pred.dtype)
+    r[:, 0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            stack = torch.stack([r[:, i - 1, j - 1], r[:, i - 1, j], r[:, i, j - 1]], dim=-1)
+            r[:, i, j] = dist[:, i - 1, j - 1] - gamma * torch.logsumexp(-stack / gamma, dim=-1)
+    return r[:, n, m]
+
+
+def _windowed_reference(pred: torch.Tensor, target: torch.Tensor, w: int, stride: int, gamma: float) -> torch.Tensor:
+    b, c = pred.shape[0], pred.shape[1]
+    ps = pred.reshape(b, c, -1).permute(0, 2, 1)
+    ts = target.reshape(b, c, -1).permute(0, 2, 1)
+    starts = range(0, ps.shape[1] - w + 1, stride)
+    per_window = [_cellwise_soft_dtw(ps[:, s : s + w], ts[:, s : s + w], gamma).mean() for s in starts]
+    return torch.stack(per_window).sum() / len(per_window)
+
+
+class TestAntiDiagonalSweepEquivalence:
+    """The vectorised DP and batched windows must reproduce the scalar loops."""
+
+    @pytest.mark.parametrize(("n", "m"), [(5, 7), (7, 5), (6, 6), (1, 4), (4, 1)])
+    def test_distance_and_gradient_match_the_cellwise_loop(self, n: int, m: int) -> None:
+        torch.manual_seed(n * 10 + m)
+        a = torch.randn(3, n, 2, dtype=torch.float64, requires_grad=True)
+        b = torch.randn(3, m, 2, dtype=torch.float64, requires_grad=True)
+        ours = _soft_dtw_distance(a, b, gamma=0.3)
+        ref = _cellwise_soft_dtw(a, b, gamma=0.3)
+        torch.testing.assert_close(ours, ref)
+        for g_ours, g_ref in zip(
+            torch.autograd.grad(ours.sum(), [a, b]),
+            torch.autograd.grad(ref.sum(), [a, b]),
+            strict=True,
+        ):
+            torch.testing.assert_close(g_ours, g_ref)
+
+    @pytest.mark.parametrize(("w", "stride"), [(16, 16), (12, 5)])
+    def test_batched_windows_match_the_window_loop(self, w: int, stride: int) -> None:
+        torch.manual_seed(w)
+        pred = torch.rand(2, 2, 6, 8, dtype=torch.float64, requires_grad=True)
+        target = torch.rand(2, 2, 6, 8, dtype=torch.float64)
+        ours = SoftDTWLoss(gamma=0.1, window_size=w, stride_size=stride)(pred, target)
+        ref = _windowed_reference(pred, target, w, stride, 0.1)
+        torch.testing.assert_close(ours, ref)
+        (g_ours,) = torch.autograd.grad(ours, pred)
+        (g_ref,) = torch.autograd.grad(ref, pred)
+        torch.testing.assert_close(g_ours, g_ref)
+
+    def test_many_windows_backpropagate_finitely(self) -> None:
+        pred = torch.rand(2, 1, 32, 32, requires_grad=True)
+        loss = SoftDTWLoss(gamma=0.1, window_size=32)(pred, torch.rand(2, 1, 32, 32))
+        loss.backward()
+        assert pred.grad is not None
+        assert torch.isfinite(pred.grad).all()

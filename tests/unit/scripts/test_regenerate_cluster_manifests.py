@@ -249,3 +249,135 @@ def test_every_dataset_name_in_the_usage_docstring_is_a_real_key():
     assert named, "no --datasets example found in the docstring -- test is vacuous"
     unknown = sorted(set(named) - set(RCM.DATASET_CONFIGS))
     assert not unknown, f"docstring names dataset(s) that do not exist: {unknown}"
+
+
+# ── --min-reps: the repetition-group filter ───────────────────────────
+#
+# A leave-one-out NEX target needs 3 repetitions. Where a group ships fewer,
+# the dataset's two escapes both change the experiment, so the group is dropped
+# at manifest time instead. These pin that it drops the right thing, writes
+# somewhere else, and fails loudly rather than emitting an empty manifest.
+
+
+def _build_nex_tree(root: Path) -> Path:
+    """M4Raw's real naming: ``<patient>_<contrast><NN>``, repetitions in NN."""
+    h5py = pytest.importorskip("h5py")
+    d = root / "databases/m4raw/data/multicoil_train/multicoil_train"
+    d.mkdir(parents=True, exist_ok=True)
+    stems = (
+        # a 3-repetition group -- survives --min-reps 3
+        "2022061007_T101", "2022061007_T102", "2022061007_T103",
+        # a 2-repetition group -- the shape that blocks n2n arm C
+        "2022061008_T101", "2022061008_T102",
+    )
+    for stem in stems:
+        with h5py.File(d / f"{stem}.h5", "w") as f:
+            f.create_dataset("kspace", data=np.zeros((2, 4, 16, 16), dtype=np.complex64))
+    return root / "databases"
+
+
+def test_group_key_matches_the_dataset_convention():
+    """``stem[:-2]`` is what M4RawRepetitionDataset groups on; mirror it exactly."""
+    assert RCM.repetition_group_key("2022061007_T101") == "2022061007_T1"
+    assert RCM.repetition_group_key("2022061007_FLAIR01") == "2022061007_FLAIR"
+
+
+def test_min_reps_drops_only_the_short_group(tmp_path, monkeypatch):
+    databases = _build_nex_tree(tmp_path)
+    rc = _run(monkeypatch, tmp_path, "--data-base", str(databases),
+              "--datasets", "m4raw_multicoil_train", "--min-reps", "3")
+    assert rc == 0
+
+    payload = json.loads((tmp_path / "data/manifests/m4raw_train_nex3.json").read_text())
+    kept = {r["file_id"] for r in payload["records"]}
+    assert kept == {"2022061007_T101", "2022061007_T102", "2022061007_T103"}
+    assert payload["total_records"] == 3
+
+
+def test_min_reps_never_overwrites_the_shared_manifest(tmp_path, monkeypatch):
+    """``m4raw_train.json`` is shared by reconstruction, physics_driven and others.
+
+    Filtering in place would silently change the corpus every one of them trains
+    on, with nothing downstream able to tell.
+    """
+    databases = _build_nex_tree(tmp_path)
+    _run(monkeypatch, tmp_path, "--data-base", str(databases),
+         "--datasets", "m4raw_multicoil_train", "--min-reps", "3")
+    assert (tmp_path / "data/manifests/m4raw_train_nex3.json").exists()
+    assert not (tmp_path / "data/manifests/m4raw_train.json").exists()
+
+
+def test_min_reps_below_two_raises(tmp_path, monkeypatch):
+    databases = _build_nex_tree(tmp_path)
+    with pytest.raises(SystemExit, match="at least 2"):
+        _run(monkeypatch, tmp_path, "--data-base", str(databases),
+             "--datasets", "m4raw_multicoil_train", "--min-reps", "1")
+
+
+def test_min_reps_that_drops_everything_is_a_failure(tmp_path, monkeypatch):
+    """Exiting 0 with no manifest reads as 'the manifests are built'."""
+    databases = _build_nex_tree(tmp_path)
+    with pytest.raises(SystemExit, match="produced no manifest"):
+        _run(monkeypatch, tmp_path, "--data-base", str(databases),
+             "--datasets", "m4raw_multicoil_train", "--min-reps", "9")
+    assert not (tmp_path / "data/manifests/m4raw_train_nex9.json").exists()
+
+
+def test_dry_run_reports_the_filtered_count_and_destination(tmp_path, monkeypatch, capsys):
+    """A dry run that printed the unfiltered pair would describe a different run."""
+    databases = _build_nex_tree(tmp_path)
+    _run(monkeypatch, tmp_path, "--data-base", str(databases),
+         "--datasets", "m4raw_multicoil_train", "--min-reps", "3", "--dry-run")
+    out = capsys.readouterr().out
+    assert "Would index 3 files" in out
+    assert "m4raw_train_nex3.json" in out
+    assert not (tmp_path / "data/manifests").exists()
+
+
+# ── fastMRI acquisition -> contrast ───────────────────────────────────
+#
+# fastMRI filenames carry no contrast token; the protocol lives only in the
+# ``acquisition`` attribute, so a contrast-conditioned arm depends on the builder
+# copying it onto the record the dataset reads.
+
+
+def test_fastmri_acquisition_reaches_the_loader_as_contrast(tmp_path):
+    from spectramr.data.datasets.universal_dataset import parse_fastmri_index
+
+    h5py = pytest.importorskip("h5py")
+    data_root = tmp_path / "databases/fastmri/multicoil_train"
+    data_root.mkdir(parents=True)
+    for stem, acquisition in (("file_brain_AXT2_1", b"AXT2"), ("file_brain_2", "AXFLAIR")):
+        with h5py.File(data_root / f"{stem}.h5", "w") as f:
+            f.create_dataset("kspace", data=np.zeros((2, 4, 16, 8), dtype=np.complex64))
+            f.attrs["acquisition"] = acquisition
+    with h5py.File(data_root / "file_no_attr.h5", "w") as f:
+        f.create_dataset("kspace", data=np.zeros((2, 16, 8), dtype=np.complex64))
+    out = tmp_path / "manifest.json"
+
+    RCM.create_manifest(data_root, tmp_path / "databases", "*.h5", out, "h5")
+
+    records = parse_fastmri_index(str(out), data_root=str(data_root))
+    contrasts = {r["file_id"]: r.get("contrast") for r in records}
+    assert contrasts == {"file_brain_AXT2_1": "AXT2", "file_brain_2": "AXFLAIR", "file_no_attr": None}
+
+
+def test_fastmri_patient_id_reaches_the_record(tmp_path):
+    """split_manifest.py keeps a patient's volumes on one side by this key."""
+    h5py = pytest.importorskip("h5py")
+    data_root = tmp_path / "databases/fastmri/multicoil_train"
+    data_root.mkdir(parents=True)
+    for stem, patient in (("file_brain_1", b"abc123"), ("file_brain_2", None)):
+        with h5py.File(data_root / f"{stem}.h5", "w") as f:
+            f.create_dataset("kspace", data=np.zeros((2, 4, 16, 8), dtype=np.complex64))
+            if patient is not None:
+                f.attrs["patient_id"] = patient
+    out = tmp_path / "manifest.json"
+
+    RCM.create_manifest(data_root, tmp_path / "databases", "*.h5", out, "h5")
+
+    records = json.loads(out.read_text())["records"]
+    assert {r["file_id"]: r.get("patient_id") for r in records} == {
+        "file_brain_1": "abc123",
+        "file_brain_2": None,
+    }

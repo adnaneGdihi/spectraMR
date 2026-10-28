@@ -23,7 +23,7 @@ flow ODE (or SDE if ``stochastic=True``) for inference.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,11 @@ from .diffusion import DiffusionTrainingStrategy
 
 class StochasticInterpolantsStrategy(DiffusionTrainingStrategy):
     """Albergo–Vanden-Eijnden stochastic-interpolant velocity matching."""
+
+    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the interpolant VELOCITY; no
+    #: declared image loss is computed and none is folded.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     @staticmethod
     def _sigma(t: torch.Tensor) -> torch.Tensor:

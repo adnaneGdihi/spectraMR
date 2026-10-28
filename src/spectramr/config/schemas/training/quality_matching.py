@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from spectramr.config.schemas.renames import reject_renamed_keys
 from spectramr.config.schemas.strictness import StrictSchema
 
 __all__ = ["QualityMatchingConfig", "QualityTargetConfig"]
@@ -152,7 +153,11 @@ class QualityTargetConfig(StrictSchema):
                     "matching one subject across two field strengths, so both must "
                     "be named."
                 )
-            if self.source_field_t <= self.target_field_t:
+            if (
+                self.source_field_t is not None
+                and self.target_field_t is not None
+                and self.source_field_t <= self.target_field_t
+            ):
                 raise ValueError(
                     f"source_field_t ({self.source_field_t} T) must EXCEED "
                     f"target_field_t ({self.target_field_t} T). Degradation goes from "
@@ -171,6 +176,10 @@ class QualityTargetConfig(StrictSchema):
 
 class QualityMatchingConfig(StrictSchema):
     """Knobs for fitting a compounded degradation chain to a quality target."""
+
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.quality_matching"))  # type: ignore[arg-type]
+    )
 
     axes: list[str] = Field(
         min_length=1,
@@ -219,7 +228,7 @@ class QualityMatchingConfig(StrictSchema):
             "quality alone is genuinely intended, and say so in metadata.note."
         ),
     )
-    use_acquisition_prior: bool | None = Field(
+    enable_acquisition_prior: bool | None = Field(
         default=None,
         description=(
             "Derive the noise axis's warm start from the two cohorts' ISMRMRD "
@@ -229,14 +238,70 @@ class QualityMatchingConfig(StrictSchema):
             "quality, and the prior selects the physically plausible one. The "
             "voxel-volume term is deliberately excluded -- match_spacing already "
             "realises it, and counting it twice would hand the noise axis a target "
-            "several dB too optimistic. Requires target.source='cohort' and a "
-            "reachable high-quality header; raises rather than guessing a field "
-            "strength.\n\n"
+            "several dB too optimistic. Acquisition is read from an ISMRMRD header (h5) "
+            "or from the JSON sidecar beside a NIfTI volume (MagneticFieldStrength, "
+            "RepetitionTime and EchoTime in seconds). Requires target.source='cohort'; "
+            "raises when the header or sidecar is absent rather than guessing a field "
+            "strength. A NIfTI arm whose volumes carry no sidecar sets this to false.\n\n"
             "None (the default) means AUTO: on when target.source='cohort' (the only "
             "source that carries the low-quality field strength), off otherwise. The "
             "resolved value is read via `acquisition_prior_enabled` and stamped into "
             "the calibration artifact, so 'auto' is a documented rule rather than a "
             "silent fallback. Setting it True against a literal target RAISES."
+        ),
+    )
+    fit_seeds: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of fit seeds (fit_seed, fit_seed+1, ...). The chain synthesised and "
+            "reported is the lowest-residual seed. The spread of theta across seeds is "
+            "reported as theta_mean and theta_sd in the calibration artifact: that spread "
+            "is the estimand for the paired-versus-unpaired comparison, not the sampling "
+            "error of one fit. Costs one full fit per seed."
+        ),
+    )
+    intensity_percentile: float = Field(
+        default=99.0,
+        gt=0.0,
+        le=100.0,
+        description=(
+            "Robust percentile of |volume| used as the shared intensity unit. The HQ "
+            "fit volume, every cohort volume and both sides of the paired agreement are "
+            "divided by their own value at this percentile before anything is measured, "
+            "so attributes are compared in one convention. A literal target is therefore "
+            "read in these normalised units (the percentile lands at 1)."
+        ),
+    )
+    max_residual: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Absolute ceiling on the weighted residual, beside min_gap_closed. The weights "
+            "are 1/target^2, so the residual is a relative error norm: 0.1 means the "
+            "achieved attributes lie within about 10% of target. None disables the "
+            "ceiling. A fit above it RAISES, because min_gap_closed alone passes any "
+            "fit that halves a large gap."
+        ),
+    )
+    held_out_fraction: float = Field(
+        default=0.0,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of PAIRS (= subjects) held out of the fit and used only to score "
+            "agreement with the real low-field scan. Seeded and subject-level. 0 scores "
+            "in-sample. Requires pairing: paired."
+        ),
+    )
+    fit_volumes: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many high-quality volumes the fit runs on. They are taken in selection "
+            "order, imposed on the target grid, and stacked along the slice axis, so the "
+            "chain is fitted to all of them at once. Default 1 fits the first selected "
+            "volume whole (not one loader slice). Raises when fewer volumes are selected."
         ),
     )
     synthesise: bool = Field(
@@ -277,15 +342,40 @@ class QualityMatchingConfig(StrictSchema):
         return v
 
     @model_validator(mode="after")
+    def _severities_are_identified(self) -> QualityMatchingConfig:
+        # One attribute constrains one severity. More axes than attributes give a
+        # zero-residual curve, not a point: the fit then reports whichever theta the seed
+        # lands on (issue #2411). A motion axis therefore needs its own attribute, and
+        # until one is declared rigid motion is held at zero by leaving it out.
+        if len(self.axes) > len(self.target.attributes):
+            raise ValueError(
+                f"{len(self.axes)} axes {list(self.axes)} are fitted against "
+                f"{len(self.target.attributes)} attribute(s) {self.target.attributes}: the "
+                "severities are unidentified and the fit lands on a curve. Drop an axis "
+                "(rigid_motion is held at zero by omitting it) or add an attribute that "
+                "constrains it."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _held_out_needs_pairs(self) -> QualityMatchingConfig:
+        if self.held_out_fraction > 0.0 and self.target.pairing != "paired":
+            raise ValueError(
+                "held_out_fraction > 0 requires target.pairing: paired. Only pairs carry "
+                "a same-subject reference to score against; an unpaired cohort has none."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _acquisition_prior_is_resolvable(self) -> QualityMatchingConfig:
         # The prior needs the LOW-quality cohort's field strength, which only a
         # cohort source can supply. Catching it here beats failing after the fit.
         # Guard the EXPLICIT request, not the resolved default: a new validation
         # that rejects the library default would invalidate every existing
         # literal-target config for a knob its author never set.
-        if self.use_acquisition_prior is True and self.target.source != "cohort":
+        if self.enable_acquisition_prior is True and self.target.source != "cohort":
             raise ValueError(
-                "use_acquisition_prior=true requires target.source='cohort': the "
+                "enable_acquisition_prior=true requires target.source='cohort': the "
                 "prior reads the low-quality cohort's field strength from its own "
                 "headers, and a literal target has none. Leave it unset (auto) or "
                 "set it false."
@@ -295,9 +385,9 @@ class QualityMatchingConfig(StrictSchema):
     @property
     def acquisition_prior_enabled(self) -> bool:
         """Resolved value of the auto default. Read this, never the raw field."""
-        if self.use_acquisition_prior is None:
+        if self.enable_acquisition_prior is None:
             return self.target.source == "cohort"
-        return bool(self.use_acquisition_prior)
+        return bool(self.enable_acquisition_prior)
 
     @model_validator(mode="after")
     def _spacing_is_resolvable(self) -> QualityMatchingConfig:

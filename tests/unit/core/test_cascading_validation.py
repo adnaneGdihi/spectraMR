@@ -637,3 +637,133 @@ class TestResolveCascadeLevels:
 
         with pytest.raises(ValueError, match="must be a sequence"):
             normalize_cascade_levels(bad)
+
+
+class TestFlattenBandRecords:
+    """Per-reveal-band attribution, summarised into cascade-row columns (#2067).
+
+    Planted violations first: each assertion below fails against one specific
+    way the summary could lie about what was measured.
+    """
+
+    @staticmethod
+    def _records():
+        nan = float("nan")
+        return [
+            # An OOD-written band: shrunk and rotated.
+            {"step": 0, "timestep": 7, "n_bins": 32, "gain_modulus": 0.74, "gain_phase_rad": 0.30},
+            # An inert step -- the loop revealed nothing and skipped it.
+            {"step": 1, "timestep": 3, "n_bins": 0, "gain_modulus": nan, "gain_phase_rad": nan},
+            # The decisive band, written at a trained timestep.
+            {"step": 2, "timestep": 1, "n_bins": 64, "gain_modulus": 0.93, "gain_phase_rad": -0.10},
+            # The observed support, pinned to the measurement by hard DC.
+            {"step": -1, "timestep": -1, "n_bins": 16, "gain_modulus": 1.0, "gain_phase_rad": 0.0},
+        ]
+
+    def test_inert_bands_are_excluded_from_every_aggregate(self):
+        """PLANTED: a nan band. Averaging it in would report an unmeasured step."""
+        from spectramr.core.cascading_validation import flatten_band_records
+
+        out = flatten_band_records(self._records())
+        assert out["val_band_count"] == 2.0
+        assert out["val_band_gain_modulus_mean"] == pytest.approx((0.74 + 0.93) / 2)
+
+    def test_the_observed_support_is_reported_separately_not_pooled(self):
+        """PLANTED: a perfect observed gain that would flatter the inferred mean."""
+        from spectramr.core.cascading_validation import flatten_band_records
+
+        out = flatten_band_records(self._records())
+        assert out["val_band_observed_gain_modulus"] == 1.0
+        assert out["val_band_gain_modulus_min"] == 0.74
+        assert out["val_band_gain_modulus_mean"] < 1.0, "the hard-DC floor must not pool in"
+
+    def test_the_worst_band_names_its_timestep(self):
+        from spectramr.core.cascading_validation import flatten_band_records
+
+        assert flatten_band_records(self._records())["val_band_worst_timestep"] == 7.0
+
+    def test_phase_is_summarised_by_absolute_value(self):
+        """A +0.30 and a -0.10 band must not cancel to a healthy-looking mean."""
+        from spectramr.core.cascading_validation import flatten_band_records
+
+        out = flatten_band_records(self._records())
+        assert out["val_band_phase_rad_absmax"] == pytest.approx(0.30)
+        assert out["val_band_phase_rad_absmean"] == pytest.approx(0.20)
+
+    def test_no_measurable_band_reports_none_not_zero(self):
+        """PLANTED: every band inert. Zero would read as a total loss of signal."""
+        from spectramr.core.cascading_validation import flatten_band_records
+
+        nan = float("nan")
+        out = flatten_band_records(
+            [{"step": 0, "timestep": 1, "n_bins": 0, "gain_modulus": nan, "gain_phase_rad": nan}]
+        )
+        assert out["val_band_count"] == 0.0
+        assert out["val_band_gain_modulus_min"] is None
+        assert out["val_band_worst_timestep"] is None
+        assert out["val_band_observed_gain_modulus"] is None
+
+
+# ---------------------------------------------------------------------------
+# An unmeasurable band among measurable ones.
+#
+# `min` seeds on element 0 and every `k < nan` is False, so selecting the worst
+# band from the UNFILTERED list returned a nan record whenever it came first --
+# while `val_band_gain_modulus_min` came from the filtered one. The two columns
+# then named different reverse steps, and the one labelled "worst" was the band
+# that was never measured.
+#
+# The tests already here plant nan only with `n_bins: 0`, which is exactly what
+# `inferred` excludes, so none of them could see it (non-negotiable 15).
+# ---------------------------------------------------------------------------
+
+
+def _band(step, timestep, modulus, *, n_bins=4):
+    return {
+        "step": step,
+        "timestep": timestep,
+        "n_bins": n_bins,
+        "gain_modulus": modulus,
+        "gain_phase_rad": 0.1 if modulus == modulus else float("nan"),
+    }
+
+
+@pytest.mark.unit
+def test_worst_band_and_min_modulus_name_the_same_step():
+    """A band with n_bins > 0 and zero target energy yields nan and survives the
+    n_bins filter -- reachable at high |k| on a cropped acquisition."""
+    from spectramr.core.cascading_validation import flatten_band_records
+
+    nan = float("nan")
+    out = flatten_band_records([_band(0, 9, nan), _band(1, 5, 0.31), _band(2, 1, 0.88)])
+
+    assert out["val_band_gain_modulus_min"] == pytest.approx(0.31)
+    assert out["val_band_worst_timestep"] == pytest.approx(5.0), (
+        "the worst-band column named the UNMEASURED band while the minimum came "
+        "from a measured one"
+    )
+
+
+@pytest.mark.unit
+def test_a_trailing_unmeasurable_band_is_also_ignored():
+    """The non-leading case worked by accident before; it must still hold."""
+    from spectramr.core.cascading_validation import flatten_band_records
+
+    nan = float("nan")
+    out = flatten_band_records([_band(0, 1, 0.88), _band(1, 9, nan), _band(2, 5, 0.31)])
+
+    assert out["val_band_gain_modulus_min"] == pytest.approx(0.31)
+    assert out["val_band_worst_timestep"] == pytest.approx(5.0)
+
+
+@pytest.mark.unit
+def test_all_bands_unmeasurable_reports_nothing_not_a_gain():
+    """An unmeasured quantity is reported as unmeasured, never as a gain."""
+    from spectramr.core.cascading_validation import flatten_band_records
+
+    nan = float("nan")
+    out = flatten_band_records([_band(0, 9, nan), _band(1, 5, nan)])
+
+    assert out["val_band_gain_modulus_min"] is None
+    assert out["val_band_worst_timestep"] is None
+    assert out["val_band_count"] == 2.0, "the bands existed; only their gain did not"

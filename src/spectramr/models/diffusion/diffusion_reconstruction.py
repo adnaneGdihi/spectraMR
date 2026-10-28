@@ -488,7 +488,7 @@ class DiffusionPosteriorSampling(nn.Module):
 
 
 @register_model(name="diffusion_reconstruction", training_mode="reconstruction")
-class ReconstructionWithDiffusionPrior:
+class ReconstructionWithDiffusionPrior(nn.Module):
     """High-level interface for diffusion prior-based reconstruction."""
 
     def __init__(
@@ -507,6 +507,7 @@ class ReconstructionWithDiffusionPrior:
             noise_scheduler (Optional[Callable]): Description.
             forward_operator (Optional[Callable]): Description.
         """
+        super().__init__()
         self.method = method
 
         if method == "pnp":
@@ -541,7 +542,7 @@ class ReconstructionWithDiffusionPrior:
         else:
             raise ValueError(f"Unknown reconstruction method: {method}")
 
-    def __call__(
+    def forward(
         self,
         y: torch.Tensor,
         mask: torch.Tensor | None = None,

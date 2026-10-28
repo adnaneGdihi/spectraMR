@@ -74,8 +74,7 @@ def test_resolve_populates_adapter_chain_from_config() -> None:
     # resolver must look declared adapters up in the registry.
     cfg = _fake_config(
         adapters=SimpleNamespace(
-            pre_loss_pred=[SimpleNamespace(name="ifft_kspace_to_image")],
-            pre_loss_target=[],
+            pre_loss_target=[SimpleNamespace(name="ifft_kspace_to_image")],
             pre_model=[],
             post_model=[],
             pre_metric=[],

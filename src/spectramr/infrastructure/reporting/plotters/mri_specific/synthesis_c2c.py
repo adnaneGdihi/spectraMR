@@ -1,6 +1,6 @@
 r"""Figure A.2 — Contrast-to-contrast synthesis.
 
-Per-row layout (6 columns):
+Per-row layout (6 columns; 5 when the cases carry no input):
 
     input | synthesised | real target | residual + colorbar | residual histogram | joint histogram (with MI)
 
@@ -27,7 +27,7 @@ from spectramr.infrastructure.reporting.plotters._comparison_helpers import (
     add_residual_histogram,
     add_residual_panel,
 )
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import use_default_style, save_plot
 
 
 def _mutual_information(x: np.ndarray, y: np.ndarray, bins: int = 64) -> float:
@@ -46,21 +46,34 @@ def make(
     out_path: str | Path,
     *,
     cases: Sequence[dict] | None = None,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path | None:
     """Build the c2c synthesis figure.
 
     Args:
-        cases: dicts with arrays ``input``, ``pred``, ``target`` (real
-            target). Optional ``name`` for the row label.
+        cases: dicts with arrays ``pred``, ``target`` (real target) and, when
+            recorded, ``input``; the input column is drawn only if every case has
+            one. Optional ``name`` for the row label.
     """
     if cases is None or len(cases) == 0:
         return None
     out_path = Path(out_path)
 
     use_default_style()
+    # Cases from saved PNG pairs carry no input, and the loader refuses to invent one.
+    has_input = all("input" in case for case in cases)
+    col_titles = (["input contrast"] if has_input else []) + [
+        "synthesised",
+        "real target",
+        "residual (synth \u2212 real)",
+        "residual histogram",
+        "joint histogram",
+    ]
+    off = len(col_titles) - 5
     n_rows = len(cases)
-    n_cols = 6
+    n_cols = len(col_titles)
     col_w, row_h = 1.65, 1.6
     fig, axes = plt.subplots(
         n_rows,
@@ -69,53 +82,46 @@ def make(
         squeeze=False,
         gridspec_kw={"wspace": 0.22, "hspace": 0.20},
     )
-    col_titles = [
-        "input contrast",
-        "synthesised",
-        "real target",
-        "residual (synth − real)",
-        "residual histogram",
-        "joint histogram",
-    ]
 
     for r, case in enumerate(cases):
-        x = np.asarray(case["input"]).squeeze().astype(float)
         pred = np.asarray(case["pred"]).squeeze().astype(float)
         target = np.asarray(case["target"]).squeeze().astype(float)
         row_label = case.get("name")
 
+        if has_input:
+            add_image_panel(
+                axes[r][0],
+                np.asarray(case["input"]).squeeze().astype(float),
+                title=col_titles[0] if r == 0 else None,
+                row_label=row_label,
+            )
         add_image_panel(
-            axes[r][0],
-            x,
-            title=col_titles[0] if r == 0 else None,
-            row_label=row_label,
-        )
-        add_image_panel(
-            axes[r][1],
+            axes[r][off],
             pred,
-            title=col_titles[1] if r == 0 else None,
+            title=col_titles[off] if r == 0 else None,
             metric_str=_format_metric_str(pred, target),
+            row_label=None if has_input else row_label,
         )
         add_image_panel(
-            axes[r][2],
+            axes[r][off + 1],
             target,
-            title=col_titles[2] if r == 0 else None,
+            title=col_titles[off + 1] if r == 0 else None,
         )
         abs_max, residual = add_residual_panel(
-            axes[r][3],
+            axes[r][off + 2],
             pred,
             target,
-            title=col_titles[3] if r == 0 else None,
+            title=col_titles[off + 2] if r == 0 else None,
             fig=fig,
         )
         add_residual_histogram(
-            axes[r][4],
+            axes[r][off + 3],
             residual,
             abs_max=abs_max,
-            title=col_titles[4] if r == 0 else None,
+            title=col_titles[off + 3] if r == 0 else None,
         )
-        # 6. Joint histogram of (target, pred) intensities with MI annotation
-        ax = axes[r][5]
+        # Joint histogram of (target, pred) intensities with MI annotation
+        ax = axes[r][off + 4]
         h, _, _ = np.histogram2d(
             target.ravel(),
             pred.ravel(),
@@ -149,13 +155,8 @@ def make(
         ax.set_ylabel("synth intensity", fontsize=7)
         ax.tick_params(labelsize=6)
         if r == 0:
-            ax.set_title(col_titles[5], fontsize=8)
+            ax.set_title(col_titles[off + 4], fontsize=8)
 
     if metadata is not None:
         stamp_figure(fig, metadata)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi, metadata=metadata)

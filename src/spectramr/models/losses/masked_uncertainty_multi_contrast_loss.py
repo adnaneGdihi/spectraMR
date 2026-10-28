@@ -115,7 +115,8 @@ class MaskedUncertaintyMultiContrastLoss(nn.Module):
             )
 
         cid = self._normalise_contrast_id(contrast_id, batch_size=pred.shape[0], device=pred.device)
-        if int(cid.max().item()) >= self.n_contrasts or int(cid.min().item()) < 0:
+        # One host sync for the range guard; the message is only built on failure.
+        if bool(((cid < 0) | (cid >= self.n_contrasts)).any()):
             raise ValueError(
                 f"contrast_id values must be in [0, {self.n_contrasts}), "
                 f"got min={int(cid.min().item())} max={int(cid.max().item())}"
@@ -136,24 +137,19 @@ class MaskedUncertaintyMultiContrastLoss(nn.Module):
 
         per_sample_l1 = residual.flatten(1).sum(dim=1) / denom  # (B,)
 
-        # Aggregate per contrast and weight by 1 / (2 * sigma^2) + log sigma.
-        total = pred.new_zeros(())
-        present = 0
-        for c in range(self.n_contrasts):
-            sel = cid == c
-            if not bool(sel.any()):
-                continue
-            present += 1
-            l1_c = per_sample_l1[sel].mean()
-            log_sigma_c = self.log_sigma[c]
-            precision = (-2.0 * log_sigma_c).exp().clamp_min(self.eps)
-            total = total + 0.5 * precision * l1_c + log_sigma_c
-
-        if present == 0:
-            # Defensive: should not happen if contrast_id was validated.
-            return per_sample_l1.mean() * pred.new_zeros(())
+        # Per-contrast mean L1 by scatter-add, weighted by 1 / (2 sigma^2) + log sigma;
+        # contrasts absent from the batch are masked out rather than branched on.
+        counts = torch.zeros(self.n_contrasts, device=pred.device, dtype=per_sample_l1.dtype)
+        counts = counts.index_add(0, cid, torch.ones_like(per_sample_l1))
+        sums = torch.zeros_like(counts).index_add(0, cid, per_sample_l1)
+        present = counts > 0
+        l1_c = sums / counts.clamp_min(1.0)
+        precision = (-2.0 * self.log_sigma).exp().clamp_min(self.eps)
+        per_contrast = 0.5 * precision * l1_c + self.log_sigma
+        terms = torch.where(present, per_contrast, torch.zeros_like(per_contrast))
+        total = terms.sum()
         if self.reduction == "mean":
-            total = total / present
+            total = total / present.sum()
         return total
 
     # ------------------------------------------------------------------

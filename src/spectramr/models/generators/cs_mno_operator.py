@@ -16,17 +16,35 @@ See ``docs/cs_mno.rst`` for math + usage and
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from spectramr.models.blocks.cs_mno_layer import CSMNOLayer
 from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
     resolution_agnostic_mode,
 )
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.registry import register_model
+
+#: ``physical``: the per-token arc length of the curve (Theorem A).
+#: ``fixed_resolution``: one scalar step ``N**(-1/d)`` on every token, the
+#: scale-matched control for the arc arm (same magnitude, no per-token term).
+ARC_STEP_MODES = ("physical", "fixed_resolution")
+
+
+def _arc_delta(
+    linearizer: ImageTopologyLinearizer, spatial_shape: tuple[int, ...], arc_step: str
+) -> torch.Tensor:
+    """Per-token Δt for ``spatial_shape`` under the declared ``arc_step`` mode."""
+    if arc_step == "physical":
+        return linearizer.physical_arc_delta()
+    n_tokens = math.prod(spatial_shape)
+    return torch.full((n_tokens,), n_tokens ** (-1.0 / len(spatial_shape)), dtype=torch.float32)
 
 __all__ = ["CSMNOOperator"]
 
@@ -49,7 +67,7 @@ __all__ = ["CSMNOOperator"]
     accepts_complex=False,
     requires_paired_data=True,
 )
-class CSMNOOperator(nn.Module):
+class CSMNOOperator(GradCheckpointingMixin, nn.Module):
     """Continuous-SFC Spectral-Local Mamba Neural Operator.
 
     Args:
@@ -69,6 +87,10 @@ class CSMNOOperator(nn.Module):
                           at construction time — no silent fallback.
         use_physical_arc: If True, scale the Mamba Δt by the physical
                           arc length of the SFC step (Theorem A).
+        arc_step:         ``"physical"`` (default) or ``"fixed_resolution"``.
+                          The latter replaces the per-token arc with one
+                          scalar step ``N**(-1/d)``; it needs
+                          ``use_physical_arc=True`` and is the control arm.
         disable_spectral: If True, drop the FNO spectral branch from
                           every layer. Used by HS-MNO (no spectral,
                           discrete Δ) and C-MNO (no spectral, physical
@@ -89,6 +111,7 @@ class CSMNOOperator(nn.Module):
         use_physical_arc: bool = True,
         disable_spectral: bool = False,
         activation: str = "gelu",
+        arc_step: str = "physical",
         **_unused: Any,  # absorb config keys not relevant here
     ) -> None:
         super().__init__()
@@ -97,6 +120,15 @@ class CSMNOOperator(nn.Module):
         if spatial_dims not in (1, 2, 3):
             raise ValueError(
                 f"CSMNOOperator: spatial_shape must be 1-D, 2-D, or 3-D, got rank {spatial_dims}"
+            )
+        if arc_step not in ARC_STEP_MODES:
+            raise ValueError(
+                f"CSMNOOperator: arc_step must be one of {ARC_STEP_MODES}, got {arc_step!r}"
+            )
+        if arc_step != "physical" and not use_physical_arc:
+            raise ValueError(
+                f"CSMNOOperator: arc_step={arc_step!r} only applies with use_physical_arc=True; "
+                "with use_physical_arc=False the step is the learnt scalar and the knob would be inert."
             )
         # Cross-check that the scan mode dimension matches the spatial rank.
         if scan_mode.endswith("_3d") and spatial_dims != 3:
@@ -152,9 +184,12 @@ class CSMNOOperator(nn.Module):
         self.register_buffer("inverse_idx", linearizer.inverse_idx.clone())
         self.register_buffer(
             "delta_phys",
-            linearizer.physical_arc_delta() if use_physical_arc else torch.zeros(0),
+            _arc_delta(linearizer, self.spatial_shape, arc_step)
+            if use_physical_arc
+            else torch.zeros(0),
         )
         self.use_physical_arc = use_physical_arc
+        self.arc_step = arc_step
         # F37 / 2026-05-22 — the SFC linearization indices were fixed at
         # construction and ``forward`` hard-raised on any other shape. That
         # crashed validation for every *_mno arm: training feeds the
@@ -200,7 +235,7 @@ class CSMNOOperator(nn.Module):
             fwd = linearizer.forward_idx.clone().to(device)
             inv = linearizer.inverse_idx.clone().to(device)
             delta = (
-                linearizer.physical_arc_delta().to(device)
+                _arc_delta(linearizer, spatial_shape, self.arc_step).to(device)
                 if self.use_physical_arc
                 else torch.zeros(0, device=device)
             )
@@ -223,11 +258,14 @@ class CSMNOOperator(nn.Module):
                 squeezed to match ``self.spatial_shape``.
 
         Returns:
-            ``[B, C_out, *spatial_shape]``.
+            ``[B, C_out, *spatial_shape]`` followed by the trailing singleton
+            dims the input carried, so the output has the input's rank.
         """
         expected_rank = len(self.spatial_shape)
+        squeezed = 0
         while x.ndim - 2 > expected_rank and x.shape[-1] == 1:
             x = x.squeeze(-1)
+            squeezed += 1
         in_shape = tuple(x.shape[2:])
         if len(in_shape) != expected_rank:
             raise ValueError(
@@ -243,5 +281,10 @@ class CSMNOOperator(nn.Module):
 
         h = self.lift(x)
         for layer in self.layers:
-            h = layer(h, forward_idx, inverse_idx, delta)
-        return self.project(h)
+            if self._checkpointing_active():
+                h = checkpoint(layer, h, forward_idx, inverse_idx, delta, use_reentrant=False)
+            else:
+                h = layer(h, forward_idx, inverse_idx, delta)
+        out = self.project(h)
+        # The target keeps the singleton dims; a lower-rank output cannot be scored against it.
+        return out.reshape(*out.shape, *([1] * squeezed))

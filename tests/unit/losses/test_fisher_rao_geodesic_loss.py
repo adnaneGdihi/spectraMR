@@ -1,12 +1,9 @@
-"""Unit tests for the Fisher-Rao geodesic information-geometry loss.
+"""Unit tests for the voxelwise Rician Fisher-Rao geodesic loss.
 
-Covers registry membership, scalar-tensor output, near-zero loss when
-prediction == target, strict positivity otherwise, and -- crucially -- that
-the loss genuinely encodes the Fisher-Rao metric rather than a plain
-Euclidean residual: it must exercise the
-``infrastructure.physics.fisher_rao_geometry`` primitive and respond to the
-Fisher-Rao scaling (a variance-distance is down-weighted by the local
-metric, so the loss differs from plain L2 on the same displacement).
+The derivation is guarded three ways: the quadrature J(u) matches a Monte
+Carlo estimate of the squared score, J has the Rayleigh (u^2) and Gaussian (1)
+limits, and the loss reduces to the MSE at high SNR while departing from it
+near the noise floor.
 """
 
 from __future__ import annotations
@@ -16,133 +13,107 @@ import torch
 
 from spectramr.models.losses.fisher_rao_geodesic_loss import (
     FisherRaoGeodesicLoss,
+    rician_fisher_information,
 )
 from spectramr.models.losses.registry import LossRegistry, create_loss
-
-
-def _img(mean: float, std: float, h: int = 16, w: int = 16) -> torch.Tensor:
-    """Deterministic [1, 1, H, W] field with a controlled mean/std."""
-    g = torch.linspace(-1.0, 1.0, h * w).reshape(1, 1, h, w)
-    g = (g - g.mean()) / (g.std() + 1e-8)
-    return g * std + mean
 
 
 class TestRegistration:
     def test_registered_under_canonical_name(self) -> None:
         assert "fisher_rao_geodesic" in LossRegistry.list_available()
 
-    def test_create_loss_returns_instance(self) -> None:
-        loss = create_loss("fisher_rao_geodesic")
-        assert isinstance(loss, FisherRaoGeodesicLoss)
-
     def test_aliases_resolve(self) -> None:
         for alias in ("fisher_rao_flow", "fr_geodesic", "information_geometry_geodesic"):
-            assert isinstance(create_loss(alias), FisherRaoGeodesicLoss)
+            loss = create_loss(alias, noise_sigma=0.02)
+            assert isinstance(loss, FisherRaoGeodesicLoss)
 
     def test_domain_is_image(self) -> None:
-        meta = LossRegistry._loss_domains["fisher_rao_geodesic"]
-        assert meta["domain"] == "image"
+        assert LossRegistry._loss_domains["fisher_rao_geodesic"]["domain"] == "image"
 
 
-class TestForwardContract:
-    def test_returns_scalar_tensor(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        out = loss(_img(0.5, 0.3), _img(0.7, 0.4))
-        assert isinstance(out, torch.Tensor)
-        assert out.ndim == 0
+class TestValidation:
+    @pytest.mark.parametrize("sigma", [None, 0.0, -0.1])
+    def test_noise_sigma_is_required_and_positive(self, sigma: float | None) -> None:
+        with pytest.raises(ValueError, match="noise_sigma"):
+            FisherRaoGeodesicLoss(noise_sigma=sigma)
 
-    def test_zero_when_identical(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        x = _img(0.5, 0.3)
-        out = loss(x, x.clone())
-        assert out.item() == pytest.approx(0.0, abs=1e-5)
-
-    def test_positive_when_different(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        out = loss(_img(0.2, 0.3), _img(0.9, 0.6))
-        assert out.item() > 0.0
-
-    def test_shape_mismatch_raises(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        with pytest.raises(ValueError):
-            loss(_img(0.5, 0.3, h=16, w=16), _img(0.5, 0.3, h=8, w=8))
+    def test_unknown_likelihood_raises(self) -> None:
+        with pytest.raises(ValueError, match="likelihood"):
+            FisherRaoGeodesicLoss(noise_sigma=0.02, likelihood="rice")
 
     def test_invalid_reduction_raises(self) -> None:
-        with pytest.raises(ValueError):
-            FisherRaoGeodesicLoss(reduction="median")
+        with pytest.raises(ValueError, match="reduction"):
+            FisherRaoGeodesicLoss(noise_sigma=0.02, reduction="median")
 
-    def test_sum_reduction_differs_from_mean(self) -> None:
-        a = torch.cat([_img(0.1, 0.2), _img(0.8, 0.5)], dim=0)
-        b = torch.cat([_img(0.4, 0.3), _img(0.2, 0.7)], dim=0)
-        mean_l = FisherRaoGeodesicLoss(reduction="mean")(a, b)
-        sum_l = FisherRaoGeodesicLoss(reduction="sum")(a, b)
-        # sum over batch of 2 strictly positive terms exceeds their mean.
-        assert sum_l.item() > mean_l.item()
-
-    def test_is_differentiable(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        pred = _img(0.3, 0.4).requires_grad_(True)
-        out = loss(pred, _img(0.7, 0.2))
-        out.backward()
-        assert pred.grad is not None
-        assert torch.isfinite(pred.grad).all()
+    def test_shape_mismatch_raises(self) -> None:
+        loss = FisherRaoGeodesicLoss(noise_sigma=0.02)
+        with pytest.raises(ValueError, match="shape"):
+            loss(torch.zeros(1, 1, 8, 8), torch.zeros(1, 1, 4, 4))
 
 
-class TestFisherRaoGeometry:
-    """The loss must honour the Fisher-Rao metric, not Euclidean distance."""
+class TestFisherInformation:
+    def test_limits(self) -> None:
+        j = rician_fisher_information(torch.tensor([0.0, 0.05, 32.0]))
+        assert j[0].item() == pytest.approx(0.0, abs=1e-12)
+        assert (j[1] / 0.05**2).item() == pytest.approx(1.0, abs=0.01)
+        assert j[2].item() == pytest.approx(1.0, abs=1e-3)
 
-    def test_primitive_is_exercised(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """fisher_norm from the primitive must be called during forward."""
-        import spectramr.models.losses.fisher_rao_geodesic_loss as mod
+    @pytest.mark.parametrize("u", [0.5, 1.5, 3.0])
+    def test_matches_monte_carlo_score_variance(self, u: float) -> None:
+        g = torch.Generator().manual_seed(0)
+        n = 400_000
+        re = u + torch.randn(n, generator=g, dtype=torch.float64)
+        im = torch.randn(n, generator=g, dtype=torch.float64)
+        r = (re**2 + im**2).sqrt()
+        score = r * torch.special.i1e(r * u) / torch.special.i0e(r * u) - u
+        mc = (score**2).mean().item()
+        quad = rician_fisher_information(torch.tensor([u])).item()
+        assert quad == pytest.approx(mc, rel=0.01)
 
-        calls = {"n": 0}
-        real = mod.fisher_norm
 
-        def spy(*args, **kwargs):  # type: ignore[no-untyped-def]
-            calls["n"] += 1
-            return real(*args, **kwargs)
+class TestLoss:
+    def test_zero_when_identical(self) -> None:
+        x = torch.rand(2, 1, 16, 16)
+        assert FisherRaoGeodesicLoss(noise_sigma=0.02)(x, x.clone()).item() == 0.0
 
-        monkeypatch.setattr(mod, "fisher_norm", spy)
-        FisherRaoGeodesicLoss()(_img(0.2, 0.3), _img(0.6, 0.5))
-        assert calls["n"] > 0
+    def test_high_snr_limit_is_mse(self) -> None:
+        g = torch.Generator().manual_seed(1)
+        target = 0.5 + 0.5 * torch.rand(1, 1, 32, 32, generator=g)
+        pred = target + 0.05 * torch.randn(1, 1, 32, 32, generator=g)
+        loss = FisherRaoGeodesicLoss(noise_sigma=0.005)(pred, target)
+        mse = (pred - target).square().mean()
+        assert loss.item() == pytest.approx(mse.item(), rel=1e-3)
 
-    def test_metric_uses_fisher_information_primitive(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import spectramr.models.losses.fisher_rao_geodesic_loss as mod
+    def test_gaussian_likelihood_is_exactly_mse(self) -> None:
+        g = torch.Generator().manual_seed(2)
+        target = torch.rand(1, 1, 16, 16, generator=g)
+        pred = torch.rand(1, 1, 16, 16, generator=g)
+        loss = FisherRaoGeodesicLoss(noise_sigma=0.05, likelihood="gaussian")(pred, target)
+        assert loss.item() == pytest.approx((pred - target).square().mean().item(), rel=1e-4)
 
-        calls = {"n": 0}
-        real = mod.fisher_information_from_jacobian
+    def test_noise_floor_errors_are_discounted(self) -> None:
+        sigma = 0.05
+        rician = FisherRaoGeodesicLoss(noise_sigma=sigma)
+        gaussian = FisherRaoGeodesicLoss(noise_sigma=sigma, likelihood="gaussian")
+        dark_t, dark_p = torch.full((1, 1, 4, 4), 0.0), torch.full((1, 1, 4, 4), 0.5 * sigma)
+        bright_t, bright_p = torch.full((1, 1, 4, 4), 0.8), torch.full((1, 1, 4, 4), 0.8 + 0.5 * sigma)
+        assert rician(dark_p, dark_t) < 0.1 * gaussian(dark_p, dark_t)
+        assert rician(bright_p, bright_t).item() == pytest.approx(
+            gaussian(bright_p, bright_t).item(), rel=1e-2
+        )
 
-        def spy(*args, **kwargs):  # type: ignore[no-untyped-def]
-            calls["n"] += 1
-            return real(*args, **kwargs)
+    def test_negative_prediction_is_pulled_back(self) -> None:
+        loss = FisherRaoGeodesicLoss(noise_sigma=0.02)
+        target = torch.full((1, 1, 4, 4), 0.3)
+        pred = torch.full((1, 1, 4, 4), -0.3, requires_grad=True)
+        loss(pred, target).backward()
+        assert pred.grad is not None and (pred.grad < 0).all()
 
-        monkeypatch.setattr(mod, "fisher_information_from_jacobian", spy)
-        FisherRaoGeodesicLoss()(_img(0.2, 0.3), _img(0.6, 0.5))
-        assert calls["n"] > 0
-
-    def test_metric_consistent_not_euclidean(self) -> None:
-        r"""Fisher-Rao curves the parameter space: a fixed Euclidean
-        displacement in (mean, log-std) costs *less* when the local
-        std (the natural scale) is large. So two pairs with the SAME
-        Euclidean (mean, std) gap but different std baselines yield
-        DIFFERENT Fisher-Rao distances -- a plain L2 cannot do this.
-        """
-        loss = FisherRaoGeodesicLoss()
-        # Pair A: tight distributions (small std baseline).
-        a_pred, a_tgt = _img(0.0, 0.10), _img(0.20, 0.20)
-        # Pair B: same mean/std *gaps* (0.20, 0.10) but wider baseline.
-        b_pred, b_tgt = _img(0.0, 0.80), _img(0.20, 0.90)
-        d_a = loss(a_pred, a_tgt).item()
-        d_b = loss(b_pred, b_tgt).item()
-        assert d_a != pytest.approx(d_b, rel=1e-3)
-        # The Fisher metric on the mean coordinate scales as 1/sigma^2, so
-        # the tighter pair (small sigma) must cost MORE for the same gap.
-        assert d_a > d_b
-
-    def test_scales_with_distribution_gap(self) -> None:
-        loss = FisherRaoGeodesicLoss()
-        near = loss(_img(0.5, 0.3), _img(0.55, 0.32)).item()
-        far = loss(_img(0.5, 0.3), _img(0.95, 0.70)).item()
-        assert far > near
+    def test_gradient_reaches_prediction_and_sum_reduction(self) -> None:
+        target = torch.rand(1, 1, 8, 8)
+        pred = torch.rand(1, 1, 8, 8, requires_grad=True)
+        mean_loss = FisherRaoGeodesicLoss(noise_sigma=0.02)(pred, target)
+        mean_loss.backward()
+        assert pred.grad is not None and pred.grad.abs().sum() > 0
+        sum_loss = FisherRaoGeodesicLoss(noise_sigma=0.02, reduction="sum")(pred, target)
+        assert sum_loss.item() == pytest.approx(mean_loss.item() * 64, rel=1e-5)

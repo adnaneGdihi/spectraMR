@@ -63,7 +63,6 @@ training:
   task: diffusion
   device: cuda
   output_dir: experiments/results/corpus_diffusion_kspace
-  num_workers: 0
   enable_mixed_precision: false
   diffusion:
     timesteps: 100

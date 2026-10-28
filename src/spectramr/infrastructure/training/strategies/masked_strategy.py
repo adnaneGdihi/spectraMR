@@ -6,7 +6,7 @@ Implements Masked Image Modeling (MIM) in image or k-space.
 """
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -118,6 +118,16 @@ class MaskedPretrainingStrategy(ReconstructionTrainingStrategy):
         - He et al. (2022): Masked Autoencoders Are Scalable Vision Learners (MAE)
         - Baevski et al. (2023): Data2vec: A General Framework for Self-supervised Learning
     """
+
+    #: Loss ownership (issue #1918). Hands env.losses to UnifiedMAELossComputer as losses_dict -- which ACCEPTS
+    #: the argument and never reads it, so route 4 is a facade here and every
+    #: declared image loss is silently discarded (issue #1918).
+    #: The computer does compute image-space l2 + l1 against the target, hence the
+    #: inline declaration. CAVEAT: their weights come from the legacy
+    #: config.losses.reconstruction.lambda_l2 / lambda_l1 section, NOT from the
+    #: loss-weight table, so a declared lambda on those two names is not honoured.
+    inline_losses: ClassVar[frozenset[str]] = frozenset({"l1", "l2"})
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(
         self,

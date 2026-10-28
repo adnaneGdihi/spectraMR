@@ -51,6 +51,7 @@ def _make_strategy() -> PrivilegedLearningStrategy:
     """Build a bare strategy via ``object.__new__`` with only the attributes
     that ``_setup_strategy_specific_components`` reads."""
     s = object.__new__(PrivilegedLearningStrategy)
+    s._owned_modules, s._owned_wrappers = {}, {}
     s.device = torch.device("cpu")
 
     student = _TinyStudent()

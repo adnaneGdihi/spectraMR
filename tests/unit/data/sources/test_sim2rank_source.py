@@ -7,8 +7,11 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from spectramr.data.sources.sim2rank_source import (  # noqa: E402
+    DEFAULT_SYNTHETIC_VOLUME_HWD,
     Sim2RankSlice,
+    Sim2RankVolume,
     Sim2RankVolumeSource,
+    synthetic_phantom_volume,
 )
 
 
@@ -74,3 +77,29 @@ class TestProtocol:
 
         assert isinstance(Fake(), Sim2RankVolumeSource)
         assert next(iter(Fake())).contrast == "AXT2"
+
+
+class TestSim2RankVolume:
+    def _volume(self, clean):
+        return Sim2RankVolume(content_id="v", clean=clean, contrast="T1")
+
+    def test_layout_is_one_by_d_h_w(self) -> None:
+        vol = self._volume(torch.rand(1, 4, 12, 10))
+        assert vol.as_batch().shape == (1, 1, 4, 12, 10)
+        assert vol.size_hwd == {"H": 12, "W": 10, "D": 4}
+
+    @pytest.mark.parametrize("shape", [(4, 12, 10), (2, 4, 12, 10), (1, 1, 12, 10)])
+    def test_bad_shapes_are_rejected(self, shape) -> None:
+        with pytest.raises(ValueError):
+            self._volume(torch.rand(*shape))
+
+    def test_complex_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="real magnitude"):
+            self._volume(torch.rand(1, 4, 12, 10, dtype=torch.complex64))
+
+    def test_synthetic_phantom_defaults_and_depth_structure(self) -> None:
+        assert DEFAULT_SYNTHETIC_VOLUME_HWD == (128, 128, 64)
+        vol = synthetic_phantom_volume(height=16, width=12, depth=5)
+        assert vol.clean.shape == (1, 5, 16, 12)
+        assert bool((vol.clean[0].flatten(1).amax(dim=1) > 0).all())
+        assert not torch.equal(vol.clean[:, 0], vol.clean[:, 2])

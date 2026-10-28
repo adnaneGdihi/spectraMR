@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 from torch import nn
 
 from spectramr.infrastructure.training.strategies.loss_folding import scheduled_overrides

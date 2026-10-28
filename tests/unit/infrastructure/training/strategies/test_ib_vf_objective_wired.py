@@ -48,6 +48,7 @@ def _param_ids(opt: torch.optim.Optimizer) -> set[int]:
 
 def _bare_strategy(env: types.SimpleNamespace) -> IBVFTrainingStrategy:
     s = object.__new__(IBVFTrainingStrategy)
+    s._owned_modules, s._owned_wrappers = {}, {}  # set by the base __init__ (#2629)
     s.env = env
     s.device = torch.device("cpu")
     s.beta_plus = 1.0

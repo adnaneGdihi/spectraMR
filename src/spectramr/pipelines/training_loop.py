@@ -14,7 +14,7 @@ Home: this lives in ``pipelines/`` (not ``infrastructure/training/``) on purpose
 The loop is *orchestration* — it drives the resolved strategy + ``TrainingEnvironment``
 + injected services through iterations, which is a pipelines concern — and the
 pipelines home keeps the loop in the same layer as ``train.py``'s loop helpers
-(``infrastructure`` may not import ``pipelines``, so a delegating/​helper-sharing
+(``infrastructure`` may not import ``pipelines``, so a delegating/helper-sharing
 loop cannot live there). It replaces the dead ``infrastructure/training/engine.py``
 ``TrainerEngine`` (epoch-based legacy, zero references), removed in this change.
 """
@@ -26,32 +26,55 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Iterable
+from contextlib import ExitStack
 from itertools import cycle
 from pathlib import Path
 from typing import Any
 
 import torch
-from tqdm import tqdm
+from spectramr.infrastructure.logging.progress import make_progress
 
 from spectramr.config.overrides import applied_override_paths
 from spectramr.core.cascading_validation import aggregate_cascade_rows
 from spectramr.core.metrics.flag_map import schema_flag_to_metric
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
+from spectramr.core.module_utils import unwrap_model
 from spectramr.core.topology import resolve_run_topology
-from spectramr.data.batch_types import BatchAdapter, TrainingBatch
+from spectramr.data.batch_types import BatchAdapter, TrainingBatch, reject_targetless_samples
 from spectramr.domain.exceptions import ConfigurationError
-from spectramr.infrastructure.builders.directors import CheckpointDirector
+from spectramr.core.wall_clock import (
+    VALIDATION_SAFETY_FACTOR,
+    resolve_check_interval,
+    resolve_wall_clock_budget,
+)
+from spectramr.infrastructure.checkpointing.async_writer import (
+    CheckpointWriteError,
+    CheckpointWriter,
+)
+from spectramr.infrastructure.checkpointing.layout import CheckpointLayout
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
+from spectramr.infrastructure.logging.provenance import config_fingerprint
+from spectramr.infrastructure.distributed.state_io import state_io_of
+from spectramr.infrastructure.optimization.ema import EMAKeyMismatchError
+from spectramr.infrastructure.training.nonfinite_monitor import (
+    NonFiniteMonitor,
+    NonFiniteVerdict,
+    process_group_spans_ranks,
+)
+from spectramr.infrastructure.training.strategies.tall_locality import TALL_LOCALITY_LOSS_KEY
 from spectramr.infrastructure.training.strategies.lifecycle import (
     StrategyLifecycleDriver,
 )
+from spectramr.pipelines.loader_wait import LoaderWaitMonitor
 
 # The loop body (moved here in WS-3 PR-2) calls these helpers, which STAY in
 # ``pipelines/train.py`` (same layer — pipelines → pipelines is legal, and
 # leaving them there means existing tests that import them from ``train`` are
 # untouched). ``train`` imports ``TrainingLoop`` lazily, so this top-level
 # import does not cycle.
+from spectramr.pipelines.divergence_report import log_divergence_state
 from spectramr.pipelines.train import (
     _evaluate_sanity_overfit,
     _extract_es_best,
@@ -60,12 +83,18 @@ from spectramr.pipelines.train import (
     _maybe_run_calibration,
     _resync_scheduler_base_lrs,
     _run_validation,
+    _drain_validation_images,
     _should_step_schedulers,
     _summarise_best_metrics_from_csv,
     early_stop_monitor_candidates,
     ema_should_update,
     epoch_validation_can_fire,
     validation_can_fire,
+)
+from spectramr.pipelines.validation_evidence import (
+    VALIDATION_FAILURE_SENTINEL,
+    ValidationTally,
+    validation_failure_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,10 +196,18 @@ def resolve_producer_declared_columns(strategy: Any) -> frozenset[str]:
     ``hasattr`` rather than a hard call because strategies are duck-typed here
     and the loop already treats ``get_last_metrics`` the same way; base returns
     an empty set, so an opted-out strategy is unaffected either route.
+
+    A strategy that forwards its loss computer's components verbatim
+    (``forwards_loss_components``) also gets the computer's
+    ``stamped_component_keys``: the computer stamps them on every call, so the
+    column is never promised empty (#2546).
     """
-    if not hasattr(strategy, "declared_metric_keys"):
-        return frozenset()
-    return frozenset(strategy.declared_metric_keys())
+    keys: set[str] = set()
+    if hasattr(strategy, "declared_metric_keys"):
+        keys.update(strategy.declared_metric_keys())
+    if getattr(type(strategy), "forwards_loss_components", False):
+        keys.update(strategy.loss_computer.stamped_component_keys)
+    return frozenset(keys)
 
 
 def classify_discarded_keys(discarded: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -218,6 +255,17 @@ def _set_optimizer_eval_mode(pipeline: Any, *, train: bool) -> None:
         if optimizer is None or not supports_schedule_free_modes(optimizer):
             continue
         getattr(optimizer, "train" if train else "eval")()
+
+
+def policy_owns_lr_scheduler(strategy: Any) -> bool:
+    """Whether the adopted step policy already steps the LR scheduler itself.
+
+    DeepSpeed's ``engine.step()`` steps the scheduler handed to
+    ``deepspeed.initialize``; stepping it here too halves the schedule's horizon.
+    Read off the executor (``is True``, like the other ownership flags).
+    """
+    executor = getattr(strategy, "step_executor", None)
+    return getattr(executor, "_policy_owns_lr_scheduler", False) is True
 
 
 def _install_parallel_step_policy(strategy: Any, parallel_runtime: Any) -> None:
@@ -270,53 +318,77 @@ def _install_parallel_step_policy(strategy: Any, parallel_runtime: Any) -> None:
     )
 
 
+def _checkpoint_layout(output_paths: Any) -> CheckpointLayout:
+    """The run's ``checkpoints/`` directory; there is no default location (#1972, #2842)."""
+    return CheckpointLayout.for_run((output_paths or {}).get("run_output_dir"))
+
+
+def _finish_checkpoints(
+    writer: CheckpointWriter | None, best_error: str | None, best_error_step: int = -1
+) -> str | None:
+    """Land every queued write and stop the writer; returns the run's best-save error.
+
+    A fatal failure raises. A failed best write is folded into ``best_checkpoint_error``
+    as the synchronous fail-soft save records it (#713); the failure at the highest
+    step wins, whichever path recorded it. This also covers a wall-clock yield:
+    nothing runs between the yield's ``break`` and the call, so its save lands here.
+    """
+    if writer is None:
+        return best_error
+    writer.close()
+    for failure in writer.soft_failures:
+        if failure.role == "best" and failure.step >= best_error_step:
+            best_error, best_error_step = failure.message, failure.step
+    return best_error
+
+
 def _save_loss_schedule_checkpoint(
     *,
+    checkpoint_service: Any,
     config: Any,
     pipeline: Any,
     strategy: Any,
     output_paths: Any,
     epoch: int,
     iteration: int,
-    metrics: dict[str, Any],
     logging_service: Any,
     parallel_runtime: Any = None,
+    early_stopping_service: Any = None,
+    checkpoint_writer: CheckpointWriter | None = None,
 ) -> None:
     """Snapshot the model when a loss-schedule trigger changes a loss weight.
 
-    Saved via the same :class:`CheckpointDirector` as the periodic/best saves, so
+    Saved through the same store as every other save, so
     the pre-change state is recoverable. Whether and how often to save (the
     user-configured throttle) is decided by the controller before this is called;
     this only performs the I/O — it holds no interval logic. Fail-soft: a save
     error is logged, not raised, so a transient FS issue never aborts training.
 
-    ``parallel_runtime`` is not optional in spirit: without it the director
+    ``parallel_runtime`` is not optional in spirit: without it the store
     resolves the DEFAULT checkpoint adapter, so an FSDP save writes rank 0's
     local SHARD and a DeepSpeed save writes no native artifact at all. It keeps a
     ``None`` default only because the single-process path has no runtime to pass.
     """
     try:
-        checkpoint_dir = str(
-            Path(output_paths.get("run_output_dir", "experiments/outputs")) / "checkpoints"
-        )
-        (
-            CheckpointDirector(config)
-            .with_checkpoint_dir(checkpoint_dir)
-            .with_pipeline(pipeline)
-            .with_strategy(strategy)
-            .with_epoch(epoch)
-            .with_global_step(iteration)
-            .with_metrics(metrics)
-            .with_scaler(getattr(pipeline, "scaler", None))
-            .with_parallel_runtime(parallel_runtime)
-            .with_counter_state({"current_step": iteration, "current_epoch": epoch})
-            .validate()
-            .save()
+        checkpoint_service.save_step(
+            pipeline,
+            layout=_checkpoint_layout(output_paths),
+            config=config,
+            strategy=strategy,
+            parallel=parallel_runtime,
+            early_stopping=early_stopping_service,
+            reason="loss_schedule",
+            epoch=epoch,
+            step=iteration,
+            config_fingerprint=config_fingerprint(config),
+            writer=checkpoint_writer,
         )
         if logging_service:
             logging_service.log_info(
                 f"[loss_schedule] checkpoint saved before weight change at iter {iteration}"
             )
+    except CheckpointWriteError:
+        raise  # an earlier periodic/final write failed; that one is not fail-soft
     except Exception as ckpt_err:  # fail-soft: never abort training on a save error
         logger.warning(
             f"[loss_schedule] checkpoint-on-change save failed at iter {iteration}: {ckpt_err}"
@@ -357,41 +429,62 @@ class TrainingLoop:
         self.metrics_service = metrics_service
         self.is_sanity_check = is_sanity_check
 
-    def run(self, *, start_iteration: int = 0) -> dict[str, Any]:
+    def run(
+        self,
+        *,
+        start_iteration: int = 0,
+        early_stopping_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Run the iteration loop; returns the pipeline result dict.
 
         PR-1 delegates to the existing ``_execute_training_loop`` body (imported
         lazily to break the construct-loop / run-loop cycle with ``train.py``);
         PR-2 inlines that body here verbatim.
         """
-        return _execute_training_loop(
-            self.strategy,
-            self.pipeline,
-            self.config,
-            self.model_type,
-            tb_writer=self.tb_writer,
-            logging_service=self.logging_service,
-            output_paths=self.output_paths,
-            checkpoint_service=self.checkpoint_service,
-            metrics_service=self.metrics_service,
-            is_sanity_check=self.is_sanity_check,
-            start_iteration=start_iteration,
-        )
+        try:
+            with ExitStack() as exit_stack:
+                return _execute_training_loop(
+                    self.strategy,
+                    self.pipeline,
+                    self.config,
+                    self.model_type,
+                    tb_writer=self.tb_writer,
+                    logging_service=self.logging_service,
+                    output_paths=self.output_paths,
+                    checkpoint_service=self.checkpoint_service,
+                    metrics_service=self.metrics_service,
+                    is_sanity_check=self.is_sanity_check,
+                    start_iteration=start_iteration,
+                    early_stopping_state=early_stopping_state,
+                    exit_stack=exit_stack,
+                )
+        finally:
+            # The loop attaches its NonFiniteMonitor to the executor; detaching on
+            # every exit, a raise included, restores the executor's synchronous
+            # guard for any later caller instead of a monitor nobody reads.
+            executor = getattr(self.strategy, "step_executor", None)
+            if executor is not None:
+                executor.nonfinite_monitor = None
 
-    def evaluate(self) -> dict[str, float]:
+    def evaluate(
+        self, *, iteration: int = 0, epoch: int = 0, csv_file: Any = None, split: str = "val"
+    ) -> dict[str, float]:
         """Run one validation pass and return the aggregated metrics.
 
         The ``run()`` peer for the scripting ``Trainer.evaluate``: it drives the
         SAME ``_run_validation`` the training loop invokes at each
         ``eval_interval`` (eval mode + EMA-swap, **no optimizer steps**), so the
         reported metrics match in-training validation exactly. The data is the
-        env's ``data_loaders["val"]`` (the SSOT) — not a parameter, because the
+        env's ``data_loaders[split]`` (the SSOT) — not a parameter, because the
         ``TrainingEnvironment`` is frozen; ``Trainer.evaluate`` builds the env
         with the caller's loader under the ``"val"`` key.
         """
         generator = self.pipeline.generator
         was_training = getattr(generator, "training", False)
         generator.eval()
+        # The in-loop validation grades a schedule-free run at its averaged
+        # weights; a standalone eval must grade the same point.
+        _set_optimizer_eval_mode(self.pipeline, train=False)
         # #1353: a standalone eval drives the same validation, so it drives the
         # same lifecycle pair. Its own driver instance -- ``evaluate()`` is an
         # entry point in its own right, not a step of a run, so its first-fire
@@ -402,13 +495,15 @@ class TrainingLoop:
             metrics = _run_validation(
                 self.pipeline,
                 self.strategy,
-                0,  # iteration — a standalone eval is not at any train step
-                0,  # epoch
+                iteration,  # 0 for a standalone eval; the resumed step under --validate-only
+                epoch,
                 self.logging_service,
                 output_paths=self.output_paths,
-                metrics_service=self.metrics_service,
-                tb_writer=self.tb_writer,
-                csv_file=None,
+                # A test pass must not write into the validation curves or images.
+                metrics_service=self.metrics_service if split == "val" else None,
+                tb_writer=self.tb_writer if split == "val" else None,
+                csv_file=csv_file,
+                split=split,
             )
         finally:
             # Drain here too (#697). A standalone eval runs the SAME cascade at
@@ -421,15 +516,19 @@ class TrainingLoop:
             _drain_cascade_rows(
                 self.strategy,
                 self.metrics_service,
-                iteration=0,
-                epoch=0,
+                iteration=iteration,
+                epoch=epoch,
                 logging_service=self.logging_service,
                 is_main_process=RankUtility.is_main_rank(),
             )
+            # Queued PNGs must exist (and a last-batch write error surface) before a
+            # caller reads them; the worker thread must not outlive the call.
+            _drain_validation_images(self.metrics_service, self.logging_service)
             # Restore the prior mode so evaluate() is side-effect-free on the
             # model (a caller may evaluate mid-training and keep training).
             if was_training:
                 generator.train()
+                _set_optimizer_eval_mode(self.pipeline, train=True)
         # Outside the ``finally``: a validation that raised produced no metrics,
         # and ``on_validation_end`` promises the aggregated ones. Reporting {} to
         # a hook that freezes stages on "no improvement" would let a crash read
@@ -480,20 +579,17 @@ def _monitor_not_applicable_reason(strategy: Any, monitor_key: str) -> str:
     )
 
 
-#: What a strategy returns when validation could not produce a prediction AT ALL.
-#:
-#: A bare failure sentinel, NOT a metric vocabulary -- returned at
-#: ``diffusion.py:3233`` (``hr_fakes is None``) and ``:3420`` (``not all_metrics``).
+#: A bare failure sentinel, NOT a metric vocabulary; owned by ``validation_evidence``.
 #: Any consumer that reads it as "the metrics this arm produces" misattributes an
 #: upstream crash to the arm's configuration.
-_VALIDATION_FAILURE_SENTINEL = "validation_error"
+_VALIDATION_FAILURE_SENTINEL = VALIDATION_FAILURE_SENTINEL
 
 
 def _unresolvable_monitor_error(monitor: str, val_metrics: dict[str, Any], iteration: int) -> str:
     """Explain an unresolvable early-stopping monitor, blaming the right thing.
 
     Fatal in both branches, for the #178 reason at the call site: an unresolvable
-    monitor costs early stopping AND ``checkpoint_best.pt`` at once, while the run
+    monitor costs early stopping AND the best checkpoint at once, while the run
     exits 0 reporting success. Only the ATTRIBUTION is decided here.
 
     The distinction matters because the two causes have opposite remedies. A
@@ -515,9 +611,9 @@ def _unresolvable_monitor_error(monitor: str, val_metrics: dict[str, Any], itera
             f"{{'{_VALIDATION_FAILURE_SENTINEL}': ...}}.\n"
             f"  early_stopping.metric: '{monitor}' -- this is NOT the problem; "
             "do not change it.\n"
-            "The upstream failure is logged at WARNING as 'Validation "
-            "generation failed: ...' with a traceback, immediately before this "
-            "line -- search the run log for that string. If the log is missing, "
+            "The upstream failure is logged before this line -- search the run "
+            "log for '[Cascading Validation]', the strategy's only remaining "
+            "producer of the sentinel. If the log is missing, "
             "provenance.json records where it went under `logging`.\n"
             "Fatal rather than skipped because early stopping and "
             "best-checkpoint selection both depend on a metric that will never "
@@ -659,6 +755,49 @@ def _drain_cascade_rows(
     return written
 
 
+def _final_loss_scalar(losses_history: dict[str, Any]) -> float | None:
+    """The run's last ``g_total_loss`` as a host float, or None when absent.
+
+    The loop keeps losses on the device; this is the one host transfer of the
+    total per run, made after the loop for the result dict and the summaries.
+    """
+    value = losses_history.get("g_total_loss")
+    if value is None:
+        return None
+    return float(value.item() if isinstance(value, torch.Tensor) else value)
+
+
+def _stop_on_divergence(
+    verdict: NonFiniteVerdict,
+    *,
+    logging_service: Any,
+    generator: Any,
+    state_after: int,
+    losses: dict[str, Any] | None = None,
+) -> int:
+    """Report a non-finite verdict and the model state; return the step it names.
+
+    The verdict arrives one step late or at a resolve, so the scanned weights
+    are those left after ``state_after``, which already include the update of
+    the step the verdict names. ``losses`` is passed only when it holds that
+    step's values, so the line can say whether the total was nan or inf.
+
+    The caller breaks out of the loop. Every rank receives the same verdict at
+    the same call (the monitor agrees it in-collective), so every rank breaks.
+    """
+    where = "on a peer rank" if verdict.on_peer_rank else f"in {', '.join(verdict.names)}"
+    total = None if losses is None else losses.get("g_total_loss", losses.get("loss"))
+    value = "" if total is None else f" (total = {float(total)})"
+    if logging_service:
+        logging_service.log_critical(
+            f"❌ DIVERGENCE DETECTED at iteration {verdict.iteration}: non-finite loss "
+            f"{where}{value}. Stopping training; that step's weights are never saved. "
+            f"The state scan below is of the weights after iteration {state_after}."
+        )
+    log_divergence_state(unwrap_model(generator), state_after)
+    return verdict.iteration
+
+
 def resolve_scheduler_cadence(strategy: Any, config: Any) -> int:
     """How many iterations pass between LR-scheduler steps.
 
@@ -691,7 +830,7 @@ def resolve_scheduler_cadence(strategy: Any, config: Any) -> int:
 
 
 def resolve_ema_warmup_gate(ema: Any, ema_cfg: Any) -> int:
-    """How many iterations the loop must SKIP before updating the EMA shadow.
+    """How many optimizer steps the loop must SKIP before updating the EMA shadow.
 
     ``ema.warmup_steps`` means "the length of the EMA warmup period" on both
     EMA paths, but the mechanism differs, so exactly one of the two applies:
@@ -714,8 +853,8 @@ def resolve_ema_warmup_gate(ema: Any, ema_cfg: Any) -> int:
         ema_cfg: ``config.ema``, or ``None``.
 
     Returns:
-        Iterations to skip before the first EMA update. 0 means "update from
-        the first iteration".
+        Optimizer steps to skip before the first EMA update. 0 means "update
+        from the first optimizer step".
     """
     if getattr(ema, "adaptive", False):
         return 0
@@ -788,6 +927,44 @@ def resolve_iteration_budget(max_iterations: int, config: Any) -> int:
     return max_iterations
 
 
+class _CsvRowSink:
+    """Append rows to the training CSV through one handle opened on first use.
+
+    Each row is flushed so readers see complete rows without waiting for
+    ``close``; the owner of the loop's ``ExitStack`` closes it on every exit.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], fieldnames: list[str]) -> None:
+        self._path = path
+        self._fieldnames = fieldnames
+        self._fh: Any = None
+        self._writer: csv.DictWriter | None = None
+
+    def write(self, row: dict[str, Any]) -> None:
+        if self._fh is None or self._writer is None:
+            self._fh = open(self._path, "a", newline="")  # noqa: SIM115 -- held open across rows
+            self._writer = csv.DictWriter(
+                self._fh, fieldnames=self._fieldnames, extrasaction="ignore"
+            )
+        try:
+            self._writer.writerow(row)
+            self._fh.flush()
+        except Exception:
+            # Drop the handle so the next row reopens in append mode instead of
+            # writing through a stream left in an unknown state; the caller
+            # logs the failure.
+            try:
+                self.close()
+            except OSError:
+                self._fh = self._writer = None
+            raise
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+        self._fh = self._writer = None
+
+
 def _execute_training_loop(
     strategy,
     pipeline,
@@ -800,11 +977,22 @@ def _execute_training_loop(
     metrics_service=None,
     is_sanity_check=False,
     start_iteration=0,
+    early_stopping_state=None,
+    exit_stack=None,
 ):
     """Iteration-based training loop.
 
     Args:
         start_iteration: Iteration to resume from (0 = start fresh).
+        early_stopping_state: ``ResumeResult.early_stopping`` of the
+            resumed checkpoint, or ``None``; restored into the early-stopping
+            service so selection continues rather than restarting (#2304).
+        exit_stack: ``ExitStack`` owned by the caller; the CSV sink and the
+            async checkpoint writer register their ``close`` there so both are
+            closed even when an exception unwinds the loop (the loop body has no
+            ``finally``). A caller passing
+            none gets no exception-path close; only ``TrainingLoop.run`` calls
+            this function, and it always passes one.
     """
 
     # Resolve the batch's non-spatial axis identity ONCE (C8).
@@ -1089,6 +1277,11 @@ def _execute_training_loop(
                             elif loss_name == "gradient_penalty":
                                 expected_loss_keys.add("gradient_penalty")
 
+            # The TALL locality term is folded into the loss dict only when its weight is > 0.
+            tall_cfg = getattr(config.training, "tall_sr", None)
+            if tall_cfg is not None and tall_cfg.lambda_locality > 0:
+                expected_loss_keys.add(TALL_LOCALITY_LOSS_KEY)
+
             # [DISENTANGLED] Add strategy-specific metrics
             # Check if strategy is disentangled-based (could be in strategy_class name or task designation)
             is_disentangled = (
@@ -1233,8 +1426,8 @@ def _execute_training_loop(
             # severity point), with `acceleration_level` and `timestep` as
             # values -- see `core/cascading_validation.py`. This file stays one
             # row per ITERATION: making it tall would repeat every training loss
-            # once per level, and `metrics_report_generator.py` reads it with
-            # `pd.read_csv(..., on_bad_lines="error")`.
+            # once per level in a file the report aggregator reads as one row
+            # per pass.
             csv_fieldnames.extend(sorted(expected_loss_keys))
             csv_fieldnames.extend(sorted(expected_metrics))
             csv_fieldnames.extend(sorted(expected_lr_keys))
@@ -1356,13 +1549,15 @@ def _execute_training_loop(
     #
     # FATAL, matching the #178 ruling at ~line 1946 rather than the WARNING its
     # siblings get. Zero validation events costs BOTH mechanisms at once --
-    # early stopping never evaluates and `checkpoint_best.pt` is never written
+    # early stopping never evaluates and the best checkpoint is never written
     # -- and the run still exits 0 reporting success. #178 already called that
     # exact consequence pair fatal; the only difference here is that the
     # RuntimeError it installed lives INSIDE a validation event, so zero events
     # makes the guard itself unreachable (pitfall #16: a mechanism that reads
     # as protection but cannot fire).
     _val_loader_present = bool(pipeline.data_loaders.get("val"))
+    # Whether validation measured anything at all (#181); judged at the return.
+    validation_tally = ValidationTally()
     _can_fire = validation_can_fire(
         eval_interval=eval_interval,
         max_iterations=max_iterations,
@@ -1397,7 +1592,7 @@ def _execute_training_loop(
             f"run's whole budget of {max_iterations} iterations, so the "
             f"validation gate can NEVER fire: this run would train to "
             f"completion, evaluate early stopping zero times, write no "
-            f"checkpoint_best.pt, and still exit reporting success. "
+            f"best checkpoint, and still exit reporting success. "
             f"Set validation.schedule.interval_steps to at most "
             f"{max(1, max_iterations // 2)} (>= 2 events), or enable "
             f"validation.schedule.on_epoch with a train loader of "
@@ -1568,7 +1763,29 @@ def _execute_training_loop(
     # iteration is NOT 1 on a resumed run. Bound once here because the logging
     # gate compares against it on every step.
     first_iteration = start_iteration + 1
-    pbar = tqdm(range(first_iteration, max_iterations + 1), desc="Training")
+    pbar = make_progress(
+        range(first_iteration, max_iterations + 1), config.logging, desc="Training"
+    )
+
+    # Wall-clock budget, resolved BEFORE the first step so a malformed or
+    # already-expired one fails at startup rather than after hours of GPU.
+    wall_clock_budget = resolve_wall_clock_budget()
+    wall_clock_yield = False
+    # Set by the divergence guard; a run that stopped on a non-finite loss must
+    # not return success, or run_summary.json reports a corrupted model as green.
+    diverged_at: int | None = None
+    # Its OWN cadence, capped independently of `log_interval`: 65 corpus arms
+    # declare `logging.intervals.log: 5000`, which at ~1s a step would inspect
+    # the deadline every ~83 min against a 900s margin -- the job dies before
+    # the check fires, on exactly the long arms this is for. Reading the clock
+    # is a vDSO call, not a device sync, so non-negotiable 9 does not bear on
+    # how often it happens.
+    _wall_clock_every = resolve_check_interval(log_interval)
+    # Duration of the most recent validation pass, used to decide whether the
+    # next one fits before the wall. None until one has been measured; the
+    # first pass therefore runs unguarded, which is safe because it happens
+    # early in the run, far from any deadline.
+    _last_val_seconds: float | None = None
     if start_iteration > 0 and logging_service:
         logging_service.log_info(f"[Resume] Training resumes from iteration {start_iteration + 1}")
 
@@ -1581,6 +1798,8 @@ def _execute_training_loop(
             )
 
             early_stopping_service = EarlyStoppingService(config.early_stopping)
+            if early_stopping_state is not None:
+                early_stopping_service.load_state_dict(early_stopping_state)
 
             if logging_service:
                 monitor = config.early_stopping.metric
@@ -1590,6 +1809,17 @@ def _execute_training_loop(
                 )
         except ImportError:
             logger.warning("[Pipeline] Warning: Could not import EarlyStoppingService")
+
+    # A run resumed after early stopping fired trains nothing: should_stop() is
+    # otherwise read only after a validation, one window too late.
+    if early_stopping_service is not None and early_stopping_service.should_stop():
+        message = (
+            f"[EarlyStopping] The run already early-stopped at step {start_iteration}; "
+            "nothing is trained."
+        )
+        (logging_service.log_info if logging_service else logger.info)(message)
+        pbar.close()
+        pbar = make_progress((), config.logging, desc="Training")
 
     # Initialize the loss-schedule controller (dynamic loss-term weights:
     # clock curriculum + plateau triggers + post-change metric monitoring).
@@ -1624,6 +1854,7 @@ def _execute_training_loop(
     # the same string N times. What a reader needs is "did this run fail to write
     # its best checkpoint, and why" (#713).
     best_checkpoint_error: str | None = None
+    best_checkpoint_error_step = -1
 
     # Metrics history
     losses_history = {}
@@ -1639,6 +1870,49 @@ def _execute_training_loop(
     # FIX #4: Direct config access for checkpoint settings (no fallbacks)
     checkpoint_enabled = config.checkpoint.enabled
     checkpoint_interval = config.checkpoint.save_interval
+    # Step of the last periodic/yield save. Set exactly where the save is entered, so
+    # every rank that enters the collective records the same value.
+    last_saved_step: int | None = None
+    # One writer per run. ``_finish_checkpoints`` closes it on the normal path and
+    # raises a fatal write failure; the caller's exit stack closes it quietly when an
+    # exception unwinds the loop, so the in-flight write lands, the thread stops, and
+    # the real exception is not replaced. After a normal close the callback is a no-op.
+    checkpoint_writer = CheckpointWriter() if config.checkpoint.async_write else None
+    if checkpoint_writer is not None and exit_stack is not None:
+        exit_stack.callback(checkpoint_writer.close, raise_fatal=False)
+    if checkpoint_enabled and checkpoint_service is None:
+        raise ValueError(
+            "checkpoint.enabled is true but no checkpoint store was injected; "
+            "resolve ICheckpointService from the container (bootstrap registers it)."
+        )
+    _checkpoint_fingerprint = config_fingerprint(config)
+    # Resolved once, so a run with nowhere to write fails here, not at its first save.
+    if checkpoint_enabled:
+        try:
+            _checkpoint_layout(output_paths)
+        except ValueError as exc:
+            raise ValueError(
+                "checkpoint.enabled is true but the loop has no run directory "
+                "(output_paths['run_output_dir']); pass one, or set checkpoint.enabled: false."
+            ) from exc
+
+    if wall_clock_budget:
+        # A yield that cannot save is just a crash with extra steps, and it
+        # would requeue forever making no progress.
+        if not checkpoint_enabled:
+            raise RuntimeError(
+                "A wall-clock budget is declared but checkpointing is off "
+                f"(checkpoint.enabled={checkpoint_enabled}). The run would yield "
+                "at the wall, save nothing, requeue, and repeat forever. Enable "
+                "checkpointing, or set NO_WALL_CLOCK=1 to train to the wall."
+            )
+        if logging_service:
+            logging_service.log_info(
+                f"[WallClock] Yielding in "
+                f"{wall_clock_budget.seconds_remaining() / 3600:.2f}h "
+                f"({wall_clock_budget.margin_s:.0f}s reserved for the final save; "
+                f"checked every {_wall_clock_every} steps)."
+            )
 
     # Initialize epoch *before* the loop so the post-loop final-checkpoint
     # block has a defined value even when the loop body never runs (e.g.
@@ -1652,9 +1926,24 @@ def _execute_training_loop(
     # loop (frozen config + a strategy/step_executor built before the loop), so
     # resolve them ONCE here instead of re-``getattr``-ing every iteration.
     _gas = resolve_scheduler_cadence(strategy, config)
+    # The step policy is adopted before the loop, so this is invariant too. A policy
+    # that steps its own scheduler (DeepSpeed) must not be stepped a second time.
+    _sched_owned_by_policy = policy_owns_lr_scheduler(strategy)
+    # Under FSDP the live generator holds shards, so the EMA blend needs the
+    # unsharded parameters; a passthrough elsewhere.
+    _state_io = state_io_of(parallel_runtime)
     _ema_cfg = getattr(config, "ema", None)
     _ema_update_freq = getattr(_ema_cfg, "update_frequency", 1)
     _ema_warmup = resolve_ema_warmup_gate(pipeline.ema, _ema_cfg)
+
+    # schedulefree 1.4 builds its optimizers in eval mode and raises on a step
+    # taken there, and the only other switch to train mode follows a validation.
+    _set_optimizer_eval_mode(pipeline, train=True)
+
+    # The divergence guard: the executor's per-config guard and the loop's total
+    # both record into it, and it answers one step late without a host sync.
+    nonfinite_monitor = NonFiniteMonitor(pipeline.device, distributed=process_group_spans_ranks())
+    strategy.step_executor.nonfinite_monitor = nonfinite_monitor
 
     # #1353: the strategy lifecycle contract (``on_epoch_start`` /
     # ``on_epoch_end`` / ``on_validation_start`` / ``on_validation_end``) was
@@ -1677,7 +1966,15 @@ def _execute_training_loop(
     # this iteration, and cleared at the end of every iteration.
     _epoch_end_metrics: dict[str, Any] = {}
 
+    csv_sink: _CsvRowSink | None = None
+    _loader_wait = LoaderWaitMonitor()
+    _fetch_started: float | None = None
+    _fetch_wait = 0.0
     for iteration in pbar:
+        _fetch_now = time.perf_counter()
+        if _fetch_started is not None:
+            _loader_wait.record(_fetch_wait, _fetch_now - _fetch_started)
+        _fetch_started = _fetch_now
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -1692,6 +1989,7 @@ def _execute_training_loop(
                 _set_sampler_epoch(train_loader, data_epoch)
             data_iter = iter(train_loader) if not is_sanity_check else data_iter
             batch = next(data_iter)
+        _fetch_wait = time.perf_counter() - _fetch_now
         epoch = iteration // train_loader_len
 
         # Update logging service SSOT state
@@ -1735,17 +2033,32 @@ def _execute_training_loop(
                 # `may_checkpoint`, NOT `is_main_process`: this builds a
                 # checkpoint like every other site, so under FSDP/DeepSpeed it is
                 # a COLLECTIVE and every rank must enter it or the job hangs.
-                if _ls_decision["checkpoint"] and may_checkpoint:
+                # The previous step is still unread by the monitor, so every rank
+                # resolves it first; the gate here is rank-uniform.
+                if _ls_decision["checkpoint"] and checkpoint_enabled:
+                    _verdict = nonfinite_monitor.resolve()
+                    if _verdict is not None:
+                        diverged_at = _stop_on_divergence(
+                            _verdict,
+                            logging_service=logging_service,
+                            generator=pipeline.generator,
+                            state_after=iteration - 1,
+                            losses=losses_history,
+                        )
+                        break
+                if _ls_decision["checkpoint"] and checkpoint_enabled and may_checkpoint:
                     _save_loss_schedule_checkpoint(
+                        checkpoint_service=checkpoint_service,
                         config=config,
                         pipeline=pipeline,
                         strategy=strategy,
                         output_paths=output_paths,
                         epoch=epoch,
                         iteration=iteration,
-                        metrics=losses_history,
                         logging_service=logging_service,
                         parallel_runtime=parallel_runtime,
+                        early_stopping_service=early_stopping_service,
+                        checkpoint_writer=checkpoint_writer,
                     )
 
         # Strategy lifecycle: open the epoch. Placed AFTER the loop_state
@@ -1765,6 +2078,7 @@ def _execute_training_loop(
                 else:
                     # Best effort: let strategy handle it or fail
                     pass
+            reject_targetless_samples(batch, strategy=type(strategy).__name__)
 
             # Move to device if it's a TrainingBatch (handles all internal tensors)
             if hasattr(batch, "to"):
@@ -1806,17 +2120,13 @@ def _execute_training_loop(
             # PyTorch >= 1.1 requires optimizer.step() to be called first, which happens
             # inside execute_step above, but the internal tracking needs one full cycle.
             # ``_gas`` hoisted above the loop (invariant).
-            if pipeline.schedulers and _should_step_schedulers(iteration, start_iteration, _gas):
+            if (
+                pipeline.schedulers
+                and not _sched_owned_by_policy
+                and _should_step_schedulers(iteration, start_iteration, _gas)
+            ):
                 for sched_name, sched in pipeline.schedulers.items():
                     try:
-                        # ReduceLROnPlateau requires a validation metric and a
-                        # per-validation cadence; stepping it here (no metric,
-                        # every optimizer step) raised every call → a warning
-                        # spam that masqueraded as a working scheduler while the
-                        # LR stayed constant. Skip it in the per-iteration loop;
-                        # plateau stepping belongs at validation time.
-                        if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            continue
                         if hasattr(sched, "step"):
                             # Re-sync base_lrs with the optimizer's param_groups
                             # first: a strategy may have added a group after the
@@ -1847,19 +2157,22 @@ def _execute_training_loop(
             if pipeline.ema is not None:
                 # EMA cadence (_ema_update_freq / _ema_warmup) hoisted above the
                 # loop (frozen config → invariant).
-                if ema_should_update(iteration, _ema_update_freq, _ema_warmup):
+                if ema_should_update(iteration, _ema_update_freq, _ema_warmup, _gas):
                     try:
-                        pipeline.ema.update(pipeline.generator)
+                        # Unwrap: the shadow was deep-copied from the bare module
+                        # at build time, while this generator may since have been
+                        # wrapped by DDP / FSDP / DeepSpeed / torch.compile. The
+                        # blend is key-matched, so a prefixed live model blends
+                        # nothing and raises nothing (#2172).
+                        with _state_io.full_params(pipeline.generator):
+                            pipeline.ema.update(unwrap_model(pipeline.generator))
+                    except EMAKeyMismatchError:
+                        # Never demote this one to a warning: it means EMA has
+                        # been inert, which is the failure the guard exists to
+                        # surface.
+                        raise
                     except Exception as ema_err:
                         logger.warning(f"Failed to update EMA model weights: {ema_err}")
-
-            # [STABILIZATION] Divergence (NaN/Inf) detection moved below: it
-            # now piggybacks on the tqdm-postfix `.item()` sync instead of
-            # paying a SECOND per-step GPU sync here (`torch.isfinite` on a
-            # CUDA scalar forces a host round-trip). The old block also
-            # or-chained the two result keys — tensor truthiness (itself a
-            # sync) that made a legitimate 0.0 loss fall through to the
-            # wrong key.
 
             # Fetch extra metric components (PSNR, SSIM, component losses)
             if hasattr(strategy, "get_last_metrics"):
@@ -1878,6 +2191,29 @@ def _execute_training_loop(
             losses_history = current_losses
 
         except Exception as e:
+            # A NaN step writes NaN weights, and the next step can fail on them
+            # (every loss component dropped as non-finite) before end_step reads
+            # the flag. The unread verdict is the cause, so it outranks the
+            # error. resolve() enters no collective, and under DDP the NaN
+            # gradients were all-reduced, so every rank fails here together.
+            _verdict = nonfinite_monitor.resolve()
+            if _verdict is not None:
+                logger.warning(
+                    "Training step %d failed after non-finite step %d; reporting "
+                    "the divergence instead: %s",
+                    iteration,
+                    _verdict.iteration,
+                    e,
+                )
+                # The failing step may have applied part of its update.
+                diverged_at = _stop_on_divergence(
+                    _verdict,
+                    logging_service=logging_service,
+                    generator=pipeline.generator,
+                    state_after=iteration - 1,
+                    losses=losses_history,
+                )
+                break
             if logging_service:
                 logging_service.log_error(f"Training Step Failed at iter {iteration}: {e}")
             else:
@@ -1885,52 +2221,41 @@ def _execute_training_loop(
             logger.error("Training Step Failed", exc_info=True)
             raise
 
-        # [FIX] Update tqdm every step with the cheap g_total_loss scalar.
-        # Full scalar conversion + CSV write happen only every log_interval steps below.
-        # None-safe .get() chain (no `or`-truthiness): a legitimate 0.0
-        # g_total_loss must not fall through to "loss".
+        # Divergence guard: the total is recorded under a scaler too (the
+        # executor's per-config guard defers to one), and end_step answers for
+        # the previous step without a host sync. Unconditional -- never gated on
+        # `detect_anomalies` -- and reached by every rank every step, because
+        # end_step is a collective under a process group. The None-safe get
+        # chain keeps a legitimate 0.0 g_total_loss from falling through.
+        _quick_key = "g_total_loss" if "g_total_loss" in losses_history else "loss"
         _quick_loss = losses_history.get("g_total_loss", losses_history.get("loss"))
         if _quick_loss is not None:
-            _quick_scalar = (
+            nonfinite_monitor.record(torch.as_tensor(_quick_loss), name=_quick_key)
+        _verdict = nonfinite_monitor.end_step(iteration)
+        if _verdict is not None:
+            # losses_history is this step's, not the verdict's, so no value.
+            diverged_at = _stop_on_divergence(
+                _verdict,
+                logging_service=logging_service,
+                generator=pipeline.generator,
+                state_after=iteration,
+            )
+            break
+
+        # Sanity mode only: record the loss trend (and a phase-coherence
+        # component if the paradigm tracks one) for the end-of-run overfit
+        # verdict. The .item() sync is acceptable because sanity mode is a
+        # diagnostic, not a perf path.
+        if is_sanity_check and _quick_loss is not None:
+            sanity_loss_trace.append(
                 _quick_loss.item() if isinstance(_quick_loss, torch.Tensor) else float(_quick_loss)
             )
-            pbar.set_postfix({"loss": f"{_quick_scalar:.4f}"}, refresh=False)
-
-            # [STABILIZATION] Divergence guard (NaN/Inf in loss): prevents
-            # continuing training with corrupted weights (blacked-out images).
-            # Runs every step but reuses the host float the tqdm postfix
-            # already paid the GPU sync for — `math.isfinite` adds zero syncs.
-            #
-            # UNCONDITIONAL since 2026-07-24. It used to be gated on
-            # ``optimization.gradient.detect_anomalies``, which bundled this free check
-            # with ``torch.autograd.set_detect_anomaly(True)`` (global, 2-4x
-            # slower — see StabilityManager). One knob for two wildly different
-            # costs meant turning off the debug mode to recover throughput also
-            # deleted the divergence tripwire, on exactly the cohorts whose
-            # documented failure mode IS divergence. A non-finite loss must stop
-            # training regardless of debug settings; the guard costs nothing.
-            if not math.isfinite(_quick_scalar):
-                if logging_service:
-                    logging_service.log_critical(
-                        f"❌ DIVERGENCE DETECTED at iteration {iteration}: "
-                        f"Loss is {_quick_scalar}. Stopping training to "
-                        f"prevent weight corruption."
+            for _mk, _mv in losses_history.items():
+                if "phase" in _mk.lower():
+                    sanity_phase_trace.append(
+                        _mv.item() if isinstance(_mv, torch.Tensor) else float(_mv)
                     )
-                break
-
-            # Sanity mode only: record the loss trend (and a phase-coherence
-            # component if the paradigm tracks one) for the end-of-run
-            # overfit verdict. The .item() sync here is acceptable because
-            # sanity mode is a diagnostic, not a perf path; the guard keeps
-            # it out of the normal training loop entirely.
-            if is_sanity_check:
-                sanity_loss_trace.append(_quick_scalar)
-                for _mk, _mv in losses_history.items():
-                    if "phase" in _mk.lower():
-                        sanity_phase_trace.append(
-                            _mv.item() if isinstance(_mv, torch.Tensor) else float(_mv)
-                        )
-                        break
+                    break
 
         # Logging
         #
@@ -1951,6 +2276,29 @@ def _execute_training_loop(
         # is not a hot-path cost; a smaller `log_interval` would be.
         is_first_iteration = iteration == first_iteration
         is_last_iteration = iteration == max_iterations
+
+        # Rank 0 decides and BROADCASTS -- ranks that disagreed by one iteration
+        # would deadlock, one entering the collective checkpoint save while the
+        # others ran another step. The cadence is `_wall_clock_every`, resolved
+        # above; it is deliberately not the logging gate's.
+        if wall_clock_budget is not None and iteration % _wall_clock_every == 0:
+            wall_clock_yield = bool(
+                RankUtility.broadcast_object(
+                    wall_clock_budget.expired() if is_main_process else None
+                )
+            )
+            if wall_clock_yield:
+                logger.info(
+                    f"[WallClock] Allocation ends in "
+                    f"{wall_clock_budget.deadline - time.time():.0f}s; yielding at "
+                    f"iteration {iteration} of {max_iterations} after a final save."
+                )
+                if logging_service:
+                    logging_service.log_info(
+                        f"[WallClock] Yielding at iteration {iteration}/{max_iterations}; "
+                        "resume with the same command to continue."
+                    )
+
         if iteration % log_interval == 0 or is_first_iteration or is_last_iteration:
             # THE converter. `get_last_metrics` returns on-device tensors (#707)
             # precisely so this gate is the only host transfer, and this comment
@@ -2005,7 +2353,7 @@ def _execute_training_loop(
                         )
 
             pbar.set_postfix(
-                {
+                lambda: {
                     k: f"{v:.4f}"
                     for k, v in losses_scalar.items()
                     if "loss" in k.lower() or "psnr" in k.lower()
@@ -2060,7 +2408,10 @@ def _execute_training_loop(
                     # allowlist that silenced them would instead become a second,
                     # unaudited owner of "which keys are known duplicates".
                     known_aliases, unexplained = classify_discarded_keys(new_discarded)
-                    logger.warning(
+                    # A decided exclusion is reported, at info; only a resolver
+                    # disagreement is a warning (non-negotiable 4).
+                    emit = logger.warning if unexplained else logger.info
+                    emit(
                         "[Pipeline] %d computed value(s) have no column in "
                         "%s and are being DISCARDED: %s. The header is built "
                         "from the config at startup, so this means the header "
@@ -2085,9 +2436,11 @@ def _execute_training_loop(
                 try:
                     # Simply append the row with the pre-initialized fieldnames
                     # No dynamic header rewriting - this prevents duplication
-                    with open(csv_file, "a", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=csv_fieldnames, extrasaction="ignore")
-                        writer.writerow(csv_data)
+                    if csv_sink is None:
+                        csv_sink = _CsvRowSink(csv_file, csv_fieldnames)
+                        if exit_stack is not None:
+                            exit_stack.callback(csv_sink.close)
+                    csv_sink.write(csv_data)
 
                 except Exception as e:
                     if logging_service:
@@ -2152,8 +2505,70 @@ def _execute_training_loop(
         ):
             time_for_eval = True
 
+        # Will this validation finish before the wall?
+        #
+        # The wall-clock check ~200 lines above runs BETWEEN iterations, and
+        # validation is inside one, so a deadline landing mid-pass cannot be
+        # acted on: the job is killed with no checkpoint, no marker and no
+        # requeue, and the chain stops looking like an ordinary TIMEOUT. That is
+        # not a corner -- `experiment_11_attention_none` records one validation
+        # event at 6.4h and validation at 41% of its wall clock.
+        #
+        # Entry is gated only on values every rank computes identically, and the
+        # decision is broadcast, because a rank that skipped while another
+        # validated would deadlock on the collective save below.
+        if wall_clock_budget is not None and time_for_eval and not wall_clock_yield:
+            _fits = None
+            if is_main_process:
+                _fits = bool(
+                    _last_val_seconds
+                    and wall_clock_budget.seconds_remaining()
+                    < _last_val_seconds * VALIDATION_SAFETY_FACTOR
+                )
+            if bool(RankUtility.broadcast_object(_fits)):
+                wall_clock_yield = True
+                logger.info(
+                    f"[WallClock] Skipping validation at iteration {iteration}: the "
+                    f"last pass took {_last_val_seconds:.0f}s and only "
+                    f"{wall_clock_budget.seconds_remaining():.0f}s remain before the "
+                    "save margin. Yielding instead."
+                )
+                if logging_service:
+                    logging_service.log_info(
+                        f"[WallClock] Validation skipped at iteration {iteration} "
+                        "(would not finish before the wall); yielding."
+                    )
+
+        # Validation, the best and periodic saves and the yield save all read the
+        # weights this step left, which the monitor has not yet cleared, so it is
+        # drained first. Every operand is rank-uniform, so every rank resolves
+        # (and, on a verdict, breaks) at the same iteration.
+        if (
+            time_for_eval
+            or wall_clock_yield
+            or (checkpoint_enabled and iteration % checkpoint_interval == 0)
+        ):
+            _verdict = nonfinite_monitor.resolve()
+            if _verdict is not None:
+                diverged_at = _stop_on_divergence(
+                    _verdict,
+                    logging_service=logging_service,
+                    generator=pipeline.generator,
+                    state_after=iteration,
+                    losses=losses_history,
+                )
+                break
+
         # Execute Validation
-        if pipeline.data_loaders.get("val") and time_for_eval:
+        #
+        # `not wall_clock_yield`: a validation event that starts after the yield
+        # decision eats the margin reserved for writing the checkpoint. The gate
+        # is on the EXECUTION, not on `time_for_eval` -- the epoch-boundary
+        # branch above re-sets that flag after the interval branch computes it.
+        _val_started = time.monotonic() if time_for_eval else None
+        _validation_ran = False
+        if pipeline.data_loaders.get("val") and time_for_eval and not wall_clock_yield:
+            _validation_ran = True
             pipeline.models.get("generator").eval()
             # Schedule-free optimizers keep an averaged sequence separate from
             # the iterate the gradient is taken at. Validating without swapping
@@ -2175,6 +2590,7 @@ def _execute_training_loop(
             )
             lifecycle.end_validation(val_metrics)
             _epoch_end_metrics = val_metrics
+            validation_tally.record(val_metrics)
 
             # Drain the tall cascading sweep the strategy just published (#697).
             # The strategy computes, the pipeline persists: `IMetricsService`
@@ -2225,17 +2641,19 @@ def _execute_training_loop(
                 # the next iteration (throttled by checkpoint_min_interval).
                 # `may_checkpoint`, NOT `is_main_process` -- see the sibling site
                 # above: a rank-0-gated collective hangs the job.
-                if _ls_decision["checkpoint"] and may_checkpoint:
+                if _ls_decision["checkpoint"] and checkpoint_enabled and may_checkpoint:
                     _save_loss_schedule_checkpoint(
+                        checkpoint_service=checkpoint_service,
                         config=config,
                         pipeline=pipeline,
                         strategy=strategy,
                         output_paths=output_paths,
                         epoch=epoch,
                         iteration=iteration,
-                        metrics=losses_history,
                         logging_service=logging_service,
                         parallel_runtime=parallel_runtime,
+                        early_stopping_service=early_stopping_service,
+                        checkpoint_writer=checkpoint_writer,
                     )
 
             # Early Stopping Integration (must be inside the if-branch where val_metrics is defined)
@@ -2279,15 +2697,13 @@ def _execute_training_loop(
                     # ``EarlyStoppingService.update`` returns EARLY on non-finite,
                     # leaving ``wait_count`` at its PRIOR value -- so if the previous
                     # check improved, ``wait_count == 0`` still holds and this block
-                    # would overwrite checkpoint_best.pt with a NaN score.
-                    # ``CheckpointDirector`` formats it with ``f"{v:.6f}"``, which
-                    # renders `nan` without raising, so nothing downstream noticed.
+                    # would overwrite the best checkpoint with a NaN score.
                     monitor_is_finite = math.isfinite(monitor_value)
                     if not monitor_is_finite and logging_service:
                         logging_service.log_warning(
                             f"[EarlyStopping] monitor '{monitor_key}' is "
                             f"{monitor_value} at iter {iteration}: not counted as an "
-                            "improvement, and checkpoint_best.pt is left untouched."
+                            "improvement, and the best checkpoint is left untouched."
                         )
 
                     # ...and a monitor that is non-finite EVERY time costs both
@@ -2295,7 +2711,7 @@ def _execute_training_loop(
                     # branch above disarms `save_best`; `EarlyStoppingService.update`
                     # returns early on non-finite, so `wait_count` never moves and
                     # the stop can never fire either. The run then burns its full
-                    # budget and exits 0 with no `checkpoint_best.pt`, which is the
+                    # budget and exits 0 with no best checkpoint, which is the
                     # #178 failure entered through a VALUE instead of a key.
                     #
                     # #178 can raise on the first event because keys are stable.
@@ -2323,7 +2739,7 @@ def _execute_training_loop(
                                 f"iteration {iteration}.\n"
                                 f"  {na_reason}\n"
                                 "Both selection mechanisms are dead in this state: "
-                                "no checkpoint_best.pt can be written and early "
+                                "no best checkpoint can be written and early "
                                 "stopping can never trigger, so continuing would "
                                 "burn the remaining budget for a run that cannot "
                                 "produce a selected model.\n"
@@ -2335,37 +2751,25 @@ def _execute_training_loop(
                     if (
                         early_stopping_service.wait_count == 0
                         and checkpoint_enabled
-                        # rank 0 writes best.pt -- but FSDP/DeepSpeed need every
+                        # rank 0 writes the best checkpoint -- but FSDP/DeepSpeed need every
                         # rank here, or rank 0 deadlocks in the gather.
                         and may_checkpoint
                         and monitor_is_finite
                     ):
                         try:
-                            checkpoint_dir = str(
-                                Path(output_paths.get("run_output_dir", "experiments/outputs"))
-                                / "checkpoints"
-                            )
-                            best_director = CheckpointDirector(config)
-                            best_path = (
-                                best_director.with_checkpoint_dir(checkpoint_dir)
-                                .with_pipeline(pipeline)
-                                .with_strategy(strategy)
-                                .with_epoch(epoch)
-                                .with_global_step(iteration)
-                                .with_metrics(losses_history)
-                                .with_scaler(getattr(pipeline, "scaler", None))
-                                .with_parallel_runtime(parallel_runtime)
-                                .with_counter_state(
-                                    {
-                                        "current_step": iteration,
-                                        "current_epoch": epoch,
-                                    }
-                                )
-                                .validate()
-                                .save_best(
-                                    metric_name=monitor_key,
-                                    metric_value=val_metrics[monitor_key],
-                                )
+                            best_path = checkpoint_service.save_best(
+                                pipeline,
+                                layout=_checkpoint_layout(output_paths),
+                                config=config,
+                                strategy=strategy,
+                                parallel=parallel_runtime,
+                                early_stopping=early_stopping_service,
+                                epoch=epoch,
+                                step=iteration,
+                                metric_name=monitor_key,
+                                metric_value=val_metrics[monitor_key],
+                                config_fingerprint=_checkpoint_fingerprint,
+                                writer=checkpoint_writer,
                             )
                             best_checkpoint_path = str(best_path)
                             if logging_service:
@@ -2373,16 +2777,19 @@ def _execute_training_loop(
                                     f"[EarlyStopping] Best checkpoint saved at iter {iteration}: "
                                     f"{monitor_key}={val_metrics[monitor_key]:.6f} → {best_path}"
                                 )
+                        except CheckpointWriteError:
+                            raise  # an earlier periodic write failed; not this best save
                         except Exception as best_err:
                             # Recorded, not just logged (#713). A failed best-save
                             # leaves the run reporting success with no
-                            # checkpoint_best.pt, and a warning in a log nobody
+                            # best file, and a warning in a log nobody
                             # re-reads is indistinguishable from "the metric never
                             # improved". Stamped into run_summary so the absence is
                             # attributable after the fact.
                             best_checkpoint_error = (
                                 f"iter {iteration}: {type(best_err).__name__}: {best_err}"
                             )
+                            best_checkpoint_error_step = iteration
                             logger.warning(
                                 f"[EarlyStopping] Failed to save best checkpoint: {best_err}"
                             )
@@ -2400,7 +2807,7 @@ def _execute_training_loop(
                     # FATAL, not a warning (#178). An unresolvable monitor costs
                     # BOTH mechanisms at once: early stopping never fires (the run
                     # burns its full budget -- ~23 h of GPU on the arms this was
-                    # found on) and `checkpoint_best.pt` is never written, because
+                    # found on) and the best checkpoint is never written, because
                     # the save_best block above lives inside the resolved branch.
                     # Neither failure is visible in any artifact: the run exits 0,
                     # `success: true`, with a warning in a log nobody re-reads.
@@ -2426,6 +2833,19 @@ def _execute_training_loop(
                 logging_service.log_warning(
                     f"[Pipeline] Skipping validation at iter {iteration}: No 'val' dataloader found in pipeline."
                 )
+        elif time_for_eval and wall_clock_yield and logging_service:
+            # Said out loud: a validation event that vanishes without a line is
+            # an unexplained gap in the arm's record.
+            logging_service.log_warning(
+                f"[WallClock] Validation at iter {iteration} skipped -- the run is "
+                "yielding at the wall clock and resumes from the checkpoint below."
+            )
+
+        if _validation_ran and _val_started is not None:
+            _last_val_seconds = time.monotonic() - _val_started
+            # Validation is not a training step: keep it out of the loader-wait wall.
+            if _fetch_started is not None:
+                _fetch_started += _last_val_seconds
 
         # Strategy lifecycle: close the epoch that just COMPLETED (``epoch - 1``
         # at this point -- see StrategyLifecycleDriver's module docstring for why
@@ -2445,184 +2865,126 @@ def _execute_training_loop(
 
         if (
             checkpoint_enabled
-            and checkpoint_service
-            and iteration % checkpoint_interval == 0
+            # `or wall_clock_yield`: the yield is worthless without the save it
+            # exists to make room for.
+            and (iteration % checkpoint_interval == 0 or wall_clock_yield)
             # rank 0 writes the shared checkpoint; collective strategies need all.
             and may_checkpoint
         ):
-            try:
-                # =====================================================================
-                # PHASE 3 TASK 3: Checkpoint via Director (Atomic Save)
-                # =====================================================================
-                # Phase 3 Task 3: Integrated CheckpointDirector for unified checkpoint
-                # management. Director automatically handles all model states, optimizer
-                # states (including multi-optimizer GANs), scheduler states, and metrics.
-                #
-                # Key Benefits:
-                # - Single method saves all state atomically
-                # - Automatic multi-optimizer GAN support (no manual collection)
-                # - Scheduler state recovered on resume
-                # - Metrics persisted
-                # - Better error handling
+            # One writer, one destination, and a failed save raises: a run that cannot
+            # checkpoint must stop rather than yield or train on (#1972).
+            checkpoint_path = checkpoint_service.save_step(
+                pipeline,
+                layout=_checkpoint_layout(output_paths),
+                config=config,
+                strategy=strategy,
+                parallel=parallel_runtime,
+                early_stopping=early_stopping_service,
+                reason="yield" if wall_clock_yield else "periodic",
+                epoch=epoch,
+                step=iteration,
+                config_fingerprint=_checkpoint_fingerprint,
+                writer=checkpoint_writer,
+            )
+            last_saved_step = iteration
+            if logging_service:
+                logging_service.log_info(f"Checkpoint at iter {iteration}: {checkpoint_path}")
 
-                # Use CheckpointDirector for atomic save (Phase 3)
-                try:
-                    checkpoint_dir = str(
-                        Path(output_paths.get("run_output_dir", "experiments/outputs"))
-                        / "checkpoints"
-                    )
+        if wall_clock_yield:
+            break
 
-                    director = CheckpointDirector(config)
-                    checkpoint_path = (
-                        director.with_checkpoint_dir(checkpoint_dir)
-                        .with_pipeline(pipeline)
-                        .with_strategy(strategy)
-                        .with_epoch(epoch)
-                        .with_global_step(iteration)
-                        .with_metrics(losses_history)
-                        .with_scaler(getattr(pipeline, "scaler", None))
-                        .with_parallel_runtime(parallel_runtime)
-                        .with_counter_state(
-                            {
-                                "current_step": iteration,
-                                "current_epoch": epoch,
-                            }
-                        )
-                        .validate()
-                        .save()
-                    )
+    # Loop exit drains the last step, so a NaN in the final iteration still marks
+    # the run diverged and suppresses the final save. TrainingLoop.run detaches
+    # the monitor from the executor on every exit.
+    if diverged_at is None:
+        _verdict = nonfinite_monitor.resolve()
+        if _verdict is not None:
+            diverged_at = _stop_on_divergence(
+                _verdict,
+                logging_service=logging_service,
+                generator=pipeline.generator,
+                state_after=iteration,
+                losses=losses_history,
+            )
+    final_loss = _final_loss_scalar(losses_history)
 
-                    if logging_service:
-                        logging_service.log_info(
-                            f"Checkpoint via director at iter {iteration}: {checkpoint_path}"
-                        )
-                except Exception as director_err:
-                    # If director fails, always try fallback
-                    logger.warning(
-                        f"[Pipeline] CheckpointDirector failed: {director_err}. "
-                        "Attempting fallback..."
-                    )
-                    try:
-                        optimizers = getattr(pipeline, "optimizers", None)
-                        main_optimizer = optimizers.get("opt_g") if optimizers else None
+    # Closed before anything below reads the CSV (best-metrics summary, reporting).
+    if csv_sink is not None:
+        csv_sink.close()
 
-                        extra_optimizers = {}
-                        if optimizers:
-                            for key, opt in optimizers.items():
-                                if key != "opt_g":
-                                    extra_optimizers[key] = opt
+    # Final checkpoint on completion, written BEFORE the best restore so it is the last
+    # state (#2799) and stamped at the last iteration that ran. Not on a yield (the
+    # loop saved) or a divergence (the file would read as a finished run).
+    ran_a_step = iteration >= first_iteration
+    final_due = (
+        checkpoint_enabled
+        and may_checkpoint
+        and ran_a_step
+        and not wall_clock_yield
+        and diverged_at is None
+    )
+    if final_due and last_saved_step == iteration:
+        # The periodic save already wrote this step's file; rewriting it is a full
+        # redundant checkpoint.
+        if logging_service:
+            logging_service.log_info(f"final state already saved at step {iteration}")
+    elif final_due:
+        # Not fail-soft: a run whose final file did not land is not finished.
+        checkpoint_path = checkpoint_service.save_step(
+            pipeline,
+            layout=_checkpoint_layout(output_paths),
+            config=config,
+            strategy=strategy,
+            parallel=parallel_runtime,
+            early_stopping=early_stopping_service,
+            reason="final",
+            epoch=epoch,
+            step=iteration,
+            config_fingerprint=_checkpoint_fingerprint,
+            writer=checkpoint_writer,
+        )
+        if logging_service:
+            logging_service.log_info(f"Final checkpoint at iter {iteration}: {checkpoint_path}")
 
-                        checkpoint_service.save_checkpoint(
-                            model=pipeline.models.get("generator"),
-                            optimizer=main_optimizer,
-                            epoch=epoch,
-                            loss=losses_history.get("g_total_loss", 0.0),
-                            step=iteration,
-                            extra_optimizers=(extra_optimizers if extra_optimizers else None),
-                            # Strategy-owned learnable state (section R) so the
-                            # fallback path doesn't silently drop it either.
-                            strategy_state=(
-                                strategy.strategy_state_dict()
-                                if hasattr(strategy, "strategy_state_dict")
-                                else None
-                            ),
-                        )
-                        if logging_service:
-                            logging_service.log_info(
-                                f"Checkpoint (legacy fallback) at iter {iteration}"
-                            )
-                    except Exception as fallback_err:
-                        if logging_service:
-                            logging_service.log_warning(
-                                f"Both director and fallback failed: {fallback_err}"
-                            )
-            except Exception as e:
-                if logging_service:
-                    logging_service.log_warning(f"Checkpoint save failed at iter {iteration}: {e}")
+    # Every file this run wrote is on disk before anything below reads one: the best
+    # restore, the run summary's checkpoint listing and the end-of-run report.
+    best_checkpoint_error = _finish_checkpoints(
+        checkpoint_writer, best_checkpoint_error, best_checkpoint_error_step
+    )
 
-    # DDP: only rank 0 wrote best.pt (and thus holds its path); broadcast it so
-    # EVERY rank restores the SAME best weights below, keeping the final model
-    # identical across ranks (otherwise non-main ranks would keep their latest
-    # weights). No-op single-process; the broadcast is also a rendezvous, so the
-    # file rank 0 wrote during the loop is visible to all ranks before they read.
+    # Only rank 0 holds the best path; the broadcast is also the rendezvous that makes
+    # the file visible to every rank before they read it.
     best_checkpoint_path = RankUtility.broadcast_object(best_checkpoint_path)
 
-    # Honor early_stopping.restore_best_weights (CLAUDE.md pitfall #15): after
-    # the loop, reload the best checkpoint so the returned/exported model is the
-    # best one, not the latest (often-degraded) weights. Runs before the final
-    # checkpoint so that, too, reflects the restored weights.
+    best_weights_restored: bool | None = None  # None: not requested, or a yield
+    # early_stopping.restore_best_weights: the returned and exported model is the best
+    # one, not the latest (pitfall #15).
     if (
         config.early_stopping
         and getattr(config.early_stopping, "restore_best_weights", False)
         and best_checkpoint_path
+        # A yielded run is mid-training; the next link must get the model the loop left.
+        and not wall_clock_yield
     ):
+        best_weights_restored = False
         try:
-            # with_parallel_runtime is what makes this symmetric with the WRITER
-            # at :1897. Without it the director resolves DefaultCheckpointAdapter
-            # (writes_native_artifact=False), so a sharded strategy's best
-            # checkpoint -- for DeepSpeed a bare consolidated state_dict, because
-            # save_best skips the generic payload whenever the adapter wrote a
-            # native artifact -- was parsed as a generic payload and raised
-            # KeyError('generator'), discarding the best weights of a finished run.
-            CheckpointDirector(config).with_pipeline(pipeline).with_strategy(
-                strategy
-            ).with_parallel_runtime(parallel_runtime).load_from(best_checkpoint_path)
+            # Weights and EMA only; collective under DeepSpeed, so every rank calls it.
+            checkpoint_service.best_weights(
+                best_checkpoint_path, pipeline, parallel=parallel_runtime, strategy=strategy
+            )
             logger.info(f"[EarlyStopping] Restored best weights from {best_checkpoint_path}")
+            best_weights_restored = True
         except Exception as restore_err:
-            logger.warning(
+            # Not raised: the run's result and summary carry it instead (NN3).
+            logger.error(
                 f"[EarlyStopping] Failed to restore best weights from "
-                f"{best_checkpoint_path}: {restore_err}"
+                f"{best_checkpoint_path}: {restore_err}. The returned model holds the LAST "
+                "weights; run_summary.best_weights_restored is false."
             )
 
-    # Final checkpoint on completion (rank 0 writes the shared output dir;
-    # FSDP/DeepSpeed need every rank here or the gather deadlocks).
-    if checkpoint_enabled and checkpoint_service and may_checkpoint:
-        try:
-            # =====================================================================
-            # PHASE 3 TASK 3: Final Checkpoint via Director
-            # =====================================================================
-            checkpoint_dir = str(
-                Path(output_paths.get("run_output_dir", "experiments/outputs")) / "checkpoints"
-            )
-
-            director = CheckpointDirector(config)
-            checkpoint_path = (
-                director.with_checkpoint_dir(checkpoint_dir)
-                .with_pipeline(pipeline)
-                .with_epoch(epoch)
-                .with_global_step(max_iterations)
-                .with_metrics(losses_history)
-                .with_scaler(getattr(pipeline, "scaler", None))
-                .with_parallel_runtime(parallel_runtime)
-                .with_counter_state(
-                    {
-                        "current_step": max_iterations,
-                        "current_epoch": epoch,
-                    }
-                )
-                .validate()
-                .save()
-            )
-
-            if logging_service:
-                logging_service.log_info(
-                    f"Final checkpoint via director at iter {max_iterations}: {checkpoint_path}"
-                )
-        except Exception as e:
-            if logging_service:
-                logging_service.log_warning(f"Final checkpoint save failed: {e}")
-
-    # Reporting is NOT invoked here. `MetricsReportGenerator` used to run from
-    # this spot on every run, ungated -- while the canonical `generate_report`
-    # sat behind `reporting.enabled`, which defaults False. The legacy generator
-    # therefore ran always and the SSOT pipeline almost never did.
-    #
-    # `pipelines/train.py::_maybe_run_reporting` is the one end-of-training
-    # report path now: the full pipeline when `reporting.enabled` is set, a
-    # tables-only CSV floor otherwise. It fires after this function returns, so
-    # it sees `final_metrics.json` written below -- which this call site did not.
-    # The class itself stays: `scripts/render_full_reporting_pipeline.py` builds
-    # its auto-report section from it.
+    # Reporting is not invoked here: `pipelines/train.py::_maybe_run_reporting`
+    # is the one end-of-training report path, and it runs after this function
+    # returns so that it reads the `final_metrics.json` written below.
 
     # =====================================================================
     # Write per-arm final_metrics.json — campaign-aggregator contract.
@@ -2654,7 +3016,7 @@ def _execute_training_loop(
                 "schema_version": "1",
                 "experiment_name": getattr(_meta, "name", None),
                 "best": best_metrics,
-                "final_loss": float(losses_history.get("g_total_loss", 0.0) or 0.0),
+                "final_loss": final_loss,
                 "early_stopping_best_value": _extract_es_best(early_stopping_service),
                 "early_stopping_best_iteration": _extract_es_best_iter(early_stopping_service),
                 # Provenance (#15): every loss-schedule fire / rollback, so a
@@ -2665,10 +3027,11 @@ def _execute_training_loop(
                     else []
                 ),
                 "csv_log_file": str(csv_path) if csv_path else None,
-                # None on a healthy run. Non-null means checkpoint_best.pt is
+                # None on a healthy run. Non-null means the best file is
                 # MISSING and why -- previously a log warning only, which reads
                 # identically to "the metric never improved" (#713).
                 "best_checkpoint_error": best_checkpoint_error,
+                "diverged_at_iteration": diverged_at,
             }
             target = run_dir / "final_metrics.json"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2694,8 +3057,55 @@ def _execute_training_loop(
     # Post-training certification hook: conformal / calibration strategies
     # compute their certificate (coverage_at_alpha, exchangeability p-value)
     # AFTER the reconstructor is trained. No-op for every other strategy.
-    if not is_sanity_check:
+    #
+    # `not wall_clock_yield`: a certificate computed from a half-trained
+    # reconstructor is a certificate for a model that will not exist by the end
+    # of the chain -- and this runs inside the save margin, so on a yield it
+    # eats the time reserved for getting out cleanly.
+    if not is_sanity_check and not wall_clock_yield and diverged_at is None:
         _maybe_run_calibration(strategy, pipeline, output_paths, logging_service)
+
+    # Checked before the sanity verdict, which reads only a trace and could
+    # still pass on a run that went non-finite.
+    if diverged_at is not None:
+        return {
+            "success": False,
+            "error": (
+                f"Training diverged at iteration {diverged_at}: the loss became "
+                "non-finite and the loop stopped to protect the weights."
+            ),
+            "diverged_at_iteration": diverged_at,
+            "sanity_check": is_sanity_check,
+            "wall_clock_yield": False,
+            "resume_from_iteration": None,
+            "final_loss": final_loss,
+            "training_time": "N/A",
+            "iterations_completed": max(0, iteration - start_iteration + 1),
+            "best_metrics": best_metrics,
+            **validation_tally.as_result_fields(),
+            **_loader_wait.as_result_fields(),
+        }
+
+    # Training completed, but a validation that measured nothing has not
+    # validated it; this outranks the sanity verdict for the same reason.
+    validation_failure = validation_failure_reason(validation_tally)
+    if validation_failure is not None:
+        if logging_service:
+            logging_service.log_error(validation_failure)
+        return {
+            "success": False,
+            "error": validation_failure,
+            "sanity_check": is_sanity_check,
+            # Never a yield: requeueing would resume a run judged unvalidated.
+            "wall_clock_yield": False,
+            "resume_from_iteration": None,
+            "final_loss": final_loss,
+            "training_time": "N/A",
+            "iterations_completed": max(0, iteration - start_iteration + 1),
+            "best_metrics": best_metrics,
+            **validation_tally.as_result_fields(),
+            **_loader_wait.as_result_fields(),
+        }
 
     # Sanity-check verdict: a green "success" is only honest if the model
     # actually learned. Overfitting one batch MUST collapse the loss; if it
@@ -2713,21 +3123,32 @@ def _execute_training_loop(
             "success": bool(passed),
             "sanity_check": True,
             "sanity_report": report,
-            "final_loss": report.get("final_loss", losses_history.get("g_total_loss", 0.0)),
+            "final_loss": report.get("final_loss", final_loss),
             "training_time": "N/A",  # overwritten by run_training_pipeline
             "iterations_completed": max(0, iteration - start_iteration + 1),
             # `train.py` reads this for run_summary.json (#481). Empty rather than
             # absent: a sanity check is too short to have a meaningful best.
             "best_metrics": best_metrics,
+            **validation_tally.as_result_fields(),
+            **_loader_wait.as_result_fields(),
             **({} if passed else {"error": report.get("reason", "sanity overfit failed")}),
         }
 
     return {
         "success": True,
-        "final_loss": losses_history.get("g_total_loss", 0.0),
+        # A yielded run succeeded at what it was asked to do and is NOT finished.
+        # Callers that treat `success` as "training is done" would archive a run
+        # that is half-trained, so the distinction is a key, not a log line.
+        "wall_clock_yield": wall_clock_yield,
+        "resume_from_iteration": iteration if wall_clock_yield else None,
+        "final_loss": final_loss,
         "training_time": "N/A",  # overwritten by run_training_pipeline with real wall-clock
         "iterations_completed": max(0, iteration - start_iteration + 1),
         # The key `train.py:905` has always read and no return path ever set, so
         # `run_summary.best_metrics` was `null` on every run ever written (#481).
         "best_metrics": best_metrics,
+        "best_weights_restored": best_weights_restored,
+        "best_iteration": _extract_es_best_iter(early_stopping_service),
+        **validation_tally.as_result_fields(),
+        **_loader_wait.as_result_fields(),
     }

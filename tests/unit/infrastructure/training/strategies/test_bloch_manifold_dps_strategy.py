@@ -11,6 +11,7 @@ composition.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -19,8 +20,8 @@ import torch.nn as nn
 from spectramr.infrastructure.training.strategies.bloch_manifold_dps_strategy import (
     BlochManifoldDPSStrategy,
     _cfg_get,
-    _linear_beta_schedule,
 )
+from spectramr.models.diffusion.bloch_manifold_dps_sampler import rescaled_linear_betas
 
 
 class _DummyScore(nn.Module):
@@ -57,7 +58,6 @@ def _bm_block(**overrides) -> dict:
         "sampling_steps": 50,
         "sampler_type": "ddim",
         "prediction_type": "epsilon",
-        "pretrained_score_checkpoint": "ckpt.pt",
     }
     block.update(overrides)
     return block
@@ -72,22 +72,15 @@ def _make_config(bm_block=None, timesteps=50) -> SimpleNamespace:
 
 
 def _build_strategy(config, generator) -> BlochManifoldDPSStrategy:
-    """Construct the strategy, replicating only the init logic under test."""
+    """Run the real ``__init__`` with only the heavy base-class init stubbed out."""
     strat = object.__new__(BlochManifoldDPSStrategy)
     strat.config = config
     strat.device = torch.device("cpu")
     strat.env = SimpleNamespace(generator=generator, config=config)
     strat.logging_service = None
-    # Replicate BlochManifoldDPSStrategy.__init__ body (minus heavy base init).
-    bm = config.training.bloch_manifold_dps
-    strat._bm_cfg = bm
-    strat._sampling_steps = int(_cfg_get(bm, "sampling_steps", 1000))
-    diff = getattr(config.training, "diffusion", None)
-    strat.num_timesteps = int(_cfg_get(diff, "timesteps", strat._sampling_steps))
-    strat.register_diffusion_buffers(_linear_beta_schedule(strat.num_timesteps, strat.device))
-    strat.prediction_type = str(_cfg_get(bm, "prediction_type", "epsilon"))
-    strat._sampler = None
-    strat.logs_validation_images_in_step = True
+    base = BlochManifoldDPSStrategy.__bases__[0]
+    with patch.object(base, "__init__", lambda self, *a, **k: None):
+        BlochManifoldDPSStrategy.__init__(strat, env=strat.env)
     return strat
 
 
@@ -417,3 +410,23 @@ class TestForwardScoreIsIntrospectedNotSwallowed:
         )
         assert seen["timesteps"] is not None
         assert int(seen["timesteps"][0]) == 7
+
+
+def test_the_sampler_walks_the_schedule_the_score_network_trained_on(generator):
+    """PLANTED (#2441): the sampler rebuilt its schedule over sampling_steps, not T."""
+    strat = _build_strategy(_make_config(_bm_block(sampling_steps=10), timesteps=40), generator)
+    sampler = strat.build_sampler()
+    assert sampler.num_timesteps == strat.num_timesteps == 40
+    assert sampler.sampling_steps == 10
+    torch.testing.assert_close(sampler.alphas_cumprod, strat.alphas_cumprod)
+
+
+def test_a_short_trained_chain_has_a_finite_schedule(generator):
+    strat = _build_strategy(_make_config(_bm_block(sampling_steps=10), timesteps=10), generator)
+    torch.testing.assert_close(strat.betas, rescaled_linear_betas(10))
+    assert torch.isfinite(1.0 / strat.sqrt_alphas_cumprod).all()
+
+
+def test_more_reverse_steps_than_trained_steps_raises_at_construction(generator):
+    with pytest.raises(ValueError, match="sampling_steps=50 must lie in"):
+        _build_strategy(_make_config(_bm_block(sampling_steps=50), timesteps=29), generator)

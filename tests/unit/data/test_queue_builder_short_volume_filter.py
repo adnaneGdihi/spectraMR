@@ -167,3 +167,27 @@ def test_fast_path_drops_short_depth_for_3d():
     out = TorchIOQueueBuilder._filter_patch_compatible_subjects(ds, patch_size=(128, 128, 16))
     assert ds.loads == 0
     assert len(out.index) == 1  # depth-2 volume dropped (2 < 16)
+
+
+def test_filter_reads_nifti_manifest_shape_as_chwd() -> None:
+    """NIfTI records store [C, H, W, D]: a 3-D patch must compare against D, not C or W."""
+    ds = _LazyShapeDataset([(1, 128, 128, 56), (1, 128, 128, 8)])
+    for r in ds.index:
+        r["primary_path"] = f"{r['file_id']}.nii.gz"
+    out = TorchIOQueueBuilder._filter_patch_compatible_subjects(ds, (64, 64, 16))
+    assert [r["file_id"] for r in out.index] == ["v0"]
+    assert ds.loads == 0
+
+
+def test_require_a_subject_fits_names_the_patch_when_every_subject_is_dropped() -> None:
+    from spectramr.data.builders.torchio_queue_builder import _require_a_subject_fits
+
+    with pytest.raises(ValueError, match=r"All 2 validation subject\(s\).*patch_size=\(64, 64, 64\)"):
+        _require_a_subject_fits("validation", 2, [], (64, 64, 64))
+
+
+def test_require_a_subject_fits_is_silent_when_a_subject_survives() -> None:
+    from spectramr.data.builders.torchio_queue_builder import _require_a_subject_fits
+
+    ds = tio.SubjectsDataset([_make_subject((1, 256, 256, 18))])
+    _require_a_subject_fits("train", 2, ds, (64, 64, 16))

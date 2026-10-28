@@ -84,6 +84,16 @@ def test_stratified_calibration_covers_within_tolerance() -> None:
     assert float(report.coverage.min()) > 0.85
 
 
+@pytest.mark.parametrize("scale", [0.01, 5.0])
+def test_gate_fails_over_and_under_coverage(scale: float) -> None:
+    """Planted violations: intervals far too wide and far too narrow both fail."""
+    r_cal, d_cal = _heteroscedastic(seed=0)
+    r_te, d_te = _heteroscedastic(seed=1)
+    cal = AnchorConformalCalibrator(alpha=0.1, n_strata=4).fit(r_cal, d_cal)
+    report = cal.coverage(r_te * scale, d_te)
+    assert not report.guaranteed
+
+
 def test_half_widths_increase_with_difficulty() -> None:
     """The point of conditioning: a flat region gets a tight interval and an
     edge gets a wide one, rather than both getting the average."""

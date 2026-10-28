@@ -24,9 +24,14 @@ Policy:
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from os import PathLike
+from typing import Any
 
 __all__ = [
+    "FILE_KEYS",
+    "SUBJECT_KEYS",
+    "record_split_key",
     "split_index",
     "split_index_grouped",
     "split_index_three_way",
@@ -34,10 +39,46 @@ __all__ = [
     "subject_id_from_name",
 ]
 
+#: Record keys that identify a *subject* (patient), strictest to loosest.
+SUBJECT_KEYS = ("subject_id", "patient_id", "subject")
+#: Record keys that identify an exact *file*, strictest to loosest.
+FILE_KEYS = ("relative_path", "primary_path", "file_id", "path", "file", "input")
+
+
+def record_split_key(record: Any) -> str:
+    """The identity an index item is split on: its subject, else its file.
+
+    A record (a mapping, or an object with those attributes) is read for a subject
+    id, then for a file whose name carries a BIDS ``sub-*`` label, then for the file
+    itself; a bare path is its ``sub-*`` label or its own name. The same identity the
+    leakage audit compares, so a split grouped on it cannot put one subject on both
+    sides. An item with none of these is its own group, which splits exactly as a
+    by-item split does.
+    """
+    if isinstance(record, (str, PathLike)):
+        name = str(record)
+        return subject_id_from_name(name) or name
+
+    def field(key: str) -> Any:
+        return record.get(key) if isinstance(record, Mapping) else getattr(record, key, None)
+
+    for k in SUBJECT_KEYS:
+        if value := field(k):
+            return str(value)
+    name = next((str(field(k)) for k in FILE_KEYS if field(k)), None)
+    if name is None:
+        return f"record-{id(record)}"
+    return subject_id_from_name(name) or name
+
+
 #: The BIDS subject label (``sub-<alnum>``) wherever it appears in a path or
 #: file name. Anchored so ``resub-01`` or ``sub-01x`` (a different label) do
 #: not match the wrong thing; the label itself is taken whole.
 _SUBJECT_TOKEN = re.compile(r"(?<![A-Za-z0-9])(sub-[A-Za-z0-9]+)")
+
+
+#: ``data.split.type`` values that partition the paired-manifest route from config, not split_hint.
+CONFIG_OWNED_SPLIT_TYPES = frozenset({"random", "loso_subject", "subjects"})
 
 
 def subject_id_from_name(name: str) -> str | None:

@@ -1,7 +1,8 @@
 """One decompression step for every k-space *visualization* path (#682).
 
-``data.processing.enable_log_scaling`` compresses k-space magnitude with
-``m -> log1p(m)`` (``data/transforms/normalization.py::compress_kspace_log``).
+With ``data.processing.enable_kspace_normalization`` on,
+``enable_log_scaling`` compresses k-space magnitude with ``m -> log1p(m)``
+(``data/transforms/normalization.py::compress_kspace_log``).
 The inverse, :func:`decompress_kspace_log`, had exactly ONE caller in the tree --
 inside the diffusion strategy, gated on ``is_cold_diffusion`` -- so every other
 arm inverse-FFT'd the *compressed* spectrum.
@@ -28,11 +29,16 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["decompress_for_view", "log_scaling_enabled"]
+__all__ = ["decompress_for_view", "decompress_scored_against", "log_scaling_enabled"]
 
 
 def log_scaling_enabled(config: Any) -> bool:
-    """Read ``data.processing.enable_log_scaling`` defensively.
+    """Whether this arm's k-space reaches the model ``log1p``-compressed.
+
+    Resolved by :attr:`KSpaceNormalizationSpec.log_compressed`, not read off
+    ``enable_log_scaling``: the compression runs only when
+    ``enable_kspace_normalization`` is also on, and the declaration alone would
+    ``expm1`` a spectrum that was never compressed (#2353).
 
     Returns ``False`` when there is no ``data.processing`` block at all -- a
     strategy constructed standalone in a unit test, or a paradigm with no data
@@ -40,32 +46,64 @@ def log_scaling_enabled(config: Any) -> bool:
     what the caller passed, rather than applying ``expm1`` to a tensor that was
     never compressed (which would blow the dynamic range apart).
 
-    But when the block DOES exist and the field does not, this raises. A plain
-    ``getattr(..., False)`` over a *declared* field is how a rename disables a
-    mechanism in silence: the guard keeps the old spelling, every call returns
-    False, #682 comes back, and nothing goes red because "absent" and "off" are
-    the same boolean. This repo has already lost eight mechanisms exactly that
-    way. Absent-block and absent-field are different facts and get different
-    answers.
+    But when the block DOES exist and a normalization knob does not, this
+    raises. A plain ``getattr(..., False)`` over a *declared* field is how a
+    rename disables a mechanism in silence: the guard keeps the old spelling,
+    every call returns False, #682 comes back, and nothing goes red because
+    "absent" and "off" are the same boolean. Absent-block and absent-field are
+    different facts and get different answers.
 
     Raises:
-        AttributeError: ``data.processing`` exists but declares no
-            ``enable_log_scaling`` -- the field was renamed or removed, and every
-            k-space visualization is silently rendering a compressed spectrum.
+        AttributeError: ``data.processing`` exists but omits one of the knobs
+            :meth:`KSpaceNormalizationSpec.from_data_config` resolves -- the
+            field was renamed or removed, and every k-space visualization is
+            silently rendering a compressed spectrum.
     """
+    from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
     data = getattr(config, "data", None)
     processing = getattr(data, "processing", None) if data is not None else None
     if processing is None:
         return False
-    if not hasattr(processing, "enable_log_scaling"):
-        raise AttributeError(
-            "data.processing exists but declares no `enable_log_scaling`. This "
-            "is the k-space log-compression flag every visualization path reads "
-            "(#682); if it was renamed, update `log_scaling_enabled` with it. "
-            "Returning False here would silently IFFT a compressed spectrum "
-            "again, which is the defect this module was written to close."
-        )
-    return bool(processing.enable_log_scaling)
+    return KSpaceNormalizationSpec.from_data_config(data).log_compressed
+
+
+def decompress_scored_against(
+    reference: torch.Tensor,
+    others: dict[str, torch.Tensor | None],
+    *,
+    log_scaled: bool,
+    channel_dim: int = 1,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
+    """Put a reference and every tensor scored against it on ONE level.
+
+    :func:`decompress_for_view` decides per tensor, which is right for a render
+    and wrong for a metric: a prediction whose compressed |k|max passes
+    ``DECOMPRESS_MAGNITUDE_CEILING`` was left compressed while its target was
+    decompressed, so the two were scored in different units. Here the decision is
+    made once, on ``reference`` (the pipeline's target, whose compression is
+    known), and the same ``decompress_kspace_log`` is applied to every tensor.
+    Its clamp turns a diverged prediction into an honestly bad finite score.
+
+    Args:
+        reference: The target the others are compared with.
+        others: Name -> tensor to transform identically; ``None`` passes through.
+        log_scaled: Whether ``compress_kspace_log`` was applied upstream.
+        channel_dim: Channel axis for real-stacked input; ignored for complex.
+
+    Returns:
+        ``(reference, others)`` after the shared decision.
+    """
+    decided = decompress_for_view(reference, log_scaled=log_scaled, channel_dim=channel_dim)
+    if decided is reference:
+        return reference, dict(others)
+
+    from spectramr.data.transforms.normalization import decompress_kspace_log
+
+    return decided, {
+        name: None if t is None else decompress_kspace_log(t, channel_dim=channel_dim)
+        for name, t in others.items()
+    }
 
 
 def decompress_for_view(x: torch.Tensor, *, log_scaled: bool, channel_dim: int = 1) -> torch.Tensor:
@@ -93,9 +131,8 @@ def decompress_for_view(x: torch.Tensor, *, log_scaled: bool, channel_dim: int =
 
     Args:
         x: Complex or real-stacked interleaved k-space.
-        log_scaled: Whether ``compress_kspace_log`` was applied upstream. Comes
-            from ``data.processing.enable_log_scaling`` -- see
-            :func:`log_scaling_enabled`.
+        log_scaled: Whether ``compress_kspace_log`` was applied upstream, as
+            resolved by :func:`log_scaling_enabled`.
         channel_dim: Channel axis for real-stacked input; ignored for complex.
 
     Returns:

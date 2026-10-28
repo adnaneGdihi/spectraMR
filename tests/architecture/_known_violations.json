@@ -1,5 +1,5 @@
 {
-  "_comment": "Pre-existing layer-direction violations recorded 2026-05-22. These are known technical debt. The gate test PASSES if no NEW violations appear beyond this list. The slow-lane cleanup tracker FAILS until this list is empty. 2026-06-12: added spectramr.data k-space readers (bart_dataset, ismrmrd_dataset) + the dataset-EDA module (eda/loader, eda/probes) as physics-SSOT consumers — they MUST import infrastructure/physics (fft2c/NUFFT/gridding/ESPIRiT) per CLAUDE.md pitfall #2 (no reimplemented FFTs); same accepted exception as the 60+ core/ entries above. 2026-07-02: pruned stale data_io entry (evaluation_use_case.py deleted); added 2 checkpoint-IO data_io entries (model_builder, conformal_calibration_strategy) + 6 layer_direction entries from the 2026-06/07 hardening commits (same accepted physics-SSOT/metric shapes). 2026-07-30 (#629): added 2 checkpoint/model-load data_io entries (mrixfields_baselines/generator_loader, pipelines/eval_baselines) - both load a model, not a dataset, so DataPipelineDirector does not apply. Also added 5 layer_direction entries (super_nyquist_fidelity, fastmri_brain_groups, m4raw_source x2, transforms/normalization) - all the SAME accepted physics-SSOT exception: reimplementing fft2c/pseudo-GT locally would violate non-negotiable #2. Pruned 4 stale entries (models/dev_experience/enhanced_cli.py deleted: 2 duplicate layer_direction + 1 data_io; spectra_tta_strategy.py no longer uses torch.fft) and deduplicated layer_direction. Staleness is now its own hard-failing gate. Also pruned 3 more stale entries the new staleness gates caught: cli/app.py's scripts.sim2rank import (now only a docstring :func: reference) and the .item() calls removed from disentangled_strategy/domain_adaptation train_step. 2026-08-04: pruned 5 stale entries (4 layer_direction + 1 raw_torch_fft) for the four duplicate transform modules deleted this day — coil_compression_transform, coil_sensitivity_transform, concomitant_phase_compensation, non_cartesian_simulation. Each was a caller-free second implementation of a live job and three disagreed numerically with it; the debt they recorded is paid by deletion, not by a fix. 2026-08-22: pruned 4 data_io entries that the text oracle recorded from prose, not code (entities_3d nib.load, optional_imports h5py.File, infer.py h5py.File + nib.load) — infer.py's docstring asserts the pipeline layer never calls them and the regex read that sentence as the violation. The scanner is now AST-based, so the list can only shrink. 2026-08-22: training_loop grew 1 -> 6 entries (8 occurrences) WITHOUT any new code -- TARGET_METHODS is now derived from base.py's own per-step call graph instead of being a four-name literal, three of whose names were defined zero times anywhere under strategies/. The real hook _compute_losses_impl (144 definers) had never been audited. Entries now carry a count: identity alone forgives a whole method, which is the NN20 hole where growth inside a baselined entry goes unseen. 2026-08-22 (#1398): layer_direction gained the three OUTER source layers (infrastructure, application, pipelines) as this test was elected sole owner of import direction and the matching emit blocks were deleted from scripts/ci/check_layering.sh. The extension surfaced exactly 2 violations, both function-local at col 8 in hpo_use_case.py -- the shape the deleted greps could never see. infrastructure -> application is a rule NEITHER checker had; it measured 0 violations, so it lands as a pure ratchet with no baselined debt. 2026-08-23 (D12#5): training_loop grew 6 -> 10 entries, again WITHOUT any new code -- the detector gained an implicit-sync visitor for 'if' tests that boolean a tensor ('.any()'/'.all()' and torch.isnan/isinf/isfinite), which no '.item()' spelling makes visible. Exactly 4 sites, recorded one per 'if' rather than one per matching call (the 'isnan().any() or isinf().any()' expression matches four times and is one sync point; counting calls would have inflated the report to 7). Bare-name any()/all() are deliberately NOT matched -- as a bare name they are the Python builtins over a generator, and 3 sites in the audited methods depend on that. Correcting the count above: _compute_losses_impl is defined in 134 files (145 definitions), not '144 definers'. 2026-08-24 (D01#16): renamed the scripts_imports key to nonpackage_imports and widened its scanner from the single hardcoded name 'scripts' to NONPACKAGE_ROOTS (scripts, scratch, runners, tools, tests) -- every repo-root tree absent from pyproject's packages=[\"src/spectramr\"]. It had recorded 0 violations since it was written while 2 real ones sat at cli/app.py:474,487 (col 8, function-local), which break spectramr list-features on every wheel install. Recorded here as one entry (both sites are the same file+import); the relocation of tools/generate_feature_matrix.py and tools/feature_introspection.py into the package is filed as #1492. The scanner skips relative ImportFrom nodes: ast drops the leading dots, so 'from .tools import x' arrives as the bare name 'tools' and the first-segment match condemned a legal in-package import of src/spectramr/tools/.",
+  "_comment": "Pre-existing layer-direction violations recorded 2026-05-22. These are known technical debt. The gate test PASSES if no NEW violations appear beyond this list. The slow-lane cleanup tracker FAILS until this list is empty. 2026-06-12: added spectramr.data k-space readers (bart_dataset, ismrmrd_dataset) + the dataset-EDA module (eda/loader, eda/probes) as physics-SSOT consumers \u2014 they MUST import infrastructure/physics (fft2c/NUFFT/gridding/ESPIRiT) per CLAUDE.md pitfall #2 (no reimplemented FFTs); same accepted exception as the 60+ core/ entries above. 2026-07-02: pruned stale data_io entry (evaluation_use_case.py deleted); added 2 checkpoint-IO data_io entries (model_builder, conformal_calibration_strategy) + 6 layer_direction entries from the 2026-06/07 hardening commits (same accepted physics-SSOT/metric shapes). 2026-07-30 (#629): added 2 checkpoint/model-load data_io entries (mrixfields_baselines/generator_loader, pipelines/eval_baselines) - both load a model, not a dataset, so DataPipelineDirector does not apply. Also added 5 layer_direction entries (super_nyquist_fidelity, fastmri_brain_groups, m4raw_source x2, transforms/normalization) - all the SAME accepted physics-SSOT exception: reimplementing fft2c/pseudo-GT locally would violate non-negotiable #2. Pruned 4 stale entries (models/dev_experience/enhanced_cli.py deleted: 2 duplicate layer_direction + 1 data_io; spectra_tta_strategy.py no longer uses torch.fft) and deduplicated layer_direction. Staleness is now its own hard-failing gate. Also pruned 3 more stale entries the new staleness gates caught: cli/app.py's scripts.sim2rank import (now only a docstring :func: reference) and the .item() calls removed from disentangled_strategy/domain_adaptation train_step. 2026-08-04: pruned 5 stale entries (4 layer_direction + 1 raw_torch_fft) for the four duplicate transform modules deleted this day \u2014 coil_compression_transform, coil_sensitivity_transform, concomitant_phase_compensation, non_cartesian_simulation. Each was a caller-free second implementation of a live job and three disagreed numerically with it; the debt they recorded is paid by deletion, not by a fix. 2026-08-22: pruned 4 data_io entries that the text oracle recorded from prose, not code (entities_3d nib.load, optional_imports h5py.File, infer.py h5py.File + nib.load) \u2014 infer.py's docstring asserts the pipeline layer never calls them and the regex read that sentence as the violation. The scanner is now AST-based, so the list can only shrink. 2026-08-22: training_loop grew 1 -> 6 entries (8 occurrences) WITHOUT any new code -- TARGET_METHODS is now derived from base.py's own per-step call graph instead of being a four-name literal, three of whose names were defined zero times anywhere under strategies/. The real hook _compute_losses_impl (144 definers) had never been audited. Entries now carry a count: identity alone forgives a whole method, which is the NN20 hole where growth inside a baselined entry goes unseen. 2026-08-22 (#1398): layer_direction gained the three OUTER source layers (infrastructure, application, pipelines) as this test was elected sole owner of import direction and the matching emit blocks were deleted from scripts/ci/check_layering.sh. The extension surfaced exactly 2 violations, both function-local at col 8 in hpo_use_case.py -- the shape the deleted greps could never see. infrastructure -> application is a rule NEITHER checker had; it measured 0 violations, so it lands as a pure ratchet with no baselined debt. 2026-08-23 (D12#5): training_loop grew 6 -> 10 entries, again WITHOUT any new code -- the detector gained an implicit-sync visitor for 'if' tests that boolean a tensor ('.any()'/'.all()' and torch.isnan/isinf/isfinite), which no '.item()' spelling makes visible. Exactly 4 sites, recorded one per 'if' rather than one per matching call (the 'isnan().any() or isinf().any()' expression matches four times and is one sync point; counting calls would have inflated the report to 7). Bare-name any()/all() are deliberately NOT matched -- as a bare name they are the Python builtins over a generator, and 3 sites in the audited methods depend on that. Correcting the count above: _compute_losses_impl is defined in 134 files (145 definitions), not '144 definers'. 2026-08-24 (D01#16): renamed the scripts_imports key to nonpackage_imports and widened its scanner from the single hardcoded name 'scripts' to NONPACKAGE_ROOTS (scripts, scratch, runners, tools, tests) -- every repo-root tree absent from pyproject's packages=[\"src/spectramr\"]. It had recorded 0 violations since it was written while 2 real ones sat at cli/app.py:474,487 (col 8, function-local), which break spectramr list-features on every wheel install. Recorded here as one entry (both sites are the same file+import); the relocation of tools/generate_feature_matrix.py and tools/feature_introspection.py into the package is filed as #1492. The scanner skips relative ImportFrom nodes: ast drops the leading dots, so 'from .tools import x' arrives as the bare name 'tools' and the first-segment match condemned a legal in-package import of src/spectramr/tools/. 2026-10-10: infrastructure/checkpointing/codecs/ became the sanctioned checkpoint-IO home; safetensors load_file/safe_open are now detected, and the 3 pre-existing loads are recorded for deletion by the checkpoint-SSOT PRs 3-4. Pruned the stale failure_gallery.py nib.load entry. 2026-10-21 (#3119): the raw_torch_fft scanner parses instead of grepping, so a string, comment or docstring naming torch.fft no longer counts and aliased imports do. Pruned 7 entries whose only match was prose (fourier, tio_physics, pinn_strategy, ssad, cross_contrast_cross_domain_generator, kspace_consistency_tta_loss, spectral_radial_prior_loss); the two files it newly found (cold_mri_kspace_scheduler, meta_varnet) only carried a dead `import torch.fft`, deleted rather than baselined.",
   "layer_direction": [
     {
       "file": "spectramr/core/metrics/connectivity/fc_metrics.py",
@@ -134,51 +134,9 @@
       "forbidden_layer": "spectramr.infrastructure"
     },
     {
-      "file": "spectramr/data/adapters/fourier.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
       "file": "spectramr/data/builders/torchio_subject_builder.py",
       "layer": "spectramr.data",
       "import": "spectramr.infrastructure.errors",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/builders/torchio_subject_builder.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/builders/torchio_transform_builder.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.digital_twin_simulator",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/bart_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/bart_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.gridding",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/bart_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.nufft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/fastmri_brain_groups.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.m4raw_pseudo_gt",
       "forbidden_layer": "spectramr.infrastructure"
     },
     {
@@ -188,195 +146,9 @@
       "forbidden_layer": "spectramr.infrastructure"
     },
     {
-      "file": "spectramr/data/datasets/inference_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/ismrmrd_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.gridding",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/ismrmrd_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.nufft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/m4raw_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/meta_learning_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
       "file": "spectramr/data/datasets/meta_learning_dataset.py",
       "layer": "spectramr.data",
       "import": "spectramr.infrastructure.training.utils.kspace_masks",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/datasets/slice_dataset.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.physics_registry",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/eda/loader.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/eda/loader.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.nufft_utils",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/eda/loader.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.trajectories",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/eda/probes.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.coil_sensitivity",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/sources/m4raw_source.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/sources/m4raw_source.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.m4raw_pseudo_gt",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/synthesis/vlf_simulator.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.bloch_simulation",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/synthesis/vlf_simulator.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/synthesis/vlf_simulator.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.tissue_properties",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/acquisition_params_injector.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.physics_registry",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/benchmarking_degradations.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/image_undersampling.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/image_undersampling.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.sampling",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/joint_rotation.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/kspace_coil_transforms.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/non_cartesian.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.trajectories",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/normalization.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/physics_sync.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/realistic_degradations.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/realistic_degradations.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.field_simulation",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/scout_acquisition.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/synthetic_lesion.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.multi_physics_bloch",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/synthetic_ulf_simulator.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.maxwell_concomitant",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/tio_physics.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
-      "forbidden_layer": "spectramr.infrastructure"
-    },
-    {
-      "file": "spectramr/data/transforms/transforms.py",
-      "layer": "spectramr.data",
-      "import": "spectramr.infrastructure.physics.fft_ops",
       "forbidden_layer": "spectramr.infrastructure"
     },
     {
@@ -443,6 +215,20 @@
       "import": "spectramr.pipelines.hpo",
       "forbidden_layer": "spectramr.pipelines",
       "note": "Recorded 2026-08-22 with the layering election (#1398). Function-local import inside a method, at col 8: every grep in check_layering.sh was anchored at ^, so this shape was invisible to the checker that owned the rule until now. Not fixed here -- untangling the HPO use case's dependency on pipelines is application-layer work, not gate work."
+    },
+    {
+      "file": "spectramr/core/metrics/coil_manifold.py",
+      "layer": "spectramr.core",
+      "import": "spectramr.infrastructure.physics.fft_ops",
+      "forbidden_layer": "spectramr.infrastructure",
+      "note": "Recorded 2026-09-24. The physics-SSOT carve-out (CLAUDE.md non-negotiable 2, check_layering.sh line 126): the coil-manifold projection moves a k-space prediction to the image domain with fft2c/ifft2c rather than a reimplemented FFT. Same accepted exception as the other core/ entries."
+    },
+    {
+      "file": "spectramr/core/metrics/sense_image_metrics.py",
+      "layer": "spectramr.core",
+      "import": "spectramr.infrastructure.physics.fft_ops",
+      "forbidden_layer": "spectramr.infrastructure",
+      "note": "Recorded 2026-10-07. The physics-SSOT carve-out (.claude/rules/physics.md): sense_psnr/sense_ssim combine coils through fft_ops.sense_adjoint(normalize=True), which delegates the divide to coil_combine_sense, its one owner. Re-deriving that divide in core/ would be a second owner (non-negotiable 17). Same accepted exception as coil_manifold.py."
     }
   ],
   "nonpackage_imports": [
@@ -454,19 +240,7 @@
   ],
   "data_io": [
     {
-      "file": "spectramr/cli/app.py",
-      "call": "torch.load"
-    },
-    {
       "file": "spectramr/cli/audit_plan_novel_cli.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/builders/directors/checkpoint_director.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/builders/leaf/model_builders.py",
       "call": "torch.load"
     },
     {
@@ -479,14 +253,6 @@
       "note": "checkpoint IO (weights_only state_dict), not dataset IO - gate docstring option (b)"
     },
     {
-      "file": "spectramr/infrastructure/inference/base_inference_strategy.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/inference/gan_inference_strategy.py",
-      "call": "torch.load"
-    },
-    {
       "file": "spectramr/infrastructure/io/adapters.py",
       "call": "h5py.File"
     },
@@ -497,10 +263,6 @@
     {
       "file": "spectramr/infrastructure/orchestration/campaign_evaluator.py",
       "call": "pickle.load"
-    },
-    {
-      "file": "spectramr/infrastructure/orchestration/campaign_evaluator.py",
-      "call": "torch.load"
     },
     {
       "file": "spectramr/infrastructure/physics/coil_sensitivity.py",
@@ -523,34 +285,6 @@
       "call": "torch.load"
     },
     {
-      "file": "spectramr/infrastructure/reporting/plotters/failure_gallery.py",
-      "call": "nib.load"
-    },
-    {
-      "file": "spectramr/infrastructure/services/checkpoint_service.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/training/builders/model_builder.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/training/strategies/conformal_calibration_strategy.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/training/strategies/diffusion.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/training/strategies/distillation_strategy.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/infrastructure/training/strategies/pipeline_strategy.py",
-      "call": "torch.load"
-    },
-    {
       "file": "spectramr/infrastructure/training/strategies/twin_dps_strategy.py",
       "call": "torch.load"
     },
@@ -567,21 +301,9 @@
       "call": "pickle.load"
     },
     {
-      "file": "spectramr/models/generators/latent_diffusion_generator.py",
-      "call": "torch.load"
-    },
-    {
       "file": "spectramr/pipelines/eval_baselines.py",
       "call": "torch.load",
       "note": "TorchScript/state-dict model load fallback for the segmentation baseline, not dataset IO"
-    },
-    {
-      "file": "spectramr/pipelines/infer.py",
-      "call": "torch.load"
-    },
-    {
-      "file": "spectramr/pipelines/make.py",
-      "call": "torch.load"
     },
     {
       "file": "spectramr/shared/utils/preprocessing_qc.py",
@@ -695,15 +417,7 @@
       "note": "integration-surfaced post-consolidation; TODO route via fft_ops port"
     },
     {
-      "file": "spectramr/data/adapters/fourier.py",
-      "note": "data adapter wrapping physics \u2014 TODO route via fft_ops port"
-    },
-    {
       "file": "spectramr/data/transforms/realistic_degradations.py",
-      "note": "data transform \u2014 TODO route via fft_ops"
-    },
-    {
-      "file": "spectramr/data/transforms/tio_physics.py",
       "note": "data transform \u2014 TODO route via fft_ops"
     },
     {
@@ -721,10 +435,6 @@
     {
       "file": "spectramr/infrastructure/training/strategies/pilot_strategy.py",
       "note": "pilot strategy uses raw fft \u2014 TODO route via fft_ops"
-    },
-    {
-      "file": "spectramr/infrastructure/training/strategies/pinn_strategy.py",
-      "note": "PINN strategy uses raw fft \u2014 TODO route via fft_ops"
     },
     {
       "file": "spectramr/models/blocks/fno_block.py",
@@ -755,10 +465,6 @@
       "note": "diffusion model \u2014 fftfreq usage for noise spectrum"
     },
     {
-      "file": "spectramr/models/diffusion/ssad.py",
-      "note": "comment-only reference \u2014 no active call (check ssad.py)"
-    },
-    {
       "file": "spectramr/models/edge/q_fno.py",
       "note": "FNO variant outside blocks/ \u2014 TODO move to blocks/ or use fft_ops"
     },
@@ -773,10 +479,6 @@
     {
       "file": "spectramr/models/generators/aftnet_generator.py",
       "note": "AFTNet attention uses FFT on Q/K/V \u2014 real feature maps"
-    },
-    {
-      "file": "spectramr/models/generators/cross_contrast_cross_domain_generator.py",
-      "note": "comment-only reference in docstring"
     },
     {
       "file": "spectramr/models/generators/geo_fno_generator.py",
@@ -799,16 +501,8 @@
       "note": "integration-surfaced post-consolidation; TODO route via fft_ops port"
     },
     {
-      "file": "spectramr/models/losses/kspace_consistency_tta_loss.py",
-      "note": "integration-surfaced post-consolidation; TODO route via fft_ops port"
-    },
-    {
       "file": "spectramr/models/losses/phase_stego_score.py",
       "note": "phase loss uses fftn on phase maps \u2014 borderline, review"
-    },
-    {
-      "file": "spectramr/models/losses/spectral_radial_prior_loss.py",
-      "note": "comment-only reference in docstring"
     }
   ]
 }

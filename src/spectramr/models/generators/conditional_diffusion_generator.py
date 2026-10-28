@@ -5,6 +5,7 @@ Conditional diffusion model for physics-informed reconstruction
 in multi-stage training pipelines.
 """
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -15,17 +16,12 @@ from spectramr.config.schemas.enums import SchedulerTypes
 from spectramr.models.blocks.embeddings import (
     SinusoidalPositionEmbedding as SinusoidalPositionEmbeddings,
 )
-
-try:  # pragma: no cover - optional dependency
-    from diffusers import DiffusionPipeline, StableDiffusionPipeline
-except ImportError:  # pragma: no cover - diffusers is optional
-    DiffusionPipeline = None  # type: ignore[assignment]
-    StableDiffusionPipeline = None  # type: ignore[assignment]
-
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 from .mixins import DiffusionMixin
+
+logger = logging.getLogger(__name__)
 
 # SinusoidalPositionEmbeddings imported from blocks.embeddings.
 
@@ -359,9 +355,19 @@ class ConditionalDiffusionGenerator(DiffusionMixin, nn.Module, IGenerator):
         """Return the preferred external diffusion pipeline class."""
         if self._pipeline_class is not None:
             return self._pipeline_class
-        if StableDiffusionPipeline is not None:
+        # Imported here, one try per name: diffusers costs ~0.8 s and is only
+        # needed once an external pipeline is actually requested.
+        try:
+            from diffusers import StableDiffusionPipeline
+        except ImportError:
+            logger.warning("diffusers.StableDiffusionPipeline unavailable (pip install diffusers)")
+        else:
             return StableDiffusionPipeline
-        if DiffusionPipeline is not None:
+        try:
+            from diffusers import DiffusionPipeline
+        except ImportError:
+            logger.warning("diffusers.DiffusionPipeline unavailable (pip install diffusers)")
+        else:
             return DiffusionPipeline
         return None
 

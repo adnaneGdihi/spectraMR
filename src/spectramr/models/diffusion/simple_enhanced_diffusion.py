@@ -3,11 +3,13 @@ Simplified but robust implementations of the three diffusion variants.
 """
 
 import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.registry import register_model
 
 
@@ -141,14 +143,16 @@ class KANLayer(nn.Module):
 class SimpleKANTimeEmbedding(nn.Module):
     """KAN-based time embedding using learnable spline activations."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, num_timesteps: int):
         """__init__.
 
         Args:
             dim (int): Description.
+            num_timesteps (int): Diffusion horizon; ``t`` is divided by it.
         """
         super().__init__()
         self.dim = dim
+        self.num_timesteps = int(num_timesteps)
         hidden_dim = dim // 2
 
         # Use KAN layers instead of regular linear layers
@@ -178,7 +182,7 @@ class SimpleKANTimeEmbedding(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        time = time.float().unsqueeze(-1) / 1000.0
+        time = time.float().unsqueeze(-1) / self.num_timesteps
         return self.kan_layers(time)
 
 
@@ -260,6 +264,7 @@ class SimpleEnhancedDiffusionUNet(nn.Module):
         channel_mult: tuple = (1, 2, 4),
         time_embedding_type: str = "sinusoidal",
         noise_type: str = "gaussian",
+        num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS,
     ):
         """__init__.
 
@@ -271,6 +276,8 @@ class SimpleEnhancedDiffusionUNet(nn.Module):
             channel_mult (tuple): Description.
             time_embedding_type (str): Description.
             noise_type (str): Description.
+            num_timesteps (int): Diffusion horizon the KAN time code divides by;
+                the builder injects ``training.diffusion.timesteps``.
         """
         super().__init__()
 
@@ -294,7 +301,7 @@ class SimpleEnhancedDiffusionUNet(nn.Module):
         # Time embeddings
         time_embed_dim = model_channels * 4
         if time_embedding_type == "kan":
-            self.time_embed = SimpleKANTimeEmbedding(time_embed_dim)
+            self.time_embed = SimpleKANTimeEmbedding(time_embed_dim, num_timesteps)
         else:
             self.time_embed = SimpleTimeEmbedding(time_embed_dim)
 
@@ -503,9 +510,14 @@ class SimpleChiSquareDiffusionUNet(SimpleEnhancedDiffusionUNet):
 class SimpleGaussianKANDiffusionUNet(SimpleEnhancedDiffusionUNet):
     """Gaussian noise with KAN embeddings diffusion variant."""
 
-    def __init__(self, **kwargs):
-        """__init__."""
-        super().__init__(noise_type="gaussian_kan", time_embedding_type="kan", **kwargs)
+    def __init__(self, num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS, **kwargs: Any):
+        """Name the horizon so the builder injects it into the KAN time code."""
+        super().__init__(
+            noise_type="gaussian_kan",
+            time_embedding_type="kan",
+            num_timesteps=num_timesteps,
+            **kwargs,
+        )
 
 
 def create_simple_diffusion_model(variant: str = "gaussian", **kwargs):

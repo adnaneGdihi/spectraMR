@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.blocks.domain_adaptation import grad_reverse
 from spectramr.models.losses.registry import register_loss
 
 
@@ -23,11 +24,11 @@ class DomainAdversarialConfig:
 
 
 class IDomainAdversarialLoss(Protocol):
-    """Protocol for domain adversarial loss computation.
+    r"""Protocol for domain adversarial loss computation.
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
+        \mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
 
     def compute_domain_loss(
         self,
@@ -46,46 +47,12 @@ class IDomainAdversarialLoss(Protocol):
         ...
 
 
-class GradientReversalLayer(torch.autograd.Function):
-    """Gradient Reversal Layer for domain adversarial training.
-    Mathematical Formulation:
-    .. math::
-
-        \\mathcal{O}_{GradientReversal}(x) = \begin{cases} x & \text{forward} \\ -\alpha \frac{\\partial L}{\\partial x} & \text{backward} \\end{cases}"""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-        """forward.
-
-        Args:
-            ctx (Any): Description.
-            x (torch.Tensor): Description.
-            alpha (float): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """backward.
-
-        Args:
-            ctx (Any): Description.
-            grad_output (torch.Tensor): Description.
-        Returns:
-            tuple[torch.Tensor, None]: Description.
-        """
-        return grad_output.neg() * ctx.alpha, None
-
-
 class GradientReversalLayerModule(nn.Module):
-    """Gradient Reversal Layer module wrapper.
+    r"""Gradient Reversal Layer module wrapper.
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{O}_{GradientReversal}(x) = \begin{cases} x & \text{forward} \\ -\alpha \frac{\\partial L}{\\partial x} & \text{backward} \\end{cases}"""
+        \mathcal{O}_{GradientReversal}(x) = \begin{cases} x & \text{forward} \\ -\alpha \frac{\partial L}{\partial x} & \text{backward} \end{cases}"""
 
     def __init__(self, max_iters: int = 1000, gamma: float = 10.0):
         """__init__.
@@ -116,24 +83,24 @@ class GradientReversalLayerModule(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         self.iter_num += 1
         coeff = self._get_coefficient()
-        return GradientReversalLayer.apply(x, coeff)
+        return grad_reverse(x, coeff)
 
     def _get_coefficient(self) -> float:
         """Get reversal coefficient based on training progress."""
         progress = min(self.iter_num / self.max_iters, 1.0)
-        return 2.0 / (1.0 + np.exp(-self.gamma * progress)) - 1.0
+        return float(2.0 / (1.0 + np.exp(-self.gamma * progress)) - 1.0)
 
 
 @register_loss(name="domain_adversarial", aliases=["DomainAdversarialLoss"])
 class DomainAdversarialLoss(IDomainAdversarialLoss):
-    """Domain adversarial loss with Gradient Reversal Layer (GRL) and stability heuristics.
+    r"""Domain adversarial loss with Gradient Reversal Layer (GRL) and stability heuristics.
 
     Implements domain-adversarial training for unsupervised domain adaptation,
     with automatic stability monitoring and gradient penalty.
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
+        \mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
 
     def __init__(self, config: DomainAdversarialConfig, feature_dim: int):
         """__init__.
@@ -178,8 +145,10 @@ class DomainAdversarialLoss(IDomainAdversarialLoss):
 
         # Domain classification
         domain_logits = self.domain_classifier(reversed_features)
+        # ``squeeze(-1)``: a bare squeeze turns a batch of one into a 0-d logit
+        # that no longer matches its (1,) label.
         domain_loss = F.binary_cross_entropy_with_logits(
-            domain_logits.squeeze(),
+            domain_logits.squeeze(-1),
             domain_labels.float(),
         )
 
@@ -190,7 +159,7 @@ class DomainAdversarialLoss(IDomainAdversarialLoss):
 
         # Stability monitoring
         with torch.no_grad():
-            domain_preds = torch.sigmoid(domain_logits).squeeze()
+            domain_preds = torch.sigmoid(domain_logits).squeeze(-1)
             accuracy = ((domain_preds > 0.5) == domain_labels).float().mean().item()
             self.domain_accuracy_history.append(accuracy)
 
@@ -216,7 +185,7 @@ class DomainAdversarialLoss(IDomainAdversarialLoss):
 
         gradients = gradients.view(gradients.size(0), -1)
         gradient_norm = gradients.norm(2, dim=1)
-        penalty = ((gradient_norm - 1) ** 2).mean()
+        penalty: torch.Tensor = ((gradient_norm - 1) ** 2).mean()
 
         return penalty
 
@@ -229,7 +198,7 @@ class DomainAdversarialLoss(IDomainAdversarialLoss):
         with torch.no_grad():
             reversed_features = self.grl(features)
             domain_logits = self.domain_classifier(reversed_features)
-            domain_preds = torch.sigmoid(domain_logits).squeeze()
+            domain_preds = torch.sigmoid(domain_logits).squeeze(-1)
             accuracy = ((domain_preds > 0.5) == domain_labels).float().mean().item()
 
-        return accuracy
+        return float(accuracy)

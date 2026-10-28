@@ -50,34 +50,32 @@ from spectramr.models.blocks.attention_domains import (
 )
 from spectramr.models.blocks.attention_domains import validate_feature_domain
 from spectramr.models.blocks.kan_layer import KANLayer
+from spectramr.models.blocks.kspace_attention_kernels import (
+    align_mask_to_grid,
+    masked_linear_attention,
+    stratified_conjugate_subsample,
+)
 
-# Query-block size for :class:`ComplexMHA`. Above this sequence length the
-# attention is computed in query chunks so the dense ``[B, h, N, N]`` score
-# matrix is never materialised — softmax / top-k are per-query (last-dim), so
-# chunking is numerically EXACT and only caps PEAK memory at O(chunk*N) instead
-# of O(N*N). This is the OOM that took out the experiment_11 KAN dual-domain
-# cohort (``ComplexMHA.forward`` allocating into a full 44 GiB GPU, 2026-06
-# cluster rerun). Mirrors the ``max_band_tokens`` cap already on
-# :class:`RadialBandAttention`. Per-instance override via ``self._query_chunk``.
+# Query-block size for :class:`ComplexMHA`: above it the dense score matrix is
+# built per query chunk, which is exact (softmax/top-k act per query) and caps
+# peak memory at O(chunk * N) -- the experiment_11 KAN cohort OOM'd on the dense
+# ``[B, h, N, N]`` tensor. Per-instance override via ``self._query_chunk``.
 _COMPLEX_MHA_QUERY_CHUNK = 2048
 
-# NOTE: the interleaved<->complex layout helpers were promoted to
-# ``spectramr.models.blocks.attention_domains`` (the feature-domain SSOT) on
-# 2026-07-03 and are re-imported above under their historical private names.
+# Per-head temperature for QK-normalised scores: init log(10), capped at
+# log(100), the cosine-attention parameterisation of Swin-V2.
+_LOGIT_SCALE_INIT = math.log(10.0)
+_LOGIT_SCALE_MAX = math.log(100.0)
+
+# Seed of the fixed per-band token subsample in :class:`RadialBandAttention`.
+_BAND_SAMPLE_SEED = 0
 
 # ---------------------------------------------------------------------------
 # Phase-aware attention primitives (memory-bounded)
 # ---------------------------------------------------------------------------
-# The phase-aware score is ``Re(Q Kᴴ) / sqrt(d)``. Computing it as a complex
-# matmul materialises a COMPLEX ``[..., N_q, N_k]`` tensor before ``.real`` is
-# taken — twice the bytes of the real result. With query chunking already in
-# place (commit 8e2172132) the surviving OOM on the experiment_11 KAN
-# dual-domain cohort (2026-06-22 reruns, ``Tried to allocate 256.00 MiB`` at
-# the score line) is exactly this complex intermediate. ``Re(q · conj(k))``
-# summed over the feature dim equals ``qr·krᵀ + qi·kiᵀ``, so the score can be
-# built from two REAL matmuls and the peak at the failing frame halves
-# (256 MiB -> 128 MiB), which fits the ~171 MiB headroom the 32 GiB-card arms
-# died for. Both helpers are numerically identical to the complex formulation.
+# ``Re(q . conj(k))`` summed over the feature dim equals ``qr.kr^T + qi.ki^T``,
+# so scores are built from two REAL matmuls and the complex ``[..., N_q, N_k]``
+# intermediate (twice the bytes, the 2026-06-22 OOM frame) is never formed.
 
 
 def _phase_aware_real_scores(q: torch.Tensor, k: torch.Tensor, scale: float) -> torch.Tensor:
@@ -112,31 +110,62 @@ def _complex_weighted_sum(attn: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.complex(torch.matmul(attn, v.real), torch.matmul(attn, v.imag))
 
 
+def _qk_normalise(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2-normalise complex ``[..., d]`` rows over their ``2d`` real features."""
+    sq = t.real.square().sum(-1, keepdim=True) + t.imag.square().sum(-1, keepdim=True)
+    return t * torch.rsqrt(sq.clamp_min(eps * eps))
+
+
+def _elu_features(t: torch.Tensor) -> torch.Tensor:
+    """Positive linear-attention features ``elu([Re t, Im t]) + 1``."""
+    return nn.functional.elu(torch.cat([t.real, t.imag], dim=-1)) + 1.0
+
+
+def _to_seq(x: torch.Tensor) -> torch.Tensor:
+    """``[B, C, H, W]`` -> ``[B, H*W, C]``."""
+    return x.permute(0, 2, 3, 1).reshape(x.shape[0], -1, x.shape[1])
+
+
+def _from_seq(seq: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """``[B, H*W, C]`` -> ``[B, C, H, W]``."""
+    return seq.reshape(seq.shape[0], height, width, -1).permute(0, 3, 1, 2).contiguous()
+
+
+def _token_grid(height: int, width: int, max_tokens: int) -> tuple[int, int]:
+    """Largest ``(h, w) <= (height, width)`` near-square grid of ``<= max_tokens``."""
+    if height * width <= max_tokens:
+        return height, width
+    side = max(1, round(max_tokens**0.5))
+    return min(height, side), min(width, side)
+
+
 # ---------------------------------------------------------------------------
-# Complex multi-head self-attention
+# Complex multi-head attention
 # ---------------------------------------------------------------------------
 
 
 class ComplexMHA(nn.Module):
-    """Complex multi-head self-attention with phase-aware scoring.
+    """Complex multi-head attention with phase-aware, QK-normalised scores.
 
-    Implements the score ``Re(Q K^H) / sqrt(d)`` where ``K^H`` is the
-    conjugate transpose; the real-part inner product preserves phase
-    information (it's ``|q||k|cos(arg q - arg k)``) while keeping the
-    softmax real-valued and numerically stable.
+    The score is ``tau_h * Re(q_hat k_hat^H)``: q and k are L2-normalised per
+    head over their ``2d`` real features and ``tau_h = exp(logit_scale_h)`` is a
+    learned per-head temperature. The unnormalised ``Re(q k^H) / sqrt(d)`` is
+    ``|q||k| cos(arg q - arg k)``, so it ranks keys by magnitude first, and on a
+    k-space sequence the DC bin -- orders of magnitude above the rest under the
+    power-law spectrum -- took every softmax row. Normalised, the score is a
+    cosine and magnitude reaches the output only through the values.
+
+    ``forward`` is dense softmax (or top-k) attention, optionally against a
+    separate ``context`` sequence; ``forward_linear`` is the O(N) linear form on
+    the same projections and temperature, with features ``elu(tau q_hat) + 1``,
+    for token counts where an ``N x N`` matrix does not fit.
 
     Args:
         channels: Complex channel count.
         num_heads: Number of attention heads. Must divide ``channels``.
-        score_fn: One of:
-            ``softmax`` — default dense softmax over all keys per query.
-            ``topk`` — sparse: keep the ``topk_k`` largest scores per query,
-                mask rest to -inf, softmax over surviving keys. Yields a
-                sparse, interpretable attention pattern that aligns with
-                compressed-sensing-style sparsity priors (plan §2.2).
-        topk_k: Number of keys to keep per query when ``score_fn='topk'``.
-            If 0, defaults to ``max(1, ceil(sqrt(N)))`` at forward time
-            (sqrt-N is a common rule-of-thumb for sparse attention).
+        score_fn: ``softmax`` (dense) or ``topk`` (keep the ``topk_k`` largest
+            scores per query, a compressed-sensing-style sparsity prior).
+        topk_k: Keys kept per query under ``topk``; 0 means ``ceil(sqrt(N))``.
     """
 
     def __init__(
@@ -158,86 +187,85 @@ class ComplexMHA(nn.Module):
         self.channels = channels
         self.score_fn = score_fn
         self.topk_k = int(topk_k)
-        # Real-valued projections applied separately to (real, imag) stacks.
+        # Real-valued projections applied to the concatenated (real, imag) stack.
         self.q_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
         self.k_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
         self.v_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
         self.out_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
+        self.logit_scale = nn.Parameter(torch.full((num_heads,), _LOGIT_SCALE_INIT))
 
     def _project(self, proj: nn.Linear, seq_complex: torch.Tensor) -> torch.Tensor:
-        # seq_complex: [B, N, C] complex
-        ri = torch.cat([seq_complex.real, seq_complex.imag], dim=-1)  # [B,N,2C]
-        out = proj(ri)
-        c = self.channels
-        return torch.complex(out[..., :c], out[..., c:])
+        out = proj(torch.cat([seq_complex.real, seq_complex.imag], dim=-1))
+        return torch.complex(out[..., : self.channels], out[..., self.channels :])
 
-    def forward(self, seq_complex: torch.Tensor) -> torch.Tensor:
-        """Args:
-            seq_complex: ``[B, N, C]`` complex sequence.
-        Returns:
-            ``[B, N, C]`` complex sequence.
-        """
-        B, N, C = seq_complex.shape
-        Q = self._project(self.q_proj, seq_complex)
-        K = self._project(self.k_proj, seq_complex)
-        V = self._project(self.v_proj, seq_complex)
+    def _heads(self, t: torch.Tensor) -> torch.Tensor:
+        b, n, _ = t.shape
+        return t.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Reshape to heads: [B, h, N, d]
-        def _heads(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+    def _temperature(self) -> torch.Tensor:
+        return self.logit_scale.clamp(max=_LOGIT_SCALE_MAX).exp().view(1, -1, 1, 1)
 
-        Qh, Kh, Vh = _heads(Q), _heads(K), _heads(V)
-        # Phase-aware score Re(Q Kᴴ)/sqrt(d) and the value aggregation are built
-        # from REAL matmuls so the large [B, h, N_q, N_k] score/weight tensors
-        # never go complex — this is the surviving 2026-06-22 KAN dual-domain
-        # OOM at the score line (chunking alone left the intermediate complex).
-        # See ``_phase_aware_real_scores`` / ``_complex_weighted_sum``.
-        scale = math.sqrt(self.head_dim)
+    def _qkv(
+        self, seq: torch.Tensor, context: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalised ``q_hat, k_hat`` and values, each ``[B, h, N, d]`` complex."""
+        ctx = seq if context is None else context
+        q = _qk_normalise(self._heads(self._project(self.q_proj, seq)))
+        k = _qk_normalise(self._heads(self._project(self.k_proj, ctx)))
+        return q, k, self._heads(self._project(self.v_proj, ctx))
+
+    def _output(self, out: torch.Tensor) -> torch.Tensor:
+        b, _, n, _ = out.shape
+        out = out.transpose(1, 2).reshape(b, n, self.channels)
+        ri = self.out_proj(torch.cat([out.real, out.imag], dim=-1))
+        return torch.complex(ri[..., : self.channels], ri[..., self.channels :])
+
+    def attention_weights(
+        self, seq: torch.Tensor, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Dense ``[B, h, N_q, N_k]`` attention weights; unchunked, for inspection."""
+        q, k, _ = self._qkv(seq, context)
+        return self._apply_score_fn(_phase_aware_real_scores(q * self._temperature(), k, 1.0))
+
+    def forward(
+        self, seq_complex: torch.Tensor, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Dense attention of ``[B, N, C]`` queries over ``context`` (default: self)."""
+        q, k, v = self._qkv(seq_complex, context)
+        q = q * self._temperature()
+
+        def attend(q_block: torch.Tensor) -> torch.Tensor:
+            scores = _phase_aware_real_scores(q_block, k, 1.0)
+            return _complex_weighted_sum(self._apply_score_fn(scores), v)
+
+        n = q.shape[2]
         chunk = int(getattr(self, "_query_chunk", _COMPLEX_MHA_QUERY_CHUNK))
-        if chunk <= 0 or chunk >= N:
-            scores = _phase_aware_real_scores(Qh, Kh, scale)
-            attn = self._apply_score_fn(scores)
-            out = _complex_weighted_sum(attn, Vh)  # [B, h, N, d] complex
-        else:
-            # Chunk over queries so the [B, h, N, N] score matrix is never fully
-            # materialised. softmax / top-k act on the last (key) dim per query,
-            # so the per-chunk result is identical to the dense computation.
-            parts: list[torch.Tensor] = []
-            for i in range(0, N, chunk):
-                q_i = Qh[:, :, i : i + chunk]  # [B, h, c, d]
-                scores_i = _phase_aware_real_scores(q_i, Kh, scale)  # [B,h,c,N] real
-                attn_i = self._apply_score_fn(scores_i)
-                parts.append(_complex_weighted_sum(attn_i, Vh))  # [B, h, c, d]
-            out = torch.cat(parts, dim=2)  # [B, h, N, d]
-        out = out.transpose(1, 2).reshape(B, N, C)
-        ri = torch.cat([out.real, out.imag], dim=-1)
-        ri = self.out_proj(ri)
-        return torch.complex(ri[..., :C], ri[..., C:])
+        if chunk <= 0 or chunk >= n:
+            return self._output(attend(q))
+        parts = [attend(q[:, :, i : i + chunk]) for i in range(0, n, chunk)]
+        return self._output(torch.cat(parts, dim=2))
+
+    def forward_linear(self, seq_complex: torch.Tensor) -> torch.Tensor:
+        """O(N) linear self-attention of a ``[B, N, C]`` sequence; no ``N x N`` tensor."""
+        q, k, v = self._qkv(seq_complex, None)
+        tau = self._temperature()
+        phi_q = _elu_features(q * tau).transpose(-2, -1)
+        phi_k = _elu_features(k * tau).transpose(-2, -1)
+        everywhere = phi_q.new_ones(phi_q.shape[0], phi_q.shape[-1])
+        out = masked_linear_attention(phi_q, phi_k, v.transpose(-2, -1), everywhere)
+        return self._output(out.transpose(-2, -1))
 
     def _apply_score_fn(self, scores: torch.Tensor) -> torch.Tensor:
-        """Apply softmax or top-k masked softmax to attention scores.
-
-        For top-k, we mask all but the largest k scores per query to -inf
-        before softmax. The result is exactly k non-zero attention weights
-        per query (sparse, autograd-compatible, no custom backward needed).
-        """
+        """Softmax, or softmax over the top-k scores per query (others -> -inf)."""
         if self.score_fn == "softmax":
             return torch.softmax(scores, dim=-1)
-        # topk path
-        # scores shape: [B, h, N_q, N_k]
-        N_k = scores.shape[-1]
-        k = self.topk_k
-        if k <= 0:
-            # sqrt-N rule-of-thumb when not explicitly configured
-            k = max(1, int(math.ceil(math.sqrt(N_k))))
-        k = min(k, N_k)
-        if k == N_k:
+        n_k = scores.shape[-1]
+        k = self.topk_k if self.topk_k > 0 else max(1, math.ceil(math.sqrt(n_k)))
+        k = min(k, n_k)
+        if k == n_k:
             return torch.softmax(scores, dim=-1)
-        topk_vals, _ = scores.topk(k, dim=-1)
-        # Threshold = the smallest of the top-k values per query
-        threshold = topk_vals[..., -1:].detach()
-        masked = scores.masked_fill(scores < threshold, float("-inf"))
-        return torch.softmax(masked, dim=-1)
+        threshold = scores.topk(k, dim=-1).values[..., -1:].detach()
+        return torch.softmax(scores.masked_fill(scores < threshold, float("-inf")), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -248,19 +276,21 @@ class ComplexMHA(nn.Module):
 class RadialBandAttention(nn.Module):
     """Self-attention restricted to concentric annular k-space bands.
 
-    Attention is computed independently within each band but shares the
-    Q/K/V projections across bands (so the model still learns a single
-    representation, only the *interaction* is band-local). Bands are
-    logarithmically spaced so the DC region is more finely resolved.
+    Attention is computed independently within each band but shares the Q/K/V
+    projections across bands. Bands are logarithmically spaced so the DC region
+    is more finely resolved.
 
-    Outer logarithmic bands on a 256² grid hold ~half the image's
-    pixels (~32 k tokens). The dense ``[B, h, N, N]`` attention matrix
-    for that single band is ~32 GiB — every ``experiment_11_attn_*``
-    arm OOM'd here on the 2026-05-10 cluster rerun. ``max_band_tokens``
-    caps each band's attended sequence at a fixed length by uniform
-    stride subsampling. Unchosen positions inherit the mean of the
-    attended outputs so the IFFT downstream doesn't see hard-zero
-    frequencies in the un-attended k-space bins.
+    Token cap. An outer band of a 256^2 grid holds ~32k tokens, whose dense
+    attention matrix alone is ~32 GiB. A band above ``max_band_tokens`` attends
+    a fixed subsample drawn over its WHOLE index set
+    (:func:`~spectramr.models.blocks.kspace_attention_kernels.stratified_conjugate_subsample`):
+    every row of the band is represented in both halves about ``N // 2``,
+    columns are drawn uniformly rather than on a stride, and each selected bin
+    arrives with its conjugate partner ``((N_h - i) % N_h, (N_w - j) % N_w)``.
+    The subsample is seeded (``_BAND_SAMPLE_SEED`` + band) and cached per shape.
+    Every bin of such a band that was not attended receives the band mean of the
+    attended outputs, so the branch output is defined everywhere and no bin of a
+    capped band falls back to the identity.
     """
 
     def __init__(
@@ -280,16 +310,16 @@ class RadialBandAttention(nn.Module):
         self.num_bands = int(num_bands)
         self.beta = float(beta)
         self.max_band_tokens = int(max_band_tokens)
-        # Cached band partition keyed by (H, W, device); re-built on a shape
-        # OR device change. ``_band_index`` is the [H,W] band-id map;
-        # ``_band_sel`` is the per-band list of the FINAL selection indices
-        # (already stride-subsampled, empty bands dropped) so the forward loop
-        # only does cached ``index_select``/``index_copy_`` and never calls
-        # ``.nonzero()``/``.numel()`` on live data (both force a CUDA sync —
-        # ~64/forward here, every step, on all kan_dual_domain arms).
+        # Per-shape cache built once on the host, so the forward only does
+        # index_select/index_copy_ and never a data-dependent .nonzero() (a sync).
+        # ``_band_slot`` maps each flat bin to its band's position in
+        # ``_band_sel``; ``_unattended`` flags bins left out by the cap.
         self._cache_key: tuple[int, int, torch.device] | None = None
         self._band_sel: list[torch.Tensor] = []
+        self._has_unattended = False
         self.register_buffer("_band_index", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("_band_slot", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("_unattended", torch.empty(0, dtype=torch.bool), persistent=False)
 
     @torch.no_grad()
     def _build_band_index(self, H: int, W: int, device: torch.device) -> torch.Tensor:
@@ -308,35 +338,35 @@ class RadialBandAttention(nn.Module):
             ],
             device=device,
         )
-        # bucketize into [0, num_bands-1]
-        band = torch.bucketize(r, edges[1:-1])
-        return band.long()
+        return torch.bucketize(r, edges[1:-1]).long()
 
     @torch.no_grad()
     def _build_band_sel(self, band_index: torch.Tensor) -> list[torch.Tensor]:
-        """Precompute the per-band token-selection indices ONCE per shape.
+        """Per-band attended indices (empty bands dropped) and the fill maps.
 
-        Mirrors the forward's selection exactly: the flat positions of each
-        band, uniform-stride-subsampled to at most ``max_band_tokens`` (stride
-        preserves frequency ordering so spatial coherence is kept). Empty bands
-        are dropped. Doing the data-dependent ``.nonzero()``/subsample here (a
-        single cached build per shape) keeps the CUDA-syncing ops off the hot
-        forward path, which then only does cached ``index_select``/
-        ``index_copy_``. Bands are disjoint and scatter to their own positions,
-        so dropping empties / preserving k-order leaves the result unchanged.
+        A band under the cap attends every bin in raster order; a band over it
+        attends the stratified, conjugate-paired subsample. Also sets
+        ``_band_slot`` / ``_unattended`` / ``_has_unattended`` for the mean fill.
         """
+        height, width = band_index.shape
         band_flat = band_index.flatten()
+        slot = torch.zeros_like(band_flat)
+        unattended = torch.zeros_like(band_flat, dtype=torch.bool)
         sel: list[torch.Tensor] = []
         for k in range(self.num_bands):
             idx = (band_flat == k).nonzero(as_tuple=False).flatten()
-            n_k = idx.numel()
-            if n_k == 0:
+            if idx.numel() == 0:
                 continue
-            if n_k > self.max_band_tokens:
-                stride = max(1, n_k // self.max_band_tokens)
-                sub_pos = torch.arange(0, n_k, stride, device=idx.device)[: self.max_band_tokens]
-                idx = idx[sub_pos]
-            sel.append(idx)
+            slot[idx] = len(sel)
+            chosen = stratified_conjugate_subsample(
+                idx, height, width, self.max_band_tokens, _BAND_SAMPLE_SEED + k
+            )
+            if chosen.numel() < idx.numel():
+                unattended[idx] = True
+                unattended[chosen] = False
+            sel.append(chosen)
+        self._band_slot, self._unattended = slot, unattended
+        self._has_unattended = bool(unattended.any())
         return sel
 
     def forward(self, kspace_complex: torch.Tensor) -> torch.Tensor:
@@ -345,23 +375,23 @@ class RadialBandAttention(nn.Module):
         Returns:
             ``[B, C, H, W]`` complex k-space features.
         """
-        B, C, H, W = kspace_complex.shape
+        H, W = kspace_complex.shape[-2:]
         cache_key = (H, W, kspace_complex.device)
         if self._cache_key != cache_key:
             self._band_index = self._build_band_index(H, W, kspace_complex.device)
             self._band_sel = self._build_band_sel(self._band_index)
             self._cache_key = cache_key
-        flat = kspace_complex.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        out_flat = flat.clone()  # default: identity (preserves un-attended bins)
-        # Cached per-band selection indices (post stride-subsample, empty bands
-        # dropped) — the forward does NO ``.nonzero()``/``.numel()`` on live
-        # data, so no per-band CUDA sync. Un-attended positions keep their
-        # original (identity) values from ``out_flat = flat.clone()``.
+        flat = _to_seq(kspace_complex)
+        out_flat = torch.zeros_like(flat)
+        band_means: list[torch.Tensor] = []
         for sel_idx in self._band_sel:
-            band_seq = flat.index_select(1, sel_idx)  # [B, n_sel, C]
-            band_out = self.attn(band_seq)
+            band_out = self.attn(flat.index_select(1, sel_idx))  # [B, n_sel, C]
             out_flat.index_copy_(1, sel_idx, band_out)
-        return out_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            band_means.append(band_out.mean(dim=1))
+        if self._has_unattended:
+            fill = torch.stack(band_means, dim=1).index_select(1, self._band_slot)
+            out_flat = torch.where(self._unattended.view(1, -1, 1), fill, out_flat)
+        return _from_seq(out_flat, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -370,67 +400,49 @@ class RadialBandAttention(nn.Module):
 
 
 class CrossDomainAttention(nn.Module):
-    """Image-side queries against k-space keys/values.
+    """K-space queries against image-domain keys/values, written back in k-space.
 
-    Output values come from the frequency domain, so we inverse-FFT
-    before returning so the result is comparable to the image-domain branch.
-    Q/K/V projections are independent (tying them would defeat the purpose).
+    Pairing an image query at pixel ``p`` with k-space keys and writing the
+    result into k-space bin ``p`` has no physical correspondence, so the roles
+    are fixed by where each quantity lives. Queries are the k-space bins of a
+    centre crop of at most ``max_tokens`` bins, taken with ``KSpaceCrop``'s
+    arithmetic so every query keeps its frequency location. Keys and values are
+    the image-domain features, average-pooled IN THE IMAGE DOMAIN to the same
+    budget when the grid exceeds it (a low-pass of an image is legitimate; a
+    pooled spectrum is a frequency rescaling). The result is a k-space update
+    for exactly the queried bins and zero outside the crop: nothing in k-space
+    is pooled, resampled, or brought through an image-domain upsample.
     """
 
-    def __init__(self, channels: int, num_heads: int = 4) -> None:
+    def __init__(self, channels: int, num_heads: int = 4, max_tokens: int = 4096) -> None:
         super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.channels = channels
-        self.q_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
-        self.k_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
-        self.v_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
-        self.out_proj = nn.Linear(2 * channels, 2 * channels, bias=False)
+        if max_tokens < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+        self.attn = ComplexMHA(channels, num_heads)
+        self.max_tokens = int(max_tokens)
 
-    def _project(self, proj: nn.Linear, seq_complex: torch.Tensor) -> torch.Tensor:
-        ri = torch.cat([seq_complex.real, seq_complex.imag], dim=-1)
-        out = proj(ri)
-        c = self.channels
-        return torch.complex(out[..., :c], out[..., c:])
-
-    def forward(
-        self,
-        image_complex: torch.Tensor,
-        kspace_complex: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, kspace_complex: torch.Tensor, image_complex: torch.Tensor) -> torch.Tensor:
         """Args:
+            kspace_complex: ``[B, C, H, W]`` complex k-space features (queries).
             image_complex: ``[B, C, H, W]`` complex image-domain features.
-            kspace_complex: ``[B, C, H, W]`` complex k-space features.
         Returns:
-            ``[B, C, H, W]`` complex image-domain features.
+            ``[B, C, H, W]`` complex k-space update, zero outside the crop.
         """
-        B, C, H, W = image_complex.shape
-        h_seq = image_complex.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        f_seq = kspace_complex.permute(0, 2, 3, 1).reshape(B, H * W, C)
-
-        Q = self._project(self.q_proj, h_seq)
-        K = self._project(self.k_proj, f_seq)
-        V = self._project(self.v_proj, f_seq)
-
-        def _heads(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-
-        Qh, Kh, Vh = _heads(Q), _heads(K), _heads(V)
-        # Real-matmul phase-aware scoring (see ComplexMHA): keeps the
-        # [B, h, N, N] cross-attention score/weight tensors real instead of
-        # complex, halving the peak at this full-resolution matmul.
-        scores = _phase_aware_real_scores(Qh, Kh, math.sqrt(self.head_dim))
-        attn = torch.softmax(scores, dim=-1)
-        out = _complex_weighted_sum(attn, Vh)
-        out = out.transpose(1, 2).reshape(B, H * W, C)
-        ri = torch.cat([out.real, out.imag], dim=-1)
-        ri = self.out_proj(ri)
-        out_freq = torch.complex(ri[..., :C], ri[..., C:])
-        out_freq = out_freq.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        # Values came from the frequency domain; bring back to image domain.
-        return ifft2c(out_freq)
+        B, C, H, W = kspace_complex.shape
+        th, tw = _token_grid(H, W, self.max_tokens)
+        sh, sw = (H - th) // 2, (W - tw) // 2
+        crop = kspace_complex[..., sh : sh + th, sw : sw + tw]
+        if (th, tw) != (H, W):
+            image_complex = torch.complex(
+                nn.functional.adaptive_avg_pool2d(image_complex.real, (th, tw)),
+                nn.functional.adaptive_avg_pool2d(image_complex.imag, (th, tw)),
+            )
+        out = _from_seq(self.attn(_to_seq(crop), context=_to_seq(image_complex)), th, tw)
+        if (th, tw) == (H, W):
+            return out
+        update = kspace_complex.new_zeros(B, C, H, W)
+        update[..., sh : sh + th, sw : sw + tw] = out
+        return update
 
 
 # ---------------------------------------------------------------------------
@@ -492,11 +504,14 @@ class WaveletFreqAttentionBlock(nn.Module):
 
     The attended output is fused with the residual input by a learned per-batch
     gate whose parameterisation (``gate_type``) is either a KAN (two
-    ``KANLayer``s) or a matched MLP. This is what makes the KAN/MLP ablation
-    axis REAL for the wavelet cell: before, this block ignored ``gate_type``
-    entirely, so ``attn_kan_wavelet`` and ``attn_mlp_wavelet`` were
-    byte-identical (a self-declared ``needs_implementation`` facade — pitfall
-    #16). The gate mirrors ``KANGatedDualDomainAttention._make_gate``.
+    ``KANLayer``s) or a matched MLP; that gate is the whole difference between
+    ``attn_kan_wavelet`` and ``attn_mlp_wavelet`` (pitfall #16).
+
+    Write gate. When the caller passes the acquisition ``mask`` (the generator
+    does, via ``IdentityAtInitAttention``), the update is applied in k-space
+    through ``1 - M`` on the centre-cropped level mask, so the acquired bins of
+    the feature map leave the block unchanged. Without a mask the update covers
+    the whole plane, as before; no support is inferred from the features.
     """
 
     def __init__(
@@ -563,23 +578,34 @@ class WaveletFreqAttentionBlock(nn.Module):
         sin_p = (h.imag / denom).mean(dim=(-2, -1))
         return torch.cat([mag, cos_p, sin_p], dim=-1)
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gated wavelet-attention update of interleaved ``x`` ``[B, 2C, H, W]``.
+
+        ``mask`` is the full-resolution acquisition mask ``[B, C', H', W']``;
+        when given, the update reaches only the bins where it is 0.
+        """
         del t_emb  # not used; signature matches KANGatedDualDomainAttention
         h_native = _interleaved_to_complex(x)
         # Image view: the Haar DWT prior only makes sense on spatial features.
         h_img = ifft2c(h_native) if self.feature_domain == "kspace" else h_native
         out_complex = self.attn(h_img)
-        # Gated residual fusion: g in (0,1) per batch. The KAN vs MLP gate is
-        # the distinguishing parameterisation between attn_kan_wavelet and
-        # attn_mlp_wavelet. Descriptor is always taken from the image view so
-        # the gate semantics are mode-invariant.
+        # Descriptor from the image view in both modes, so gate semantics are
+        # mode-invariant.
         b = h_native.shape[0]
         g = torch.sigmoid(self.gate(self._phase_aware_gap(h_img))).view(b, 1, 1, 1)
-        if self.feature_domain == "kspace":
-            # Native-frame anchoring: the residual base is the UNTRANSFORMED
-            # k-space input; only the gated update is conjugated back. Equals
-            # fft2c(g*out + (1-g)*h_img) up to roundoff, but g=0 reduces to
-            # the input bit-exactly (pitfall #20 guarantee preserved).
+        if mask is not None:
+            observed = align_mask_to_grid(mask.to(x.dtype), x.shape[-2], x.shape[-1])
+            update_k = (1.0 - observed) * fft2c(out_complex - h_img)
+            update = update_k if self.feature_domain == "kspace" else ifft2c(update_k)
+            fused = h_native + g * update
+        elif self.feature_domain == "kspace":
+            # Residual anchored on the UNTRANSFORMED input, so g = 0 returns it
+            # bit-exactly (pitfall #20).
             fused = h_native + g * fft2c(out_complex - h_img)
         else:
             fused = g * out_complex + (1.0 - g) * h_native
@@ -628,61 +654,28 @@ class MultiScaleFreqBandAttention(nn.Module):
             raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
         self.channels = channels
         self.num_levels = int(num_levels)
-        # OOM cap. The dense attention matrix is O(N²) in token count, so
-        # attending directly over a 256×256 band (N=65536) requires ~16
-        # GiB just for the [B,h,N,N] softmax tensor. The 2026-05-10 cluster
-        # rerun OOM'd 15 ``experiment_11_attn_*`` arms on exactly this
-        # path. We cap N at ``max_tokens`` by adaptive-pooling the band
-        # before attention and bilinear-upsampling after — the attention
-        # pattern is computed at coarser resolution but the residual
-        # connection in the parent block preserves fine detail.
+        # Dense attention is O(N^2): a 128^2 band alone needs a 16k x 16k score
+        # matrix. Bands above ``max_tokens`` take the O(N) linear path of the
+        # same ComplexMHA instead -- never a 2x2 average pool, which cancels
+        # the alternating-sign detail coefficients the band exists to carry.
         self.max_tokens = int(max_tokens)
-        # One ComplexMHA per band. Bands at the same level share an
-        # attention block (low param count); levels each get their own
-        # so the inductive bias of each scale stays distinct.
-        # Bands per level: 4 at level 1, 3 new bands per additional level
-        # (the LL child gets recursed into).
+        # One ComplexMHA per level, shared by that level's bands, so each scale
+        # keeps its own inductive bias at a low parameter count.
         self.attn_bands: nn.ModuleList = nn.ModuleList()
         for _ in range(num_levels):
             band_attn = ComplexMHA(channels, num_heads, score_fn=score_fn, topk_k=topk_k)
             self.attn_bands.append(band_attn)
 
     def _attend_band(self, band: torch.Tensor, attn: ComplexMHA) -> torch.Tensor:
-        """Apply one ComplexMHA over the spatial dims of a single band.
+        """Apply one ComplexMHA over every coefficient of a single band.
 
-        Caps the token count at ``self.max_tokens`` to avoid the
-        quadratic dense-softmax OOM seen on 256×256 bands. Pool→attend→
-        upsample is mathematically lossy but the parent block's
-        residual carries the fine spatial detail.
+        Dense up to ``self.max_tokens`` coefficients, linear above it; the band
+        is attended at full resolution either way.
         """
-        B, C, H, W = band.shape
-        if self.max_tokens < H * W:
-            # Pick (h, w) that satisfies h*w <= max_tokens and preserves aspect
-            ratio = (self.max_tokens / float(H * W)) ** 0.5
-            new_h = max(1, int(H * ratio))
-            new_w = max(1, int(W * ratio))
-            # Complex adaptive pool: pool real and imag separately
-            band_pooled = torch.complex(
-                nn.functional.adaptive_avg_pool2d(band.real, (new_h, new_w)),
-                nn.functional.adaptive_avg_pool2d(band.imag, (new_h, new_w)),
-            )
-            flat = band_pooled.permute(0, 2, 3, 1).reshape(B, new_h * new_w, C)
-            out_flat = attn(flat)
-            out_pooled = out_flat.reshape(B, new_h, new_w, C).permute(0, 3, 1, 2).contiguous()
-            # Upsample back. Bilinear is fine for complex via
-            # interpolate-on-stack (real and imag separately).
-            up = torch.complex(
-                nn.functional.interpolate(
-                    out_pooled.real, size=(H, W), mode="bilinear", align_corners=False
-                ),
-                nn.functional.interpolate(
-                    out_pooled.imag, size=(H, W), mode="bilinear", align_corners=False
-                ),
-            )
-            return up.contiguous()
-        flat = band.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        out_flat = attn(flat)
-        return out_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        _, _, H, W = band.shape
+        seq = _to_seq(band)
+        out = attn.forward_linear(seq) if self.max_tokens < H * W else attn(seq)
+        return _from_seq(out, H, W)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Args:
@@ -751,8 +744,13 @@ class KANGatedDualDomainAttention(nn.Module):
     branch a spatial map in BOTH modes; the output is composed back in the
     input's domain (output domain == input domain), with the residual
     anchored on the untransformed native input (pitfall #20 guarantee
-    holds bit-exactly in both modes). ``feature_domain="image"`` is
-    numerically identical to the historical behavior.
+    holds bit-exactly in both modes).
+
+    Branches. The image branch is linear attention over every pixel, so its
+    update reaches every frequency; the radial branch attends k-space within
+    annuli; the cross branch attends centre-cropped k-space queries to
+    image-domain keys/values and returns a k-space update on the cropped bins
+    (:class:`CrossDomainAttention`).
     """
 
     def __init__(
@@ -794,6 +792,14 @@ class KANGatedDualDomainAttention(nn.Module):
             nh //= 2
         self.num_heads = max(1, nh)
 
+        # Token budget of the cross branch's dense attention (k-space crop and
+        # image pooling). The image branch is linear and the radial branch
+        # band-capped, so neither reads it. 4096 = 64^2.
+        if max_dense_attn_tokens <= 0:
+            raise ValueError(f"max_dense_attn_tokens must be positive, got {max_dense_attn_tokens}")
+        self.max_dense_attn_tokens = int(max_dense_attn_tokens)
+
+        # Image branch: O(N) linear attention at full resolution (forward_linear).
         self.attn_img = ComplexMHA(self.complex_channels, self.num_heads)
         # Sparsity-promoting attention is most physically motivated in
         # the k-space branch (compressed-sensing prior) — pass through.
@@ -805,7 +811,9 @@ class KANGatedDualDomainAttention(nn.Module):
             score_fn=kspace_score_fn,
             topk_k=kspace_topk_k,
         )
-        self.attn_cross = CrossDomainAttention(self.complex_channels, self.num_heads)
+        self.attn_cross = CrossDomainAttention(
+            self.complex_channels, self.num_heads, max_tokens=self.max_dense_attn_tokens
+        )
 
         # Phase-aware GAP gives [|h|; cos arg h; sin arg h] per channel.
         gate_in = 3 * self.complex_channels + self.time_embedding_dim
@@ -829,17 +837,6 @@ class KANGatedDualDomainAttention(nn.Module):
         self.gate_img = _make_gate()
         self.gate_kspace = _make_gate()
         self.gate_cross = _make_gate()
-
-        # Maximum sequence length for the dense (image, cross) attention
-        # branches. When H*W exceeds this, the image and cross branches
-        # operate on a downsampled feature map (adaptive avg pool ->
-        # attend -> bilinear interpolate up). The radial-band branch is
-        # always full resolution because it's already band-local.
-        # Default 4096 = 64*64; safe for diffusion U-Net depths typical
-        # for 256² inputs after 2 downsamples.
-        if max_dense_attn_tokens <= 0:
-            raise ValueError(f"max_dense_attn_tokens must be positive, got {max_dense_attn_tokens}")
-        self.max_dense_attn_tokens = int(max_dense_attn_tokens)
 
         # Branch ablations: any name in {'image', 'kspace', 'cross'} silences
         # the corresponding branch by zeroing its gate at forward time.
@@ -1036,78 +1033,17 @@ class KANGatedDualDomainAttention(nn.Module):
             h_complex = h_native
             h_freq = fft2c(h_complex)
 
-        # Decide whether the dense (image, cross) branches operate at
-        # full or reduced resolution. The radial-band branch always
-        # operates at full resolution because per-band token counts are
-        # naturally bounded by num_bands.
-        n_full = H * W
-        if n_full > self.max_dense_attn_tokens:
-            side = max(1, int(round(self.max_dense_attn_tokens**0.5)))
-            target_h = min(H, side)
-            target_w = min(W, side)
-        else:
-            target_h, target_w = H, W
-        downsampled = (target_h, target_w) != (H, W)
+        # Image branch: linear attention over every pixel, no pooling, so the
+        # update is not band-limited to the pooled grid's frequencies.
+        attn_i = _from_seq(self.attn_img.forward_linear(_to_seq(h_complex)), H, W)
 
-        # --- Branches ---
-        # Image branch (optionally downsampled)
-        if downsampled:
-            # Adaptive pool real and imag channels separately, then re-pair.
-            real_ds = torch.nn.functional.adaptive_avg_pool2d(h_complex.real, (target_h, target_w))
-            imag_ds = torch.nn.functional.adaptive_avg_pool2d(h_complex.imag, (target_h, target_w))
-            h_complex_ds = torch.complex(real_ds, imag_ds)
-        else:
-            h_complex_ds = h_complex
-
-        h_seq = h_complex_ds.permute(0, 2, 3, 1).reshape(
-            B, target_h * target_w, self.complex_channels
-        )
-        attn_i_seq = self.attn_img(h_seq)
-        attn_i_ds = (
-            attn_i_seq.reshape(B, target_h, target_w, self.complex_channels)
-            .permute(0, 3, 1, 2)
-            .contiguous()
-        )
-        if downsampled:
-            attn_i = torch.complex(
-                torch.nn.functional.interpolate(
-                    attn_i_ds.real, size=(H, W), mode="bilinear", align_corners=False
-                ),
-                torch.nn.functional.interpolate(
-                    attn_i_ds.imag, size=(H, W), mode="bilinear", align_corners=False
-                ),
-            )
-        else:
-            attn_i = attn_i_ds
-
-        # K-space branch (full res, in freq domain). In image mode the branch
-        # output is brought to the image frame for composition (historical
-        # path); in kspace mode it already lives in the native frame — keep it
-        # there and conjugate the OTHER branches at composition time instead.
+        # K-space branch (full res, in freq domain). In image mode its output is
+        # brought to the image frame; in kspace mode it is already native.
         attn_k_freq = self.attn_kspace(h_freq)
         attn_k = attn_k_freq if self.feature_domain == "kspace" else ifft2c(attn_k_freq)
 
-        # Cross-domain branch (downsampled if needed; uses image-domain queries
-        # against frequency keys/values, both at the reduced resolution)
-        if downsampled:
-            real_freq_ds = torch.nn.functional.adaptive_avg_pool2d(
-                h_freq.real, (target_h, target_w)
-            )
-            imag_freq_ds = torch.nn.functional.adaptive_avg_pool2d(
-                h_freq.imag, (target_h, target_w)
-            )
-            h_freq_ds = torch.complex(real_freq_ds, imag_freq_ds)
-            attn_x_ds = self.attn_cross(h_complex_ds, h_freq_ds)
-            attn_x = torch.complex(
-                torch.nn.functional.interpolate(
-                    attn_x_ds.real, size=(H, W), mode="bilinear", align_corners=False
-                ),
-                torch.nn.functional.interpolate(
-                    attn_x_ds.imag, size=(H, W), mode="bilinear", align_corners=False
-                ),
-            )
-        else:
-            attn_x = self.attn_cross(h_complex, h_freq)
+        # Cross branch: a k-space update on the centre-cropped query bins.
+        attn_x_freq = self.attn_cross(h_freq, h_complex)
 
         # --- Gates ---
         # Descriptor is ALWAYS the image view (h_complex), in both modes:
@@ -1135,18 +1071,19 @@ class KANGatedDualDomainAttention(nn.Module):
         g1 = torch.sigmoid(self.gate_img(z)).view(B, 1, 1, 1)
         g2 = torch.sigmoid(self.gate_kspace(z)).view(B, 1, 1, 1)
         g3 = torch.sigmoid(self.gate_cross(z)).view(B, 1, 1, 1)
-        # Branch-zeroing ablations (after gate computation so telemetry still
-        # records what the gate would have produced).
+        # Telemetry records what the gate PRODUCED, which is read before the
+        # ablation zeroes it: a disabled branch's applied gate is 0.0 by
+        # construction and says nothing, while the value the gate wanted is
+        # what makes the ablation readable.
+        with torch.no_grad():
+            self._last_gates.copy_(torch.stack([g1.mean(), g2.mean(), g3.mean()]).detach())
+
         if "image" in self.disable_branches:
             g1 = torch.zeros_like(g1)
         if "kspace" in self.disable_branches:
             g2 = torch.zeros_like(g2)
         if "cross" in self.disable_branches:
             g3 = torch.zeros_like(g3)
-
-        # Telemetry only — detached.
-        with torch.no_grad():
-            self._last_gates.copy_(torch.stack([g1.mean(), g2.mean(), g3.mean()]).detach())
 
         # Optional S-map conditioning: FiLM-modulate the k-space branch
         # output by a projection of the per-channel coil-sensitivity
@@ -1164,34 +1101,15 @@ class KANGatedDualDomainAttention(nn.Module):
                 # parameterisation difference between modes, not an inversion.
                 attn_k = attn_k * gamma + beta
 
-        # Additive identity residual: this block REFINES the input feature map
-        # rather than replacing it. Without the ``h_native +`` term the three
-        # gated branches must reconstruct the ENTIRE feature map, and because
-        # the gates are per-batch scalars from a spatially-collapsed global pool
-        # (and KAN spline bases saturate to near-constants more readily than a
-        # SiLU-MLP), when the gates shrink toward 0 the output loses all
-        # measurement information -> a fixed, acceleration-independent DC blob
-        # (pitfall #20). That is the measurement-independence collapse the L4
-        # gate flagged across the experiment_11 KAN dual-domain cohort, and the
-        # reason KAN-gated arms collapsed while their byte-identical MLP-gated
-        # siblings survived. The residual makes that trivial solution
-        # structurally impossible — the input (a function of the undersampled
-        # k-space) always flows through — and matches every sibling attention
-        # block (self: ``x + out``; sparse: ``attn_out + x``; channel:
-        # multiplicative; PhaseSafeDual: ``x + gamma*out``; wavelet_freq:
-        # ``g*out + (1-g)*h``). With all branches disabled it reduces to a
-        # pure passthrough, i.e. identical to ``attention_type='none'``.
-        #
-        # Native-frame anchoring (2026-07-03 feature-domain change): the
-        # residual base is the UNTRANSFORMED native input in BOTH modes — it
-        # never passes through an FFT roundtrip, so the zero-gate identity is
-        # bit-exact. In kspace mode the image-frame branches (attn_i, attn_x)
-        # are conjugated into the native k frame with a single fft2c of their
-        # gated sum (gates are scalars, so this equals conjugating each), and
-        # attn_k is already native (attn_k_freq). fft2c(0) == 0, so disabled
-        # branches contribute exactly nothing.
+        # Additive identity residual: the block refines its input rather than
+        # replacing it, so gates shrinking toward 0 (KAN splines saturate more
+        # readily than an MLP) cannot collapse the output to a measurement-
+        # independent DC blob (pitfall #20); with every branch disabled it is a
+        # passthrough. The residual base is the UNTRANSFORMED native input and
+        # only gated updates are FFT'd, so fft2c(0) == ifft2c(0) == 0 keeps the
+        # zero-gate identity bit-exact in both modes.
         if self.feature_domain == "kspace":
-            fused = h_native + fft2c(g1 * attn_i + g3 * attn_x) + g2 * attn_k
+            fused = h_native + fft2c(g1 * attn_i) + g2 * attn_k + g3 * attn_x_freq
         else:
-            fused = h_native + g1 * attn_i + g2 * attn_k + g3 * attn_x
+            fused = h_native + g1 * attn_i + g2 * attn_k + ifft2c(g3 * attn_x_freq)
         return _complex_to_interleaved(fused)

@@ -5,9 +5,10 @@ from __future__ import annotations
 import types
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.infrastructure.training.strategies.ulf_map_strategy import ulf_degrade
+from spectramr.infrastructure.training.strategies.ulf_lowpass_operator import UlfLowpassOperator
 from spectramr.infrastructure.training.strategies.ulf_redegrad_tta_strategy import (
     UlfReDegradationTTAStrategy,
     compute_redegrad_tta_train_loss,
@@ -162,8 +163,9 @@ def test_validation_forward_raises_without_field() -> None:
         validation=block_stub("validation", val_chunk_size=0)
     )
     strat._tta_steps = 0
-    for k, v in (("_tta_lr", 1e-4), ("_tta_weight", 1.0), ("_tta_cutoff", 0.5)):
+    for k, v in (("_tta_lr", 1e-4), ("_tta_weight", 1.0)):
         setattr(strat, k, v)
+    strat._ulf_lowpass = UlfLowpassOperator.constant_cutoff(0.5)
     with pytest.raises(ValueError, match="field_strength_target"):
         strat._validation_forward(torch.rand(1, 1, 16, 16), {"use_dc": False})
 
@@ -187,7 +189,8 @@ def test_validation_defaults_to_per_sample_adaptation() -> None:
     strat = object.__new__(UlfReDegradationTTAStrategy)
     strat.env = types.SimpleNamespace(generator=rec)
     strat._tta_steps, strat._tta_lr = 2, 1e-3
-    strat._tta_weight, strat._tta_cutoff = 1.0, 0.5
+    strat._tta_weight = 1.0
+    strat._ulf_lowpass = UlfLowpassOperator.constant_cutoff(0.5)
     strat.config = types.SimpleNamespace(
         validation=block_stub("validation", val_chunk_size=0)  # unset -> defaults to 1
     )
@@ -259,3 +262,16 @@ def test_contrast_id_threaded_train_and_render() -> None:
         blur_cutoff=0.5, contrast_id=cid,
     )
     assert seen["cid"] is cid
+
+
+def test_tta_consistency_uses_the_per_contrast_forward_op() -> None:
+    # The re-degradation loss ||A(G(src)) - src|| runs through the strategy's operator, so
+    # adapting the same source under two contrast ids renders two different images.
+    op = UlfLowpassOperator(axis_cutoffs={0: (0.15, 0.15), 1: (2.0, 2.0)})
+    src = torch.rand(1, 1, 16, 16)
+    kw = {"adaptation_steps": 4, "adaptation_lr": 1e-2, "consistency_weight": 1.0, "forward_op": op}
+    torch.manual_seed(0)
+    m = _net()
+    a = redegrad_tta_render(m, src, torch.tensor([3.0]), contrast_id=torch.tensor([0]), **kw)
+    b = redegrad_tta_render(m, src, torch.tensor([3.0]), contrast_id=torch.tensor([1]), **kw)
+    assert not torch.allclose(a, b)

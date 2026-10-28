@@ -29,11 +29,12 @@ Wired components:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import read_batch_field
 
 from .diffusion import DiffusionTrainingStrategy
@@ -42,6 +43,15 @@ from .mixins.utils import _callable_accepts_kwarg
 
 class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
     """Cold-diffusion in k-space for cross-contrast translation."""
+
+    # parallel_compat: Calls the generator only through its wrapped forward and builds no parameters;
+    # a permission is not inherited from the diffusion parent, so it is stated here.
+    parallel_compat = frozenset({"replicated"})
+
+    #: Loss ownership (issue #1918). mse_loss(dst_hat, k_dst) is a K-SPACE term against the destination contrast,
+    #: not an image loss against the target, and the hook routes nowhere.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     sigma_max: float = 0.05
     lambda_destination: float = 1.0
@@ -172,7 +182,7 @@ class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
         # nn.Module must be introspected through `.forward` (its `__call__` is
         # `(*args, **kwargs)`, so VAR_KEYWORD would answer True for everything),
         # while a plain callable's own signature IS its forward signature.
-        if _callable_accepts_kwarg(getattr(gen, "forward", gen), "contrast_idx"):
+        if _callable_accepts_kwarg(getattr(unwrap_model(gen), "forward", gen), "contrast_idx"):
             dst_hat = gen(k_t, t, contrast_idx=contrast_idx)
         else:
             dst_hat = gen(k_t, t)

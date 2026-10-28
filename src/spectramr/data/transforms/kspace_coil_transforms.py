@@ -120,6 +120,7 @@ class CoilCombineTransform(tio.Transform):
 
     Methods:
     - RSS: Root Sum of Squares (no sensitivity maps needed)
+    - RSS per channel: RSS reduced once per real/imaginary channel (Shen 2024)
     - SENSE: Uses sensitivity maps for optimal combination (requires 'sensitivity' key)
 
     For RSS in k-space domain:
@@ -143,7 +144,7 @@ class CoilCombineTransform(tio.Transform):
 
     def __init__(
         self,
-        method: Literal["rss", "rss_image", "sense"] = "rss",
+        method: Literal["rss", "rss_image", "rss_per_channel", "sense"] = "rss",
         keys: list[str] | None = None,
         sensitivity_key: str = "sensitivity",
     ):
@@ -163,6 +164,11 @@ class CoilCombineTransform(tio.Transform):
                   image-domain ``(1, H, W, D)`` real. The canonical
                   mode for image-domain reconstruction networks that
                   want pre-combined input (no phase strip downstream).
+                - ``"rss_per_channel"`` — IFFT → RSS over coils applied
+                  separately to the real and the imaginary channel → FFT
+                  back to k-space (output domain: k-space,
+                  ``(2, H, W, D)`` real). Shen 2024's own combination;
+                  see :meth:`_rss_per_channel_combine`.
                 - ``"sense"`` — IFFT → sensitivity-weighted complex sum
                   → FFT back to k-space (preserves phase).
             keys: Image keys to transform. If None, uses KSPACE_KEYS.
@@ -260,6 +266,8 @@ class CoilCombineTransform(tio.Transform):
                     f"{rss_mag.shape} real (method=rss_image, image-domain)"
                 )
                 continue
+            elif self.method == "rss_per_channel":
+                combined = self._rss_per_channel_combine(data)
             elif self.method == "sense":
                 combined = self._sense_combine(data, sensitivity)
             else:
@@ -344,6 +352,34 @@ class CoilCombineTransform(tio.Transform):
         # ``rss_combined`` is real-valued already; return as image.
         # Transpose back: (1, D, H, W) -> (1, H, W, D)
         return rss_combined.permute(0, 2, 3, 1)
+
+    def _rss_per_channel_combine(self, kspace: torch.Tensor) -> torch.Tensor:
+        """RSS over coils applied separately to the real and imaginary channels.
+
+        Reproduces Shen 2024's ``DataTransform_Diffusion``
+        (``utils/data_transform.py:62``), which calls ``fastmri.rss`` on a
+        ``[Nc, H, W, 2]`` tensor. That function is ``sqrt(sum(x**2, dim=0))`` and
+        takes no view of the trailing real/imaginary axis, so it reduces coils
+        once per channel and returns two non-negative ones -- ``rss_complex`` is
+        the sibling that reduces ``|x_c|``. The published numbers were produced
+        from this input, so the difference is reproduced rather than corrected;
+        :meth:`_rss_combine` is the conventional magnitude RSS.
+
+        Args:
+            kspace: ``(Coils, H, W, D)`` complex k-space.
+
+        Returns:
+            ``(1, H, W, D)`` complex k-space of the combined image.
+        """
+        kspace_transposed = kspace.permute(0, 3, 1, 2)
+        images = ifft2c(kspace_transposed)
+
+        real = torch.sqrt(torch.sum(images.real**2, dim=0, keepdim=True))
+        imag = torch.sqrt(torch.sum(images.imag**2, dim=0, keepdim=True))
+        combined_kspace = fft2c(torch.complex(real, imag))
+
+        # Transpose back: (1, D, H, W) -> (1, H, W, D)
+        return combined_kspace.permute(0, 2, 3, 1)
 
     def _sense_combine(
         self, kspace: torch.Tensor, sensitivity: torch.Tensor | None

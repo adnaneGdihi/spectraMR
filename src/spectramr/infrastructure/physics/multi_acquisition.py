@@ -33,10 +33,14 @@ from torch.nn.functional import (
 )
 
 from spectramr.infrastructure.physics.differentiable_bloch import DifferentiableBlochLayer
+from spectramr.infrastructure.physics.marker_realisation import marker_batch
 from spectramr.infrastructure.physics.psf_estimation import apply_psf
 from spectramr.infrastructure.physics.relaxation_priors import bottomley_t1
 from spectramr.infrastructure.physics.subpixel_registration import fourier_shift
 from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
+
+# Class order of the three-class tissue proxy (index 0, 1, 2).
+TISSUE_ORDER = ("white_matter", "gray_matter", "csf")
 
 # Methods whose acquisition stack this module can synthesise faithfully
 # (tissue-independent / single-tissue-T1 closed forms, or — for ``mrf`` — a
@@ -86,6 +90,13 @@ class AcquisitionResult:
             the anatomy, ``[B, n_frames, H/s, W/s]``. Registering it against
             :meth:`MultiAcquisitionSimulator.marker_reference` recovers the
             offsets without ever consulting ``shifts``.
+        marker_hr: The un-shifted HR fiducial each sample's ``marker_stack`` was
+            built from, ``[B, 1, H, W]``. Every consumer (registration, probe
+            target, PSF and kappa measurement, conformal calibration) reads it
+            from here, so a per-sample realisation cannot be paired with the
+            wrong reference.
+        marker_seeds: The per-sample realisation seeds, or ``None`` for the
+            fixed (``marker_seed``) fiducial.
     """
 
     stack: torch.Tensor
@@ -93,6 +104,8 @@ class AcquisitionResult:
     echoes: torch.Tensor | None = None
     shifts: torch.Tensor | None = None
     marker_stack: torch.Tensor | None = None
+    marker_hr: torch.Tensor | None = None
+    marker_seeds: tuple[int, ...] | None = None
 
 
 def _smooth_field(
@@ -206,6 +219,7 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         self.marker_kappa = marker_kappa
         # Contrast transfer, installed by the strategy when an arm declares it.
         self.field_gains: dict[str, float] | None = None
+        self._gain_tables: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
         self.marker_gain: float | None = None
         self.forward_psf_kernel: torch.Tensor | None = None
         if marker_enabled and method != "subvoxel_sr":
@@ -215,6 +229,7 @@ class MultiAcquisitionSimulator(torch.nn.Module):
             )
         # Built once per spatial size; the pattern is a fixed, known reference.
         self._fiducial_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._fiducial_geometry: dict[tuple[int, int], tuple[tuple[float, ...], ...]] = {}
         # Long-TR (T1-independent) regime for the double-angle method.
         self.tr_long_ms = 3000.0
         self.t1_ms = bottomley_t1(field_strength_t, "white_matter")
@@ -227,32 +242,58 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         key = (int(size[0]), int(size[1]))
         cached = self._fiducial_cache.get(key)
         if cached is None or cached.device != device:
-            # Physical mode when the arm declares the resolution the marker must
-            # survive at. The synthetic M4Raw arm leaves it unset and keeps the
-            # pixel geometry, where the grid IS the resolution and voxels are
-            # isotropic, so both are correct in their own regime.
-            if self.marker_effective_voxel_mm is not None:
-                fiducial = VirtualFiducial(
-                    im_size=key,
-                    jitter=self.marker_jitter,
-                    seed=self.marker_seed,
-                    voxel_mm=self.marker_voxel_mm,
-                    effective_voxel_mm=self.marker_effective_voxel_mm,
-                    sigma_mm=self.marker_sigma_mm,
-                    spacing_mm=self.marker_spacing_mm,
-                    kappa=self.marker_kappa,
-                )
-            else:
-                fiducial = VirtualFiducial(
-                    im_size=key,
-                    grid_spacing=self.marker_grid_spacing,
-                    sigma=self.marker_sigma,
-                    jitter=self.marker_jitter,
-                    seed=self.marker_seed,
-                )
+            fiducial = self._make_fiducial(key)
             cached = fiducial(1).real.to(device=device, dtype=dtype).contiguous()
             self._fiducial_cache[key] = cached
         return cached
+
+    def _make_fiducial(self, key: tuple[int, int]) -> VirtualFiducial:
+        """The fixed fiducial at ``key``; also caches its pixel geometry."""
+        # Physical mode when the arm declares the resolution the marker must
+        # survive at. The synthetic M4Raw arm leaves it unset and keeps the
+        # pixel geometry, where the grid IS the resolution and voxels are
+        # isotropic, so both are correct in their own regime.
+        if self.marker_effective_voxel_mm is not None:
+            fiducial = VirtualFiducial(
+                im_size=key,
+                jitter=self.marker_jitter,
+                seed=self.marker_seed,
+                voxel_mm=self.marker_voxel_mm,
+                effective_voxel_mm=self.marker_effective_voxel_mm,
+                sigma_mm=self.marker_sigma_mm,
+                spacing_mm=self.marker_spacing_mm,
+                kappa=self.marker_kappa,
+            )
+        else:
+            fiducial = VirtualFiducial(
+                im_size=key,
+                grid_spacing=self.marker_grid_spacing,
+                sigma=self.marker_sigma,
+                jitter=self.marker_jitter,
+                seed=self.marker_seed,
+            )
+        self._fiducial_geometry[key] = (fiducial.spacing_px, fiducial.sigma_px)
+        return fiducial
+
+    def marker_realisations(
+        self,
+        seeds: tuple[int, ...],
+        size: tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """One un-shifted HR fiducial per seed, ``[B, 1, H, W]``, same geometry."""
+        key = (int(size[0]), int(size[1]))
+        if key not in self._fiducial_geometry:
+            self._make_fiducial(key)
+        spacing_px, sigma_px = self._fiducial_geometry[key]
+        return marker_batch(
+            seeds, key, spacing_px, sigma_px, self.marker_jitter, device=device, dtype=dtype
+        ).contiguous()
+
+    def pooled(self, marker_hr: torch.Tensor) -> torch.Tensor:
+        """A marker on the acquisition grid: the ABSOLUTE registration reference."""
+        return avg_pool2d(marker_hr, self.sr_scale)
 
     def set_forward_psf(self, kernel: torch.Tensor | None) -> None:
         """Install the blur the simulator applies BEFORE pooling.
@@ -271,6 +312,7 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         to disable, which is the pre-2026-07-26 behaviour.
         """
         self.field_gains = gains
+        self._gain_tables = {}
         self.marker_gain = marker_gain
 
     def _tissue_gain_field(self, pd: torch.Tensor) -> torch.Tensor:
@@ -285,14 +327,27 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         gains = self.field_gains
         if gains is None:
             return torch.ones_like(pd)
+        # Built once per device: a host list -> CUDA copy blocks on every step.
+        key = (pd.device, pd.dtype)
+        table = self._gain_tables.get(key)
+        if table is None:
+            table = torch.tensor([gains[t] for t in TISSUE_ORDER], device=pd.device, dtype=pd.dtype)
+            self._gain_tables[key] = table
+        return table[self.tissue_classes(pd)]
+
+    @staticmethod
+    def tissue_classes(pd: torch.Tensor) -> torch.Tensor:
+        """Per-voxel class index into :data:`TISSUE_ORDER`, ``[B, 1, H, W]`` long.
+
+        The one owner of the quantile proxy: the transfer above and the
+        tissue-map factored head's agreement report both read it.
+        """
         b = pd.shape[0]
         flat = pd.reshape(b, -1)
         lo = torch.quantile(flat.float(), 0.60, dim=-1).view(b, 1, 1, 1)
         hi = torch.quantile(flat.float(), 0.95, dim=-1).view(b, 1, 1, 1)
         # dark -> white matter, mid -> grey matter, bright -> CSF-like
-        out = torch.full_like(pd, gains["white_matter"])
-        out = torch.where(pd >= lo, torch.full_like(pd, gains["gray_matter"]), out)
-        return torch.where(pd >= hi, torch.full_like(pd, gains["csf"]), out)
+        return (pd >= lo).long() + (pd >= hi).long()
 
     def marker_hr(
         self, size: tuple[int, int], device: torch.device, dtype: torch.dtype
@@ -316,8 +371,7 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         an arbitrary frame. That absolute anchor is the whole point of carrying
         a known fiducial rather than doing blind frame-to-frame registration.
         """
-        field = self._fiducial_field(size, device, dtype)
-        return avg_pool2d(field, self.sr_scale)
+        return self.pooled(self._fiducial_field(size, device, dtype))
 
     def _maps(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(pd_map, t1_map) broadcast to the image grid."""
@@ -355,6 +409,7 @@ class MultiAcquisitionSimulator(torch.nn.Module):
         image: torch.Tensor,
         generator: torch.Generator | None = None,
         external_field: torch.Tensor | None = None,
+        marker_seeds: tuple[int, ...] | None = None,
     ) -> AcquisitionResult:
         pd, t1 = self._maps(image)
         t2 = torch.full_like(pd, self.t2_ms)
@@ -437,9 +492,17 @@ class MultiAcquisitionSimulator(torch.nn.Module):
                 shifted = apply_psf(shifted, self.forward_psf_kernel.expand(b, -1, -1, -1, -1))
             frames = avg_pool2d(shifted, s)
 
-            marker_stack = None
+            marker_stack = marker_hr = None
+            if marker_seeds is not None and not self.marker_enabled:
+                raise ValueError("marker_seeds given but the fiducial is not enabled")
             if self.marker_enabled:
-                marker = self._fiducial_field((h, w), pd.device, pd.dtype)
+                if marker_seeds is None:
+                    marker = self._fiducial_field((h, w), pd.device, pd.dtype)
+                else:
+                    if len(marker_seeds) != b:
+                        raise ValueError(f"{len(marker_seeds)} marker seeds for a batch of {b}")
+                    marker = self.marker_realisations(marker_seeds, (h, w), pd.device, pd.dtype)
+                marker_hr = marker.expand(b, 1, h, w)
                 # The fiducial's gain is DECLARED, not inferred from intensity,
                 # which is the whole point: its kappa is known exactly while the
                 # anatomy's is only proxied.
@@ -456,7 +519,12 @@ class MultiAcquisitionSimulator(torch.nn.Module):
                     )
                 marker_stack = avg_pool2d(marker_shifted, s)
             return AcquisitionResult(
-                stack=frames, field=hr, shifts=shifts, marker_stack=marker_stack
+                stack=frames,
+                field=hr,
+                shifts=shifts,
+                marker_stack=marker_stack,
+                marker_hr=marker_hr,
+                marker_seeds=None if marker_seeds is None else tuple(marker_seeds),
             )
 
         if self.method == "bloch_siegert":
@@ -714,6 +782,7 @@ def invert_dual_echo(stack: torch.Tensor, te1_ms: float, te2_ms: float) -> torch
 
 __all__ = [
     "PAIRED_METHODS",
+    "TISSUE_ORDER",
     "AcquisitionResult",
     "MultiAcquisitionSimulator",
     "invert_afi",

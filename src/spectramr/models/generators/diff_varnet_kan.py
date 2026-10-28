@@ -12,9 +12,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditioning
-from spectramr.infrastructure.physics.data_consistency_layer import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.kan.complex_kan import ComplexFastKANConvLayer
 from spectramr.models.registry import register_model
@@ -95,7 +97,7 @@ class ComplexKANUnrolledBlock(nn.Module):
         # But we can add it if needed. For now, rely on KAN non-linearity.
 
         # Data Consistency
-        self.dc = DataConsistencyLayer()
+        self.dc = MaskedReplacementDataConsistency()
 
     def forward(
         self,
@@ -143,7 +145,7 @@ class ComplexKANUnrolledBlock(nn.Module):
 
 
 @register_model(name="diff_varnet_kan", training_mode="diffusion", spatial_dims=(2,))
-class DiffVarNetKAN(nn.Module, IGenerator):
+class DiffVarNetKAN(GradCheckpointingMixin, nn.Module, IGenerator):
     """
     Diff-VarNet-KAN Backbone.
     """
@@ -202,6 +204,7 @@ class DiffVarNetKAN(nn.Module, IGenerator):
             ]
         )
 
+
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """get_output_shape.
 
@@ -259,8 +262,13 @@ class DiffVarNetKAN(nn.Module, IGenerator):
         emb = self.time_pos_enc(cond_input.float())
 
         curr_x = x
+        ckpt = self._checkpointing_active()
         for block in self.blocks:
-            curr_x = block(curr_x, emb, measured_kspace, mask)
+            curr_x = (
+                checkpoint(block, curr_x, emb, measured_kspace, mask, use_reentrant=False)
+                if ckpt
+                else block(curr_x, emb, measured_kspace, mask)
+            )
 
         return curr_x
 

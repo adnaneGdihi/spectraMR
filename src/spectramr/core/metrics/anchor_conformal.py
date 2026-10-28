@@ -113,7 +113,7 @@ class CoverageReport:
 
     Attributes:
         nominal: Target coverage, ``1 - alpha``.
-        tolerance: Absolute slack allowed below nominal before a stratum fails.
+        tolerance: Absolute slack allowed either side of nominal before a stratum fails.
         counts: ``[n_strata]`` calibration points per stratum.
         coverage: ``[n_strata]`` empirical coverage measured on held-out data.
         passed: ``[n_strata]`` booleans.
@@ -288,10 +288,10 @@ class AnchorConformalCalibrator:
         """Per-stratum empirical coverage on data the calibrator did NOT see.
 
         This is the exchangeability test, and it is allowed to fail. A stratum
-        below ``nominal - tolerance`` means fiducial residuals do not stand in
-        for anatomy residuals at that difficulty, and any interval quoted there
-        carries no guarantee. Reporting that is the correct outcome; widening
-        the tolerance until it passes is not.
+        outside ``nominal +/- tolerance`` means fiducial residuals do not stand
+        in for anatomy residuals at that difficulty. Over-coverage fails too: an
+        interval that passes by being too wide carries no information. Reporting
+        that is the correct outcome; widening the tolerance until it passes is not.
         """
         r = residual.abs().reshape(-1)
         d = difficulty.reshape(-1)
@@ -315,5 +315,5 @@ class AnchorConformalCalibrator:
             tolerance=self.tolerance,
             counts=torch.tensor(counts),
             coverage=coverage,
-            passed=coverage >= (nominal - self.tolerance),
+            passed=(coverage - nominal).abs() <= self.tolerance,
         )

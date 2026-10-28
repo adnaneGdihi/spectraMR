@@ -53,15 +53,9 @@ def test_health_check_result_to_dict_round_trips() -> None:
 def test_health_check_report_to_dict_aggregates_counts() -> None:
     report = HealthCheckReport(
         results=[
-            HealthCheckResult(
-                passed=True, check_name="x", message="ok", severity="info"
-            ),
-            HealthCheckResult(
-                passed=False, check_name="y", message="warn", severity="warning"
-            ),
-            HealthCheckResult(
-                passed=False, check_name="z", message="bad", severity="error"
-            ),
+            HealthCheckResult(passed=True, check_name="x", message="ok", severity="info"),
+            HealthCheckResult(passed=False, check_name="y", message="warn", severity="warning"),
+            HealthCheckResult(passed=False, check_name="z", message="bad", severity="error"),
         ]
     )
     d = report.to_dict()
@@ -74,9 +68,7 @@ def test_health_check_report_to_dict_aggregates_counts() -> None:
 def test_health_check_report_to_json_is_valid_json() -> None:
     report = HealthCheckReport(
         results=[
-            HealthCheckResult(
-                passed=True, check_name="x", message="ok", severity="info"
-            ),
+            HealthCheckResult(passed=True, check_name="x", message="ok", severity="info"),
         ]
     )
     parsed = json.loads(report.to_json())
@@ -232,6 +224,34 @@ def test_loss_domain_consistency_error_when_kspace_loss_in_image_config() -> Non
     assert "kspace_losses" in " ".join(failures[0].yaml_keys)
 
 
+@pytest.mark.parametrize(
+    ("target", "names", "bridged"),
+    [
+        ("alternate_repetition", ["masked_kspace_l2"], True),
+        ("measured", ["masked_kspace_l2"], False),
+        ("alternate_repetition", ["kspace_l1_sparsity"], False),
+        ("alternate_repetition", ["masked_kspace_l2", "kspace_l1_sparsity"], False),
+    ],
+    ids=["ei-anchor", "anchor-on-y", "other-loss", "extra-loss"],
+)
+def test_the_ei_anchor_bridges_only_its_own_kspace_loss(
+    target: str, names: list[str], bridged: bool
+) -> None:
+    """supervised_bound_mc: the EI anchor scores F S x_hat with masked_kspace_l2.
+
+    Any other target, or any other k-space loss, is never called by the strategy
+    and is still the unbridged combination the check exists for.
+    """
+    cfg = _losses_cfg(
+        "image", kspace=[types.SimpleNamespace(name=n, weight=1.0, enabled=True) for n in names]
+    )
+    cfg.training = types.SimpleNamespace(
+        equivariant_imaging=types.SimpleNamespace(measurement_target=target)
+    )
+    results = ConfigHealthChecker().check_loss_domain_consistency(cfg)
+    assert all(r.passed for r in results) is bridged
+
+
 # ── VF-smoke-2026-05-25: complex_image output domain bridging ───────────
 #
 # LossBuilder._build_list_based_losses accepts ``complex_image`` (raises on
@@ -246,11 +266,7 @@ def test_loss_domain_consistency_error_when_kspace_loss_in_image_config() -> Non
 def test_loss_domain_complex_image_accepts_complex_losses() -> None:
     cfg = _losses_cfg(
         "complex_image",
-        complex=[
-            types.SimpleNamespace(
-                name="phase_smoothness_complex", weight=0.01, enabled=True
-            )
-        ],
+        complex=[types.SimpleNamespace(name="phase_smoothness_complex", weight=0.01, enabled=True)],
     )
     results = ConfigHealthChecker().check_loss_domain_consistency(cfg)
     assert all(r.passed for r in results), [r.message for r in results if not r.passed]
@@ -271,11 +287,7 @@ def test_loss_domain_complex_image_bridges_image_and_kspace_losses() -> None:
 def test_loss_domain_image_output_casts_complex_losses() -> None:
     cfg = _losses_cfg(
         "image",
-        complex=[
-            types.SimpleNamespace(
-                name="phase_smoothness_complex", weight=0.01, enabled=True
-            )
-        ],
+        complex=[types.SimpleNamespace(name="phase_smoothness_complex", weight=0.01, enabled=True)],
     )
     results = ConfigHealthChecker().check_loss_domain_consistency(cfg)
     # image + complex_losses is the builder's cast-to-complex path → info.
@@ -291,9 +303,7 @@ def test_loss_domain_image_output_casts_complex_losses() -> None:
 # placed under image_losses/kspace_losses.
 
 
-def _patch_loss_domains(
-    monkeypatch: pytest.MonkeyPatch, mapping: dict[str, dict]
-) -> None:
+def _patch_loss_domains(monkeypatch: pytest.MonkeyPatch, mapping: dict[str, dict]) -> None:
     from spectramr.models.losses.registry import LossRegistry
 
     monkeypatch.setattr(LossRegistry, "_loss_domains", mapping, raising=False)
@@ -305,9 +315,7 @@ def test_loss_domain_block_match_accepts_agnostic_under_image_block(
     _patch_loss_domains(monkeypatch, {"nll_bits_per_dim": {"domain": "agnostic"}})
     cfg = _losses_cfg(
         "image",
-        image=[
-            types.SimpleNamespace(name="nll_bits_per_dim", weight=1.0, enabled=True)
-        ],
+        image=[types.SimpleNamespace(name="nll_bits_per_dim", weight=1.0, enabled=True)],
     )
     results = ConfigHealthChecker().check_loss_domain_block_match(cfg)
     assert all(r.passed for r in results), [r.message for r in results if not r.passed]
@@ -699,8 +707,7 @@ def test_channel_audit_assumptions_input_concat_model_emits_info() -> None:
     # The info entry mentions the by-design bypass.
     infos = [r for r in results if r.severity == "info"]
     assert any(
-        "_INPUT_CONCAT_MODELS" in r.message and "disentangled_mri" in r.message
-        for r in infos
+        "_INPUT_CONCAT_MODELS" in r.message and "disentangled_mri" in r.message for r in infos
     )
 
 
@@ -726,10 +733,7 @@ def test_channel_audit_assumptions_known_pre_model_chain_emits_info() -> None:
     warnings = [r for r in results if not r.passed and r.severity == "warning"]
     assert len(warnings) == 0
     infos = [r for r in results if r.severity == "info"]
-    assert any(
-        "rss_coils_to_magnitude" in r.message and "audit-known" in r.message
-        for r in infos
-    )
+    assert any("rss_coils_to_magnitude" in r.message and "audit-known" in r.message for r in infos)
 
 
 def test_channel_audit_assumptions_unknown_pre_model_chain_still_warns() -> None:
@@ -744,9 +748,7 @@ def test_channel_audit_assumptions_unknown_pre_model_chain_still_warns() -> None
     assert "adapters.pre_model" in warnings[0].yaml_keys
 
 
-def test_channel_audit_assumptions_coil_mode_none_without_target_channels_is_info() -> (
-    None
-):
+def test_channel_audit_assumptions_coil_mode_none_without_target_channels_is_info() -> None:
     """F32 / 2026-05-22: ``coil_processing_mode='none'`` is an UNVERIFIABLE
     assumption (the channel count is deferred to the h5 header at runtime),
     not a defect. It is now informational (passed=True) so --strict does not
@@ -762,9 +764,7 @@ def test_channel_audit_assumptions_coil_mode_none_without_target_channels_is_inf
     assert "data.coil_processing_mode" in deferral[0].yaml_keys
 
 
-def test_channel_audit_assumptions_coil_mode_none_matching_target_channels_is_info() -> (
-    None
-):
+def test_channel_audit_assumptions_coil_mode_none_matching_target_channels_is_info() -> None:
     """F6c / 2026-05-20: ``coil_processing_mode='none'`` + matching
     ``data.target_channels`` is the user's explicit declaration → info, not warning.
 
@@ -781,15 +781,10 @@ def test_channel_audit_assumptions_coil_mode_none_matching_target_channels_is_in
     warnings = [r for r in results if not r.passed and r.severity == "warning"]
     assert len(warnings) == 0
     infos = [r for r in results if r.severity == "info"]
-    assert any(
-        "coil_processing_mode='none'" in r.message and "matches" in r.message
-        for r in infos
-    )
+    assert any("coil_processing_mode='none'" in r.message and "matches" in r.message for r in infos)
 
 
-def test_channel_audit_assumptions_coil_mode_none_mismatched_target_channels_is_info() -> (
-    None
-):
+def test_channel_audit_assumptions_coil_mode_none_mismatched_target_channels_is_info() -> None:
     """F32 / 2026-05-22: target_channels != in_channels under coil='none' is the
     legitimate ASYMMETRIC-recon case (e.g. multi-coil input → 1-channel
     magnitude target). It cannot be confirmed statically, so it is now
@@ -919,6 +914,29 @@ def test_output_dir_check_warns_on_nonstandard_prefix() -> None:
     res = ConfigHealthChecker().check_output_dir_convention(cfg)
     assert not res.passed
     assert res.severity == "warning"
+    assert res.category == "output_dir_nonstandard"
+
+
+def test_output_dir_check_passes_absolute_path_under_results_root() -> None:
+    """The campaign orchestrator resolves its base dir, so its runs carry an absolute path."""
+    cfg = _output_dir_cfg("/project/x/repo/experiments/results/campaigns/c/arm")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert res.passed, res.message
+
+
+def test_output_dir_check_errors_on_absolute_deprecated_prefix() -> None:
+    """PLANTED: absolute spelling must not launder a deprecated prefix."""
+    cfg = _output_dir_cfg("/project/x/experiments/results/linear_configs/experiment_42")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert not res.passed
+    assert res.category == "output_dir_deprecated"
+
+
+def test_output_dir_check_warns_on_absolute_path_without_a_name() -> None:
+    """PLANTED: the results root itself names no experiment."""
+    cfg = _output_dir_cfg("/project/x/experiments/results")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert not res.passed
     assert res.category == "output_dir_nonstandard"
 
 
@@ -1436,7 +1454,6 @@ def test_hardcoded_path_check_auto_detects_cluster_owner_from_cwd_and_user(
     without env-var ceremony while keeping the colleague-leak protection
     (a different ``<user>`` segment doesn't match).
     """
-    import os
 
     # Build a fake "cluster" cwd path with the proper structure.
     fake_cluster_root = tmp_path / "project" / "alpha_lab" / "researcher" / "spectramr"
@@ -1614,21 +1631,17 @@ def test_themed_check_exempts_honest_generic_key() -> None:
 class TestMambaSsmAuditHook:
     """Mamba-family configs must declare a usable mamba_ssm kernel at audit time."""
 
-    import spectramr.models.blocks.mamba_block as _mb  # noqa: PLC0415
+    import spectramr.models.blocks.mamba_block as _mb
 
     def test_non_mamba_model_passes(self) -> None:
-        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(
-            _make_config("unet")
-        )
+        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(_make_config("unet"))
         assert res.passed is True
         assert res.severity == "info"
 
     def test_mamba_model_errors_when_kernel_absent(self, monkeypatch) -> None:
         monkeypatch.setattr(self._mb, "_mamba_ssm_importable", lambda: False)
         monkeypatch.setattr(self._mb, "_mamba_fallback_allowed", lambda: False)
-        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(
-            _make_config("ct_mamba")
-        )
+        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(_make_config("ct_mamba"))
         assert res.passed is False
         assert res.severity == "error"
         assert "mamba_ssm" in res.message
@@ -1642,6 +1655,22 @@ class TestMambaSsmAuditHook:
         assert res.passed is False
         assert res.severity == "warning"
 
+    def test_fix_hint_names_the_arch_aware_installer(self, monkeypatch) -> None:
+        """The bare pip line installs a wheel with no ``sm_70``, so it must not be the hint.
+
+        This check gates on importability alone, and an architecture-mismatched
+        wheel imports cleanly — so the remediation has to point at the installer
+        that verifies the built architectures, or the audit sends a V100 user to
+        the command that produced the broken install.
+        """
+        monkeypatch.setattr(self._mb, "_mamba_ssm_importable", lambda: False)
+        monkeypatch.setattr(self._mb, "_mamba_fallback_allowed", lambda: False)
+        res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(_make_config("ct_mamba"))
+        assert res.fix_hint is not None
+        assert "install-mamba" in res.fix_hint
+        assert "--verify-only" in res.fix_hint
+        assert "pip install -e '.[mamba]'" not in res.fix_hint
+
     def test_mamba_model_passes_when_kernel_available(self, monkeypatch) -> None:
         monkeypatch.setattr(self._mb, "_mamba_ssm_importable", lambda: True)
         res = ConfigHealthChecker().check_mamba_models_require_mamba_ssm(
@@ -1649,3 +1678,186 @@ class TestMambaSsmAuditHook:
         )
         assert res.passed is True
         assert res.severity == "info"
+
+
+# ─────────────────────────────────────────────────────────────────────── #
+# #1929 — check_identity_paths_agree
+#
+# ``check_output_dir_convention`` above is a PREFIX test: it accepts
+# ``experiments/results/<anything>``. The arms it cannot see are the ones whose
+# output_dir, checkpoints, logs and metrics name DIFFERENT experiments, so half
+# the run's artifacts land in another arm's tree. Measured over the 660
+# ``experiments/inprogress`` arms: 658 agree, 2 do not.
+#
+# Every plant below is one shape the check must catch, or one the scope
+# deliberately excludes and must therefore leave green (non-negotiable 15).
+# ─────────────────────────────────────────────────────────────────────── #
+
+
+def _identity_cfg(
+    *,
+    output_dir: Any = None,
+    sinks_dir: Any = None,
+    metrics_dir: Any = None,
+) -> Any:
+    """The three identity paths a stub can express, each independently settable."""
+    return types.SimpleNamespace(
+        training=types.SimpleNamespace(output_dir=output_dir),
+        logging=types.SimpleNamespace(sinks=types.SimpleNamespace(dir=sinks_dir)),
+        metrics=types.SimpleNamespace(output_dir=metrics_dir),
+    )
+
+
+def test_identity_paths_that_agree_pass() -> None:
+    """Anti-vacuity. Without this, a check that ALWAYS fired would satisfy every
+    red assertion below and still be worthless."""
+    cfg = _identity_cfg(
+        output_dir="experiments/results/arm_alpha",
+        sinks_dir="experiments/results/arm_alpha/logs",
+        metrics_dir="experiments/results/arm_alpha/metrics",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert res.passed
+    assert res.severity == "info"
+    assert "arm_alpha" in res.message
+
+
+def test_an_absolute_output_dir_is_compared_with_the_relative_trees() -> None:
+    """PLANTED: a campaign run redirects output_dir (absolute) but not metrics.output_dir."""
+    cfg = _identity_cfg(
+        output_dir="/project/x/experiments/results/campaigns/c/arm_alpha",
+        metrics_dir="experiments/results/arm_alpha/metrics",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert not res.passed
+    assert set(res.yaml_keys) == {"training.output_dir", "metrics.output_dir"}
+
+
+def test_a_split_between_output_dir_and_the_log_tree_is_reported() -> None:
+    """The shape that motivates the check: two names, so two trees.
+
+    This is ``conditioning/recon_field_conditioned_off_v1.yaml`` reduced -- an
+    ``off`` control arm whose ``training.output_dir`` still names the ``on`` arm
+    it was copied from, while its logs name itself.
+    """
+    cfg = _identity_cfg(
+        output_dir="experiments/results/recon_field_conditioned_v1",
+        sinks_dir="experiments/results/recon_field_conditioned_off_v1/logs",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert not res.passed
+    assert res.severity == "warning"
+    assert res.category == "identity_paths_disagree"
+    assert set(res.yaml_keys) == {"training.output_dir", "logging.sinks.dir"}
+    assert "recon_field_conditioned_v1" in res.message
+    assert "recon_field_conditioned_off_v1" in res.message
+    assert res.fix_hint is not None
+
+
+def test_a_third_disagreeing_path_is_counted_and_named() -> None:
+    """Three names, not just "they differ" -- the message must say how many trees
+    and which key put the arm in each, or the reader cannot tell which is wrong."""
+    cfg = _identity_cfg(
+        output_dir="experiments/results/arm_a",
+        metrics_dir="experiments/results/arm_b",
+        sinks_dir="experiments/results/arm_c",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert not res.passed
+    assert "3 different" in res.message
+    assert set(res.yaml_keys) == {
+        "training.output_dir",
+        "metrics.output_dir",
+        "logging.sinks.dir",
+    }
+
+
+def test_checkpoints_are_not_an_identity_path() -> None:
+    """Checkpoints land in ``<training.output_dir>/checkpoints`` by construction (#2842).
+
+    No key can send them elsewhere, so there is nothing to disagree with
+    ``output_dir``. A stray ``checkpoint`` attribute on a stub naming another
+    experiment is not compared.
+    """
+    from spectramr.infrastructure.validation.config_health_checker import IDENTITY_PATHS
+
+    assert not [p for p in IDENTITY_PATHS if p.startswith("checkpoint.")]
+    cfg = _identity_cfg(output_dir="experiments/results/arm_alpha")
+    cfg.checkpoint = types.SimpleNamespace(checkpoint_dir="experiments/results/arm_beta")
+    assert ConfigHealthChecker().check_identity_paths_agree(cfg).passed
+
+
+def test_a_cwd_relative_path_is_out_of_scope() -> None:
+    """The noise control, and the reason this check is usable at all.
+
+    Comparing CWD-relative paths against ``experiments/results/<name>`` would
+    fire on much of the corpus, the check would be baselined, and the real
+    splits would be lost in it. That is a separate defect with its own issue.
+    """
+    cfg = _identity_cfg(
+        output_dir="experiments/results/arm_alpha",
+        metrics_dir="./metrics",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert res.passed
+
+
+def test_a_nested_subdirectory_resolves_to_its_experiment_segment() -> None:
+    """``experiments/results/<name>/logs`` is <name>, not "logs".
+
+    Taking the LAST segment instead of the first would make every arm that nests
+    its sinks disagree with its own output_dir -- a check that fires on almost
+    everything and means nothing.
+    """
+    cfg = _identity_cfg(
+        output_dir="experiments/results/arm_alpha",
+        sinks_dir="experiments/results/arm_alpha/logs/train",
+        metrics_dir="experiments/results/arm_alpha/metrics",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert res.passed
+
+
+def test_an_arm_with_no_convention_path_reports_the_absence() -> None:
+    """Absent is a state to report, not one to infer (non-negotiable 18).
+
+    Nothing under ``experiments/results/`` means nothing to compare -- which is
+    ``check_output_dir_convention``'s finding, not this one's -- so the message
+    says so rather than claiming agreement it never checked.
+    """
+    cfg = _identity_cfg(output_dir="./training_output", metrics_dir="./metrics")
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert res.passed
+    assert "no identity path" in res.message
+
+
+def test_the_check_is_registered_in_run_all_checks(tmp_path: Any) -> None:
+    """A defined-but-uncalled check is the exact shape non-negotiable 16 names.
+
+    Asserted BEHAVIOURALLY -- by finding the result in a real report -- and never
+    by scanning ``run_all_checks`` source. The call site carries a comment naming
+    this check, so a source scan would match the comment and pass whether or not
+    the method is ever invoked. ``test_the_dead_check_is_gone`` in the sibling
+    module records that same trap.
+    """
+    import yaml as _yaml
+
+    from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
+    from spectramr.config.settings import TrainingSettings
+
+    doc = {
+        "config_version": CANONICAL_CONFIG_VERSION,
+        "data": {"train_path": "/tmp/t", "val_path": "/tmp/v"},
+        "optimization": {"learning_rate": 1e-4},
+        "logging": {},
+        "model": {"model_type": "unet"},
+        "training": {"output_dir": "experiments/results/arm_alpha"},
+        "metrics": {"output_dir": "experiments/results/arm_beta/metrics"},
+    }
+    path = tmp_path / "split_arm.yaml"
+    path.write_text(_yaml.dump(doc))
+
+    report = ConfigHealthChecker().run_all_checks(TrainingSettings.from_yaml(str(path)))
+    hits = [r for r in report.results if r.check_name == "identity_paths_agree"]
+    assert len(hits) == 1, "run_all_checks does not invoke check_identity_paths_agree"
+    assert not hits[0].passed

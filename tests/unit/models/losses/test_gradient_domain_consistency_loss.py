@@ -191,3 +191,25 @@ def test_loss_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "gradient_domain_consistency" in list_available()
+
+
+def test_normalise_per_image_gradient_is_finite_for_a_flat_prediction() -> None:
+    """A constant prediction has an all-zero gradient field, whose RMS is 0."""
+    pred = torch.zeros(1, 1, 8, 8, requires_grad=True)
+    target = torch.rand(1, 1, 8, 8, generator=torch.Generator().manual_seed(0))
+    GradientDomainConsistencyLoss(normalise_per_image=True)(pred, target).backward()
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+
+
+@pytest.mark.parametrize(("anchor", "target_moves"), [("target", False), ("prediction", True)])
+def test_anchor_decides_whether_the_target_receives_gradient(
+    anchor: str, target_moves: bool
+) -> None:
+    """``anchor`` is read: the default pins the target's gradient field."""
+    gen = torch.Generator().manual_seed(1)
+    pred = torch.rand(1, 1, 8, 8, generator=gen, requires_grad=True)
+    target = torch.rand(1, 1, 8, 8, generator=gen, requires_grad=True)
+    GradientDomainConsistencyLoss(anchor=anchor)(pred, target).backward()
+    assert pred.grad is not None and pred.grad.abs().sum() > 0
+    target_grad = 0.0 if target.grad is None else target.grad.abs().sum().item()
+    assert (target_grad > 0) is target_moves

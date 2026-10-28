@@ -51,8 +51,9 @@ def _weight_mapping() -> dict[str, str]:
 #: default substitution (non-negotiable 3): the loss trains at a weight nobody
 #: chose, and no config declaration can change it because no such field exists.
 #: Baselined, not forgiven -- pre-existing debt found by this guard while landing
-#: #421, tracked separately. The set may only SHRINK.
-KNOWN_UNRESOLVABLE = {"patch_nce": "lambda_patch_nce"}
+#: #421, tracked separately. The set may only SHRINK; `lambda_patch_nce` now exists on
+#: `LatentLossesConfig`, so it is empty.
+KNOWN_UNRESOLVABLE: dict[str, str] = {}
 
 
 def _searched_fields() -> set[str]:
@@ -114,3 +115,93 @@ class TestMappingTargetsAreRealSchemaFields:
 
         assert "content_consistency" in KNOWN_LOSS_COMPONENTS
         assert "perceptual" in KNOWN_LOSS_COMPONENTS
+
+
+def _weighted_computer(**latent):
+    """The computer with only the config sections ``_get_loss_weight`` searches."""
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from spectramr.config.schemas.loss import LatentLossesConfig
+    from spectramr.models.losses.computers.unified_disentangled import (
+        UnifiedDisentangledLossComputer,
+    )
+
+    comp = UnifiedDisentangledLossComputer.__new__(UnifiedDisentangledLossComputer)
+    nn.Module.__init__(comp)
+    comp.config = SimpleNamespace(
+        losses=SimpleNamespace(
+            reconstruction=ReconstructionLossesConfig(), latent=LatentLossesConfig(**latent)
+        )
+    )
+    return comp
+
+
+def test_patch_nce_trains_at_the_declared_weight() -> None:
+    """The term was always on at a weight no config could change: the field did not exist."""
+    assert _weighted_computer(lambda_patch_nce=0.25)._get_loss_weight("patch_nce") == 0.25
+    assert _weighted_computer(lambda_patch_nce=0.0)._get_loss_weight("patch_nce") == 0.0
+
+
+def test_patch_nce_default_keeps_the_weight_every_earlier_arm_trained_at() -> None:
+    assert _weighted_computer()._get_loss_weight("patch_nce") == 1.0
+
+
+def _recon_computer(loss_type: str):
+    """The computer with only what _compute_recon_losses reads (#2016)."""
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from spectramr.models.losses.computers.unified_disentangled import (
+        UnifiedDisentangledLossComputer,
+    )
+
+    comp = UnifiedDisentangledLossComputer.__new__(UnifiedDisentangledLossComputer)
+    nn.Module.__init__(comp)
+    comp.losses = {"mse": nn.MSELoss()}
+    comp.config = SimpleNamespace(
+        losses=SimpleNamespace(reconstruction=SimpleNamespace(loss_type=loss_type))
+    )
+    return comp
+
+
+def test_recon_trains_the_declared_loss() -> None:
+    import torch
+
+    pred, target = torch.full((1, 1, 2, 2), 2.0), torch.zeros(1, 1, 2, 2)
+    out = _recon_computer("mse")._compute_recon_losses(pred, target)
+    assert torch.isclose(out["recon_a"], torch.tensor(4.0))  # mse; the old L1 gave 2.0
+
+
+def test_an_unbuilt_loss_type_is_refused_at_construction(monkeypatch) -> None:
+    """Fail where audit and smoke see it, not at the first training step (#2016)."""
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    import spectramr.infrastructure.training.builders.loss_builder as lb
+    from spectramr.models.losses.computers.unified_disentangled import (
+        UnifiedDisentangledLossComputer,
+    )
+
+    class _Builder:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            return lambda: self if name != "build" else {"mse": nn.MSELoss()}
+
+    monkeypatch.setattr(lb, "LossBuilder", _Builder)
+    cfg = SimpleNamespace(losses=SimpleNamespace(reconstruction=SimpleNamespace(loss_type="l1")))
+    with pytest.raises(ValueError, match="not among the built losses"):
+        UnifiedDisentangledLossComputer(cfg)
+
+
+def test_recon_refuses_a_loss_type_that_was_not_built() -> None:
+    """The old path built a bare nn.L1Loss weighted 10.0 that no YAML declared (#2016)."""
+    import torch
+
+    with pytest.raises(ValueError, match="not among the built losses"):
+        _recon_computer("l1")._compute_recon_losses(torch.ones(1), torch.zeros(1))

@@ -32,7 +32,7 @@ import torch
 
 from .field_guided_diffusion_strategy import make_alphas_cumprod, q_sample
 from .reconstruction import ReconstructionTrainingStrategy
-from .ulf_map_strategy import ulf_degrade
+from .ulf_lowpass_operator import UlfLowpassOperator, build_ulf_lowpass_operator
 
 
 def compute_ulf_dps_loss(
@@ -69,8 +69,12 @@ def ulf_dps_sample(
     likelihood_weight: float = 1.0,
     blur_cutoff: float = 0.5,
     contrast_id: torch.Tensor | None = None,
+    forward_op: UlfLowpassOperator | None = None,
 ) -> torch.Tensor:
     """Normalized DPS reverse sampling: high-field prior + ULF data-consistency.
+
+    ``forward_op`` is the strategy's resolved ``A``; ``blur_cutoff`` builds a constant
+    one when it is not given.
 
     ``contrast_id`` (optional, per-sample ``[B]``) conditions the widened score net's
     FiLM (only when the net's ``use_contrast_conditioning`` is on).
@@ -88,6 +92,7 @@ def ulf_dps_sample(
     idx = torch.linspace(timesteps - 1, 0, n, device=y_ulf.device).round().long()
     b_t_vec = b_t.reshape(-1).to(y_ulf.device)
     zeta = float(likelihood_weight)
+    op = forward_op if forward_op is not None else UlfLowpassOperator.constant_cutoff(blur_cutoff)
     x = torch.randn_like(y_ulf)
     with torch.enable_grad():
         for i in range(n):
@@ -98,7 +103,7 @@ def ulf_dps_sample(
             a_t = alphas_cumprod[t]
             x0_hat = (x - (1.0 - a_t).sqrt() * eps) / a_t.sqrt().clamp_min(1e-3)
             x0_hat = x0_hat.clamp(-1.0, 2.0)  # data range guard (images are [0,1])
-            residual = ulf_degrade(x0_hat, blur_cutoff) - y_ulf  # A(x0)-y
+            residual = op.apply(x0_hat, contrast_id) - y_ulf  # A(x0)-y
             # Deterministic DDIM prior step.
             if i < n - 1:
                 a_next = alphas_cumprod[int(idx[i + 1])]
@@ -144,7 +149,7 @@ class UlfDpsStrategy(ReconstructionTrainingStrategy):
         self._dps_schedule = str(getattr(cfg, "beta_schedule", "cosine")) if cfg else "cosine"
         self._dps_sampling_steps = int(getattr(cfg, "sampling_steps", 50)) if cfg else 50
         self._dps_likelihood_weight = float(getattr(cfg, "likelihood_weight", 1.0)) if cfg else 1.0
-        self._dps_blur_cutoff = float(getattr(cfg, "blur_cutoff", 0.5)) if cfg else 0.5
+        self._ulf_lowpass = build_ulf_lowpass_operator(self.config)
         self._acp_cache: dict[tuple, torch.Tensor] = {}
 
     def _alphas_cumprod(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -207,7 +212,6 @@ class UlfDpsStrategy(ReconstructionTrainingStrategy):
         gen = self.env.generator
         n_steps = getattr(self, "_dps_sampling_steps", 50)
         zeta = getattr(self, "_dps_likelihood_weight", 1.0)
-        cutoff = getattr(self, "_dps_blur_cutoff", 0.5)
         # val_chunk_size: the DPS reverse loop retains an autograd graph PER STEP (the
         # data-consistency gradient), so a full val batch at 256x256 can OOM (worse
         # than the no_grad cold-diffusion case that already did). Micro-batch when set.
@@ -226,7 +230,7 @@ class UlfDpsStrategy(ReconstructionTrainingStrategy):
                     alphas_cumprod=acp,
                     n_steps=n_steps,
                     likelihood_weight=zeta,
-                    blur_cutoff=cutoff,
+                    forward_op=self._ulf_lowpass,
                     contrast_id=None if cid is None else cid[i : i + chunk],
                 )
                 for i in range(0, y_ulf.shape[0], chunk)
@@ -239,6 +243,6 @@ class UlfDpsStrategy(ReconstructionTrainingStrategy):
             alphas_cumprod=acp,
             n_steps=n_steps,
             likelihood_weight=zeta,
-            blur_cutoff=cutoff,
+            forward_op=self._ulf_lowpass,
             contrast_id=cid,
         )

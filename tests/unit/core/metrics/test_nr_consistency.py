@@ -99,7 +99,7 @@ def test_all_registered_with_contract():
 
 @pytest.mark.unit
 def test_metrics_return_nan_without_context():
-    """Absent measurement context ⇒ nan (never raise — computer.py re-raises ValueError)."""
+    """Absent measurement context is the declared N/A, so it is nan rather than a raise."""
     img = _blob()
     for key in ("ndcr", "prp_snr", "fmrs", "csoe", "aoqv"):
         out = get_metric(key)(img, context=MetricContext())
@@ -174,6 +174,114 @@ def test_ndcr_mask_none_is_fully_sampled():
     ctx_ones = MetricContext(y_kspace=y, mask=ones, coil_maps=smaps)
     assert abs(ndcr(xrec + 0.2 * noise, context=ctx_none)
                - ndcr(xrec + 0.2 * noise, context=ctx_ones)) < 1e-5
+
+
+def _noisy_multicoil(sigma: float = 0.02):
+    """A 4-coil measurement whose noise is i.i.d. per coil, hence partly off span(S).
+
+    Returns ``(img, smaps, clean, full, mask, y)``: ``clean = F S img``, ``full``
+    the fully-sampled noisy k-space (what the validation target is), ``y = M full``.
+    """
+    img, smaps = _blob(), _smooth_smaps()
+    clean = sense_forward(img, smaps=smaps)
+    g = torch.Generator().manual_seed(0)
+    scale = sigma * float(clean.abs().max())
+    noise = scale * torch.complex(
+        torch.randn(clean.shape, generator=g), torch.randn(clean.shape, generator=g)
+    )
+    full = clean + noise
+    mask = torch.zeros(32, 32)
+    mask[:, ::2] = 1.0  # R=2
+    mask[:, 12:20] = 1.0  # ACS
+    return img, smaps, clean, full, mask, full * mask
+
+
+@pytest.mark.unit
+def test_ndcr_reprojection_floor_ranks_the_truth_below_zero_filling():
+    """PLANTED (#2316): the coil-combine-then-reproject path without ``pred_kspace``.
+
+    A coil-combined image re-expanded through ``S`` reproduces only the part of
+    ``y`` on the sensitivity subspace, so noise off it is a floor: the zero-filled
+    image, which reproduces the acquired lines exactly, reads far from 0, and the
+    noiseless truth reads worse still. This is the inversion seen on 0.3 T data.
+    """
+    img, smaps, _, _, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps)
+    ndcr = get_metric("ndcr")
+    zf = ndcr(sense_adjoint(y, smaps=smaps), context=ctx)
+    truth = ndcr(img, context=ctx)
+    assert zf > 0.2
+    assert truth > zf
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_scores_data_consistent_predictions_zero():
+    r"""With ``pred_kspace`` the residual is per coil, and the floor is gone.
+
+    By the definition :math:`\lVert M(\hat k - y)\rVert/\lVert My\rVert`:
+    zero-filled k-space IS ``y`` and the fully-sampled target agrees with ``y`` on
+    every acquired sample, so both score exactly 0; an all-zero prediction scores
+    1. The coil-combined ``prediction`` argument is not read on this branch.
+    """
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    ndcr = get_metric("ndcr")
+
+    def score(k: torch.Tensor) -> float:
+        ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=k)
+        return ndcr(torch.zeros(1, 1, 32, 32), context=ctx)
+
+    assert score(y) < 1e-6  # zero-filled
+    assert score(full) < 1e-6  # the fully-sampled target
+    assert abs(score(torch.zeros_like(y)) - 1.0) < 1e-6
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_reads_the_noise_of_a_clean_truth():
+    """A noiseless ``F S x`` misses ``y`` by exactly the acquired noise, ``||Mn||/||My||``."""
+    _, smaps, clean, full, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=clean)
+    expected = float(torch.linalg.vector_norm((full - clean) * mask) / torch.linalg.vector_norm(y))
+    assert get_metric("ndcr")(torch.zeros(1), context=ctx) == pytest.approx(expected, rel=1e-4)
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_is_monotone_in_acquired_line_error():
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    g = torch.Generator().manual_seed(3)
+    err = torch.complex(torch.randn(full.shape, generator=g), torch.randn(full.shape, generator=g))
+    err = err * float(full.abs().mean())
+    ndcr = get_metric("ndcr")
+    sevs = [0.0, 0.05, 0.1, 0.2, 0.4]
+    vals = [
+        ndcr(torch.zeros(1), context=MetricContext(
+            y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=full + s * err
+        ))
+        for s in sevs
+    ]
+    assert vals[0] < 1e-6
+    assert _spearman(sevs, vals) > 0.99
+
+
+@pytest.mark.unit
+def test_ndcr_rejects_a_pred_kspace_in_another_layout():
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=full[:, :1])
+    with pytest.raises(ValueError, match="pred_kspace"):
+        get_metric("ndcr")(torch.zeros(1), context=ctx)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", ["ndcr", "csoe"])
+def test_a_failure_that_used_to_be_swallowed_now_raises(key):
+    """PLANTED: coil maps that disagree with the measurement's coil count.
+
+    Both metrics returned ``nan`` here from a blanket ``except Exception``, which
+    the computer cannot tell apart from a declared N/A.
+    """
+    _, _, _, _, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=_smooth_smaps(c=3))
+    with pytest.raises(RuntimeError):
+        get_metric(key)(_blob(), context=ctx)
 
 
 # --------------------------------------------------------------------------- #
@@ -747,3 +855,127 @@ def test_fabrication_excess_full_reference_contract():
     assert MetricsRegistry.needs("fabrication_excess") == ("mask",)
     assert get_metric("fabrication_excess").higher_is_better is False
     assert get_metric("H_T").name == "fabrication_excess"
+
+
+# ---------------------------------------------------------------------------
+# null_band_energy_deficit
+# ---------------------------------------------------------------------------
+def _partially_filled(mask: torch.Tensor, truth: torch.Tensor, fill: float) -> torch.Tensor:
+    """Acquired lines exactly the truth; the null band at ``fill`` x its energy.
+
+    This is the shape a hard-DC reconstruction takes: data consistency pins the
+    measured lines, so every deviation lives in the band the model had to invent.
+    ``fill=0`` is zero-filling, ``fill=1`` is the truth.
+    """
+    k = fft2c(truth)
+    return ifft2c(k * mask + fill * k * (1.0 - mask))
+
+
+def test_null_band_energy_deficit_anchors():
+    # The two ends the metric is defined by: zero-filled leaves the whole
+    # unacquired band empty (1.0); the truth fills it exactly (0.0).
+    mask = _cartesian_mask()
+    tgt = _complex_img(1)
+    m = get_metric("null_band_energy_deficit")
+    ctx = MetricContext(mask=mask)
+    assert m(_partially_filled(mask, tgt, 0.0), tgt, context=ctx) == pytest.approx(1.0, abs=1e-5)
+    assert m(tgt, tgt, context=ctx) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_null_band_energy_deficit_monotone_in_the_fill_fraction():
+    mask = _cartesian_mask()
+    tgt = _complex_img(1)
+    m = get_metric("null_band_energy_deficit")
+    fills = [0.0, 0.25, 0.5, 0.75, 1.0]
+    vals = [m(_partially_filled(mask, tgt, f), tgt, context=MetricContext(mask=mask)) for f in fills]
+    assert _spearman(fills, vals) < -0.99
+    # Analytic anchor: the deficit IS 1 - fill while the null band is scaled.
+    for f, v in zip(fills, vals, strict=True):
+        assert v == pytest.approx(1.0 - f, abs=1e-5)
+
+
+def test_null_band_energy_deficit_clamps_the_fabrication_direction():
+    # Over-filling is a real failure, but it is fabrication_excess's to report
+    # (non-negotiable 17). Registering the raw two-sided ratio under a
+    # lower-is-better direction would have it read backwards by every consumer
+    # that resolves through ``metric_higher_is_better``, so this one clamps.
+    mask = _cartesian_mask()
+    tgt = _complex_img(1)
+    over = _partially_filled(mask, tgt, 1.7)
+    assert get_metric("null_band_energy_deficit")(
+        over, tgt, context=MetricContext(mask=mask)
+    ) == pytest.approx(0.0, abs=1e-6)
+    # ...and the owner of that direction does move.
+    assert get_metric("fabrication_excess")(over, tgt, context=MetricContext(mask=mask)) > 0.1
+
+
+def test_null_band_energy_deficit_sees_what_the_rest_of_the_battery_cannot():
+    """PLANTED: the experiment_11_attention_none failure shape, R=32.
+
+    A hard-DC reconstruction whose unacquired band is uniformly attenuated. Every
+    other trust functional reads healthy or uninformative on it -- which is how a
+    reconstruction carrying ~30% of the target's energy passed every gate on a
+    70000-iteration run (validation_metrics.csv, 2026-09-16).
+    """
+    mask = _cartesian_mask()
+    tgt = _complex_img(1)
+    pred = _partially_filled(mask, tgt, 0.3)
+    ctx = MetricContext(mask=mask, y_kspace=fft2c(tgt) * mask)
+
+    # ndcr: data consistency holds exactly, so the residual is at the floor.
+    assert get_metric("ndcr")(pred, context=ctx) < 1e-5
+    # nse_hall: ~1 whatever the null band's SIZE -- it reports where the error
+    # is, not how much was left out, so it is constant across the whole sweep.
+    assert get_metric("nse_hall")(pred, tgt, context=ctx) > 0.99
+    # eta_null moves, but downward -- it reads like LESS invented content, which
+    # is the opposite of an alarm.
+    assert get_metric("eta_null")(pred, context=ctx) < get_metric("eta_null")(tgt, context=ctx)
+    # Only the deficit names the failure, and names its size.
+    assert get_metric("null_band_energy_deficit")(pred, tgt, context=ctx) == pytest.approx(
+        0.7, abs=1e-5
+    )
+
+
+def test_null_band_energy_deficit_requires_mask_and_reference():
+    mask = _cartesian_mask()
+    tgt = _complex_img(1)
+    pred = _partially_filled(mask, tgt, 0.3)
+    m = get_metric("null_band_energy_deficit")
+    assert math.isnan(m(pred, None, context=MetricContext(mask=mask)))
+    assert math.isnan(m(pred, tgt, context=MetricContext()))
+
+
+def test_null_band_energy_deficit_is_nan_when_there_is_nothing_to_fill():
+    # A fully-sampled mask has an empty null band, so the ratio is 0/0. Reporting
+    # 0.0 there would be a measurement-independent constant dressed as a perfect
+    # score (pitfall #9) -- and 1.0 would be a false alarm.
+    m = get_metric("null_band_energy_deficit")
+    tgt = _complex_img(1)
+    full = torch.ones(1, 1, 32, 32)
+    assert math.isnan(m(tgt, tgt, context=MetricContext(mask=full)))
+
+    # The shape the guard is actually FOR, and the dangerous one: a null band
+    # that is not exactly empty, only negligible. 0/0 is NaN by IEEE and needs no
+    # guard, but dividing by ~1e-11 does not raise -- it makes the ratio enormous,
+    # so ``1 - ratio`` clamps to 0.0 and the metric reports a PERFECTLY FILLED
+    # band for a target that had nothing there to fill. Deleting the guard turns
+    # this red; deleting it and testing only the fully-sampled case above does not.
+    #
+    # The 1e-5 scale is load-bearing: a bandlimited target's null band is not
+    # zero but the float32 round-trip floor (~1e-6 relative), so at unit scale it
+    # sits ABOVE eps and the guard correctly stays out of the way. Scaling the
+    # whole target down moves the absolute null energy under eps while leaving
+    # the in-band signal intact.
+    mask = _cartesian_mask()
+    k = fft2c(_complex_img(1))
+    bandlimited = 1e-5 * ifft2c(k * mask)
+    pred = bandlimited + _band_error(mask, 7, in_null=True)
+    assert math.isnan(m(pred, bandlimited, context=MetricContext(mask=mask)))
+
+
+def test_null_band_energy_deficit_contract():
+    assert MetricsRegistry.is_registered("null_band_energy_deficit")
+    assert MetricsRegistry.requires_reference("null_band_energy_deficit") is True
+    assert MetricsRegistry.needs("null_band_energy_deficit") == ("mask",)
+    assert get_metric("null_band_energy_deficit").higher_is_better is False
+    assert get_metric("null_fill_deficit").name == "null_band_energy_deficit"

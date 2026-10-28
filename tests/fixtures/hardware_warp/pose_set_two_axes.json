@@ -1,0 +1,62 @@
+{
+  "unit_id": "hyperfine_swoop_lumc",
+  "software_version": "unknown",
+  "ball_radius_mm": 100.0,
+  "center_mm": [0.0, 0.0, 0.0],
+  "pairs": [
+    {
+      "subject_id": "sub-01",
+      "sessions": [
+        "ses-01",
+        "ses-02"
+      ],
+      "omega": [
+        0.0,
+        0.0,
+        0.05
+      ],
+      "translation": [
+        0.5,
+        -0.3,
+        0.2
+      ],
+      "residual_path": null
+    },
+    {
+      "subject_id": "sub-01",
+      "sessions": [
+        "ses-01",
+        "ses-03"
+      ],
+      "omega": [
+        0.043301,
+        0.0,
+        0.025
+      ],
+      "translation": [
+        -0.2,
+        0.4,
+        0.1
+      ],
+      "residual_path": null
+    },
+    {
+      "subject_id": "sub-02",
+      "sessions": [
+        "ses-01",
+        "ses-02"
+      ],
+      "omega": [
+        0.04,
+        0.0,
+        0.0
+      ],
+      "translation": [
+        0.1,
+        0.1,
+        -0.3
+      ],
+      "residual_path": null
+    }
+  ]
+}

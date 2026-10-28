@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from spectramr.config.schemas.physics import PhysicsConfigSchema
 from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.builders.context import BuilderContext
 from spectramr.infrastructure.training.builders.data_builder import DataBuilder
@@ -35,6 +36,8 @@ def mock_settings():
     settings.undersampling.base_acceleration = 1.0
     settings.undersampling.max_acceleration = 1.0
     settings.undersampling.center_fraction = 1.0
+    # Real defaults: a Mock `physics` would answer `apply_as_transform` truthy.
+    settings.physics = PhysicsConfigSchema()
     return settings
 
 
@@ -99,6 +102,21 @@ class TestDataBuilder:
         assert builder._loaders["train"] == mock_train
         assert builder._loaders["val"] == mock_val
         assert "test" not in builder._loaders
+
+    @patch(
+        "spectramr.infrastructure.builders.directors.data_pipeline_director.DataPipelineDirector"
+    )
+    def test_the_director_partition_stamp_is_kept_for_provenance(self, mock_director_cls, builder):
+        stamp = {"route": "config_owned", "subjects": {"train": ["01"], "val": ["02"], "test": []}}
+        mock_director = MagicMock()
+        mock_director.build_dataloaders.return_value = (MagicMock(), MagicMock())
+        mock_director.split_provenance = stamp
+        mock_director_cls.return_value = mock_director
+
+        builder.build_train_val_loaders()
+
+        assert builder.split_provenance == stamp
+        assert builder.split_provenance is not stamp
 
     @patch("spectramr.infrastructure.training.builders.data_builder.torch")
     @patch(
@@ -178,6 +196,67 @@ class TestDataBuilder:
 
         assert "inference" in builder._loaders
         assert isinstance(builder._loaders["inference"], torch.utils.data.DataLoader)
+
+    @patch("spectramr.infrastructure.training.builders.data_builder.Path")
+    @patch("spectramr.data.datasets.universal_dataset.UniversalMRIDataset")
+    def test_inference_loader_is_non_persistent_despite_the_schema_default(
+        self, mock_ds, mock_path, builder
+    ):
+        """A single-pass walk must not hold a worker pool (#194), even though
+        ``data.loader.persistent_workers`` now defaults to True."""
+        from spectramr.infrastructure.builders.leaf.data_builders import (
+            DataLoaderBuilder,
+        )
+
+        assert builder._config.data.loader.persistent_workers is True
+        mock_path.return_value.glob.return_value = [Path("test.nii.gz")]
+        seen: list[bool] = []
+        orig = DataLoaderBuilder.with_persistent_workers
+
+        def _spy(self_, persistent=True):
+            seen.append(persistent)
+            return orig(self_, persistent)
+
+        with (
+            patch("spectramr.data.builders.TorchIOTransformBuilder.build_val_transforms"),
+            patch("spectramr.data.collation.strategies.CollateStrategyFactory.create"),
+            patch.object(DataLoaderBuilder, "with_persistent_workers", _spy),
+        ):
+            builder.build_inference_loader(Path("/tmp/input"))
+
+        assert seen == [False]
+
+    @patch("spectramr.infrastructure.training.builders.data_builder.Path")
+    @patch("spectramr.infrastructure.training.builders.data_builder.ContrastAwarePairedDataset")
+    def test_contrast_aware_inference_admits_targetless_records(
+        self, mock_ds, mock_path, builder
+    ):
+        """Inference records have no target_path; a paired-only dataset raises on them."""
+        from types import SimpleNamespace
+
+        contrast = SimpleNamespace(
+            name="c", normalization="percentile", percentile=99.5, out_range=None,
+            clamp=False, keywords=[],
+        )
+        builder._config.data.dataset_type = "contrast_aware_paired"
+        builder._config.data.input_contrast = contrast
+        builder._config.data.target_contrast = contrast
+        mock_path.return_value.glob.return_value = [Path("test.nii.gz")]
+        with (
+            patch("spectramr.data.builders.TorchIOTransformBuilder.build_val_transforms"),
+            patch("spectramr.data.collation.strategies.CollateStrategyFactory.create"),
+            patch("spectramr.infrastructure.training.builders.data_builder.ContrastConfig"),
+        ):
+            builder.build_inference_loader(Path("/tmp/input"))
+        assert mock_ds.call_args.kwargs["allow_unpaired"] is True
+
+    @patch("spectramr.infrastructure.training.builders.data_builder.Path")
+    def test_inference_refuses_the_digital_twin_transform(self, mock_path, builder):
+        """The twin sits in the val chain; on real acquisitions it would degrade them."""
+        mock_path.return_value.glob.return_value = [Path("test.nii.gz")]
+        builder._config.physics = PhysicsConfigSchema(digital_twin={"apply_as_transform": True})
+        with pytest.raises(ValueError, match="apply_as_transform"):
+            builder.build_inference_loader(Path("/tmp/input"))
 
     def test_build_inference_loader_no_files(self, builder):
         """Test error when no NIfTI files found."""
@@ -320,7 +399,7 @@ class TestLoaderConstructionRoutesThroughTheLeafBuilder:
         assert 'CollateStrategyFactory.create("image")' in src
         assert ".with_collate_fn(collate_strategy.collate)" in src
 
-    def test_inference_loader_reads_prefetch_and_persistent_from_config(self) -> None:
+    def test_inference_loader_reads_prefetch_from_config_and_is_never_persistent(self) -> None:
         """#194: both were hardcoded (2 / True) past the schema fields that exist
         to set them.
 
@@ -341,7 +420,7 @@ class TestLoaderConstructionRoutesThroughTheLeafBuilder:
         )
 
         assert ".with_prefetch_factor(data_config.loader.prefetch_factor)" in code
-        assert ".with_persistent_workers(data_config.loader.persistent_workers)" in code
+        assert ".with_persistent_workers(False)" in code
         assert "prefetch_factor=2" not in code
         assert "persistent_workers=True" not in code
 
@@ -437,3 +516,20 @@ class TestMultiDomainRouting:
         assert "multi" in _run(True)
         off = _run(False)
         assert "multi" not in off and "single" in off
+
+
+def test_the_test_loader_batch_size_is_owned_by_the_test_split(monkeypatch):
+    """The data builder passes no batch size: the validation one would make rows batch means."""
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.builders.directors import test_split
+    from spectramr.infrastructure.training.builders.data_builder import DataBuilder
+
+    seen = {}
+    monkeypatch.setattr(test_split, "declares_test_set", lambda cfg: True)
+    monkeypatch.setattr(test_split, "build_test_loader", lambda cfg, **kw: seen.update(kw) or "t")
+    builder = DataBuilder.__new__(DataBuilder)
+    builder._config = SimpleNamespace(data=SimpleNamespace(loader=SimpleNamespace(num_workers=2)))
+    builder._loaders = {}
+    builder.build_test_loader()
+    assert builder._loaders["test"] == "t" and "val_batch_size" not in seen

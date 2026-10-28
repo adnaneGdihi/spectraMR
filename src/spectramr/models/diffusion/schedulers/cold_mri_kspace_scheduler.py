@@ -8,7 +8,6 @@ Adapted to use KSpaceAccelerator for mask generation.
 
 import numpy as np
 import torch
-import torch.fft
 
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.infrastructure.physics.sampling import KSpaceAccelerator

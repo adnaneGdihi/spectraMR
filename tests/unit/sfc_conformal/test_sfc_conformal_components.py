@@ -151,6 +151,9 @@ def test_adaptive_sfc_hssc_strategy_smoke() -> None:
     # Manually mirror init side-effects we need.
     from spectramr.models.blocks.space_filling_curves import BeltramiSFCBlock
     strat.sfc = BeltramiSFCBlock(grid_size=16, in_channels=1)
+    # What register_owned_module records in __init__ (the call_owned lookup reads it).
+    strat._owned_modules = {"sfc": strat.sfc}
+    strat._owned_wrappers = {}
     strat.lambda_mu = 0.01
     strat.lambda_traj = 0.01
     x = torch.randn(1, 1, 32, 32)
@@ -212,6 +215,8 @@ def test_beltrami_motion_correction_strategy_smoke() -> None:
     strat.mu_head = nn.Sequential(
         nn.Conv2d(1, 8, 3, padding=1), nn.GELU(), nn.Conv2d(8, 2, 3, padding=1)
     )
+    strat._owned_modules = {"mu_head": strat.mu_head}
+    strat._owned_wrappers = {}
     x = torch.randn(1, 1, 32, 32)
     out = strat._compute_losses_impl(x, x, epoch=0)
     assert torch.isfinite(out["g_total_loss"])

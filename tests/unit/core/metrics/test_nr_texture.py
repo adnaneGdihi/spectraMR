@@ -20,7 +20,7 @@ import math
 
 import pytest
 import torch
-import torch.nn.functional as F  # noqa: N812 - universal PyTorch idiom
+import torch.nn.functional as F
 
 from spectramr.core.metrics.context import MetricContext
 from spectramr.core.metrics.registry import MetricsRegistry, get_metric

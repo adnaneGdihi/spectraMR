@@ -100,8 +100,8 @@ class TestTheThreeStatesAreDistinguishable:
         assert isinstance(result, list)
 
     def test_a_discarded_key_is_reported_with_its_block(self, census, tmp_path) -> None:
-        """`checkpoint.save_dir` is a real phantom: `CheckpointConfigSchema` is
-        `extra="ignore"` and has no such field, so the declaration is dropped."""
+        """A key `CheckpointConfigSchema` does not declare is dropped: the block is
+        `extra="ignore"`, so the declaration never reaches the run."""
         arm = _reference_plus_phantom_key(tmp_path)
         result = census.discarded_keys(arm)
         assert result is not None, "fixture must still load; only the key is bogus"

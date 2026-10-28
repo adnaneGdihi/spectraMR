@@ -415,3 +415,40 @@ class TestValidateNansKnob:
         batch = [{"x": torch.tensor([float("nan")])}]
         with pytest.raises(ValueError, match="non-finite"):
             strategy.collate(batch)
+
+
+class TestSelectedStrategiesCanBeBuilt:
+    """What the selector hands the factory must be what the class accepts.
+
+    The selector tests stopped at the kwargs, and the strategy tests built the classes
+    by hand, so the pairing in between was never run: every slab arm raised
+    ``got multiple values for keyword argument 'allow_variable_shapes'`` at loader build.
+    """
+
+    @pytest.mark.parametrize(
+        ("slab_mode", "expected"), [(False, "ImageCollateStrategy"), (True, "SlabCollateStrategy")]
+    )
+    def test_the_strategy_selected_for_a_2d_patch_is_constructible(self, slab_mode, expected):
+        from spectramr.data.collation.strategies import CollateStrategyFactory
+
+        name, kwargs = CollationStrategySelector.select_strategy(
+            config=CollationConfigSchema(),
+            dataset_type="m4raw",
+            enable_slab_mode=slab_mode,
+            patch_size=(256, 256, 1),
+        )
+        assert type(CollateStrategyFactory.create(name, **kwargs)).__name__ == expected
+
+    def test_slab_refuses_variable_shapes_it_does_not_implement(self):
+        config = CollationConfigSchema(strategy="slab", allow_variable_shapes=True)
+        with pytest.raises(ValueError, match="allow_variable_shapes"):
+            CollationStrategySelector.select_strategy(
+                config=config, dataset_type="nifti", patch_size=(64, 64, 5)
+            )
+
+    def test_slab_refuses_a_depth_squeeze_it_does_not_implement(self):
+        config = CollationConfigSchema(strategy="slab", squeeze_depth_dim=True)
+        with pytest.raises(ValueError, match="squeeze_depth_dim"):
+            CollationStrategySelector.select_strategy(
+                config=config, dataset_type="nifti", patch_size=(64, 64, 5)
+            )

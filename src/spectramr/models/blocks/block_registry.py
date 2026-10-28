@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 # Import convolutional blocks for U-Net strategies
@@ -511,18 +512,12 @@ class DiffusionAttentionStrategy(IBlockStrategy):
         qkv = self.qkv(h)
         q, k, v = qkv.chunk(3, dim=1)
 
-        # Reshape for attention
-        q = q.view(B, C, H * W).transpose(1, 2)
-        k = k.view(B, C, H * W)
-        v = v.view(B, C, H * W).transpose(1, 2)
-
-        # Attention
-        scale = C**-0.5
-        attn = torch.softmax(torch.bmm(q, k) * scale, dim=-1)
-        h = torch.bmm(attn, v)
-
-        # Reshape back
-        h = h.transpose(1, 2).reshape(B, C, H, W)
+        # Single-head SDPA over H*W tokens; default scale is C**-0.5.
+        q = q.reshape(B, C, H * W).transpose(1, 2).unsqueeze(1)
+        k = k.reshape(B, C, H * W).transpose(1, 2).unsqueeze(1)
+        v = v.reshape(B, C, H * W).transpose(1, 2).unsqueeze(1)
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.squeeze(1).transpose(1, 2).reshape(B, C, H, W)
         h = self.proj(h)
 
         return x + h

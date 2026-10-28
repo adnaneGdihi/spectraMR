@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.core.metrics.b0_field_rmse import B0FieldRMSE
@@ -43,6 +43,11 @@ from spectramr.models.capabilities import StrategyCapabilities
 
 class MultiEchoB0FitStrategy(BaseTrainingStrategy):
     """Physics-in-the-loop multi-echo B0 field fit (the real B0 estimator)."""
+
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     #: Quantitative MRI: the differentiable b0_mapping fit (phase difference +
     #: Tikhonov CG) is a real layer in the training loop and yields the claimed

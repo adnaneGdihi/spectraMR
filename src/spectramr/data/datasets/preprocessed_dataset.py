@@ -21,7 +21,7 @@ import torch
 import torchio as tio
 
 from spectramr.data.builders.torchio_subject_builder import PreprocessedSubjectBuilder
-from spectramr.data.split_utils import split_index
+from spectramr.data.split_utils import record_split_key, split_index_grouped
 
 logger = logging.getLogger(__name__)
 
@@ -630,7 +630,9 @@ class PreprocessedMRIDataset(torch.utils.data.Dataset):
         """
         if split not in ("train", "val"):
             raise ValueError(f"Unknown split value: {split!r}. Expected 'train' or 'val'.")
-        train_samples, val_samples = split_index(samples, validation_split)
+        train_samples, val_samples = split_index_grouped(
+            samples, validation_split, key=record_split_key
+        )
         return val_samples if split == "val" else train_samples
 
     def __len__(self) -> int:

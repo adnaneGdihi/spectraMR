@@ -254,9 +254,51 @@ def test_build_dataloaders_forwards_num_workers_to_train_queue(
         ),
     ):
         director = DataPipelineDirector(settings)
-        director.build_dataloaders(num_workers=7, pin_memory=False)
+        director.build_dataloaders(num_workers=2, pin_memory=False)
 
-    assert captured["queue_config"].num_workers == 7
+    # 2 is below the default (4) and below any share the reserve leaves, so it
+    # distinguishes the forwarded value from a re-read of the config.
+    assert captured["queue_config"].num_workers == 2
+
+
+
+def test_the_digital_twin_flag_reaches_both_chains(tmp_path) -> None:
+    """``physics`` is a run-level block. The director handed the transform builder a
+    data-only proxy, so ``physics.digital_twin.apply_as_transform`` was never read."""
+    from unittest.mock import patch
+
+    from spectramr.data.builders.dataset_instantiator import DatasetInstantiator
+    from spectramr.data.transforms.tio_physics import DigitalTwinDegradation
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        textwrap.dedent("""
+        config_version: '1.0'
+        model: {model_type: standard_unet, in_channels: 1, out_channels: 1}
+        training: {training_mode: reconstruction, epochs: 1}
+        optimization: {optimizer_type: adam, learning_rate: 0.001}
+        logging: {log_dir: /tmp/logs, tensorboard_enabled: false}
+        physics:
+          field_strength: 0.3
+          digital_twin: {apply_as_transform: true}
+        data: {dataset_type: synthetic, patch_size: [32, 32, 1], batch_size: 2}
+        """)
+    )
+    st = TrainingSettings.from_yaml(str(config_file))
+    chains: dict = {}
+
+    def _capture(_data, _train_idx, _val_idx, train_tf, val_tf, **_kw):
+        chains.update(train=train_tf, val=val_tf)
+        raise StopIteration
+
+    with (
+        patch.object(DatasetInstantiator, "create_datasets", staticmethod(_capture)),
+        pytest.raises(StopIteration),
+    ):
+        DataPipelineDirector(st).build_dataloaders(num_workers=0, pin_memory=False)
+
+    for name, chain in chains.items():
+        assert any(isinstance(t, DigitalTwinDegradation) for t in chain.transforms), name
 
 
 # ── F4 (smoke 2026-06-16): oracle_bssfp must self-index, not load_fastmri_splits ─
@@ -426,8 +468,8 @@ def test_mrixfields_bypasses_tio_queue(tmp_path) -> None:
                 "file_id": f"s1_{f}",
                 "field_strength": f,
                 "contrast": "T1w",
-                "subject_id": "s1",
-                "pairing_group": "s1|T1w",
+                "subject_id": f"s1_{f}",
+                "pairing_group": f"s1_{f}|T1w",
             }
             for f in (0.1, 3.0, 7.0)
         ],
@@ -504,8 +546,8 @@ def test_validation_loader_uses_no_worker_fanout(tmp_path) -> None:
                 "file_id": f"s1_{f}",
                 "field_strength": f,
                 "contrast": "T1w",
-                "subject_id": "s1",
-                "pairing_group": "s1|T1w",
+                "subject_id": f"s1_{f}",
+                "pairing_group": f"s1_{f}|T1w",
             }
             for f in (0.1, 3.0, 7.0)
         ],
@@ -653,7 +695,8 @@ class TestBuildDataloadersKnobs:
         import inspect
 
         src = inspect.getsource(DataPipelineDirector.build_dataloaders)
-        assert src.count(".with_persistent_workers(_persistent)") == 4
+        assert src.count(".with_persistent_workers(_persistent_train)") == 2
+        assert src.count(".with_persistent_workers(_persistent_val)") == 2
         assert src.count(".with_prefetch_factor(_prefetch)") == 4
         # Resolution reads each knob off the CANONICAL sub-block and coerces
         # the worker count to a concrete int (never None) before it reaches the
@@ -675,6 +718,7 @@ class TestBuildDataloadersKnobs:
         ):
             assert (
                 f'data_config.loader, "{knob}"' in src
+                or f"data_config.loader.{knob}" in src
             ), f"{knob} is no longer read off data_config.loader"
         assert "num_workers = int(num_workers or 0)" in src
 
@@ -1472,11 +1516,12 @@ class TestWorkerClampAtTheDirectorChokePoint:
         # The exact shape of the reported slowdown: 4 GPUs, --cpus-per-task=16,
         # the arm declaring num_workers: 8. 32 decoders on 16 cores becomes 4
         # decoders per rank -- 16 total, which is what the node actually has.
+        # The default reserve of 2 cores per rank for the main process leaves 2.
         topology = self._topology(world_size=4, local_world_size=4, cpus=16.0)
         _director, queue_config = self._run(
             settings, topology, monkeypatch, num_workers=8
         )
-        assert queue_config.num_workers == 4
+        assert queue_config.num_workers == 2
 
     def test_single_gpu_is_byte_identical(
         self, settings: TrainingSettings, monkeypatch
@@ -1538,7 +1583,143 @@ class TestWorkerClampAtTheDirectorChokePoint:
         )
         train = director.worker_decisions["train"]
         assert train["declared"] == 8
-        assert train["workers"] == 4
+        assert train["workers"] == 2
+        assert train["reserved_cores"] == 2
         assert train["clamped"] is True
         # Validation defaults to 0 and must not be clamped into existence.
         assert director.worker_decisions["val"]["workers"] == 0
+
+
+def _build_default_loaders(
+    tmp_path, monkeypatch, *, persistent_yaml="", cpus=16.0, **build_kwargs
+):
+    """Build loaders; ``persistent_yaml`` is an optional extra ``data:`` line."""
+    import json
+    import textwrap
+    from unittest.mock import patch
+
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from spectramr.core.topology import RunTopology
+    from spectramr.data.builders.dataset_instantiator import DatasetInstantiator
+    from spectramr.infrastructure.builders.directors import (
+        data_pipeline_director as dpd,
+    )
+
+    topology = RunTopology(
+        execution_mode="slurm",
+        world_size=1,
+        local_world_size=1,
+        num_nodes=1,
+        rank=0,
+        local_rank=0,
+        cpus_on_node=cpus,
+    )
+    monkeypatch.setattr(dpd, "resolve_run_topology", lambda: topology)
+    manifest = {
+        "data_root": "",
+        "records": [
+            {
+                "path": f"s1_{f}.nii",
+                "file_id": f"s1_{f}",
+                "field_strength": f,
+                "contrast": "T1w",
+                "subject_id": f"s1_{f}",
+                "pairing_group": f"s1_{f}|T1w",
+            }
+            for f in (0.1, 3.0, 7.0)
+        ],
+    }
+    mpath = tmp_path / "m.json"
+    mpath.write_text(json.dumps(manifest))
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(textwrap.dedent(f"""
+        config_version: '1.0'
+        model: {{model_type: standard_unet, in_channels: 1, out_channels: 1}}
+        training: {{training_mode: reconstruction, epochs: 1}}
+        optimization: {{optimizer_type: adam, learning_rate: 0.001}}
+        logging: {{log_dir: /tmp/logs, tensorboard_enabled: false}}
+        data:
+          dataset_type: mrixfields
+          index_path: {mpath}
+          patch_size: [32, 32, 1]
+          batch_size: 2
+          num_workers: 2
+          {persistent_yaml}
+          mrixfields:
+            pairing_policy: multi_source
+            target_field: 7.0
+        """))
+    st = TrainingSettings.from_yaml(str(cfg_file))
+    dummy = TensorDataset(torch.zeros(4, 1, 8, 8))
+    with patch.object(
+        DatasetInstantiator, "create_datasets", staticmethod(lambda *a, **k: (dummy, dummy))
+    ):
+        return DataPipelineDirector(st).build_dataloaders(**build_kwargs)
+
+
+def test_persistent_workers_default_on_for_train_off_for_serial_val(
+    tmp_path, monkeypatch
+) -> None:
+    # Default flipped to True; the val loader loads in the main process (0 workers),
+    # where torch raises on persistent_workers=True, so only train keeps it.
+    train_loader, val_loader = _build_default_loaders(tmp_path, monkeypatch)
+    assert train_loader.num_workers == 2 and train_loader.persistent_workers is True
+    assert val_loader.num_workers == 0 and val_loader.persistent_workers is False
+
+
+def test_reserved_cores_is_recorded_in_worker_decisions(tmp_path, monkeypatch) -> None:
+    from spectramr.infrastructure.builders.directors import (
+        data_pipeline_director as dpd,
+    )
+
+    captured = {}
+    orig = dpd.DataPipelineDirector.build_dataloaders
+
+    def spy(self, *a, **k):
+        out = orig(self, *a, **k)
+        captured["d"] = self.worker_decisions
+        return out
+
+    monkeypatch.setattr(dpd.DataPipelineDirector, "build_dataloaders", spy)
+    _build_default_loaders(tmp_path, monkeypatch)
+    assert captured["d"]["train"]["reserved_cores"] == 2
+    # the value actually handed to the DataLoader, not the declared knob
+    assert captured["d"]["train"]["persistent"] is True
+    assert captured["d"]["val"]["persistent"] is False
+
+
+def test_explicit_persistent_true_still_leaves_a_serial_val_loader_non_persistent(
+    tmp_path, monkeypatch
+) -> None:
+    train_loader, val_loader = _build_default_loaders(
+        tmp_path, monkeypatch, persistent_yaml="persistent_workers: true"
+    )
+    assert train_loader.persistent_workers is True
+    assert val_loader.num_workers == 0 and val_loader.persistent_workers is False
+
+
+def test_explicit_persistent_false_wins_over_the_new_default(
+    tmp_path, monkeypatch
+) -> None:
+    train_loader, _ = _build_default_loaders(
+        tmp_path, monkeypatch, persistent_yaml="persistent_workers: false"
+    )
+    assert train_loader.num_workers == 2 and train_loader.persistent_workers is False
+
+
+def test_single_pass_caller_can_turn_persistence_off(tmp_path, monkeypatch) -> None:
+    train_loader, _ = _build_default_loaders(
+        tmp_path, monkeypatch, persistent_workers=False
+    )
+    assert train_loader.num_workers == 2 and train_loader.persistent_workers is False
+
+
+def test_two_cpu_single_rank_still_keeps_one_train_worker(
+    tmp_path, monkeypatch
+) -> None:
+    # share 2 - reserve 2 would be 0; the floor of 1 keeps the declared-positive
+    # count from collapsing to a serial loader.
+    train_loader, _ = _build_default_loaders(tmp_path, monkeypatch, cpus=2.0)
+    assert train_loader.num_workers == 1 and train_loader.persistent_workers is True

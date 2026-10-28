@@ -19,6 +19,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from torch import Tensor, nn
 
@@ -31,7 +32,7 @@ class IMetricsAwareLoss(ABC):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{IMetricsAwareLoss} = \text{abstract}"""
+        \\mathcal{L}_{IMetricsAwareLoss} = \\text{abstract}"""
 
     @abstractmethod
     def compute_metrics(
@@ -39,7 +40,7 @@ class IMetricsAwareLoss(ABC):
         pred: Tensor,
         target: Tensor,
         loss_value: Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute metrics from prediction and target tensors.
 
@@ -59,7 +60,7 @@ class IMetricsAwareLoss(ABC):
         self,
         pred: Tensor,
         target: Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute loss and metrics simultaneously.
 
@@ -97,7 +98,7 @@ class MetricsAwareLossMixin(IMetricsAwareLoss):
         pred: Tensor,
         target: Tensor,
         loss_value: Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Default metrics computation.
 
@@ -126,7 +127,7 @@ class MetricsAwareLossMixin(IMetricsAwareLoss):
         self,
         pred: Tensor,
         target: Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute loss and metrics.
 
@@ -138,14 +139,11 @@ class MetricsAwareLossMixin(IMetricsAwareLoss):
         Returns:
             Tuple of (loss_value, metrics_dict)
         """
-        # Compute loss
-        result = self.forward(pred, target, **kwargs)  # type: ignore
+        # The mixin is only ever combined with an nn.Module, which supplies forward.
+        result = self.forward(pred, target, **kwargs)  # type: ignore[attr-defined]
 
-        # Handle case where forward returns tuple (when compute_metrics=True)
-        if isinstance(result, tuple):
-            loss_value = result[0]
-        else:
-            loss_value = result
+        # forward returns (loss, metrics) when the loss was built with compute_metrics=True.
+        loss_value: Tensor = result[0] if isinstance(result, tuple) else result
 
         # Compute metrics
         metrics = self.compute_metrics(pred, target, loss_value, **kwargs)
@@ -220,10 +218,14 @@ def add_metrics_to_loss(loss_fn: nn.Module) -> nn.Module:
     if isinstance(loss_fn, MetricsAwareLossMixin):
         return loss_fn  # Already has metrics support
 
-    class WrappedLoss(MetricsAwareLossMixin, loss_fn.__class__):
+    base_cls: type[nn.Module] = type(loss_fn)
+
+    class WrappedLoss(MetricsAwareLossMixin, base_cls):  # type: ignore[valid-type,misc]
         """Wrapped loss with metrics support."""
 
-        def compute_metrics(self, pred, target, loss_value, **kwargs):
+        def compute_metrics(
+            self, pred: Tensor, target: Tensor, loss_value: Tensor, **kwargs: Any
+        ) -> dict[str, float]:
             """Default metrics for wrapped loss."""
             return {
                 "loss": (
@@ -235,8 +237,10 @@ def add_metrics_to_loss(loss_fn: nn.Module) -> nn.Module:
                 "target_std": target.std().item(),
             }
 
-    # Copy state from original to wrapped
-    wrapped = WrappedLoss(*([getattr(loss_fn, attr, None) for attr in loss_fn.__dict__]))
+    # ``__dict__`` carries the whole module state (parameters, buffers, hooks and the
+    # loss's own attributes), so the instance is made without calling ``__init__``,
+    # whose arguments this wrapper cannot know.
+    wrapped: nn.Module = WrappedLoss.__new__(WrappedLoss)
     wrapped.__dict__.update(loss_fn.__dict__)
 
     return wrapped

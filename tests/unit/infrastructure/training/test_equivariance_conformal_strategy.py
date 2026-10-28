@@ -146,7 +146,6 @@ def _make_bare_strategy(cfg, device="cpu"):
 def test_strategy_run_calibration_writes_artefact(tmp_path):
     out = tmp_path / "q.json"
     cfg = EquivarianceConformalConfig(
-        pretrained_reconstructor_checkpoint="unused.ckpt",
         num_rotations_K=4,
         group="SO2",
         alpha=0.1,
@@ -172,7 +171,7 @@ def test_strategy_run_calibration_requires_block():
 
 
 def test_strategy_train_step_is_noop():
-    cfg = EquivarianceConformalConfig(pretrained_reconstructor_checkpoint="x.ckpt")
+    cfg = EquivarianceConformalConfig()
     strat = _make_bare_strategy(cfg)
     out = strat.train_step(batch=torch.randn(1, 1, 8, 8))
     # train_step returns an EMPTY step-config list (no optimizer steps); the
@@ -183,7 +182,7 @@ def test_strategy_train_step_is_noop():
 
 
 def test_strategy_compute_losses_zero():
-    cfg = EquivarianceConformalConfig(pretrained_reconstructor_checkpoint="x.ckpt")
+    cfg = EquivarianceConformalConfig()
     strat = _make_bare_strategy(cfg)
     x = torch.randn(1, 1, 8, 8)
     losses = strat._compute_losses_impl(x, x, epoch=0)
@@ -191,7 +190,7 @@ def test_strategy_compute_losses_zero():
 
 
 def test_frozen_reconstructor_detaches_and_freezes():
-    cfg = EquivarianceConformalConfig(pretrained_reconstructor_checkpoint="x.ckpt")
+    cfg = EquivarianceConformalConfig()
     strat = _make_bare_strategy(cfg)
     lin = torch.nn.Conv2d(1, 1, 3, padding=1)
     strat.context = types.SimpleNamespace(generator=lin)
@@ -214,7 +213,6 @@ def test_setup_coerces_raw_dict_block_to_typed_config():
         "alpha": 0.1,
         "num_rotations_K": 16,
         "group": "SO2",
-        "pretrained_reconstructor_checkpoint": "x.ckpt",
         "output_artefact": "out.json",
     }
     strat.config = types.SimpleNamespace(

@@ -179,7 +179,6 @@ class TestNameAliases:
             ("step", "step_lr"),
             ("step_lr", "step_lr"),
             ("linear_decay", "linear"),
-            ("plateau", "reduce_on_plateau"),
             ("cosine_annealing_warm_restarts", "cosine_annealing_warm_restarts"),
         ],
     )
@@ -212,6 +211,29 @@ class TestNameAliases:
         assert spec.name == expected
         assert spec.warmup_steps == 50
 
+    @pytest.mark.parametrize("declared", ["plateau", "reduce_on_plateau", "reduce_lr_on_plateau"])
+    def test_the_plateau_scheduler_is_rejected_with_its_reason(self, declared):
+        """It was built and never stepped with a metric, so it held the LR (#2301)."""
+        with pytest.raises(ConfigurationError, match="#2301"):
+            resolve_scheduler_spec(_opt(lr_scheduler_strategy=declared, scheduler={}), 1000)
+
+    def test_no_registered_scheduler_needs_a_metric(self):
+        """The loop steps every scheduler with no argument; a metric-driven one
+        can only be added together with the validation-time call that feeds it."""
+        import inspect
+
+        from spectramr.infrastructure.training.scheduler_system import SCHEDULER_REGISTRY
+
+        p = [torch.nn.Parameter(torch.zeros(1))]
+        for name, factory in SCHEDULER_REGISTRY.items():
+            sched = factory(torch.optim.SGD(p, lr=0.1), {})
+            required = [
+                a
+                for a in inspect.signature(sched.step).parameters.values()
+                if a.default is inspect.Parameter.empty and a.kind is a.POSITIONAL_OR_KEYWORD
+            ]
+            assert not required, f"{name}.step requires {required}"
+
     def test_every_registry_name_has_a_param_key_set(self):
         """A factory with no declared param set cannot be validated."""
         from spectramr.infrastructure.training.scheduler_system import SCHEDULER_REGISTRY
@@ -242,12 +264,16 @@ class TestBuiltSchedulerBehaviour:
 
     def test_cosine_anneals_monotonically_over_the_run(self):
         spec = resolve_scheduler_spec(
-            _opt(scheduler={"type": "cosine", "eta_min": 1e-6}), max_iterations=4000
+            _opt(
+                scheduler={"type": "cosine", "eta_min": 1e-6},
+                gradient={"accumulation_steps": 2},
+            ),
+            max_iterations=4000,
         )
         trace = self._lr_trace(spec, iters=4000, accum=2)
-        # T_max == max_iterations, stepped once per 2 iters -> half a cosine.
+        # One full cosine over the run's 2000 optimizer steps.
         assert trace[0] > trace[-1]
-        assert trace[-1] == pytest.approx(2.35e-5, rel=0.2)
+        assert trace[-1] == pytest.approx(1e-6, rel=0.01)
         # and it must never come back up (the oscillation signature)
         assert all(b <= a + 1e-12 for a, b in pairwise(trace))
 
@@ -289,6 +315,88 @@ class TestBuiltSchedulerBehaviour:
         trace = self._lr_trace(spec, iters=400, accum=1)
         assert trace[0] == pytest.approx(1e-7, rel=0.5)
         assert trace[99] > trace[0]
+
+
+class TestDefaultPeriodIsTheRunInSchedulerSteps:
+    """The default period counts the steps the main scheduler actually takes.
+
+    The loop steps schedulers once per optimizer step, and a warmup wrapper
+    holds the main scheduler for its first ``warmup_steps``. A period of
+    ``max_iterations`` micro-batches left the 11 ``accumulation_steps: 4``
+    arms at 85 % of their base LR when the run ended, and ``max_iterations:
+    -1`` (epoch-bounded) produced ``T_max=-1``.
+    """
+
+    def test_period_counts_optimizer_steps_under_accumulation(self):
+        spec = resolve_scheduler_spec(
+            _opt(lr_scheduler_strategy="cosine", gradient={"accumulation_steps": 4}),
+            max_iterations=100_000,
+        )
+        assert spec.params["T_max"] == 25_000
+
+    def test_period_excludes_the_warmup(self):
+        spec = resolve_scheduler_spec(
+            _opt(scheduler={"type": "cosine", "warmup_steps": 100}),
+            max_iterations=1000,
+        )
+        assert spec.params["T_max"] == 900
+
+    def test_linear_total_iters_uses_the_same_run_length(self):
+        spec = resolve_scheduler_spec(
+            _opt(
+                lr_scheduler_strategy="linear_decay",
+                gradient={"accumulation_steps": 2},
+                warmup_steps=50,
+            ),
+            max_iterations=1000,
+        )
+        assert spec.params["total_iters"] == 450
+
+    def test_accumulated_run_ends_annealed(self):
+        """The observable the defect broke: the LR at the end of the run."""
+        from spectramr.infrastructure.training.scheduler_resolution import (
+            build_scheduler_from_spec,
+        )
+
+        spec = resolve_scheduler_spec(
+            _opt(
+                lr_scheduler_strategy="cosine",
+                scheduler={"eta_min": 1e-6},
+                gradient={"accumulation_steps": 4},
+            ),
+            max_iterations=4000,
+        )
+        p = torch.nn.Parameter(torch.zeros(1))
+        opt = torch.optim.AdamW([p], lr=1e-4)
+        sched = build_scheduler_from_spec(spec, opt)
+        for it in range(4000):
+            opt.step()
+            if (it + 1) % 4 == 0:
+                sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-6, rel=1e-3)
+
+    @pytest.mark.parametrize("max_iterations", [-1, 0])
+    def test_epoch_bounded_run_needs_a_declared_period(self, max_iterations):
+        with pytest.raises(ConfigurationError, match="T_max"):
+            resolve_scheduler_spec(
+                _opt(scheduler={"warmup_steps": 1000}), max_iterations=max_iterations
+            )
+
+    def test_declared_period_is_honoured_on_an_epoch_bounded_run(self):
+        spec = resolve_scheduler_spec(
+            _opt(scheduler={"type": "cosine", "T_max": 5000}), max_iterations=-1
+        )
+        assert spec.params["T_max"] == 5000
+
+    def test_warmup_that_consumes_the_run_raises(self):
+        with pytest.raises(ConfigurationError, match="no optimizer steps"):
+            resolve_scheduler_spec(
+                _opt(
+                    scheduler={"type": "cosine", "warmup_steps": 300},
+                    gradient={"accumulation_steps": 4},
+                ),
+                max_iterations=1000,
+            )
 
 
 class TestDeclaredStrategyWithoutSchedulerBlock:
@@ -336,7 +444,10 @@ class TestDeclaredStrategyWithoutSchedulerBlock:
         from types import SimpleNamespace
 
         stub = SimpleNamespace(
-            scheduler=None, lr_scheduler_strategy="cosine", scheduler_type=None
+            scheduler=None,
+            lr_scheduler_strategy="cosine",
+            scheduler_type=None,
+            gradient=SimpleNamespace(accumulation_steps=1),
         )
         spec = resolve_scheduler_spec(stub, max_iterations=500)
         assert spec is not None and spec.name == "cosine_annealing"
@@ -394,3 +505,30 @@ class TestWarmupBearingAliases:
         )
         assert spec.name == "constant"
         assert spec.warmup_steps == 10_000
+
+
+class TestResolvedScheduleRecord:
+    """The one record of the built schedule, stamped by provenance and the dump (#2760)."""
+
+    @staticmethod
+    def _config(opt: OptimizationConfigSchema) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(optimization=opt, training=SimpleNamespace(max_iterations=100))
+
+    def test_an_undeclared_scheduler_records_none_despite_the_default(self):
+        from spectramr.infrastructure.training.scheduler_resolution import (
+            resolved_schedule_record,
+        )
+
+        opt = _opt()
+        assert opt.lr_scheduler_strategy == "cosine", "precondition: the default is set"
+        assert resolved_schedule_record(self._config(opt)) == {"scheduler": None}
+
+    def test_a_declared_scheduler_is_recorded_as_built(self):
+        from spectramr.infrastructure.training.scheduler_resolution import (
+            resolved_schedule_record,
+        )
+
+        record = resolved_schedule_record(self._config(_opt(lr_scheduler_strategy="cosine")))
+        assert record == {"scheduler": "cosine_annealing", "T_max": 100}

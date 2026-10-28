@@ -92,9 +92,21 @@ def test_edm_still_returns_its_loss() -> None:
     s = _bare(recorder)
     clean = torch.randn(2, 1, 8, 8)
 
-    losses = s._compute_losses_impl(
-        input_batch={"target": clean}, target_batch=clean, epoch=0
-    )
+    losses = s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean, epoch=0)
 
     assert "loss_total" in losses and "loss_edm" in losses
     assert torch.isfinite(losses["loss_total"])
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: EDM score matching computes no image loss and routes nowhere.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert EDMTrainingStrategy.__dict__["folds_image_losses"] is False
+    assert EDMTrainingStrategy.__dict__["inline_losses"] == frozenset()

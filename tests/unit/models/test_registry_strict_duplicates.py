@@ -128,20 +128,22 @@ class _CapModel(nn.Module):
     pass
 
 
-def test_model_registry_rejects_capability_downgrade() -> None:
-    """A same-class re-registration with EMPTY caps must not clobber declared
-    caps (a bare ``register_model(name, mode)(Cls)`` after a decorator with
-    full ``ModelCapabilities`` silently disabled the audit checks)."""
-    register_model(
-        name="_test_caps_downgrade",
-        training_mode="reconstruction",
-        output_domain="kspace",
-        spatial_dims=(2,),
-    )(_CapModel)
-    with pytest.raises(ValueError, match="EMPTY capabilities"):
-        register_model(name="_test_caps_downgrade", training_mode="reconstruction")(
-            _CapModel
-        )
+# ``test_model_registry_rejects_capability_downgrade`` lived here and has been
+# DELETED, not repaired (NN17: one owner per invariant, and the loser's
+# enforcement goes).
+#
+# It asserted the bare-re-registration shape with ``match="EMPTY capabilities"``.
+# The guard was later widened to refuse any re-registration that drops a
+# declared capability, and its message became "... would DROP already-declared
+# [...]" — so this test failed on the WORDING while the behaviour it cared about
+# was intact, which is the failure mode ``pin-the-api-name-not-the-prose`` warns
+# about. Re-pinning it would have left two prose-pinned owners of one guard.
+#
+# Elected owner: ``tests/unit/models/test_registry_helpers.py``
+# ``TestReRegistrationRefusesADowngrade::test_total_downgrade_still_raises`` —
+# same shape, pinned on the stable ``would DROP already-declared``, and it claims
+# the ``bloch_mamba_v2`` scar by name. Its ``test_partial_downgrade_raises``
+# sibling is the leg that was watched red on the pre-fix guard.
 
 
 def test_model_registry_downgrade_guard_allows_override() -> None:

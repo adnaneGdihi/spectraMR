@@ -131,6 +131,7 @@ def test_locality_regulariser_finite_and_guarded() -> None:
     m = _build()
     with pytest.raises(RuntimeError, match="before forward"):
         m.last_locality_loss()
+    m.track_locality = True
     m.eval()
     with torch.no_grad():
         m(torch.randn(1, 1, _SIDE, _SIDE))

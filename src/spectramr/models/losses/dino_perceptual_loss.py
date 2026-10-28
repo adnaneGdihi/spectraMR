@@ -8,6 +8,8 @@ VGG-based approaches, especially for medical imaging tasks.
 """
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -16,13 +18,6 @@ from torch import nn
 from spectramr.models.losses.registry import register_loss
 
 from .base_loss import BaseLoss
-
-try:
-    import timm
-
-    TIMM_AVAILABLE = True
-except ImportError:
-    TIMM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +35,9 @@ class DINOv2PerceptualLoss(BaseLoss):
 
     Based on: DINOv2 (Oquab et al., 2023)
     """
+
+    mean: torch.Tensor
+    std: torch.Tensor
 
     def __init__(
         self,
@@ -63,10 +61,12 @@ class DINOv2PerceptualLoss(BaseLoss):
                 features
             reduction: Reduction method ('mean', 'sum', 'none')
         """
-        if not TIMM_AVAILABLE:
+        try:
+            import timm
+        except ImportError as exc:
             raise ImportError(
                 "timm is required for DINOv2PerceptualLoss. Install with: pip install timm"
-            )
+            ) from exc
 
         super().__init__(reduction)
 
@@ -90,14 +90,15 @@ class DINOv2PerceptualLoss(BaseLoss):
         self.layers = layers
 
         # Load DINOv2 model
-        self.dino_model = timm.create_model(
+        dino_model: Any = timm.create_model(
             model_name,
             pretrained=use_pretrained,
             num_classes=0,  # Remove classification head
         )
+        self.dino_model = dino_model
 
         # Get expected input size
-        self.expected_size = self.dino_model.patch_embed.img_size[0]  # type: ignore
+        self.expected_size = int(dino_model.patch_embed.img_size[0])
 
         # Adapt for single-channel medical images
         self._adapt_for_medical_input()
@@ -118,10 +119,10 @@ class DINOv2PerceptualLoss(BaseLoss):
             param.requires_grad = False
 
         # Register hooks to extract features from specified layers
-        self.feature_maps = {}
-        self.hooks = []
+        self.feature_maps: dict[str, torch.Tensor] = {}
+        self.hooks: list[Any] = []
 
-        def hook_fn(name):
+        def hook_fn(name: str) -> Callable[[nn.Module, Any, torch.Tensor], None]:
             """hook_fn.
 
             Args:
@@ -130,7 +131,7 @@ class DINOv2PerceptualLoss(BaseLoss):
                 Any: Description.
             """
 
-            def hook(module, input, output):
+            def hook(module: nn.Module, input: Any, output: torch.Tensor) -> None:
                 """hook.
 
                 Args:
@@ -149,9 +150,9 @@ class DINOv2PerceptualLoss(BaseLoss):
             layer_name = f"blocks.{layer_idx}"
             try:
                 # Access blocks as model.blocks[int(layer_idx)]
-                block = self.dino_model.blocks[int(layer_idx)]  # type: ignore
-                hook = block.register_forward_hook(hook_fn(layer_name))  # type: ignore
-                self.hooks.append(hook)  # type: ignore
+                block = dino_model.blocks[int(layer_idx)]
+                hook = block.register_forward_hook(hook_fn(layer_name))
+                self.hooks.append(hook)
             except (IndexError, ValueError):
                 logger.warning(f"Could not register hook for layer {layer_name}")
 
@@ -159,34 +160,33 @@ class DINOv2PerceptualLoss(BaseLoss):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def _adapt_for_medical_input(self):
+    def _adapt_for_medical_input(self) -> None:
         """Adapt DINOv2 model for single-channel medical images.
 
         Replaces the 3-channel input projection with a 1-channel version
         that expands to 3 channels internally.
         """
         # Get original patch embedding layer
-        patch_embed = self.dino_model.patch_embed
+        patch_embed: Any = self.dino_model.patch_embed
 
         # Create new projection layer for 1-channel input
-        old_proj = patch_embed.proj  # type: ignore
         old_proj = patch_embed.proj
         new_proj = nn.Conv2d(
             1,  # Single channel input
-            old_proj.out_channels,  # type: ignore
-            kernel_size=old_proj.kernel_size,  # type: ignore
-            stride=old_proj.stride,  # type: ignore
-            padding=old_proj.padding,  # type: ignore
-            bias=old_proj.bias is not None,  # type: ignore
+            old_proj.out_channels,
+            kernel_size=old_proj.kernel_size,
+            stride=old_proj.stride,
+            padding=old_proj.padding,
+            bias=old_proj.bias is not None,
         )
 
         # Initialize weights by replicating across channels
         with torch.no_grad():
             # Average the original 3-channel weights across input channels
-            new_weight = old_proj.weight.mean(dim=1, keepdim=True)  # type: ignore
-            new_proj.weight.copy_(new_weight)  # type: ignore
-            if old_proj.bias is not None:  # type: ignore
-                new_proj.bias.copy_(old_proj.bias)  # type: ignore
+            new_weight = old_proj.weight.mean(dim=1, keepdim=True)
+            new_proj.weight.copy_(new_weight)
+            if old_proj.bias is not None and new_proj.bias is not None:
+                new_proj.bias.copy_(old_proj.bias)
 
         # Replace the projection layer
         patch_embed.proj = new_proj
@@ -201,7 +201,7 @@ class DINOv2PerceptualLoss(BaseLoss):
             return (x - self.mean[:, :1]) / self.std[:, :1]
         return x
 
-    def _extract_features(self, x: torch.Tensor) -> dict:
+    def _extract_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Extract features from specified layers."""
         # Resize input to expected size
         x_resized = self.resize(x)

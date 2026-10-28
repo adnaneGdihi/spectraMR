@@ -19,6 +19,8 @@ and forwards ``sample`` calls to it. The pattern mirrors
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -48,11 +50,10 @@ class ColdMRISampler(nn.Module):
             lines under the mask; ``"soft"`` applies a residual
             correction scaled by ``dc_weight``.
         dc_weight: Weight on the soft-DC residual term.
-        sampling_steps: Number of reverse steps at inference; defaults
-            to ``num_timesteps`` if ``None``.
-        reverse_mode: ``"additive"`` (legacy Bansal-Alg-2 accumulate loop)
-            or ``"replace_freeze"`` (corrected bounded monotone infill).
-            Forwarded to :class:`PhysicsInformedColdDiffusion`.
+        sampling_steps: Number of reverse steps at inference; ``None`` takes
+            ``kspace_process.resolve_sampling_steps``'s logged default.
+        reverse_mode: one of ``kspace_process.VALID_REVERSE_MODES``, forwarded
+            to :class:`PhysicsInformedColdDiffusion`.
         reverse_clip_ratio: per-sample magnitude ceiling ratio used by
             ``replace_freeze``.
         clip_reference: what that ratio multiplies -- ``global_max`` (the whole
@@ -64,6 +65,8 @@ class ColdMRISampler(nn.Module):
             from entropy). Forwarded likewise.
         selection_rule: which lines each reverse step reveals; only ``fixed``
             exists. Validated by the wrapped class at construction.
+        refine_alpha: blend weight of ``reverse_mode='reveal_refine_dc'``;
+            required by that mode and rejected by the others.
         kspace_log_scaled: whether the k-space tensor arrives in ``log1p`` units
             (``data.processing.enable_log_scaling``). **Required and
             keyword-only** -- ``reverse_clip_ratio`` is a *physical* multiplier,
@@ -71,6 +74,8 @@ class ColdMRISampler(nn.Module):
             ``expm1(ratio*m)/expm1(m)``, exponential in the dynamic range. There
             is no safe default: guessing either way silently mis-scales the
             ceiling, so an unwired caller must fail loud (pitfall #9).
+        integrity_check: ``off`` or ``raise``; checks every reverse write
+            against ``reverse_integrity``'s invariants. Forwarded likewise.
 
     .. note::
 
@@ -86,7 +91,7 @@ class ColdMRISampler(nn.Module):
     def __init__(
         self,
         model: nn.Module,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         max_acceleration: float = 8.0,
         center_fraction: float = 0.0325,
         dc_method: str = "hard",
@@ -98,8 +103,15 @@ class ColdMRISampler(nn.Module):
         sampler_sigma: float = 0.0,
         sampler_seed: int | None = None,
         selection_rule: str = "fixed",
+        refine_alpha: float | None = None,
         *,
         kspace_log_scaled: bool,
+        integrity_check: str = "off",
+        decay_envelope: str | None = None,
+        projection: str | None = None,
+        dc_trust: str | None = None,
+        support_radius: int | None = None,
+        reverse_dc: str | None = None,
     ) -> None:
         """Thin registry wrapper over :class:`PhysicsInformedColdDiffusion`.
 
@@ -130,7 +142,14 @@ class ColdMRISampler(nn.Module):
             sampler_sigma=sampler_sigma,
             sampler_seed=sampler_seed,
             selection_rule=selection_rule,
+            refine_alpha=refine_alpha,
             kspace_log_scaled=kspace_log_scaled,
+            integrity_check=integrity_check,
+            decay_envelope=decay_envelope,
+            projection=projection,
+            dc_trust=dc_trust,
+            support_radius=support_radius,
+            reverse_dc=reverse_dc,
         )
 
     @torch.no_grad()
@@ -141,6 +160,7 @@ class ColdMRISampler(nn.Module):
         return_trajectory: bool = False,
         start_timestep: int | None = None,
         seed_offset: int = 0,
+        measured_lines: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Reverse-diffuse from undersampled k-space to a fully-sampled estimate.
 
@@ -168,6 +188,11 @@ class ColdMRISampler(nn.Module):
                 the signature declares it, and RAISES for a non-zero offset it
                 cannot forward, because an ensemble whose members share one
                 noise stream is a facade.
+            measured_lines: ``[B, N]`` lines each sample acquired (#2160), so the
+                reverse rungs count R over them as the forward process did.
+                NAMED for the same reason as ``seed_offset``: the generator RAISES
+                when a line-structured arm's sampler does not declare it, and
+                ``None`` keeps full support.
 
         Returns:
             The reconstructed k-space tensor, optionally with a list of
@@ -179,7 +204,18 @@ class ColdMRISampler(nn.Module):
             return_trajectory=return_trajectory,
             start_timestep=start_timestep,
             seed_offset=seed_offset,
+            measured_lines=measured_lines,
         )
+
+    @property
+    def reverse_stats(self) -> dict[str, Any]:
+        """What the wrapped reverse loop ran on the last :meth:`sample` call.
+
+        Delegated rather than recomputed: this wrapper owns no schedule, and a
+        second derivation of "how many steps ran" would be a second owner of the
+        answer (non-negotiable 17).
+        """
+        return self._diffusion.reverse_stats
 
 
 __all__ = ["ColdMRISampler"]

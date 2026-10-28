@@ -12,7 +12,15 @@ from spectramr.models.registry import register_model
 from spectramr.shared.utils.metaclass import ModuleABCMeta
 
 
-@register_model(name="conditional_patchgan_discriminator", training_mode="gan")
+# Concatenation-conditioned convolution stack, no internal transform: it scores whatever
+# space it is handed. Both live arms (mrixfields2026/task3/field_cocycle_*) declare
+# ``losses.policy.output_domain: image``, which is the space this critic is trained on.
+@register_model(
+    role="discriminator",
+    name="conditional_patchgan_discriminator",
+    training_mode="gan",
+    input_domain="image",
+)
 class ConditionalPatchGANDiscriminator(IDiscriminator, nn.Module, metaclass=ModuleABCMeta):
     """A PatchGAN discriminator that is conditioned on additional inputs.
     The conditional inputs are concatenated to the input image along the

@@ -1,10 +1,8 @@
 .. _tutorial_06_hyperparameter_optimization:
 
 ================================================
-Tutorial 06: Hyperparameter Optimization (HPO)
+Tutorial 6: Hyperparameter Optimization (HPO)
 ================================================
-
-**Difficulty:** Advanced | **Time:** ~3 hours | **GPU:** 8GB+ VRAM
 
 This tutorial covers the HPO pipeline built on **Optuna**, accessed
 through the framework's ``HPOUseCase``. You will run a Bayesian
@@ -117,7 +115,6 @@ Create ``experiments/hpo/hpo_reconstruction.yaml``:
      precision:
        enabled: true
    checkpoint:
-     checkpoint_dir: checkpoints/hpo_trials
      save_interval: 999999     # Don't save during trials (space)
      format: safetensors
 
@@ -271,22 +268,15 @@ Step 3 — Inspect Results Programmatically
    for param, importance in sorted(importances.items(), key=lambda x: -x[1]):
        print(f"  {param:<45} {importance:.3f}")
 
-Expected output:
+This prints three things: the best trial's objective value, the parameter
+values that produced it, and — one per line — how much each searched
+parameter accounted for the variation across trials. The parameter names are
+the dotted config paths you declared in the search space, so they can be
+pasted straight into a YAML override.
 
-.. code-block:: text
-
-   Best val_psnr: 36.8 dB
-   Best params:   {
-     'optimization.optimizer.learning_rate': 0.000312,
-     'optimization.optimizer.weight_decay': 1.7e-05,
-     'model.model_kwargs.depth': 5,
-     'losses.image_losses[name=l1].weight': 6.4,
-   }
-
-   optimization.optimizer.learning_rate       0.487
-   model.model_kwargs.depth                   0.264
-   losses.image_losses[name=l1].weight        0.170
-   optimization.optimizer.weight_decay        0.079
+Importance scores sum to 1.0 and are only meaningful once the study has
+enough trials to separate signal from noise; with a handful of trials they
+mostly reflect sampling order.
 
 
 Step 4 — Train Best Configuration to Convergence
@@ -333,9 +323,9 @@ You can also apply the winning values to the base config by hand:
    express a ``[name=...]`` selector: it splits on the first ``=``, which lands
    inside the selector, and then **silently discards** the result while logging
    ``Overrides applied (1)``. The selector
-   works in a search space, which uses a different resolver. Until that is
-   fixed, edit sampled loss weights into the YAML — or just run
-   ``best_config.yaml``, which already has them.
+   works in a search space, which uses a different resolver — so edit sampled
+   loss weights into the YAML, or just run ``best_config.yaml``, which already
+   has them.
 
 
 Step 5 — Advanced: Multi-Objective HPO
@@ -436,8 +426,8 @@ HPO Pruner Guide
      ``--multi-objective --cost-weight >0`` only because a separate
      ``n_objectives > 1`` branch catches it.
 
-   Until that is fixed, the choices that behave as documented are
-   ``--sampler {tpe,cmaes}`` and ``--pruner {hyperband,median,successive_halving}``.
+   The choices that behave as documented are ``--sampler {tpe,cmaes}`` and
+   ``--pruner {hyperband,median,successive_halving}``.
    To genuinely disable pruning, raise ``--max-iter`` past the first Hyperband
    milestone instead.
 

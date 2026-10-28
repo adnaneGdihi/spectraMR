@@ -22,11 +22,9 @@ def test_b0_distortion_grid():
     # Simple gradient B0 map
     b0_map = torch.linspace(-1, 1, W).view(1, 1, 1, 1, W).expand(1, 1, 1, H, W)
     # This b0 map varies along W (x-axis).
-    # B0GeometricDistortion with readout_dim=2 (H, y-axis) shifts pixels in Y based on value.
-    # So pixels at different X locations will have different Y shifts.
-    # Vertical lines (constant X) will become curved/slanted.
+    # shift_dim=4 shifts pixels along W by a W-varying amount, so the lines bend/stretch.
 
-    distorter = B0GeometricDistortion(strength=5.0, readout_dim=2)  # 5 pixels max shift
+    distorter = B0GeometricDistortion(strength=5.0, shift_dim=4)  # 5 pixels max shift
 
     out = distorter(grid, b0_map)
 

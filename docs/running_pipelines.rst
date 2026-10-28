@@ -29,7 +29,7 @@ Keep these separate in your head — they compose freely:
      - **this page**
    * - **WHERE / HOW-MANY**
      - the launcher backend + single/campaign
-     - :doc:`execution_modes`, :doc:`campaigns_user_guide`
+     - :doc:`execution_modes`
 
 The same config flows, frozen and loaded once, through whichever mode you run —
 so a config that trains is the same object that gets audited, dry-run, smoke-
@@ -70,20 +70,22 @@ and data roots, env knobs. The cluster pre-flight gate.
    spectramr doctor --require-cuda            # exit non-zero if no GPU is visible
    spectramr doctor --config exp.yaml --json  # also confirm the YAML loads
 
-**1. Is my config valid?** ``audit`` — the audit ladder. Tier 0 (Pydantic v6
+**1. Is my config valid?** ``audit`` — the audit ladder. Tier 0 (Pydantic
 schema) + Tier 1 (static cross-validation) in ~100 ms; add ``--probe`` for the
 Tier-2 synthetic forward pass (~30 s, instantiates the model, catches AMP / shape
 / OOM). Note the config is a **positional** argument here, not ``--config``.
 
 .. code-block:: bash
 
-   spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml          # Tier 0+1
-   spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml --probe  # + Tier 2
-   spectramr audit experiments/inprogress/<paradigm>/ --strict           # bulk; warnings → errors
+   spectramr audit experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml          # Tier 0+1
+   spectramr audit experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml --probe   # + Tier 2
+   spectramr audit experiments/inprogress/workflow_baselines/            # bulk
 
-``--strict`` promotes every warning to an error (exit 2) — the smoke-wrapper
-default. A directory argument audits every YAML beneath it and prints an aggregate
-summary. See :doc:`audit_ladder_user_guide`.
+``--strict`` is **on by default**: every warning is an error and the exit code is
+2. Pass ``--no-strict`` to accept warnings with exit 1 — a per-arm opt-out belongs
+in the config (``synthetic_forward_probe_skip``), not on the command line. A
+directory argument audits every YAML beneath it and prints an aggregate summary.
+See :doc:`audit_ladder_user_guide`.
 
 **2. Does the whole thing wire up?** ``train --dry-run`` — loads the config,
 builds the full DI container (model + losses + data + strategy), then stops
@@ -111,17 +113,54 @@ zero if the model, losses, and gradients are wired correctly. A sanity check tha
    spectramr train --config exp.yaml --device cuda --seed 42
 
    # tweak config values inline without editing the YAML (repeatable, nested keys):
-   spectramr train -c exp.yaml -O optimization.learning_rate=1e-4 \
-                             -O validation.val_interval=100
+   spectramr train -c exp.yaml -O optimization.optimizer.learning_rate=1e-4 \
+                             -O validation.schedule.interval_steps=100
 
    # resume from a checkpoint (explicit path, or 'auto' for the latest in output_dir):
-   spectramr train -c exp.yaml --resume experiments/results/exp/checkpoints/best.pt
+   spectramr train -c exp.yaml --resume experiments/results/exp/checkpoints/step_00010000.safetensors
    spectramr train -c exp.yaml --resume auto
 
 ``--override / -O`` uses **dotted nested paths** because the config is nested
 (``optimization.optimizer.learning_rate``, never ``lr``); each ``-O`` is one
 key. Overrides are re-validated against the schema, so an illegal value still
 fails loudly.
+
+.. _what-a-resume-restores:
+
+**What a resume restores.** A checkpoint written by ``checkpointing.store`` — the
+writer every periodic and wall-clock-yield save uses — carries the generator and
+discriminator, both optimizers, both LR schedulers, the AMP scaler, the EMA
+shadow weights, the step/epoch counters, the **global** torch / CUDA / numpy /
+python RNG streams, and every strategy-owned module or parameter (SFC heads,
+learnable DC lambdas, and the like, discovered by walking the strategy rather
+than from a hand-kept list). A component that constructs its own
+``torch.Generator`` is outside that snapshot and has to seed itself
+deterministically, which the ones in the tree do. The
+k-space curriculum needs no separate entry: its difficulty is a pure function of
+the restored ``global_step``, so a resumed link continues at the rung it left
+rather than restarting at the easiest one.
+
+Two things no checkpoint carries, and both are silent:
+
+* **the dataloader's within-epoch position** — the epoch is recomputed from
+  ``global_step``, but the sampler restarts at that epoch's beginning, so a
+  resume mid-epoch replays samples it has already seen;
+* **the config** — ``meta.config_fingerprint`` records it, but nothing compares
+  the resumed configuration against it, so an edited YAML resumes without comment.
+
+Under DDP the file holds rank 0's RNG streams, since only rank 0 reaches the
+save. Rank 0 replays; the other ranks continue on the rank-offset streams they
+were seeded with, which is what keeps their augmentations from collapsing onto
+one sequence.
+
+Read the parts off a real artifact rather than trusting the list above. The
+script prints ``meta`` and each part's tensor count and bytes, and exits 1 when a
+part a resume needs is missing and 2 when the file predates schema 1:
+
+.. code-block:: bash
+
+   python scripts/verification/inspect_checkpoint.py \
+       --checkpoint experiments/results/<arm>/checkpoints/step_00040000.safetensors
 
 **5. Figures and tables.** ``report`` — runs the same reporting pipeline the
 end-of-training hook uses, against an existing output directory. Idempotent: the
@@ -137,15 +176,13 @@ settings come from the run's own ``resolved_config.json`` when it sits beside
 the checkpoint (its directory or the parent): its ``_declared`` block
 re-validates to exactly the settings the run resolved, overrides included, so
 the checkpoint is scored under the config it trained under. ``--config`` is
-then optional; it is read when no artifact exists, when the artifact predates
-the ``_declared`` block (every run directory written before 2026-09-03; the log
-says so), or under ``--from-yaml``. A
+then optional; it is read when no artifact exists, or under ``--from-yaml``. A
 YAML that disagrees with the artifact is reported (the differing top-level
 blocks, at WARNING and in the result's ``config_source``), not used.
 
 .. code-block:: bash
 
-   spectramr infer --checkpoint experiments/results/exp/checkpoints/best.pt \
+   spectramr infer --checkpoint experiments/results/exp/checkpoints/best.safetensors \
                  --input data/test/ --output predictions/ --device cuda
    # the training YAML, even when the artifact exists beside the checkpoint:
    spectramr infer --config exp.yaml --from-yaml --checkpoint ... --input ... --output ...
@@ -155,8 +192,8 @@ blocks, at WARNING and in the result's ``config_source``), not used.
    ``predict`` (``--model``) runs the same pipeline through the same preamble
    (ledger, seed, determinism policy, accelerator resolution) and takes the
    same ``--from-yaml``; ``infer-dataset`` is a back-compat alias for ``infer``.
-   Artifacts written before 2026-09-03 carry no ``_declared`` block: the
-   YAML is used for them, with a warning; without a YAML the run refuses.
+   An artifact carrying no ``_declared`` block falls back to the YAML, with a
+   warning; without a YAML the run refuses.
 
 **Hard data consistency at predict.** With
 ``physics.data_consistency.apply_at_predict: true`` the prediction is projected
@@ -179,6 +216,27 @@ by that loop. The result dict and ``run_summary.json`` record a
 of batches the predict step projected, and the loops that projected instead.
 The measurement is used as acquired; ``eval_noise_level`` is a validation-time
 simulation parameter and is not added.
+
+**k-space normalisation and the recorrupted estimator at predict.** An arm
+that trained on normalised k-space (``data.processing.enable_kspace_normalization``)
+is fed normalised k-space at predict: the scale comes from the arm's own
+``KSpaceNormalizationSpec``, one per volume (one per slice under
+``data.slice_level_records``), and the output is multiplied back to scanner
+units before it is written or scored. Training measures that scale on the
+target, which a deployed scan does not have, so predict measures it on the
+input. Diffusion and cold-diffusion strategies normalise inside their own
+sampler and are not normalised a second time. A complex multi-coil k-space
+input is passed to the model real/imag interleaved per coil, the layout the
+loader serves. An R2R arm that declares
+``validation.scoring.recorrupted_inference`` is run through the same
+``J``-sample estimator validation scores, seeded by ``run.seed`` and the index
+of the batch's first slice. ``nullspace_r2r`` reads the coil maps from
+``data.coil_maps_root``. If there is no file and the arm declares
+``coil_maps_missing: estimate``, the maps are estimated from the input
+repetition alone. A self-calibrated arm fits ``Sigma_n`` on the input with the
+loader's fit function. The result dict and ``run_summary.json`` record a
+``kspace_at_predict`` block with these choices and the per-file sources
+(#2581, #2329).
 
 Variant modes — same config, different question
 -----------------------------------------------
@@ -226,9 +284,15 @@ Utility modes
 .. code-block:: bash
 
    spectramr benchmark --suite all          # quality / throughput / memory micro-benchmarks
-   spectramr export --model best.pt --config exp.yaml --format onnx   # ONNX / TorchScript
+   spectramr export --model best.safetensors --config exp.yaml --format onnx   # ONNX / TorchScript
    spectramr list-features --module models --format markdown          # what's registered
    spectramr meta-evaluate ...              # rank a metric set (see meta-evaluation docs)
+
+``export`` and ``campaign evaluate`` read a checkpoint the way ``infer`` does: the
+run's ``resolved_config.json`` beside the checkpoint wins over ``--config`` when it
+carries the ``_declared`` block, and the weights are the checkpoint's ``generator``
+part. ``export`` loads them strictly; campaign evaluation transfers the shared
+parameter names and refuses a checkpoint that shares none.
 
 Scaling out & choosing where to run
 -----------------------------------
@@ -240,13 +304,13 @@ other two axes, handled by the unified launcher and campaign manifests:
 .. code-block:: bash
 
    spectramr launch exp.yaml --where slurm --gpus 2          # train as a SLURM job
-   spectramr launch exp.yaml --pipeline infer --where local -- --checkpoint best.pt --input d/
+   spectramr launch exp.yaml --pipeline infer --where local -- --checkpoint best.safetensors --input d/
    spectramr launch campaign.yaml --fanout campaign --where slurm   # a whole sweep
 
 ``launch`` is an additive front door over the same machinery — every dedicated
 verb still works on its own. ``--dry-run`` on ``launch`` prints the exact command
 / sbatch script that *would* run. See :doc:`execution_modes` for the full
-WHAT × WHERE × HOW-MANY cube and :doc:`campaigns_user_guide` for sweeps.
+WHAT × WHERE × HOW-MANY cube, including campaign fan-out.
 
 Going config-free: the imperative API
 -------------------------------------
@@ -318,7 +382,6 @@ Quick reference
 
    * :doc:`cli_reference` — full per-command flag reference and dispatch internals.
    * :doc:`execution_modes` — WHAT × WHERE × HOW-MANY launch cube (local / Docker / Apptainer / SLURM).
-   * :doc:`campaigns_user_guide` — campaign manifests and comparative evaluation.
    * :doc:`audit_ladder_user_guide` — the Tier 0/1/2 audit ladder in depth.
    * :doc:`scripting_api` — the imperative ``fit`` / ``Trainer`` surface.
-   * :doc:`config_schema_reference` — the v6.x config schema (``training.training_mode`` and friends).
+   * :doc:`config_schema_reference` — every config key, with defaults.

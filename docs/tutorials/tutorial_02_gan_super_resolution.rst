@@ -42,17 +42,11 @@ The total generator objective is:
 
 The discriminator is updated separately with its own loss.
 
-==================
+============================
 Step 1: Create Configuration
-==================
+============================
 
-.. code-block:: bash
-
-   mkdir -p experiments/tutorials
-   cp experiments/active/dummy_gan.yaml \
-      experiments/tutorials/tutorial_02_gan_sr.yaml
-
-Then edit the file:
+Save the following as ``experiments/tutorials/tutorial_02_gan_sr.yaml``.
 
 .. code-block:: yaml
 
@@ -147,44 +141,50 @@ Step 2: Train
 
    spectramr train --config experiments/tutorials/tutorial_02_gan_sr.yaml
 
-**Expected Training Output:**
+Adversarial training logs two loss families, one per network. Their totals
+are named ``g_total_loss`` (generator) and ``d_total_loss`` (discriminator),
+and each total is accompanied by the individual terms that were summed into
+it. **The component names depend on which loss library the arm resolves**, so
+read them off your own run rather than expecting a fixed list — every key on
+the progress bar is also written to ``logs/training_metrics.csv``, whose
+header is the authoritative list for your configuration.
 
-.. code-block:: text
-
-   [Step  100] g_total_loss=2.31  l1=0.183  perceptual=0.044  g_adv=0.512
-   [Step  100] d_total_loss=0.421  d_real=0.198  d_fake=0.223
-   [Step  500] Val: PSNR=29.2 dB | SSIM=0.841 | LPIPS=0.124
-   ...
-   [Step 5000] Val: PSNR=30.1 dB | SSIM=0.869 | LPIPS=0.091
+Validation metrics arrive separately, on the ``[VAL] Results:`` line at each
+validation event.
 
 .. note::
 
-   PSNR and SSIM may be slightly *lower* than the supervised U-Net, but LPIPS
-   (lower is better) should improve significantly — indicating perceptually
-   sharper outputs.
+   Judge a GAN arm on the perceptual metric, not on PSNR. An adversarial loss
+   trades pixel fidelity for sharpness, so PSNR and SSIM commonly sit *below*
+   a supervised L1 baseline on the same data while LPIPS (lower is better)
+   improves. Declare ``lpips`` in ``metrics.compute`` or you will not see it.
 
-==================
+==========================
 Step 3: Monitor GAN Health
-==================
+==========================
 
 A well-behaved GAN training shows these patterns in TensorBoard:
 
 **Healthy signs:**
 
-- ``d_total_loss`` ≈ 0.3–0.7 (discriminator is neither perfect nor failing)
-- ``g_adv_loss`` decreases steadily
-- ``l1`` loss decreases over time
-- No loss spikes or NaN values
+- ``d_total_loss`` settles into a band and stays there — the discriminator is
+  neither perfect nor failing
+- The generator's adversarial term decreases steadily rather than diverging
+- The generator's pixel term decreases over time
+- No loss spikes and no NaN values
 
 **Warning signs:**
 
-- ``d_total_loss`` → 0.0 : Discriminator always wins → generator collapses
-- ``g_adv_loss`` explodes : Learning rate too high
-- Loss NaN : Reduce ``lr`` or enable gradient clipping
+- ``d_total_loss`` → 0.0 — the discriminator always wins, and the generator
+  collapses
+- The adversarial term explodes — the learning rate is too high
+- Any loss reaches NaN — lower
+  ``optimization.optimizer.learning_rate`` or enable gradient clipping under
+  ``optimization.gradient.clip``
 
-==================
+=======================================
 Step 4: Troubleshooting GAN Instability
-==================
+=======================================
 
 **Problem: Mode Collapse (all outputs look similar)**
 
@@ -200,7 +200,8 @@ Step 4: Troubleshooting GAN Instability
 .. code-block:: yaml
 
    optimization:
-     learning_rate: 0.0001  # Halve generator lr
+     optimizer:
+       learning_rate: 0.0001  # Halve the generator learning rate
 
 **Problem: Checkerboard artifacts**
 
@@ -214,27 +215,28 @@ Switch discriminator architecture:
        ndf: 64
        n_layers: 4      # Increase receptive field
 
-==================
+======================================
 Step 5: Compare to Supervised Baseline
-==================
+======================================
 
 .. code-block:: python
 
-   # Load both checkpoints and evaluate on test set
    import json
 
-   with open('experiments/tutorials/tutorial_01_basic_unet/inference/metrics.json') as f:
-       unet_metrics = json.load(f)
+   runs = {
+       "U-Net (L1)": "experiments/results/tutorial_01_basic_unet",
+       "GAN": "experiments/results/tutorial_02_gan_sr",
+   }
 
-   with open('experiments/results/tutorial_02_gan_sr/inference/metrics.json') as f:
-       gan_metrics = json.load(f)
+   for label, run in runs.items():
+       with open(f"{run}/inference/final_eval.json") as handle:
+           scores = json.load(handle)
+       print(label, {k: round(v, 4) for k, v in sorted(scores.items())})
 
-   print("Model       | PSNR (dB) | SSIM  | LPIPS")
-   print("------------|-----------|-------|------")
-   print(f"U-Net (L1)  | {unet_metrics['psnr_mean']:.2f}     | "
-         f"{unet_metrics['ssim_mean']:.3f} | {unet_metrics.get('lpips_mean', 'N/A')}")
-   print(f"GAN         | {gan_metrics['psnr_mean']:.2f}     | "
-         f"{gan_metrics['ssim_mean']:.3f} | {gan_metrics['lpips_mean']:.3f}")
+Both arms must declare the same metrics in ``metrics.compute`` and run at the
+same acceleration, or the comparison measures the configuration rather than
+the model. Check ``inference/final_eval_manifest.json`` for each run before
+comparing: a metric listed there as skipped has no value to compare.
 
 ==================
 Next Steps

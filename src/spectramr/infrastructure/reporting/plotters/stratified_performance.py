@@ -52,10 +52,8 @@ def make(
         slot = sub[sub["method"] == m] if "method" in sub.columns else sub
         means: list[float] = []
         ci_half: list[float] = []
-        ns: list[int] = []
         for g in groups:
             v = slot[slot[group_col] == g]["value"].dropna().to_numpy().astype(float)
-            ns.append(int(v.size))
             if v.size == 0:
                 means.append(np.nan)
                 ci_half.append(0)
@@ -75,10 +73,6 @@ def make(
             alpha=0.85,
             error_kw={"elinewidth": 0.8, "capsize": 2},
         )
-        # n annotations on first method
-        if i == 0:
-            for xi, n in enumerate(ns):
-                ax.text(x[xi], 0, f"n={n}", ha="center", va="bottom", fontsize=5, color="#444")
 
     ax.set_xticks(x)
     ax.set_xticklabels(groups, rotation=20, ha="right", fontsize=7)

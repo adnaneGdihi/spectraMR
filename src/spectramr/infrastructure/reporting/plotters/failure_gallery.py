@@ -13,7 +13,7 @@ Plotter input
 
     {name, image|input, predicted, target, residual}
 
-where each value is a numpy array OR a path to a NIfTI / NPY / PNG.
+where each image value is a numpy array (the report case loader supplies them).
 The ``residual`` field can also be a scalar (e.g. mean L1) used to
 sort cases.
 """
@@ -35,36 +35,31 @@ from spectramr.infrastructure.reporting.plotters._comparison_helpers import (
     add_residual_histogram,
     l1,
 )
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import use_default_style, save_plot
 
 
 def _load_array(value: Any) -> np.ndarray | None:
+    """The case array, squeezed; ``None`` when the case does not carry it.
+
+    Arrays only: opening files is the data layer's job (non-negotiable 7), and
+    the case loader already materialises every recorded array. A path raises
+    rather than degrading to a missing panel.
+    """
     if value is None:
         return None
     if isinstance(value, np.ndarray):
         return value.squeeze()
-    p = Path(str(value))
-    if not p.exists():
-        return None
-    if p.suffix in (".npy",):
-        return np.load(p).squeeze()
-    if p.suffix in (".nii", ".gz") or "".join(p.suffixes).endswith(".nii.gz"):
-        try:
-            import nibabel as nib
+    raise TypeError(
+        f"failure_gallery takes arrays, got {type(value).__name__}; load files through "
+        "spectramr.data or the report case loader"
+    )
 
-            arr = nib.load(str(p)).get_fdata()  # type: ignore[no-untyped-call]
-            if arr.ndim == 3:
-                arr = arr[:, :, arr.shape[2] // 2]
-            return arr
-        except Exception:
-            return None
-    if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
-        try:
-            from PIL import Image
 
-            return np.asarray(Image.open(p).convert("L"))
-        except Exception:
-            return None
+def _prediction(case: dict) -> Any:
+    """The recorder writes ``prediction``; older callers pass ``predicted``."""
+    for key in ("predicted", "prediction", "pred"):
+        if case.get(key) is not None:
+            return case[key]
     return None
 
 
@@ -74,7 +69,7 @@ def _sort_key(c: dict) -> float:
         return float(np.abs(v).mean())
     if isinstance(v, (int, float)):
         return float(v)
-    pred = _load_array(c.get("predicted"))
+    pred = _load_array(_prediction(c))
     targ = _load_array(c.get("target"))
     if pred is not None and targ is not None and pred.shape == targ.shape:
         return l1(pred, targ)
@@ -87,6 +82,8 @@ def make(
     *,
     cases: Sequence[dict] | None = None,
     n_cases: int = 8,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path | None:
     """Build the failure-case gallery.
@@ -126,9 +123,9 @@ def make(
         ax_img = axes[r][c0]
         ax_hist = axes[r][c1]
 
-        pred = _load_array(case.get("predicted"))
+        pred = _load_array(_prediction(case))
         targ = _load_array(case.get("target"))
-        name = case.get("name", f"case_{idx}")
+        name = case.get("name") or case.get("case_id", f"case_{idx}")
         rank_str = f"#{idx + 1}  {name}"
 
         if pred is None and targ is None:
@@ -188,9 +185,4 @@ def make(
 
     if metadata is not None:
         stamp_figure(fig, metadata)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi, metadata=metadata)

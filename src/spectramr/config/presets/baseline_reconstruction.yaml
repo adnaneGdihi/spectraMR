@@ -18,7 +18,6 @@ model:
   model_type: standard_unet
   in_channels: 2
   out_channels: 2
-  features: [64, 128, 256, 512]
   num_residual_blocks: 3
 
 optimization:

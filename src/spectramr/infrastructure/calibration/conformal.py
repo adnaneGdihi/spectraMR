@@ -60,12 +60,28 @@ class IConformalCalibrator(Protocol):
 ScoreFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
+def foreground_mask(target: torch.Tensor, threshold: float | None) -> torch.Tensor | None:
+    """Boolean mask of target pixels whose magnitude exceeds ``threshold`` x the image peak.
+
+    Returns ``None`` when ``threshold`` is ``None`` (every pixel scores). The peak is taken
+    per sample over all non-batch dims, so one bright slice cannot drag another's mask.
+    """
+    if threshold is None:
+        return None
+    mag = target.abs()
+    peak = mag.reshape(mag.shape[0], -1).amax(dim=1)
+    peak = peak.reshape((-1,) + (1,) * (mag.dim() - 1))
+    return mag > threshold * peak
+
+
 class ConformalCalibrator:
     """Standard (Vovk-Gammerman-Shafer) split-conformal calibrator.
 
     Args:
         score_fn: Non-conformity score; defaults to absolute residual.
         alpha: Mis-coverage rate ``α ∈ (0, 1)``. Smaller → wider bands.
+        foreground_threshold: Score and cover only foreground pixels (see
+            :func:`foreground_mask`); ``None`` uses every pixel.
 
     Raises:
         ValueError: when ``alpha`` is outside ``(0, 1)``.
@@ -75,12 +91,14 @@ class ConformalCalibrator:
         self,
         score_fn: ScoreFn | None = None,
         alpha: float = 0.1,
+        foreground_threshold: float | None = None,
     ) -> None:
         if not 0.0 < alpha < 1.0:
             raise ValueError(
                 f"alpha must lie in (0, 1), got {alpha!r}. "
                 "(Common choices: 0.05 → 95% coverage, 0.1 → 90%.)"
             )
+        self._foreground_threshold = foreground_threshold
         # Defer importing the default to module body to avoid a circular
         # import if a caller monkey-patches `scores`.
         if score_fn is None:
@@ -137,7 +155,7 @@ class ConformalCalibrator:
         """
         scores: list[torch.Tensor] = []
         for pred, target in calibration_pairs:
-            scores.append(self._score_fn(pred, target).flatten())
+            scores.append(self._masked(self._score_fn(pred, target), target))
         if not scores:
             raise ValueError(
                 "Calibration set is empty. fit() needs at least one (prediction, target) pair."
@@ -200,7 +218,24 @@ class ConformalCalibrator:
         """
         _, lower, upper = self.predict(prediction)
         inside = (target >= lower) & (target <= upper)
+        mask = foreground_mask(target, self._foreground_threshold)
+        if mask is not None:
+            inside = inside[mask]
+            if inside.numel() == 0:
+                raise ValueError("foreground mask selects no pixels; coverage is undefined.")
         return float(inside.float().mean().item())
 
+    def _masked(self, score: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Flatten the score, keeping foreground pixels only when a threshold is set."""
+        mask = foreground_mask(target, self._foreground_threshold)
+        if mask is None:
+            return score.flatten()
+        if score.shape != target.shape:
+            raise ValueError(
+                f"foreground masking needs a per-pixel score; got {tuple(score.shape)} "
+                f"for target {tuple(target.shape)}."
+            )
+        return score[mask]
 
-__all__ = ["ConformalCalibrator", "IConformalCalibrator"]
+
+__all__ = ["ConformalCalibrator", "IConformalCalibrator", "foreground_mask"]

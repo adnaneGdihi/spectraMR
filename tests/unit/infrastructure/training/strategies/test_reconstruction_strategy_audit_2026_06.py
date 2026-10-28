@@ -15,10 +15,16 @@ import inspect
 import re
 
 from spectramr.infrastructure.training.strategies.reconstruction import (
+    ReconstructionStepMixin,
     ReconstructionTrainingStrategy,
 )
 
-_SRC = inspect.getsource(ReconstructionTrainingStrategy)
+# The step body lives on the shared mixin; the concrete strategy composes it.
+_SRC = inspect.getsource(ReconstructionStepMixin)
+
+
+def test_the_concrete_strategy_composes_the_step() -> None:
+    assert ReconstructionStepMixin in ReconstructionTrainingStrategy.__mro__
 
 
 def _reraises_after(marker: str, window: int = 400) -> bool:
@@ -41,6 +47,7 @@ def test_validation_uses_deterministic_timesteps() -> None:
     # The val path threads validation=True and draws a deterministic timestep.
     assert "validation: bool = False" in _SRC
     assert "validation=True" in _SRC
-    assert "torch.zeros((B,), device=lr_image.device)" in _SRC
-    # The random draw is now gated to the training branch only.
-    assert "torch.rand((B,), device=lr_image.device)" in _SRC
+    # #2759: one fixed t on every split, so training has no random draw either;
+    # the behaviour itself is pinned in test_reconstruction.py.
+    assert "torch.rand((B,)" not in _SRC
+    assert 'if _callable_accepts_kwarg(generator_forward, "timesteps"):' in _SRC

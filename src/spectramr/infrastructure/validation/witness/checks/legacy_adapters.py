@@ -165,26 +165,15 @@ def validator_registry(subject: WitnessSubject) -> list[WitnessVerdict]:
                 witness_name="legacy.validator_registry",
                 passed=False,
                 message=str(exc),
-                # WARNING, not ERROR, and deliberately so. This rule set is not
-                # currently satisfiable corpus-wide: `_validate_training_mode_compatibility`
-                # requires `objectives.reconstruction`, but `objectives` was
-                # REMOVED from TrainingSettings in the v6 migration, so every
-                # `training_mode: reconstruction` config fails it for a defect in
-                # the rule rather than in the config. Surfacing these as blocking
-                # errors in the audit would reject a large slice of the corpus.
-                #
-                # Same judgement as af3e40154, which deliberately kept
-                # `assert_ladder_realisable` out of `q_sample` because 56 of 176
-                # arms were defective and an unconditional raise would have taken
-                # them all offline at once. Report now, ratchet to error once the
-                # rule set is repaired.
+                # WARNING, not ERROR: bootstrap already raises on these at startup,
+                # and the audit has not yet been run corpus-wide at ERROR to show the
+                # rule set is satisfiable. Ratchet once it has.
                 severity=Severity.WARNING,
                 category="config_validation",
                 tier=Tier.T1,
                 fix_hint=(
                     "Findings from ValidatorRegistry, which `spectramr audit` never "
-                    "ran before. Some rules are known-unsatisfiable — see the "
-                    "`objectives` note in legacy_adapters.py."
+                    "ran before; `spectramr train` raises on the same findings at startup."
                 ),
             )
         ]

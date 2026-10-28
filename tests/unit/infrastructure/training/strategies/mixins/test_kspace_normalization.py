@@ -150,6 +150,11 @@ class TestValidationDoesNotNormalizeATwiceNormalizedBatch:
             ),
             model=types.SimpleNamespace(in_channels=2),
         )
+        # The production gate, bound to the stub (#2607): it returns at once
+        # because the stub has no generator carrying a kspace_process.
+        o._gate_validation_line_axis = types.MethodType(
+            KspaceMixin._gate_validation_line_axis, o
+        )
         return o
 
     @staticmethod

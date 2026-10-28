@@ -23,16 +23,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from spectramr.infrastructure.reporting.style import save_plot
+
 logger = logging.getLogger(__name__)
 
 
-def _save(fig, out_path: str | Path) -> Path:
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def _save(fig, out_path: str | Path, formats=None, dpi: int = 600) -> Path | None:
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi)
 
 
 # --------------------------------------------------------------------- #
@@ -45,6 +43,8 @@ def make_beltrami_field(
     out_path: str | Path = "fig_c1_beltrami_field.pdf",
     *,
     mu: np.ndarray | None = None,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     **kwargs,
 ) -> Path | None:
     """Render a single Beltrami coefficient field as |μ| heat-map +
@@ -64,7 +64,7 @@ def make_beltrami_field(
     im1 = ax_phase.imshow(np.angle(mu), cmap="twilight", vmin=-np.pi, vmax=np.pi)
     ax_phase.set_title("arg μ (Beltrami phase)")
     plt.colorbar(im1, ax=ax_phase, shrink=0.85)
-    return _save(fig, out_path)
+    return _save(fig, out_path, formats, dpi)
 
 
 # --------------------------------------------------------------------- #
@@ -79,6 +79,8 @@ def make_spd_geodesic_trajectory(
     distances: np.ndarray | None = None,
     step_column: str = "step",
     distance_column: str = "geodesic_fc_error",
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     **kwargs,
 ) -> Path | None:
     """Render the affine-invariant geodesic distance trajectory across
@@ -99,7 +101,7 @@ def make_spd_geodesic_trajectory(
     ax.set_ylabel("Affine-invariant geodesic distance")
     ax.set_title("FC manifold geodesic error")
     ax.grid(True, alpha=0.3)
-    return _save(fig, out_path)
+    return _save(fig, out_path, formats, dpi)
 
 
 # --------------------------------------------------------------------- #
@@ -112,6 +114,8 @@ def make_teichmuller_schedule(
     out_path: str | Path = "fig_c3_teich_schedule.pdf",
     *,
     r: np.ndarray | None = None,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     **kwargs,
 ) -> Path | None:
     """Render the Teichmüller schedule and the implied log-dilatation
@@ -135,7 +139,7 @@ def make_teichmuller_schedule(
     ax_k.set_ylabel("log K(t)")
     ax_k.set_title("log maximal dilatation")
     ax_k.grid(True, alpha=0.3)
-    return _save(fig, out_path)
+    return _save(fig, out_path, formats, dpi)
 
 
 # --------------------------------------------------------------------- #
@@ -150,6 +154,8 @@ def make_fingerprint_embedding(
     *,
     embedding: np.ndarray | None = None,
     labels: np.ndarray | None = None,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     **kwargs,
 ) -> Path | None:
     """2-D PCA projection of the 5-D conformal fingerprint embedding.
@@ -180,7 +186,7 @@ def make_fingerprint_embedding(
     ax.set_ylabel("PC 2")
     ax.set_title("Conformal fingerprint embedding (PCA(5→2))")
     ax.grid(True, alpha=0.3)
-    return _save(fig, out_path)
+    return _save(fig, out_path, formats, dpi)
 
 
 __all__ = [

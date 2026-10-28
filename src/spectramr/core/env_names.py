@@ -57,6 +57,11 @@ SPECTRAMR_SUPPRESS_CLINICAL_WARNING = "SPECTRAMR_SUPPRESS_CLINICAL_WARNING"
 FORCE_CPU = "FORCE_CPU"
 SPECTRAMR_DEVICE = "SPECTRAMR_DEVICE"
 SPECTRAMR_NO_GPU_PROBE = "SPECTRAMR_NO_GPU_PROBE"
+#: Compute capability of the machine the run will land on, as "<major>.<minor>"
+#: (e.g. "7.0" for a V100). Read only when a live probe cannot see a device --
+#: `spectramr audit` on a login node. A malformed value RAISES rather than
+#: defaulting, and a live probe always wins over it.
+SPECTRAMR_TARGET_COMPUTE_CAPABILITY = "SPECTRAMR_TARGET_COMPUTE_CAPABILITY"
 # Per-process GPU memory cap applied by ``initialize_device`` — float in
 # (0, 1], default 0.85. Invalid values RAISE at device init (pitfall #9/#15).
 SPECTRAMR_GPU_MEMORY_FRACTION = "SPECTRAMR_GPU_MEMORY_FRACTION"
@@ -79,6 +84,30 @@ SPECTRAMR_PLUGINS = "SPECTRAMR_PLUGINS"
 #: Read for membership in ``{"1", "true", "yes"}`` (``execution_ledger``), so
 #: unlike the bare-truthiness flags in section 6, ``=0`` here does mean off.
 SPECTRAMR_LEDGER_STRICT = "SPECTRAMR_LEDGER_STRICT"
+#: Absolute unix epoch second at which THIS job's allocation ends, exported by
+#: the sbatch from Slurm's own remaining-time report. Training yields (saves a
+#: checkpoint and stops cleanly) before it, so a requeued task resumes instead
+#: of losing everything since the last periodic save.
+SPECTRAMR_WALL_CLOCK_DEADLINE = "SPECTRAMR_WALL_CLOCK_DEADLINE"
+#: Seconds reserved ahead of that deadline for the final checkpoint write and
+#: teardown. Must exceed one logging interval's worth of step time, since the
+#: deadline is only inspected at that cadence. Default 900.
+SPECTRAMR_WALL_CLOCK_MARGIN_S = "SPECTRAMR_WALL_CLOCK_MARGIN_S"
+#: Absolute path the run writes when it yields at the wall clock. The LAUNCHER
+#: chooses it and the run obeys, so the two cannot disagree about where to look
+#: (non-negotiable 17). Unset falls back to ``<run_dir>/WALL_CLOCK_YIELD``.
+SPECTRAMR_WALL_CLOCK_MARKER = "SPECTRAMR_WALL_CLOCK_MARKER"
+#: ``1`` lets an array task start although its HEAD or config differs from the
+#: submit-time snapshot (#2662); unset or ``0`` raises. Any other value raises.
+#: Rides ``sbatch --export=ALL``, so it is decided when the array is submitted.
+SPECTRAMR_DISPATCH_ALLOW_DRIFT = "SPECTRAMR_DISPATCH_ALLOW_DRIFT"
+#: The branch array runs follow; unset means ``dev``, the only branch runs come from.
+#: It exists for test fixtures whose checkout is a feature branch; never set it on a
+#: cluster. Read by ``dispatch_git.run_branch`` and recorded in the snapshot.
+SPECTRAMR_DISPATCH_RUN_BRANCH = "SPECTRAMR_DISPATCH_RUN_BRANCH"
+#: Path of the per-task snapshot verdict the dispatcher writes and the run stamps
+#: into provenance. The DISPATCHER sets it; setting it by hand falsifies the record.
+SPECTRAMR_DISPATCH_SNAPSHOT_RECORD = "SPECTRAMR_DISPATCH_SNAPSHOT_RECORD"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. CUDA / PyTorch tuning
@@ -88,6 +117,15 @@ CUDA_VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 PYTORCH_CUDA_ALLOC_CONF = "PYTORCH_CUDA_ALLOC_CONF"
 CUDA_CACHE_MAXSIZE = "CUDA_CACHE_MAXSIZE"
 CUDA_CACHE_CONFIG = "CUDA_CACHE_CONFIG"
+#: PTX JIT cache directory -- the NVIDIA-documented spelling, unlike
+#: ``CUDA_CACHE_CONFIG`` above it (#2178). Unset, the cache stays in
+#: ``~/.nv/ComputeCache``, outside ``SPECTRAMR_CACHE_ROOT``.
+CUDA_CACHE_PATH = "CUDA_CACHE_PATH"
+#: Inductor's generated modules and compiled kernels. Pinned explicitly
+#: because Inductor derives its default from ``tempfile.gettempdir()``,
+#: which memoizes -- so inheriting it through ``TMPDIR`` stops holding the
+#: moment anything touches tempdir first.
+TORCHINDUCTOR_CACHE_DIR = "TORCHINDUCTOR_CACHE_DIR"
 TORCH_HOME = "TORCH_HOME"
 #: Set to "1" by ``main.py`` to keep the eager-mode CUDA cache manager active.
 TORCH_CUDA_EAGER_CACHE_MANAGER = "TORCH_CUDA_EAGER_CACHE_MANAGER"
@@ -99,6 +137,9 @@ TORCH_CUDA_EAGER_CACHE_MANAGER = "TORCH_CUDA_EAGER_CACHE_MANAGER"
 OMP_NUM_THREADS = "OMP_NUM_THREADS"
 MKL_NUM_THREADS = "MKL_NUM_THREADS"
 OPENBLAS_NUM_THREADS = "OPENBLAS_NUM_THREADS"
+#: CPU threads ``spectramr train`` gives OpenMP, MKL, OpenBLAS and torch. ``main.py``
+#: overwrites the three variables above, so this is the one knob.
+SPECTRAMR_CPU_THREADS = "SPECTRAMR_CPU_THREADS"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Distributed training (set by torchrun / launchers)
@@ -128,6 +169,10 @@ SPECTRAMR_DEBUG = "SPECTRAMR_DEBUG"
 #: Suppress the CLI startup notice. Same bare-truthiness read as
 #: ``SPECTRAMR_DEBUG`` above: ``SPECTRAMR_QUIET=0`` is quiet. Unset to turn off.
 SPECTRAMR_QUIET = "SPECTRAMR_QUIET"
+#: Log level for the whole process (``debug|info|warning|error|critical``). Beats
+#: the config's ``logging.sinks.level``; ``--log-level`` beats this. An unknown
+#: value raises at CLI entry.
+SPECTRAMR_LOG_LEVEL = "SPECTRAMR_LOG_LEVEL"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Filesystem
@@ -200,6 +245,7 @@ __all__ = [
     "CUBLAS_WORKSPACE_CONFIG",
     "CUDA_CACHE_CONFIG",
     "CUDA_CACHE_MAXSIZE",
+    "CUDA_CACHE_PATH",
     "CUDA_VISIBLE_DEVICES",
     "FASTMRI_DATASETS_ROOT",
     "FORCE_COLOR",
@@ -220,9 +266,17 @@ __all__ = [
     "SPECTRAMR_DOCKER_IMAGE",
     "SPECTRAMR_GPU_MEMORY_FRACTION",
     "SPECTRAMR_LEDGER_STRICT",
+    "SPECTRAMR_WALL_CLOCK_DEADLINE",
+    "SPECTRAMR_WALL_CLOCK_MARGIN_S",
+    "SPECTRAMR_WALL_CLOCK_MARKER",
+    "SPECTRAMR_DISPATCH_ALLOW_DRIFT",
+    "SPECTRAMR_DISPATCH_RUN_BRANCH",
+    "SPECTRAMR_DISPATCH_SNAPSHOT_RECORD",
     "SPECTRAMR_LEGACY_ABS_PREFIXES",
     "SPECTRAMR_LEGACY_CLUSTER_PREFIX",
+    "SPECTRAMR_LOG_LEVEL",
     "SPECTRAMR_NO_GPU_PROBE",
+    "SPECTRAMR_TARGET_COMPUTE_CAPABILITY",
     "SPECTRAMR_PLUGINS",
     "SPECTRAMR_QUIET",
     "SPECTRAMR_ROOT",
@@ -233,6 +287,7 @@ __all__ = [
     "NO_COLOR",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
+    "SPECTRAMR_CPU_THREADS",
     "PROJECT_ROOT",
     "PYTHONHASHSEED",
     "PYTORCH_CUDA_ALLOC_CONF",
@@ -240,6 +295,7 @@ __all__ = [
     "TMPDIR",
     "TORCH_CUDA_EAGER_CACHE_MANAGER",
     "TORCH_HOME",
+    "TORCHINDUCTOR_CACHE_DIR",
     "TORCH_METRICS_CACHE",
     "TRITON_CACHE_DIR",
     "WORLD_SIZE",

@@ -1,12 +1,15 @@
 """Unit tests for data consistency layers."""
 
+import math
+
 import pytest
 import torch
 
 from spectramr.infrastructure.physics.data_consistency import (
     AdaptiveDataConsistency,
-    DataConsistencyLayer,
     NoiseAdaptiveDataConsistency,
+    NoiseAdjustedDataConsistency,
+    NoiseSimulatingDataConsistency,
     SimpleDataConsistency,
     data_consistency,
 )
@@ -57,7 +60,7 @@ class TestSimpleDataConsistencyMethod:
 class TestDataConsistencyLayerNoiseTypeValidation:
     """Regression: noise_type knob must be validated, not silently no-op'd.
 
-    Previously DataConsistencyLayer accepted any noise_type string but
+    Previously NoiseSimulatingDataConsistency accepted any noise_type string but
     ``_add_realistic_noise`` only branched on 'gaussian'; any other value
     (e.g. 'rician', or the typo 'guassian') silently added ZERO noise
     (CLAUDE.md pitfalls #9/#15). The fix validates the knob in __init__.
@@ -66,22 +69,22 @@ class TestDataConsistencyLayerNoiseTypeValidation:
     def test_rejects_unsupported_noise_type(self):
         """An advertised-but-unimplemented noise model must RAISE at construction."""
         with pytest.raises(ValueError, match="unsupported noise_type"):
-            DataConsistencyLayer(noise_type="rician")
+            NoiseSimulatingDataConsistency(noise_type="rician")
 
     def test_rejects_typo_noise_type(self):
         """A typo in noise_type must RAISE, not silently disable noise."""
         with pytest.raises(ValueError, match="unsupported noise_type"):
-            DataConsistencyLayer(noise_type="guassian")  # typo
+            NoiseSimulatingDataConsistency(noise_type="guassian")  # typo, codespell:ignore
 
     def test_accepts_gaussian(self):
         """The one supported value is accepted and normalised to lowercase."""
-        layer = DataConsistencyLayer(noise_type="GAUSSIAN")
+        layer = NoiseSimulatingDataConsistency(noise_type="GAUSSIAN")
         assert layer.noise_type == "gaussian"
 
     def test_gaussian_noise_actually_added_in_training(self):
         """The gaussian path adds non-zero noise (no silent no-op fallback)."""
         torch.manual_seed(0)
-        layer = DataConsistencyLayer(train_noise_level=0.5)
+        layer = NoiseSimulatingDataConsistency(train_noise_level=0.5)
         layer.train()
         kspace = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
         noised = layer._add_realistic_noise(kspace)
@@ -89,11 +92,11 @@ class TestDataConsistencyLayerNoiseTypeValidation:
 
 
 class TestDataConsistencyLayerBasic:
-    """Test basic DataConsistencyLayer functionality."""
+    """Test basic NoiseSimulatingDataConsistency functionality."""
 
     def test_initialization_default(self):
         """Test initialization with default parameters."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         assert dc_layer is not None
         assert dc_layer.noise_lvl is None
@@ -101,13 +104,13 @@ class TestDataConsistencyLayerBasic:
     def test_initialization_with_noise_level(self):
         """Test initialization with noise level."""
         noise_lvl = 0.01
-        dc_layer = DataConsistencyLayer(noise_lvl=noise_lvl)
+        dc_layer = NoiseSimulatingDataConsistency(noise_lvl=noise_lvl)
 
         assert dc_layer.noise_lvl == noise_lvl
 
     def test_forward_basic(self):
         """Test basic forward pass."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create tensors
         # Use (B, C, H, W) complex format which is robust
@@ -126,7 +129,7 @@ class TestDataConsistencyLayerComplexFormat:
 
     def test_forward_complex_input(self):
         """Test forward pass with complex tensors."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create complex tensors
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -139,7 +142,7 @@ class TestDataConsistencyLayerComplexFormat:
 
     def test_forward_mixed_complex_and_real(self):
         """Test forward with mixed complex and real inputs."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Complex predicted, real-imag measured
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -156,7 +159,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_full_sampling_mask(self):
         """Test with fully sampled mask."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -168,7 +171,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_zero_sampling_mask(self):
         """Test with zero sampling (no measured data)."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -180,7 +183,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_partial_sampling_mask(self):
         """Test with partial sampling mask."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 16, 16, dtype=torch.complex64)
@@ -193,7 +196,7 @@ class TestDataConsistencyLayerMaskHandling:
 
     def test_mask_broadcasting(self):
         """Test mask broadcasting to match k-space dimensions."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(2, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.randn(2, 1, 16, 16, dtype=torch.complex64)
@@ -209,7 +212,7 @@ class TestDataConsistencyLayerConsistency:
 
     def test_consistency_enforcement(self):
         """Test that measured k-space is enforced at sampled locations."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         # Create image estimate
         predicted_img = torch.ones(1, 1, 16, 16, dtype=torch.complex64)
@@ -226,7 +229,7 @@ class TestDataConsistencyLayerConsistency:
 
     def test_selective_consistency(self):
         """Test consistency enforcement at masked locations only."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.ones(1, 1, 16, 16, dtype=torch.complex64)
         measured_kspace = torch.zeros(1, 1, 16, 16, dtype=torch.complex64)
@@ -245,7 +248,7 @@ class TestDataConsistencyLayerBatchProcessing:
 
     def test_batch_forward(self):
         """Test forward with batch of samples."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         batch_size = 4
         predicted_img = torch.randn(batch_size, 1, 16, 16, dtype=torch.complex64)
@@ -258,7 +261,7 @@ class TestDataConsistencyLayerBatchProcessing:
 
     def test_batch_processing_preserves_batch_size(self):
         """Test that batch size is preserved."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         for batch_size in [1, 2, 4, 8]:
             predicted_img = torch.randn(batch_size, 1, 16, 16, dtype=torch.complex64)
@@ -275,7 +278,7 @@ class TestDataConsistencyLayerMultiCoil:
 
     def test_multicoil_forward(self):
         """Test forward with multi-coil data."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         num_coils = 4
         predicted_img = torch.randn(1, num_coils, 16, 16, dtype=torch.complex64)
@@ -288,7 +291,7 @@ class TestDataConsistencyLayerMultiCoil:
 
     def test_multicoil_with_sensitivity_handling(self):
         """Test multi-coil processing."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         num_coils = 8
         height, width = 32, 32
@@ -309,7 +312,7 @@ class TestDataConsistencyLayerGradientFlow:
 
     def test_gradient_propagation(self):
         """Test that gradients propagate through DC layer."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(
             1, 1, 16, 16, dtype=torch.complex64, requires_grad=True
@@ -335,7 +338,7 @@ class TestDataConsistencyLayerEdgeCases:
 
     def test_small_image(self):
         """Test with very small image."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 4, 4, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 4, 4, dtype=torch.complex64)
@@ -347,7 +350,7 @@ class TestDataConsistencyLayerEdgeCases:
 
     def test_large_image(self):
         """Test with large image."""
-        dc_layer = DataConsistencyLayer()
+        dc_layer = NoiseSimulatingDataConsistency()
 
         predicted_img = torch.randn(1, 1, 256, 256, dtype=torch.complex64)
         measured_kspace = torch.randn(1, 1, 256, 256, dtype=torch.complex64)
@@ -483,7 +486,7 @@ class TestDataConsistencyIntegration:
             def __init__(self, num_unrolls=5):
                 super().__init__()
                 self.dc_layers = torch.nn.ModuleList(
-                    [DataConsistencyLayer() for _ in range(num_unrolls)]
+                    [NoiseSimulatingDataConsistency() for _ in range(num_unrolls)]
                 )
                 self.image_updates = torch.nn.ModuleList(
                     [
@@ -578,6 +581,7 @@ class TestValidDcMethodsSSOT:
             "kan_adaptive",
             "target_aware_fsdc",
             "noise_adaptive",
+            "wiener_gain",
         } <= VALID_DC_METHODS
 
 
@@ -639,7 +643,7 @@ class TestNoiseAdaptiveDataConsistency:
         uns = ~mask.bool().expand_as(out)
         assert torch.allclose(out[uns], k_pred[uns], atol=1e-6)
 
-    def test_estimate_sigma2_sane(self):
+    def test_estimate_noise_variance_sane(self):
         """Self-contained sigma^2 estimate is within a small factor of the truth."""
         torch.manual_seed(2)
         H = W = 32
@@ -647,7 +651,7 @@ class TestNoiseAdaptiveDataConsistency:
         noise = (torch.randn(1, 1, H, W) + 1j * torch.randn(1, 1, H, W)) * sigma
         mask = torch.ones(1, 1, H, W)
         dc = NoiseAdaptiveDataConsistency(beta=1.0)
-        s2 = dc._estimate_sigma2(noise.abs() ** 2, mask)
+        s2 = dc.estimate_noise_variance(noise.abs() ** 2, mask)
         expected = 2.0 * sigma**2  # E[|noise|^2] for complex Gaussian
         assert 0.25 * expected < float(s2.mean()) < 4.0 * expected
 
@@ -693,12 +697,62 @@ class TestNoiseAdaptiveDataConsistency:
         out_i_as_c = torch.complex(out_i[:, 0::2], out_i[:, 1::2])
         assert torch.allclose(out_i_as_c, out_c, atol=1e-4)
 
+    def test_signal_power_replaces_the_measured_power_in_the_weight(self):
+        """A large declared signal power pulls a noise-level bin to the measurement."""
+        H = W = 16
+        measured = torch.full((1, 1, H, W), 0.1, dtype=torch.cfloat)
+        k_pred = torch.full((1, 1, H, W), 5.0, dtype=torch.cfloat)
+        mask = torch.ones(1, 1, H, W)
+        dc = NoiseAdaptiveDataConsistency(beta=1.0)
+        plain = dc(k_pred, measured, mask, is_kspace_domain=True, noise_sigma=0.1)
+        loud = dc(
+            k_pred,
+            measured,
+            mask,
+            is_kspace_domain=True,
+            noise_sigma=0.1,
+            signal_power=torch.full((1, 1, H, W), 1e6),
+        )
+        assert float((loud - measured).abs().max()) < float((plain - measured).abs().max())
+        assert torch.allclose(loud, measured, atol=1e-3)
+
+    def test_the_trust_radius_keeps_measured_bins_in_the_noise_disc(self):
+        torch.manual_seed(5)
+        H = W = 16
+        sigma, radius = 0.2, 3.0
+        measured = torch.randn(1, 2, H, W, dtype=torch.cfloat)
+        k_pred = 100.0 * torch.randn(1, 2, H, W, dtype=torch.cfloat)
+        mask = torch.zeros(1, 1, H, W)
+        mask[..., ::2, :] = 1.0
+        dc = NoiseAdaptiveDataConsistency(beta=1.0)
+        out = dc(
+            k_pred, measured, mask, is_kspace_domain=True, noise_sigma=sigma, trust_radius=radius
+        )
+        held = mask.bool().expand_as(out)
+        assert float((out - measured).abs()[held].max()) <= radius * sigma * (1 + 1e-5)
+        assert torch.equal(out[~held], k_pred[~held])
+
+    def test_the_new_arguments_default_to_the_wiener_blend(self):
+        """Without them the layer is ``lam = |y|^2 / (|y|^2 + softplus(beta) sigma^2)``."""
+        torch.manual_seed(6)
+        measured = torch.randn(2, 2, 16, 16, dtype=torch.cfloat)
+        k_pred = torch.randn(2, 2, 16, 16, dtype=torch.cfloat)
+        mask = (torch.rand(2, 1, 16, 16) > 0.5).float()
+        dc = NoiseAdaptiveDataConsistency(beta=1.0)
+        out = dc(k_pred, measured, mask, is_kspace_domain=True, noise_sigma=0.5)
+        power = (measured.abs() ** 2).mean(dim=1, keepdim=True)
+        beta = torch.nn.functional.softplus(dc.beta)
+        lam = power / (power + beta * 0.25 + dc.eps)
+        blend = (1 - lam) * k_pred + lam * measured
+        expected = torch.where(mask.bool().expand_as(k_pred), blend, k_pred)
+        assert torch.allclose(out, expected, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # noise_type: one owner, one policy (#1525)
 #
 # Three layers took this parameter and applied three different policies:
-# DataConsistencyLayer validated it, SimpleDataConsistency stored it unchecked,
+# NoiseSimulatingDataConsistency validated it, SimpleDataConsistency stored it unchecked,
 # and HardDataConsistency accepted it and never stored it at all -- so an
 # unsupported value degraded silently to Gaussian on two of the three.
 # ---------------------------------------------------------------------------
@@ -710,12 +764,12 @@ class TestNoiseTypeIsValidatedEverywhere:
     @staticmethod
     def _layers():
         from spectramr.infrastructure.physics.data_consistency import (
-            DataConsistencyLayer,
             HardDataConsistency,
+            NoiseSimulatingDataConsistency,
             SimpleDataConsistency,
         )
 
-        return [DataConsistencyLayer, HardDataConsistency, SimpleDataConsistency]
+        return [NoiseSimulatingDataConsistency, HardDataConsistency, SimpleDataConsistency]
 
     def test_gaussian_is_accepted_and_stored(self) -> None:
         for cls in self._layers():
@@ -766,3 +820,328 @@ class TestHardDataConsistencyTakesNoWeight:
         layer = HardDataConsistency(train_noise_level=0.07, eval_noise_level=0.03)
         assert layer.train_noise_level == 0.07
         assert layer.eval_noise_level == 0.03
+
+
+# ---------------------------------------------------------------------------
+# Noise estimate on centre-weighted masks (#2475)
+#
+# The estimator read a fixed outer annulus (r > 0.7 r_max) and fell back to every
+# measured bin when it held fewer than 8, so on variable-density and gaussian masks
+# it reported signal power as noise. It now ranks each sample's measured support.
+# ---------------------------------------------------------------------------
+
+_GRID = 256
+_SIGMA = 0.05
+_ACCELERATIONS = (2, 4, 8, 16, 32)
+
+
+def _radius() -> torch.Tensor:
+    k = torch.arange(_GRID) - _GRID // 2
+    r = torch.sqrt(k[:, None] ** 2 + k[None, :] ** 2).float()
+    return r / r.max()
+
+
+def _density_mask(shape, accel: int, seed: int) -> torch.Tensor:
+    """A random point mask of density ``shape(r / w)`` truncated at 0.5 r_max, mean ``1/accel``."""
+    r = _radius()
+    lo, hi = 1e-3, 10.0
+    for _ in range(60):
+        w = 0.5 * (lo + hi)
+        density = torch.where(r <= 0.5, shape(r / w), torch.zeros_like(r)).clamp(0, 1)
+        lo, hi = (w, hi) if float(density.mean()) < 1.0 / accel else (lo, w)
+    keep = torch.rand(_GRID, _GRID, generator=torch.Generator().manual_seed(seed)) < density
+    return keep.float().view(1, 1, _GRID, _GRID)
+
+
+def _variable_density(accel: int) -> torch.Tensor:
+    return _density_mask(lambda x: (1.0 - x).clamp_min(0) ** 4, accel, seed=accel)
+
+
+def _gaussian(accel: int) -> torch.Tensor:
+    return _density_mask(lambda x: torch.exp(-(x**2)), accel, seed=100 + accel)
+
+
+def _central_band(accel: int) -> torch.Tensor:
+    """Fully sampled central rows (a density_nested-like rung)."""
+    mask = torch.zeros(1, 1, _GRID, _GRID)
+    rows = max(1, _GRID // accel)
+    start = _GRID // 2 - rows // 2
+    mask[..., start : start + rows, :] = 1.0
+    return mask
+
+
+_MASKS = {"variable_density": _variable_density, "gaussian": _gaussian, "band": _central_band}
+
+
+def _power() -> torch.Tensor:
+    """``|y|^2`` of a low-frequency object plus white complex noise of variance ``_SIGMA^2``."""
+    gen = torch.Generator().manual_seed(7)
+    k = torch.arange(_GRID) - _GRID // 2
+    r = torch.sqrt(k[:, None] ** 2 + k[None, :] ** 2).float()
+    phase = torch.exp(1j * 6.283 * torch.rand(_GRID, _GRID, generator=gen))
+    signal = 100.0 * torch.exp(-((r / 14.0) ** 2)) * phase
+    noise = torch.complex(
+        torch.randn(_GRID, _GRID, generator=gen), torch.randn(_GRID, _GRID, generator=gen)
+    )
+    y = signal + noise * (_SIGMA / 2**0.5)
+    return (y.abs() ** 2).view(1, 1, _GRID, _GRID)
+
+
+# Median of an exponential of mean sigma^2: what a median estimator converges to.
+_NOISE_MEDIAN = _SIGMA**2 * math.log(2.0)
+
+
+def _fixed_annulus_estimate(power: torch.Tensor, mask: torch.Tensor) -> tuple[int, float]:
+    """The pre-#2475 estimator, kept as the planted violation: ``(annulus bins, sigma^2)``."""
+    radius = _radius().view(1, 1, _GRID, _GRID)
+    vals = power[(mask > 0) & (radius > 0.7)]
+    count = vals.numel()
+    if count < 8:
+        vals = power[mask > 0]
+    return count, float(vals.median())
+
+
+class TestNoiseEstimateOnMeasuredSupport:
+    @pytest.mark.parametrize("accel", _ACCELERATIONS)
+    @pytest.mark.parametrize("kind", sorted(_MASKS))
+    def test_estimate_tracks_the_noise_median(self, kind, accel):
+        mask = _MASKS[kind](accel)
+        dc = NoiseAdaptiveDataConsistency()
+        region = dc.noise_region(mask)
+        n = int(mask.sum())
+        assert int(region.sum()) == max(1, -(-n // 10))
+        assert bool((region <= (mask > 0)).all())
+        sigma2 = float(dc.estimate_noise_variance(_power(), mask))
+        assert abs(sigma2 / _NOISE_MEDIAN - 1.0) < 0.3
+
+    @pytest.mark.parametrize("accel", (16, 32))
+    @pytest.mark.parametrize("kind", ("variable_density", "gaussian"))
+    def test_fixed_annulus_estimator_fails_where_the_new_one_holds(self, kind, accel):
+        """Planted violation: the old annulus is empty and its fallback reads signal."""
+        mask = _MASKS[kind](accel)
+        power = _power()
+        count, old = _fixed_annulus_estimate(power, mask)
+        assert count == 0
+        assert old > 5.0 * _NOISE_MEDIAN
+        new = float(NoiseAdaptiveDataConsistency().estimate_noise_variance(power, mask))
+        assert abs(new / _NOISE_MEDIAN - 1.0) < 0.3
+
+    @pytest.mark.parametrize("accel", _ACCELERATIONS)
+    @pytest.mark.parametrize("kind", ("variable_density", "gaussian"))
+    def test_fixed_annulus_is_empty_at_every_rung(self, kind, accel):
+        count, _ = _fixed_annulus_estimate(_power(), _MASKS[kind](accel))
+        assert count == 0
+
+    def test_zero_padded_edge_is_not_read_as_noise(self):
+        """Planted violation: on zero-padded columns the outermost measured bins are the padding."""
+        mask = _central_band(4)
+        power = _power().clone()
+        pad = 30
+        power[..., :pad] = 1e-16  # what the log1p round trip leaves of an exact zero
+        power[..., -pad:] = 1e-16
+        dc = NoiseAdaptiveDataConsistency()
+        naive = dc.noise_region(mask)
+        assert float(power[naive].median()) < 1e-12
+        support = (mask > 0) & (power > 1e-12)
+        assert bool((dc.noise_region(support) <= support).all())
+        sigma2 = float(dc.estimate_noise_variance(power, mask))
+        assert abs(sigma2 / _NOISE_MEDIAN - 1.0) < 0.3
+
+    def test_noise_region_takes_a_bool_or_float_support(self):
+        mask = _gaussian(8)
+        dc = NoiseAdaptiveDataConsistency()
+        assert torch.equal(dc.noise_region(mask), dc.noise_region(mask > 0))
+
+    def test_mixed_batch_matches_per_sample(self):
+        masks = [_variable_density(32), _central_band(4), _gaussian(8)]
+        power = _power().expand(3, -1, -1, -1)
+        dc = NoiseAdaptiveDataConsistency()
+        batched = dc.estimate_noise_variance(power, torch.cat(masks)).flatten()
+        single = torch.stack(
+            [dc.estimate_noise_variance(power[:1], m).flatten()[0] for m in masks]
+        )
+        assert torch.equal(batched, single)
+
+    def test_a_sample_without_measured_bins_raises(self):
+        mask = torch.cat([_central_band(4), torch.zeros(1, 1, _GRID, _GRID)])
+        power = _power().expand(2, -1, -1, -1)
+        with pytest.raises(ValueError, match=r"sample\(s\) \[1\] have no measured"):
+            NoiseAdaptiveDataConsistency().estimate_noise_variance(power, mask)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_the_cuda_empty_support_check_does_not_sync(self):
+        mask = _central_band(4).cuda()
+        power = _power().cuda()
+        dc = NoiseAdaptiveDataConsistency()
+        dc.estimate_noise_variance(power, mask)  # builds the coordinate cache
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            dc.noise_region(mask)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+    def test_a_supplied_variance_skips_the_estimate(self, monkeypatch):
+        dc = NoiseAdaptiveDataConsistency()
+        y = torch.randn(1, 2, _GRID, _GRID, dtype=torch.complex64)
+        mask = _central_band(4)
+        monkeypatch.setattr(dc, "estimate_noise_variance", pytest.fail)
+        sigma2 = torch.full((1, 1, 1, 1), 0.5)
+        lam = dc._compute_lambda(y, mask, None, sigma2=sigma2)
+        power = (y.abs() ** 2).mean(dim=1, keepdim=True)
+        beta = torch.nn.functional.softplus(dc.beta)
+        torch.testing.assert_close(lam, power / (power + beta * sigma2 + dc.eps))
+
+    @pytest.mark.parametrize("frac", (0.0, -0.1, 1.5))
+    def test_noise_support_frac_outside_unit_interval_raises(self, frac):
+        with pytest.raises(ValueError, match="noise_support_frac"):
+            NoiseAdaptiveDataConsistency(noise_support_frac=frac)
+
+
+class TestNoiseAdjustedDataConsistency:
+    """One Wiener trust per sample from its noise level (``noise_adjusted``).
+
+    It shares ``noise_adaptive``'s noise estimate and blend, with the sample's mean
+    measured power in place of each bin's, so every measured bin of a sample is trusted
+    equally. Until 2026-10-09 the name was an alias of ``soft``.
+    """
+
+    @staticmethod
+    def _peaked(h: int = 16) -> torch.Tensor:
+        """A k-space whose centre bin is much louder than its periphery."""
+        torch.manual_seed(0)
+        k = 0.1 * torch.randn(1, 1, h, h, dtype=torch.cfloat)
+        k[0, 0, h // 2, h // 2] = 50.0
+        return k
+
+    @staticmethod
+    def _trust(dc, measured, mask) -> torch.Tensor:
+        """The blend weight each measured bin got: out = (1 - lam) * 0 + lam * y."""
+        out = dc(
+            torch.zeros_like(measured), measured_kspace=measured, mask=mask, is_kspace_domain=True
+        )
+        return (out / measured)[mask.bool().expand_as(measured)].real
+
+    def test_every_measured_bin_of_a_sample_gets_the_same_trust(self) -> None:
+        measured, mask = self._peaked(), torch.ones(1, 1, 16, 16)
+        lam = self._trust(NoiseAdjustedDataConsistency(beta=1.0), measured, mask)
+        assert torch.allclose(lam, lam[0].expand_as(lam), atol=1e-5)
+
+    def test_it_differs_from_the_per_bin_noise_adaptive_layer(self) -> None:
+        """Planted: the alias it replaced (or noise_adaptive itself) would not be constant."""
+        measured, mask = self._peaked(), torch.ones(1, 1, 16, 16)
+        per_bin = self._trust(NoiseAdaptiveDataConsistency(beta=1.0), measured, mask)
+        assert float(per_bin.max() - per_bin.min()) > 0.1
+
+    def test_more_noise_means_less_trust(self) -> None:
+        measured, mask = self._peaked(), torch.ones(1, 1, 16, 16)
+        dc = NoiseAdjustedDataConsistency(beta=1.0)
+        zero = torch.zeros_like(measured)
+        kw = {"measured_kspace": measured, "mask": mask, "is_kspace_domain": True}
+        quiet = dc(zero, noise_sigma=0.01, **kw)
+        loud = dc(zero, noise_sigma=5.0, **kw)
+        assert float((quiet / measured).real.mean()) > float((loud / measured).real.mean())
+
+    def test_unsampled_bins_are_pure_prediction(self) -> None:
+        torch.manual_seed(1)
+        measured = torch.randn(1, 1, 16, 16, dtype=torch.cfloat)
+        k_pred = torch.randn(1, 1, 16, 16, dtype=torch.cfloat)
+        mask = torch.zeros(1, 1, 16, 16)
+        mask[..., :8] = 1.0
+        out = NoiseAdjustedDataConsistency()(
+            k_pred, measured_kspace=measured, mask=mask, is_kspace_domain=True
+        )
+        assert torch.equal(out[..., 8:], k_pred[..., 8:])
+
+    def test_padded_zeros_do_not_dilute_the_signal_power(self) -> None:
+        measured, mask = self._peaked(), torch.ones(1, 1, 16, 16)
+        dc = NoiseAdjustedDataConsistency()
+        padded = measured.clone()
+        padded[..., -4:] = 0.0
+        unpadded = dc.mean_measured_power(measured[..., :-4], mask[..., :-4])
+        assert torch.allclose(dc.mean_measured_power(padded, mask), unpadded)
+
+    def test_a_caller_supplied_signal_power_is_refused(self) -> None:
+        measured, mask = self._peaked(), torch.ones(1, 1, 16, 16)
+        with pytest.raises(ValueError, match="sets its own signal power"):
+            NoiseAdjustedDataConsistency()(
+                torch.zeros_like(measured),
+                measured_kspace=measured,
+                mask=mask,
+                is_kspace_domain=True,
+                signal_power=measured.abs() ** 2,
+            )
+
+    def test_the_generator_builds_it_for_noise_adjusted_and_not_soft(self) -> None:
+        """Wiring pin: the alias branch is gone (building the generator is a cpu_tests job)."""
+        import inspect
+
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        src = inspect.getsource(KSpaceColdDiffusionGenerator)
+        assert 'self.dc_method == "noise_adjusted":' in src
+        assert "NoiseAdjustedDataConsistency(\n                beta=self.dc_weight, log_scaled=dc_log_scaled\n            )" in src
+        assert 'or self.dc_method == "noise_adjusted"' not in src
+
+
+class TestLinearDomainBlendGradients:
+    """Backward through decompress -> blend -> recompress stays finite.
+
+    The reverse-loop harness samples without gradients, so a NaN that only the
+    backward pass produces is invisible to it. Compressed magnitudes span the
+    realistic range up to near the decompression ceiling, where ``expm1`` is ~1e10.
+    """
+
+    @staticmethod
+    def _operands(seed: int = 0):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+
+        g = torch.Generator().manual_seed(seed)
+        mag = torch.cat(
+            [torch.rand(1, 2, 8, 6, generator=g) * 12.0, 20.0 + torch.rand(1, 2, 8, 2, generator=g) * 3.0],
+            dim=-1,
+        )
+        phase = torch.rand(1, 2, 8, 8, generator=g) * 6.283
+        z = torch.polar(torch.expm1(mag), phase)
+        pred = compress_kspace_log(torch.stack([z.real, z.imag], 2).flatten(1, 2), channel_dim=1)
+        meas = compress_kspace_log(
+            torch.stack([z.real * 0.9, z.imag * 1.1], 2).flatten(1, 2), channel_dim=1
+        )
+        mask = torch.zeros(1, 1, 8, 8)
+        mask[..., ::2] = 1.0
+        return pred.detach().requires_grad_(True), meas, mask
+
+    @pytest.mark.parametrize("kind", ["soft", "noise_adaptive", "noise_adjusted", "fsdc"])
+    def test_gradient_is_finite(self, kind: str) -> None:
+        from spectramr.infrastructure.physics.data_consistency import (
+            NoiseAdaptiveDataConsistency,
+            NoiseAdjustedDataConsistency,
+            SoftDataConsistency,
+            TargetAwareFSDC,
+        )
+
+        pred, meas, mask = self._operands()
+        layer = {
+            "soft": lambda: SoftDataConsistency(lambda_init=0.5, log_scaled=True),
+            "noise_adaptive": lambda: NoiseAdaptiveDataConsistency(
+                beta=0.5, learnable_beta=True, log_scaled=True
+            ),
+            "noise_adjusted": lambda: NoiseAdjustedDataConsistency(
+                beta=0.5, learnable_beta=True, log_scaled=True
+            ),
+            "fsdc": lambda: TargetAwareFSDC(
+                target_channels=4, center_fraction=0.25, log_scaled=True
+            ),
+        }[kind]()
+        if kind == "fsdc":
+            out = layer(pred, meas, mask)
+        else:
+            out = layer(pred, meas, mask, is_kspace_domain=True)
+        assert torch.isfinite(out).all()
+        out.square().sum().backward()
+        assert torch.isfinite(pred.grad).all(), f"{kind}: non-finite input gradient"
+        for name, p in layer.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"{kind}: non-finite grad on {name}"

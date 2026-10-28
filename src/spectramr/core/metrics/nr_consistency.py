@@ -4,10 +4,12 @@ This module implements the ``nr_consistency`` block of the NR metric battery
 (spec §3). Every metric here answers "is the reconstruction self-consistent
 with the acquisition physics?" rather than "how close is it to a reference?".
 They consume a :class:`~spectramr.core.metrics.context.MetricContext` (acquired
-k-space, sampling mask, coil maps, reconstructor, acquisition order). When the
-context is absent the metric returns ``nan`` so it degrades gracefully in the
-sim2rank sweep (never raising — ``core/metrics/computer.py`` re-raises
-``ValueError`` and aborts the whole validation pass).
+k-space, sampling mask, coil maps, reconstructor, acquisition order). A metric
+returns ``nan`` only for a *declared* not-applicable input — a context field it
+needs is absent, or the docstring names the case (single-coil ``csoe``, a
+perfect reconstruction for ``nse_hall``). Every other failure raises, so the
+validation computer and the sim2rank engine can report it as a crash rather
+than read it as an honest N/A.
 
 Forward model: :math:`\mathbf{y} = \mathbf{M}\mathbf{F}\mathbf{S}\mathbf{x} +
 \mathbf{n}` with :math:`\mathbf{A} = \mathbf{M}\mathbf{F}\mathbf{S}`
@@ -23,6 +25,7 @@ Metrics
 - **aoqv** — Acquisition-Order Quadratic Variation (↓)
 - **eta_null** — Invented Null Energy, trust functional T2 (↓, no-reference)
 - **fabrication_excess** — Fabrication Excess :math:`\mathcal{H}_T` (↓, full-reference)
+- **null_band_energy_deficit** — unfilled fraction of the unacquired band (↓, full-reference)
 """
 
 from __future__ import annotations
@@ -104,7 +107,20 @@ class NormalisedDataConsistencyResidual:
     monotonically with injected k-space error.
 
     Needs ``y_kspace`` + ``mask`` (``coil_maps`` optional → single-coil).
-    Returns ``nan`` if the measurement context is absent.
+    Returns ``nan`` if ``y_kspace`` is absent; any other failure raises.
+
+    **Which** :math:`\mathbf{F}\mathbf{S}\hat{\mathbf{x}}` **is compared.** When
+    the caller supplies ``context.pred_kspace`` (the prediction's own coil
+    k-space, linear, same layout as ``y_kspace``) the residual is taken on it
+    directly, coil by coil: :math:`\lVert\mathbf{M}(\hat{\mathbf{k}}-\mathbf{y})
+    \rVert/\lVert\mathbf{M}\mathbf{y}\rVert`. This is the only reading that is
+    meaningful on multi-coil data: re-expanding a coil-combined image through
+    :math:`\mathbf{S}` reproduces only the part of :math:`\mathbf{y}` on the
+    sensitivity subspace, so measurement noise off that subspace sets a floor no
+    image can go below, and the ground truth scores worse than zero-filling
+    (#2316). Without ``pred_kspace`` the prediction is RSS-combined and
+    re-projected with ``sense_forward`` — exact for single-coil data and for a
+    noiseless multi-coil synthetic, and subject to that floor otherwise.
 
     This is also the cold-diffusion trust functional **T1**, the (relative)
     inconsistency :math:`\kappa_T = d(D_T\hat x_0, x_T)/\lVert x_T\rVert` of
@@ -143,32 +159,36 @@ class NormalisedDataConsistencyResidual:
         # NR metric returned no value at all. Only ``y_kspace`` is mandatory.
         if not ctx.has("y_kspace"):
             return NAN
-        try:
+        y = ctx.y_kspace
+        assert y is not None
+        y = y if torch.is_complex(y) else y.to(torch.complex64)
+        m = ctx.mask
+        if m is not None and torch.is_complex(m):
+            m = m.real
+
+        if ctx.pred_kspace is not None:
+            k_pred = ctx.pred_kspace
+            k_pred = k_pred if torch.is_complex(k_pred) else k_pred.to(torch.complex64)
+            if k_pred.shape != y.shape:
+                raise ValueError(
+                    f"ndcr: context.pred_kspace has shape {tuple(k_pred.shape)} but "
+                    f"y_kspace has {tuple(y.shape)}; the per-coil residual needs the "
+                    f"prediction's k-space in the measurement's own layout"
+                )
+        else:
             from spectramr.infrastructure.physics.fft_ops import sense_forward
 
-            y = ctx.y_kspace
-            assert y is not None
-            mask = ctx.mask
-            smaps = ctx.coil_maps  # may be None → single-coil
-            y = y if torch.is_complex(y) else y.to(torch.complex64)
+            k_pred = sense_forward(
+                _single_channel_complex(prediction), smaps=ctx.coil_maps, mask=None
+            )
 
-            # Predicted image: single-channel when single-coil, else keep complex.
-            if smaps is None:
-                pred_img = _single_channel_complex(prediction)
-            else:
-                pred_img = _single_channel_complex(prediction)
-
-            k_pred = sense_forward(pred_img, smaps=smaps, mask=mask)
-            # Apply the same mask to y so we compare on acquired samples only.
-            m = mask
-            if m is not None and torch.is_complex(m):
-                m = m.real
-            y_obs = y * m if m is not None else y
-            resid = _norm(k_pred - y_obs)
-            denom = _norm(y_obs) + self.eps
-            return float((resid / denom).detach())
-        except Exception:
-            return NAN
+        # The one residual both branches share: compared on acquired samples only.
+        resid = k_pred - y
+        y_obs = y
+        if m is not None:
+            resid = resid * m
+            y_obs = y * m
+        return float((_norm(resid) / (_norm(y_obs) + self.eps)).detach())
 
 
 # ---------------------------------------------------------------------------
@@ -261,20 +281,17 @@ class PseudoReplicaPartitionSNR:
         ctx = resolve_context(context, kwargs)
         if not ctx.has("y_kspace", "mask"):
             return NAN
-        try:
-            assert ctx.mask is not None
-            m1 = _split_mask_columns(ctx.mask, parity=0)
-            m2 = _split_mask_columns(ctx.mask, parity=1)
-            x1 = self._recon(ctx, m1)
-            x2 = self._recon(ctx, m2)
-            d = x1 - x2
-            xbar = 0.5 * (x1 + x2)
-            sigma2 = 0.5 * (d.real**2 + d.imag**2).mean()
-            sigma = torch.sqrt(sigma2 + self.eps)
-            signal = xbar.abs().mean()
-            return float((signal / sigma).detach())
-        except Exception:
-            return NAN
+        assert ctx.mask is not None
+        m1 = _split_mask_columns(ctx.mask, parity=0)
+        m2 = _split_mask_columns(ctx.mask, parity=1)
+        x1 = self._recon(ctx, m1)
+        x2 = self._recon(ctx, m2)
+        d = x1 - x2
+        xbar = 0.5 * (x1 + x2)
+        sigma2 = 0.5 * (d.real**2 + d.imag**2).mean()
+        sigma = torch.sqrt(sigma2 + self.eps)
+        signal = xbar.abs().mean()
+        return float((signal / sigma).detach())
 
 
 # ---------------------------------------------------------------------------
@@ -326,49 +343,46 @@ class ForwardModelRoundTripStability:
         ctx = resolve_context(context, kwargs)
         if not ctx.has("mask"):
             return NAN
-        try:
-            from spectramr.infrastructure.physics.fft_ops import (
-                sense_adjoint,
-                sense_forward,
-            )
-            from spectramr.infrastructure.physics.sampling import MaskGenerator
+        from spectramr.infrastructure.physics.fft_ops import (
+            sense_adjoint,
+            sense_forward,
+        )
+        from spectramr.infrastructure.physics.sampling import MaskGenerator
 
-            xhat = _single_channel_complex(prediction)
-            h, w = xhat.shape[-2], xhat.shape[-1]
-            mask = ctx.mask
-            m = mask.real if torch.is_complex(mask) else mask
-            density = float((m > 0).float().mean().clamp(min=1e-3, max=1.0))
-            # The VD mask generator needs R > 1 (a full-density resample is a
-            # degenerate identity); floor the acceleration so the round trip is
-            # actually an under-sampling round trip.
-            accel = max(1.5, 1.0 / density)
-            smaps = ctx.coil_maps
+        xhat = _single_channel_complex(prediction)
+        h, w = xhat.shape[-2], xhat.shape[-1]
+        mask = ctx.mask
+        m = mask.real if torch.is_complex(mask) else mask
+        density = float((m > 0).float().mean().clamp(min=1e-3, max=1.0))
+        # The VD mask generator needs R > 1 (a full-density resample is a
+        # degenerate identity); floor the acceleration so the round trip is
+        # actually an under-sampling round trip.
+        accel = max(1.5, 1.0 / density)
+        smaps = ctx.coil_maps
 
-            # Deterministic seeds from ctx.generator if present, else fixed.
-            base_seed = 0
-            if ctx.generator is not None:
-                base_seed = int(torch.randint(0, 2**31 - 1, (1,), generator=ctx.generator).item())
+        # Deterministic seeds from ctx.generator if present, else fixed.
+        base_seed = 0
+        if ctx.generator is not None:
+            base_seed = int(torch.randint(0, 2**31 - 1, (1,), generator=ctx.generator).item())
 
-            xn = _norm(xhat) + self.eps
-            acc = 0.0
-            n = 0
-            for k in range(self.num_masks):
-                gen = MaskGenerator(seed=base_seed + k)
-                mk = gen.generate_mask("variable_density", (h, w), acceleration_factor=accel)
-                mk = mk.to(xhat.device)
-                if ctx.reconstructor is not None:
-                    yk = sense_forward(xhat, smaps=smaps, mask=mk)
-                    rk = _single_channel_complex(ctx.reconstructor(yk, mk, smaps))
-                else:
-                    yk = sense_forward(xhat, smaps=smaps, mask=mk)
-                    rk = _single_channel_complex(sense_adjoint(yk, smaps=smaps, mask=mk))
-                acc += float((_norm(rk - xhat) / xn).detach())
-                n += 1
-            if n == 0:
-                return NAN
-            return acc / n
-        except Exception:
+        xn = _norm(xhat) + self.eps
+        acc = 0.0
+        n = 0
+        for k in range(self.num_masks):
+            gen = MaskGenerator(seed=base_seed + k)
+            mk = gen.generate_mask("variable_density", (h, w), acceleration_factor=accel)
+            mk = mk.to(xhat.device)
+            if ctx.reconstructor is not None:
+                yk = sense_forward(xhat, smaps=smaps, mask=mk)
+                rk = _single_channel_complex(ctx.reconstructor(yk, mk, smaps))
+            else:
+                yk = sense_forward(xhat, smaps=smaps, mask=mk)
+                rk = _single_channel_complex(sense_adjoint(yk, smaps=smaps, mask=mk))
+            acc += float((_norm(rk - xhat) / xn).detach())
+            n += 1
+        if n == 0:
             return NAN
+        return acc / n
 
 
 # ---------------------------------------------------------------------------
@@ -421,46 +435,43 @@ class CoilSubspaceOrthogonalEnergy:
         ctx = resolve_context(context, kwargs)
         if not ctx.has("y_kspace"):
             return NAN
-        try:
-            from spectramr.infrastructure.physics.fft_ops import ifft2c
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
 
-            y = ctx.y_kspace
-            assert y is not None
-            y = y if torch.is_complex(y) else y.to(torch.complex64)
-            if y.dim() != 4:
-                return NAN
-            num_coils = _coil_count(y)
-            if num_coils < 2:
-                return NAN  # single-coil — undefined
-
-            # Per-pixel coil vectors in image domain.
-            coil_imgs = ifft2c(y)  # [B, C, H, W] complex
-
-            smaps = ctx.coil_maps
-            if smaps is None:
-                from spectramr.infrastructure.physics.coil_sensitivity import (
-                    estimate_csm_espirit,
-                )
-
-                acs = min(24, y.shape[-2], y.shape[-1])
-                smaps = estimate_csm_espirit(y, num_coils, acs_size=acs)
-            smaps = smaps if torch.is_complex(smaps) else smaps.to(torch.complex64)
-
-            # V = normalised per-pixel coil vector (1-D signal subspace).
-            v = smaps  # [B, C, H, W]
-            vnorm = torch.sqrt((v.real**2 + v.imag**2).sum(dim=1, keepdim=True) + self.eps)
-            v = v / vnorm  # unit per pixel
-
-            # Projection of Y_coils onto span(V): (V^H y) V.
-            coeff = (torch.conj(v) * coil_imgs).sum(dim=1, keepdim=True)  # [B,1,H,W]
-            proj = coeff * v  # [B, C, H, W]
-            ortho = coil_imgs - proj
-
-            num = (ortho.real**2 + ortho.imag**2).sum()
-            den = (coil_imgs.real**2 + coil_imgs.imag**2).sum() + self.eps
-            return float((num / den).detach())
-        except Exception:
+        y = ctx.y_kspace
+        assert y is not None
+        y = y if torch.is_complex(y) else y.to(torch.complex64)
+        if y.dim() != 4:
             return NAN
+        num_coils = _coil_count(y)
+        if num_coils < 2:
+            return NAN  # single-coil — undefined
+
+        # Per-pixel coil vectors in image domain.
+        coil_imgs = ifft2c(y)  # [B, C, H, W] complex
+
+        smaps = ctx.coil_maps
+        if smaps is None:
+            from spectramr.infrastructure.physics.coil_sensitivity import (
+                estimate_csm_espirit,
+            )
+
+            acs = min(24, y.shape[-2], y.shape[-1])
+            smaps = estimate_csm_espirit(y, num_coils, acs_size=acs)
+        smaps = smaps if torch.is_complex(smaps) else smaps.to(torch.complex64)
+
+        # V = normalised per-pixel coil vector (1-D signal subspace).
+        v = smaps  # [B, C, H, W]
+        vnorm = torch.sqrt((v.real**2 + v.imag**2).sum(dim=1, keepdim=True) + self.eps)
+        v = v / vnorm  # unit per pixel
+
+        # Projection of Y_coils onto span(V): (V^H y) V.
+        coeff = (torch.conj(v) * coil_imgs).sum(dim=1, keepdim=True)  # [B,1,H,W]
+        proj = coeff * v  # [B, C, H, W]
+        ortho = coil_imgs - proj
+
+        num = (ortho.real**2 + ortho.imag**2).sum()
+        den = (coil_imgs.real**2 + coil_imgs.imag**2).sum() + self.eps
+        return float((num / den).detach())
 
 
 # ---------------------------------------------------------------------------
@@ -548,32 +559,29 @@ class AcquisitionOrderQuadraticVariation:
         ctx = resolve_context(context, kwargs)
         if not ctx.has("y_kspace"):
             return NAN
-        try:
-            y = ctx.y_kspace
-            assert y is not None
-            h, w = y.shape[-2], y.shape[-1]
-            order = self._sampled_columns(ctx, w)
-            n = int(order.numel())
-            if n < 2:
-                return NAN
-
-            # Coarse breakpoints over the acquisition order.
-            k = min(self.num_breaks, n)
-            idx = torch.linspace(1, n, steps=k).round().long().clamp(1, n)
-            idx = torch.unique(idx)
-
-            prev: Tensor | None = None
-            total = 0.0
-            for m in idx.tolist():
-                cols = order[:m].to(y.device).long()
-                xm = self._recon_prefix(ctx, cols, h, w)
-                if prev is not None:
-                    diff = xm - prev
-                    total += float((diff.real**2 + diff.imag**2).sum().detach())
-                prev = xm
-            return total
-        except Exception:
+        y = ctx.y_kspace
+        assert y is not None
+        h, w = y.shape[-2], y.shape[-1]
+        order = self._sampled_columns(ctx, w)
+        n = int(order.numel())
+        if n < 2:
             return NAN
+
+        # Coarse breakpoints over the acquisition order.
+        k = min(self.num_breaks, n)
+        idx = torch.linspace(1, n, steps=k).round().long().clamp(1, n)
+        idx = torch.unique(idx)
+
+        prev: Tensor | None = None
+        total = 0.0
+        for m in idx.tolist():
+            cols = order[:m].to(y.device).long()
+            xm = self._recon_prefix(ctx, cols, h, w)
+            if prev is not None:
+                diff = xm - prev
+                total += float((diff.real**2 + diff.imag**2).sum().detach())
+            prev = xm
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -657,29 +665,26 @@ class NullSpaceEnergyHallucination:
         ctx = resolve_context(context, kwargs)
         if target is None or not ctx.has("mask"):
             return NAN
-        try:
-            from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+        from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 
-            pred = _single_channel_complex(prediction)
-            tgt = _single_channel_complex(target)
-            if pred.shape != tgt.shape:
-                return NAN
-            err = pred - tgt  # complex [B,1,H,W]
-            total = (err.real**2 + err.imag**2).sum()
-            if float(total) < self.eps:
-                return NAN  # perfect recon: no error to decompose (pitfall #20)
-
-            m = ctx.mask.to(dtype=torch.float32, device=err.device)
-            if m.dim() == 2:
-                m = m[None, None]
-            elif m.dim() == 3:
-                m = m[:, None]
-            # P_null e = F^H (1 - M) F e — error in the UNMEASURED k-space lines.
-            null_img = ifft2c((1.0 - m) * fft2c(err))
-            null_energy = (null_img.real**2 + null_img.imag**2).sum()
-            return float((null_energy / total).clamp(0.0, 1.0).detach())
-        except Exception:
+        pred = _single_channel_complex(prediction)
+        tgt = _single_channel_complex(target)
+        if pred.shape != tgt.shape:
             return NAN
+        err = pred - tgt  # complex [B,1,H,W]
+        total = (err.real**2 + err.imag**2).sum()
+        if float(total) < self.eps:
+            return NAN  # perfect recon: no error to decompose (pitfall #20)
+
+        m = ctx.mask.to(dtype=torch.float32, device=err.device)
+        if m.dim() == 2:
+            m = m[None, None]
+        elif m.dim() == 3:
+            m = m[:, None]
+        # P_null e = F^H (1 - M) F e — error in the UNMEASURED k-space lines.
+        null_img = ifft2c((1.0 - m) * fft2c(err))
+        null_energy = (null_img.real**2 + null_img.imag**2).sum()
+        return float((null_energy / total).clamp(0.0, 1.0).detach())
 
 
 # ---------------------------------------------------------------------------
@@ -739,25 +744,22 @@ class InventedNullEnergy:
         ctx = resolve_context(context, kwargs)
         if not ctx.has("mask"):
             return NAN
-        try:
-            from spectramr.infrastructure.physics.fft_ops import fft2c
+        from spectramr.infrastructure.physics.fft_ops import fft2c
 
-            pred = _single_channel_complex(prediction)
-            k_pred = fft2c(pred)
-            m = ctx.mask
-            assert m is not None
-            if torch.is_complex(m):
-                m = m.real
-            m = m.to(dtype=torch.float32, device=k_pred.device)
-            if m.dim() == 2:
-                m = m[None, None]
-            elif m.dim() == 3:
-                m = m[:, None]
-            null_energy = _norm((1.0 - m) * k_pred)
-            total = _norm(k_pred) + self.eps
-            return float((null_energy / total).clamp(0.0, 1.0).detach())
-        except Exception:
-            return NAN
+        pred = _single_channel_complex(prediction)
+        k_pred = fft2c(pred)
+        m = ctx.mask
+        assert m is not None
+        if torch.is_complex(m):
+            m = m.real
+        m = m.to(dtype=torch.float32, device=k_pred.device)
+        if m.dim() == 2:
+            m = m[None, None]
+        elif m.dim() == 3:
+            m = m[:, None]
+        null_energy = _norm((1.0 - m) * k_pred)
+        total = _norm(k_pred) + self.eps
+        return float((null_energy / total).clamp(0.0, 1.0).detach())
 
 
 # ---------------------------------------------------------------------------
@@ -818,28 +820,123 @@ class FabricationExcess:
         ctx = resolve_context(context, kwargs)
         if target is None or not ctx.has("mask"):
             return NAN
-        try:
-            from spectramr.infrastructure.physics.fft_ops import fft2c
+        from spectramr.infrastructure.physics.fft_ops import fft2c
 
-            pred = _single_channel_complex(prediction)
-            tgt = _single_channel_complex(target)
-            if pred.shape != tgt.shape:
-                return NAN
-            k_err = fft2c(pred) - fft2c(tgt)
-            m = ctx.mask
-            assert m is not None
-            if torch.is_complex(m):
-                m = m.real
-            m = m.to(dtype=torch.float32, device=k_err.device)
-            if m.dim() == 2:
-                m = m[None, None]
-            elif m.dim() == 3:
-                m = m[:, None]
-            null_err = _norm((1.0 - m) * k_err)
-            denom = _norm(fft2c(tgt)) + self.eps
-            return float((null_err / denom).detach())
-        except Exception:
+        pred = _single_channel_complex(prediction)
+        tgt = _single_channel_complex(target)
+        if pred.shape != tgt.shape:
             return NAN
+        k_err = fft2c(pred) - fft2c(tgt)
+        m = ctx.mask
+        assert m is not None
+        if torch.is_complex(m):
+            m = m.real
+        m = m.to(dtype=torch.float32, device=k_err.device)
+        if m.dim() == 2:
+            m = m[None, None]
+        elif m.dim() == 3:
+            m = m[:, None]
+        null_err = _norm((1.0 - m) * k_err)
+        denom = _norm(fft2c(tgt)) + self.eps
+        return float((null_err / denom).detach())
+
+
+# ---------------------------------------------------------------------------
+# null_band_energy_deficit — how much of the unacquired band was left empty
+# ---------------------------------------------------------------------------
+@register_metric(
+    "null_band_energy_deficit",
+    aliases=["null_fill_deficit"],
+    requires_reference=True,
+    needs=("mask",),
+    direction="lower",
+)
+class NullBandEnergyDeficit:
+    r"""Unfilled fraction of the unacquired band's energy (↓, full-reference).
+
+    .. math::
+
+        \mathcal{D} = \max\!\left(0,\; 1 -
+        \frac{\lVert(\mathbf{1}-\mathbf{M})\odot\mathbf{F}\hat{\mathbf{x}}\rVert_2}
+             {\lVert(\mathbf{1}-\mathbf{M})\odot\mathbf{F}\mathbf{x}\rVert_2}\right)
+        \in [0,1]
+
+    A zero-filled reconstruction leaves the unacquired band empty and scores
+    **1.0**; one carrying the truth's null-band energy scores **0.0**. It is the
+    direct answer to "how much of what was missing did the model actually put
+    back?", and it is the one direction the rest of the battery cannot see: a
+    reconstruction whose null band is uniformly attenuated keeps ``ndcr`` at the
+    noise floor (hard DC pins the acquired lines), keeps ``nse_hall`` near 1
+    (all of its error *is* in the null band, whatever its size), and moves
+    ``eta_null`` only in proportion — none of them reports the deficit itself.
+
+    **Why the bare ratio is not what is registered.** The underlying quantity is
+    two-sided: below 1 is blur, above 1 is fabrication. ``direction`` admits only
+    ``"higher"``/``"lower"``, so a two-sided value registered under either label
+    would be read backwards by ``metric_higher_is_better`` and by every consumer
+    that resolves through it (``keep_best_n``, early stopping, the leaderboard).
+    Clamping at 0 makes the registered value monotone and honest, and the
+    fabrication direction keeps its existing single owner in
+    :class:`FabricationExcess` (non-negotiable 17) — read the two together.
+
+    **Scope.** Like ``eta_null`` this uses the *Fourier* sampling operator, so on
+    multi-coil SENSE data it is a dominant-subspace approximation (see
+    :class:`NullSpaceEnergyHallucination` for the size of that bias). Both the
+    reconstruction and any baseline it is compared against cross the identical
+    code, so the bias largely cancels in a ``zf_delta``.
+
+    Returns ``nan`` when ``mask`` or the reference is absent, on a shape
+    mismatch, or when the target's null band is empty (a fully-sampled
+    measurement has nothing to fill — a measurement-independent constant is not
+    a score, pitfall #9).
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        self.eps = eps
+
+    @property
+    def name(self) -> str:
+        return "null_band_energy_deficit"
+
+    @property
+    def higher_is_better(self) -> bool:
+        return False
+
+    def __call__(
+        self,
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> float:
+        ctx = resolve_context(context, kwargs)
+        if target is None or not ctx.has("mask"):
+            return NAN
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        pred = _single_channel_complex(prediction)
+        tgt = _single_channel_complex(target)
+        if pred.shape != tgt.shape:
+            return NAN
+        m = ctx.mask
+        assert m is not None
+        if torch.is_complex(m):
+            m = m.real
+        k_pred = fft2c(pred)
+        m = m.to(dtype=torch.float32, device=k_pred.device)
+        if m.dim() == 2:
+            m = m[None, None]
+        elif m.dim() == 3:
+            m = m[:, None]
+        null = 1.0 - m
+        target_null = _norm(null * fft2c(tgt))
+        # A fully-sampled mask leaves nothing to fill, so the ratio is 0/0.
+        # Report it as absent rather than as a perfect or a total deficit.
+        if float(target_null) <= self.eps:
+            return NAN
+        ratio = _norm(null * k_pred) / target_null
+        return float((1.0 - ratio).clamp(0.0, 1.0).detach())
 
 
 __all__ = [
@@ -849,6 +946,7 @@ __all__ = [
     "ForwardModelRoundTripStability",
     "InventedNullEnergy",
     "NormalisedDataConsistencyResidual",
+    "NullBandEnergyDeficit",
     "NullSpaceEnergyHallucination",
     "PseudoReplicaPartitionSNR",
 ]

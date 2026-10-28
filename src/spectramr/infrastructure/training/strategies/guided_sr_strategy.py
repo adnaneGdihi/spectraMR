@@ -350,19 +350,9 @@ class GuidedSuperResolutionStrategy(BaseTrainingStrategy, ReconstructionMixin, A
 
             total = sum(losses.values())
 
-            # Fail-fast on divergence. Previously a non-finite total was
-            # silently replaced with a fabricated ``requires_grad=True`` zero
-            # leaf, so the optimizer stepped on a disconnected zero gradient —
-            # training *looked* like it was progressing while learning nothing
-            # (pitfall #10). Surface the instability with the per-term breakdown.
-            if not torch.isfinite(total):
-                breakdown = {k: float(v.detach()) for k, v in losses.items()}
-                msg = (
-                    "GuidedSR gen loss is non-finite "
-                    f"(epoch={epoch}); per-term breakdown={breakdown}"
-                )
-                raise RuntimeError(msg)
-
+            # A non-finite total is left to the executor's pre-backward guard, the
+            # one owner of that rule; a second check here raised under AMP too,
+            # where the GradScaler is meant to skip the step (#1471).
             return total
 
         # Discriminator step (if available)
@@ -432,7 +422,8 @@ class GuidedSuperResolutionStrategy(BaseTrainingStrategy, ReconstructionMixin, A
     ) -> dict[str, float]:
         """Validation step for guided SR.
 
-        Uses center slice/slab as deterministic reference.
+        The reference is zeros with the training slab's shape: the HF ground
+        truth must not reach the generator input, or val_psnr measures a leak.
 
         Args:
             batch: Validation batch.
@@ -454,8 +445,11 @@ class GuidedSuperResolutionStrategy(BaseTrainingStrategy, ReconstructionMixin, A
         ulf_input = ulf_input.to(device, non_blocking=True)
         hf_target = hf_target.to(device, non_blocking=True)
 
-        # Use center slice/slab for deterministic validation
-        hf_reference = self._extract_reference(hf_target, mode="center_slab")
+        # Shape-only zero reference (no GT values); see the docstring.
+        ref_shape = list(hf_target.shape)
+        if hf_target.ndim == 5:
+            ref_shape[2] = min(self._ref_slab_size, hf_target.shape[2])
+        hf_reference = torch.zeros(ref_shape, device=device, dtype=ulf_input.dtype)
         combined_input = self._build_reference_input(ulf_input, hf_reference)
 
         with torch.no_grad():

@@ -1,6 +1,4 @@
 import logging
-
-logger = logging.getLogger(__name__)
 from functools import partial
 from math import prod
 
@@ -8,38 +6,7 @@ import torch
 from torch import nn
 from torch.amp import autocast
 
-# Try to import timm, fall back to basic LayerNorm if not available
-try:
-    from timm.layers import LayerNorm2d
-except ImportError:
-    logger.warning("timm not available. Using basic LayerNorm2d implementation.")
-
-    class LayerNorm2d(nn.LayerNorm):
-        """Basic LayerNorm2d implementation as fallback for timm.layers.LayerNorm2d"""
-
-        def __init__(self, num_features, eps=1e-6):
-            """__init__.
-
-            Args:
-                num_features (Any): Description.
-                eps (Any): Description.
-            """
-            super().__init__(num_features, eps=eps)
-
-        def forward(self, x):
-            # Reshape from (B, C, H, W) to (B, H, W, C) for LayerNorm
-            """forward.
-
-            Args:
-                x (Any): Description.
-            Returns:
-                Any: Description.
-            """
-            x = x.permute(0, 2, 3, 1)
-            x = super().forward(x)
-            # Reshape back to (B, C, H, W)
-            return x.permute(0, 3, 1, 2)
-
+from spectramr.models.layers.layer_norm_2d import LayerNorm2d
 
 from .fast_kan_conv import FastKANConv1DLayer, FastKANConv2DLayer, FastKANConv3DLayer
 from .kabn_conv import KABNConv1DLayer, KABNConv2DLayer, KABNConv3DLayer
@@ -64,6 +31,8 @@ from .relukan_bottleneck_conv import (
 )
 from .relukan_conv import ReLUKANConv1DLayer, ReLUKANConv2DLayer, ReLUKANConv3DLayer
 from .wav_kan import WavKANConv1DLayer, WavKANConv2DLayer, WavKANConv3DLayer
+
+logger = logging.getLogger(__name__)
 
 
 def _init_coords_nd(*dims):

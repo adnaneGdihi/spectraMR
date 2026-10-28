@@ -8,7 +8,10 @@ for efficient and effective image restoration.
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -207,7 +210,7 @@ class NAFBlock(nn.Module):
 
 
 @register_model(name="nafnet", training_mode="reconstruction", spatial_dims=(2,))
-class NAFNetGenerator(IGenerator, nn.Module):
+class NAFNetGenerator(GradCheckpointingMixin, IGenerator, nn.Module):
     """NAFNet Generator for MRI Cold Diffusion.
 
     Refactored for MRI Physics:
@@ -357,6 +360,7 @@ class NAFNetGenerator(IGenerator, nn.Module):
         # Tanh is strictly forbidden for MRI reconstruction.
         self.output_activation = nn.Identity()
 
+
     def _get_sinusoidal_embedding(self, timesteps: torch.Tensor, dim: int) -> torch.Tensor:
         """Generate sinusoidal timestep embeddings."""
         import math
@@ -426,31 +430,31 @@ class NAFNetGenerator(IGenerator, nn.Module):
                     "model_kwargs.time_embedding_dim, which is the width the "
                     "generator builds contrast_embedding at."
                 )
-            if emb is None:
-                emb = contrast_emb
-            else:
-                if contrast_emb.shape[0] != emb.shape[0]:
-                    contrast_emb = contrast_emb[: emb.shape[0]]
-                emb = emb + contrast_emb
+            emb = fuse_contrast_embedding(emb, contrast_emb, owner="NAFNetGenerator")
 
         # Input
         x = self.intro(x)
 
         # Encoder
+        ckpt = self._checkpointing_active()
         encs = []
         for encoder, down in zip(self.encoders, self.downs, strict=False):
-            x = encoder(x, emb)
+            x = checkpoint(encoder, x, emb, use_reentrant=False) if ckpt else encoder(x, emb)
             encs.append(x)
             x = down(x)
 
         # Middle
-        x = self.middle_blks(x, emb)
+        x = (
+            checkpoint(self.middle_blks, x, emb, use_reentrant=False)
+            if ckpt
+            else self.middle_blks(x, emb)
+        )
 
         # Decoder
         for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1], strict=False):
             x = up(x)
             x = x + enc_skip
-            x = decoder(x, emb)
+            x = checkpoint(decoder, x, emb, use_reentrant=False) if ckpt else decoder(x, emb)
 
         # Output
         x = self.ending(x)

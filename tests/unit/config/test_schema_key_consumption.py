@@ -39,6 +39,7 @@ import pytest
 
 from spectramr.config.key_reachability import ReachabilityVerdict, is_key_reachable
 from spectramr.config.settings import TrainingSettings
+from spectramr.models.losses.weights import accessor_read_paths
 
 TOOLS = Path(__file__).resolve().parents[3] / "tools" / "audit"
 sys.path.insert(0, str(TOOLS))
@@ -194,9 +195,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "undersampling.use_distributed",  # -> #680
         "acquisition.active.query_strategy",
         "audit.ksd.bootstrap_replications",
-        "checkpoint.pretrained_path",
-        "checkpoint.resume_training",
-        "checkpoint.save_on_epoch",
         "data.augmentation.cutmix_alpha",
         # Deferred to the physics lane, not dead by accident: wiring k-space
         # acceleration augmentation needs fft_ops.fft2c (non-negotiable 2) and
@@ -241,9 +239,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "logging.log_activations",
         "logging.log_validation_graphs",
         "logging.log_weights",
-        "logging.progress_bar_enabled",
-        "logging.progress_bar_no_progress",
-        "logging.progress_bar_on_warning",
         "logging.save_images_per_epoch",
         # Refused, not merely inert (#675): a non-null value now RAISES at
         # construction (LoggingConfigSchema._refuse_deferred_wandb). Still
@@ -292,7 +287,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "metrics.compute_limits_of_agreement_lower",
         "metrics.compute_limits_of_agreement_upper",
         "metrics.paradigm_specific_metrics",
-        "metrics.track_best_metric",
         "model.architecture.bridge.pretrained_source",
         "model.architecture.decoder.pretrained_source",
         "model.architecture.encoder.pretrained_source",
@@ -369,8 +363,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "physics.relaxation_priors.t2_table_uri",
         "training.bloch_synth.opaque_band",
         "training.bloch_synth.target_field_tesla",
-        "training.cs_mno.architecture.lift_dim",
-        "training.diffusion.degradation_dynamics",
         "training.diffusion.enable_diffusion_amp",
         "training.field_cocycle.triple_sampling",
         "training.gan.progan_gradient_penalty_lambda",
@@ -404,7 +396,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "training.multi.stages.stage_config.metrics.compute_limits_of_agreement_lower",
         "training.multi.stages.stage_config.metrics.compute_limits_of_agreement_upper",
         "training.multi.stages.stage_config.metrics.paradigm_specific_metrics",
-        "training.multi.stages.stage_config.metrics.track_best_metric",
         "training.multi.stages.stage_config.optimization.memory.enable_fragmentation_mitigation",
         "training.multi.stages.stage_config.optimization.optimizer.generator_learning_rate",
         "training.multi.stages.stage_config.optimization.memory.monitoring_interval",
@@ -415,17 +406,13 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "training.vae.latent_regularization_weight",
         "training.vae.n_embeddings",
         "training.vae.use_latent_regularization",
-        "validation.enable_validation_augmentation",
         # `validation.frequency_steps` was here until phase 10a. It did not get
         # wired -- it got MERGED: it and `eval_interval` were one cadence with
         # one default, 58 arms declared both and none disagreed, so the fold
         # sends both to `validation.schedule.interval_steps`, which the training
         # loop already read. The key is gone, so the entry would be stale.
-        "validation.num_visualizations",
-        "validation.use_training_loss",
         "validation.validation_dir",
         "validation.validation_metric",
-        "validation.visualization_dir",
     }
 )
 
@@ -463,9 +450,22 @@ def configured_keys() -> list[str]:
 
 @pytest.fixture(scope="module")
 def unreachable(configured_keys: list[str]) -> dict[str, ReachabilityVerdict]:
-    """Configured keys whose every read was positively shown unable to run."""
+    """Configured keys whose every read was positively shown unable to run.
+
+    The loss-weight accessor's read set is injected (#1925). ``is_key_reachable``
+    finds a read by its field name as a source *token*, and
+    ``build_loss_weight_table`` names none of the 112 paths it reads -- it builds
+    every name at runtime from ``LAMBDA_SECTIONS`` and ``model_fields_set``. 52 of
+    them therefore looked exactly like "nothing reads this". They are declared
+    beside the reader, checked against what the reader executes by
+    ``test_weights.py``, and passed in here because ``config/`` may not import
+    ``models/`` (NN5). This test file is the one place that legitimately sees both.
+    """
+    external_reads = accessor_read_paths()
     return {
-        key: verdict for key in configured_keys if not (verdict := is_key_reachable(key)).reachable
+        key: verdict
+        for key in configured_keys
+        if not (verdict := is_key_reachable(key, external_reads=external_reads)).reachable
     }
 
 
@@ -590,7 +590,7 @@ class TestReachabilityAwareConsumption:
 
     This is a **ratchet on findings, not a suppression list -- for keys not
     already tracked elsewhere.** ``test_no_new_unreachable_reads`` below also
-    exempts anything already in ``KNOWN_UNCONSUMED``: those 119 keys are
+    exempts anything already in ``KNOWN_UNCONSUMED``: those keys are
     pre-existing rg-tracked debt, and re-litigating each one here at the same
     time the rg gate above is measuring it would just double-count the same
     finding under two ratchets. That exemption is a **fixed, already-measured
@@ -644,11 +644,9 @@ class TestReachabilityAwareConsumption:
             "losses.gan.enable_gradient_penalty",
             "metrics.compute_precision_recall",
             "physics.bloch_simulation",
-            "physics.coil_sensitivity.estimation_method",
             "physics.phase_correction.estimation_method",
             "physics.pinn.boundary_condition",
             "physics.relaxation_priors",
-            "training.cs_mno",
             "training.multi.stages.stage_config.loss.gan.enable_gradient_penalty",
         }
     )
@@ -665,6 +663,10 @@ class TestReachabilityAwareConsumption:
             # referenced from no live scope -- only from tests/. The schema
             # description asserts it "is called" from the training loop.
             "metrics.metric_interval",
+            # Read only by `IterationCounterService` (iteration_counter_service.py:263-269),
+            # which nothing constructs, so 29 YAMLs set it to 1 expecting a cap that
+            # never applies (#2951).
+            "training.max_steps_per_epoch",
             # Named at scheduler_system.py:505 (a signature default), :522 and
             # :546 -- all inside `AdaptiveWarmupScheduler`, an unrelated
             # learning-rate scheduler nothing constructs. The leaf names merely
@@ -679,6 +681,28 @@ class TestReachabilityAwareConsumption:
             # existing capability, unwired. Surfaced when the entry was pruned
             # from KNOWN_UNCONSUMED, where it had been masking a real read.
             "optimization.memory.safety_margin",
+            # The second loss accessor, not yet declared (#1925 covers only the
+            # first). The single token site, `loss_recommender.py:523`, is not
+            # even a read -- it is a keyword ARGUMENT constructing a
+            # `ReconstructionLossesConfig`, inside `LossRecommender`, a class
+            # nothing constructs. The real read is
+            # `LossConfigSchema.get_enabled_losses`, which builds the field name
+            # at runtime (`enable_field = f"enable_{loss_name}"` at loss.py:1735,
+            # :1745, :1761, :1773, :1794) and is live from `loss_builder.py:229`
+            # and `training_loop.py:1078`. Measured, not inferred: with
+            # `enable_l1` ON, moving `lambda_l1` moves the returned dict; with it
+            # OFF, nothing moves -- so the flag is read and it gates a weight.
+            #
+            # It is NOT in `accessor_read_paths()` on purpose. That export is
+            # derived from the two constants `build_loss_weight_table` iterates,
+            # so it cannot drift from its reader. `get_enabled_losses` has no
+            # such constant: its enable-field mapping is ~85 lines of inline
+            # `elif` literals inside a nested closure, and deriving a read set
+            # from it means hoisting that table out of a live loss resolver --
+            # a refactor of what trains, not of what audits. Declared here with
+            # its consumer cited instead; delete this entry when that accessor
+            # declares its own reads.
+            "losses.reconstruction.enable_l1",
         }
     )
 
@@ -732,13 +756,21 @@ class TestReachabilityAwareConsumption:
 
         Deleting an entry here is legitimate exactly when the key was WIRED.
         Say so in the commit message.
+
+        `losses.reconstruction.enable_l1` was ADDED by #1925 rather than
+        deleted, which the seal also makes visible. It is not a key being
+        quieted: it moved here from the gate's live red set once the first loss
+        accessor declared its reads, because its own reader -- the second
+        accessor -- still declares nothing. The entry cites that reader.
         """
         assert (
             frozenset(
                 {
                     "ema.stability_threshold",
+                    "losses.reconstruction.enable_l1",
                     "metrics.metric_interval",
                     "optimization.memory.safety_margin",
+                    "training.max_steps_per_epoch",
                 }
             )
             == self.UNREACHABLE_READ
@@ -940,22 +972,6 @@ class TestUnconsumedKnobsSaySoInTheirDescription:
         ),
         ("spectramr.config.schemas.ema", "EMAConfigSchema", "adaptation_rate"),
         ("spectramr.config.schemas.metrics", "MetricsConfigSchema", "best_metric_mode"),
-        ("spectramr.config.schemas.metrics", "MetricsConfigSchema", "track_best_metric"),
-        (
-            "spectramr.config.schemas.validation",
-            "ValidationConfigSchema",
-            "num_visualizations",
-        ),
-        (
-            "spectramr.config.schemas.validation",
-            "ValidationConfigSchema",
-            "visualization_dir",
-        ),
-        (
-            "spectramr.config.schemas.validation",
-            "ValidationConfigSchema",
-            "use_training_loss",
-        ),
     ]
 
     @pytest.mark.parametrize(("module", "cls_name", "field"), _DOCUMENTED)

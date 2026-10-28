@@ -20,6 +20,7 @@ import torch
 from spectramr.models.blocks.normalization import (
     AdaptiveGroupNorm,
     AdaptiveInstanceNorm,
+    ComplexAdaptiveGroupNorm,
     ConditionalBatchNorm,
     get_adaptive_groups,
 )
@@ -180,3 +181,20 @@ def test_ada_gn_shape_matrix(channels: int, h: int, w: int) -> None:
     emb = torch.randn(1, 8)
     out = norm(x, emb)
     assert out.shape == x.shape
+
+
+# ---------------------------------------------------------------------------
+# ComplexAdaptiveGroupNorm: no additive term (a shift is a k-space delta)
+# ---------------------------------------------------------------------------
+
+
+class TestComplexAdaptiveGroupNormHasNoShift:
+    def test_zero_in_zero_out_with_trained_projection(self):
+        norm = ComplexAdaptiveGroupNorm(channels=8, num_groups=4, emb_channels=16)
+        torch.nn.init.normal_(norm.proj.weight)
+        torch.nn.init.normal_(norm.proj.bias)
+        out = norm(torch.zeros(2, 8, 8, 8), torch.randn(2, 16))
+        assert torch.count_nonzero(out) == 0
+
+    def test_projection_emits_one_scale_per_complex_channel(self):
+        assert ComplexAdaptiveGroupNorm(8, 4, 16).proj.out_features == 4

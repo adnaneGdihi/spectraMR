@@ -139,3 +139,72 @@ def test_samples_get_independent_masks() -> None:
     torch.manual_seed(3)
     mask = strat._create_patch_mask(2, 64, 64, torch.device("cpu"))
     assert not torch.equal(mask[0], mask[1])
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: it hands env.losses to a computer that accepts losses_dict and never reads it.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``ReconstructionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert MaskedPretrainingStrategy.__dict__["folds_image_losses"] is False
+    assert MaskedPretrainingStrategy.__dict__["inline_losses"] == frozenset({"l1", "l2"})
+
+
+def test_the_mae_computer_discards_the_losses_dict_it_accepts() -> None:
+    """The empirical half of issue #1918: route 4 is a facade for this computer.
+
+    ``MaskedPretrainingStrategy._compute_losses_impl`` forwards ``env.losses`` to
+    ``UnifiedMAELossComputer.compute`` as ``losses_dict``. The keyword is accepted
+    (``**kwargs``) and never read, so every module ``LossBuilder`` built from
+    ``losses.image_losses`` is silently discarded. Source text cannot show that --
+    the call site looks identical to a real fold -- so this runs the REAL computer
+    and watches.
+
+    The second half is the control that keeps this from being vacuous: the same
+    spy handed to a computer that DOES fold is called exactly once and lands in
+    ``components``. Without it a malformed spy would make the first half pass
+    while proving nothing (memory: same-helper-on-both-sides-is-vacuous).
+
+    ``ssim`` is the probe, not ``l1``: the MAE computer emits its own ``l1_loss``
+    component, so a name-in-components assertion on ``l1`` passes while the spy is
+    never called -- the exact false green this test exists to avoid.
+    """
+    import torch
+
+    from spectramr.models.losses.computers import (
+        UnifiedMAELossComputer,
+        UnifiedReconstructionLossComputer,
+    )
+
+    pred = torch.randn(2, 1, 8, 8)
+    target = torch.randn(2, 1, 8, 8)
+
+    def make_spy() -> tuple[list[int], object]:
+        calls: list[int] = []
+
+        def spy(pred_: torch.Tensor, target_: torch.Tensor, **_: object) -> torch.Tensor:
+            calls.append(1)
+            return (pred_ - target_).abs().mean()
+
+        return calls, spy
+
+    dropped_calls, dropped_spy = make_spy()
+    dropped = UnifiedMAELossComputer(config=None, device=torch.device("cpu")).compute(
+        pred=pred, target=target, losses_dict={"ssim": dropped_spy}
+    )
+    assert dropped_calls == [], "UnifiedMAELossComputer called a losses_dict entry -- it now folds"
+    assert not [k for k in dropped.components if "ssim" in k], (
+        f"declared loss reached components after all: {sorted(dropped.components)}"
+    )
+
+    folded_calls, folded_spy = make_spy()
+    folded = UnifiedReconstructionLossComputer(config=None, device=torch.device("cpu")).compute(
+        pred=pred, target=target, losses_dict={"ssim": folded_spy}
+    )
+    assert folded_calls == [1], "the control computer did not fold -- the spy itself is broken"
+    assert [k for k in folded.components if "ssim" in k]

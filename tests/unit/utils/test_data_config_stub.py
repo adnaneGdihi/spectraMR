@@ -35,7 +35,8 @@ def test_every_block_is_a_real_schema_instance() -> None:
             f"stub `{name}` is {type(instance).__name__}, schema declares "
             f"{getattr(declared, '__name__', declared)}"
         )
-        assert type(instance).__module__ == data_mod.__name__
+        # The class schemas.data mounts (some, e.g. augmentation, live in a sibling module).
+        assert getattr(data_mod, type(instance).__name__, None) is type(instance)
 
 
 def test_the_stub_covers_every_sub_block_the_schema_mounts() -> None:

@@ -29,15 +29,17 @@ Registration (returned to the caller — do NOT edit strategy_factory.py here)::
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.nn.functional import l1_loss
 
 from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
 from spectramr.models.blocks.physics_prompt import PhysicsPromptEmbedding
 
 from .mixins.utils import _callable_accepts_kwarg
+from .owned_param_groups import add_owned_param_group
 from .reconstruction import ReconstructionTrainingStrategy
 
 
@@ -48,6 +50,22 @@ class UniversalReconstructionStrategy(ReconstructionTrainingStrategy):
     can be instantiated through the standard ``ReconstructionTrainingStrategy``
     path without any new schema keys (``training_mode`` alone selects it).
     """
+
+    # parallel_compat: The prompt embedder is a bare group on opt_g, refused under ddp. It is
+    # built only when a batch carries acquisition_params, which a multi-domain mixture supplies
+    # per domain, so ranks need not build it at the same step.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("_prompt_embedder", OWNED_PARAM_GROUP),)
+        return (*super().owned_module_declarations(config), *own)
+
+    #: Loss ownership (issue #1918). Computes l1_loss(pred, target) inline -- image space, against the target --
+    #: and returns it as the whole objective. Declared so the fold skips it.
+    #: CAVEAT: the weight is hardcoded 1.0, not the declared lambda_l1.
+    inline_losses: ClassVar[frozenset[str]] = frozenset({"l1"})
+    folds_image_losses: ClassVar[bool] = False
 
     #: Acquisition-parameter layout the physics prompt expects.
     PROMPT_PARAM_ORDER = ("TR", "TE", "flip_angle", "field_strength_T")
@@ -70,7 +88,9 @@ class UniversalReconstructionStrategy(ReconstructionTrainingStrategy):
                 existing = {p for g in opt.param_groups for p in g["params"]}
                 new_params = [p for p in embedder.parameters() if p not in existing]
                 if new_params:
-                    opt.add_param_group({"params": new_params})
+                    add_owned_param_group(
+                        self, opt, {"params": new_params}, owner="its prompt embedder"
+                    )
         return embedder
 
     def _compute_losses_impl(

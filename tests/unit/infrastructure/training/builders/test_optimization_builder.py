@@ -89,6 +89,8 @@ class _Opt:
 
     def __init__(self, **kw: Any) -> None:
         self.precision = SimpleNamespace(enabled=False, dtype=None)
+        # The scheduler's default period counts optimizer steps, so it reads this.
+        self.gradient = SimpleNamespace(accumulation_steps=1)
         self.lr_scheduler_strategy = "cosine"
         self.lr_scheduler_kwargs: dict[str, Any] = {}
         self.scheduler: dict[str, Any] | None = None
@@ -155,7 +157,8 @@ class TestSchedulerWiring:
         assert b.scheduler_spec.params["T_max"] == 30000
 
     def test_no_scheduler_block_builds_nothing(self):
-        b = _builder(_Opt(scheduler=None))
+        # The stand-in's default lr_scheduler_strategy counts as a declared family.
+        b = _builder(_Opt(scheduler=None, lr_scheduler_strategy=None))
         b.build_schedulers()
         assert b._schedulers == {}
         assert b.scheduler_spec is None
@@ -233,7 +236,7 @@ class TestOptimizerKwargs:
 class TestGradScalerIsNoLongerFabricated:
     """The builder used to hand the pipeline a scaler nothing ever called.
 
-    Not a leaked allocation: ``CheckpointDirector`` persisted ITS state, so
+    Not a leaked allocation: the pre-1.0 checkpoint writer persisted ITS state, so
     every fp16 checkpoint carried an untouched scale of 65536 and a zero
     growth-tracker while the live ``NativeScaler`` / ``ComplexGradScaler`` on
     the strategy was never written. A fabricated field is worse than a missing
@@ -262,15 +265,22 @@ class TestGradScalerIsNoLongerFabricated:
         builder.build_grad_scaler()
         assert builder._scaler is sentinel
 
-    def test_the_single_reader_is_the_checkpoint_director(self):
+    def test_the_single_reader_is_capture_resolve_scaler(self):
         """Guards the SSOT: if a second resolver appears, the two disagree
         about which scaler a resume restores."""
-        import inspect
+        import re
+        from pathlib import Path
 
-        from spectramr.infrastructure.builders.directors import checkpoint_director
+        from spectramr.infrastructure import checkpointing
 
-        source = inspect.getsource(checkpoint_director)
-        assert source.count("def _resolve_scaler") == 1
+        definer = re.compile(r"^\s*def _?resolve_scaler\b", re.MULTILINE)
+        package = Path(checkpointing.__file__).parent
+        definers = sorted(
+            str(p.relative_to(package))
+            for p in package.rglob("*.py")
+            if definer.search(p.read_text(encoding="utf-8"))
+        )
+        assert definers == ["capture.py"]
 
 
 class TestTheStandInDoesNotDivergeFromTheSchema:
@@ -433,7 +443,30 @@ class TestCreateSingleOptimizerHonoursTheRegistryTable:
         )
 
     def test_unknown_name_still_raises_with_the_available_list(self) -> None:
-        with pytest.raises(ValueError, match=r"[Uu]nknown optimizer"):
+        with pytest.raises(ValueError, match=r"(?i)unknown optimizer"):
             OptimizationBuilder.create_single_optimizer(
                 self._params(), optimizer_type="nonexistent_xyz"
             )
+
+
+class TestParameterFreeGenerator:
+    """A declared parameter-free solver gets no optimizer; anything else still needs one."""
+
+    class _Solver(nn.Module):
+        parameter_free = True
+
+    def test_declared_solver_builds_no_optimizer_and_validates(self):
+        b = OptimizationBuilder(_Cfg(_Opt()), models={"generator": self._Solver()})
+        optimizers, schedulers, _ = b.build_optimizers().build_schedulers().validate().build()
+        assert optimizers == {} and schedulers == {}
+
+    def test_an_undeclared_empty_model_still_raises(self):
+        b = OptimizationBuilder(_Cfg(_Opt()), models={"generator": nn.Sequential()})
+        with pytest.raises(ValueError, match="does not declare parameter_free"):
+            b.build_optimizers()
+
+    def test_a_network_still_requires_its_optimizer(self):
+        b = OptimizationBuilder(_Cfg(_Opt()), models={"generator": nn.Linear(2, 2)})
+        b._optimizers = {}
+        with pytest.raises(ValueError, match="No optimizers created"):
+            b.validate()

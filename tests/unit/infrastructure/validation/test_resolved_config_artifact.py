@@ -306,6 +306,7 @@ def test_payload_carries_a_declared_block_that_revalidates_to_the_resolved_setti
     from spectramr.config.settings import TrainingSettings
     from spectramr.infrastructure.validation.resolved_config_artifact import (
         DECLARED_KEY,
+        LR_SCHEDULE_KEY,
         build_resolved_config_payload,
     )
 
@@ -314,7 +315,8 @@ def test_payload_carries_a_declared_block_that_revalidates_to_the_resolved_setti
     declared = payload[DECLARED_KEY]
     assert declared and set(declared) < set(payload)
     rebuilt = TrainingSettings.model_validate(declared)
-    resolved = {k: v for k, v in payload.items() if k not in ("_ledger", DECLARED_KEY)}
+    additive = ("_ledger", DECLARED_KEY, LR_SCHEDULE_KEY)
+    resolved = {k: v for k, v in payload.items() if k not in additive}
     assert rebuilt.model_dump(mode="json") == resolved
 
 
@@ -373,3 +375,127 @@ def test_has_declared_block_reads_the_artifact_without_rebuilding(tmp_path):
         )
         is True
     )
+
+
+class TestTheDumpStatesTheBuiltSchedule:
+    """#2760: a defaulted ``lr_scheduler_strategy`` dumped as ``"cosine"`` on runs
+    that built no scheduler, so the artifact read as an annealed run."""
+
+    def test_an_optimizer_only_arm_dumps_no_scheduler(self):
+        from spectramr.infrastructure.validation.resolved_config_artifact import LR_SCHEDULE_KEY
+
+        settings = _settings()
+        assert settings.optimization.lr_scheduler_strategy == "cosine", "precondition"
+        payload = build_resolved_config_payload(settings)
+        assert payload["optimization"]["lr_scheduler_strategy"] is None
+        assert payload[LR_SCHEDULE_KEY] == {"scheduler": None}
+        assert "lr_scheduler_strategy" not in payload["_declared"]["optimization"]
+
+    def test_a_declared_strategy_is_left_as_declared(self):
+        from spectramr.infrastructure.validation.resolved_config_artifact import LR_SCHEDULE_KEY
+
+        extra = {"optimization": {"learning_rate": 1e-4, "lr_scheduler_strategy": "cosine"}}
+        payload = build_resolved_config_payload(_settings(extra))
+        assert payload["optimization"]["lr_scheduler_strategy"] == "cosine"
+        assert payload[LR_SCHEDULE_KEY]["scheduler"] == "cosine_annealing"
+
+    def test_a_scheduler_declared_elsewhere_replaces_the_defaulted_family(self):
+        extra = {
+            "optimization": {
+                "learning_rate": 1e-4,
+                "scheduler_type": "step",
+                "scheduler": {"step_size": 5},
+            }
+        }
+        payload = build_resolved_config_payload(_settings(extra))
+        assert payload["optimization"]["lr_scheduler_strategy"] == "step_lr"
+
+    def test_an_unresolvable_scheduler_is_recorded_not_raised(self, monkeypatch):
+        """The audit builds this payload for every arm, so the failure belongs to
+        the check that owns it, not to the ledger block."""
+        import spectramr.infrastructure.training.scheduler_resolution as _sr
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.infrastructure.validation.resolved_config_artifact import LR_SCHEDULE_KEY
+
+        def boom(_config):
+            raise ConfigurationError("planted")
+
+        monkeypatch.setattr(_sr, "resolved_schedule_record", boom)
+        payload = build_resolved_config_payload(_settings())
+        assert payload[LR_SCHEDULE_KEY] == {"unresolved": "planted"}
+        assert payload["optimization"]["lr_scheduler_strategy"] == "cosine"
+
+
+# ----------------------------------------------------------------------
+# A run's snapshot outlives the removal of a key it declared (#2842)
+# ----------------------------------------------------------------------
+#
+# `early_stopping.check_interval` was removed on 2026-10-09 (#1555, #2805). 16 of
+# the 24 n2n/self_supervised arms declared it until then, so every run trained
+# from them carries it in its `_declared` block, and predict refused to rebuild
+# those runs. Nothing read the key, so dropping it rebuilds the run that trained.
+
+
+def _snapshot(tmp_path, declared):
+    from spectramr.infrastructure.validation.resolved_config_artifact import DECLARED_KEY
+
+    path = tmp_path / "resolved_config.json"
+    path.write_text(json.dumps({DECLARED_KEY: declared, "_ledger": {}}))
+    return path
+
+
+def _declared_with(**blocks):
+    import copy
+
+    data = copy.deepcopy(BASE)
+    for block, values in blocks.items():
+        data.setdefault(block, {}).update(values)
+    return data
+
+
+def test_a_snapshot_with_a_retired_key_rebuilds_with_one_warning(tmp_path, caplog):
+    import logging
+
+    from spectramr.infrastructure.validation.resolved_config_artifact import (
+        settings_from_resolved_config,
+    )
+
+    declared = _declared_with(early_stopping={"enabled": True, "check_interval": 5120})
+    with caplog.at_level(logging.WARNING):
+        rebuilt = settings_from_resolved_config(_snapshot(tmp_path, declared))
+
+    assert rebuilt.early_stopping.enabled is True
+    warned = [r.getMessage() for r in caplog.records if "removed since the run" in r.getMessage()]
+    assert len(warned) == 1, warned
+    assert "`early_stopping.check_interval` (removed 2026-10-09" in warned[0]
+
+
+def test_the_same_key_in_an_authored_yaml_is_still_refused(tmp_path):
+    import yaml
+
+    from spectramr.config.settings import TrainingSettings
+
+    path = tmp_path / "arm.yaml"
+    authored = _declared_with(early_stopping={"enabled": True, "check_interval": 5120})
+    path.write_text(yaml.safe_dump({"config_version": "1.0", **authored}))
+    with pytest.raises(ValueError, match=r"early_stopping\.check_interval"):
+        TrainingSettings.from_yaml(str(path))
+
+
+@pytest.mark.parametrize(
+    ("declared", "named"),
+    [
+        (_declared_with(no_such_block={"x": 1}), "no_such_block"),
+        (_declared_with(training={"seed": 3}), "seed"),
+    ],
+    ids=["unknown-root-key", "moved-key"],
+)
+def test_a_key_that_was_not_removed_still_fails_the_snapshot(tmp_path, declared, named):
+    """Only `removals.py` keys are dropped: an unknown key, or one that moved to a
+    new path and whose value would matter there, still refuses the rebuild."""
+    from spectramr.infrastructure.validation.resolved_config_artifact import (
+        settings_from_resolved_config,
+    )
+
+    with pytest.raises(ValueError, match=named):
+        settings_from_resolved_config(_snapshot(tmp_path, declared))

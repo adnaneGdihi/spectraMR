@@ -11,9 +11,6 @@ import torch
 from spectramr.models.blocks.block_registry import (
     DiffusionAttentionStrategy as AttentionBlock,
 )
-from spectramr.models.diffusion.architectures.enhanced_deep_unet import (
-    EnhancedDeepDiffusionUNet as _EnhancedDeepDiffusionUNet,
-)
 from spectramr.models.diffusion.architectures.score_based_unet import ScoreBasedUNet
 
 
@@ -47,33 +44,6 @@ class StandardDiffusionUNet(ScoreBasedUNet):
         """Get output shape for given input shape."""
         # Assume same spatial dimensions for diffusion models
         return (input_shape[0], self.out_channels, input_shape[2], input_shape[3])
-
-
-class EnhancedDeepDiffusionUNet(_EnhancedDeepDiffusionUNet):
-    """Enhanced Deep Diffusion U-Net with parameter mapping."""
-
-    def __init__(self, in_channels=1, out_channels=1, time_emb_dim=256, **kwargs):
-        # Map parameter names to EnhancedDeepDiffusionUNet parameters
-        # Use smaller model for testing to avoid tensor size issues
-        """__init__.
-
-        Args:
-            in_channels (Any): Description.
-            out_channels (Any): Description.
-            time_emb_dim (Any): Description.
-        """
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            model_channels=64,  # Smaller base channels
-            channel_mult=(1,),  # Single level for testing
-            num_res_blocks=1,  # Fewer residual blocks
-            **kwargs,
-        )
-
-    def get_parameter_count(self):
-        """Get total parameter count."""
-        return sum(p.numel() for p in self.parameters())
 
 
 class DiffusionPrior(torch.nn.Module):
@@ -241,6 +211,5 @@ class DiffusionPrior(torch.nn.Module):
 __all__ = [
     "AttentionBlock",
     "DiffusionPrior",
-    "EnhancedDeepDiffusionUNet",
     "StandardDiffusionUNet",
 ]

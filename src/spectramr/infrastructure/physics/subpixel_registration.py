@@ -32,7 +32,7 @@ import math
 
 import torch
 
-from spectramr.infrastructure.physics.fft_ops import fftnc, ifftnc, spatial_dims
+from spectramr.infrastructure.physics.fft_ops import centred_freqs, fftnc, ifftnc, spatial_dims
 
 __all__ = [
     "centred_fft",
@@ -44,12 +44,7 @@ __all__ = [
 ]
 
 
-def centred_freqs(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Cycles-per-pixel for a ``fft2c`` axis of length ``n`` (DC at ``n // 2``)."""
-    return (torch.arange(n, device=device, dtype=dtype) - n // 2) / n
-
-
-# ``spatial_dims`` / ``centred_fft`` / ``centred_ifft`` are re-exports, not
+# ``centred_freqs``, ``spatial_dims`` / ``centred_fft`` / ``centred_ifft`` are re-exports, not
 # definitions: their owner is ``fft_ops``, the FFT SSOT (non-negotiable 2/17).
 # They lived here while ``fft_ops`` exposed no CENTRED N-D pair; #1350 moved the
 # implementation there verbatim, so this module no longer calls ``torch.fft``
@@ -87,9 +82,9 @@ def fourier_shift(
     """Translate ``x`` by ``shifts`` via a k-space phase ramp.
 
     Args:
-        x: ``[B, C, H, W]`` or ``[B, C, H, W, D]``, real or complex.
+        x: ``[B, C, H, W]`` or ``[B, C, D, H, W]``, real or complex.
         shifts: ``[B, C, ndim]`` ordered like the spatial axes, so ``(dy, dx)``
-            in 2-D and ``(dy, dx, dz)`` in 3-D. Positive moves content toward
+            in 2-D and ``(dz, dy, dx)`` in 3-D. Positive moves content toward
             increasing index. Per-sample and per-channel, so a frame stack takes
             a different shift on every frame with no loop.
         voxel_mm: When given, ``shifts`` is read in MILLIMETRES and converted

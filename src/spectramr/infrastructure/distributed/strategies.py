@@ -139,7 +139,11 @@ class _BaseStrategy:
         return DefaultCheckpointAdapter()
 
     def provenance(self, ctx: ParallelContext) -> dict[str, Any]:
-        return {"strategy": self.name, "world_size": ctx.world_size}
+        return {
+            "strategy": self.name,
+            "world_size": ctx.world_size,
+            "timeout_seconds": ctx.parallel.timeout_seconds,
+        }
 
 
 class NoParallelStrategy(_BaseStrategy):
@@ -180,6 +184,29 @@ class DataParallelStrategy(_BaseStrategy):
         )
 
 
+def wrap_with_ddp(module: nn.Module, parallel: Any, device: Any) -> nn.Module:
+    """The one ``DistributedDataParallel`` construction, shared with strategy-owned modules.
+
+    Construction broadcasts rank 0's parameters, so every rank must call it at the same
+    point in the run (#2629).
+    """
+    from torch.nn.parallel import DistributedDataParallel
+
+    _require_process_group("ddp")
+    device_ids = (
+        [device.index]
+        if getattr(device, "type", None) == "cuda" and device.index is not None
+        else None
+    )
+    return DistributedDataParallel(
+        module,
+        device_ids=device_ids,
+        find_unused_parameters=parallel.find_unused_parameters,
+        gradient_as_bucket_view=parallel.gradient_as_bucket_view,
+        static_graph=parallel.static_graph,
+    )
+
+
 class DDPStrategy(_BaseStrategy):
     """``DistributedDataParallel`` — one process per device."""
 
@@ -193,25 +220,11 @@ class DDPStrategy(_BaseStrategy):
 
     def adopt(self, models, optimizers, schedulers, ctx):
         _require_process_group(self.name)
-        from torch.nn.parallel import DistributedDataParallel
-
-        device = ctx.device
-        device_ids = (
-            [device.index]
-            if getattr(device, "type", None) == "cuda" and device.index is not None
-            else None
-        )
         wrapped = dict(models)
         for name, module in models.items():
             if module is None:
                 continue
-            wrapped[name] = DistributedDataParallel(
-                module,
-                device_ids=device_ids,
-                find_unused_parameters=ctx.parallel.find_unused_parameters,
-                gradient_as_bucket_view=ctx.parallel.gradient_as_bucket_view,
-                static_graph=ctx.parallel.static_graph,
-            )
+            wrapped[name] = wrap_with_ddp(module, ctx.parallel, ctx.device)
             logger.info("[Parallel] Wrapped %s with DDP", name)
         return ParallelizationResult(
             models=wrapped,
@@ -256,7 +269,9 @@ class FSDPStrategy(_BaseStrategy):
             _convert_sync_batchnorm(models)
         for name in list(models):
             if models[name] is not None:
-                models[name] = maybe_wrap_with_fsdp(models[name], ctx.parallel)
+                models[name] = maybe_wrap_with_fsdp(
+                    models[name], ctx.parallel, ctx.config.optimization.precision
+                )
                 logger.info("[Parallel] Wrapped %s with FSDP", name)
         return models
 
@@ -288,6 +303,8 @@ class FSDPStrategy(_BaseStrategy):
         return FSDPCheckpointAdapter()
 
     def provenance(self, ctx):
+        from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision
+
         record = super().provenance(ctx)
         fsdp = ctx.parallel.fsdp
         record["fsdp"] = {
@@ -296,7 +313,9 @@ class FSDPStrategy(_BaseStrategy):
             "transformer_layer_cls": list(fsdp.transformer_layer_cls),
             "min_num_params": fsdp.min_num_params,
             "cpu_offload": fsdp.cpu_offload,
-            "mixed_precision": fsdp.mixed_precision,
+            "mixed_precision": resolve_fsdp_precision(fsdp, ctx.config.optimization.precision),
+            "reduce_dtype": fsdp.reduce_dtype,
+            "buffer_dtype": fsdp.buffer_dtype,
             "activation_checkpointing": fsdp.activation_checkpointing,
             "use_orig_params": fsdp.use_orig_params,
         }
@@ -379,17 +398,11 @@ class DeepSpeedStrategy(_BaseStrategy):
         return _wrap_with_distributed_samplers(loaders)
 
     def checkpoint_adapter(self, ctx):
-        # `save_consolidated_best` is read HERE and nowhere else: it is a
-        # spectramr concern, so build_deepspeed_config correctly omits it from
-        # the rendered ds_config, and anything reconstructing the adapter from
-        # provenance would silently see the default.
         from spectramr.infrastructure.distributed.checkpoint_adapters import (
             DeepSpeedCheckpointAdapter,
         )
 
-        return DeepSpeedCheckpointAdapter(
-            save_consolidated_best=ctx.parallel.deepspeed.save_consolidated_best
-        )
+        return DeepSpeedCheckpointAdapter()
 
     def provenance(self, ctx):
         from spectramr.infrastructure.distributed.deepspeed_backend import (

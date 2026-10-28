@@ -73,11 +73,8 @@ def _stamp_reporting_failure(run_dir: Path, exc: BaseException, logger_: Any) ->
 def run_unconfigured_report(run_dir: Path, logger_: Any) -> None:
     """Tables-only floor for a run that configured no reporting.
 
-    Until now this path ran ``MetricsReportGenerator`` — unconditionally, with no
-    config gate at all — while the canonical ``generate_report`` sat behind
-    ``reporting.enabled``, which defaults False. So the *legacy* generator ran on
-    every run and the *canonical* pipeline almost never did, which is the SSOT
-    inverted. One entry point now, with a graduated default.
+    ``generate_report`` is the one report entry point; this is its graduated
+    default for a run whose YAML sets no ``reporting.enabled``.
 
     Deliberately cheap: no figures, no HTML, no plotly. A run that wants figures
     declares ``reporting.enabled: true``.

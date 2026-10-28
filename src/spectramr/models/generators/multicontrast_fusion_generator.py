@@ -615,9 +615,11 @@ class MultiContrastFusionGenerator(nn.Module, IGenerator):
         n_img = self.input_channels * (2 if self.instrument_channels else 1)
         cond = x[:, n_img:] if self.conditioning_per_stream else None
         anatomy = self._encode_streams(x[:, : self.input_channels], cond)
+        # Only the marker keys read the instrument features; encoding them
+        # for content/none would be discarded compute.
         instrument = (
             self._encode_streams(x[:, self.input_channels : n_img], cond)
-            if self.instrument_channels
+            if self.instrument_channels and self.attention_keys == "marker"
             else None
         )
 
@@ -756,12 +758,10 @@ class MultiContrastAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # Attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=getattr(self.dropout, "p", 0.0) if self.training else 0.0,
+            scale=self.scale,
+        )
 
         # Concatenate heads
         attn_output = attn_output.transpose(1, 2).reshape(

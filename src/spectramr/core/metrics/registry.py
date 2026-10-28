@@ -24,7 +24,7 @@ Example:
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 
 import torch
 
@@ -96,6 +96,10 @@ class MetricsRegistry:
     _needs: ClassVar[dict[str, tuple[str, ...]]] = {}
     _requires_context: ClassVar[dict[str, bool]] = {}
     _requires_reference: ClassVar[dict[str, bool]] = {}
+    # Whether the metric measures phase and so must be handed a complex tensor
+    # (``requires_complex``). The computer routes the complex image to these and
+    # refuses a magnitude-only one (#867).
+    _requires_complex: ClassVar[dict[str, bool]] = {}
     # Workflow tagging (imaging-regime × task). Keyed by canonical metric name;
     # ``None`` values mean unannotated. Consumed by the maturity ledger to
     # assert an EVAL_ONLY regime is backed by real, registered metrics.
@@ -119,6 +123,7 @@ class MetricsRegistry:
         "_needs",
         "_requires_context",
         "_requires_reference",
+        "_requires_complex",
         "_workflow_tags",
     )
 
@@ -144,6 +149,7 @@ class MetricsRegistry:
         direction: str | None = None,
         workflows: frozenset[Regime] | None = None,
         tasks: frozenset[Task] | None = None,
+        requires_complex: bool | None = None,
     ) -> Any:
         """Decorator to register a metric class.
 
@@ -170,6 +176,10 @@ class MetricsRegistry:
             workflows: Imaging regimes this metric is specific to. ``None`` =
                 agnostic (skip). Backs EVAL_ONLY regimes in the maturity ledger.
             tasks: Tasks this metric is specific to. ``None`` = agnostic.
+            requires_complex: ``True`` for a metric that measures phase and so
+                must receive a complex (or ``[B, 2, H, W]`` real/imag) tensor.
+                If ``None``, falls back to a ``requires_complex`` class
+                attribute, else ``False``.
 
         Returns:
             Decorator function
@@ -261,13 +271,13 @@ class MetricsRegistry:
 
             declares_own = any("higher_is_better" in base.__dict__ for base in metric_cls.__mro__)
             if not declares_own and name in METRIC_HIGHER_IS_BETTER:
-                metric_cls.higher_is_better = METRIC_HIGHER_IS_BETTER[name]
+                metric_cls.higher_is_better = METRIC_HIGHER_IS_BETTER[name]  # type: ignore[attr-defined]
             elif not declares_own and direction is not None:
                 # Spec-fidelity convenience: ``direction="higher"/"lower"`` maps
                 # to the boolean SSOT only when no other source declares it, so
                 # the metric_directions ↔ METRIC_SPECS parity test never sees a
                 # third, conflicting direction source.
-                metric_cls.higher_is_better = direction == "higher"
+                metric_cls.higher_is_better = direction == "higher"  # type: ignore[attr-defined]
 
             # --- capability metadata (spec §1.2) --------------------------
             # Resolve from the decorator kwarg first, else a matching class
@@ -291,6 +301,11 @@ class MetricsRegistry:
             cls._needs[name] = resolved_needs
             cls._requires_context[name] = resolved_requires_ctx
             cls._requires_reference[name] = resolved_requires_ref
+            cls._requires_complex[name] = (
+                requires_complex
+                if requires_complex is not None
+                else bool(getattr(metric_cls, "requires_complex", False))
+            )
 
             if aliases:
                 for alias in aliases:
@@ -385,7 +400,7 @@ class MetricsRegistry:
         device = kwargs.get("device")
         if device is not None and isinstance(instance, torch.nn.Module):
             instance = instance.to(device)
-        return instance
+        return cast(IMetric, instance)
 
     @classmethod
     def list_available(cls) -> list[str]:
@@ -459,9 +474,26 @@ class MetricsRegistry:
         return declared is None or regime in declared
 
     @classmethod
+    def input_signature(cls, name: str) -> str:
+        """The metric class's declared ``INPUT_SIGNATURE`` (``"image_pair"`` when undeclared).
+
+        Raises ``KeyError`` on an unknown name: a caller routing by signature must not
+        route a typo as an image-pair metric.
+        """
+        canonical = cls._canonical(name)
+        if canonical not in cls._metrics:
+            raise KeyError(f"Unknown metric: '{name}'.")
+        return str(getattr(cls._metrics[canonical], "INPUT_SIGNATURE", "image_pair"))
+
+    @classmethod
     def requires_reference(cls, name: str) -> bool:
         """True iff ``name`` needs a reference ``target`` (full-reference)."""
         return cls._requires_reference.get(cls._canonical(name), True)
+
+    @classmethod
+    def requires_complex(cls, name: str) -> bool:
+        """True iff ``name`` measures phase and must be handed a complex tensor."""
+        return cls._requires_complex.get(cls._canonical(name), False)
 
     @classmethod
     def clear(cls) -> None:
@@ -533,6 +565,7 @@ def register_metric(
     direction: str | None = None,
     workflows: frozenset[Regime] | None = None,
     tasks: frozenset[Task] | None = None,
+    requires_complex: bool | None = None,
 ) -> Any:
     """Decorator to register a metric.
 
@@ -556,6 +589,7 @@ def register_metric(
         direction=direction,
         workflows=workflows,
         tasks=tasks,
+        requires_complex=requires_complex,
     )
 
 

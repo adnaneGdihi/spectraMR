@@ -18,18 +18,21 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-from spectramr.infrastructure.physics.data_consistency_layer import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 from spectramr.models.blocks.complex_blocks import ComplexResBlock
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
 from spectramr.models.blocks.residual import ResidualBlock as ResBlock
 from spectramr.models.blocks.swin import SwinBlock
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
 @register_model(name="swin_diff_rec", training_mode="diffusion", spatial_dims=(2,))
-class SwinDiffRec(nn.Module, IGenerator):
+class SwinDiffRec(GradCheckpointingMixin, nn.Module, IGenerator):
     """
     Swin-Diff-Rec Backbone.
 
@@ -220,7 +223,8 @@ class SwinDiffRec(nn.Module, IGenerator):
             self.final_conv = nn.Conv2d(base_channels, out_channels, 3, padding=1)
 
         # 5. Data Consistency
-        self.dc_layer = DataConsistencyLayer()
+        self.dc_layer = MaskedReplacementDataConsistency()
+
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """get_output_shape.
@@ -281,7 +285,11 @@ class SwinDiffRec(nn.Module, IGenerator):
         # count, so leave that path unscaled.
         _max_t = kwargs.get("max_timesteps") if acceleration is None else None
         t_sin = sinusoidal_timestep_embedding(
-            cond_input.squeeze(-1), self.emb_dim, max_timesteps=_max_t
+            cond_input.squeeze(-1),
+            self.emb_dim,
+            max_timesteps=_max_t,
+            scale=kwargs.get("timestep_scale", "unit_interval") if acceleration is None
+            else "unit_interval",
         )
         emb = self.time_pos_enc(t_sin)
 
@@ -298,17 +306,16 @@ class SwinDiffRec(nn.Module, IGenerator):
                     "model_kwargs.time_embedding_dim (the generator builds "
                     "contrast_embedding at that width)."
                 )
-            if contrast_emb.shape[0] != emb.shape[0]:
-                contrast_emb = contrast_emb[: emb.shape[0]]
-            emb = emb + contrast_emb
+            emb = fuse_contrast_embedding(emb, contrast_emb, owner="SwinDiffRec")
 
         # 2. Encoder
+        ckpt = self._checkpointing_active()
         h = self.start_conv(x)
         skips = [h]
 
         for i, blocks in enumerate(self.down_blocks):
             for block in blocks:
-                h = block(h, emb)
+                h = checkpoint(block, h, emb, use_reentrant=False) if ckpt else block(h, emb)
             skips.append(h)
             if i < len(self.downs):
                 h = self.downs[i](h)
@@ -319,7 +326,11 @@ class SwinDiffRec(nn.Module, IGenerator):
         h_flat = h.flatten(2).transpose(1, 2)  # [B, H*W, C]
 
         for swin_block in self.swin_blocks:
-            h_flat = swin_block(h_flat, input_resolution=(H, W))
+            h_flat = (
+                checkpoint(swin_block, h_flat, (H, W), use_reentrant=False)
+                if ckpt
+                else swin_block(h_flat, input_resolution=(H, W))
+            )
 
         h = h_flat.transpose(1, 2).view(B, C, H, W)
 
@@ -351,7 +362,7 @@ class SwinDiffRec(nn.Module, IGenerator):
                 h = torch.cat([h, skip], dim=1)
 
             for block in blocks:
-                h = block(h, emb)
+                h = checkpoint(block, h, emb, use_reentrant=False) if ckpt else block(h, emb)
 
         # 5. Output
         h = self.final_norm(h)

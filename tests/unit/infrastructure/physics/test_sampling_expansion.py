@@ -11,8 +11,8 @@ Modes / classes covered:
 * ``KSpaceAccelerator`` concrete subclasses: ``UniformCartesianKSpaceAccelerator``,
   ``PartialFourierKSpaceAccelerator``, ``VDCartesian1DAccelerator``,
   ``VDCartesian2DGaussianAccelerator``, ``VDCartesianCAVAAccelerator``,
-  ``RadialKSpaceAccelerator``, ``SpiralKSpaceAccelerator``,
-  ``GoldenAngleRadialKSpaceAccelerator``, ``RandomCartesianKSpaceAccelerator``,
+  ``RadialKSpaceAccelerator`` (also behind ``golden_angle``), ``SpiralKSpaceAccelerator``,
+  ``RandomCartesianKSpaceAccelerator``,
   ``LinearKSpaceAccelerator``, ``LowPassAccelerator``,
   ``NestedKSpaceAccelerator``, ``VariableDensityKSpaceAccelerator``,
   ``FractionalVariableDensityAccelerator``, ``LearnedPatternAccelerator``.
@@ -44,7 +44,6 @@ from spectramr.infrastructure.physics.sampling import (
     SUPPORTED_ACCELERATION_TYPES,
     ColdDiffusionAccelerator,
     FractionalVariableDensityAccelerator,
-    GoldenAngleRadialKSpaceAccelerator,
     KSpaceAccelerator,
     LearnedPatternAccelerator,
     LinearKSpaceAccelerator,
@@ -381,7 +380,7 @@ class TestUniformCartesianAccelerator:
 
     def test_invalid_line_axis_raises(self) -> None:
         with pytest.raises(ValueError, match="line_axis"):
-            UniformCartesianKSpaceAccelerator(line_axis="z")  # type: ignore[arg-type]
+            UniformCartesianKSpaceAccelerator(num_timesteps=1000, line_axis="z")  # type: ignore[arg-type]
 
     def test_invalid_num_timesteps_raises(self) -> None:
         with pytest.raises(ValueError, match="num_timesteps"):
@@ -431,7 +430,7 @@ class TestVDCartesian1DAccelerator:
 
     def test_invalid_line_axis(self) -> None:
         with pytest.raises(ValueError, match="line_axis"):
-            VDCartesian1DAccelerator(line_axis="diagonal")  # type: ignore[arg-type]
+            VDCartesian1DAccelerator(num_timesteps=1000, line_axis="diagonal")  # type: ignore[arg-type]
 
 
 class TestVDCartesian2DGaussianAccelerator:
@@ -478,47 +477,42 @@ class TestRadialKSpaceAccelerator:
     SHAPE = (1, 64, 64)
 
     def test_basic_contract(self) -> None:
-        acc = RadialKSpaceAccelerator(num_timesteps=10, max_acceleration=4.0, center_fraction=0.08)
-        mask = acc.get_acceleration_mask(self.SHAPE, timestep=5)
+        acc = RadialKSpaceAccelerator(num_timesteps=4, max_acceleration=4.0, center_fraction=0.08)
+        mask = acc.get_acceleration_mask(self.SHAPE, timestep=2)
         assert mask.shape == self.SHAPE
         assert mask.dtype == torch.bool
         assert mask.sum().item() > 0
 
     def test_center_preserved(self) -> None:
-        acc = RadialKSpaceAccelerator(num_timesteps=10, max_acceleration=4.0, center_fraction=0.1)
-        mask = acc.get_acceleration_mask(self.SHAPE, timestep=9)
+        acc = RadialKSpaceAccelerator(num_timesteps=4, max_acceleration=4.0, center_fraction=0.1)
+        mask = acc.get_acceleration_mask(self.SHAPE, timestep=3)
         H, W = self.SHAPE[1:]
         assert mask[0, H // 2, W // 2].item()
 
-    @pytest.mark.xfail(
-        reason="Worker-authored; radial-accelerator density-progression assertion "
-        "doesn't match the current sampling distribution. Needs revisit on cluster.",
-        strict=False,
-    )
     def test_progressive_density(self) -> None:
-        """Higher timestep → more degradation → fewer samples."""
-        acc = RadialKSpaceAccelerator(num_timesteps=20, max_acceleration=8.0, center_fraction=0.05)
+        """Higher timestep → more degradation → fewer samples; t=0 is the identity."""
+        acc = RadialKSpaceAccelerator(num_timesteps=8, max_acceleration=8.0, center_fraction=0.05)
         f_start = _sampling_fraction(acc.get_acceleration_mask(self.SHAPE, 0))
-        f_end = _sampling_fraction(acc.get_acceleration_mask(self.SHAPE, 19))
-        assert f_start >= f_end
+        f_end = _sampling_fraction(acc.get_acceleration_mask(self.SHAPE, 7))
+        assert f_start == 1.0
+        assert f_start > f_end
 
 
-class TestGoldenAngleRadialKSpaceAccelerator:
-    SHAPE = (1, 64, 64)
-
-    def test_basic_contract(self) -> None:
-        acc = GoldenAngleRadialKSpaceAccelerator(num_timesteps=10, max_acceleration=4.0, seed=42)
-        mask = acc.get_acceleration_mask(self.SHAPE, timestep=5)
-        assert mask.shape == self.SHAPE
-        assert mask.dtype == torch.bool
+class TestGoldenAngleKey:
+    def test_golden_angle_is_the_radial_accelerator(self) -> None:
+        """Radial is golden-angle radial (#612): one class serves both keys."""
+        acc = ColdDiffusionAccelerator(
+            num_timesteps=4, acceleration_type="golden_angle", max_acceleration=4.0
+        )
+        assert type(acc.accelerator) is RadialKSpaceAccelerator
 
 
 class TestSpiralKSpaceAccelerator:
     SHAPE = (1, 64, 64)
 
     def test_basic_contract(self) -> None:
-        acc = SpiralKSpaceAccelerator(num_timesteps=10, max_acceleration=4.0, center_fraction=0.08)
-        mask = acc.get_acceleration_mask(self.SHAPE, timestep=5)
+        acc = SpiralKSpaceAccelerator(num_timesteps=4, max_acceleration=4.0, center_fraction=0.08)
+        mask = acc.get_acceleration_mask(self.SHAPE, timestep=2)
         assert mask.shape == self.SHAPE
         assert mask.dtype == torch.bool
         assert mask.sum().item() > 0
@@ -593,14 +587,14 @@ class TestPartialFourierKSpaceAccelerator:
     SHAPE = (1, 96, 96)
 
     def test_basic_contract(self) -> None:
-        acc = PartialFourierKSpaceAccelerator(pf_fraction=0.75)
+        acc = PartialFourierKSpaceAccelerator(num_timesteps=1000, pf_fraction=0.75)
         mask = acc.get_acceleration_mask(self.SHAPE, timestep=5)
         assert mask.shape == self.SHAPE
         assert mask.dtype == torch.bool
 
     def test_density_matches_pf_fraction(self) -> None:
         pf_fraction = 0.75
-        acc = PartialFourierKSpaceAccelerator(pf_fraction=pf_fraction, line_axis="y")
+        acc = PartialFourierKSpaceAccelerator(num_timesteps=1000, pf_fraction=pf_fraction, line_axis="y")
         mask = acc.get_acceleration_mask(self.SHAPE, timestep=0)
         frac = _sampling_fraction(mask)
         # PF samples a contiguous block; small ACS overhead may inflate it.
@@ -608,17 +602,17 @@ class TestPartialFourierKSpaceAccelerator:
 
     def test_pf_fraction_out_of_range_raises(self) -> None:
         with pytest.raises(ValueError, match="Partial Fourier"):
-            PartialFourierKSpaceAccelerator(pf_fraction=0.3)
+            PartialFourierKSpaceAccelerator(num_timesteps=1000, pf_fraction=0.3)
         with pytest.raises(ValueError, match="Partial Fourier"):
-            PartialFourierKSpaceAccelerator(pf_fraction=1.5)
+            PartialFourierKSpaceAccelerator(num_timesteps=1000, pf_fraction=1.5)
 
     def test_invalid_line_axis_raises(self) -> None:
         with pytest.raises(ValueError, match="line_axis"):
-            PartialFourierKSpaceAccelerator(line_axis="z")  # type: ignore[arg-type]
+            PartialFourierKSpaceAccelerator(num_timesteps=1000, line_axis="z")  # type: ignore[arg-type]
 
     def test_max_acceleration_capped_at_two(self) -> None:
         """Per source docs, PF max acceleration is theoretically 2.0."""
-        acc = PartialFourierKSpaceAccelerator(pf_fraction=0.5, max_acceleration=10.0)
+        acc = PartialFourierKSpaceAccelerator(num_timesteps=1000, pf_fraction=0.5, max_acceleration=10.0)
         assert acc.max_acceleration == 2.0
 
 
@@ -680,12 +674,12 @@ class TestFractionalVariableDensityAccelerator:
         assert mask.shape == self.SHAPE
 
     def test_base_acceleration_is_min(self) -> None:
-        acc = FractionalVariableDensityAccelerator(min_acceleration=2.0, max_acceleration=8.0)
+        acc = FractionalVariableDensityAccelerator(num_timesteps=1000, min_acceleration=2.0, max_acceleration=8.0)
         assert acc.base_acceleration == 2.0
 
     def test_min_acceleration_clamped(self) -> None:
         # min_acceleration < 1.0 is silently clamped to 1.0
-        acc = FractionalVariableDensityAccelerator(min_acceleration=0.1, max_acceleration=8.0)
+        acc = FractionalVariableDensityAccelerator(num_timesteps=1000, min_acceleration=0.1, max_acceleration=8.0)
         assert acc.min_acceleration == 1.0
 
 
@@ -818,7 +812,7 @@ class TestColdDiffusionAccelerator:
 
     def test_unknown_type_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown acceleration type"):
-            ColdDiffusionAccelerator(acceleration_type="totally_not_real")
+            ColdDiffusionAccelerator(num_timesteps=1000, acceleration_type="totally_not_real")
 
     @pytest.mark.xfail(
         reason="Worker-authored; apply_acceleration's 3D input contract may have "
@@ -870,23 +864,41 @@ class TestColdDiffusionAccelerator:
         )
         assert cd.seed == 42
 
-    def test_mask_direction_compat(self) -> None:
-        """'mask_direction' kwarg is mapped to line_axis."""
-        cd = ColdDiffusionAccelerator(
-            num_timesteps=10,
-            acceleration_type="uniform_cartesian",
-            mask_direction="phase",
-            seed=42,
-        )
-        assert cd.accelerator.line_axis == "y"
+    @pytest.mark.parametrize(
+        ("axis", "phase", "readout"), [(-1, "x", "y"), (-2, "y", "x")]
+    )
+    def test_mask_direction_resolves_through_the_phase_encode_axis(
+        self, axis: int, phase: str, readout: str
+    ) -> None:
+        """'phase'/'readout' map onto line_axis through the declared axis (#2160)."""
+        for direction, expected in (("phase", phase), ("readout", readout)):
+            cd = ColdDiffusionAccelerator(
+                num_timesteps=10,
+                acceleration_type="uniform_cartesian",
+                mask_direction=direction,
+                phase_encode_axis=axis,
+                seed=42,
+            )
+            assert cd.accelerator.line_axis == expected
 
-        cd2 = ColdDiffusionAccelerator(
-            num_timesteps=10,
-            acceleration_type="uniform_cartesian",
-            mask_direction="readout",
-            seed=42,
+    def test_phase_without_a_declared_axis_raises(self) -> None:
+        with pytest.raises(ValueError, match="measure_phase_encode_axis"):
+            ColdDiffusionAccelerator(
+                num_timesteps=10, acceleration_type="uniform_cartesian", mask_direction="phase"
+            )
+
+    def test_raw_axis_names_need_no_declaration(self) -> None:
+        cd = ColdDiffusionAccelerator(
+            num_timesteps=10, acceleration_type="uniform_cartesian", mask_direction="x"
         )
-        assert cd2.accelerator.line_axis == "x"
+        assert cd.accelerator.line_axis == "x"
+
+    def test_the_axis_is_consumed_without_a_direction(self) -> None:
+        """Every family takes **kwargs, so an unpopped axis would vanish silently."""
+        cd = ColdDiffusionAccelerator(
+            num_timesteps=10, acceleration_type="uniform_cartesian", phase_encode_axis=-1
+        )
+        assert not hasattr(cd.accelerator, "phase_encode_axis")
 
     def test_supported_acceleration_types_present(self) -> None:
         # The registry must expose at least the documented set.
@@ -980,7 +992,8 @@ class TestAcceleratorMemoization:
         expected[:, sel // 16, sel % 16] = True
         assert torch.equal(mask.bool(), expected)
 
-    def test_radial_binary_search_runs_once_per_timestep(self, monkeypatch) -> None:
+    def test_radial_ordering_is_built_once_per_grid(self, monkeypatch) -> None:
+        """One golden-angle ordering per grid; every rung after that is a cache hit."""
         from spectramr.infrastructure.physics import trajectories as traj_mod
 
         calls = {"n": 0}
@@ -994,15 +1007,12 @@ class TestAcceleratorMemoization:
             traj_mod.TrajectoryFactory, "get_radial_trajectory", staticmethod(_counting)
         )
 
-        acc = RadialKSpaceAccelerator(num_timesteps=10, max_acceleration=4.0)
+        acc = RadialKSpaceAccelerator(num_timesteps=4, max_acceleration=4.0)
         shape = (1, 24, 24)
-        acc.get_acceleration_mask(shape, timestep=5)
-        first = calls["n"]  # 12 search + 1 final rasterization
-        acc.get_acceleration_mask(shape, timestep=5)
-        second = calls["n"] - first
-        assert first >= 13  # binary search executed on the cold cache
-        assert second == 1  # cached: only the final rasterization remains
-        assert acc._spoke_cache  # populated
+        for t in (1, 2, 3, 2):
+            acc.get_acceleration_mask(shape, timestep=t)
+        assert calls["n"] == 1
+        assert set(acc._sample_counts) == {(24, 24, 1), (24, 24, 2), (24, 24, 3)}
 
 
 def test_low_pass_is_reachable_from_config() -> None:

@@ -11,9 +11,7 @@ from spectramr.infrastructure.physics.degradation_chain import (
     UnapplicableAxisError,
     UnreplayableAxisError,
 )
-from spectramr.infrastructure.physics.digital_twin_extensions import (
-    is_identity_at_theta_zero,
-)
+from spectramr.infrastructure.physics.degradations import is_identity_at_theta_zero
 
 
 def _chain() -> DegradationChain:
@@ -117,13 +115,31 @@ def test_complex_gaussian_has_a_declared_nonzero_floor():
 
 
 def test_to_digital_twin_config_lists_every_axis_with_a_degenerate_range():
+    from spectramr.infrastructure.physics.digital_twin_simulator import NATIVE_DEGRADATION_AXES
+
     cfg = _chain().to_digital_twin_config()
     assert cfg["progressive_degradations"] == ["complex_gaussian", "t2star_blur"]
     assert cfg["degradation_ranges"] == {
-        "noise": (0.0, 0.0),  # the simulator's own stage — see the test below
+        # every native stage is silenced — see the noise test below
+        **dict.fromkeys(NATIVE_DEGRADATION_AXES, (0.0, 0.0)),
         "complex_gaussian": (0.4, 0.4),
         "t2star_blur": (0.25, 0.25),
     }
+
+
+def test_emitted_block_silences_a_native_stage_the_consumer_enables():
+    """A stage the fit never saw (here B1) must not replay at full strength."""
+    from spectramr.config.schemas.physics import DigitalTwinConfig
+    from spectramr.infrastructure.physics.digital_twin_simulator import DigitalTwinSimulator
+
+    vol = torch.zeros(1, 1, 32, 32)
+    vol[0, 0, 8:24, 8:24] = 1.0
+    chain = DegradationChain(links=(ChainLink(axis="complex_gaussian", theta=0.0),))
+    cfg = DigitalTwinConfig(**{**chain.to_digital_twin_config(), "enable_b1": True})
+    sim = DigitalTwinSimulator.from_config(cfg, (32, 32))
+    replayed, _markers, clean = sim(vol.to(torch.complex64), degradation_only=True, seed=0)
+    fitted = chain.apply(clean, seed=0)
+    assert ((replayed - fitted).abs().norm() / fitted.abs().norm()).item() < 1e-4
 
 
 def test_every_chain_axis_appears_in_the_emitted_ranges():
@@ -251,8 +267,8 @@ def test_emitted_config_pins_theta_in_the_real_simulator(monkeypatch):
     Without this test the calibration artifact is an unverified claim: a degenerate
     range that silently tracked ``cf`` would still produce a plausible image.
     """
-    from spectramr.infrastructure.physics import digital_twin_extensions as dte
     from spectramr.infrastructure.physics import digital_twin_simulator as dts
+    from spectramr.infrastructure.physics.degradations import registry as dte
 
     real_apply = dte.apply_degradation  # capture BEFORE patching
     chain = _chain()

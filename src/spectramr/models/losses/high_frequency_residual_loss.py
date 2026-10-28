@@ -36,24 +36,33 @@ def _gaussian_kernel_1d(sigma: float, *, truncate: float = 3.0) -> torch.Tensor:
     Returns a tensor of shape ``[1, 1, K]`` ready for ``F.conv2d``-style
     separable convolution.
     """
-    radius = max(1, int(math.ceil(truncate * sigma)))
+    radius = max(1, math.ceil(truncate * sigma))
     coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
     kernel = torch.exp(-(coords**2) / (2.0 * sigma**2))
     kernel = kernel / kernel.sum()
     return kernel.view(1, 1, -1)
 
 
-def _gaussian_lowpass(x: torch.Tensor, *, sigma: float, truncate: float = 3.0) -> torch.Tensor:
+def _gaussian_lowpass(
+    x: torch.Tensor,
+    *,
+    sigma: float,
+    truncate: float = 3.0,
+    kernel_1d: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Separable depthwise Gaussian lowpass on ``[B, C, H, W]`` tensors.
 
     Works on real-valued tensors (magnitude images). For complex tensors
     apply to magnitude and phase separately or convert to ``[B, 2C, H, W]``
-    real-imag stack.
+    real-imag stack. ``kernel_1d`` lets a caller pass the prebuilt
+    ``_gaussian_kernel_1d(sigma, truncate=truncate)`` instead of rebuilding it.
     """
     if x.dim() != 4:
         raise ValueError(f"_gaussian_lowpass expects [B, C, H, W], got shape {tuple(x.shape)}.")
-    B, C, H, W = x.shape
-    kernel_1d = _gaussian_kernel_1d(sigma, truncate=truncate).to(x.dtype).to(x.device)
+    C = x.shape[1]
+    if kernel_1d is None:
+        kernel_1d = _gaussian_kernel_1d(sigma, truncate=truncate)
+    kernel_1d = kernel_1d.to(device=x.device, dtype=x.dtype)
     radius = kernel_1d.shape[-1] // 2
     # Expand to [C, 1, 1, K] / [C, 1, K, 1] for depthwise conv.
     kernel_h = kernel_1d.view(1, 1, 1, -1).expand(C, 1, 1, -1).contiguous()
@@ -80,6 +89,8 @@ class HighFrequencyResidualLoss(nn.Module):
     See ``TODO/backlog_multi_contrast_remaining.md`` §Item 2.
     """
 
+    kernel_1d: torch.Tensor
+
     def __init__(
         self,
         *,
@@ -97,6 +108,9 @@ class HighFrequencyResidualLoss(nn.Module):
         self.sigma = sigma
         self.truncate = truncate
         self.loss_type = loss_type
+        self.register_buffer(
+            "kernel_1d", _gaussian_kernel_1d(sigma, truncate=truncate), persistent=False
+        )
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor, *args: object, **kwargs: object
@@ -114,8 +128,12 @@ class HighFrequencyResidualLoss(nn.Module):
             raise ValueError(
                 f"pred and target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}."
             )
-        pred_lp = _gaussian_lowpass(pred, sigma=self.sigma, truncate=self.truncate)
-        target_lp = _gaussian_lowpass(target, sigma=self.sigma, truncate=self.truncate)
+        pred_lp = _gaussian_lowpass(
+            pred, sigma=self.sigma, truncate=self.truncate, kernel_1d=self.kernel_1d
+        )
+        target_lp = _gaussian_lowpass(
+            target, sigma=self.sigma, truncate=self.truncate, kernel_1d=self.kernel_1d
+        )
         pred_hf = pred - pred_lp
         target_hf = target - target_lp
         if self.loss_type == "l1":

@@ -23,7 +23,7 @@ remains future work tracked in the ULF-PR-4 plan.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +41,13 @@ class KSpaceINRStrategy(ReconstructionTrainingStrategy):
     See the module docstring for the scope caveat: this is a k-space-domain
     masked-L1 strategy, not (yet) the per-subject SIREN coordinate-MLP fit.
     """
+
+    #: Loss ownership (issue #1918). l1_loss(pred_k, kspace) is a K-SPACE fidelity term. It is not the canonical
+    #: image-space l1, so it must NOT be declared inline: doing so would make the
+    #: witness exclude a declared image_losses: [l1] from the very check that
+    #: would otherwise report it as unreachable.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

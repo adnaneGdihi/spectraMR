@@ -6,6 +6,9 @@ and the full DigitalTwinSimulator pipeline.
 
 from __future__ import annotations
 
+import math
+import typing
+
 import pytest
 import torch
 
@@ -18,6 +21,7 @@ from spectramr.infrastructure.physics.digital_twin_simulator import (
     _robust_quantile,
     simulate_b0_geometric_distortion,
     simulate_b0_inhomogeneity,
+    gre_flip_modulation,
     simulate_b1_bias_field,
     simulate_chemical_shift,
     simulate_eddy_current,
@@ -28,9 +32,10 @@ from spectramr.infrastructure.physics.digital_twin_simulator import (
     simulate_rf_crosstalk,
     simulate_rigid_motion_kspace,
     simulate_spike_noise,
+    simulate_spike_noise_volume,
     simulate_undersampling,
 )
-from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.infrastructure.physics.fft_ops import fft2c, fftnc
 
 # ──────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -46,7 +51,7 @@ def complex_image() -> torch.Tensor:
     # N806: upper-case here matches H, W on the line above and the image-space
     # convention used throughout the physics tree. Lower-casing only these two
     # would be less readable, not more.
-    Y, X = torch.meshgrid(  # noqa: N806
+    Y, X = torch.meshgrid(
         torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing="ij"
     )
     mag = (X**2 + Y**2 < 0.5).float()
@@ -74,10 +79,31 @@ class TestB0ExternalField:
         img = torch.complex(torch.randn(1, 1, H, W), torch.randn(1, 1, H, W))
         real_b0 = torch.full((1, H, W), 123.0)  # known real field, 123 Hz
         _, b0_map, shift_y = simulate_b0_geometric_distortion(
-            img, (H, W), return_field=True, external_b0_field=real_b0
+            img, (H, W), return_field=True, external_b0_field=real_b0, sequence="epi"
         )
         assert torch.allclose(b0_map, real_b0, atol=1e-3)  # REAL field, not random
-        assert shift_y.abs().mean() > 0  # a non-zero field induces a displacement
+        assert shift_y.abs().mean() > 0  # EPI: a non-zero field induces a PE displacement
+
+    def test_spin_warp_shifts_along_readout_only(self) -> None:
+        """Spin-warp/TSE: the PE bandwidth is infinite, so dB0 moves the voxel along readout
+        by exactly dB0 / BW_pixel and not at all along PE."""
+        n, dwell = 64, 5e-5
+        imp = torch.zeros(1, 1, n, n, dtype=torch.complex64)
+        imp[..., 32, 32] = 1.0
+        field = torch.full((1, n, n), 3.0 / (n * dwell))  # exactly 3 px
+        out, _, shift_y = simulate_b0_geometric_distortion(
+            imp, (n, n), dwell_time=dwell, return_field=True, external_b0_field=field
+        )
+        m = out.abs().squeeze()
+        yy, xx = torch.meshgrid(torch.arange(n).float(), torch.arange(n).float(), indexing="ij")
+        assert (m * yy).sum() / m.sum() == pytest.approx(32.0, abs=1e-4)
+        assert (m * xx).sum() / m.sum() == pytest.approx(29.0, abs=1e-4)
+        assert shift_y.abs().max() == 0.0
+
+    def test_unknown_sequence_raises(self) -> None:
+        img = torch.zeros(1, 1, 8, 8, dtype=torch.complex64)
+        with pytest.raises(ValueError, match="sequence"):
+            simulate_b0_geometric_distortion(img, (8, 8), sequence="tse")
 
     def test_external_field_4d_and_resize_accepted(self) -> None:
         H = W = 16
@@ -393,6 +419,13 @@ class TestCorruptionFunctions:
         out = simulate_b1_bias_field(complex_image, IM_SIZE, strength=0.2)
         assert out.shape == complex_image.shape
 
+    def test_gre_flip_modulation_is_the_small_tr_ernst_ratio(self) -> None:
+        kappa = torch.tensor([0.6, 1.0, 1.4])
+        out = gre_flip_modulation(kappa, math.radians(30.0))
+        expected = torch.sin(kappa * math.radians(30.0)) / math.sin(math.radians(30.0))
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        assert float(out[1]) == pytest.approx(1.0)
+
     def test_undersampling_reduces_energy(self, complex_kspace: torch.Tensor) -> None:
         """Undersampling zeros out k-space lines → less total energy."""
         out = simulate_undersampling(complex_kspace, acceleration=4.0)
@@ -461,6 +494,29 @@ class TestCorruptionFunctions:
         torch.manual_seed(42)
         out = simulate_spike_noise(complex_kspace, probability=0.05, spike_amplitude=10.0)
         assert (out.abs() ** 2).sum() > (complex_kspace.abs() ** 2).sum()
+
+    def test_spike_noise_volume_fraction_amplitude_shared_positions(self) -> None:
+        p = 0.05
+        g = torch.Generator().manual_seed(3)
+        shape = (1, 3, 16, 32, 32)
+        x = torch.complex(torch.randn(shape, generator=g), torch.randn(shape, generator=g))
+        k = fftnc(x, (-3, -2, -1))
+        torch.manual_seed(0)
+        spikes = simulate_spike_noise_volume(k, probability=p) - k
+        hit = spikes.abs() > 0
+        assert torch.equal(hit, hit[:, :1].expand_as(hit))  # one (kz, ky, kx) for every coil
+        assert abs(float(hit[:, 0].float().mean()) - p) < 0.05 * p
+        rms = float(k.abs().pow(2).mean().sqrt())
+        spike_rms = float(spikes[hit].abs().pow(2).mean().sqrt())
+        assert abs(spike_rms - 5 * rms) < 0.05 * 5 * rms
+
+    def test_spike_noise_volume_one_plane_matches_2d(self, complex_kspace: torch.Tensor) -> None:
+        k = complex_kspace.expand(2, 2, -1, -1).contiguous()
+        torch.manual_seed(4)
+        a = simulate_spike_noise(k, probability=0.03)
+        torch.manual_seed(4)
+        b = simulate_spike_noise_volume(k.unsqueeze(2), probability=0.03).squeeze(2)
+        assert torch.equal(a, b)
 
     def test_rf_crosstalk_shape(self, complex_image: torch.Tensor) -> None:
         out = simulate_rf_crosstalk(complex_image, crosstalk_fraction=0.05)
@@ -733,7 +789,9 @@ def test_motion_corruption_ramps_with_cf() -> None:
     sim = DigitalTwinSimulator(
         im_size=(64, 64),
         motion_type="rigid",
-        motion_severity=3.0,
+        # At 3 px the per-line jitter already decorrelates k-space at cf=0.25 and the mean
+        # deviation is flat (~0.34) to cf=1, so the ordering there is set by the draw.
+        motion_severity=0.5,
         enable_b0=False,
         enable_b1=False,
     )
@@ -848,6 +906,73 @@ def test_simulator_mask_none_when_undersampling_disabled() -> None:
     clean = torch.randn(1, 1, 64, 64, dtype=torch.complex64)
     sim(clean)
     assert sim.last_undersampling_mask is None
+
+
+def test_simulate_undersampling_line_dim_minus_one_drops_columns() -> None:
+    """``line_dim=-1`` keeps or drops whole columns; the kept count realises R over all lines."""
+    torch.manual_seed(3)
+    k = torch.randn(1, 1, 64, 64, dtype=torch.complex64)
+    _, mask = simulate_undersampling(k, acceleration=4.0, return_mask=True, line_dim=-1)
+    assert mask.shape == (1, 1, 1, 64)
+    assert 64 / int(mask.sum().item()) == pytest.approx(4.0, rel=0.1)
+
+
+def test_simulate_undersampling_rejects_a_non_plane_line_dim() -> None:
+    k = torch.randn(1, 1, 64, 64, dtype=torch.complex64)
+    with pytest.raises(ValueError, match="line_dim"):
+        simulate_undersampling(k, line_dim=0)
+
+
+def test_twin_mask_axis_phase_on_columns_when_phase_encode_is_minus_one() -> None:
+    sim = DigitalTwinSimulator(
+        im_size=(64, 64),
+        enable_motion=False,
+        enable_b0=False,
+        enable_b1=False,
+        enable_undersampling=True,
+        acceleration=4.0,
+        mask_axis="phase",
+        phase_encode_axis=-1,
+    )
+    assert sim.undersampling_line_axis == "x"
+    torch.manual_seed(4)
+    sim(torch.randn(1, 1, 64, 64, dtype=torch.complex64))
+    assert sim.last_undersampling_mask.shape == (1, 1, 1, 64)
+
+
+def test_twin_mask_axis_phase_on_rows_when_phase_encode_is_minus_two() -> None:
+    sim = DigitalTwinSimulator(
+        im_size=(64, 64),
+        enable_motion=False,
+        enable_b0=False,
+        enable_b1=False,
+        enable_undersampling=True,
+        acceleration=4.0,
+        mask_axis="phase",
+        phase_encode_axis=-2,
+    )
+    assert sim.undersampling_line_axis == "y"
+    torch.manual_seed(5)
+    sim(torch.randn(1, 1, 64, 64, dtype=torch.complex64))
+    assert sim.last_undersampling_mask.shape == (1, 1, 64, 1)
+
+
+def test_twin_mask_axis_unset_keeps_the_row_mask() -> None:
+    sim = DigitalTwinSimulator(im_size=(64, 64), enable_undersampling=True, acceleration=4.0)
+    assert sim.undersampling_line_axis == "y"
+
+
+def test_twin_mask_axis_raises_when_phase_encode_axis_is_undeclared() -> None:
+    with pytest.raises(ValueError, match="phase-encode axis"):
+        DigitalTwinSimulator(im_size=(64, 64), enable_undersampling=True, mask_axis="phase")
+
+
+def test_from_config_forwards_mask_axis_and_phase_encode_axis() -> None:
+    from spectramr.config.schemas.physics import DigitalTwinConfig
+
+    cfg = DigitalTwinConfig(enable_undersampling=True, mask_axis="phase")
+    sim = DigitalTwinSimulator.from_config(cfg, (64, 64), phase_encode_axis=-1)
+    assert sim.undersampling_line_axis == "x"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1033,19 +1158,17 @@ class TestForwardSeed:
 
 
 def test_extensions_taxonomy_cross_reference_is_accurate() -> None:
-    """The module docstring cross-references the ``D1-D31`` taxonomy living in
-    :mod:`digital_twin_extensions`. Verify that claim stays accurate (the
-    ``D1-D20`` label it replaced was stale): the extensions registry is 31 ops."""
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
-        DEGRADATION_REGISTRY,
-    )
+    """The module docstring cross-references the degradation taxonomy living in
+    :mod:`spectramr.infrastructure.physics.degradations` without a count (the ``D1-D20`` and
+    ``D1-D28`` labels went stale); the registry count is pinned here."""
+    from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
-    assert len(DEGRADATION_REGISTRY) == 31
+    assert len(DEGRADATION_REGISTRY) == 70
 
 
 class TestRegistryDegradationsAreReachable:
     """The simulator used to validate ``progressive_degradations`` against a
-    hardcoded 14-name frozenset, so **26 of the 31 registered physics
+    hardcoded 14-name frozenset, so **26 of the 32 originally registered physics
     degradations could not be named from any config** — only sim2rank's sweep
     could reach them. The legal set is now the union of the native axes and
     ``DEGRADATION_REGISTRY``.
@@ -1053,9 +1176,7 @@ class TestRegistryDegradationsAreReachable:
 
     @staticmethod
     def _registry_names() -> set[str]:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         return set(DEGRADATION_REGISTRY)
 
@@ -1071,7 +1192,7 @@ class TestRegistryDegradationsAreReachable:
         assert known > NATIVE_DEGRADATION_AXES
 
     def test_every_registry_degradation_is_nameable(self) -> None:
-        """Each of the 31 registered ops now constructs without raising."""
+        """Each registered op constructs without raising."""
         for name in sorted(self._registry_names()):
             DigitalTwinSimulator(im_size=IM_SIZE, progressive_degradations=[name])
 
@@ -1281,3 +1402,422 @@ class TestAtAcceleration:
         sim = self._sim()
         with pytest.raises(ValueError, match="must exceed 1.0"), sim.at_acceleration(1.0):
             pass
+
+
+class TestAcquisitionProfileWiring:
+    """``physics.digital_twin.acquisition`` reaches the stage-5 registry operators."""
+
+    _AXIS = "b0_geometric_distortion"  # registry-only; its dwell comes from the profile's BW
+
+    @staticmethod
+    def _sim(acquisition=None, field_strength_t=3.0):
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        cfg = DigitalTwinConfig(
+            progressive_degradations=[TestAcquisitionProfileWiring._AXIS],
+            acquisition=acquisition,
+        )
+        return DigitalTwinSimulator.from_config(cfg, (32, 32), field_strength_t=field_strength_t)
+
+    @staticmethod
+    def _run(sim):
+        x = torch.randn(1, 1, 32, 32, generator=torch.Generator().manual_seed(3)).to(
+            torch.complex64
+        )
+        return sim(x, degradation_only=True, seed=11)[0]
+
+    def test_absent_block_builds_no_profile_and_leaves_output_unchanged(self):
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        sim = self._sim()
+        assert sim.scanner_profile is None
+        legacy = DigitalTwinSimulator.from_config(
+            DigitalTwinConfig(progressive_degradations=[self._AXIS]), (32, 32)
+        )
+        assert torch.equal(self._run(sim), self._run(legacy))
+
+    def test_readout_bandwidth_changes_the_output(self):
+        block = {"readout_bw_hz_per_px": 100.0, "sequence": "spin_echo"}
+        narrow = self._run(self._sim(block))
+        wide = self._run(self._sim({**block, "readout_bw_hz_per_px": 800.0}))
+        unconditioned = self._run(self._sim())
+        assert not torch.allclose(narrow, wide)
+        assert not torch.allclose(narrow, unconditioned)
+
+    def test_profile_b0_is_physics_field_strength_and_block_overrides_preset(self):
+        sim = self._sim(
+            {"scanner_profile": "m4raw_0.3T", "sequence": "tse", "readout_bw_hz_per_px": 150.0},
+            field_strength_t=0.3,
+        )
+        meta = sim.scanner_profile.to_meta()
+        assert meta["name"] == "m4raw_0.3T"
+        assert meta["b0_T"] == 0.3
+        assert meta["sequence"] == "tse"
+        assert meta["readout_bw_hz_per_px"] == 150.0
+        assert meta["n_coils"] == 4  # preset default kept
+
+    def test_custom_block_geometry_is_stamped(self):
+        sim = self._sim(
+            {
+                "readout_bw_hz_per_px": 200.0,
+                "sequence": "gre",
+                "mode": "volume_3d",
+                "voxel_mm": (1.0, 1.0, 1.0),
+                "line_order": "kz_inner",
+            },
+            field_strength_t=1.5,
+        )
+        geom = sim.scanner_profile.to_meta()["geometry"]
+        assert geom["mode"] == "volume_3d"
+        assert geom["line_order"] == "kz_inner"
+        assert sim.scanner_profile.b0_T == 1.5
+
+    def test_block_without_field_strength_raises(self):
+        with pytest.raises(ValueError, match="field_strength"):
+            self._sim({"readout_bw_hz_per_px": 200.0, "sequence": "gre"}, field_strength_t=None)
+
+
+class TestAcquisitionProfileOwnsNativeStages:
+    """With the block present the profile owns field scale, dwell, shift model and fat shift."""
+
+    _BLOCK: typing.ClassVar[dict] = {"readout_bw_hz_per_px": 200.0, "sequence": "spin_echo"}
+
+    @staticmethod
+    def _sim(field_strength_t=3.0, acquisition=None, **kw):
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        block = TestAcquisitionProfileOwnsNativeStages._BLOCK if acquisition is None else acquisition
+        cfg = DigitalTwinConfig(acquisition=block, **kw)
+        return DigitalTwinSimulator.from_config(cfg, (32, 32), field_strength_t=field_strength_t)
+
+    @staticmethod
+    def _run(sim):
+        x = torch.randn(1, 1, 32, 32, generator=torch.Generator().manual_seed(5)).to(
+            torch.complex64
+        )
+        return sim(x, degradation_only=True, seed=13)[0]
+
+    def test_sequence_changes_the_registry_b0_geometric_distortion(self):
+        kw = {"progressive_degradations": ["b0_geometric_distortion"]}
+        epi = self._run(self._sim(acquisition={**self._BLOCK, "sequence": "epi"}, **kw))
+        spin = self._run(self._sim(**kw))
+        assert not torch.allclose(epi, spin)
+
+    @pytest.mark.parametrize(
+        "stage",
+        [
+            {"enable_chemical_shift": True, "progressive_degradations": ["chemical_shift"]},
+            {"enable_b0": True, "progressive_degradations": ["b0"]},
+            {"enable_b1": True, "progressive_degradations": ["b1"]},
+        ],
+        ids=["chemical_shift", "b0_phase", "b1"],
+    )
+    def test_profile_field_strength_changes_the_native_stage(self, stage):
+        low = self._run(self._sim(field_strength_t=0.3, **stage))
+        high = self._run(self._sim(field_strength_t=3.0, **stage))
+        assert not torch.allclose(low, high)
+
+    def test_native_b0_distortion_follows_the_profile_sequence(self):
+        kw = {"enable_b0_distortion": True, "progressive_degradations": ["b0_distortion"]}
+        spin = self._sim(**kw)
+        self._run(spin)
+        epi = self._sim(acquisition={**self._BLOCK, "sequence": "epi"}, **kw)
+        self._run(epi)
+        assert torch.count_nonzero(spin.last_pe_shift_field) == 0
+        assert torch.count_nonzero(epi.last_pe_shift_field) > 0
+
+    @pytest.mark.parametrize(
+        ("key", "value"), [("b0_dwell_time", 2e-5), ("chemical_shift_pixels", 5.0)]
+    )
+    def test_a_native_value_contradicting_the_profile_raises(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            self._sim(**{key: value})
+
+    def test_a_native_value_equal_to_the_profile_derivation_loads(self):
+        derived = 1.0 / (200.0 * 32)
+        assert self._sim(b0_dwell_time=derived).scanner_profile is not None
+
+    @pytest.mark.parametrize("sequence", ["radial", "spiral"])
+    def test_non_cartesian_profile_with_b0_distortion_raises(self, sequence):
+        with pytest.raises(ValueError, match="non-Cartesian"):
+            self._sim(acquisition={**self._BLOCK, "sequence": sequence}, enable_b0_distortion=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Canonical 5-D layout (B, C, D, H, W) and the acquisition geometry
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _geom(mode: str, **kw):
+    from spectramr.infrastructure.physics.degradations.geometry import (
+        AcquisitionGeometry,
+        AcquisitionMode,
+    )
+
+    return AcquisitionGeometry(mode=AcquisitionMode(mode), voxel_mm=kw.pop("voxel_mm", None), **kw)
+
+
+def _volume(b: int = 2, c: int = 1, d: int = 5, h: int = 8, w: int = 6) -> torch.Tensor:
+    g = torch.Generator().manual_seed(4)
+    return torch.complex(torch.randn(b, c, d, h, w, generator=g), torch.randn(b, c, d, h, w, generator=g))
+
+
+_NO_NATIVE: dict = {"enable_motion": False, "enable_b0": False, "enable_b1": False}
+
+
+class TestCanonicalVolumeLayout:
+    """The twin reads 5-D only as (B, C, D, H, W), and only with a declared acquisition mode."""
+
+    def test_5d_without_a_mode_raises(self):
+        with pytest.raises(ValueError, match="explicit AcquisitionMode"):
+            DigitalTwinSimulator(im_size=(8, 6))(_volume(), degradation_only=True)
+
+    def test_5d_declared_slice_2d_raises(self):
+        with pytest.raises(ValueError, match="multislice_2d or volume_3d"):
+            DigitalTwinSimulator(im_size=(8, 6))(
+                _volume(), degradation_only=True, geometry=_geom("slice_2d")
+            )
+
+    def test_4d_with_a_volume_mode_raises(self):
+        with pytest.raises(ValueError, match="4-D input"):
+            DigitalTwinSimulator(im_size=(8, 6))(
+                _volume()[:, :, 0], degradation_only=True, geometry=_geom("multislice_2d")
+            )
+
+    def test_per_call_geometry_and_a_profile_together_raise(self):
+        from spectramr.infrastructure.physics.scanner_presets import FASTMRI_3T
+
+        sim = DigitalTwinSimulator(im_size=(8, 6), scanner_profile=FASTMRI_3T)
+        with pytest.raises(ValueError, match="not both"):
+            sim(_volume(), degradation_only=True, geometry=_geom("multislice_2d"))
+
+    def test_multislice_folds_slices_into_the_batch_exactly(self):
+        """Native stages see permute(0,2,1,3,4).reshape(B*D, C, H, W) and the result unfolds."""
+        x = _volume(b=2, c=1, d=5, h=8, w=6)
+        sim = DigitalTwinSimulator(im_size=(8, 6), enable_motion=True, enable_b0=True)
+        # 100 dB: the noise level differs (subject vs slice RMS) but is ~1e-5 of the signal.
+        kw = {"snr_target": 100.0, "degradation_only": True, "seed": 7}
+        out = sim(x, geometry=_geom("multislice_2d"), **kw)[0]
+        flat = x.permute(0, 2, 1, 3, 4).reshape(10, 1, 8, 6)
+        ref = sim(flat, **kw)[0]
+        assert out.shape == x.shape
+        assert torch.allclose(out, ref.reshape(2, 5, 1, 8, 6).permute(0, 2, 1, 3, 4), atol=1e-4)
+
+    def test_multislice_receiver_noise_is_referenced_to_the_subject(self):
+        """A slice at 1 % of the signal gets the same sigma as its neighbours: one receiver."""
+        x = _volume(b=2, c=1, d=3, h=16, w=16)
+        x[:, :, 0] *= 0.01
+        sim = DigitalTwinSimulator(im_size=(16, 16), **_NO_NATIVE)
+        out = sim(x, snr_target=20.0, degradation_only=True, seed=3, geometry=_geom("multislice_2d"))[0]
+        noise_rms = (out - x).abs().pow(2).mean(dim=(1, 3, 4)).sqrt()  # (B, D)
+        sigma = x.abs().pow(2).mean(dim=(1, 2, 3, 4)).sqrt() / 10.0  # 20 dB per subject
+        expected = (sigma * 2**0.5)[:, None].expand_as(noise_rms)
+        assert torch.allclose(noise_rms, expected, rtol=0.25)
+
+    def test_multislice_snr_per_subject_is_repeated_over_its_slices(self):
+        x = _volume(b=2, c=1, d=3, h=16, w=16)
+        sim = DigitalTwinSimulator(im_size=(16, 16), **_NO_NATIVE)
+        snr = torch.tensor([10.0, 40.0])
+        out = sim(x, snr_target=snr, degradation_only=True, seed=3, geometry=_geom("multislice_2d"))[0]
+        noise_rms = (out - x).abs().pow(2).mean(dim=(1, 3, 4)).sqrt()  # (B, D)
+        assert (noise_rms[0] > 10 * noise_rms[1]).all()
+
+    @pytest.mark.parametrize("shape", [(6,), (2, 1), (3,)])
+    def test_multislice_snr_of_another_shape_raises(self, shape):
+        sim = DigitalTwinSimulator(im_size=(8, 6), **_NO_NATIVE)
+        with pytest.raises(ValueError, match=r"one value per subject \(2,\)"):
+            sim(
+                _volume(b=2, d=3),
+                snr_target=torch.full(shape, 20.0),
+                degradation_only=True,
+                geometry=_geom("multislice_2d"),
+            )
+
+    def test_unfold_broadcasts_only_a_batch_of_one(self):
+        from spectramr.infrastructure.physics.digital_twin_simulator import _unfold_slices
+
+        assert _unfold_slices(torch.zeros(1, 1, 8, 6), 2, 3).shape == (1, 1, 1, 8, 6)
+        assert _unfold_slices(torch.zeros(6, 1, 8, 6), 2, 3).shape == (2, 1, 3, 8, 6)
+        with pytest.raises(ValueError, match="cannot unfold batch 4"):
+            _unfold_slices(torch.zeros(4, 1, 8, 6), 2, 3)
+
+    def test_fold_then_unfold_is_bit_exact(self):
+        from spectramr.infrastructure.physics.digital_twin_simulator import (
+            _fold_slices,
+            _unfold_slices,
+        )
+
+        x = _volume()
+        folded = _fold_slices(x)
+        assert torch.equal(folded[1], x[0, :, 1])  # b-major: sample 0's slices come first
+        assert torch.equal(_unfold_slices(folded, x.shape[0], x.shape[2]), x)
+
+    def test_multislice_unfolds_the_clean_target_too(self):
+        x = _volume()
+        _, _, clean = DigitalTwinSimulator(im_size=(8, 6), **_NO_NATIVE)(
+            x, degradation_only=True, geometry=_geom("multislice_2d")
+        )
+        assert torch.equal(clean, x)
+
+    def test_volume_3d_native_stage_raises_naming_it_and_the_plan(self):
+        sim = DigitalTwinSimulator(im_size=(8, 6), enable_motion=False, enable_b0=False)
+        with pytest.raises(ValueError, match=r"\['b1'\].*plan_degradation_bank_consolidation"):
+            sim(_volume(), degradation_only=True, geometry=_geom("volume_3d"))
+
+    def test_volume_3d_markers_raise(self):
+        sim = DigitalTwinSimulator(im_size=(8, 6), **_NO_NATIVE)
+        with pytest.raises(ValueError, match="markers"):
+            sim(_volume(), degradation_only=False, geometry=_geom("volume_3d"))
+
+    def test_volume_3d_profile_with_a_native_stage_raises_at_build(self):
+        from dataclasses import replace
+
+        from spectramr.infrastructure.physics.scanner_presets import FASTMRI_3T
+
+        vol = replace(FASTMRI_3T, geometry=_geom("volume_3d", voxel_mm=(1.0, 1.0, 1.0)))
+        with pytest.raises(ValueError, match="volume_3d"):
+            DigitalTwinSimulator(im_size=(8, 6), scanner_profile=vol)
+
+    def test_native_stage_table_is_every_native_axis_but_the_receiver_noise(self):
+        from spectramr.infrastructure.physics.digital_twin_simulator import (
+            _NATIVE_STAGE_FLAGS,
+            NATIVE_DEGRADATION_AXES,
+        )
+
+        assert set(_NATIVE_STAGE_FLAGS) == NATIVE_DEGRADATION_AXES - {"noise"}
+        sim = DigitalTwinSimulator()
+        assert all(isinstance(getattr(sim, flag), bool) for flag in _NATIVE_STAGE_FLAGS.values())
+
+    def test_volume_3d_receiver_noise_is_one_level_per_volume(self):
+        """3-D k-space white noise at the declared SNR against the whole volume's RMS."""
+        x = _volume(b=1, c=1, d=4, h=8, w=8)
+        sim = DigitalTwinSimulator(im_size=(8, 8), **_NO_NATIVE)
+        out = sim(x, snr_target=20.0, degradation_only=True, seed=1, geometry=_geom("volume_3d"))[0]
+        noise = out - x
+        rms = x.abs().pow(2).mean().sqrt()
+        sigma = rms / 10.0  # 20 dB amplitude SNR; complex noise has 2 sigma^2 total variance
+        assert noise.abs().pow(2).mean().sqrt() == pytest.approx(float(sigma) * 2**0.5, rel=0.2)
+
+    @pytest.mark.parametrize("mode", ["multislice_2d", "volume_3d"])
+    def test_stage_5_runs_at_5d_with_the_per_call_geometry(self, mode, monkeypatch):
+        from spectramr.infrastructure.physics.degradations import registry
+
+        seen = []
+        real = registry.apply_degradation
+
+        def spy(name, x, theta, seed=0, **kw):
+            seen.append((name, x.dim(), kw.get("geometry"), kw.get("profile")))
+            return real(name, x, theta, seed, **kw)
+
+        monkeypatch.setattr(registry, "apply_degradation", spy)
+        geom = _geom(mode, voxel_mm=(2.0, 1.0, 1.0))
+        sim = DigitalTwinSimulator(im_size=(8, 6), progressive_degradations=["bias"], **_NO_NATIVE)
+        out = sim(_volume(), degradation_only=True, seed=2, geometry=geom)[0]
+        assert seen == [("bias", 5, geom, None)]
+        assert out.shape == _volume().shape
+
+    def test_stage_5_runs_at_5d_with_the_profile(self, monkeypatch):
+        from dataclasses import replace
+
+        from spectramr.infrastructure.physics.degradations import registry
+        from spectramr.infrastructure.physics.scanner_presets import FASTMRI_3T
+
+        seen = []
+        real = registry.apply_degradation
+
+        def spy(name, x, theta, seed=0, **kw):
+            seen.append((x.dim(), kw.get("geometry"), kw.get("profile")))
+            return real(name, x, theta, seed, **kw)
+
+        monkeypatch.setattr(registry, "apply_degradation", spy)
+        prof = replace(FASTMRI_3T, geometry=_geom("multislice_2d", voxel_mm=(2.0, 1.0, 1.0)))
+        sim = DigitalTwinSimulator(
+            im_size=(8, 6), progressive_degradations=["bias"], scanner_profile=prof, **_NO_NATIVE
+        )
+        sim(_volume(), degradation_only=True, seed=2)
+        assert seen == [(5, None, prof)]
+
+
+class TestAcquisitionGeometryKnobsReachTheTwin:
+    """Ruling 48: every geometry knob of the block changes the twin's output where it is read."""
+
+    _BLOCK: typing.ClassVar[dict] = {"readout_bw_hz_per_px": 200.0, "sequence": "spin_echo"}
+
+    @classmethod
+    def _run(cls, axis: str, **block) -> torch.Tensor:
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        cfg = DigitalTwinConfig(
+            progressive_degradations=[axis],
+            acquisition={**cls._BLOCK, **block},
+            **_NO_NATIVE,
+        )
+        sim = DigitalTwinSimulator.from_config(cfg, (8, 6), field_strength_t=3.0)
+        return sim(_volume(), snr_target=40.0, degradation_only=True, seed=5)[0]
+
+    @pytest.mark.parametrize("mode", ["multislice_2d", "volume_3d"])
+    def test_voxel_mm(self, mode):
+        a = self._run("susceptibility", mode=mode, voxel_mm=(1.0, 1.0, 1.0))
+        b = self._run("susceptibility", mode=mode, voxel_mm=(4.0, 1.0, 1.0))
+        assert not torch.allclose(a, b)
+
+    def test_voxel_mm_in_slice_2d(self):
+        # A mm-declared 2-D kernel reads the slice geometry's voxel size (spec.VoxelSliceKernel).
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        def run(voxel_mm):
+            cfg = DigitalTwinConfig(
+                progressive_degradations=["respiratory_motion"],
+                acquisition={**self._BLOCK, "mode": "slice_2d", "voxel_mm": voxel_mm},
+                **_NO_NATIVE,
+            )
+            sim = DigitalTwinSimulator.from_config(cfg, (8, 6), field_strength_t=3.0)
+            x = _volume()[:, :, 0]
+            return sim(x, snr_target=40.0, degradation_only=True, seed=5)[0]
+
+        assert not torch.allclose(run((5.0, 1.0, 1.0)), run((5.0, 4.0, 4.0)))
+
+    def test_slice_thickness_mm(self):
+        ms = {"mode": "multislice_2d", "voxel_mm": (4.0, 1.0, 1.0)}
+        thin = self._run("susceptibility", **ms, slice_thickness_mm=1.0)
+        thick = self._run("susceptibility", **ms, slice_thickness_mm=4.0)
+        assert not torch.allclose(thin, thick)
+
+    def test_slice_order(self):
+        ms = {"mode": "multislice_2d"}
+        a = self._run("translation_drift", **ms, slice_order="interleaved")
+        b = self._run("translation_drift", **ms, slice_order="sequential")
+        assert not torch.allclose(a, b)
+
+    def test_line_order(self):
+        vol = {"mode": "volume_3d"}
+        a = self._run("translation_drift", **vol, line_order="linear")
+        b = self._run("translation_drift", **vol, line_order="kz_inner")
+        assert not torch.allclose(a, b)
+
+    def test_slice_gap_mm_is_refused_since_nothing_reads_it(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="slice_gap_mm"):
+            self._run("susceptibility", mode="multislice_2d", slice_gap_mm=1.0)
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "spectramr.infrastructure.physics.digital_twin_simulator",
+        "spectramr.data.transforms.realistic_degradations",
+    ],
+)
+def test_the_twin_imports_cold_before_the_degradations_package(first: str) -> None:
+    # The degradations catalogue imports twin primitives; a cold twin import must not cycle.
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", f"import {first}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]

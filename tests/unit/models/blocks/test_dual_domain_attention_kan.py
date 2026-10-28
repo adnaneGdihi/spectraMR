@@ -1,12 +1,13 @@
 """Unit tests for KAN-Gated Dual-Domain Attention.
 
-Verifies the three attention branches (image MHA, radial-band MHA,
-cross-domain MHA), the KAN/MLP gate switch, the branch-disable ablation
-knob, the high-resolution downsample-attend-upsample shortcut, and
-the telemetry buffer that exposes per-branch gate means.
+Verifies the three attention branches (full-resolution linear image
+attention, radial-band MHA, k-space-query cross attention), the KAN/MLP gate
+switch, the branch-disable ablation knob, the telemetry buffer, and -- each
+beside a planted violation -- the frequency-locality contracts: QK-normalised
+scores, the conjugate-paired band subsample, the cross branch's k-space crop,
+and the wavelet path's survival of Nyquist detail.
 
-CPU-only; the heavy dense attention is exercised at small spatial
-resolutions (≤16×16) so test runtime stays under a second.
+CPU-only, on tiny tensors (<= 128x128 with a handful of channels).
 """
 
 from __future__ import annotations
@@ -197,7 +198,7 @@ class TestCrossDomainAttention:
         block = CrossDomainAttention(channels=4, num_heads=2)
         h = torch.complex(torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8))
         f = torch.complex(torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8))
-        out = block(h, f)
+        out = block(f, h)  # (k-space queries, image keys/values)
         assert out.shape == h.shape
         assert out.is_complex()
 
@@ -463,7 +464,7 @@ class TestKANGatedDualDomainAttention:
         assert isinstance(block.gate_cross[0], nn.Linear)
 
     def test_high_resolution_shortcut_engaged(self):
-        """At H*W > max_dense_attn_tokens, downsample shortcut activates without OOM."""
+        """Above max_dense_attn_tokens the cross branch crops/pools; shape is kept."""
         # H*W = 256 below the cap of 1024 -> dense path
         block = KANGatedDualDomainAttention(
             in_channels=8, max_dense_attn_tokens=1024
@@ -472,10 +473,10 @@ class TestKANGatedDualDomainAttention:
         out_low = block(x_low)
         assert out_low.shape == x_low.shape
 
-        # H*W = 4096 above the cap -> downsample shortcut
+        # H*W = 4096 above the cap -> cross branch attends a 32x32 k-space crop
         x_high = torch.randn(1, 8, 64, 64)  # 4096 tokens
         out_high = block(x_high)
-        assert out_high.shape == x_high.shape  # bilinear upsample restores shape
+        assert out_high.shape == x_high.shape
 
     def test_forward_rejects_wrong_channels(self):
         block = KANGatedDualDomainAttention(in_channels=8)
@@ -828,9 +829,8 @@ class TestFeatureDomainContract:
             assert not torch.allclose(out_no_stash, out_stash, atol=1e-6), fd
 
     def test_kspace_mode_survives_dense_token_pooling(self):
-        """The pooled (downsample-attend-upsample) path for the dense image /
-        cross branches must run in kspace mode and preserve shape + the
-        native-frame anchor (H*W above the token cap)."""
+        """Above the token cap the cross branch's crop + image pooling must run
+        in kspace mode and preserve shape (H*W above the token cap)."""
         block = _KANGatedDualDomainAttention(
             in_channels=8, num_heads=2, num_bands=4, time_embedding_dim=0,
             max_dense_attn_tokens=16,  # 16x16=256 >> 16 -> pooled path
@@ -841,3 +841,263 @@ class TestFeatureDomainContract:
             out = block(x)
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
+
+
+def test_gate_telemetry_records_the_produced_gate_not_the_ablated_zero():
+    """A disabled branch's applied gate is 0.0 by construction and says nothing.
+
+    The telemetry copy sat after the branch-zeroing while its own comment
+    promised the opposite, so every ``disable_branches`` ablation logged 0.0 for
+    exactly the gate whose behaviour the ablation exists to study.
+    """
+    import torch as _t
+
+    from spectramr.models.blocks.dual_domain_attention_kan import (
+        KANGatedDualDomainAttention,
+    )
+
+    _t.manual_seed(0)
+    block = KANGatedDualDomainAttention(
+        8, feature_domain="kspace", disable_branches={"image"}
+    ).eval()
+    with _t.no_grad():
+        block(_t.randn(1, 8, 16, 16))
+    assert float(block._last_gates[0]) > 1e-3, (
+        "the image gate reports the ablation's zero, not what the gate produced"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Frequency-locality contracts, each beside its planted violation
+# ---------------------------------------------------------------------------
+
+
+def _complex(*shape: int, seed: int = 0) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.complex(torch.randn(*shape, generator=g), torch.randn(*shape, generator=g))
+
+
+class TestQKNormalisedScores:
+    def test_scaling_the_dc_token_leaves_the_weights_unchanged(self):
+        """A 1e3x DC token no longer captures every softmax row."""
+        torch.manual_seed(0)
+        mha = ComplexMHA(channels=8, num_heads=2).eval()
+        seq = _complex(1, 16, 8)
+        loud = seq.clone()
+        loud[:, 5] = loud[:, 5] * 1e3
+        with torch.no_grad():
+            torch.testing.assert_close(
+                mha.attention_weights(loud), mha.attention_weights(seq), rtol=0, atol=1e-5
+            )
+
+    def test_unnormalised_scores_are_captured_by_the_dc_token(self):
+        """Planted violation: the old ``Re(q k^H) / sqrt(d)`` score."""
+        import math
+
+        torch.manual_seed(0)
+        mha = ComplexMHA(channels=8, num_heads=2).eval()
+        seq = _complex(1, 16, 8)
+        loud = seq.clone()
+        loud[:, 5] = loud[:, 5] * 1e3
+
+        def old_weights(s: torch.Tensor) -> torch.Tensor:
+            q = mha._heads(mha._project(mha.q_proj, s))
+            k = mha._heads(mha._project(mha.k_proj, s))
+            scores = (q @ k.conj().transpose(-2, -1)).real / math.sqrt(mha.head_dim)
+            return torch.softmax(scores, dim=-1)
+
+        with torch.no_grad():
+            assert (old_weights(loud) - old_weights(seq)).abs().max() > 0.1
+
+    def test_temperature_is_a_learned_per_head_parameter(self):
+        mha = ComplexMHA(channels=8, num_heads=2)
+        assert mha.logit_scale.shape == (2,)
+        out = mha(_complex(1, 6, 8))
+        (out.real.sum() + out.imag.sum()).backward()
+        assert mha.logit_scale.grad is not None and mha.logit_scale.grad.abs().sum() > 0
+
+
+class TestRadialBandCap:
+    SIZE, CAP = 64, 256
+
+    def _block(self) -> RadialBandAttention:
+        torch.manual_seed(0)
+        return RadialBandAttention(
+            channels=4, num_heads=2, num_bands=4, max_band_tokens=self.CAP
+        ).eval()
+
+    def test_every_row_of_a_capped_band_is_attended_in_both_halves(self):
+        from spectramr.models.blocks.kspace_attention_kernels import conjugate_partner
+
+        block = self._block()
+        with torch.no_grad():
+            block(_complex(1, 4, self.SIZE, self.SIZE))
+        capped = 0
+        for slot, sel in enumerate(block._band_sel):
+            band = (block._band_slot == slot).nonzero().flatten()
+            assert sel.numel() <= self.CAP
+            assert set((sel // self.SIZE).tolist()) == set((band // self.SIZE).tolist())
+            assert torch.isin(conjugate_partner(sel, self.SIZE, self.SIZE), sel).all()
+            capped += int(band.numel() > self.CAP)
+        assert capped >= 2, "the test must exercise bands above the cap"
+
+    def test_unattended_bins_receive_the_band_mean_and_every_row_moves(self):
+        block = self._block()
+        x = _complex(1, 4, self.SIZE, self.SIZE, seed=1)
+        with torch.no_grad():
+            out = block(x)
+        out_flat = out.permute(0, 2, 3, 1).reshape(1, -1, 4)
+        x_flat = x.permute(0, 2, 3, 1).reshape(-1, 4)
+        for slot, sel in enumerate(block._band_sel):
+            band = (block._band_slot == slot).nonzero().flatten()
+            if band.numel() <= self.CAP:
+                continue
+            left = band[~torch.isin(band, sel)]
+            mean = out_flat[:, sel].mean(dim=1, keepdim=True)
+            torch.testing.assert_close(out_flat[:, left], mean.expand_as(out_flat[:, left]))
+            rows = band // self.SIZE
+            moved = (out_flat[0, band] - x_flat[band]).abs().sum(dim=-1)
+            for r in rows.unique():
+                assert moved[rows == r].sum() > 0
+
+
+class TestCrossDomainFrequencyLocality:
+    @staticmethod
+    def _impulse(size: int, row: int, col: int) -> torch.Tensor:
+        k = torch.zeros(1, 4, size, size, dtype=torch.complex64)
+        k[:, :, row, col] = 10.0 * (1 + 1j)
+        return k
+
+    @staticmethod
+    def _near_dc_fraction(update: torch.Tensor, radius: int) -> float:
+        size = update.shape[-1]
+        energy = update.abs().pow(2).sum(dim=(0, 1))
+        yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+        near = (yy - size // 2) ** 2 + (xx - size // 2) ** 2 <= radius**2
+        return float(energy[near].sum() / energy.sum())
+
+    def test_a_high_frequency_feature_is_not_moved_toward_dc(self):
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        torch.manual_seed(0)
+        cross = CrossDomainAttention(channels=4, num_heads=2, max_tokens=4096).eval()
+        k = self._impulse(64, 32, 32 + 20)
+        with torch.no_grad():
+            update = cross(k, ifft2c(k))
+        assert self._near_dc_fraction(update, 8) < 1e-3
+        energy = update.abs().pow(2).sum(dim=(0, 1))
+        assert energy.argmax().item() == 32 * 64 + 52
+
+    def test_pooling_the_spectrum_moves_the_impulse(self):
+        """Planted violation: the old pool -> ifft2c -> upsample -> fft2c path."""
+        from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+
+        k = self._impulse(64, 32, 32 + 20)
+        pooled = torch.complex(
+            torch.nn.functional.adaptive_avg_pool2d(k.real, (24, 24)),
+            torch.nn.functional.adaptive_avg_pool2d(k.imag, (24, 24)),
+        )
+        img = ifft2c(pooled)
+        up = torch.complex(
+            torch.nn.functional.interpolate(img.real, size=(64, 64), mode="bilinear"),
+            torch.nn.functional.interpolate(img.imag, size=(64, 64), mode="bilinear"),
+        )
+        assert self._near_dc_fraction(fft2c(up), 8) > 0.5
+
+    def test_update_is_written_only_into_the_centre_crop(self):
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        torch.manual_seed(0)
+        cross = CrossDomainAttention(channels=4, num_heads=2, max_tokens=1024).eval()
+        k = self._impulse(128, 64, 64 + 10)
+        with torch.no_grad():
+            update = cross(k, ifft2c(k))
+        outside = torch.ones(128, 128, dtype=torch.bool)
+        outside[48:80, 48:80] = False
+        assert torch.equal(update[..., outside], torch.zeros_like(update[..., outside]))
+        energy = update.abs().pow(2).sum(dim=(0, 1))
+        assert energy.argmax().item() == 64 * 128 + 74
+
+
+class TestImageBranchFullResolution:
+    def test_image_branch_never_pools_or_upsamples(self, monkeypatch):
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("the image branch must not pool or resample")
+
+        torch.manual_seed(0)
+        block = KANGatedDualDomainAttention(in_channels=8, num_heads=2, num_bands=4).eval()
+        seen: list[int] = []
+        original = block.attn_img.forward_linear
+
+        def spy(seq: torch.Tensor) -> torch.Tensor:
+            seen.append(seq.shape[1])
+            return original(seq)
+
+        monkeypatch.setattr(block.attn_img, "forward_linear", spy)
+        monkeypatch.setattr(torch.nn.functional, "adaptive_avg_pool2d", _forbidden)
+        monkeypatch.setattr(torch.nn.functional, "interpolate", _forbidden)
+        with torch.no_grad():
+            out = block(torch.randn(1, 8, 64, 64))
+        assert out.shape == (1, 8, 64, 64)
+        assert seen == [64 * 64]
+
+
+class TestWaveletDetail:
+    @staticmethod
+    def _checkerboard_input(size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+        cb = torch.ones(size // 2, size // 2)
+        cb[0::2, 1::2] = -1.0
+        cb[1::2, 0::2] = -1.0
+        vec = _complex(1, 4, 1, 1, seed=3)
+        zero = torch.zeros(1, 4, size // 2, size // 2, dtype=torch.complex64)
+        return _haar_reconstruct_2d(zero, zero, zero, vec * cb), cb
+
+    @staticmethod
+    def _checkerboard_share(hh: torch.Tensor, cb: torch.Tensor) -> float:
+        aligned = (hh * cb).mean(dim=(-2, -1)).abs().sum()
+        return float(aligned / hh.abs().mean(dim=(-2, -1)).sum().clamp_min(1e-12))
+
+    def test_nyquist_detail_survives_the_linear_band_path(self):
+        torch.manual_seed(0)
+        block = MultiScaleFreqBandAttention(
+            channels=4, num_heads=2, num_levels=1, max_tokens=16
+        ).eval()
+        x, cb = self._checkerboard_input()
+        with torch.no_grad():
+            _, _, _, hh = _haar_decompose_2d(block(x))
+        assert self._checkerboard_share(hh, cb) > 0.3
+
+    def test_two_by_two_pooling_cancels_the_detail(self):
+        """Planted violation: the old pool -> attend -> bilinear-upsample band path."""
+        x, _ = self._checkerboard_input()
+        _, _, _, hh = _haar_decompose_2d(x)
+        pooled = torch.complex(
+            torch.nn.functional.adaptive_avg_pool2d(hh.real, (4, 4)),
+            torch.nn.functional.adaptive_avg_pool2d(hh.imag, (4, 4)),
+        )
+        assert pooled.abs().max() < 1e-6
+
+    @pytest.mark.parametrize("feature_domain", ["kspace", "image"])
+    def test_mask_gates_the_update_to_the_null_space(self, feature_domain):
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+        from spectramr.models.blocks.attention import IdentityAtInitAttention
+
+        torch.manual_seed(0)
+        block = _WaveletFreqAttentionBlock(
+            in_channels=8, num_heads=2, kan_hidden=8, feature_domain=feature_domain
+        ).eval()
+        assert IdentityAtInitAttention(block).takes_mask, "the generator must reach the gate"
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[..., ::4] = 1.0
+        x = torch.randn(1, 8, 16, 16)
+        acquired = mask[..., 8:24, 8:24].bool().expand(1, 4, 16, 16)
+        with torch.no_grad():
+            gated, ungated = block(x, mask=mask), block(x)
+
+        def k_delta(out: torch.Tensor) -> torch.Tensor:
+            delta = _interleaved_to_complex(out) - _interleaved_to_complex(x)
+            return delta if feature_domain == "kspace" else fft2c(delta)
+
+        assert k_delta(gated)[acquired].abs().max() < 1e-5
+        assert k_delta(gated)[~acquired].abs().max() > 1e-4
+        assert k_delta(ungated)[acquired].abs().max() > 1e-4  # planted: no gate

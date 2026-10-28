@@ -9,6 +9,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64GB
 #SBATCH --gpus=2
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --mail-type=END,FAIL
 
 # ── Diagnostics ──
@@ -19,13 +21,19 @@ echo "Start: $(date)"
 echo "=========================================="
 
 # ── Environment ──
-module load torchvision 2>/dev/null || true
-
-if [[ -f "/scratch/myalloc/spectramr/.venv/bin/activate" ]]; then
-    source "/scratch/myalloc/spectramr/.venv/bin/activate"
+# The project venv is the torch SSOT. No `module load torchvision`: a second, module-provided
+# torch (and the PYTHONPATH its module sets) shadows the venv's, and the first torch-dependent
+# import then fails with a misleading "cannot import name".
+if [[ ! -f "/scratch/myalloc/spectramr/.venv/bin/activate" ]]; then
+    echo "FATAL: venv activate script not found: /scratch/myalloc/spectramr/.venv/bin/activate" >&2
+    exit 3
 fi
+source "/scratch/myalloc/spectramr/.venv/bin/activate"
 
-export PYTHONPATH=/scratch/myalloc/spectramr:${PYTHONPATH}
+# The package lives in src/, so the repo root alone selects nothing: the job then imports
+# whichever clone the venv's editable install points at, which can be an older tree than
+# the one this script was generated for.
+export PYTHONPATH=/scratch/myalloc/spectramr/src:/scratch/myalloc/spectramr:${PYTHONPATH:-}
 # Bytecode cache: write .pyc to NODE-LOCAL scratch rather than disabling
 # it. With ~1000 spectramr.* modules, disabling the cache forced a full
 # source recompile on EVERY array task — a large, repeated startup tax on
@@ -42,9 +50,44 @@ export SPECTRAMR_SUPPRESS_CLINICAL_WARNING=1
 
 cd /scratch/myalloc/spectramr
 
+# ── GPUs and cores granted to this task ──
+GPU_COUNT_HELPER="/scratch/myalloc/spectramr/scripts/common/gpu_count.sh"
+if [[ ! -f "${GPU_COUNT_HELPER}" ]]; then
+    echo "FATAL: missing ${GPU_COUNT_HELPER}; is the campaign base_dir correct?" >&2
+    exit 3
+fi
+source "${GPU_COUNT_HELPER}"
+derive_gpus_per_node   # sets GPUS_PER_NODE, or exits 1 rather than assume 1
+_CPUS="${SLURM_CPUS_PER_TASK:-8}"
+_THREADS=$(( _CPUS / GPUS_PER_NODE ))
+(( _THREADS < 1 )) && _THREADS=1
+export OMP_NUM_THREADS="${_THREADS}"
+export MKL_NUM_THREADS="${_THREADS}"
+echo "[ENV] cpus-per-task=${_CPUS} gpus=${GPUS_PER_NODE} -> OMP_NUM_THREADS=${_THREADS} per rank"
+
+# ── Environment guard ──
+LD_PATH_HELPER="/scratch/myalloc/spectramr/scripts/common/torch_ld_path.sh"
+if [[ ! -f "${LD_PATH_HELPER}" ]]; then
+    echo "FATAL: missing ${LD_PATH_HELPER}; is the campaign base_dir correct?" >&2
+    exit 3
+fi
+source "${LD_PATH_HELPER}"
+scrub_freesurfer_from_ld_path
+echo "[ENV] python: $(command -v python)"
+if ! python -c "import torch; print('[ENV] torch', torch.__version__, '| cuda_available', torch.cuda.is_available())"; then
+    echo "FATAL: 'import torch' failed in the active environment." >&2
+    echo "       active python: $(command -v python)" >&2
+    echo "       LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<unset>}" >&2
+    echo "       A module-provided torch or a leaked site module can shadow the venv's;" >&2
+    echo "       submit from a shell with no such module loaded, or install into the venv:" >&2
+    echo "       pip install -e '.[dev]'." >&2
+    exit 3
+fi
+
 echo "Python: $(which python) ($(python --version))"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
-echo "CUDA: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\")')"
+echo "CUDA: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")')"
+echo "spectramr: $(python -c 'import spectramr; print(spectramr.__file__)' 2>/dev/null)"
 echo ""
 
 # ── Training ──
@@ -53,13 +96,43 @@ echo ""
 # v6.2 PR-14: when the per-arm parallel block requests >1 GPU, dispatch
 # through torchrun so FSDP / DDP land on every rank. Single-GPU path is
 # unchanged.
-NUM_GPUS=2
+#
+# The multi-rank verb is `train-distributed`, NOT `train`: `train` never calls
+# `setup_distributed`, so no process group exists and every group-requiring
+# strategy raises out of `_require_process_group` during `adopt` -- at Stage B,
+# after the model and the data are already built. `launcher.py` fixed the same
+# defect in its own emitter; this was the copy that kept it (#2228).
+NUM_GPUS=${GPUS_PER_NODE}
 NUM_NODES=1
-if [[ "${NUM_GPUS}" -gt 1 || "${NUM_NODES}" -gt 1 ]]; then
-    TRAIN_CMD="torchrun --nproc_per_node=${NUM_GPUS} --nnodes=${NUM_NODES} --rdzv_backend=c10d --rdzv_endpoint=${SLURMD_NODENAME:-127.0.0.1}:29500 -m spectramr.cli train --config \"experiments/inprogress/x.yaml\" --resume auto -O training.output_dir=experiments/results/campaigns/demo/exp_demo -O checkpoint.inject_as=model.pretrained"
+# The first link follows the arm's own setting. Every REQUEUED link (a wall-clock yield, or a
+# node failure) must continue the run that link started, but tolerate an empty directory: the
+# strict `auto` spelling raises when there is no checkpoint, which is the wall-clock chain's
+# `if-present` spelling the error message itself names.
+RESUME_ARG=" --resume auto"
+if [[ "${SLURM_RESTART_COUNT:-0}" -gt 0 ]]; then
+    RESUME_ARG=" --resume if-present"
+fi
+# A process-group backend (ddp, fsdp, deepspeed) needs torchrun and `train-distributed` even at
+# ONE rank: `train` never creates the group, so the arm builds its model and data and only then
+# refuses at Stage B. The answer comes from the same two functions the array path uses (the
+# arm's declared parallel.strategy, then the strategy registry), not from the GPU count.
+NEEDS_GROUP="$(python -c 'import sys; from spectramr.cli.manifest_dispatch import read_parallel_strategy, requires_process_group; print(int(requires_process_group(read_parallel_strategy(sys.argv[1]))))' "experiments/inprogress/x.yaml")" || {
+    echo "FATAL: could not read parallel.strategy from experiments/inprogress/x.yaml; refusing to guess the launch verb." >&2
+    exit 3
+}
+if [[ "${NUM_GPUS}" -gt 1 || "${NUM_NODES}" -gt 1 || "${NEEDS_GROUP}" -eq 1 ]]; then
+    # Rendezvous on the first allocated node, keyed by the job id: a fixed port
+    # on the node's own name made two jobs on one node join the same c10d group,
+    # and gave every node of a multi-node job a different endpoint.
+    MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST:-localhost}" | head -n1)"
+    MASTER_PORT="$(( 20000 + (${SLURM_JOB_ID:-0} % 20000) ))"
+    # One torchrun per node: a batch script runs on the first node only, so
+    # nodes > 1 needs srun to put a launcher on each of them.
+    LAUNCH=""
+    [[ "${NUM_NODES}" -gt 1 ]] && LAUNCH="srun --kill-on-bad-exit=1 --ntasks=${NUM_NODES} --ntasks-per-node=1 "
+    TRAIN_CMD="${LAUNCH}torchrun --nproc_per_node=${NUM_GPUS} --nnodes=${NUM_NODES} --rdzv_id=${SLURM_JOB_ID:-spectramr} --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} -m spectramr.cli train-distributed --config \"experiments/inprogress/x.yaml\"${RESUME_ARG} -O training.output_dir=experiments/results/campaigns/demo/exp_demo -O checkpoint.inject_as=model.pretrained"
 else
-    export CUDA_VISIBLE_DEVICES=0
-    TRAIN_CMD="python -m spectramr.cli train --config \"experiments/inprogress/x.yaml\" --resume auto -O training.output_dir=experiments/results/campaigns/demo/exp_demo -O checkpoint.inject_as=model.pretrained"
+    TRAIN_CMD="python -m spectramr.cli train --config \"experiments/inprogress/x.yaml\"${RESUME_ARG} -O training.output_dir=experiments/results/campaigns/demo/exp_demo -O checkpoint.inject_as=model.pretrained"
 fi
 
 echo "Config: experiments/inprogress/x.yaml"
@@ -67,28 +140,54 @@ echo "Output: experiments/results/campaigns/demo/exp_demo"
 echo "Resume: True"
 echo ""
 
+# ── Wall-clock yield ──
+# A job killed at the wall loses everything since the last periodic save. The deadline is
+# exported so the training loop stops itself a margin ahead of it, saves, and leaves a
+# marker; the same two helpers the array path and train_distributed.sbatch use.
+# The marker lives on SHARED storage, never ${TMPDIR}: under c10d rendezvous global rank 0
+# is whichever node arrives first, not necessarily the one running this batch script.
+WALL_CLOCK_HELPER="/scratch/myalloc/spectramr/scripts/common/wall_clock.sh"
+if [[ ! -f "${WALL_CLOCK_HELPER}" ]]; then
+    echo "FATAL: missing ${WALL_CLOCK_HELPER}; is the campaign base_dir correct?" >&2
+    exit 3
+fi
+source "${WALL_CLOCK_HELPER}"
+derive_wall_clock_deadline
+if [[ -n "${SPECTRAMR_WALL_CLOCK_DEADLINE:-}" ]]; then
+    mkdir -p "/scratch/myalloc/spectramr/experiments/results/dispatch"
+    export SPECTRAMR_WALL_CLOCK_MARKER="/scratch/myalloc/spectramr/experiments/results/dispatch/yield_${SLURM_JOB_ID:-$$}.json"
+    rm -f "${SPECTRAMR_WALL_CLOCK_MARKER}"
+fi
+
 eval ${TRAIN_CMD}
 TRAIN_EXIT_CODE=$?
+
+# The marker, not the exit code, says the run yielded on purpose: a yield is a clean partial
+# run (every rank exits 0), so a nonzero exit WITH a marker is a crash after rank 0 wrote it.
+if [[ -n "${SPECTRAMR_WALL_CLOCK_MARKER:-}" && -f "${SPECTRAMR_WALL_CLOCK_MARKER}" ]]; then
+    if [[ ${TRAIN_EXIT_CODE} -ne 0 ]]; then
+        echo "FATAL: yield marker present but training exited ${TRAIN_EXIT_CODE}; not requeueing." >&2
+        exit ${TRAIN_EXIT_CODE}
+    fi
+    # The requeued link re-runs this command with SLURM_RESTART_COUNT > 0, which switches the
+    # resume spelling above, so it continues from the checkpoint just written.
+    echo "[WallClock] Yield marker found; requeueing job ${SLURM_JOB_ID}."
+    if scontrol requeue "${SLURM_JOB_ID}"; then
+        exit 0
+    fi
+    echo "FATAL: scontrol requeue failed. This run YIELDED and is NOT finished." >&2
+    exit 1
+fi
 
 if [[ ${TRAIN_EXIT_CODE} -eq 0 ]]; then
     echo ""
     echo "✅ Training completed: exp_demo"
 
     # ── Automated Inference ──
-    # Resolve the checkpoint via the REAL writer conventions (best.{pt,safetensors}
-    # alias, then checkpoint_best.*, then newest checkpoint_step_/epoch_*). The old
-    # ``model_iter_*.pt`` glob matched nothing either writer produces, so the
-    # fallback was dead and safetensors runs were never found.
-    CKPT_DIR="experiments/results/campaigns/demo/exp_demo/checkpoints"
-    CHECKPOINT=""
-    for cand in "${CKPT_DIR}/best.pt" "${CKPT_DIR}/best.safetensors" \
-                "${CKPT_DIR}/checkpoint_best.pt" "${CKPT_DIR}/checkpoint_best.safetensors"; do
-        if [[ -f "${cand}" ]]; then CHECKPOINT="${cand}"; break; fi
-    done
-    if [[ -z "${CHECKPOINT}" ]]; then
-        CHECKPOINT=$(ls -t "${CKPT_DIR}"/checkpoint_step_*.pt "${CKPT_DIR}"/checkpoint_step_*.safetensors \
-            "${CKPT_DIR}"/checkpoint_epoch_*.pt "${CKPT_DIR}"/checkpoint_epoch_*.safetensors 2>/dev/null | head -1)
-    fi
+    # Python chooses the checkpoint, with the same rule campaign evaluation uses; a bash
+    # glob here was a second owner and picked the deleted writer's files by mtime (#2853).
+    # With nothing to evaluate the resolver says so on stderr and inference is skipped.
+    CHECKPOINT="$(python -m spectramr.cli.resolve_checkpoint "experiments/results/campaigns/demo/exp_demo/checkpoints")" || CHECKPOINT=""
 
     # Use campaign test manifest if available, fall back to experiment-local
     MANIFEST=""

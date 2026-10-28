@@ -89,6 +89,14 @@ class MultiAxisCFGMixin(nn.Module):
             f"{type(self).__name__} must implement _predict_noise(x, conditions)."
         )
 
+    def _predict_noise_many(
+        self,
+        x: torch.Tensor,
+        condition_sets: Sequence[Mapping[str, torch.Tensor | None]],
+    ) -> list[torch.Tensor]:
+        """One prediction per condition set. Override to batch them into one call."""
+        return [self._predict_noise(x, conditions) for conditions in condition_sets]
+
     @staticmethod
     def _drop_axes(
         conditions: Mapping[str, torch.Tensor | None],
@@ -170,10 +178,9 @@ class MultiAxisCFGMixin(nn.Module):
             + \sum_i w_i\, w_i(t)\, (\boldsymbol\epsilon_\theta(\mathbf{x}, c_i)
             - \boldsymbol\epsilon_\theta(\mathbf{x}, \emptyset))`.
         """
-        # Unconditional baseline — drop every axis.
-        null_conditions: dict[str, torch.Tensor | None] = dict.fromkeys(conditions)
-        eps_null = self._predict_noise(x, null_conditions)
-        result = eps_null.clone()
+        # Unconditional baseline drops every axis; each guided axis is then
+        # evaluated alone. All 1+k predictions go through one batched hook.
+        active: list[tuple[str, float]] = []
         for axis, weight in weights.items():
             if weight == 0.0:
                 continue
@@ -185,9 +192,16 @@ class MultiAxisCFGMixin(nn.Module):
                 effective_weight = weight * schedule.weight_at(axis, t)
             if effective_weight == 0.0:
                 continue
+            active.append((axis, effective_weight))
+        sets: list[dict[str, torch.Tensor | None]] = [dict.fromkeys(conditions)]
+        for axis, _ in active:
             single_axis = dict.fromkeys(conditions)
             single_axis[axis] = conditions[axis]
-            eps_axis = self._predict_noise(x, single_axis)
+            sets.append(single_axis)
+        predictions = self._predict_noise_many(x, sets)
+        eps_null = predictions[0]
+        result = eps_null.clone()
+        for (_, effective_weight), eps_axis in zip(active, predictions[1:], strict=True):
             result = result + effective_weight * (eps_axis - eps_null)
         return result
 

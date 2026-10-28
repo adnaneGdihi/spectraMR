@@ -24,17 +24,18 @@ acquired measurements.
    :local:
    :depth: 2
 
-==================
+==============================================
 Step 1: Add Data Consistency to Reconstruction
-==================
+==============================================
 
 The simplest physics constraint is **hard data consistency**: after each
 forward pass, replace the model's k-space predictions in measured locations
 with the actual measurements.
 
+Save the following as ``experiments/tutorials/tutorial_04a_physics_dc.yaml``.
+
 .. code-block:: yaml
 
-   # experiments/tutorials/tutorial_04a_physics_dc.yaml
    config_version: '1.0'
 
    metadata:
@@ -54,7 +55,6 @@ with the actual measurements.
 
    data:
      dataset_type: kspace
-     volume_format: h5
      loader:
        batch_size: 4
      source:
@@ -108,12 +108,15 @@ with the actual measurements.
    run:
      seed: 42
 
-**Expected Result:** +0.5–1.0 dB PSNR compared to Tutorial 01 baseline,
-and significantly reduced aliasing artefacts near the k-space centre.
+Hard data consistency guarantees the reconstruction agrees with the
+measurements at every sampled k-space location, so the residual error is
+confined to the unmeasured ones. Compare against the same arm with
+``physics.data_consistency.enabled: false`` on the same seed — that difference
+is what the constraint bought, and it is the only honest way to attribute it.
 
-==================
+====================================
 Step 2: Add K-Space Frequency Losses
-==================
+====================================
 
 Frequency-domain losses penalise errors in specific k-space bands. This is
 particularly useful for preserving fine anatomical detail (high frequencies)
@@ -168,9 +171,9 @@ The full k-space loss suite available in the framework:
      - ``SpectralKSpaceLoss``
      - Frequency-band–weighted loss with custom :math:`w(u,v)`
 
-==================
+===============================================
 Step 3: Cycle-Bloch Physics Strategy (Advanced)
-==================
+===============================================
 
 The :class:`CycleBlochStrategy` enforces physical self-consistency for
 ultra-low-field (ULF) → high-field (HF) synthesis. It contains a full
@@ -196,11 +199,10 @@ The cycle loss ensures the synthesised HF image is *physically plausible*:
 if you estimated tissue parameters from it and forward-simulated an MRI
 acquisition, you would recover the original ULF measurement.
 
-Configuration for Cycle-Bloch:
+Save the following as ``experiments/tutorials/tutorial_04b_cycle_bloch.yaml``.
 
 .. code-block:: yaml
 
-   # experiments/tutorials/tutorial_04b_cycle_bloch.yaml
    config_version: '1.0'
 
    metadata:
@@ -220,7 +222,6 @@ Configuration for Cycle-Bloch:
 
    data:
      dataset_type: kspace
-     volume_format: h5
      loader:
        batch_size: 2
      coils:
@@ -241,12 +242,6 @@ Configuration for Cycle-Bloch:
      output_dir: experiments/results/tutorial_04b_cycle_bloch
      strategy_class: spectramr.infrastructure.training.strategies.cycle_bloch_strategy.CycleBlochStrategy
      epochs: 100
-
-   physics:
-     bloch:
-       enabled: true
-       ulf_tr: 500.0    # ms – repetition time for ULF sequence
-       ulf_te: 14.0     # ms – echo time for ULF sequence
 
    losses:
      image_losses:
@@ -299,9 +294,9 @@ Configuration for Cycle-Bloch:
      - :math:`\frac{1}{2}(\mathcal{L}_{D,real} + \mathcal{L}_{D,fake})`
      - Discriminator loss
 
-==================
+=====================================================
 Step 4: Complex-Valued Losses (K-Space Domain Models)
-==================
+=====================================================
 
 When ``output_domain: complex_image``, losses are computed in k-space and
 routed through the automatic ``DifferentiableFourierBridge``:
@@ -329,9 +324,9 @@ routed through the automatic ``DifferentiableFourierBridge``:
    :class:`LossConfigSchema` when ``output_domain`` is ``complex_image`` or
    ``kspace``. You do not need to manually convert tensors.
 
-==================
+====================
 Step 5: Run & Verify
-==================
+====================
 
 .. code-block:: bash
 
@@ -345,13 +340,11 @@ After training, compare results:
 
 .. code-block:: bash
 
-   # Quick PSNR comparison
-   python -c "
-   import json
-   for exp in ['tutorial_01_basic_unet', 'tutorial_04a']:
-       m = json.load(open(f'experiments/tutorials/{exp}/inference/metrics.json'))
-       print(f'{exp}: PSNR={m[\"psnr_mean\"]:.2f} dB  SSIM={m[\"ssim_mean\"]:.3f}')
-   "
+   spectramr report --exp-dir experiments/results/tutorial_04a_physics_dc
+   spectramr report --exp-dir experiments/results/tutorial_04b_cycle_bloch
+
+Each writes ``report/qc_report.html`` with the learning curves and the run
+summary card drawn from that run's own artifacts.
 
 ==================
 Summary

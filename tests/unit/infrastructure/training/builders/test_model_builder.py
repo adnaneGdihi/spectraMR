@@ -14,6 +14,7 @@ explicit ``is not None`` check.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,7 @@ torch = pytest.importorskip("torch")  # noqa: E402
 from spectramr.infrastructure.training.builders.model_builder import (  # noqa: E402
     ModelBuilder,
 )
+from tests.fixtures.run_state_files import write_run_state  # noqa: E402
 
 
 def _builder_with_config(config: SimpleNamespace) -> ModelBuilder:
@@ -202,150 +204,145 @@ def _ckpt_builder(checkpoint_path) -> ModelBuilder:
     return builder
 
 
-def test_load_init_checkpoint_transfers_weights(tmp_path) -> None:
+def test_warm_start_transfers_weights(tmp_path) -> None:
     """``model.checkpoint_path`` must load another model's weights INTO the freshly
     built generator (transfer-init / conditioning warm-start). This is the
     consumer that makes the sequential-campaign injection real, not just a logged
     no-op."""
     torch.manual_seed(1)
     src = torch.nn.Conv2d(2, 2, 3, padding=1)
-    ckpt = tmp_path / "src.pt"
-    torch.save(src.state_dict(), ckpt)
+    ckpt = write_run_state(tmp_path / "src.safetensors", {"generator": src.state_dict()})
 
     torch.manual_seed(2)
     tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
     assert not torch.allclose(tgt.weight, src.weight)
 
-    _ckpt_builder(str(ckpt))._load_init_checkpoint(tgt)
+    _ckpt_builder(str(ckpt))._warm_start(tgt)
     assert torch.allclose(tgt.weight, src.weight)
 
 
-def test_load_init_checkpoint_unwraps_state_dict_container(tmp_path) -> None:
-    """Checkpoints saved as ``{'model': state_dict}`` / ``{'state_dict': ...}`` /
-    ``{'generator': ...}`` must be unwrapped, not loaded as-is."""
-    torch.manual_seed(3)
-    src = torch.nn.Conv2d(2, 2, 3, padding=1)
-    ckpt = tmp_path / "wrapped.pt"
-    torch.save({"epoch": 7, "model": src.state_dict()}, ckpt)
-
-    torch.manual_seed(4)
-    tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
-    _ckpt_builder(str(ckpt))._load_init_checkpoint(tgt)
-    assert torch.allclose(tgt.weight, src.weight)
-
-
-def test_load_init_checkpoint_noop_when_unset() -> None:
+def test_warm_start_noop_when_unset() -> None:
     tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
     before = tgt.weight.detach().clone()
-    _ckpt_builder(None)._load_init_checkpoint(tgt)
+    _ckpt_builder(None)._warm_start(tgt)
     assert torch.allclose(tgt.weight, before)
 
 
-def test_load_init_checkpoint_raises_on_zero_overlap(tmp_path) -> None:
+def test_warm_start_raises_on_zero_overlap(tmp_path) -> None:
     """A checkpoint with no overlapping keys must RAISE — a silently-dropped
     warm-start (strict=False swallowing everything) is the Method-C facade bug
     (CLAUDE.md pitfall #16)."""
-    ckpt = tmp_path / "alien.pt"
-    torch.save({"totally.unrelated.key": torch.zeros(3)}, ckpt)
-    tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
-    with pytest.raises(ValueError):
-        _ckpt_builder(str(ckpt))._load_init_checkpoint(tgt)
-
-
-# ---------------------------------------------------------------------------
-# ModelBuilder.compile — failure must RAISE, never degrade to eager
-#
-# The old body wrapped everything in a blanket ``except Exception`` that logged
-# a warning and continued. Combined with the then-unvalidated compile_mode /
-# compile_backend, a single typo produced a full-length run that reported
-# success while executing eager — the arm was simply slower than its own
-# provenance claimed (#619 F1+F2). This method had ZERO test coverage.
-# ---------------------------------------------------------------------------
-
-
-def _compile_builder(**compile_opts) -> ModelBuilder:
-    """Phase 8: the five `compile_*` scalars are one `compile:` sub-block."""
-    opts = {
-        "enabled": True,
-        "mode": "default",
-        "backend": "inductor",
-        "fullgraph": False,
-        "dynamic": True,
-    }
-    opts.update(compile_opts)
-    mb = _builder_with_config(
-        SimpleNamespace(optimization=SimpleNamespace(compile=SimpleNamespace(**opts)))
+    ckpt = write_run_state(
+        tmp_path / "alien.safetensors", {"generator": {"totally.unrelated.key": torch.zeros(3)}}
     )
-    mb._models = {"generator": torch.nn.Conv2d(2, 2, 3)}
-    return mb
+    tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
+    with pytest.raises(ValueError, match="zero parameter names"):
+        _ckpt_builder(str(ckpt))._warm_start(tgt)
 
 
-def test_compile_is_a_noop_when_disabled() -> None:
-    """``compile.enabled: false`` is the supported way to ask for eager."""
-    mb = _compile_builder(enabled=False)
-    original = mb._models["generator"]
-    assert mb.compile() is mb
-    assert mb._models["generator"] is original
+def test_warm_start_refuses_a_foreign_state_dict_as_foreign(tmp_path) -> None:
+    """A bare ``torch.save`` state dict was not written by a run: it is refused as
+    foreign, never guessed at, and the converter (which cannot apply) is not named."""
+    ckpt = tmp_path / "pretrained.pt"
+    torch.save(torch.nn.Conv2d(2, 2, 3, padding=1).state_dict(), ckpt)
+    with pytest.raises(ValueError, match="not a spectramr RunState"):
+        _ckpt_builder(str(ckpt))._warm_start(torch.nn.Conv2d(2, 2, 3, padding=1))
 
 
-def test_compile_wraps_the_model_when_enabled() -> None:
-    mb = _compile_builder()
-    mb.compile()
-    wrapped = mb._models["generator"]
-    assert wrapped is not None
-    # torch.compile is lazy, so the observable effect at build time is the
-    # wrapper object itself, not a traced graph.
-    assert hasattr(wrapped, "_orig_mod")
+class _AutoencoderHost(torch.nn.Module):
+    """Stands in for the LDM: the builder hands it the stage-1 generator part."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def load_autoencoder_state(self, state, *, freeze, source):
+        self.calls.append({"keys": sorted(state), "freeze": freeze, "source": source})
 
 
-def test_compile_raises_instead_of_falling_back_to_eager() -> None:
-    """A backend that cannot compile must abort the run, not quietly eager it.
+def _vae_builder(vae_path, **extra) -> ModelBuilder:
+    model = SimpleNamespace(
+        checkpoint_path=None, model_kwargs={"vae_checkpoint_path": vae_path, **extra}
+    )
+    builder = _builder_with_config(SimpleNamespace(model=model))
+    builder._device = torch.device("cpu")
+    return builder
 
-    Uses a backend name that passes schema validation is impossible here (the
-    schema closes the vocabulary), so the failure is injected at the torch layer
-    to exercise the builder's own policy rather than the validator's.
+
+def test_warm_start_hands_the_stage1_generator_part_to_the_autoencoder(tmp_path) -> None:
+    stage1 = torch.nn.Linear(2, 2)
+    path = write_run_state(
+        tmp_path / "best.safetensors",
+        {"generator": {f"module.{k}": v for k, v in stage1.state_dict().items()}},
+    )
+    host = _AutoencoderHost()
+    _vae_builder(str(path), freeze_vae=False)._warm_start(host)
+    assert host.calls == [{"keys": ["bias", "weight"], "freeze": False, "source": str(path)}]
+
+
+def test_warm_start_refuses_a_vae_path_the_generator_cannot_take(tmp_path) -> None:
+    path = write_run_state(tmp_path / "best.pt", {"generator": torch.nn.Linear(2, 2).state_dict()})
+    with pytest.raises(ValueError, match="loads no stage-1 autoencoder"):
+        _vae_builder(str(path))._warm_start(torch.nn.Linear(2, 2))
+
+
+def test_a_missing_stage1_vae_keeps_the_layout_hint(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match=r"best\.<format>"):
+        _vae_builder(str(tmp_path / "checkpoint_best.pt"))._warm_start(_AutoencoderHost())
+
+
+def test_warm_start_is_off_unless_the_builder_is_told() -> None:
+    """infer/make/export/campaign evaluation build the same model and must not
+    warm-start from a predecessor before loading their own checkpoint."""
+    import inspect
+
+    assert inspect.signature(ModelBuilder.__init__).parameters["warm_start"].default is False
+    src = inspect.getsource(ModelBuilder.build_generator)
+    assert "if self._warm_start_enabled:" in src
+    assert "self._warm_start(generator)" in src
+    # Before train(), so a frozen stage-1 autoencoder ends in train mode as it did when
+    # the constructor loaded it.
+    assert src.index("self._warm_start(generator)") < src.index("generator.train()")
+
+
+def test_the_director_is_the_one_warm_starting_caller() -> None:
+    """The director always warm-starts. The second caller, ``pipelines/make.py``, does
+    so only when it is given no checkpoint of its own (pinned in test_make.py)."""
+    import inspect
+    import re
+
+    from spectramr.infrastructure.training.builders import director
+
+    src = inspect.getsource(director)
+    assert "ModelBuilder(self._config, self._device, warm_start=True)" in src
+    pkg = Path(director.__file__).resolve().parents[3]
+    others = [
+        p for p in pkg.rglob("*.py")
+        if p.name != "director.py" and re.search(r"ModelBuilder\([^)]*warm_start=True", p.read_text())
+    ]
+    assert others == []
+
+
+# ---------------------------------------------------------------------------
+# ModelBuilder no longer compiles.
+#
+# `compile()` was deleted, not deprecated. Compilation is placed per parallel
+# strategy now (`builders/compile_placement.py`) and applied by the director at
+# the point that table names -- step 1 was the wrong point for every strategy
+# but DeepSpeed. The behaviour the old tests pinned, failure RAISES and never
+# degrades to eager (#619 F2), moved with the code to `test_compile_apply.py`.
+# ---------------------------------------------------------------------------
+
+
+def test_model_builder_no_longer_exposes_compile() -> None:
+    """Guards against a second compile owner reappearing here.
+
+    Two call sites for one decision is how the placement came to be fixed at
+    step 1 in the first place (non-negotiable 17).
     """
-    mb = _compile_builder()
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("backend exploded")
-
-    original_compile = torch.compile
-    torch.compile = _boom
-    try:
-        with pytest.raises(RuntimeError, match="Refusing to fall back to eager"):
-            mb.compile()
-    finally:
-        torch.compile = original_compile
+    assert not hasattr(ModelBuilder, "compile")
 
 
-def test_compile_error_names_the_model_and_the_settings() -> None:
-    """The message has to be actionable: which model, which mode/backend."""
-    mb = _compile_builder(mode="max-autotune")
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("kaboom")
-
-    original_compile = torch.compile
-    torch.compile = _boom
-    try:
-        with pytest.raises(RuntimeError) as excinfo:
-            mb.compile()
-    finally:
-        torch.compile = original_compile
-
-    message = str(excinfo.value)
-    assert "generator" in message
-    assert "max-autotune" in message
-    assert "compile.enabled: false" in message
-
-
-def test_compile_raises_when_torch_compile_is_unavailable(monkeypatch) -> None:
-    """PyTorch < 2.0 previously logged a warning and skipped."""
-    mb = _compile_builder()
-    monkeypatch.delattr(torch, "compile", raising=False)
-    with pytest.raises(RuntimeError, match=r"torch\.compile is unavailable"):
-        mb.compile()
 
 
 class TestFsdpIsNotWrappedTwice:
@@ -474,7 +471,10 @@ class TestKSpaceLogScaledIsInjectedFromTheDataBlock:
             data={
                 "sampling": {"patch_size": [8, 8]},
                 "loader": {"batch_size": 1},
-                "processing": {"enable_log_scaling": enable_log_scaling},
+                "processing": {
+                    "enable_kspace_normalization": enable_log_scaling,
+                    "enable_log_scaling": enable_log_scaling,
+                },
             },
             optimization={},
             logging={},
@@ -548,70 +548,16 @@ class _LogScaleProbeModel(_nn.Module):
         return self.conv(x)
 
 
-# ── the extracted, shared checkpoint reader (resolve_state_dict) ────────────
+# ── one weight reader (checkpointing.restore) ──────────────────────────────
 
 
-def test_load_init_checkpoint_reads_the_generator_envelope(tmp_path) -> None:
-    """The envelope ``checkpoint_director`` actually writes.
-
-    ``test_load_init_checkpoint_unwraps_state_dict_container`` names
-    ``{'generator': ...}`` in its docstring but only exercises ``{'model': ...}``.
-    ``generator`` is the key the live writer emits, and the reader in
-    ``pipelines/infer.py`` did not know it -- that is #1310.
-    """
-    torch.manual_seed(11)
-    src = torch.nn.Conv2d(2, 2, 3, padding=1)
-    ckpt = tmp_path / "gen.pt"
-    torch.save({"epoch": 3, "generator": src.state_dict()}, ckpt)
-
-    torch.manual_seed(12)
-    tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
-    assert not torch.allclose(tgt.weight, src.weight)
-    _ckpt_builder(str(ckpt))._load_init_checkpoint(tgt)
-    assert torch.allclose(tgt.weight, src.weight)
-
-
-def test_load_init_checkpoint_prefers_weights_over_a_config_under_model(
-    tmp_path,
-) -> None:
-    """Selection is by parameter overlap, not by key order.
-
-    Some checkpoints store the *config* under ``"model"``. The order-driven
-    reader tried ``model`` first, found a dict, and handed the config to
-    ``load_state_dict`` -- which then matched nothing and raised, while the
-    weights sat unread under ``generator``.
-    """
-    torch.manual_seed(13)
-    src = torch.nn.Conv2d(2, 2, 3, padding=1)
-    ckpt = tmp_path / "decoy.pt"
-    torch.save(
-        {"model": {"model_type": "unet", "base_channels": 32},
-         "generator": src.state_dict()},
-        ckpt,
-    )
-
-    torch.manual_seed(14)
-    tgt = torch.nn.Conv2d(2, 2, 3, padding=1)
-    _ckpt_builder(str(ckpt))._load_init_checkpoint(tgt)
-    assert torch.allclose(tgt.weight, src.weight), (
-        "the config dict under 'model' was selected over the real weights"
-    )
-
-
-def test_builder_uses_the_shared_resolver_not_its_own_vocabulary() -> None:
-    """One reader, not six.
-
-    ``_load_init_checkpoint`` was the only correct reader in the repository;
-    five other call sites each knew a different subset of the envelope keys.
-    The fix extracts this one rather than writing a sixth, so the binding here
-    is what keeps them from drifting apart again.
-    """
+def test_builder_reads_through_restore_not_its_own_vocabulary() -> None:
+    """A RunState has one place for the generator, and ``restore.weights`` /
+    ``read_part`` are the only readers of it."""
     import spectramr.infrastructure.training.builders.model_builder as mb
 
-    assert hasattr(mb, "resolve_state_dict"), (
-        "model_builder no longer shares the extracted reader; the other five "
-        "call sites will drift back to private vocabularies"
-    )
+    restore = "spectramr.infrastructure.checkpointing.restore"
+    assert mb.weights.__module__ == restore and mb.read_part.__module__ == restore
 
 
 def test_build_generator_passes_its_device_to_kwarg_resolution(monkeypatch) -> None:

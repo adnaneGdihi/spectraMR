@@ -78,3 +78,12 @@ class TestSkippedFiguresCarryAReason:
         )
         assert entry["status"] == "ok"
         assert "reason" not in entry
+
+
+def test_runs_are_recorded_only_when_supplied(tmp_path):
+    meta = RunMetadata(git_commit="abc1234", seed=7, dataset_version="m4raw")
+    bare = write_report_manifest(tmp_path / "a", figures={}, tables={}, metadata=meta)
+    assert "runs" not in json.loads(bare.read_text())
+    runs = [{"arm": "crashed", "included": False, "status": "failed"}]
+    path = write_report_manifest(tmp_path / "b", figures={}, tables={}, metadata=meta, runs=runs)
+    assert json.loads(path.read_text())["runs"] == runs

@@ -76,7 +76,7 @@ def benchmark_data_consistency(benchmark, kspace_tensors, benchmark_config):
 
 def benchmark_mask_generation(benchmark, benchmark_config):
     """Benchmark K-Space Mask Generation."""
-    mask_gen = KSpaceMaskGenerator(device=benchmark_config["device"])
+    mask_gen = KSpaceMaskGenerator(num_timesteps=1000, device=benchmark_config["device"])
     shape = (256, 256)
 
     def _op():

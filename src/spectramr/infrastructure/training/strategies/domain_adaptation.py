@@ -6,15 +6,16 @@ This module contains DomainAdaptation training strategies.
 import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 import torch
 from torch import nn
 
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.models.losses.computers import UnifiedGANLossComputer
 
 from .base import BaseTrainingStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class DomainAdaptationTrainingStrategy(BaseTrainingStrategy):
@@ -169,10 +170,16 @@ class DomainAdaptationTrainingStrategy(BaseTrainingStrategy):
         if self.env and hasattr(self.env, "losses"):
             env_losses = self.env.losses or {}
 
+        # ``iteration`` is the live loop seam, not ``self.env.step`` and not a
+        # bare ``kwargs.get`` (pitfall #16, #1937). Omitting it here defaulted
+        # ``compute``'s parameter to 0, which held every warm-up gate shut for
+        # the whole run -- silently, because a gated loss is absent from
+        # ``components`` rather than scaled to zero (#1950).
         loss_output = self.loss_computer.compute(
             pred=hr_fakes,
             target=hr_reals,
             epoch=epoch,
+            iteration=resolve_loop_iteration(self),
             discriminator=self.domain_discriminator,
             losses_dict=env_losses,
         )

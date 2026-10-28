@@ -696,12 +696,14 @@ def test_twin_b0_distortion_exposes_field_when_requested():
     img = torch.randn(2, 1, 64, 64, dtype=torch.complex64)
     # default return is unchanged (single complex tensor) — no caller breakage.
     assert torch.is_complex(simulate_b0_geometric_distortion(img, (64, 64)))
-    out = simulate_b0_geometric_distortion(img, (64, 64), b0_strength=0.3, return_field=True)
+    out = simulate_b0_geometric_distortion(
+        img, (64, 64), b0_strength=0.3, return_field=True, sequence="epi"
+    )
     assert isinstance(out, tuple) and len(out) == 3
     dist, b0_map, pe_shift = out
     assert torch.is_complex(dist) and dist.shape == img.shape
     assert b0_map.shape == (2, 64, 64) and pe_shift.shape == (2, 64, 64)
-    # PE shift is ~ETL× larger than the FE shift → non-trivial displacement.
+    # EPI: the PE shift is 8x the FE shift, so the tracker has a displacement to recover.
     assert pe_shift.abs().mean() > 0
 
 
@@ -714,7 +716,8 @@ def _vf_with_field(twin_pe_shift, est):
 
 def test_score_field_zero_when_estimate_matches_twin():
     _, _, pe = simulate_b0_geometric_distortion(
-        torch.randn(3, 1, 64, 64, dtype=torch.complex64), (64, 64), return_field=True
+        torch.randn(3, 1, 64, 64, dtype=torch.complex64), (64, 64), return_field=True,
+        sequence="epi",  # the tracker scores the EPI phase-encode shift
     )
     twin_char = pe.abs().flatten(1).mean(dim=1)
     est = twin_char / (64 / 2.0)  # invert px→normalised so the model "matches"
@@ -726,7 +729,8 @@ def test_score_field_zero_when_estimate_matches_twin():
 
 def test_score_field_penalises_wrong_estimate():
     _, _, pe = simulate_b0_geometric_distortion(
-        torch.randn(3, 1, 64, 64, dtype=torch.complex64), (64, 64), return_field=True
+        torch.randn(3, 1, 64, 64, dtype=torch.complex64), (64, 64), return_field=True,
+        sequence="epi",  # the tracker scores the EPI phase-encode shift
     )
     twin_char = pe.abs().flatten(1).mean(dim=1)
     bad = (twin_char * 5.0) / (64 / 2.0)  # 5× too large
@@ -937,3 +941,55 @@ def test_severity_vector_reports_the_rate_the_twin_is_held_at() -> None:
         inside = _VF._severity_vector(strat.simulator, 1, device)[0, -1].item()
     assert abs(outside - (4.0 - 1.0) / 15.0) < 1e-6
     assert abs(inside - 1.0) < 1e-6
+
+
+# ── #867: phase metrics at VF validation see the complex pair ─────────────────
+# ``_score_at_current_twin`` scored the metric set on magnitudes, so a declared
+# ``phase_mse`` (exp_vf_04) raised PhaseBlindInputError and the strategy's broad
+# ``except`` reduced the step to ``val_psnr`` alone.
+
+
+def _vfs_with_phase_metrics():
+    from spectramr.core.metrics.computer import ValidationMetricsComputer
+    from spectramr.core.metrics.types import ValidationMetricsConfig
+
+    strat = _ood_vfs([])
+    strat.validation_metrics_computer = ValidationMetricsComputer(
+        ValidationMetricsConfig.from_dict({"metrics": ["psnr", "phase_mse"]}), device="cpu"
+    )
+    return strat
+
+
+def test_phase_metrics_are_scored_on_the_complex_pair() -> None:
+    strat = _vfs_with_phase_metrics()
+    target = torch.complex(torch.randn(2, 1, 32, 32), torch.randn(2, 1, 32, 32))
+    with torch.no_grad():
+        scored = strat._score_at_current_twin(target, None, cache_visuals=False)
+    assert {"val_psnr", "psnr", "phase_mse"} <= set(scored)
+    assert torch.isfinite(torch.tensor(scored["phase_mse"]))
+
+
+def test_a_phase_blind_metric_set_raises_instead_of_degrading(monkeypatch) -> None:
+    """Planted: the pre-fix magnitude-only call must fail loudly, not leave val_psnr alone."""
+    from spectramr.core.metrics.complex_input import PhaseBlindInputError
+    from spectramr.infrastructure.training.strategies import virtual_fiducial_strategy as vfs
+    from spectramr.infrastructure.training.utils.metric_views import MetricViews
+
+    monkeypatch.setattr(vfs, "MetricViews", lambda p, t, *_: MetricViews(p, t))
+    strat = _vfs_with_phase_metrics()
+    target = torch.complex(torch.randn(2, 1, 32, 32), torch.randn(2, 1, 32, 32))
+    with torch.no_grad(), pytest.raises(PhaseBlindInputError):
+        strat._score_at_current_twin(target, None, cache_visuals=False)
+
+
+def test_the_conditioner_is_declared_exactly_when_it_is_built():
+    """The audit and the builder share one predicate (#2629): declared as a bare group only
+    for a config that builds the conditioner, so VF without conditioning is not refused."""
+    on = SimpleNamespace(
+        model=SimpleNamespace(
+            conditioning=ConditioningConfig(enabled=True, sources=["severity_vec"], embed_dim=8)
+        )
+    )
+    off = SimpleNamespace(model=SimpleNamespace(conditioning=ConditioningConfig()))
+    assert ("_conditioner", "param_group") in _VF.owned_module_declarations(on)
+    assert _VF.owned_module_declarations(off) == ()

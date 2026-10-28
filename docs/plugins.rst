@@ -53,7 +53,7 @@ fail loudly, while installed third-party plugins fail soft.
       spectramr train --config experiment.yaml
 
    An unimportable token **raises** at startup (a user-declared knob must not
-   silently no-op — pitfall #15). The resolved list is stamped into the run's
+   silently no-op). The resolved list is stamped into the run's
    ``provenance.json``.
 
 3. **``config.plugins`` block** — declare the import paths inside the config:
@@ -77,7 +77,7 @@ Name collisions are an error
 ----------------------------
 
 A plugin that re-registers a name an in-tree component already owns is a hard
-error, not a silent override (spec §6.1, pitfall #9). The in-tree registry is
+error, not a silent override. The in-tree registry is
 populated **first**, so the duplicate ``@register_*`` raises when the plugin is
 imported:
 
@@ -107,6 +107,27 @@ Minimal example
 Then either set ``SPECTRAMR_PLUGINS=my_pkg.models.my_unet``, add it to
 ``plugins.paths``, or declare the entry-point — and use ``model_type: my_unet``
 in any config, or build it directly via :doc:`scripting_api`.
+
+In-repo example: the prior-method baselines
+-------------------------------------------
+
+The CDiffMR, FDB and Shen 2024 adapters live in ``plugins/spectramr_baselines/``
+rather than in ``src/spectramr/``: they wrap third-party code vendored as
+submodules under ``external/baselines/``, and the framework should not carry it.
+The distribution declares its three models under ``spectramr.models`` and its
+``UpstreamProcessStrategy`` under ``spectramr.strategies``, and each
+``kspace_filling`` baseline arm also names its adapter module in
+``plugins.paths`` and its strategy by dotted ``strategy_class``, so the arm loads
+whether the plugin is installed or only on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   git submodule update --init external/baselines
+   pip install -e plugins/spectramr_baselines
+
+The contract every adapter satisfies, ``BaselineAdapter``, stays in-tree in
+:mod:`spectramr.models.baselines` so provenance and the config health checks can
+read it without importing the plugin.
 
 .. seealso::
 

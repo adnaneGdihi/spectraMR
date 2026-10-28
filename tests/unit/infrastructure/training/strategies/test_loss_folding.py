@@ -8,10 +8,17 @@ import pytest
 import torch
 from torch import nn
 
+from spectramr.config.schemas.loss import LossComponentConfig
+from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.strategies.loss_folding import (
+    declared_loss_roles,
     declared_loss_weights,
     fold_builder_image_losses,
+    fold_source_role_losses,
+    unpaired_source_terms,
 )
+from spectramr.models.losses.mind_ssc_loss import MINDSSCLoss
+from spectramr.models.losses.spectral_band_split_loss import SpectralBandSplitLoss
 
 
 def _cfg(entries):
@@ -36,9 +43,7 @@ def test_declared_loss_weights_empty_when_no_losses() -> None:
 def test_fold_returns_none_when_no_env_losses() -> None:
     comp: dict[str, torch.Tensor] = {}
     assert (
-        fold_builder_image_losses(
-            {}, {}, {}, torch.rand(1, 1, 4, 4), torch.rand(1, 1, 4, 4), comp
-        )
+        fold_builder_image_losses({}, {}, {}, torch.rand(1, 1, 4, 4), torch.rand(1, 1, 4, 4), comp)
         is None
     )
 
@@ -49,9 +54,7 @@ def test_fold_skips_inline_fidelity_terms() -> None:
     pred, target = torch.rand(1, 1, 4, 4), torch.rand(1, 1, 4, 4)
     env = {"l1": nn.L1Loss(), "hfen": nn.L1Loss()}
     comp: dict[str, torch.Tensor] = {}
-    out = fold_builder_image_losses(
-        env, {"l1": 1.0, "hfen": 0.5}, {}, pred, target, comp
-    )
+    out = fold_builder_image_losses(env, {"l1": 1.0, "hfen": 0.5}, {}, pred, target, comp)
     assert out is not None
     assert "loss_hfen" in comp and "loss_l1" not in comp  # l1 skipped
 
@@ -63,9 +66,7 @@ def test_fold_scheduled_overrides_declared() -> None:
     base_comp: dict[str, torch.Tensor] = {}
     base = fold_builder_image_losses(env, {"hfen": 0.5}, {}, pred, target, base_comp)
     hi_comp: dict[str, torch.Tensor] = {}
-    hi = fold_builder_image_losses(
-        env, {"hfen": 0.5}, {"hfen": 2.0}, pred, target, hi_comp
-    )
+    hi = fold_builder_image_losses(env, {"hfen": 0.5}, {"hfen": 2.0}, pred, target, hi_comp)
     assert base is not None and hi is not None
     # same raw loss, 4x the weight (2.0 vs 0.5)
     assert float(hi) == float(base) * 4.0
@@ -161,7 +162,114 @@ def test_declaring_an_inline_term_makes_its_weight_resolvable() -> None:
     """The point of the declaration: the schedule controller can now find a base."""
     from spectramr.models.losses.weights import build_loss_weight_table
 
-    table = build_loss_weight_table(
-        _cfg([("l1", 1.0), ("cocycle_consistency", 0.1)]).losses
-    )
+    table = build_loss_weight_table(_cfg([("l1", 1.0), ("cocycle_consistency", 0.1)]).losses)
     assert table.weight("cocycle_consistency", iteration=1_000_000) == pytest.approx(0.1)
+
+
+# --- declares_inline_objective: the pairing LossBuilder.validate() rests on -----------
+
+
+@pytest.mark.parametrize(
+    ("inline", "folds", "expected"),
+    [
+        (frozenset(), False, True),  # owns its objective, folds nothing
+        (frozenset({"l1"}), False, True),  # a non-empty declaration is ownership too
+        (frozenset(), True, False),  # folds the builder's modules -- it needs them
+        (None, False, False),  # half-declared: never says what it computes
+        (None, None, False),  # silent
+        (frozenset(), None, False),  # half-declared the other way
+    ],
+    ids=["empty-nofold", "named-nofold", "empty-folds", "nofold-only", "silent", "inline-only"],
+)
+def test_declares_inline_objective_truth_table(inline, folds, expected) -> None:
+    """Both declarations are tri-state and ``None`` is falsy, so the predicate must test
+    ``is False`` rather than ``not folds`` -- the ``nofold-only`` and ``inline-only`` rows
+    are what separate the two spellings."""
+    from spectramr.infrastructure.training.strategies.loss_folding import (
+        declares_inline_objective,
+    )
+
+    cls = type("_Probe", (), {"inline_losses": inline, "folds_image_losses": folds})
+    assert declares_inline_objective(cls) is expected
+
+
+def test_the_bases_own_none_is_not_a_declaration() -> None:
+    """``BaseTrainingStrategy`` sets both ClassVars to ``None`` in its own ``__dict__``.
+    A subclass that declares nothing must still read as undeclared, or every strategy in
+    the tree would inherit the exemption."""
+    from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+    from spectramr.infrastructure.training.strategies.loss_folding import (
+        declares_inline_objective,
+    )
+
+    silent = type("_SilentStrategy", (BaseTrainingStrategy,), {})
+    assert declares_inline_objective(silent) is False
+
+
+def _unpaired_cfg(image_losses: list[dict]) -> TrainingSettings:
+    return TrainingSettings(
+        data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 2},
+        model={"model_type": "cyclegan_generator", "in_channels": 1, "out_channels": 1},
+        optimization={"learning_rate": 2e-4},
+        logging={},
+        losses={
+            "gan": {"lambda_cycle": 10.0, "lambda_identity": 0.5, "lambda_nce": 1.0},
+            "image_losses": image_losses,
+            "policy": {"output_domain": "image"},
+        },
+    )
+
+
+class _RecordingLoss(nn.Module):
+    """Records the second argument it is called with."""
+
+    def forward(self, pred: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        self.seen = other
+        return (pred - other).abs().mean()
+
+
+def test_role_is_read_and_defaults_to_target() -> None:
+    cfg = _unpaired_cfg(
+        [{"name": "mind_ssc", "weight": 1.0, "role": "source"}, {"name": "l1", "weight": 1.0}]
+    )
+    assert declared_loss_roles(cfg) == {"mind_ssc": "source", "l1": "target"}
+
+
+def test_unknown_role_is_rejected_at_schema() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        LossComponentConfig(name="mind_ssc", role="both")
+
+
+def test_source_role_loss_is_called_with_the_source() -> None:
+    rec = _RecordingLoss()
+    pred, src, tgt = torch.rand(2, 1, 8, 8), torch.rand(2, 1, 8, 8), torch.rand(2, 1, 8, 8)
+    extra, comps = fold_source_role_losses(
+        {"rec": rec}, {"rec": "source"}, {"rec": 2.0}, {}, pred, src
+    )
+    assert torch.equal(rec.seen, src)
+    assert not torch.equal(rec.seen, tgt)
+    assert extra is not None and "loss_rec" in comps
+    assert torch.allclose(extra, 2.0 * comps["loss_rec"])
+
+
+def test_band_split_source_term_uses_its_low_band_total() -> None:
+    band = SpectralBandSplitLoss(lambda_low=1.0, lambda_high=0.0)
+    pred, src = torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16)
+    extra, comps = fold_source_role_losses(
+        {"spectral_band_split": band}, {"spectral_band_split": "source"}, {}, {}, pred, src
+    )
+    expected = band(pred, src)["spectral_total"]
+    assert torch.allclose(comps["loss_spectral_band_split"], expected)
+    assert torch.allclose(extra, expected)
+
+
+def test_target_role_image_loss_refused_under_unpaired_owner() -> None:
+    owner = SimpleNamespace(
+        config=_unpaired_cfg([{"name": "mind_ssc", "weight": 1.0}]),
+        env=SimpleNamespace(losses={"mind_ssc": MINDSSCLoss()}),
+    )
+    pred, src = torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16)
+    with pytest.raises(ValueError, match="role 'target'"):
+        unpaired_source_terms(owner, pred, src)

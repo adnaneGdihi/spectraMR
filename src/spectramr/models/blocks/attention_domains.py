@@ -68,13 +68,21 @@ ATTENTION_DOMAIN_SUPPORT: dict[str, frozenset[str]] = {
     "dual_domain": _BOTH,
     "kan_dual_domain": _BOTH,
     "wavelet_freq": _BOTH,
+    "null_space_dual_domain": _BOTH,
+    "hermitian_null_space": _BOTH,
 }
 
 # Attention types whose constructors take the ``feature_domain`` kwarg (the
 # blocks with an internal FFT/domain assumption). Everything else is
 # domain-agnostic and is constructed without it.
 DOMAIN_AWARE_ATTENTION: frozenset[str] = frozenset(
-    {"dual_domain", "kan_dual_domain", "wavelet_freq"}
+    {
+        "dual_domain",
+        "kan_dual_domain",
+        "wavelet_freq",
+        "null_space_dual_domain",
+        "hermitian_null_space",
+    }
 )
 
 # What the ComplexUNet down/up block dispatch can actually construct.
@@ -92,6 +100,8 @@ COMPLEX_UNET_BLOCK_ATTENTION: frozenset[str] = frozenset(
         "kan_dual_domain",
         "wavelet_freq",
         "cross_contrast_olmpa",
+        "null_space_dual_domain",
+        "hermitian_null_space",
     }
 )
 

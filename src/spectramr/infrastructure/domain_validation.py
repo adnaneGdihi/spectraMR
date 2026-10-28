@@ -15,93 +15,43 @@ from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
 logger = logging.getLogger(__name__)
 
 
-# Domain Metadata Registry (Phase 3 - will be extended)
-LOSS_DOMAIN_REGISTRY = {
-    # K-Space native
-    "complex_l1": {"domain": "kspace", "compatible_with": ["kspace", "agnostic"]},
-    "weighted_kspace_l1": {
-        "domain": "kspace",
-        "compatible_with": ["kspace", "agnostic"],
-    },
-    "data_consistency": {
-        "domain": "kspace",
-        "compatible_with": ["kspace", "agnostic"],
-    },
-    "parallel_imaging_kspace": {
-        "domain": "kspace",
-        "compatible_with": ["kspace", "agnostic"],
-    },
-    "spectral_kspace": {"domain": "kspace", "compatible_with": ["kspace", "agnostic"]},
-    "frequency_weighted_l1_kspace": {
-        "domain": "kspace",
-        "compatible_with": ["kspace", "agnostic"],
-    },
-    "background_suppression": {
-        "domain": "kspace",
-        "compatible_with": ["kspace", "agnostic"],
-    },
-    # Image-domain only (DANGEROUS with k-space)
-    "hfen": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "ssim": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "ms_ssim": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "perceptual": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "lpips": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "dino_perceptual": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "mind_ssc": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "sobel_edge": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "edge_consistency": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    "histogram_consistency": {
-        "domain": "image",
-        "compatible_with": ["image", "agnostic"],
-    },
-    "topological": {"domain": "image", "compatible_with": ["image", "agnostic"]},
-    # Physics-informed
-    "bloch_residual": {
-        "domain": "physics",
-        "compatible_with": ["kspace", "image", "agnostic"],
-    },
-    "non_cartesian_graph": {
-        "domain": "physics",
-        "compatible_with": ["kspace", "image", "agnostic"],
-    },
-    "graph_consistency": {
-        "domain": "physics",
-        "compatible_with": ["kspace", "image", "agnostic"],
-    },
-    # Diffusion-agnostic
-    "diffusion_mse": {"domain": "agnostic", "compatible_with": ["kspace", "image"]},
-    "diffusion_velocity": {
-        "domain": "agnostic",
-        "compatible_with": ["kspace", "image"],
-    },
-    "huber": {"domain": "agnostic", "compatible_with": ["kspace", "image"]},
-    # Standard agnostic
-    "l1": {"domain": "agnostic", "compatible_with": ["kspace", "image", "latent"]},
-    "l2": {"domain": "agnostic", "compatible_with": ["kspace", "image", "latent"]},
-    "smooth_l1": {
-        "domain": "agnostic",
-        "compatible_with": ["kspace", "image", "latent"],
-    },
-    "frequency": {"domain": "agnostic", "compatible_with": ["kspace", "image"]},
-    "log_spectral": {"domain": "agnostic", "compatible_with": ["kspace", "image"]},
-    # Latent-specific
-    "kl": {"domain": "latent", "compatible_with": ["latent", "agnostic"]},
-    "vq": {"domain": "latent", "compatible_with": ["latent", "agnostic"]},
-    "vq_kl": {"domain": "latent", "compatible_with": ["latent", "agnostic"]},
-    "vqgan": {"domain": "latent", "compatible_with": ["latent", "agnostic"]},
-    "latent_consistency": {
-        "domain": "latent",
-        "compatible_with": ["latent", "agnostic"],
-    },
-    "perceptual_latent": {
-        "domain": "latent",
-        "compatible_with": ["latent", "agnostic"],
-    },
-    "latent_diffusion": {
-        "domain": "latent",
-        "compatible_with": ["latent", "agnostic"],
-    },
-}
+# The registry's ``@register_loss(domain=...)`` annotation is the ONE owner of a
+# loss's domain (non-negotiable 17). This module used to carry a second,
+# hand-maintained table of 36 entries beside it. Characterized before removing,
+# as the rule requires: of the 19 names both surfaces annotated, 18 agreed and
+# ONE disagreed -- ``complex_l1``, hand-written as ``kspace`` against the
+# decorator's ``agnostic``. The decorator is right; an elementwise L1 is defined
+# on any tensor, and the hand entry would have flagged a legal declaration. The
+# hand table also covered 36 of 220 registered losses, so 184 were invisible to
+# it while reading as checked.
+#
+# ``get_loss_capabilities`` is the documented single retrieval surface, and it
+# keeps the distinction this check needs: ``domain=None`` means UNANNOTATED
+# (skip, nobody has said) while ``domain_agnostic=True`` is a positive claim
+# that skipping is correct. Collapsing those is what let an un-audited loss and
+# a deliberately generic one look alike.
+
+
+def _loss_domain_of(loss_name: str) -> tuple[str | None, bool, bool]:
+    """``(domain, is_agnostic, is_registered)`` for ``loss_name``.
+
+    ``domain`` is ``None`` when the loss is registered but carries no
+    ``domain=`` annotation -- a different state from "not registered at all",
+    and the two get different messages below (non-negotiable 18: absent is a
+    state to report, never one to infer).
+    """
+    from spectramr.models.losses.registry import LossRegistry, get_loss_capabilities
+
+    canonical = _normalize_loss_name(loss_name)
+    registered = canonical in LossRegistry.list_available() or canonical in getattr(
+        LossRegistry, "_aliases", {}
+    )
+    caps = get_loss_capabilities(canonical)
+    if caps is None:
+        return None, False, registered
+    domain = getattr(caps.domain, "value", caps.domain)
+    return domain, bool(caps.domain_agnostic), registered
+
 
 # Normalize aliases to canonical names
 LOSS_ALIASES = {
@@ -149,19 +99,6 @@ def _normalize_loss_name(loss_name: str) -> str:
     """Normalize loss name to canonical form via aliases."""
     canonical = loss_name.lower()
     return LOSS_ALIASES.get(canonical, canonical)
-
-
-def _get_loss_domain(loss_name: str) -> dict | None:
-    """Get domain metadata for a loss.
-
-    Args:
-        loss_name: Loss name (canonical or alias)
-
-    Returns:
-        Domain metadata dict or None if not found
-    """
-    canonical = _normalize_loss_name(loss_name)
-    return LOSS_DOMAIN_REGISTRY.get(canonical)
 
 
 def validate_loss_domains(config: LossConfigSchema, input_domain: str) -> DomainValidationResult:
@@ -232,27 +169,42 @@ def validate_loss_domains(config: LossConfigSchema, input_domain: str) -> Domain
 
     # Check each enabled loss against input domain
     for loss_name, weight in enabled_losses.items():
-        domain_meta = _get_loss_domain(loss_name)
+        loss_domain, is_agnostic, is_registered = _loss_domain_of(loss_name)
 
-        if domain_meta is None:
-            # Unknown loss, warn but don't fail (may be custom loss)
+        if loss_domain is None:
+            # Two different absences, and conflating them is what let an
+            # un-audited loss read as a deliberately generic one. Neither is an
+            # error here: an unregistered NAME is owned by the audit's
+            # ``check_declared_losses_registered``, and raising in both places
+            # would be two owners of one rule.
+            if is_agnostic:
+                continue
             result.warnings.append(
                 DomainMismatchWarning(
                     loss_name=loss_name,
-                    loss_domain="unknown",
+                    loss_domain="unannotated" if is_registered else "unregistered",
                     input_domain=input_domain,
                     severity="warning",
-                    message=f"Unknown loss '{loss_name}' - domain validation skipped (custom loss?).",
-                    fix="Register loss domain in LOSS_DOMAIN_REGISTRY",
+                    message=(
+                        f"Loss '{loss_name}' carries no domain annotation - domain "
+                        "validation skipped."
+                        if is_registered
+                        else f"Loss '{loss_name}' is not in the loss registry - domain "
+                        "validation skipped (custom loss?)."
+                    ),
+                    fix=(
+                        f"Add domain=... to @register_loss for '{loss_name}', or "
+                        "domain_agnostic=True if it genuinely imposes no constraint."
+                        if is_registered
+                        else f"Register '{loss_name}' with @register_loss."
+                    ),
                 )
             )
             continue
 
-        loss_domain = domain_meta["domain"]
-        compatible = domain_meta.get("compatible_with", [])
-
-        # Check if loss domain is compatible with input domain
-        is_compatible = loss_domain == "agnostic" or input_domain in compatible
+        # Agnostic is a positive claim of compatibility; otherwise the loss's
+        # own domain must be the one the model feeds it.
+        is_compatible = is_agnostic or loss_domain == input_domain
 
         if not is_compatible:
             error_msg = (
@@ -346,30 +298,6 @@ def verify_startup_loss_domains(
         )
 
     return result.is_valid
-
-
-def register_loss_domain(loss_name: str, domain: str, compatible_with: list | None = None) -> None:
-    """Register domain metadata for a loss (for custom losses).
-
-    Allows users to register custom losses with domain information.
-
-    Args:
-        loss_name: Canonical loss name
-        domain: Loss domain (kspace, image, latent, agnostic, physics)
-        compatible_with: List of compatible input domains
-    """
-    if domain not in ("kspace", "image", "latent", "agnostic", "physics"):
-        raise ValueError(
-            f"Invalid domain: {domain}. Must be one of: kspace, image, latent, agnostic, physics"
-        )
-
-    if compatible_with is None:
-        compatible_with = []
-
-    LOSS_DOMAIN_REGISTRY[loss_name.lower()] = {
-        "domain": domain,
-        "compatible_with": compatible_with,
-    }
 
 
 def get_domain_report(config: LossConfigSchema, input_domain: str) -> str:

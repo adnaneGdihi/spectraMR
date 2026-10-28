@@ -609,6 +609,95 @@ def _resolve_deferred_extra(
     return resolved
 
 
+#: Snapshot roots this PROCESS has already scanned for another run's leftovers.
+#: The scan is one directory listing, and it only has an answer to give once.
+_MARKED_ROOTS: set[str] = set()
+
+#: Which ``<tag>_step_<n>`` directories THIS run wrote, per snapshot root.
+_WRITTEN_DIRS: dict[str, list[str]] = {}
+
+#: Where an earlier run's snapshots move to, one folder per run id, so the root
+#: holds only the current run's and the readers' ``*_step_*`` globs never mix two.
+PREVIOUS_RUNS_DIR = "previous_runs"
+
+
+def _archive_previous_run(snap_root: Path, stale: list[str], previous: dict) -> Path | None:
+    """Move another run's snapshot directories and its ``RUN.json`` out of the root."""
+    import shutil
+
+    run_id = str(previous.get("run_id") or "run-id-not-recorded")
+    dest = snap_root / PREVIOUS_RUNS_DIR / run_id
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in [*stale, "RUN.json"]:
+            src = snap_root / name
+            if src.exists():
+                target = dest / name
+                if target.exists():
+                    shutil.rmtree(target) if target.is_dir() else target.unlink()
+                shutil.move(str(src), str(target))
+    except OSError as exc:
+        logger.warning("[debug-snapshot] could not archive %s's snapshots: %s", run_id, exc)
+        return None
+    return dest
+
+
+def _mark_run(snap_root: Path, snap_dir: Path) -> None:
+    """Record which run owns which snapshot directories, and warn about the rest.
+
+    A run directory is reused across runs and a snapshot directory is named
+    ``<tag>_step_<n>`` -- no run in it. So a shorter run overwrites the early
+    steps IN PLACE and leaves the later ones untouched, and the result reads as
+    one coherent set: ``experiment_11_attention_none`` came back from the
+    2026-09-16 smoke run holding steps 1-2 from that run beside steps 3-8 and
+    ``model_output_dc`` steps 500-4000 from 2026-09-14, with nothing on disk
+    saying so. Directory mtimes do not tell them apart either -- rewriting a
+    file in place leaves the directory's own mtime alone.
+
+    ``RUN.json`` names the run that owns the listed directories. A new run moves
+    the previous run's directories under ``previous_runs/<run_id>/`` before it
+    writes, so the root never blends two runs; nothing is deleted. Instrumentation,
+    so a failure to archive or to write the marker warns rather than killing the
+    run it was only describing.
+    """
+    identity = run_identity()
+    marker = snap_root / "RUN.json"
+    key = str(snap_root)
+
+    if key not in _MARKED_ROOTS:
+        _MARKED_ROOTS.add(key)
+        try:
+            previous = json.loads(marker.read_text()) if marker.is_file() else {}
+        except (OSError, ValueError):
+            previous = {}
+        stale = sorted(
+            d.name for d in snap_root.iterdir() if d.is_dir() and d.name != PREVIOUS_RUNS_DIR
+        )
+        if stale and previous.get("run_id") != identity.get("run_id"):
+            archived = _archive_previous_run(snap_root, stale, previous)
+            logger.warning(
+                "[debug-snapshot] %s held %d snapshot director%s from an earlier run "
+                "(%s); %s: %s",
+                snap_root,
+                len(stale),
+                "y" if len(stale) == 1 else "ies",
+                previous.get("run_id") or "run id not recorded",
+                f"moved to {archived}" if archived else "left in place, read RUN.json "
+                "for the ones this run owns",
+                ", ".join(stale[:6]) + (" ..." if len(stale) > 6 else ""),
+            )
+
+    written = _WRITTEN_DIRS.setdefault(key, [])
+    if snap_dir.name not in written:
+        written.append(snap_dir.name)
+    try:
+        marker.write_text(
+            json.dumps({**identity, "directories": sorted(written)}, indent=2, default=str)
+        )
+    except OSError as exc:
+        logger.warning("[debug-snapshot] could not write %s: %s", marker, exc)
+
+
 def save_debug_snapshot(
     *,
     run_dir: str | Path,
@@ -735,6 +824,16 @@ def save_debug_snapshot(
     if not cfg.enabled:
         return None
 
+    # Rank 0 writes. Every rank used to write the same ``<tag>_step_NNNNNN`` directory:
+    # the PNGs and JSON raced and overwrote each other, which rank's tensors ended up
+    # on disk was nondeterministic, and each rank paid the device-to-host copies. Gated
+    # before the budget and before any deferred ``extra`` is resolved, so a non-writing
+    # rank spends neither a call count nor a sync.
+    from spectramr.infrastructure.distributed.distributed_training import RankUtility
+
+    if not RankUtility.is_main_rank():
+        return None
+
     # A real filesystem path, or nothing (#693/#476). `run_dir` is declared
     # `str | Path` and was never checked, so a `MagicMock` env -- which
     # auto-creates a truthy `run_output_dir` -- stringified into
@@ -778,7 +877,10 @@ def save_debug_snapshot(
 
     snap_root = Path(run_dir) / "debug_snapshots"
     snap_dir = snap_root / f"{tag}_step_{step:06d}"
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    # Marked before this step's directory exists, so a same-named one from an earlier run is archived too.
+    snap_root.mkdir(parents=True, exist_ok=True)
+    _mark_run(snap_root, snap_dir)
+    snap_dir.mkdir(exist_ok=True)
 
     if in_kspace_keys is None:
         in_kspace_keys = {
@@ -958,7 +1060,7 @@ def save_debug_snapshot(
             ],
         }
         (snap_dir / "snapshot.json").write_text(
-            json.dumps(json_payload, indent=2, default=_json_default)
+            json.dumps(_json_safe(json_payload), indent=2, default=_json_default)
         )
 
     # Image previews (best-effort, never raises)
@@ -966,7 +1068,20 @@ def save_debug_snapshot(
         try:
             from torchvision.utils import save_image
 
+            from spectramr.infrastructure.training.snapshot_coil_maps import (
+                COIL_MAP_KEYS,
+                render_coil_map_grid,
+            )
+
             for name, t, unit_kspace, unit_auth, unit_log in render_units:
+                if name in COIL_MAP_KEYS and t.dim() == 4:
+                    # The RSS of RSS-normalised maps is constant, so the generic
+                    # preview min-max-stretches FFT round-off into noise.
+                    grid = render_coil_map_grid(t, in_kspace=unit_kspace, log_scaled=unit_log)
+                    save_image(
+                        grid, str(snap_dir / f"{_safe_name(name)}.png"), nrow=(grid.shape[0] - 1) // 2
+                    )
+                    continue
                 # Reuse the k-space preview rendered for the domain check above;
                 # render the (image-domain) remainder here.
                 preview = previews.get(name)
@@ -1017,11 +1132,25 @@ def _coerce_extra(d: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _json_safe(o: Any) -> Any:
+    """Replace every non-finite float with ``None``, recursively.
+
+    ``json.dumps`` serialises a float NaN itself, as the bare token ``NaN`` that
+    strict parsers reject, so a ``default=`` hook never sees one; and the
+    snapshot of a diverged run is the one a reader most needs to parse.
+    """
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return o
+
+
 def _json_default(o: Any) -> Any:
-    if isinstance(o, float) and (math.isnan(o) or math.isinf(o)):
-        return None
     if hasattr(o, "tolist"):
-        return o.tolist()
+        return _json_safe(o.tolist())
     return str(o)
 
 

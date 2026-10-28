@@ -120,16 +120,20 @@ class PlateauMonitor:
         window opens, so a sustained plateau fires at most once per
         ``cooldown + patience`` window rather than every check.
 
-        During cooldown the value is still observed (so the best/wait state
-        re-arms correctly) but no fire is reported.
+        During cooldown the value is still observed, so an improvement updates
+        the best, but a non-improving check does not count toward the next
+        plateau (as in torch's ``ReduceLROnPlateau``). Counting them made a
+        sustained plateau re-fire every ``cooldown + 1`` checks, the first of
+        them possibly on a NaN observation.
         """
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
             self.observe(value, iteration)
+            self.wait_count = 0
             return False
 
         self.observe(value, iteration)
-        if self.is_plateaued():
+        if math.isfinite(value) and self.is_plateaued():
             self.wait_count = 0
             self.cooldown_remaining = self.cooldown
             return True

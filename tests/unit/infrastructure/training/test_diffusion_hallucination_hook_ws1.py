@@ -20,7 +20,7 @@ def _stub(*, enabled, interval=1, step=0, predict=None, method="feature_insertio
     s.config = SimpleNamespace(
         validation=block_stub(
             "validation",
-            
+
             hallucination_test=SimpleNamespace(
                 enabled=enabled,
                 interval_validations=interval,
@@ -37,7 +37,7 @@ def _stub(*, enabled, interval=1, step=0, predict=None, method="feature_insertio
 
 def _run(stub, target):
     return DiffusionTrainingStrategy._maybe_hallucination_metrics(
-        stub, target, None, torch.tensor([1]), None, {}, None
+        stub, target, None, torch.tensor([1]), None, {}
     )
 
 

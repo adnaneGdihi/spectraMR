@@ -82,3 +82,56 @@ def test_source_derives_from_recon_not_input() -> None:
     )
     assert "x = recon[:, 0]" in src
     assert "x = input_batch[:, 0]" not in src
+
+
+# --- idea_2: what BeltramiEPIDistortionStrategy validates and owns (#1768) ----
+
+
+def _epi_strategy(field_hz: float):
+    from spectramr.infrastructure.training.strategies.fmri_kspace_strategies import (
+        BeltramiEPIDistortionStrategy,
+    )
+
+    class _Field(nn.Module):
+        def forward(self, x):
+            return torch.full_like(x, field_hz)
+
+    s = object.__new__(BeltramiEPIDistortionStrategy)
+    s.env = types.SimpleNamespace(generator=_Field())
+    s.device = torch.device("cpu")
+    s.t_esp = 0.5e-3
+    s.config = types.SimpleNamespace(
+        validation=types.SimpleNamespace(
+            scoring=types.SimpleNamespace(compute=["psnr"], primary="psnr", transform=None)
+        ),
+        metrics=None,
+    )
+    return s
+
+
+def test_validation_grades_the_epi_the_field_predicts_not_the_field_itself() -> None:
+    """The generator emits Hz; ``val_psnr`` used to compare that field with the
+    undistorted image. It now warps the target by the predicted field and grades
+    that against the observed EPI, so the correct field scores best."""
+    from spectramr.infrastructure.physics.epi_forward import apply_epi_distortion
+
+    torch.manual_seed(0)
+    yy = torch.linspace(0, 1, 32).view(1, 1, 32, 1).expand(2, 1, 32, 32)
+    target = 0.5 + 0.4 * torch.sin(6.0 * yy)
+    observed = apply_epi_distortion(target, torch.full_like(target, 40.0), t_esp=0.5e-3)
+
+    right = _epi_strategy(40.0).validation_step(observed, target)
+    wrong = _epi_strategy(-40.0).validation_step(observed, target)
+    assert float(right["val_beltrami_epi_residual"]) < 1e-5
+    assert float(right["val_psnr"]) > float(wrong["val_psnr"])
+
+
+def test_both_fmri_strategies_declare_an_inline_objective() -> None:
+    from spectramr.infrastructure.training.strategies.fmri_kspace_strategies import (
+        BeltramiEPIDistortionStrategy,
+    )
+
+    assert SpatiotemporalAdaptiveSFCReconStrategy.inline_losses == frozenset({"l1"})
+    assert SpatiotemporalAdaptiveSFCReconStrategy.folds_image_losses is False
+    assert BeltramiEPIDistortionStrategy.inline_losses == frozenset({"beltrami_epi_residual"})
+    assert BeltramiEPIDistortionStrategy.folds_image_losses is False

@@ -474,6 +474,27 @@ class TestDiffusionStrategy:
         config.objectives.diffusion.timesteps = 100
         config.objectives.diffusion.noise_schedule = "linear"
         config.objectives.diffusion.lambda_mse = 1.0
+        # Fourth member of the same family as the three above, and the reason is
+        # the same: a guard newer than this fixture turns it red at the point the
+        # mock stops being a plausible config.
+        #
+        # `build_loss_weight_table` collapses the `mse` alias onto `l2` and then
+        # refuses a name declared with two different weights across sections. The
+        # shared fixture writes `reconstruction.lambda_l2 = 0.0` and the line
+        # above writes `diffusion.lambda_mse = 1.0`, so the two surfaces state
+        # 0.0 and 1.0 for one loss and the table raises `ConfigurationError` --
+        # correctly. A real config could not say both.
+        #
+        # `del` rather than a second assignment, because written-ness is what the
+        # table reads: for a config double every `lambda_*` in the instance dict
+        # counts as declared, and deleting the attribute takes it out of that
+        # dict while `_LossDefaultsMock.__getattr__` still answers 0.0 for the
+        # `lambda_` prefix. So every read in the strategy is unchanged and this
+        # fixture declares the diffusion ladder it means to exercise, once,
+        # rather than contradicting itself. Setting `reconstruction.lambda_l2` to
+        # 1.0 would also silence the raise, but by declaring one weight on two
+        # surfaces -- the exact shape `dual_surface_loss_declarations` reports.
+        del config.objectives.reconstruction.lambda_l2
 
         # Also set training.diffusion as expected by v6.0 strategy
         if (

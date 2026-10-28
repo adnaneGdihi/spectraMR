@@ -164,9 +164,20 @@ def main() -> int:
     doc_dir = root / "docs"
 
     # A repo-rooted script run from outside its repo resolves its root to somewhere
-    # with no docs/ and reports all-clean, which reads exactly like a pass. Refuse.
-    if not doc_dir.is_dir():
-        print(f"FAIL: no docs/ under {root} -- refusing to report a vacuous pass.")
+    # with no pages and reports all-clean, which reads exactly like a pass. Refuse.
+    #
+    # The refusal keys on the PAGE SET, not on ``docs/``, and neither half of that
+    # implies the other. A ``docs/`` that exists but holds no page scans nothing
+    # and prints OK -- indistinguishable from a clean tree. A distribution whose
+    # prose is entirely root-level is a legitimate tree with no ``docs/`` at all,
+    # and refusing that one would leave this gate unable to check ``README.md``
+    # and ``CONTRIBUTING.md``, the two pages its scan root was widened to cover.
+    # This gate sets the exit code of the public export now, so "no page was
+    # checked" must never read as "every page is clean" -- and "checked only the
+    # root pages" must not be refused as though it were that.
+    if not shipped_pages(root, doc_dir):
+        missing = " (no docs/, and no root-level page)" if not doc_dir.is_dir() else ""
+        print(f"FAIL: no .rst/.md page under {root}{missing} -- refusing to report a vacuous pass.")
         return 1
 
     findings = scan(root, doc_dir)

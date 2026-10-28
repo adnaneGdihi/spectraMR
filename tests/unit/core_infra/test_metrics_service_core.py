@@ -141,6 +141,7 @@ class TestMetricsTracker:
             real_images, fake_images, prefix="test", epoch=1, step=10, max_images=2
         )
 
+        tracker.drain()
         # Mock Image.save should be called for each image (2 real, 2 fake)
         assert mock_img.save.call_count == 4
         assert len(real_paths) == 2

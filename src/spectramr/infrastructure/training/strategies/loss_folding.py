@@ -89,6 +89,20 @@ def declared_folds_image_losses(cls: type) -> bool | None:
     return None
 
 
+def declares_inline_objective(cls: type) -> bool:
+    """True when an EMPTY built loss stack is this strategy's declared design.
+
+    The two declarations answer this only together: a non-None ``inline_losses``
+    says the strategy has stated which terms it computes itself, and a False
+    ``folds_image_losses`` says it consumes none of the builder's modules. A
+    strategy asserting both owns its whole objective, so a builder that produced
+    nothing has not failed. Either reader returning None leaves the strategy
+    UNDECLARED and therefore not exempt -- silence is not a claim of ownership
+    (#1918), which is the distinction ``LossBuilder.validate()`` rests on.
+    """
+    return declared_inline_losses(cls) is not None and declared_folds_image_losses(cls) is False
+
+
 def unreachable_image_losses(
     names: Any,
     inline: frozenset[str],
@@ -206,3 +220,81 @@ def fold_builder_image_losses(
     if extra is not None:
         components["loss_builder_aux"] = extra.detach()
     return extra
+
+
+#: Roles a declared image loss can take (mirrors ``LossComponentConfig.role``).
+TARGET_ROLE = "target"
+SOURCE_ROLE = "source"
+#: Keys a loss may return its scalar under, in priority order.
+_SCALAR_KEYS = ("loss", "loss_total", "spectral_total")
+
+
+def declared_loss_roles(config: Any) -> dict[str, str]:
+    """Canonical name -> role for the enabled ``losses.image_losses`` entries."""
+    losses = getattr(config, "losses", None)
+    entries = getattr(losses, "image_losses", None) or []
+    return {canonical_loss_name(e.name): e.role for e in entries if e.enabled}
+
+
+def _scalar(value: Any) -> torch.Tensor:
+    if isinstance(value, dict):
+        for key in _SCALAR_KEYS:
+            if value.get(key) is not None:
+                return value[key]
+        return next(iter(value.values()))
+    if isinstance(value, (tuple, list)):
+        return value[0]
+    return value
+
+
+def fold_source_role_losses(
+    env_losses: dict[str, Any] | None,
+    roles: dict[str, str],
+    declared: dict[str, float],
+    scheduled: dict[str, float],
+    pred: torch.Tensor,
+    source: torch.Tensor,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Weighted sum of the ``role: source`` image losses, compared against ``source``.
+
+    Returns ``(extra, components)``: ``extra`` is the grad-carrying weighted sum (or
+    ``None`` when nothing folds); ``components`` holds each term detached as
+    ``loss_<name>``. Weights follow the same SSOT as :func:`fold_builder_image_losses`.
+    """
+    extra: torch.Tensor | None = None
+    components: dict[str, torch.Tensor] = {}
+    for name, module in (env_losses or {}).items():
+        canon = canonical_loss_name(name)
+        if roles.get(canon) != SOURCE_ROLE:
+            continue
+        weight = scheduled.get(canon, scheduled.get(name, declared.get(canon, 1.0)))
+        if not weight:
+            continue
+        value = _scalar(module(pred, source))
+        components[f"loss_{name}"] = value.detach()
+        term = weight * value
+        extra = term if extra is None else extra + term
+    return extra, components
+
+
+def unpaired_source_terms(
+    owner: Any, pred: torch.Tensor, source: torch.Tensor
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Source-role fold for an unpaired strategy, after refusing any target-role loss.
+
+    An unpaired batch has no pixel-aligned target, so a ``role: target`` image loss
+    would compare against the wrong domain. That raises instead of folding silently.
+    """
+    env_losses = getattr(getattr(owner, "env", None), "losses", None) or {}
+    roles = declared_loss_roles(owner.config)
+    targets = sorted(n for n in env_losses if roles.get(canonical_loss_name(n)) == TARGET_ROLE)
+    if targets:
+        raise ValueError(
+            f"{type(owner).__name__} is unpaired, but losses.image_losses declares "
+            f"{targets} with role 'target'. Set role: source on each loss that compares "
+            "against the input, or remove it."
+        )
+    scheduled = getattr(getattr(owner, "loop_state", None), "loss_weight_overrides", None) or {}
+    return fold_source_role_losses(
+        env_losses, roles, declared_loss_weights(owner.config), scheduled, pred, source
+    )

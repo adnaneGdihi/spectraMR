@@ -119,10 +119,17 @@ class TestResolveDiffusionConfig(unittest.TestCase):
 class TestEtaWiredIntoReverseStep(unittest.TestCase):
     """eta must scale the stochastic term (was validated-but-unused)."""
 
-    def test_reverse_step_multiplies_noise_by_eta(self):
-        src = inspect.getsource(_dis.DiffusionInferenceStrategy)
-        # The stochastic term is gated by self.eta now, not a bare sqrt(beta).
-        self.assertIn("self.eta * torch.sqrt(beta_t) * noise", src)
+    def _run(self, eta: float, seed: int):
+        config = {"diffusion": {"num_inference_steps": 5, "eta": eta, "image_size": 4}}
+        strategy = DiffusionInferenceStrategy(MockModel(), torch.device("cpu"), config)
+        strategy.performance_optimizer = MagicMock()
+        strategy._predict_noise = lambda x_t, t, conditioning, **kw: torch.zeros_like(x_t)
+        torch.manual_seed(seed)
+        return strategy.run_inference(torch.ones(1, 1, 4, 4), unconditional=True)
+
+    def test_eta_zero_is_deterministic_and_eta_one_is_not(self):
+        self.assertTrue(torch.equal(self._run(0.0, 1), self._run(0.0, 2)))
+        self.assertFalse(torch.equal(self._run(1.0, 1), self._run(1.0, 2)))
 
 
 class TestPredictDataConsistencyLedger(unittest.TestCase):
@@ -210,3 +217,68 @@ class TestPredictDataConsistencyLedger(unittest.TestCase):
         the in-loop DC path was unreachable from ``spectramr infer``."""
         strategy = self._strategy(False)
         self.assertIsNotNone(strategy.dc_layer)
+
+
+class TestSamplingUsesTheTrainingSchedule(unittest.TestCase):
+    """#2305: `infer` rebuilt a `sampling_steps`-long schedule, so a model trained
+    on T=1000 was sampled on T=100 and told indices 0..99."""
+
+    def _strategy(self):
+        config = {
+            "training": {
+                "diffusion": {
+                    "timesteps": 1000,
+                    "sampling_steps": 100,
+                    "noise_schedule": "linear",
+                    "in_channels": 1,
+                    "image_size": 8,
+                }
+            }
+        }
+        return DiffusionInferenceStrategy(MockModel(), torch.device("cpu"), config)
+
+    def test_the_schedule_has_the_training_length(self):
+        strategy = self._strategy()
+        self.assertEqual(strategy.num_train_timesteps, 1000)
+        self.assertEqual(len(strategy.alphas_cumprod), 1000)
+        self.assertEqual(len(strategy.sampling_timesteps), 100)
+
+    def test_the_model_is_told_training_indices(self):
+        strategy = self._strategy()
+        seen: list[int] = []
+        strategy.performance_optimizer = MagicMock()
+
+        def _predict(x_t, t, conditioning, **kw):
+            seen.append(t)
+            return torch.zeros_like(x_t)
+
+        strategy._predict_noise = _predict
+        strategy.run_inference(torch.randn(1, 1, 8, 8), unconditional=True)
+        self.assertEqual(len(seen), 100)
+        self.assertEqual((seen[0], seen[-1]), (999, 9))
+
+    def test_the_oracle_noise_recovers_the_clean_sample(self):
+        strategy = self._strategy()
+        strategy.performance_optimizer = MagicMock()
+        torch.manual_seed(0)
+        x0 = torch.rand(1, 1, 8, 8) * 0.8 - 0.4
+        eps = torch.randn(1, 1, 8, 8)
+        abar = strategy.alphas_cumprod[999]
+        x_noisiest = abar.sqrt() * x0 + (1 - abar).sqrt() * eps
+        strategy._predict_noise = lambda x_t, t, conditioning, **kw: eps
+        out = strategy.run_inference(x_noisiest, unconditional=True)
+        self.assertLess((out - x0).abs().max().item(), 1e-4)
+
+    def test_more_sampling_steps_than_training_steps_raises(self):
+        config = {"training": {"diffusion": {"timesteps": 10, "sampling_steps": 50}}}
+        with self.assertRaises(ValueError):
+            DiffusionInferenceStrategy(MockModel(), torch.device("cpu"), config)
+
+
+def test_it_owns_its_kspace_normalisation() -> None:
+    """The sampler normalises and de-normalises, so predict must not divide again (#2581)."""
+    from spectramr.infrastructure.inference.diffusion_inference_strategy import (
+        DiffusionInferenceStrategy,
+    )
+
+    assert DiffusionInferenceStrategy.owns_kspace_normalization is True

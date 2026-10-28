@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.diffusion.components import StandardDiffusionUNet
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
@@ -70,6 +71,7 @@ class DiffDeuR(nn.Module, IGenerator):
         out_channels: int = 1,
         _prior_model_path: str = None,  # Path to pre-trained HF diffusion model
         hidden_dim: int = 256,
+        num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS,
     ):
         """__init__.
 
@@ -78,10 +80,12 @@ class DiffDeuR(nn.Module, IGenerator):
             out_channels (int): Description.
             _prior_model_path (str): Description.
             hidden_dim (int): Description.
+            num_timesteps (int): Horizon the prior was trained on; SDS draws t from it.
         """
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.num_timesteps = int(num_timesteps)
 
         # 1. Generative Prior (Pre-trained Diffusion Model)
         # In a real scenario, we would load weights here.
@@ -227,13 +231,13 @@ class DiffDeuR(nn.Module, IGenerator):
             # SDS: ∇_θ ||ε_θ(z_t, t) - ε||^2 where z_t = √α_t z_0 + √(1-α_t) ε
 
             # Sample random timestep
-            t = torch.randint(0, 1000, (B,), device=device).long()
+            t = torch.randint(0, self.num_timesteps, (B,), device=device).long()
 
             # Add noise to reconstruction
             noise = torch.randn_like(reconstructed)
 
             # Simple linear noise schedule (same as in prior training)
-            alpha_t = 1 - t.float() / 1000
+            alpha_t = 1 - t.float() / self.num_timesteps
             alpha_t = alpha_t.view(-1, 1, 1, 1)
 
             noisy_img = torch.sqrt(alpha_t) * reconstructed + torch.sqrt(1 - alpha_t) * noise

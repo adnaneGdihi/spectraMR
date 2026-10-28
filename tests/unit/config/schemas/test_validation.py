@@ -208,3 +208,116 @@ class TestValidationEnsembleKnobs:
         )
         assert cfg.sampling.ensemble_samples == 4
         assert cfg.sampling.coverage_k == 1.5
+
+
+class TestRevealAttributionKnob:
+    """``validation.sampling.reveal_attribution`` (#2067 follow-up).
+
+    Planted refusal first: the knob partitions the reconstruction by reverse
+    step, which a single deterministic forward does not have. Accepting it there
+    would emit an all-``nan`` ``val_band_*`` block, which reads as "the bands are
+    unmeasurable" rather than "this arm cannot run the diagnostic".
+    """
+
+    def test_default_is_off_so_existing_arms_are_unchanged(self) -> None:
+        assert ValidationConfigSchema().sampling.reveal_attribution is False
+
+    def test_attribution_without_the_multistep_sampler_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="enable_multistep_cold"):
+            ValidationConfigSchema(sampling={"reveal_attribution": True})
+
+    def test_attribution_loads_with_the_multistep_sampler(self) -> None:
+        sampling = ValidationConfigSchema(
+            sampling={"enable_multistep_cold": True, "reveal_attribution": True}
+        ).sampling
+        assert sampling.reveal_attribution is True
+
+    def test_the_multistep_sampler_alone_does_not_enable_attribution(self) -> None:
+        """Opt-in: the oracle reads the target, so it is never implied."""
+        sampling = ValidationConfigSchema(sampling={"enable_multistep_cold": True}).sampling
+        assert sampling.reveal_attribution is False
+
+
+class TestCoilManifoldProjectionKnob:
+    """`validation.scoring.coil_manifold_projection` (n2n arm F, PAPER.md § 3)."""
+
+    @staticmethod
+    def _scoring(**kwargs):
+        from spectramr.config.schemas.validation import ValidationScoringConfigSchema
+
+        return ValidationScoringConfigSchema(**kwargs)
+
+    def test_default_is_off_so_existing_arms_score_the_raw_output(self) -> None:
+        assert self._scoring().coil_manifold_projection is False
+
+    def test_it_can_be_declared_on(self) -> None:
+        assert self._scoring(coil_manifold_projection=True).coil_manifold_projection is True
+
+    def test_a_non_boolean_is_refused(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="coil_manifold_projection"):
+            self._scoring(coil_manifold_projection="rank_one")
+
+
+class TestRecorruptedInference:
+    """`validation.scoring.recorrupted_inference` (#2329, PAPER.md Theorem 4).
+
+    The cross-block half -- refused unless data.target_mode is an R2R mode -- is
+    owned by the resolver, ``test_recorrupted_inference.py``.
+    """
+
+    @staticmethod
+    def _scoring(**knob):
+        return ValidationConfigSchema(scoring={"recorrupted_inference": knob}).scoring
+
+    def test_off_by_default(self):
+        assert ValidationConfigSchema().scoring.recorrupted_inference is None
+
+    def test_samples_alone_takes_the_trained_strength(self):
+        knob = self._scoring(samples=5).recorrupted_inference
+        assert (knob.samples, knob.alpha, knob.angle_deg) == (5, None, None)
+
+    @pytest.mark.parametrize(
+        "knob",
+        [{}, {"samples": 0}, {"samples": 5, "alpha": 0.0}, {"samples": 5, "angle_deg": 90.0}],
+        ids=["no_samples", "zero_samples", "zero_alpha", "right_angle"],
+    )
+    def test_malformed_declarations_are_refused(self, knob):
+        with pytest.raises(ValidationError):
+            self._scoring(**knob)
+
+    def test_both_strengths_are_refused(self):
+        with pytest.raises(ValidationError, match="never both"):
+            self._scoring(samples=5, alpha=0.5, angle_deg=30.0)
+
+    def test_an_unknown_key_is_refused(self):
+        with pytest.raises(ValidationError, match="draws"):
+            self._scoring(samples=5, draws=3)
+
+
+def test_per_batch_rows_defaults_off_and_is_a_declared_knob() -> None:
+    """The per-slice rows are opt-in: a run that did not ask for them writes none."""
+    assert ValidationConfigSchema().per_batch_rows is False
+    assert ValidationConfigSchema(per_batch_rows=True).per_batch_rows is True
+    description = ValidationConfigSchema.model_fields["per_batch_rows"].description
+    assert "validation_batches.csv" in description
+
+
+def test_selection_rule_defaults_to_none() -> None:
+    from spectramr.config.schemas.enums import SelectionRule
+
+    cfg = ValidationConfigSchema()
+    assert cfg.selection.rule is SelectionRule.NONE
+    assert cfg.selection.power_ratio_max == pytest.approx(1.05)
+
+
+def test_unknown_selection_rule_is_refused_at_load() -> None:
+    with pytest.raises(ValidationError):
+        ValidationConfigSchema(selection={"rule": "best_guess"})
+
+
+def test_selection_thresholds_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        ValidationConfigSchema(selection={"rule": "guarded_ring_fidelity", "fabrication_max": 0})

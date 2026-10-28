@@ -5,7 +5,7 @@ This module provides comprehensive learning rate scheduling with warmup capabili
 for all model types in the GAN training system.
 
 Features:
-- Multiple scheduler types: cosine_annealing, step_lr, exponential, reduce_on_plateau
+- Multiple scheduler types: cosine_annealing, step_lr, exponential, linear, constant
 - Linear warmup with smooth transition to main scheduler
 - Model-specific scheduler recommendations
 - Integration with existing training pipeline
@@ -15,20 +15,19 @@ Date: August 2025
 """
 
 import logging
-import warnings
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
+from spectramr.infrastructure.training.schedulers.monotone_cosine import MonotoneCosineLR
+
 logger = logging.getLogger(__name__)
 from torch.optim.lr_scheduler import (
     ConstantLR,
-    CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
     ExponentialLR,
     LinearLR,
-    ReduceLROnPlateau,
     StepLR,
 )
 
@@ -65,9 +64,9 @@ def register_scheduler(name: str):
 @register_scheduler("cosine_annealing")
 def _create_cosine_annealing_scheduler(
     optimizer: torch.optim.Optimizer, params: dict[str, Any]
-) -> CosineAnnealingLR:
-    """Create CosineAnnealingLR scheduler"""
-    return CosineAnnealingLR(
+) -> MonotoneCosineLR:
+    """Cosine decay held at ``eta_min`` past ``T_max``; never restarts on resume."""
+    return MonotoneCosineLR(
         optimizer,
         T_max=params.get("T_max", 100),
         eta_min=params.get("eta_min", 1e-6),
@@ -142,24 +141,6 @@ def _create_linear_scheduler(optimizer: torch.optim.Optimizer, params: dict[str,
     )
 
 
-@register_scheduler("reduce_on_plateau")
-def _create_reduce_on_plateau_scheduler(
-    optimizer: torch.optim.Optimizer, params: dict[str, Any]
-) -> ReduceLROnPlateau:
-    """Create ReduceLROnPlateau scheduler"""
-    return ReduceLROnPlateau(
-        optimizer,
-        mode=params.get("mode", "min"),
-        factor=params.get("factor", 0.5),
-        patience=params.get("patience", 10),
-        threshold=params.get("threshold", 1e-4),
-        threshold_mode=params.get("threshold_mode", "rel"),
-        cooldown=params.get("cooldown", 0),
-        min_lr=params.get("min_lr", 0),
-        eps=params.get("eps", 1e-8),
-    )
-
-
 class WarmupScheduler:
     """Learning rate scheduler with linear warmup followed by a main scheduler"""
 
@@ -206,7 +187,7 @@ class WarmupScheduler:
             for group, lr in zip(optimizer.param_groups, self.warmup_start_lr, strict=False):
                 group["lr"] = lr
 
-    def step(self, metrics: float | None = None):
+    def step(self) -> None:
         """Step the scheduler"""
         self.current_step += 1
 
@@ -218,15 +199,6 @@ class WarmupScheduler:
                     self.warmup_end_lr[i] - self.warmup_start_lr[i]
                 )
                 param_group["lr"] = lr
-        # Main scheduler phase
-        elif isinstance(self.main_scheduler, ReduceLROnPlateau):
-            if metrics is not None:
-                self.main_scheduler.step(metrics)
-            else:
-                warnings.warn(
-                    "ReduceLROnPlateau requires metrics but none provided",
-                    stacklevel=2,
-                )
         else:
             self.main_scheduler.step()
 
@@ -252,9 +224,58 @@ class WarmupScheduler:
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
-        """Load scheduler state"""
+        """Load scheduler state, refusing one saved by a different decay family."""
+        check_scheduler_state_compatible(
+            self.main_scheduler, state_dict["main_scheduler"], "main scheduler"
+        )
         self.current_step = state_dict["current_step"]
         self.main_scheduler.load_state_dict(state_dict["main_scheduler"])
+
+
+class SchedulerStateMismatchError(ValueError):
+    """A saved scheduler state belongs to a different scheduler family than the one built."""
+
+
+#: Keys every torch LR scheduler carries; the family-specific remainder identifies the family.
+_COMMON_SCHEDULER_KEYS = frozenset(
+    {
+        "base_lrs",
+        "last_epoch",
+        "_step_count",
+        "_get_lr_called_within_step",
+        "_last_lr",
+        "_is_initial",
+        "verbose",
+    }
+)
+
+
+def check_scheduler_state_compatible(scheduler: Any, state: dict[str, Any], what: str) -> None:
+    """Raise when ``state`` was saved by a scheduler family other than ``scheduler``'s.
+
+    ``load_state_dict`` copies whatever keys it is given, so a warm-restart state loaded into
+    a plain cosine schedule keeps its ``last_epoch`` past the new ``T_max`` and the LR climbs
+    back up instead of annealing. The family-specific keys (``T_0``/``T_cur`` against
+    ``T_max``) tell the two apart.
+    """
+    built = set(scheduler.state_dict()) - _COMMON_SCHEDULER_KEYS
+    saved = set(state) - _COMMON_SCHEDULER_KEYS
+    if built != saved:
+        raise SchedulerStateMismatchError(
+            f"The checkpoint's {what} state was saved by a different scheduler family "
+            f"({sorted(saved)}) than this run builds ({sorted(built)}), e.g. a warm-restart "
+            "schedule resumed after T_0/T_mult were dropped. Resume with the scheduler it "
+            "was saved with, or start the schedule fresh with "
+            "checkpoint.load_scheduler_state: false."
+        )
+
+
+def load_scheduler_state(scheduler: Any, state: dict[str, Any], what: str = "LR scheduler") -> None:
+    """``scheduler.load_state_dict(state)`` after the family check; the one resume entry point."""
+    # A WarmupScheduler checks its own main scheduler, which is also the DeepSpeed resume path.
+    if not isinstance(scheduler, WarmupScheduler):
+        check_scheduler_state_compatible(scheduler, state, what)
+    scheduler.load_state_dict(state)
 
 
 class SchedulerFactory:
@@ -296,16 +317,6 @@ class SchedulerFactory:
                 "warmup_steps": 100,
             },
             # KAN models
-            "kan": {
-                "scheduler": "reduce_on_plateau",
-                "params": {
-                    "mode": "min",
-                    "factor": 0.5,
-                    "patience": 10,
-                    "verbose": True,
-                },
-                "warmup_steps": 200,
-            },
             "vit_kan": {
                 "scheduler": "cosine_annealing",
                 "params": {"T_max": 30, "eta_min": 1e-7},
@@ -512,7 +523,7 @@ class AdaptiveWarmupScheduler(WarmupScheduler):
         self.max_warmup_extension = max_warmup_extension
         self.warmup_extended = False
 
-    def step(self, metrics: float | None = None, loss: float | None = None):
+    def step(self, loss: float | None = None) -> None:
         """Step with adaptive warmup extension"""
         # Track loss for stability assessment
         if loss is not None:
@@ -541,7 +552,7 @@ class AdaptiveWarmupScheduler(WarmupScheduler):
                 )
 
         # Call parent step
-        super().step(metrics)
+        super().step()
 
 
 def create_enhanced_scheduler_system(
@@ -671,7 +682,6 @@ if __name__ == "__main__":
         "cosine_annealing",
         "step_lr",
         "exponential",
-        "reduce_on_plateau",
     ]
 
     for scheduler_type in scheduler_types:
@@ -690,10 +700,7 @@ if __name__ == "__main__":
 
         # Test a few steps
         for step in range(15):
-            if scheduler_type == "reduce_on_plateau":
-                scheduler.step(metrics=0.5)  # Dummy metric
-            else:
-                scheduler.step()
+            scheduler.step()
 
             if step in [0, 5, 10, 14]:
                 logger.debug(f"Step {step}: LR = {scheduler.get_last_lr()}")

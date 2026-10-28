@@ -1,6 +1,6 @@
 """Unit tests for _squeeze_volume_to_2d contiguity fix.
 
-Verifies that middle-slice extraction from 5D volumes returns
+Verifies that the depth fold of 5D volumes returns
 contiguous tensors, preventing cuDNN CUDNN_STATUS_NOT_SUPPORTED
 errors in downstream Conv2d operations.
 """
@@ -16,16 +16,15 @@ from spectramr.models.generators.hilbert_mamba_generators import (
 class TestSqueezeVolumeTo2D:
     """Test suite for _squeeze_volume_to_2d contiguity."""
 
-    def test_5d_middle_slice_is_contiguous(self):
-        """Middle-slice extraction must return contiguous tensor."""
-        x = torch.randn(2, 3, 8, 16, 16)  # [B, C, D, H, W]
+    def test_5d_depth_fold_is_contiguous(self):
+        """Depth fold must return a contiguous tensor."""
+        x = torch.randn(2, 3, 8, 16, 4)  # [B, C, H, W, D]
         squeezed, original_shape = _squeeze_volume_to_2d(x)
         assert squeezed.is_contiguous(), (
-            f"Middle-slice tensor is not contiguous: "
-            f"stride={squeezed.stride()}, shape={squeezed.shape}"
+            f"Folded tensor is not contiguous: stride={squeezed.stride()}, shape={squeezed.shape}"
         )
-        assert squeezed.shape == (2, 3, 16, 16)
-        assert original_shape == (2, 3, 8, 16, 16)
+        assert squeezed.shape == (8, 3, 8, 16)
+        assert original_shape == (2, 3, 8, 16, 4)
 
     def test_5d_single_depth_squeeze(self):
         """5D with D=1 should squeeze last dim and be contiguous."""
@@ -51,9 +50,9 @@ class TestSqueezeVolumeTo2D:
 
     def test_squeeze_compatible_with_conv2d(self):
         """Squeezed tensor must work with Conv2d without cuDNN errors."""
-        x = torch.randn(2, 3, 8, 16, 16)
+        x = torch.randn(2, 3, 8, 16, 4)
         squeezed, _ = _squeeze_volume_to_2d(x)
         conv = torch.nn.Conv2d(3, 8, kernel_size=3, padding=1)
         # This should NOT raise cuDNN errors
         out = conv(squeezed)
-        assert out.shape == (2, 8, 16, 16)
+        assert out.shape == (8, 8, 8, 16)

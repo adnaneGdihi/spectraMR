@@ -30,6 +30,10 @@ from typing import Any
 
 import pandas as pd
 
+from spectramr.core.run_artifacts import INFERENCE_SUBDIR
+
+from .metric_names import annotate_frame
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +49,16 @@ class ExperimentArtifacts:
     config_yaml: Path | None
     run_summary_json: Path | None
     report_cases_dir: Path | None
+    #: Where ``final_eval_json`` came from; see :func:`eval_source`.
+    eval_source: str = "none"
+
+
+def eval_source(experiment_dir: str | Path) -> str:
+    """``inference`` when ``campaign infer`` re-ran the test pass, ``training`` for the run's own, else ``none``."""
+    p = Path(experiment_dir)
+    if (p / INFERENCE_SUBDIR / "final_eval.json").exists():
+        return "inference"
+    return "training" if (p / "final_eval.json").exists() else "none"
 
 
 def discover_artifacts(experiment_dir: str | Path) -> ExperimentArtifacts:
@@ -58,12 +72,17 @@ def discover_artifacts(experiment_dir: str | Path) -> ExperimentArtifacts:
           │   ├── validation_metrics.csv
           │   └── run_summary.json   (optional)
           ├── final_eval.json        (optional, written by inference pipelines)
+          ├── inference/final_eval.json  (optional, `campaign infer`; read in preference)
           ├── final_metrics.json     (optional, per-arm campaign contract)
           ├── run_summary.json       (optional, run-level facts)
           └── config.yaml            (optional snapshot)
     """
     p = Path(experiment_dir)
     logs = p / "logs"
+    source = eval_source(p)
+    # The re-run test pass (`campaign infer`) is the report's inference phase when it exists; the
+    # training-time one stays on disk beside it for comparison.
+    final_eval = p / INFERENCE_SUBDIR / "final_eval.json" if source == "inference" else p / "final_eval.json"
     # run_summary.json historically lived under logs/; the training pipeline
     # now writes it at the run root — accept either location.
     run_summary = next(
@@ -78,7 +97,8 @@ def discover_artifacts(experiment_dir: str | Path) -> ExperimentArtifacts:
         validation_metrics_csv=(logs / "validation_metrics.csv")
         if (logs / "validation_metrics.csv").exists()
         else None,
-        final_eval_json=(p / "final_eval.json") if (p / "final_eval.json").exists() else None,
+        final_eval_json=final_eval if source != "none" else None,
+        eval_source=source,
         final_metrics_json=(p / "final_metrics.json")
         if (p / "final_metrics.json").exists()
         else None,
@@ -245,8 +265,10 @@ def aggregate(
 
     Returns:
         Long-format DataFrame with columns
-        ``[run_id, method, split, step, metric, value]`` (plus
-        ``subject_id`` where the eval JSON provided per-subject data).
+        ``[run_id, method, split, step, metric, value]`` plus the parsed
+        ``base_metric`` / ``acceleration`` / ``headline`` columns
+        (:mod:`.metric_names`), and ``subject_id`` where the eval JSON provided
+        per-subject data.
     """
     artifacts = discover_artifacts(experiment_dir)
     method = method_name or artifacts.experiment_dir.name
@@ -263,7 +285,7 @@ def aggregate(
     if not parts:
         logger.warning("No metric artifacts found under %s", experiment_dir)
         return pd.DataFrame(columns=["run_id", "method", "split", "step", "metric", "value"])
-    return pd.concat(parts, ignore_index=True, sort=False)
+    return annotate_frame(pd.concat(parts, ignore_index=True, sort=False))
 
 
 def aggregate_many(

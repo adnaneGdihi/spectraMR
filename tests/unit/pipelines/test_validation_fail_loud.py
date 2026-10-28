@@ -157,13 +157,14 @@ def test_all_batches_succeeding_does_not_raise() -> None:
     assert "val_loss" in metrics
 
 
-def test_single_batch_failure_is_tolerated() -> None:
+def test_single_batch_failure_fails_the_run() -> None:
+    """One batch fails and one succeeds: the survivors would select the checkpoint, so it raises."""
     pipeline = _make_pipeline([_batch(), _batch()])
-    # One batch fails, one succeeds → val_count > 0 → no raise.
-    metrics = _run_validation(
-        pipeline, _SometimesFailStrategy(), iteration=10, epoch=0, logging_service=None
-    )
-    assert "val_loss" in metrics
+    with pytest.raises(RuntimeError, match=r"lost 1 of 2 batch\(es\)") as excinfo:
+        _run_validation(
+            pipeline, _SometimesFailStrategy(), iteration=10, epoch=0, logging_service=None
+        )
+    assert "transient batch failure" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -343,3 +344,62 @@ def test_distribution_head_prediction_reduced_before_save() -> None:
     assert (
         saved.shape[1] == 1
     ), f"saved fake is not single-channel: {tuple(saved.shape)}"
+
+
+@pytest.mark.parametrize(
+    "arm", ["ei_multicoil_m4raw_r4", "robust_ssdu_m4raw_r4", "robust_ssdu_selfcal_m4raw_r4"]
+)
+def test_a_batch_context_arm_saves_its_validation_image_through_the_loop(arm) -> None:
+    """#2431: these arms logged metrics and never an image. The capture's bare context
+    lacked the maps and measurement, and preparing the input folded its four coils
+    across the axes; a builder-only test passed while the loop still dropped the image."""
+    from unittest.mock import MagicMock
+
+    from spectramr.pipelines.train import _visual_capture_state
+    from tests.fixtures.self_supervised_batches import build_strategy, load_arm, real_batches
+
+    config = load_arm(arm)
+    _, val = real_batches(config, coils=4)
+    strategy = build_strategy(config)
+    pipeline = SimpleNamespace(
+        ema=None,
+        device=torch.device("cpu"),
+        config=config,
+        data_loaders={"val": [val]},
+        generator=strategy.env.generator,
+        models={"generator": strategy.env.generator},
+    )
+    tb_writer = MagicMock()
+    _run_validation(
+        pipeline, strategy, iteration=0, epoch=0, logging_service=None,
+        metrics_service=MagicMock(), tb_writer=tb_writer,
+    )
+    assert _visual_capture_state(strategy).get("last_error") is None
+    assert any("image" in name for name, _, _ in tb_writer.mock_calls), "no image was logged"
+
+
+
+class _SentinelOnFirstBatchStrategy:
+    """Returns the failure sentinel for batch 0 and real metrics after, as a strategy does
+    when one batch yields no prediction (``DiffusionTrainingStrategy.validation_step``)."""
+
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(logging=_logging_cfg())
+
+    def validation_step(self, input_batch, target_batch, batch_idx=0):
+        if batch_idx == 0:
+            return {"validation_error": 1.0}
+        return {"val_loss": 0.5, "psnr": 25.0}
+
+    def finalize_validation(self) -> dict:
+        return {}
+
+
+def test_a_sentinel_batch_counts_as_failed_not_scored() -> None:
+    """Planted: before, the sentinel batch counted as a success and the run selected on the rest."""
+    pipeline = _make_pipeline([_batch(), _batch()])
+    with pytest.raises(RuntimeError, match=r"lost 1 of 2 batch\(es\)") as excinfo:
+        _run_validation(
+            pipeline, _SentinelOnFirstBatchStrategy(), iteration=10, epoch=0, logging_service=None
+        )
+    assert "failure sentinel" in str(excinfo.value)

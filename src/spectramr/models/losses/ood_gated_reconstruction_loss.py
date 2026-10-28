@@ -38,6 +38,7 @@ References
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -80,7 +81,7 @@ class OODGatedReconstructionLoss(nn.Module):
             to uniform weighting.
     """
 
-    _SOURCES = {"reconstruction_error", "context"}
+    _SOURCES: ClassVar[frozenset[str]] = frozenset({"reconstruction_error", "context"})
 
     def __init__(
         self,
@@ -111,8 +112,8 @@ class OODGatedReconstructionLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
-        **kwargs,
+        context: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         per_voxel = _BASE_FNS[self.base](prediction, target)
 
@@ -140,5 +141,7 @@ class OODGatedReconstructionLoss(nn.Module):
                     f"prediction spatial shape {tuple(prediction.shape[-2:])}."
                 )
 
-        weights = 1.0 + self.boost * score
+        # Normalise by the weights broadcast over the channels they multiply, so
+        # boost=0 (or a zero score) reduces to the base loss's plain mean for any C.
+        weights = (1.0 + self.boost * score).expand_as(per_voxel)
         return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)

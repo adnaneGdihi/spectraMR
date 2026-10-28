@@ -80,7 +80,12 @@ def build_simulator_from_config(
 
     # SSOT config→simulator mapping lives on the simulator (also used by the
     # transversal DigitalTwinDegradation data transform).
-    simulator = DigitalTwinSimulator.from_config(dt, img_size).to(device)
+    simulator = DigitalTwinSimulator.from_config(
+        dt,
+        img_size,
+        field_strength_t=config.physics.field_strength,
+        phase_encode_axis=getattr(config.data.acquisition, "phase_encode_axis", None),
+    ).to(device)
 
     logger.info(
         "[build_simulator] marker=%s, motion=%s, im_size=%s on %s",
@@ -90,6 +95,22 @@ def build_simulator_from_config(
         device,
     )
     return simulator
+
+
+def require_epi_profile(simulator: Any) -> None:
+    """Raise if the twin's scanner profile is not EPI.
+
+    The VF field score grades the twin's phase-encode B0 shift, which only EPI produces: a
+    spin-warp profile makes that shift identically zero, so the score would be silently dead.
+    """
+    profile = getattr(simulator, "scanner_profile", None)
+    if profile is not None and str(profile.sequence) != "epi":
+        raise ValueError(
+            "The virtual-fiducial field score needs the phase-encode B0 shift that only EPI "
+            f"produces, but physics.digital_twin.acquisition declares sequence "
+            f"{str(profile.sequence)!r} (profile {profile.name!r}). Declare sequence: epi, "
+            "or drop the acquisition block."
+        )
 
 
 def undersampling_mask_kwargs(simulator: Any) -> dict[str, torch.Tensor]:
@@ -109,4 +130,4 @@ def undersampling_mask_kwargs(simulator: Any) -> dict[str, torch.Tensor]:
     return {"mask": mask} if mask is not None else {}
 
 
-__all__ = ["build_simulator_from_config", "undersampling_mask_kwargs"]
+__all__ = ["build_simulator_from_config", "require_epi_profile", "undersampling_mask_kwargs"]

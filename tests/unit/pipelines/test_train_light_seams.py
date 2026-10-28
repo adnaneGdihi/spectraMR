@@ -486,6 +486,20 @@ class TestEmaShouldUpdate:
         # Default warmup_steps=0 preserves every-step behavior.
         assert ema_should_update(0, 1, warmup_steps=0) is True
 
+    @pytest.mark.parametrize("gas", [2, 4])
+    def test_updates_once_per_optimizer_step_under_accumulation(self, gas: int) -> None:
+        """The weights change only on the boundary micro-batch; a blend on any
+        other one re-applies the decay to unchanged weights (decay**gas)."""
+        hits = [i for i in range(4 * gas) if ema_should_update(i, 1, 0, gas)]
+        assert hits == [gas - 1, 2 * gas - 1, 3 * gas - 1, 4 * gas - 1]
+
+    def test_frequency_and_warmup_count_optimizer_steps(self) -> None:
+        gas = 2
+        hits = [i for i in range(40) if ema_should_update(i, 5, 0, gas)]
+        assert [i // gas for i in hits] == [0, 5, 10, 15]
+        first = next(i for i in range(40) if ema_should_update(i, 1, 3, gas))
+        assert first // gas == 3
+
 
 # ---------------------------------------------------------------------------
 # restore_best_weights is wired into the training loop (was inert; pitfall #15)
@@ -505,7 +519,8 @@ class TestRestoreBestWeightsWiring:
         # (1) the best path is tracked, (2) gated on the flag, (3) reloaded.
         assert "best_checkpoint_path = str(best_path)" in src
         assert "restore_best_weights" in src
-        assert ".load_from(best_checkpoint_path)" in src
+        restore = src.index("checkpoint_service.best_weights(")
+        assert "best_checkpoint_path" in src[restore : src.index(")", restore)]
 
 
 # ---------------------------------------------------------------------------

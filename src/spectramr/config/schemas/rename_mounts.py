@@ -53,6 +53,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel
 
+from .removals import REMOVALS, RemovalRecord, removals_for_block
 from .renames import RENAMES, Posture, RenameRecord, renames_for_block
 
 __all__ = [
@@ -174,6 +175,7 @@ def audit_mounts(
     root: type[BaseModel],
     table: dict[str, RenameRecord] | None = None,
     allowed_inert: dict[tuple[str, str], str] | None = None,
+    removals: dict[str, RemovalRecord] | None = None,
 ) -> list[MountFinding]:
     """Compare the mounts reachable from ``root`` against ``table``.
 
@@ -184,13 +186,20 @@ def audit_mounts(
     audit with no exemptions at all.
     """
     records = RENAMES if table is None else table
+    # An injected rename table audits that table alone unless removals are injected too.
+    removed = (REMOVALS if table is None else {}) if removals is None else removals
     exempt = FORWARD_PROVISIONED if allowed_inert is None else allowed_inert
     mounted = discover_mounts(root)
+    # A removed key is refused by the `raise` mount of its block, like a raise rename.
     owed = {(record.mount_path, record.posture) for record in records.values()}
+    owed |= {(record.mount_path, "raise") for record in removed.values()}
 
     findings: list[MountFinding] = []
     for block, posture in sorted(owed - set(mounted)):
-        served = renames_for_block(block, records, posture=posture)
+        served = {
+            **renames_for_block(block, records, posture=posture),
+            **(removals_for_block(block, removed) if posture == "raise" else {}),
+        }
         findings.append(
             MountFinding(
                 kind="missing_mount",

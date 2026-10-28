@@ -58,7 +58,7 @@ SKIP_MODEL_FIELDS = frozenset(
         # equivariance_conformal arms (cluster smoke 20260605, job 7095209).
         "conditioning",
         # Sequential-campaign warm-start knob, consumed by
-        # ModelBuilder._load_init_checkpoint AFTER the generator is built.
+        # ModelBuilder._warm_start AFTER the generator is built.
         # Leaking it crashed exp_p1_b1_equivariance_conformal (2026-06-16).
         "checkpoint_path",
     }

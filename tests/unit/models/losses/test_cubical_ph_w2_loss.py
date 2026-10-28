@@ -57,12 +57,10 @@ def test_matching_uses_linfinity_ground_metric() -> None:
 
     cost, _pairs = _wasserstein_matching(a, b, p=2, ot_module=_DiagonalOT())
 
-    # Plan = diag([0.5, 0.5]); off-diagonal (genuine) pair cost =
-    # max(0.2, 0.3)^2 = 0.09. The diagonal↔diagonal block is now zeroed
-    # (Hera reduction: both endpoints lie on the diagonal), so that pair
-    # contributes 0, not the old spurious max(0.25, 0.25)^2 = 0.0625 (F2).
-    # L∞ total = 0.5*0.09 + 0.5*0 = 0.045  (was 0.07625 with the bug).
-    assert cost == pytest.approx(0.045, abs=1e-6)
+    # Plan = diag: the genuine pair costs max(0.2, 0.3)^2 = 0.09; the
+    # diagonal-to-diagonal pair costs 0 (Hera reduction). The cost is the sum of
+    # p-th powers over the chosen permutation, with no 1/n normalisation.
+    assert cost == pytest.approx(0.09, abs=1e-6)
 
 
 def test_diagonal_block_zeroed_routes_genuine_match() -> None:
@@ -187,7 +185,7 @@ def test_mask_zeros_out_background_features() -> None:
 
 
 def test_stability_bound() -> None:
-    """W_p(Dgm(p), Dgm(t)) <= ||p - t||_p (Cohen-Steiner)."""
+    """W_p(Dgm(p), Dgm(t)) <= 3^(d/p) ||p - t||_2 for voxel images (Skraba-Turner)."""
     pred = torch.rand(1, 1, 8, 8, requires_grad=True)
     target = torch.rand(1, 1, 8, 8)
     ph_loss = CubicalPHWassersteinLoss(homology_dims=(0,), wasserstein_p=2)(
@@ -196,4 +194,80 @@ def test_stability_bound() -> None:
     l2_bound = (pred - target).pow(2).sum().sqrt()
     # Allow a small numerical slack — the loss is computed on a
     # detached numpy view and re-attached via birth-voxel scatter.
-    assert ph_loss.item() <= l2_bound.item() + 1e-3
+    # Bound with the voxel constant 3^(d/p) from Skraba-Turner, d=2, p=2.
+    assert ph_loss.item() <= 3.0 * l2_bound.item() + 1e-3
+
+
+@pytest.mark.parametrize("shape", [(7, 11), (12, 12), (4, 5, 6)])
+def test_diagram_matches_gudhi_on_non_symmetric_input(shape: tuple[int, ...]) -> None:
+    """gudhi numbers cells in Fortran order; reading them in C order transposes
+    every voxel, which the symmetric fixtures above cannot see."""
+    import numpy as np
+
+    vol = np.random.default_rng(0).random(shape)
+    cc = gudhi.CubicalComplex(top_dimensional_cells=vol)
+    cc.compute_persistence()
+    expected = sorted(
+        (b, d) for dim, (b, d) in cc.persistence() if dim in (0, 1) and np.isfinite(d)
+    )
+    out = CubicalPHWassersteinLoss(homology_dims=(0, 1))._persistence_with_voxels(vol)
+    for dim in (0, 1):
+        dgm, births, deaths = out[dim]
+        expected = sorted((b, d) for q, (b, d) in cc.persistence() if q == dim and np.isfinite(d))
+        assert np.allclose(sorted(map(tuple, dgm)), expected)
+        assert np.array_equal(vol.reshape(-1)[births], dgm[:, 0])
+        assert np.array_equal(vol.reshape(-1)[deaths], dgm[:, 1])
+
+
+def test_off_diagonal_well_gradient_lands_on_the_well() -> None:
+    """A hallucinated well at [1, 6] is pushed flat at [1, 6], not at its transpose."""
+    target = _one_well()
+    pred = _one_well()
+    pred[0, 0, 1, 6] = 0.3
+    pred.requires_grad_(True)
+    CubicalPHWassersteinLoss(homology_dims=(0,), wasserstein_p=2)(pred, target).backward()
+    assert pred.grad is not None
+    assert pred.grad[0, 0, 1, 6] != 0.0
+    assert pred.grad[0, 0, 6, 1] == 0.0
+
+
+def _dots(points, n: int = 16) -> torch.Tensor:
+    img = torch.ones(1, 1, n, n)
+    for y, x in points:
+        img[0, 0, y, x] = 0.0
+    return img
+
+
+def test_erased_target_feature_raises_loss() -> None:
+    """A prediction missing target features must score above zero (#2374)."""
+    dots = [(2, 2), (2, 12), (12, 2), (12, 12)]
+    target = _dots(dots)
+    loss_fn = CubicalPHWassersteinLoss(homology_dims=(0,))
+    assert loss_fn(target.clone(), target).item() == pytest.approx(0.0, abs=1e-6)
+    assert loss_fn(_dots(dots[:3]), target).item() > 0.0
+
+
+def test_h0_point_never_matches_h1_point() -> None:
+    """A loop (H1) against two dots (H0) is not a free match across dimensions."""
+    ring = torch.ones(1, 1, 16, 16)
+    ring[0, 0, 4:12, 4] = 0.0
+    ring[0, 0, 4:12, 11] = 0.0
+    ring[0, 0, 4, 4:12] = 0.0
+    ring[0, 0, 11, 4:12] = 0.0
+    dots = _dots([(2, 2), (13, 13)])
+    loss_fn = CubicalPHWassersteinLoss(homology_dims=(0, 1))
+    assert loss_fn(ring, dots).item() > 0.0
+
+
+def test_wasserstein_p_reaches_the_loss() -> None:
+    torch.manual_seed(0)
+    pred = torch.rand(1, 1, 8, 8, requires_grad=True)
+    target = torch.rand(1, 1, 8, 8)
+    p1 = CubicalPHWassersteinLoss(homology_dims=(0,), wasserstein_p=1)(pred, target)
+    p2 = CubicalPHWassersteinLoss(homology_dims=(0,), wasserstein_p=2)(pred, target)
+    assert p1.item() != pytest.approx(p2.item())
+
+
+def test_stratify_subvolumes_above_one_is_refused() -> None:
+    with pytest.raises(ValueError, match="not implemented"):
+        CubicalPHWassersteinLoss(homology_dims=(0,), stratify_subvolumes=2)

@@ -12,6 +12,7 @@ from torch import nn
 
 from spectramr.config.schemas.enums import TrainingModeTypes
 from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+from spectramr.infrastructure.inference.strided_sampling import ddim_step, strided_timesteps
 from spectramr.infrastructure.physics.data_consistency import HardDataConsistency
 from spectramr.infrastructure.training.schedulers.diffusion_scheduler import (
     DiffusionScheduler,
@@ -74,6 +75,9 @@ class DiffusionInferenceStrategy(BaseInferenceStrategy, MultiModalInferenceMixin
     Handles iterative sampling for diffusion models trained with
     denoising objectives (DDPM, cold diffusion, flow matching, etc.).
     """
+
+    #: The sampler normalises its input and de-normalises the sample itself.
+    owns_kspace_normalization: bool = True
 
     def __init__(
         self,
@@ -184,9 +188,23 @@ class DiffusionInferenceStrategy(BaseInferenceStrategy, MultiModalInferenceMixin
                 f"beta_schedule must be one of {valid_schedules}, got {self.beta_schedule}"
             )
 
-        # Initialize noise schedule via DiffusionScheduler
+        # The schedule is the one the model was trained on; sampling visits a
+        # strided subsequence of its indices. A schedule rebuilt at the sampling
+        # length named different noise levels by the same indices (#2305). A
+        # legacy top-level `diffusion:` block has no training length, and its
+        # num_inference_steps describes the schedule itself.
+        self.num_train_timesteps = self._validate_param(
+            self.diffusion_config.get("timesteps", self.num_inference_steps),
+            "timesteps",
+            min_val=1,
+            max_val=10000,
+            param_type=int,
+        )
+        self.sampling_timesteps = strided_timesteps(
+            self.num_train_timesteps, self.num_inference_steps
+        )
         self.scheduler = DiffusionScheduler(
-            num_timesteps=self.num_inference_steps,
+            num_timesteps=self.num_train_timesteps,
             beta_schedule=self.beta_schedule,
             beta_start=self.beta_start,
             beta_end=self.beta_end,
@@ -516,33 +534,18 @@ class DiffusionInferenceStrategy(BaseInferenceStrategy, MultiModalInferenceMixin
             self.model, batch_size, channels, height, width, conditioning_channels
         )
 
-        # Iterative denoising with advanced sampling
+        # Iterative denoising over the strided training indices (DDIM; eta=0
+        # deterministic, eta=1 the DDPM posterior variance).
         own_dc_applied = False
-        for t in reversed(range(self.num_inference_steps)):
-            # Predict noise using advanced methods
+        visits = self.sampling_timesteps
+        for i, t in enumerate(visits):
             noise_pred = self._predict_noise(x_t, t, conditioning, **kwargs)
 
-            # Apply dynamic thresholding if enabled
             if self.dynamic_thresholding:
                 x_t = self._apply_dynamic_thresholding(x_t, self.thresholding_percentile)
 
-            # Reverse diffusion step (DDPM)
-            alpha_t = self.alphas[t]
-            alpha_t_cumprod = self.alphas_cumprod[t]
-            beta_t = self.betas[t]
-
-            if t > 0:
-                noise = torch.randn_like(x_t)
-            else:
-                noise = torch.zeros_like(x_t)
-
-            # DDPM/DDIM sampling. eta scales the stochastic term: eta=1 → full
-            # DDPM variance, eta=0 → deterministic (DDIM-style). Previously eta
-            # was validated and stored but never read (CLAUDE.md pitfall #15),
-            # so eta=0.0 — the documented default — silently ran stochastic.
-            x_t = (1 / torch.sqrt(alpha_t)) * (
-                x_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_t_cumprod)) * noise_pred
-            ) + self.eta * torch.sqrt(beta_t) * noise
+            alpha_bar_prev = self.alphas_cumprod[visits[i + 1]] if i + 1 < len(visits) else 1.0
+            x_t = ddim_step(x_t, noise_pred, self.alphas_cumprod[t], alpha_bar_prev, self.eta)
 
             # [MRI] Apply Data Consistency
             # We assume conditioning IS the measured k-space for Cold Diffusion
@@ -627,6 +630,7 @@ class DiffusionInferenceStrategy(BaseInferenceStrategy, MultiModalInferenceMixin
             {
                 "diffusion_config": self.diffusion_config,
                 "num_inference_steps": self.num_inference_steps,
+                "num_train_timesteps": self.num_train_timesteps,
                 "guidance_scale": self.guidance_scale,
                 "beta_schedule": self.beta_schedule,
                 "use_classifier_free_guidance": self.use_classifier_free_guidance,

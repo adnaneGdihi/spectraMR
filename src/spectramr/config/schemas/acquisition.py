@@ -55,6 +55,15 @@ class CodesignConfig(BaseModel):
         ge=0.0,
         description="Weight on the hardware-feasibility penalty term.",
     )
+    field_of_view_m: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Field of view in metres along the phase-encode/readout plane. Required when "
+            "codesign is enabled: it converts the trajectory to cycles per metre for the "
+            "T/m and T/m/s limits."
+        ),
+    )
 
 
 class ActiveAcquisitionConfig(BaseModel):

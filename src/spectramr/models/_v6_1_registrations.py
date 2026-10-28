@@ -202,11 +202,8 @@ class VendorAwareTranslation(_BackboneAlias):
 
 
 # NOTE: cdiffmr_baseline / shen2024_baseline / fdb_baseline are NOT stubbed
-# here. Real BaselineAdapter implementations live in
-# spectramr/models/baselines/{cdiffmr,shen2024,fdb}.py and register the same
-# names; they are auto-imported via the `spectramr.models.baselines` entry in
-# init_registry's walk list. Keeping the old _BackboneAlias placeholders here
-# double-registered the names and tripped the fail-loud collision guard.
+# here: the out-of-tree ``spectramr_baselines`` plugin registers them, and a
+# placeholder would collide with it on the fail-loud duplicate guard.
 # filterdiff_baseline / amk_cdiffnet_baseline below remain placeholders
 # (no upstream implementation yet).
 

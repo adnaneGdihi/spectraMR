@@ -35,7 +35,6 @@ class TestRegistryCoverage:
             "exponential",
             "linear",
             "constant",
-            "reduce_on_plateau",
         ],
     )
     def test_family_is_registered(self, name):
@@ -108,3 +107,86 @@ class TestWarmupScheduler:
         sched2 = WarmupScheduler(opt2, main2, warmup_steps=5, warmup_start_lr=1e-7)
         sched2.load_state_dict(state)
         assert sched2.current_step == sched.current_step
+
+
+def test_every_recommended_scheduler_is_one_the_factory_builds():
+    """A recommendation naming a removed scheduler (the plateau family, #2301)
+    turned ``create_scheduler(..., model_type=...)`` into a raise."""
+    import torch
+
+    from spectramr.infrastructure.training.scheduler_system import SchedulerFactory
+
+    recs = SchedulerFactory.get_model_specific_scheduler_recommendations()
+    for model_type in recs:
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+        SchedulerFactory.create_scheduler(opt, "cosine", None, model_type=model_type)
+
+
+# --- Resuming across a scheduler-family change (#2748) --------------------------------
+# A warm-restart state loaded into CosineAnnealingLR keeps last_epoch past T_max and the LR
+# climbs back up; the loads must refuse it, on the bare and the warmup-wrapped path alike.
+
+
+def _opt():
+    return torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-3)
+
+
+def _warm_restarts(opt):
+    return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=70000, T_mult=2)
+
+
+def _cosine(opt):
+    return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=31500, eta_min=1e-6)
+
+
+def test_a_warm_restart_state_is_refused_by_a_cosine_scheduler() -> None:
+    from spectramr.infrastructure.training.scheduler_system import (
+        SchedulerStateMismatchError,
+        load_scheduler_state,
+    )
+
+    old = _warm_restarts(_opt())
+    for _ in range(5):
+        old.step()
+    with pytest.raises(SchedulerStateMismatchError, match="different scheduler family"):
+        load_scheduler_state(_cosine(_opt()), old.state_dict())
+
+
+def test_the_warmup_wrapped_path_refuses_it_too() -> None:
+    """DeepSpeed restores through WarmupScheduler.load_state_dict, not the helper."""
+    from spectramr.infrastructure.training.scheduler_system import (
+        SchedulerStateMismatchError,
+        WarmupScheduler,
+    )
+
+    old = WarmupScheduler(_o := _opt(), main_scheduler=_warm_restarts(_o), warmup_steps=10)
+    new = WarmupScheduler(_n := _opt(), main_scheduler=_cosine(_n), warmup_steps=10)
+    with pytest.raises(SchedulerStateMismatchError):
+        new.load_state_dict(old.state_dict())
+
+
+def test_a_same_family_state_still_resumes() -> None:
+    from spectramr.infrastructure.training.scheduler_system import (
+        WarmupScheduler,
+        load_scheduler_state,
+    )
+
+    old = WarmupScheduler(_o := _opt(), main_scheduler=_cosine(_o), warmup_steps=10)
+    for _ in range(25):
+        old.step()
+    new = WarmupScheduler(_n := _opt(), main_scheduler=_cosine(_n), warmup_steps=10)
+    load_scheduler_state(new, old.state_dict())
+    assert new.current_step == 25
+    assert new.main_scheduler.last_epoch == old.main_scheduler.last_epoch
+
+
+def test_cosine_annealing_key_builds_the_monotone_schedule() -> None:
+    """The registry's cosine never re-ascends; the periodic torch class did."""
+    from spectramr.infrastructure.training.schedulers.monotone_cosine import MonotoneCosineLR
+
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    sched = SCHEDULER_REGISTRY["cosine_annealing"](opt, {"T_max": 5, "eta_min": 0.0})
+    assert isinstance(sched, MonotoneCosineLR)
+    for _ in range(12):
+        sched.step()
+    assert sched.get_last_lr()[0] == 0.0

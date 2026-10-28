@@ -32,10 +32,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from spectramr.data.split_utils import split_index
+from spectramr.data.split_utils import (
+    FILE_KEYS as _FILE_KEYS,
+    SUBJECT_KEYS as _SUBJECT_KEYS,
+    record_split_key,
+    split_index_grouped,
+)
 
 __all__ = [
     "SplitLeakageReport",
+    "analyze_paired_partition_leakage",
     "analyze_split_leakage",
     "analyze_test_split_leakage",
     "read_manifest_records",
@@ -44,10 +50,6 @@ __all__ = [
 #: Cap on how many overlapping identities we surface (keep messages bounded).
 _OVERLAP_SAMPLE_CAP = 20
 
-#: Record keys that identify a *subject* (patient), strictest → loosest.
-_SUBJECT_KEYS = ("subject_id", "patient_id", "subject")
-#: Record keys that identify an exact *file*, strictest → loosest.
-_FILE_KEYS = ("relative_path", "primary_path", "file_id", "path", "file")
 
 
 @dataclass(frozen=True)
@@ -302,6 +304,67 @@ def analyze_test_split_leakage(config: Any) -> SplitLeakageReport:
     return _overlap_report("held_out_test", pool, test, sides=("training pool", "held-out test"))
 
 
+def partition_leakage_report(
+    train: list[dict[str, Any]],
+    val: list[dict[str, Any]],
+    test: list[dict[str, Any]],
+) -> SplitLeakageReport:
+    """Subject/file overlap across every pair of a train/val/test partition.
+
+    Repeat scans of one subject (``sub-X/ses-NN``) share ``subject_id``, so a
+    subject straddling two splits is caught even when its files differ.
+    """
+    pairs = [
+        ("train", "validation", train, val),
+        ("train", "held-out test", train, test),
+        ("validation", "held-out test", val, test),
+    ]
+    last: SplitLeakageReport | None = None
+    for left_name, right_name, left, right in pairs:
+        if not left or not right:
+            continue
+        report = _overlap_report(
+            "paired_partition", left, right, sides=(left_name, right_name)
+        )
+        if report.status == "leak":
+            return report
+        last = report
+    if last is None:
+        return _skipped("paired_partition", "fewer than two non-empty splits to compare.")
+    return last
+
+
+def analyze_paired_partition_leakage(data: Any) -> SplitLeakageReport:
+    """Replay the paired-manifest route's real partition and check it for leaks.
+
+    A config-owned partition is replayed through the loader's own function. On
+    the ``split_hint`` route the train and validation records are read by the
+    same reader the loader uses.
+    """
+    from spectramr.data.metadata.index_builder import IndexBuilder
+    from spectramr.data.metadata.paired_partition import (
+        is_config_owned,
+        resolve_paired_partition,
+    )
+
+    path = _resolve(str(data.source.paired_manifest_path))
+    if not Path(path).exists():
+        return _skipped(
+            "paired_partition",
+            "paired manifest not present locally (gitignored — runs on cluster).",
+        )
+    try:
+        if is_config_owned(data):
+            part = resolve_paired_partition(Path(path), data)
+            return partition_leakage_report(part.train, part.val, part.test)
+        train = IndexBuilder.load_paired_bids_manifest(Path(path), split="train", config=data)
+        val = IndexBuilder.load_paired_bids_manifest(Path(path), split="val", config=data)
+    except ValueError as exc:
+        # The loader raises on the same declaration at load time; the audit reports why.
+        return _skipped("paired_partition", f"partition does not resolve: {exc}")
+    return partition_leakage_report(train, val, [])
+
+
 def analyze_split_leakage(config: Any) -> SplitLeakageReport:
     """Analyse a config's train/val split for subject/file leakage.
 
@@ -313,7 +376,7 @@ def analyze_split_leakage(config: Any) -> SplitLeakageReport:
     * single index + ``holdout_site`` → LOSO: a subject at both the holdout
       site and elsewhere leaks;
     * single index, no holdout → ``random``: replay the deterministic
-      ``split_index`` and check for a subject straddling the boundary;
+      subject-grouped split and check for a subject straddling the boundary;
     * directory crawl with no index files → replay ``IndexBuilder``'s crawl for
       both splits and compare (skipped only when the data is not on this host).
 
@@ -323,6 +386,9 @@ def analyze_split_leakage(config: Any) -> SplitLeakageReport:
     data = getattr(config, "data", None)
     if data is None:
         return _skipped("unknown", "no data section.")
+
+    if data.source.paired_manifest_path:
+        return analyze_paired_partition_leakage(data)
 
     index_path = data.source.index_path
     val_index_path = data.source.validation_index_path
@@ -375,8 +441,8 @@ def analyze_split_leakage(config: Any) -> SplitLeakageReport:
             (held if any(holdout in s for s in sites) else rest).append(r)
         return _overlap_report("loso", rest, held)
 
-    # 3. Random — replay the deterministic file-level split, check for a
-    #    subject straddling the held-out boundary.
+    # 3. Random — replay the subject-grouped split every route makes, check for
+    #    a subject straddling the held-out boundary.
     if float(validation_split) <= 0.0:
         return SplitLeakageReport(
             status="clean",
@@ -387,10 +453,10 @@ def analyze_split_leakage(config: Any) -> SplitLeakageReport:
             n_val=0,
             detail="validation_split<=0: train-only run, no validation set.",
         )
-    if len(records) < 2:
+    if len({record_split_key(r) for r in records}) < 2:
         return _skipped(
             "single_index",
-            "fewer than 2 records; split_index handles this at runtime.",
+            "fewer than 2 subjects; the runtime split raises on this itself.",
         )
-    train, val = split_index(records, float(validation_split))
+    train, val = split_index_grouped(records, float(validation_split), key=record_split_key)
     return _overlap_report("single_index", train, val)

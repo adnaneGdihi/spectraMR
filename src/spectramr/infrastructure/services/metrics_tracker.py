@@ -10,6 +10,8 @@ import dataclasses
 import datetime
 import json
 import logging
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,14 @@ class MetricsTracker(IMetricsService):
 
         # Current metrics state
         self.current_metrics: dict[str, Any] = {}
+
+        # PNG encode + write run on one worker thread so validation does not
+        # wait on the disk. At most one batch is in flight: the next submit
+        # waits for it, which bounds the held arrays and surfaces a failed
+        # write at the following save rather than never.
+        self._image_executor: ThreadPoolExecutor | None = None
+        self._pending_images: Future[None] | None = None
+        self._image_lock = threading.Lock()
 
         # CSV headers cache (IOPS reduction)
         self._csv_headers_cache: dict[Path, list[str]] = {}
@@ -348,27 +358,27 @@ class MetricsTracker(IMetricsService):
             f"[MetricsTracker] Saving images to: real={self.real_images_dir}, fake={self.fake_images_dir}"
         )
 
-        # Save images up to max_images limit
+        # Rasterise on this thread (``.cpu()`` and the finite check belong to the
+        # caller's device context); only numpy/PIL work is handed to the worker.
+        jobs: list[tuple[np.ndarray, str, Path]] = []
         for i, (real_img, fake_img) in enumerate(
             zip(real_normalized, fake_normalized, strict=False)
         ):
             if i >= max_images:
                 break
+            real_path = self.real_images_dir / f"{identifier}_real_{i:03d}.{self.image_format}"
+            fake_path = self.fake_images_dir / f"{identifier}_fake_{i:03d}.{self.image_format}"
             try:
-                # Save real image
-                real_path = self.real_images_dir / f"{identifier}_real_{i:03d}.{self.image_format}"
-                self._save_tensor_as_image(real_img, real_path)
-                real_paths.append(str(real_path))
-                logger.debug(f"[MetricsTracker] Saved real image: {real_path}")
-
-                # Save fake image
-                fake_path = self.fake_images_dir / f"{identifier}_fake_{i:03d}.{self.image_format}"
-                self._save_tensor_as_image(fake_img, fake_path)
-                fake_paths.append(str(fake_path))
-                logger.debug(f"[MetricsTracker] Saved fake image: {fake_path}")
+                for img, path in ((real_img, real_path), (fake_img, fake_path)):
+                    array, mode = self._rasterize_tensor(img, path)
+                    jobs.append((array, mode, path))
             except Exception as e:
-                logger.error(f"[MetricsTracker] Failed to save image {i}: {e}")
+                logger.error(f"[MetricsTracker] Failed to rasterise image {i}: {e}")
                 raise
+            real_paths.append(str(real_path))
+            fake_paths.append(str(fake_path))
+
+        self._submit_image_writes(jobs)
 
         self._write_render_windows(identifier, len(fake_paths), real_windows, fake_windows)
 
@@ -1163,8 +1173,54 @@ class MetricsTracker(IMetricsService):
             consequence,
         )
 
-    def _save_tensor_as_image(self, tensor: torch.Tensor, path: Path) -> None:
-        """Save a tensor as an image file.
+    def _submit_image_writes(self, jobs: list[tuple[np.ndarray, str, Path]]) -> None:
+        """Queue one batch of writes, then re-raise the previous batch's error (if any).
+
+        The current batch is submitted first so a failed predecessor costs only its own pictures.
+        """
+        if not jobs:
+            return
+        with self._image_lock:
+            previous, self._pending_images = self._pending_images, None
+            if self._image_executor is None:
+                self._image_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="metrics-png"
+                )
+            self._pending_images = self._image_executor.submit(self._write_images, jobs)
+            if previous is not None:
+                previous.result()
+
+    def _wait_pending_locked(self) -> None:
+        pending, self._pending_images = self._pending_images, None
+        if pending is not None:
+            pending.result()
+
+    def _write_images(self, jobs: list[tuple[np.ndarray, str, Path]]) -> None:
+        for array, mode, path in jobs:
+            self._write_image(array, mode, path)
+            logger.debug(f"[MetricsTracker] Saved image: {path}")
+
+    @staticmethod
+    def _write_image(array: np.ndarray, mode: str, path: Path) -> None:
+        Image.fromarray(array, mode=mode).save(path)
+
+    def drain(self) -> None:
+        """Block until queued PNG writes finish; re-raise the worker's error, if any."""
+        with self._image_lock:
+            self._wait_pending_locked()
+
+    def shutdown_image_writer(self) -> None:
+        """Drain, then stop the worker thread. Call once after the last validation."""
+        try:
+            self.drain()
+        finally:
+            with self._image_lock:
+                executor, self._image_executor = self._image_executor, None
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+    def _rasterize_tensor(self, tensor: torch.Tensor, path: Path) -> tuple[np.ndarray, str]:
+        """Convert a tensor to a ``(uint8 array, PIL mode)`` pair on the calling thread.
 
         Handles 1-channel (grayscale), 2-channel (complex MRI → magnitude),
         and 3-channel (RGB) tensors.
@@ -1180,6 +1236,7 @@ class MetricsTracker(IMetricsService):
         # noise on another. ``_normalize_images`` already scrubs its output,
         # so a hit here means a caller bypassed it — say so instead of
         # emitting a silently-wrong image.
+        tensor = tensor.detach().cpu()
         if not torch.isfinite(tensor).all():
             n_bad = int((~torch.isfinite(tensor)).sum().item())
             logger.warning(
@@ -1196,10 +1253,10 @@ class MetricsTracker(IMetricsService):
         if tensor.dim() == 3:  # [C, H, W]
             if tensor.shape[0] == 1:  # Grayscale
                 img_array = tensor.squeeze(0).numpy()
-                img = Image.fromarray((img_array * 255).astype(np.uint8), mode="L")
+                return (img_array * 255).astype(np.uint8), "L"
             elif tensor.shape[0] == 3:  # RGB
                 img_array = tensor.permute(1, 2, 0).numpy()
-                img = Image.fromarray((img_array * 255).astype(np.uint8), mode="RGB")
+                return (img_array * 255).astype(np.uint8), "RGB"
             else:
                 # Multi-channel (incl. C=2): RSS-combine all channels.
                 # Previously a special C==2 branch treated the channels as
@@ -1217,11 +1274,8 @@ class MetricsTracker(IMetricsService):
                 if mag_max > 1e-6:
                     magnitude = magnitude / mag_max
                 img_array = magnitude.numpy()
-                img = Image.fromarray((img_array * 255).astype(np.uint8), mode="L")
-        else:
-            raise ValueError(f"Unsupported tensor shape: {tensor.shape}")
-
-        img.save(path)
+                return (img_array * 255).astype(np.uint8), "L"
+        raise ValueError(f"Unsupported tensor shape: {tensor.shape}")
 
     # Metadata columns that are not quality metrics and must not be "best"-tracked.
     _BEST_EXCLUDE_KEYS = frozenset(

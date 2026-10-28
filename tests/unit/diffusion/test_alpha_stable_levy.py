@@ -87,3 +87,18 @@ def test_invalid_inputs_raise() -> None:
         sample_alpha_stable((4,), alpha=1.0, scale=-1.0)
     with pytest.raises(ValueError):
         alpha_stable_kernel_fft((4,), alpha=3.0)
+
+
+@pytest.mark.parametrize("alpha", [1.5, 2.0])
+def test_fractional_score_matching_target_is_minus_noise_over_sigma_alpha(alpha: float) -> None:
+    """The documented DSM surrogate: a model emitting -noise/sigma**alpha scores zero."""
+    x0 = torch.randn(2, 1, 4, 4)
+    sigma = 0.5
+    loss = fractional_score_matching_loss(
+        lambda x_t: -(x_t - x0) / sigma**alpha,
+        x0,
+        alpha=alpha,
+        sigma=sigma,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.allclose(loss, torch.zeros(()), atol=1e-10)

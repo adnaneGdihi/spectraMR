@@ -165,6 +165,51 @@ def test_explicit_param_kwarg_passes_clean(monkeypatch):
     assert all(r.passed for r in results)
 
 
+class _ReadsKnobsStrategy:
+    reads_model_kwargs: ClassVar[frozenset[str]] = frozenset({"gain_mode"})
+
+
+def _with_strategy(monkeypatch, checker, strategy_cls):
+    monkeypatch.setattr(ConfigHealthChecker, "_resolve_strategy_class", staticmethod(lambda c: strategy_cls))
+    return checker
+
+
+def test_a_key_the_strategy_reads_is_not_a_facade_knob(monkeypatch):
+    # The q-map strategy reads gain_mode from model_kwargs; the advisory flagged it on
+    # bloch_parameter_bottleneck in every q-map run (sabine job 17889904).
+    checker = _with_strategy(
+        monkeypatch, _patched_checker(monkeypatch, _NoKwargsModel), _ReadsKnobsStrategy
+    )
+    results = checker.check_advertised_options(_cfg_with_kwargs("m", {"gain_mode": "projected"}))
+    assert all(r.passed for r in results)
+
+
+def test_a_key_neither_the_model_nor_the_strategy_reads_is_still_flagged(monkeypatch):
+    checker = _with_strategy(
+        monkeypatch, _patched_checker(monkeypatch, _NoKwargsModel), _ReadsKnobsStrategy
+    )
+    cfg = _cfg_with_kwargs("m", {"gain_mode": "projected", "typo_knob": 1})
+    flagged = [r for r in checker.check_advertised_options(cfg) if not r.passed]
+    assert [r.yaml_keys for r in flagged] == [["model.model_kwargs.typo_knob"]]
+
+
+def test_a_key_outside_the_declared_readers_is_an_error(monkeypatch):
+    # The model's signature and the strategy's declaration name every reader, so a key in
+    # neither is certainly unread: `contrast_droput: 0.3` trained silently with p = 0.
+    checker = _with_strategy(
+        monkeypatch, _patched_checker(monkeypatch, _NoKwargsModel), _ReadsKnobsStrategy
+    )
+    cfg = _cfg_with_kwargs("m", {"gain_mode": "projected", "contrast_droput": 0.3})
+    flagged = [r for r in checker.check_advertised_options(cfg) if not r.passed]
+    assert [r.severity for r in flagged] == ["error"]
+
+
+def test_a_strategy_without_the_declaration_changes_nothing(monkeypatch):
+    checker = _with_strategy(monkeypatch, _patched_checker(monkeypatch, _NoKwargsModel), object)
+    results = checker.check_advertised_options(_cfg_with_kwargs("m", {"gain_mode": "projected"}))
+    assert [r.severity for r in results if not r.passed] == ["info"]
+
+
 def test_varkwargs_model_skips_signature_advisory(monkeypatch):
     """A **kwargs signature can absorb anything — nothing to assert statically."""
     checker = _patched_checker(monkeypatch, _VarKwargsModel)

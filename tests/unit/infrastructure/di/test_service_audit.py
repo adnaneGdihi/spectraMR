@@ -31,6 +31,9 @@ class MockLoggingService(ILoggingService):
     def log_error(self, msg: str):
         pass
 
+    def log_critical(self, msg: str):
+        pass
+
     def log_warning(self, msg: str):
         pass
 
@@ -63,17 +66,17 @@ class MockLoggingService(ILoggingService):
 
 
 class MockCheckpointService(ICheckpointService):
-    def save_checkpoint(self, path: str, state_dict: dict):
+    def save_step(self, pipeline, **kwargs):
         pass
 
-    def load_checkpoint(self, path: str) -> dict:
-        return {}
+    def save_best(self, pipeline, **kwargs):
+        pass
 
-    def get_latest_checkpoint(self) -> str:
-        return ""
+    def resume(self, path, pipeline, **kwargs):
+        pass
 
-    def find_latest_checkpoint(self) -> str:
-        return ""
+    def best_weights(self, path, pipeline, **kwargs):
+        pass
 
 
 class MockMetricsService(IMetricsService):

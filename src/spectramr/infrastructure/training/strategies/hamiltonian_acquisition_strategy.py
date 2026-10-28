@@ -79,7 +79,8 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     # ------------------------------------------------------------------
     def _coerce_config(self) -> HamiltonianAcquisitionConfig:

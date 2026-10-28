@@ -23,7 +23,6 @@ training:
   task: reconstruction
   output_dir: /tmp/spectramr_test/diffusion
   enable_mixed_precision: false
-  enable_gradient_checkpointing: false
   physics_informed: false
   diffusion:
     type: ddpm

@@ -238,16 +238,19 @@ def test_summary_embeds_pngs_and_headline_numbers(tmp_path):
 
     logs = tmp_path / "logs"
     logs.mkdir()
-    (logs / "validation_metrics.csv").write_text("step,val_loss\n1,0.5\n2,0.3\n")
+    (logs / "validation_metrics.csv").write_text(
+        "step,val_loss,val_ssim\n1,0.5,0.80\n2,0.3,0.84\n"
+    )
+    # the per-metric best block is not what the summary quotes: it mixes checkpoints
     (tmp_path / "final_metrics.json").write_text(
-        json.dumps({"best": {"ssim_best": 0.86}})
+        json.dumps({"best": {"ssim_best": 0.99}, "early_stopping_best_iteration": 2})
     )
     res = pipe.generate_report(
         tmp_path, task="default", figures=["fig_1_2_learning_curves"], tables_=[]
     )
     text = (res["out_dir"] / "report_summary.md").read_text()
-    assert "## Headline numbers (best)" in text
-    assert "SSIM" in text
+    assert "## Headline numbers (selected pass, step 2)" in text
+    assert "validation SSIM | 0.84" in text and "0.99" not in text
     assert "![fig_1_2_learning_curves]" in text  # inline PNG embed
 
 
@@ -363,7 +366,7 @@ def test_generate_report_emits_qc_html(tmp_path):
     # per-case metrics → group strip has one point per case
     (tmp_path / "per_call_metrics.csv").write_text(
         "case_id,split,step,psnr,ssim\n"
-        + "\n".join(f"c{i},val,{i},{30 + i},{0.8 + 0.01 * i}" for i in range(8))
+        + "\n".join(f"c{i},val,2,{30 + i},{0.8 + 0.01 * i}" for i in range(8))
         + "\n"
     )
     rec = ReportCaseRecorder(
@@ -428,7 +431,7 @@ def _seed_qc_run(tmp_path, *, with_volume=False):
     )
     (tmp_path / "per_call_metrics.csv").write_text(
         "case_id,split,step,psnr,ssim\n"
-        + "\n".join(f"c{i},val,{i},{30+i},{0.8+0.01*i}" for i in range(8))
+        + "\n".join(f"c{i},val,2,{30+i},{0.8+0.01*i}" for i in range(8))
         + "\n"
     )
     rec = ReportCaseRecorder(
@@ -550,10 +553,10 @@ class TestFiguresNullResolvesToThePreset:
 
     @pytest.mark.parametrize(
         ("task", "expected"),
-        [("default", 11), ("reconstruction", 20), ("gan", 10)],
+        [("default", 11), ("reconstruction", 31), ("gan", 10)],
     )
     def test_the_preset_not_all_44(self, task, expected):
-        assert len(pipe._all_figure_ids()) == 44, "registry size changed; update below"
+        assert len(pipe._all_figure_ids()) == 69, "registry size changed; update below"
         assert len(self._resolve(task)) == expected
 
     def test_different_tasks_now_give_different_figure_sets(self):
@@ -696,3 +699,49 @@ class TestSkippedFiguresAreAccountedForNotDropped:
 
         assert reasons == {SKIP_RAISED}
         assert SKIP_NO_DATA not in reasons
+
+def test_extra_runs_stay_out_of_the_main_runs_summary(tmp_path):
+    def run(path, psnr):
+        (path / "logs").mkdir(parents=True)
+        (path / "logs" / "validation_metrics.csv").write_text(
+            f"step,val_psnr\n100,{psnr - 1}\n200,{psnr}\n"
+        )
+        return path
+
+    main = run(tmp_path / "main", 20.0)
+    extra = run(tmp_path / "extra", 99.0)
+    res = pipe.generate_report(main, figures=[], tables_=[], extra_runs=[extra],
+                               html_report=False, qc_figures=False)
+    summary = res["summary"].read_text()
+    assert "| validation PSNR (dB) | 20 |" in summary and "| 99 |" not in summary
+
+
+@pytest.mark.parametrize(
+    ("summary", "status", "label"),
+    [
+        ({"success": False, "error_type": "RuntimeError"}, "failed", "crashed: RuntimeError"),
+        (None, "unknown", "status unknown: no run_summary.json"),
+        ({"success": True}, "ok", "ok"),
+    ],
+)
+def test_a_per_run_report_states_whether_the_run_finished(tmp_path, summary, status, label):
+    """#2525: a crashed run is still reported, with its status in summary and manifest."""
+    import json
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "validation_metrics.csv").write_text("step,val_psnr\n1,20.0\n2,21.0\n")
+    if summary is not None:
+        (tmp_path / "run_summary.json").write_text(json.dumps(summary))
+    res = pipe.generate_report(
+        tmp_path,
+        figures=[],
+        tables_=["tab_2_1_main_results"],
+        html_report=False,
+        qc_figures=False,
+    )
+    assert f"- Run status: `{label}`" in res["summary"].read_text()
+    manifest = json.loads((res["out_dir"] / "report_manifest.json").read_text())
+    assert [r["status"] for r in manifest["runs"]] == [status]
+    table = res["tables"]["tab_2_1_main_results"]["markdown"].read_text()
+    assert ("‡" in table) is (status != "ok")

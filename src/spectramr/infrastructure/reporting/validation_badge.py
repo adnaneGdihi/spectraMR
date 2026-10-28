@@ -30,7 +30,7 @@ for clinical-pilot eligibility.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -43,6 +43,66 @@ DEFAULT_REQUIRED_GATES: tuple[str, ...] = (
     "pathology_recall",
     "pac_bayes",
 )
+
+
+# Certificate letter -> the required gate its artefact feeds.
+_CERTIFICATE_GATES: dict[str, str] = {
+    "r1_cdfc": "conformal_coverage",
+    "r2_chd": "hallucination",
+    "r4_prc": "pathology_recall",
+    "r5_pac_bayes": "pac_bayes",
+}
+
+
+def _gate_from_artefact(letter: str, path: str) -> GateResult:
+    """Map one upstream certificate JSON to its gate.
+
+    A missing, unreadable or malformed artefact fails the gate rather than raising.
+    """
+    artefact = Path(path)
+    if not artefact.is_file():
+        return GateResult(passed=False, details=f"{letter}: artefact missing at {path}")
+    try:
+        data = json.loads(artefact.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return GateResult(passed=False, details=f"{letter}: unreadable artefact ({exc})")
+    try:
+        return _evaluate_artefact(letter, data)
+    except (KeyError, TypeError, ValueError) as exc:
+        return GateResult(passed=False, details=f"{letter}: malformed artefact ({exc!r})")
+
+
+def _evaluate_artefact(letter: str, data: dict) -> GateResult:
+    """Gate verdict for one parsed certificate payload."""
+    if letter == "r1_cdfc":
+        coverage = data.get("empirical_coverage")
+        target = 1.0 - float(data["alpha"])
+        passed = coverage is not None and float(coverage) >= target
+        return GateResult(
+            passed=passed,
+            details=f"{letter}: empirical coverage {coverage} vs target {target:.3f}",
+            threshold=target,
+            observed=None if coverage is None else float(coverage),
+        )
+    if letter == "r2_chd":
+        tight = bool(data.get("bound_is_tight", False))
+        fpr = data.get("empirical_fpr")
+        passed = tight and fpr is not None and float(fpr) <= float(data["beta"])
+        return GateResult(
+            passed=passed,
+            details=f"{letter}: empirical FPR {fpr}, DKW bound tight={tight}",
+            threshold=float(data["beta"]),
+            observed=None if fpr is None else float(fpr),
+        )
+    if letter == "r4_prc":
+        return GateResult(
+            passed=bool(data.get("is_certified", False)),
+            details=f"{letter}: certified={data.get('is_certified')}",
+        )
+    return GateResult(
+        passed=bool(data.get("is_non_vacuous", False)),
+        details=f"{letter}: non-vacuous={data.get('is_non_vacuous')}, bound={data.get('bound')}",
+    )
 
 
 @dataclass(frozen=True)
@@ -111,6 +171,37 @@ class ValidationBadge:
             missing_gates=missing,
             failed_gates=failed,
         )
+
+    @classmethod
+    def from_certificate_paths(
+        cls,
+        upstream: Mapping[str, str],
+        required_gates: Sequence[str] | None = None,
+    ) -> ValidationBadge:
+        """Build the badge from upstream certificate JSONs, failing closed.
+
+        ``upstream`` maps a certificate letter (``r1_cdfc``, ``r2_chd``, ``r4_prc``,
+        ``r5_pac_bayes``) to its artefact path. A required gate with no artefact, an
+        unreadable artefact, or no certificate that feeds it is recorded as failed,
+        never skipped.
+        """
+        req = tuple(required_gates) if required_gates is not None else DEFAULT_REQUIRED_GATES
+        gates: dict[str, GateResult] = {}
+        for letter, path in upstream.items():
+            gate = _CERTIFICATE_GATES.get(letter)
+            if gate is None:
+                raise ValueError(
+                    f"unknown certificate letter {letter!r}; expected one of "
+                    f"{sorted(_CERTIFICATE_GATES)}."
+                )
+            gates[gate] = _gate_from_artefact(letter, path)
+        for gate in req:
+            if gate not in gates:
+                gates[gate] = GateResult(
+                    passed=False,
+                    details=f"no certificate artefact feeds gate {gate!r}",
+                )
+        return cls.from_gates(gates, required_gates=req)
 
     def to_dict(self) -> dict:
         """JSON-friendly serialisation."""

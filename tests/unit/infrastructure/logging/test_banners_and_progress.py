@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from spectramr.infrastructure.logging import banner, phase, smart_progress
+from spectramr.infrastructure.logging import banner, make_progress, phase
 
 
 def test_banner_emits_three_lines(caplog) -> None:
@@ -26,14 +26,12 @@ def test_phase_emits_banner_plus_elapsed(caplog) -> None:
     assert any("finished in" in m for m in msgs)
 
 
-def test_smart_progress_yields_all_items() -> None:
-    items = list(smart_progress(range(10), desc="t", log_every_n=4))
-    assert items == list(range(10))
+def test_make_progress_yields_all_items() -> None:
+    assert list(make_progress(range(10), desc="t")) == list(range(10))
 
 
-def test_smart_progress_with_known_total() -> None:
-    items = list(smart_progress(range(5), total=5, desc="t"))
-    assert items == [0, 1, 2, 3, 4]
+def test_make_progress_with_known_total() -> None:
+    assert list(make_progress(range(5), total=5, desc="t")) == [0, 1, 2, 3, 4]
 
 
 # ---------------------------------------------------------------------------

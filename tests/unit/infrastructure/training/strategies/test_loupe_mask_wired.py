@@ -27,16 +27,19 @@ import types
 import pytest
 import torch
 
+from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.infrastructure.training.strategies import reconstruction as recon_mod
 from spectramr.infrastructure.training.strategies.loupe_strategy import LOUPEStrategy
 
 
-def _adaptive_cfg(enabled: bool = True):
+def _adaptive_cfg(enabled: bool = True, budget: str = "soft"):
     annealing = types.SimpleNamespace(tau_init=5.0, tau_final=0.1, anneal_steps=1000)
     return types.SimpleNamespace(
         enabled=enabled,
         target_rate=0.125,
         density_penalty_lambda=1.0,
+        budget=budget,
+        mask_learning_rate=1e-3,
         annealing=annealing,
     )
 
@@ -55,7 +58,8 @@ def _config(model_kwargs=None):
 
 def _env_with_opt():
     dummy = torch.nn.Parameter(torch.zeros(1))
-    return types.SimpleNamespace(opt_g=torch.optim.SGD([dummy], lr=0.1))
+    generator = types.SimpleNamespace(training=True)
+    return types.SimpleNamespace(opt_g=torch.optim.SGD([dummy], lr=0.1), generator=generator)
 
 
 def _param_ids(opt):
@@ -70,6 +74,8 @@ def _make_strategy(config=None):
     s._adaptive_cfg = _adaptive_cfg(enabled=True)
     s._mask_logits = None
     s._steps_seen = 0
+    s._owned_modules = {}
+    s._owned_wrappers = {}
     return s
 
 
@@ -196,3 +202,99 @@ def test_non_bool_share_across_coils_raises():
     s = _make_strategy(_config(model_kwargs={"share_across_coils": "yes"}))
     with pytest.raises(TypeError):
         s._ensure_mask(h=8, w=6, n_coils=2)
+
+
+# ── the learned mask survives a resume (#2820) ──────────────────────────────
+
+
+def _trained_strategy():
+    s = _make_strategy(_config(model_kwargs={"share_across_coils": False}))
+    s.env.opt_g = torch.optim.SGD(s.env.opt_g.param_groups[0]["params"], lr=0.1, momentum=0.9)
+    logits = s._ensure_mask(h=8, w=6, n_coils=2)
+    (logits * torch.arange(logits.numel()).reshape(logits.shape)).sum().backward()
+    s.env.opt_g.step()
+    return s
+
+
+def test_a_resume_restores_the_learned_mask_and_its_optimizer_state():
+    saved = _trained_strategy()
+    resumed = _make_strategy(_config(model_kwargs={"share_across_coils": False}))
+    resumed.env.opt_g = torch.optim.SGD(
+        resumed.env.opt_g.param_groups[0]["params"], lr=0.1, momentum=0.9
+    )
+
+    state = saved.strategy_state_dict()
+    # The DDP holder is not an attribute, so the checkpoint key is unchanged (#2629).
+    assert sorted(state["params"]) == ["_mask_logits"] and state["modules"] == {}
+    resumed.load_strategy_state_dict(state)
+    resumed.env.opt_g.load_state_dict(saved.env.opt_g.state_dict())
+
+    assert torch.equal(resumed._mask_logits, saved._mask_logits)
+    assert resumed.owned_modules()["_mask_logits"].value is resumed._mask_logits
+    assert resumed.env.opt_g.param_groups[-1]["params"] == [resumed._mask_logits]
+    assert torch.equal(
+        resumed.env.opt_g.state[resumed._mask_logits]["momentum_buffer"],
+        saved.env.opt_g.state[saved._mask_logits]["momentum_buffer"],
+    )
+
+
+def test_a_resume_does_not_rebuild_the_mask_when_none_was_saved():
+    resumed = _make_strategy()
+    resumed.load_strategy_state_dict({"modules": {}, "params": {}, "generators": {}})
+    assert resumed._mask_logits is None
+
+
+def test_mask_in_image_domain_keeps_only_the_chosen_phase_encode_column() -> None:
+    # cohort5 §2.1: the mask is applied in k-space of an IMAGE input (LOUPE's
+    # pre_model chain delivers one); one kept column must survive as one column.
+    s = _make_strategy()
+    x = torch.randn(1, 2, 16, 16)
+    line = torch.zeros(16)
+    line[5] = 1.0
+    out = s._apply_learned_mask(x, line)
+    k = fft2c(out)
+    dropped = [c for c in range(16) if c != 5]
+    assert k[..., dropped].abs().max().item() < 1e-4
+    assert k[..., 5].abs().max().item() > 1e-3
+
+
+def test_validation_grades_the_deterministic_topk_mask(monkeypatch) -> None:
+    # cohort5 §2.0/§2.3: validation applies the eval mask, not the fully sampled input,
+    # and it draws no Gumbel noise, so two passes see the same input.
+    captured: list[torch.Tensor] = []
+
+    def _capture(self, input_batch, batch_context, **kw):
+        captured.append(input_batch.clone())
+        return input_batch
+
+    s = _make_strategy()
+    s._adaptive_cfg = _adaptive_cfg(enabled=True, budget="hard_topk")
+    monkeypatch.setattr(recon_mod.ReconstructionTrainingStrategy, "_validation_forward", _capture)
+    x = torch.randn(1, 2, 16, 16)
+    s._validation_forward(x, {})
+    s._validation_forward(x, {})
+
+    assert not torch.allclose(captured[0], x)
+    assert torch.equal(captured[0], captured[1])
+    k = fft2c(captured[0])
+    kept = (k.abs().sum(dim=(0, 1, 2)) > 1e-4).sum().item()
+    assert kept == round(0.125 * 16)
+
+
+def test_eval_pass_does_not_advance_the_schedule(monkeypatch) -> None:
+    monkeypatch.setattr(
+        recon_mod.ReconstructionTrainingStrategy,
+        "_compute_losses_impl",
+        lambda self, **kw: {"g_total_loss": torch.tensor(0.0, requires_grad=True)},
+    )
+    s = _make_strategy()
+    s.env.generator.training = False
+    s._compute_losses_impl(input_batch=torch.randn(1, 2, 8, 8), target_batch=None, epoch=0)
+    assert s._steps_seen == 0
+
+
+def test_unknown_budget_raises() -> None:
+    s = _make_strategy()
+    s._adaptive_cfg = _adaptive_cfg(enabled=True, budget="greedy")
+    with pytest.raises(ValueError, match="budget"):
+        s._eval_mask(torch.zeros(16))

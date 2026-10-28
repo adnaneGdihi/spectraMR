@@ -40,7 +40,8 @@ from .cartoon_texture_safe import CartoonTextureSafeConfig
 from .certified_robustness import CertifiedRobustnessConfig
 from .confluence import ConfluenceConfig
 from .cross_field import CrossFieldConfig, FieldCocycleConfig, FieldFlowConfig
-from .cs_mno import CSMNOTrainingConfigSchema
+from .cycle_bloch import CycleBlochConfig
+from .distillation import DistillationTrainingConfigSchema
 from .doob_bridge import DoobBridgeConfig
 from .equivariant_imaging import TrainingConfigEquivariantImaging
 from .field_bridge import FieldBridgeConfig
@@ -106,9 +107,12 @@ from .strategy_knobs_2026_08 import (
     RiemannianBlochDiffusionTrainingConfigSchema,
     SpatiotemporalAdaptiveSFCReconTrainingConfigSchema,
 )
+from .levy_denoising import LevyDenoisingTrainingConfigSchema
+from .tall_sr import TALLSRTrainingConfigSchema
 from .teichmuller import TeichmullerTrainingConfigSchema
 from .ulf_dps import UlfDpsConfig
 from .ulf_map import UlfMapConfig
+from .ulf_lowpass import UlfLowpassConfig
 from .ulf_redegrad_tta import UlfReDegradationTTAConfig
 
 logger = logging.getLogger(__name__)
@@ -203,9 +207,30 @@ class DiffusionTrainingConfigSchema(StrategySchema):
     # Degradation
     degradation: str | None = Field(
         default=None,
-        description="Degradation type: physics, gaussian, kspace_mask, blur",
+        description=(
+            "Degradation type: physics, gaussian, kspace_mask, blur, rician. "
+            "GraphColdDiffusionStrategy reads it (None = kspace_mask; it accepts "
+            "kspace_mask and rician and raises on anything else)."
+        ),
     )
-    degradation_dynamics: str | None = Field(default=None, description="Degradation dynamics")
+    rician_sigma_max: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Rician cold-diffusion forward process: noise std at t = T-1, as a "
+            "fraction of each image's p99 magnitude; sigma_t = rician_sigma_max * "
+            "t / (T-1). Required by, and only accepted with, degradation: rician."
+        ),
+    )
+    validation_timestep: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Degradation level GraphColdDiffusionStrategy tells the model the "
+            "validation input sits at (None = 0, the clean end, where a cold model "
+            "learns the identity). Must be < timesteps."
+        ),
+    )
     degradation_source: str = Field(
         default="input",
         description=(
@@ -240,14 +265,36 @@ class DiffusionTrainingConfigSchema(StrategySchema):
             )
         return value
 
+    @model_validator(mode="after")
+    def _rician_sigma_needs_rician(self) -> "DiffusionTrainingConfigSchema":
+        """A Rician noise ceiling is read only by the Rician forward process."""
+        rician = self.degradation == "rician"
+        if rician and self.rician_sigma_max is None:
+            raise ValueError("training.diffusion.degradation: rician needs rician_sigma_max.")
+        if not rician and self.rician_sigma_max is not None:
+            raise ValueError(
+                f"training.diffusion.rician_sigma_max is read only with degradation: "
+                f"rician, not {self.degradation!r}."
+            )
+        level, horizon = self.validation_timestep, self.timesteps
+        if level is not None and horizon is not None and level >= horizon:
+            raise ValueError(
+                f"training.diffusion.validation_timestep={level} must be < timesteps={horizon}."
+            )
+        return self
+
     # The first NESTED rename mount in the codebase (`training.diffusion`, not
     # `training`). Mounting it is not optional bookkeeping: `renames_for_block`
     # serves a record to the validator whose mount path matches, so a record
     # declared with `mount="training.diffusion"` and no validator here is
     # registered, reachable, and silently never fires -- the exact three-claim
     # gap the reachability contract is about.
+    # pydantic accepts the classmethod at runtime; its protocol types cannot describe one.
     _fold_renamed = model_validator(mode="before")(
-        classmethod(fold_renamed_keys("training.diffusion"))
+        classmethod(fold_renamed_keys("training.diffusion"))  # type: ignore[arg-type]
+    )
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.diffusion"))  # type: ignore[arg-type]
     )
 
 
@@ -600,7 +647,9 @@ class TrainingStrategyConfigSchema(BaseModel):
     # shim is load-bearing here rather than cosmetic: this class is
     # `extra="allow"`, so simply deleting the field would let `training.seed`
     # keep parsing, silently, while nothing read it.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("training")))
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training"))  # type: ignore[arg-type]
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -656,10 +705,11 @@ class TrainingStrategyConfigSchema(BaseModel):
     # the ledger classified them as untyped extras -- for `training_mode`, the
     # key 49 call sites dispatch the whole paradigm on.
     #
-    # Only the three with readers are declared. Five more are equally universal
-    # -- `batch_size` (401 arms), `enable_gradient_checkpointing` (342),
-    # `enable_mixed_precision` (321), `num_workers` (257), `max_steps` (85) --
-    # and have **zero** readers in `src/`. Declaring those would advertise a
+    # Only the three with readers are declared. `enable_gradient_checkpointing`
+    # and `num_workers` had zero readers and are refused at load (removals.py,
+    # #1135 / #557). Three more are equally universal -- `batch_size` (401 arms),
+    # `enable_mixed_precision` (321), `max_steps` (85) -- and have **zero**
+    # readers in `src/`. Declaring those would advertise a
     # knob nothing consumes, which non-negotiable #8 forbids outright; it would
     # also make the audit go quiet about 20 arms that run at a batch size they
     # never asked for and 84 that run at an AMP setting they never asked for.
@@ -692,6 +742,28 @@ class TrainingStrategyConfigSchema(BaseModel):
         default=None,
         description="Domain the model emits ('image', 'kspace', 'feature').",
     )
+
+    @model_validator(mode="after")
+    def _graph_cold_knobs_need_their_reader(self) -> "TrainingStrategyConfigSchema":
+        """Refuse the GraphCold-only diffusion knobs on any other strategy (NN8)."""
+        block = self.diffusion
+        if block is None:
+            return self
+        declared = [
+            name
+            for name, on in (
+                ("degradation: rician", block.degradation == "rician"),
+                ("validation_timestep", block.validation_timestep is not None),
+            )
+            if on
+        ]
+        owner = (self.strategy_class or "").rsplit(".", 1)[-1]
+        if declared and owner != "GraphColdDiffusionStrategy":
+            raise ValueError(
+                f"training.diffusion {declared} is read only by GraphColdDiffusionStrategy; "
+                f"declare it as training.strategy_class (got {self.strategy_class!r})."
+            )
+        return self
 
     # [REMOVED] Flat training keys (v5.0 strictness)
     # legacy fields like diffusion_type, timesteps, etc. are now strictly nested
@@ -831,6 +903,20 @@ class TrainingStrategyConfigSchema(BaseModel):
             "training.strategy_class resolves to GeoMambaULFStrategy."
         ),
     )
+    levy_denoising: LevyDenoisingTrainingConfigSchema | None = Field(
+        default=None,
+        description=(
+            "Conditional alpha-stable denoising parameters (noise law, noise range, "
+            "validation sampler). Required by LevyDenoisingStrategy."
+        ),
+    )
+    tall_sr: TALLSRTrainingConfigSchema | None = Field(
+        default=None,
+        description=(
+            "TALL-SR paradigm parameters (differentiable locality regulariser). "
+            "Read by ReconstructionTrainingStrategy when model_type is tall_sr."
+        ),
+    )
     ssdu: SSDUTrainingConfigSchema | None = Field(
         default=None,
         description=(
@@ -867,15 +953,6 @@ class TrainingStrategyConfigSchema(BaseModel):
             "defaults that equal its historical hard-coded values."
         ),
     )
-    cs_mno: CSMNOTrainingConfigSchema | None = Field(
-        default=None,
-        description=(
-            "CS-MNO neural-operator parameters (spectral truncation, "
-            "SFC scan, physical-arc Δt). Read by CSMNOOperator at "
-            "construction time. The strategy stays 'reconstruction' — "
-            "CS-MNO is a model architecture, not a paradigm."
-        ),
-    )
     teichmuller: TeichmullerTrainingConfigSchema | None = Field(
         default=None,
         description=(
@@ -909,6 +986,10 @@ class TrainingStrategyConfigSchema(BaseModel):
         default=None,
         description="Plug-and-Play / RED ADMM iterates with spectral-norm-bounded denoiser.",
     )
+    distillation: DistillationTrainingConfigSchema | None = Field(
+        default=None,
+        description="Teacher-student distillation: the frozen teacher's checkpoint.",
+    )
 
     # MICCAI MRIxFields2026 — encode-once/render-anywhere cross-field translation
     # (B-3.8 / B-1.9). Read by CrossFieldTranslationStrategy via
@@ -940,6 +1021,13 @@ class TrainingStrategyConfigSchema(BaseModel):
         description=(
             "Field-conditioned Schrödinger-bridge knobs (entropic noise scale, "
             "sampler steps) for FieldBridgeStrategy (B-3.3)."
+        ),
+    )
+    cycle_bloch: CycleBlochConfig | None = Field(
+        default=None,
+        description=(
+            "Cycle-Bloch backward operator (bloch_fixed | ulf_forward) and its ULF "
+            "sequence for CycleBlochStrategy."
         ),
     )
     ulf_map: UlfMapConfig | None = Field(
@@ -975,7 +1063,7 @@ class TrainingStrategyConfigSchema(BaseModel):
         default=None,
         description=(
             "ULF-consistent diffusion-posterior-sampling knobs (likelihood_weight, "
-            "blur_cutoff, sampling_steps) for UlfDpsStrategy (B-2.2)."
+            "sampling_steps) for UlfDpsStrategy (B-2.2)."
         ),
     )
     generative_refiner: GenerativeRefinerConfig | None = Field(
@@ -1005,7 +1093,15 @@ class TrainingStrategyConfigSchema(BaseModel):
         default=None,
         description=(
             "Re-degradation-consistency test-time-adaptation knobs (adaptation_steps/lr, "
-            "consistency_weight, blur_cutoff) for UlfReDegradationTTAStrategy (B-2.10)."
+            "consistency_weight) for UlfReDegradationTTAStrategy (B-2.10)."
+        ),
+    )
+    ulf_lowpass: UlfLowpassConfig | None = Field(
+        default=None,
+        description=(
+            "Cutoff of the ULF low-pass forward operator A shared by ulf_map, ulf_dps, "
+            "ulf_redegrad_tta and generative_refiner (field_lowpass); those strategies "
+            "raise when it is absent."
         ),
     )
     quality_matching: QualityMatchingConfig | None = Field(
@@ -1247,6 +1343,15 @@ class TrainingStrategyConfigSchema(BaseModel):
     se3_equivariant_navigator: "SE3NavigatorConfig | None" = Field(
         default=None, description="SE(3)-equivariant navigator knobs."
     )
+    phase_steganography: "PhaseSteganographyConfig | None" = Field(
+        default=None, description="VF phase-domain steganographic marker."
+    )
+    bloch_ode: "BlochODEConfig | None" = Field(
+        default=None, description="VF spin-history (through-plane Bloch ODE) corruption."
+    )
+    null_space_erasure: "NullSpaceErasureConfig | None" = Field(
+        default=None, description="VF null-space marker erasure at inference."
+    )
     twin_dps: "TwinDPSConfig | None" = Field(
         default=None, description="Twin diffusion-posterior-sampling knobs."
     )
@@ -1261,6 +1366,15 @@ class TrainingStrategyConfigSchema(BaseModel):
     )
     equivariance_conformal: "EquivarianceConformalConfig | None" = Field(
         default=None, description="Equivariance conformal-calibration knobs."
+    )
+    phys_residual_conformal: "PhysResidualConformalConfig | None" = Field(
+        default=None, description="Physics-residual conformal (PR-CC) calibration knobs."
+    )
+    acq_hypernetwork: "AcqHypernetworkConfig | None" = Field(
+        default=None, description="LCAH hypernetwork width, depth and Lipschitz knobs."
+    )
+    dispersion_bloch_ae: "DispersionBlochAEConfig | None" = Field(
+        default=None, description="DL-BAE pool count, fields and loss weights."
     )
     qspace_diffusion: QSpaceDiffusionTrainingConfigSchema | None = Field(
         default=None,
@@ -1556,17 +1670,12 @@ class BaseTrainingConfigSchema(BaseModel):
 
     @field_validator("device")
     @classmethod
-    def validate_device(cls, value):
+    def validate_device(cls, value: Any) -> Any:
         """Extract device string from dict for backward compatibility."""
         if isinstance(value, dict):
             return value.get("device_type", "cuda")
         return value
 
-    num_workers: int = Field(
-        default=4,
-        ge=0,
-        description="Number of data loading workers",
-    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1774,10 +1883,6 @@ class BaseTrainingConfigSchema(BaseModel):
         default=False,
         description="Enable automatic mixed precision (AMP) training",
     )
-    enable_gradient_checkpointing: bool = Field(
-        default=False,
-        description="Enable gradient checkpointing to save memory",
-    )
 
     # === Runtime Capabilities (Auto-detected) ===
     has_timm: bool = Field(default=False, exclude=True)
@@ -1807,7 +1912,8 @@ class BaseTrainingConfigSchema(BaseModel):
 # ---------------------------------------------------------------------------
 # Deferred sub-block references (see `defer_build` on TrainingStrategyConfigSchema).
 #
-# `se3_navigator`, `vf_advanced`, `bloch_manifold_dps` and
+# `se3_navigator`, `vf_advanced`, `bloch_manifold_dps`, `acq_hypernetwork`,
+# `dispersion_bloch_ae` and
 # `equivariance_conformal` each import from this module for a DIFFERENT class in
 # the same file, so a top-level import would cycle. The knob classes themselves
 # are cycle-free: import them here, once every class in this module exists, and
@@ -1816,11 +1922,17 @@ class BaseTrainingConfigSchema(BaseModel):
 # This MUST precede `StageEnvironmentSchema.model_rebuild()` below: that call
 # references `TrainingStrategyConfigSchema` and so forces its schema to build,
 # which `defer_build` would otherwise have postponed past this point.
+from .acq_hypernetwork import AcqHypernetworkConfig  # noqa: E402
 from .bloch_manifold_dps import BlochManifoldDPSConfig  # noqa: E402
+from .bloch_ode import BlochODEConfig  # noqa: E402
+from .dispersion_bloch_ae import DispersionBlochAEConfig  # noqa: E402
 from .equivariance_conformal import EquivarianceConformalConfig  # noqa: E402
 from .federated import FederatedConfig  # noqa: E402
 from .flow import FlowConfig  # noqa: E402
 from .motion import MotionConfig  # noqa: E402
+from .null_space_erasure import NullSpaceErasureConfig  # noqa: E402
+from .phase_steganography import PhaseSteganographyConfig  # noqa: E402
+from .phys_residual_conformal import PhysResidualConformalConfig  # noqa: E402
 from .se3_navigator import SE3NavigatorConfig  # noqa: E402
 from .vf_advanced import IBVFConfig, TwinDPSConfig  # noqa: E402
 

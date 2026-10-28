@@ -10,8 +10,12 @@ anywhere and an xfail describing it as "needs apex / custom".
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import overload
+
 import torch
 from torch.optim import Optimizer
+from torch.optim.optimizer import ParamsT
 
 from spectramr.infrastructure.training.optimizer_registry import register_optimizer
 
@@ -48,7 +52,7 @@ class LAMB(Optimizer):
 
     def __init__(
         self,
-        params,
+        params: ParamsT,
         lr: float = 1e-3,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-6,
@@ -81,66 +85,77 @@ class LAMB(Optimizer):
             },
         )
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss: float | None = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("LAMB does not support sparse gradients")
+        with torch.no_grad():
+            for group in self.param_groups:
+                beta1, beta2 = group["betas"]
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.is_sparse:
+                        raise RuntimeError("LAMB does not support sparse gradients")
+                    # A complex parameter is optimised as its (real, imag) pair, as
+                    # torch.optim does: addcmul_(grad, grad) on a complex tensor is
+                    # g**2, not |g|**2, and moved a purely imaginary gradient's real part.
+                    param = torch.view_as_real(p) if p.is_complex() else p
+                    if grad.is_complex():
+                        grad = torch.view_as_real(grad)
 
-                state = self.state[p]
-                if not state:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p)
-                    state["exp_avg_sq"] = torch.zeros_like(p)
+                    state = self.state[p]
+                    if not state:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(param)
+                        state["exp_avg_sq"] = torch.zeros_like(param)
 
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                state["step"] += 1
+                    exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                    state["step"] += 1
 
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Bias correction folded into the step size, as in the reference
-                # implementation: applying it to the moments directly would change
-                # the trust ratio's numerator scale.
-                bias_c1 = 1 - beta1 ** state["step"]
-                bias_c2 = 1 - beta2 ** state["step"]
-                step_size = group["lr"] * (bias_c2**0.5) / bias_c1
+                    # Bias-correct the moments themselves (You et al., Alg. 2). Folded
+                    # into the step size instead, sqrt(bc2)/bc1 survives the trust
+                    # ratio, which rescales only the update's norm, as an implicit
+                    # warmup the method does not have (0.32x the step at t=1).
+                    bias_c1 = 1 - beta1 ** state["step"]
+                    bias_c2 = 1 - beta2 ** state["step"]
+                    update = (exp_avg / bias_c1) / (exp_avg_sq / bias_c2).sqrt().add(group["eps"])
+                    if group["weight_decay"] != 0:
+                        update = update.add(param, alpha=group["weight_decay"])
 
-                update = exp_avg / exp_avg_sq.sqrt().add(group["eps"])
-                if group["weight_decay"] != 0:
-                    update = update.add(p, alpha=group["weight_decay"])
+                    if group["adam"]:
+                        param.add_(update, alpha=-group["lr"])
+                        continue
 
-                if group["adam"]:
-                    p.add_(update, alpha=-step_size)
-                    continue
-
-                w_norm = torch.norm(p).clamp(0, group["clamp_value"])
-                u_norm = torch.norm(update)
-                # Either norm being zero leaves no meaningful ratio; 1.0 keeps
-                # the step on plain Adam rather than emitting nan.
-                #
-                # Kept ON DEVICE. This was
-                #     1.0 if (w_norm == 0 or u_norm == 0) else (w_norm/u_norm).item()
-                # which is three host round-trips per parameter tensor per step
-                # -- two tensor-to-bool conversions plus the .item() -- inside the
-                # training loop, against non-negotiable #9. Measured on CUDA over
-                # 80 parameter tensors that made a LAMB step 19.1x an AdamW one.
-                #
-                # clamp_min on the denominator keeps torch.where's discarded
-                # branch finite: where evaluates BOTH sides, so an unguarded
-                # 0/0 would produce a nan that the selection cannot remove.
-                ratio = w_norm / u_norm.clamp_min(_TINY)
-                trust = torch.where((w_norm > 0) & (u_norm > 0), ratio, torch.ones_like(ratio))
-                p.sub_(update * (step_size * trust))
+                    w_norm = torch.norm(param).clamp(0, group["clamp_value"])
+                    u_norm = torch.norm(update)
+                    # Either norm being zero leaves no meaningful ratio; 1.0 keeps
+                    # the step on plain Adam rather than emitting nan.
+                    #
+                    # Kept ON DEVICE. This was
+                    #     1.0 if (w_norm == 0 or u_norm == 0) else (w_norm/u_norm).item()
+                    # which is three host round-trips per parameter tensor per step
+                    # -- two tensor-to-bool conversions plus the .item() -- inside the
+                    # training loop, against non-negotiable #9. Measured on CUDA over
+                    # 80 parameter tensors that made a LAMB step 19.1x an AdamW one.
+                    #
+                    # clamp_min on the denominator keeps torch.where's discarded
+                    # branch finite: where evaluates BOTH sides, so an unguarded
+                    # 0/0 would produce a nan that the selection cannot remove.
+                    ratio = w_norm / u_norm.clamp_min(_TINY)
+                    trust = torch.where((w_norm > 0) & (u_norm > 0), ratio, torch.ones_like(ratio))
+                    param.sub_(update * (group["lr"] * trust))
 
         return loss

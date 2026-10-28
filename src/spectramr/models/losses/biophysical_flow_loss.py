@@ -10,7 +10,7 @@ class BiophysicalFlowLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{BiophysicalFlow} = \\lambda_{dc} \\|k_{pred} - k_{target}\\|_1 + \\lambda_{bloch} \\mathcal{L}_{bloch} + \\lambda_{sparsity} \\|\alpha\\|_1 + \\lambda_{smooth} \\|\\psi\\|_2^2"""
+        \\mathcal{L}_{BiophysicalFlow} = \\lambda_{dc} \\|k_{pred} - k_{target}\\|_1 + \\lambda_{bloch} \\mathcal{L}_{bloch} + \\lambda_{sparsity} \\|\\alpha\\|_1 + \\lambda_{smooth} \\|\\psi\\|_2^2"""
 
     def __init__(
         self,
@@ -18,9 +18,9 @@ class BiophysicalFlowLoss(nn.Module):
         lambda_bloch: float = 0.1,
         lambda_sparsity: float = 0.01,
         lambda_smoothness: float = 0.1,
-        t1_range: tuple = (10.0, 3000.0),  # ms
-        t2_range: tuple = (5.0, 500.0),  # ms
-    ):
+        t1_range: tuple[float, float] = (10.0, 3000.0),  # ms
+        t2_range: tuple[float, float] = (5.0, 500.0),  # ms
+    ) -> None:
         """__init__.
 
         Args:
@@ -77,12 +77,14 @@ class BiophysicalFlowLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        losses = {}
+        losses: dict[str, torch.Tensor] = {}
 
         # 1. Data Consistency (DC)
         # Handle complex
         if torch.is_complex(k_pred) or torch.is_complex(k_target):
-            dc_loss = torch.norm(k_pred - k_target, p=1)  # Reduced L1 for complex
+            # Mean modulus, the same per-element reduction as the real branch, so
+            # lambda_dc does not scale with the number of k-space samples.
+            dc_loss = (k_pred - k_target).abs().mean()
         else:
             dc_loss = self.l1(k_pred, k_target)
 

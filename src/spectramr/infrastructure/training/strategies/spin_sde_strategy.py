@@ -27,6 +27,8 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE, OwnedParameter
+
 from .multi_param_mapping_strategy import OneShotMultiParameterStrategy
 
 logger = logging.getLogger(__name__)
@@ -35,11 +37,18 @@ logger = logging.getLogger(__name__)
 class SpinSDEStrategy(OneShotMultiParameterStrategy):
     """Stochastic Bloch SDE strategy."""
 
+    # parallel_compat: The diffusion parameter is an owned module, DDP-wrapped, read via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
     n_steps: int = 32
     dt: float = 1e-3
     diffusion: float = 0.05
     lambda_consistency: float = 1.0
     lambda_diffusion_prior: float = 1e-3
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("diffusion", OWNED_MODULE))
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -71,6 +80,7 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
         # optimised (the strategy is not an nn.Module, so we add the param
         # group explicitly — mirroring the VF/IB-VF lazy-builder pattern).
         self.diffusion = torch.nn.Parameter(torch.tensor(diffusion_init, device=self.device))
+        self.register_owned_module("diffusion", OwnedParameter(self.diffusion))
         opt = getattr(self.env, "opt_g", None)
         if opt is not None:
             existing = {p for group in opt.param_groups for p in group["params"]}
@@ -123,15 +133,16 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
         T2: torch.Tensor,
         omega: torch.Tensor,
         mz_eq: torch.Tensor,
+        diffusion: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """One Euler-Maruyama step of the Bloch SDE."""
+        """One Euler-Maruyama step of the Bloch SDE; ``diffusion`` defaults to the parameter."""
         mx, my, mz = m[:, 0:1], m[:, 1:2], m[:, 2:3]
         dmx = (-mx / T2 - my * omega) * self.dt
         dmy = (-my / T2 + mx * omega) * self.dt
         dmz = ((mz_eq - mz) / T1) * self.dt
         drift = torch.cat([dmx, dmy, dmz], dim=1)
         # State-dependent diffusion: damp longitudinal more.
-        g = self.diffusion * torch.tensor(
+        g = (self.diffusion if diffusion is None else diffusion) * torch.tensor(
             [[1.0], [1.0], [0.5]], device=m.device, dtype=m.dtype
         ).view(1, 3, 1, 1)
         noise = g * torch.randn_like(m) * (self.dt**0.5)
@@ -150,6 +161,7 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
         readout_steps: list[int],
         B0: torch.Tensor | None = None,
         m_eq: torch.Tensor | None = None,
+        diffusion: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-contrast transverse-magnitude readouts ``(B, C, H, W)``.
 
@@ -166,7 +178,7 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
         want = set(readout_steps)
         captured: dict[int, torch.Tensor] = {}
         for step in range(1, self.n_steps + 1):
-            m = self._euler_step(m, T1, T2, omega, mz_eq)
+            m = self._euler_step(m, T1, T2, omega, mz_eq, diffusion)
             if step in want:
                 captured[step] = self._transverse(m)
         return torch.cat([captured[s] for s in readout_steps], dim=1)
@@ -242,11 +254,10 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
         if not isinstance(batch, dict):
             return base
 
-        # Diffusion-coefficient prior — encourages low stochasticity unless
-        # data forces otherwise. ``self.diffusion`` is now a learnable Parameter,
-        # so ``.pow(2)`` carries a gradient back to it (the old
-        # ``torch.tensor(self.diffusion ** 2)`` was a detached constant).
-        prior = self.diffusion.pow(2) * self.lambda_diffusion_prior
+        # Diffusion-coefficient prior, which favours low stochasticity. The prior and
+        # every Euler step share one call_owned output, so DDP sees one forward per step.
+        diffusion = self.call_owned("diffusion")
+        prior = diffusion.pow(2) * self.lambda_diffusion_prior
         base["loss_sde_diffusion_prior"] = prior
 
         T1 = batch.get("T1_map")
@@ -264,7 +275,7 @@ class SpinSDEStrategy(OneShotMultiParameterStrategy):
             n_contrasts = signals_obs.shape[1] if signals_obs.dim() >= 2 else 1
             readout_steps = self._resolve_readout_steps(n_contrasts)
             sig_pred = self.integrate_multicontrast(
-                m0, T1, T2, readout_steps, B0=batch.get("B0_map"), m_eq=M0
+                m0, T1, T2, readout_steps, B0=batch.get("B0_map"), m_eq=M0, diffusion=diffusion
             )
             consistency = self.lambda_consistency * (sig_pred - signals_obs).abs().mean()
             base["loss_bloch_consistency"] = consistency

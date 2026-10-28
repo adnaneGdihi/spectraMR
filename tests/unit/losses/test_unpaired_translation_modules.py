@@ -10,14 +10,14 @@ import torch
 
 class TestGradientReversalLayer:
     def test_forward_identity(self):
-        from spectramr.models.losses.domain_adversarial_grl import GradientReversalLayer
+        from spectramr.models.blocks.domain_adaptation import GradientReversalLayer
         grl = GradientReversalLayer(alpha=1.0)
         x = torch.randn(2, 8)
         y = grl(x)
         assert torch.allclose(y, x), "Forward should be identity"
 
     def test_backward_negates(self):
-        from spectramr.models.losses.domain_adversarial_grl import GradientReversalLayer
+        from spectramr.models.blocks.domain_adaptation import GradientReversalLayer
         grl = GradientReversalLayer(alpha=1.0)
         x = torch.randn(2, 4, requires_grad=True)
         y = grl(x)
@@ -29,7 +29,7 @@ class TestGradientReversalLayer:
         )
 
     def test_alpha_scaling(self):
-        from spectramr.models.losses.domain_adversarial_grl import GradientReversalLayer
+        from spectramr.models.blocks.domain_adaptation import GradientReversalLayer
         grl = GradientReversalLayer(alpha=0.5)
         x = torch.randn(2, 4, requires_grad=True)
         y = grl(x)

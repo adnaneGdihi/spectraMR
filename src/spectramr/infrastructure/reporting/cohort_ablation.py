@@ -20,6 +20,12 @@ best-over-iterations validation value (max, or min for ``lower_is_better``
 metrics), matching each run's ``restore_best_weights`` early-stopping semantics.
 Arms with no validation metrics (e.g. a calibration-only run) contribute no
 rows and are skipped.
+
+Completion follows the ``--compare`` policy, read through
+:func:`.run_status.read_run_status`: an arm whose ``run_summary.json`` records
+``success: false`` is left out of every figure and named in the log and the
+figure footnote, because its metric files may belong to an earlier attempt. An
+arm whose status is unknown is kept and marked ‡.
 """
 
 from __future__ import annotations
@@ -27,13 +33,19 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
 from spectramr.infrastructure.reporting.aggregator import aggregate
 from spectramr.infrastructure.reporting.plotters import get as get_plotter
+from spectramr.infrastructure.reporting.run_status import (
+    RunStatus,
+    log_status,
+    read_run_status,
+    status_notes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +101,7 @@ class ArmInfo:
     paradigm: str | None
     baseline: str | None
     primary_metric: str | None
+    status: RunStatus = field(default_factory=lambda: RunStatus("unknown", "not read"))
 
 
 def _family_of(arm: str, tag_arm: str | None = None) -> str:
@@ -159,6 +172,7 @@ def discover_cohort_arms(cohort_root: str | Path, *, prefix: str = "mrixfields_"
                 paradigm=tags.get("paradigm"),
                 baseline=meta.get("baseline"),
                 primary_metric=meta.get("primary_metric"),
+                status=read_run_status(arm_dir),
             )
         )
     return arms
@@ -200,10 +214,13 @@ def build_task_frame(
     task: str,
     metrics: tuple[str, ...] = DEFAULT_METRICS,
 ) -> pd.DataFrame:
-    """Tidy ``[family, role, arm, metric, value]`` frame for one task."""
+    """Tidy ``[family, role, arm, metric, value]`` frame for one task; crashed arms are left out."""
     rows: list[dict] = []
     for arm in arms:
         if arm.task != task:
+            continue
+        log_status(arm.arm, arm.status, action=_status_action(arm.status))
+        if arm.status.state == "failed":
             continue
         best = best_val_metrics(arm.dir, metrics)
         for metric, value in best.items():
@@ -217,6 +234,18 @@ def build_task_frame(
                 }
             )
     return pd.DataFrame(rows, columns=pd.Index(["family", "role", "arm", "metric", "value"]))
+
+
+def _status_action(status: RunStatus) -> str:
+    return "excluded from the figure" if status.state == "failed" else "kept and marked"
+
+
+def status_kwargs(arms: list[ArmInfo], task: str) -> dict[str, dict[str, str]]:
+    """Plotter kwargs that mark unknown-status arms and name excluded ones for ``task``."""
+    in_task = {a.arm: a.status for a in arms if a.task == task}
+    excluded = {name: s.label for name, s in in_task.items() if s.state == "failed"}
+    kept = {name: s for name, s in in_task.items() if s.state != "failed"}
+    return {"run_notes": status_notes(kept), "excluded_runs": excluded}
 
 
 def generate_task_ablation_figures(
@@ -269,6 +298,7 @@ def generate_task_ablation_figures(
             formats=formats,
             dpi=dpi,
             metadata=meta,
+            **status_kwargs(arms, task),
         )
     return written
 
@@ -393,5 +423,6 @@ def generate_baseline_overlay_figures(
             formats=formats,
             dpi=dpi,
             metadata=meta,
+            **status_kwargs(arms, task),
         )
     return written

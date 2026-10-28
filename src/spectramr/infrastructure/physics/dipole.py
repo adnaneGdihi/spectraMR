@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from spectramr.infrastructure.physics.fft_ops import centred_freqs
+
 
 def generate_kspace_grid_3d(
     shape: tuple[int, ...],
@@ -64,6 +66,38 @@ def get_dipole_kernel_3d(
             dipole_kernel = dipole_kernel.unsqueeze(0)
 
     return dipole_kernel
+
+
+def dipole_kernel_centred(
+    shape: tuple[int, int, int],
+    b0_dim: int,
+    *,
+    voxel_mm: tuple[float, float, float] | None = None,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Unit dipole kernel ``D(k) = 1/3 - k_b0^2 / |k|^2`` on the ``fftnc`` grid (DC at ``N // 2``).
+
+    The sign of :func:`get_dipole_kernel_3d`, laid out for centred spectra, with ``B0`` along
+    ``b0_dim`` of ``(D, H, W)`` (-3, -2 or -1). ``D(0) = 0``: a uniform offset is the receiver's
+    centre frequency. ``voxel_mm`` makes ``k`` physical (cycles/mm), so anisotropic voxels keep
+    the dipole's angular shape; ``None`` uses cycles/px on every axis.
+    """
+    if len(shape) != 3 or any(n < 1 for n in shape):
+        raise ValueError(f"shape must be three positive sizes (D, H, W); got {shape!r}")
+    if b0_dim not in (-3, -2, -1):
+        raise ValueError(f"b0_dim must be -3, -2 or -1 of (D, H, W); got {b0_dim!r}")
+    spacing = (1.0, 1.0, 1.0) if voxel_mm is None else voxel_mm
+    if len(spacing) != 3 or any(v <= 0 for v in spacing):
+        raise ValueError(f"voxel_mm must be three positive sizes; got {voxel_mm!r}")
+    axes = [
+        centred_freqs(n, device=device, dtype=dtype) / v
+        for n, v in zip(shape, spacing, strict=True)
+    ]
+    k = torch.meshgrid(*axes, indexing="ij")
+    k2 = k[0] ** 2 + k[1] ** 2 + k[2] ** 2
+    kernel = 1.0 / 3.0 - k[b0_dim + 3] ** 2 / k2.clamp_min(torch.finfo(dtype).tiny)
+    return torch.where(k2 > 0, kernel, torch.zeros_like(kernel))
 
 
 def apply_3d_dipole_kernel(

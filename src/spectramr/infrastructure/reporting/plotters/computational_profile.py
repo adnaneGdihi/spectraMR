@@ -1,10 +1,10 @@
 r"""Figure 1.15 — Computational profile.
 
 Bar chart of per-stage runtime and peak memory (logarithmic where the
-dynamic range is wide), plus a run-facts panel (parameters, throughput,
+dynamic range is wide), plus one small panel per run fact (parameters, throughput,
 wall-time) sourced from the ``split="run"`` rows that the aggregator folds
 in from ``run_summary.json``. Real runs rarely log per-step stage timings,
-so the run-facts panel is what makes this figure fire outside synthetic
+so the run-fact panels are what make this figure fire outside synthetic
 fixtures.
 """
 
@@ -24,12 +24,13 @@ from spectramr.infrastructure.reporting.style import (
     use_default_style,
 )
 
-# Run-level facts (metric key → display precision) drawn as labelled bars.
+# Run-level facts (metric key → axis unit), one small panel each: the units differ, so a
+# shared axis would mislead and a value label would be clutter.
 _RUN_FACTS: tuple[tuple[str, str], ...] = (
-    ("params_m", "{:.2f} M"),
-    ("iterations_per_sec", "{:.2f} it/s"),
-    ("duration_min", "{:.1f} min"),
-    ("effective_batch", "{:.0f}"),
+    ("params_m", "M"),
+    ("iterations_per_sec", "it/s"),
+    ("duration_min", "min"),
+    ("effective_batch", "samples"),
 )
 
 
@@ -66,9 +67,8 @@ def make(
         return None
 
     use_default_style()
-    n_panels = sum(
-        1 for present in (not rt_rows.empty, not mem_rows.empty, bool(run_facts)) if present
-    )
+    n_panels = sum(1 for present in (not rt_rows.empty, not mem_rows.empty) if present)
+    n_panels += len(run_facts)
     fig, axes = plt.subplots(1, n_panels, figsize=(2.5 * n_panels, 2.4), squeeze=False)
     axes_flat = list(axes[0])
     panel_i = 0
@@ -107,26 +107,17 @@ def make(
             panel_label(ax, chr(ord("a") + panel_i))
         panel_i += 1
 
-    # Run facts (horizontal bars, each annotated with value + unit — the units
-    # differ per fact, so the annotation, not the axis, carries the number).
-    if run_facts:
+    for key, unit in _RUN_FACTS:
+        if key not in run_facts:
+            continue
         ax = axes_flat[panel_i]
-        keys = [k for k, _fmt in _RUN_FACTS if k in run_facts]
-        vals = [run_facts[k] for k in keys]
-        y = np.arange(len(keys))
-        ax.barh(y, vals, color="#009E73", alpha=0.85)
-        ax.set_yticks(y)
-        ax.set_yticklabels([pretty_label(k) for k in keys], fontsize=6)
-        ax.invert_yaxis()
-        for yi, (k, v) in enumerate(zip(keys, vals, strict=True)):
-            fmt = dict(_RUN_FACTS)[k]
-            ax.text(v, yi, " " + fmt.format(v), va="center", fontsize=6)
-        # Mixed units: hide the shared x-axis, the per-bar labels carry values.
+        ax.bar([0], [run_facts[key]], width=0.5, color="#009E73", alpha=0.85)
         ax.set_xticks([])
-        ax.set_xlim(0, max(vals) * 1.35)
-        ax.set_title("run profile")
+        ax.set_ylabel(unit)
+        ax.set_title(pretty_label(key))
         if n_panels > 1:
             panel_label(ax, chr(ord("a") + panel_i))
+        panel_i += 1
 
     fig.tight_layout()
     if metadata is not None:

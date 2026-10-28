@@ -18,7 +18,7 @@ Both directions live here because both are physics:
   This is the *estimator*, not an adjoint: it inverts the model by solving a
   regression, which is available only because taking a log linearises this
   particular decay. Do not mistake it for ``A'``; it does not generalise to
-  IVIM/DTI and it is not what a ``DataConsistencyLayer`` wants.
+  IVIM/DTI and it is not what a ``OperatorProjectionDataConsistency`` wants.
 
 ``fit_adc_loglinear`` previously lived inside
 ``models/losses/dwi_adc_monoexp_loss.py``. Physics has one canonical home

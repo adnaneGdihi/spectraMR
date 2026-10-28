@@ -18,23 +18,18 @@ This tutorial walks you through training a basic U-Net model for MRI reconstruct
 
 - Completed :doc:`../getting_started` (framework installed, dataset ready)
 - Basic understanding of MRI physics
-- ~2 hours of GPU time (RTX 3090 or equivalent)
+- A CUDA GPU. Wall-clock depends on the corpus, the patch size and the
+  batch size; measure one epoch before committing to a schedule.
 
 .. contents:: Tutorial Steps
    :local:
    :depth: 2
 
-==================
+============================
 Step 1: Create Configuration
-==================
+============================
 
-Create a new configuration file for your experiment:
-
-.. code-block:: bash
-
-   cd /home/<user>/work/spectramr
-   mkdir -p experiments/tutorials
-   nano experiments/tutorials/tutorial_01_basic_unet.yaml
+Save the following as ``experiments/tutorials/tutorial_01_basic_unet.yaml``.
 
 Configuration File
 ------------------
@@ -64,7 +59,7 @@ Configuration File
      input_domain: image
      output_domain: image
      strategy_class: spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy
-     num_epochs: 50
+     epochs: 50
      device: cuda
      output_dir: experiments/results/tutorial_01_basic_unet
 
@@ -120,7 +115,6 @@ Configuration File
      policy:
        output_domain: image
    logging:
-     enable_wandb: false  # Set true to use Weights & Biases
      intervals:
        log: 50
        save: 5
@@ -142,9 +136,9 @@ Configuration File
 4. **Loss**: L1 + SSIM - Balance pixel accuracy with perceptual quality
 5. **Learning Rate**: ``1e-4`` - Safe default for Adam
 
-==================
+======================
 Step 2: Verify Dataset
-==================
+======================
 
 Before training, ensure your dataset is properly set up:
 
@@ -164,18 +158,12 @@ If manifests don't exist, generate them:
        --data-base databases \
        --datasets fastmri
 
-**Expected Output:**
+The script reports the manifest it wrote and how many volumes it indexed. Use
+``--dry-run`` first to see what it would regenerate without writing.
 
-.. code-block:: text
-
-   Generated manifest: data/manifests/fastmri_brain_multicoil_train.json
-   Total samples: 34,742
-   Scans: 973
-   Average slices per scan: 35.7
-
-==================
+=======================
 Step 3: Train the Model
-==================
+=======================
 
 Start training:
 
@@ -188,20 +176,14 @@ The run directory is not a command-line flag — it comes from
 (``experiments/results/tutorial_01_basic_unet``). Override it for a one-off run
 with ``-O training.output_dir=...`` if you need to.
 
-**Expected Output (first few epochs):**
+Training prints a progress bar carrying the live loss terms, and a
+``[VAL] Results:`` line at each validation event listing every metric the arm
+declared. The run ends with a summary naming the final loss, the best value of
+each tracked metric, the iteration count and the elapsed time.
 
-.. code-block:: text
-
-   [Epoch 1/50] Step 100: loss=0.1523 | l1=0.0892 | ssim=0.0631 | lr=1.0e-04
-   [Epoch 1/50] Step 200: loss=0.1245 | l1=0.0734 | ssim=0.0511 | lr=1.0e-04
-   [Epoch 1/50] Val Metrics: PSNR=24.3 dB | SSIM=0.732
-
-   [Epoch 5/50] Val Metrics: PSNR=28.1 dB | SSIM=0.823
-   [Epoch 10/50] Val Metrics: PSNR=30.2 dB | SSIM=0.867
-   [Epoch 20/50] Val Metrics: PSNR=31.8 dB | SSIM=0.891
-   [Epoch 50/50] Val Metrics: PSNR=32.4 dB | SSIM=0.902
-
-**Training Time:** ~2 hours on RTX 3090 (50 epochs, 34k samples)
+Watch the validation line rather than the training loss: it is the number that
+says whether the model generalises, and ``val_zf_psnr`` — the zero-filled
+baseline scored on the same batch — is what the reconstruction has to beat.
 
 Monitoring Training
 -------------------
@@ -222,18 +204,22 @@ Monitoring Training
    # Watch training progress
    tail -f experiments/results/tutorial_01_basic_unet/logs/train.log
 
-==================
+=====================
 Step 4: Run Inference
-==================
+=====================
 
 Test the trained model on validation data:
 
 .. code-block:: bash
 
    spectramr infer \
-       --checkpoint experiments/results/tutorial_01_basic_unet/checkpoints/best.pt \
+       --checkpoint experiments/results/tutorial_01_basic_unet/checkpoints/step_<NNNNNNNN>.safetensors \
        --input databases/fastmri/datasets/multicoil_val \
        --output experiments/results/tutorial_01_basic_unet/inference
+
+``ls`` the ``checkpoints/`` directory and substitute the file you want.
+A ``best.safetensors`` is written there too once more than one
+validation event has been scored.
 
 ``--config`` is optional here: the run directory beside the checkpoint holds
 ``resolved_config.json``, which wins unless you pass ``--from-yaml``. Every
@@ -244,92 +230,87 @@ input under ``--input`` is reconstructed — there is no per-run sample cap.
 .. code-block:: text
 
    experiments/results/tutorial_01_basic_unet/inference/
-   ├── predictions/
-   │   ├── slice_0000.npy  # Reconstructed image
-   │   ├── slice_0001.npy
-   │   └── ...
-   ├── ground_truth/
-   │   ├── slice_0000.npy  # Original fully-sampled
-   │   └── ...
-   ├── undersampled/
-   │   ├── slice_0000.npy  # Zero-filled reconstruction (baseline)
-   │   └── ...
-   └── metrics.json  # Quantitative results
+   ├── <input-stem>_output.npy    # one reconstruction per input file
+   ├── final_eval.json            # aggregated metric values
+   ├── final_eval_manifest.json   # which metrics were computed, and why any were skipped
+   ├── inference_metrics.csv      # one row per input
+   └── run_summary.json           # checkpoint, config source, seed, duration, counts
 
-==================
+The output filename follows ``data.modes.infer.output.filename_template``,
+which defaults to ``{file_id}_output``; the format defaults to ``npy`` and can
+be set to ``nifti`` or ``h5`` in the same block. Read
+``final_eval_manifest.json`` before quoting a number from ``final_eval.json``:
+a full-reference metric that had no reference to score against is recorded
+there as skipped, with the reason, rather than silently omitted.
+
+========================
 Step 5: Evaluate Results
-==================
+========================
 
 Compute Metrics
 ---------------
 
+The run writes its metrics twice: ``final_metrics.json`` in the run directory
+holds the best value each tracked metric reached, and
+``logs/validation_metrics.csv`` holds one row per validation event.
+
 .. code-block:: python
 
    import json
-   import numpy as np
 
-   # Load metrics
-   with open('experiments/results/tutorial_01_basic_unet/inference/metrics.json') as f:
-       metrics = json.load(f)
+   run = "experiments/results/tutorial_01_basic_unet"
 
-   print(f"Average PSNR: {metrics['psnr_mean']:.2f} ± {metrics['psnr_std']:.2f} dB")
-   print(f"Average SSIM: {metrics['ssim_mean']:.3f} ± {metrics['ssim_std']:.3f}")
-   print(f"Average NMSE: {metrics['nmse_mean']:.4f}")
+   with open(f"{run}/final_metrics.json") as handle:
+       final = json.load(handle)
 
-**Expected Results (4× acceleration):**
+   for name, value in sorted(final["best"].items()):
+       print(f"{name}: {value}")
 
-.. code-block:: text
-
-   Average PSNR: 32.4 ± 2.1 dB
-   Average SSIM: 0.902 ± 0.031
-   Average NMSE: 0.0023
+The ``best`` block is keyed by metric name with a ``_best`` suffix — the
+validation metrics appear as ``val_psnr_best``, ``val_ssim_best`` and so on,
+beside the losses. For the per-event curve, read the CSV: its columns are
+``iteration``, ``epoch`` and one column per validation metric.
 
 Visualize Reconstructions
 --------------------------
+
+Inference writes the reconstruction only — the reference and the zero-filled
+baseline are not re-emitted, so a side-by-side panel comes from ``spectramr
+report`` (below) rather than from hand-loading three arrays.
 
 .. code-block:: python
 
    import matplotlib.pyplot as plt
    import numpy as np
 
-   def visualize_reconstruction(slice_idx=0):
-       # Load data
-       pred = np.load(f'experiments/results/tutorial_01_basic_unet/inference/predictions/slice_{slice_idx:04d}.npy')
-       gt = np.load(f'experiments/results/tutorial_01_basic_unet/inference/ground_truth/slice_{slice_idx:04d}.npy')
-       zf = np.load(f'experiments/results/tutorial_01_basic_unet/inference/undersampled/slice_{slice_idx:04d}.npy')
+   pred = np.load("experiments/results/tutorial_01_basic_unet/inference/"
+                  "<input-stem>_output.npy")
 
-       # Create visualization
-       fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+   # (C, H, W) for a single-file write; take the magnitude channel.
+   image = np.abs(pred[0]) if pred.ndim == 3 else np.abs(pred)
 
-       axes[0].imshow(np.abs(zf), cmap='gray')
-       axes[0].set_title('Zero-Filled (Input)')
-       axes[0].axis('off')
+   plt.imshow(image, cmap="gray")
+   plt.axis("off")
+   plt.savefig("reconstruction.png", dpi=150, bbox_inches="tight")
 
-       axes[1].imshow(np.abs(pred), cmap='gray')
-       axes[1].set_title('U-Net Reconstruction')
-       axes[1].axis('off')
+For the comparison panels, run the report verb against the run directory:
 
-       axes[2].imshow(np.abs(gt), cmap='gray')
-       axes[2].set_title('Ground Truth (Fully Sampled)')
-       axes[2].axis('off')
+.. code-block:: bash
 
-       # Error map
-       error = np.abs(pred - gt)
-       axes[3].imshow(error, cmap='hot', vmin=0, vmax=0.1)
-       axes[3].set_title('Absolute Error')
-       axes[3].axis('off')
+   spectramr report --exp-dir experiments/results/tutorial_01_basic_unet
 
-       plt.tight_layout()
-       plt.savefig(f'reconstruction_slice_{slice_idx}.png', dpi=150)
-       plt.show()
+It writes ``report/qc_report.html`` and ``report/report_summary.md`` beside
+``report/figures/`` (learning curves, loss decomposition, a computational
+profile, a run-summary card and a contact sheet — each rendered as both
+``.png`` and ``.pdf``, the ``.pdf`` carrying a sidecar ``.meta.json``) and
+``report/tables/run_summary.{csv,md}``. Every figure is drawn from artifacts
+already on disk, so a figure whose inputs are missing is recorded in
+``report/report_manifest.json`` with ``"status": "skipped"`` rather than
+being drawn from nothing.
 
-   # Visualize first 5 slices
-   for i in range(5):
-       visualize_reconstruction(i)
-
-==================
+=============================
 Step 6: Experiment Variations
-==================
+=============================
 
 Try Different Configurations
 ----------------------------
@@ -414,7 +395,7 @@ Next Steps
 
 **Resources:**
 
-- :doc:`../user_guide` - Detailed framework reference
+- :doc:`../config_schema_reference` - Every configuration key, with defaults
 
 ==================
 Summary
@@ -428,11 +409,9 @@ Summary
 ✅ Visualizing and comparing results
 ✅ Common troubleshooting techniques
 
-**Expected Results:**
-
-- **PSNR:** 32-34 dB (4× acceleration)
-- **SSIM:** 0.89-0.91
-- **Training Time:** ~2 hours (50 epochs)
-- **Inference Speed:** ~50ms per slice
-
-**Congratulations!** You've successfully trained your first MRI reconstruction model. 🎉
+**Where the numbers are:** ``final_metrics.json`` for the best value each
+tracked metric reached, ``logs/validation_metrics.csv`` for the per-event
+curve, and ``report/`` for the rendered figures. Quality depends on the
+corpus, the acceleration factor and the schedule — read your own run rather
+than a quoted range, and compare against ``val_zf_psnr`` in the same row,
+which is the zero-filled baseline scored on the same batch.

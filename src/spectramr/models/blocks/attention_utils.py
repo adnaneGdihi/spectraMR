@@ -283,13 +283,11 @@ class AttentionWrapper:
         **kwargs,
     ) -> torch.Tensor:
         """Compute attention using standard PyTorch"""
-        # Standard attention computation
         scale = self.config.scale or (query.size(-1) ** -0.5)
 
-        # Compute attention scores
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-
         if attn_mask is not None:
+            # The mask is additive (it was added to the scores); SDPA would read a bool as keep/drop.
+            attn_mask = attn_mask.to(query.dtype)
             # Ensure mask is broadcastable to attention scores shape
             if attn_mask.dim() == 4:
                 # Handle [batch, 1, seq_len, seq_len] or
@@ -317,24 +315,28 @@ class AttentionWrapper:
                     .unsqueeze(1)
                     .expand(query.shape[0], query.shape[1], -1, -1)
                 )
-            attn_scores = attn_scores + attn_mask
 
+        is_causal = False
         if self.config.causal:
-            causal_mask = torch.triu(torch.ones_like(attn_scores), diagonal=1).bool()
-            attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+            if attn_mask is None:
+                is_causal = True
+            else:
+                # SDPA rejects ``is_causal`` together with a mask: fold it in.
+                causal = torch.ones(
+                    query.shape[-2], key.shape[-2], dtype=torch.bool, device=query.device
+                ).triu(diagonal=1)
+                attn_mask = attn_mask.masked_fill(causal, float("-inf"))
 
-        # Apply softmax
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        if self.config.dropout > 0:
-            attn_weights = F.dropout(
-                attn_weights,
-                p=self.config.dropout,
-                training=self.training,
-            )
-
-        # Apply attention to values
-        output = torch.matmul(attn_weights, value)
+        dropout_p = self.config.dropout if self.training else 0.0
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+        )
 
         return output
 

@@ -73,3 +73,44 @@ def test_fsdp_no_parallel_block_passthrough() -> None:
     model = nn.Linear(4, 4)
     wrapped = maybe_wrap_with_fsdp(model, parallel)
     assert wrapped is model
+
+
+class TestFSDPPrecisionFollowsTheGlobalPrecision:
+    """``optimization.precision`` owns the arm's precision; FSDP only overrides it."""
+
+    @staticmethod
+    def _resolve(local, enabled=False, dtype=None):
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision
+
+        return resolve_fsdp_precision(
+            SimpleNamespace(mixed_precision=local), SimpleNamespace(enabled=enabled, dtype=dtype)
+        )
+
+    def test_the_default_is_single_precision(self) -> None:
+        assert self._resolve(None) is None
+
+    def test_no_precision_block_is_single_precision(self) -> None:
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision
+
+        assert resolve_fsdp_precision(SimpleNamespace(mixed_precision=None), None) is None
+
+    def test_float32_wins_even_when_enabled(self) -> None:
+        assert self._resolve(None, enabled=True, dtype="float32") is None
+
+    def test_bfloat16_must_be_declared_and_is_then_followed(self) -> None:
+        assert self._resolve(None, enabled=True, dtype="bfloat16") == "bf16"
+
+    def test_mixed_precision_without_a_type_is_float16_and_fsdp_refuses_it(self) -> None:
+        with pytest.raises(ValueError, match="float16 under FSDP"):
+            self._resolve(None, enabled=True, dtype=None)
+
+    def test_the_fsdp_override_wins_over_the_global_block(self) -> None:
+        assert self._resolve("bf16", enabled=False) == "bf16"
+        assert self._resolve("bf16", enabled=True, dtype="float32") == "bf16"
+
+    def test_the_schema_default_defers_to_the_global_block(self) -> None:
+        assert FSDPConfigSchema(enabled=True).mixed_precision is None

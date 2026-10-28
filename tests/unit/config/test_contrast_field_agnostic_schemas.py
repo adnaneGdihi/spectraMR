@@ -55,33 +55,33 @@ class TestAcqHypernetworkConfig:
 
 class TestDispersionBlochAEConfig:
     def test_accepts_an_identifiable_arm(self) -> None:
-        cfg = DispersionBlochAEConfig(n_pools=2, fields_present=(0.055, 0.3, 1.5, 3.0, 7.0))
-        assert cfg.n_pools == 2
+        cfg = DispersionBlochAEConfig(num_pools=2, fields_present=(0.055, 0.3, 1.5, 3.0, 7.0))
+        assert cfg.num_pools == 2
 
     def test_rejects_duplicate_fields(self) -> None:
         """Repeated fields inflate the apparent M without adding rank."""
         with pytest.raises(ValidationError, match="DISTINCT"):
-            DispersionBlochAEConfig(n_pools=1, fields_present=(1.5, 1.5, 3.0))
+            DispersionBlochAEConfig(num_pools=1, fields_present=(1.5, 1.5, 3.0))
 
     def test_rejects_non_positive_field(self) -> None:
         with pytest.raises(ValidationError, match="positive field strengths"):
-            DispersionBlochAEConfig(n_pools=1, fields_present=(0.0, 1.5, 3.0))
+            DispersionBlochAEConfig(num_pools=1, fields_present=(0.0, 1.5, 3.0))
 
     def test_rejects_inverted_tau_bounds(self) -> None:
         with pytest.raises(ValidationError, match="0 < min < max"):
             DispersionBlochAEConfig(
-                n_pools=1, fields_present=(0.3, 1.5, 3.0), tau_c_bounds=(1e-6, 1e-11)
+                num_pools=1, fields_present=(0.3, 1.5, 3.0), tau_c_bounds=(1e-6, 1e-11)
             )
 
     def test_fields_present_is_required(self) -> None:
         """There is no sane default field set; the arm must declare it."""
         with pytest.raises(ValidationError):
-            DispersionBlochAEConfig(n_pools=1)
+            DispersionBlochAEConfig(num_pools=1)
 
     def test_frozen(self) -> None:
-        cfg = DispersionBlochAEConfig(n_pools=1, fields_present=(0.3, 1.5, 3.0))
+        cfg = DispersionBlochAEConfig(num_pools=1, fields_present=(0.3, 1.5, 3.0))
         with pytest.raises(ValidationError):
-            cfg.n_pools = 2
+            cfg.num_pools = 2
 
     def test_mode_dispatch_reaches_the_wrapper(self) -> None:
         assert _MODE_DISPATCH["dispersion_bloch_ae"] == "TrainingConfigDispersionBlochAE"
@@ -107,3 +107,25 @@ class TestMCGIConfig:
             cfg.hard_rank_eval = False
         with pytest.raises(ValidationError):
             MCGIConfig(hard_rank=True)
+
+
+def test_the_dlbae_arm_loads_its_block_typed() -> None:
+    """#1711: the block reached the strategy as a dict, so getattr read every default."""
+    from spectramr.config.settings import TrainingSettings
+
+    cfg = TrainingSettings.from_yaml(
+        "experiments/inprogress/dispersion_bloch_ae/dlbae_brain_5field.yaml"
+    ).training.dispersion_bloch_ae
+    assert isinstance(cfg, DispersionBlochAEConfig)
+    assert cfg.num_pools == 2 and len(cfg.fields_present) == 5
+
+
+def test_the_lcah_arm_loads_its_block_typed() -> None:
+    """The block reached the strategy as a dict, so getattr read hyper_hidden=32, not 64."""
+    from spectramr.config.settings import TrainingSettings
+
+    cfg = TrainingSettings.from_yaml(
+        "experiments/inprogress/acq_hypernetwork/lcah_recon_multifield.yaml"
+    ).training.acq_hypernetwork
+    assert isinstance(cfg, AcqHypernetworkConfig)
+    assert cfg.hyper_hidden == 64

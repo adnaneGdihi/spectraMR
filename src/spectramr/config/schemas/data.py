@@ -5,12 +5,14 @@ CLEANED: Removed legacy specific path keys (lr_volume, ulf_root, etc.)
 in favor of a unified 'data_root' + 'dataset_type' strategy.
 """
 
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator, model_validator
 
 from spectramr.config.schemas.augmentation import AugmentationConfigSchema
 from spectramr.config.schemas.collation import CollationConfigSchema
+from spectramr.config.schemas.data_acquisition import DataAcquisitionSchema
+from spectramr.config.schemas.m4raw_triplet import M4RawTripletConfigSchema
 from spectramr.shared.utils.path_normalizer import PathNormalizer
 
 from .renames import (
@@ -30,6 +32,7 @@ __all__ = [
     "CollationConfigSchema",
     "ContrastConfigSchema",
     "CoordinateEmissionConfigSchema",
+    "DataAcquisitionSchema",
     "DataConfigSchema",
     "DataExposeConfigSchema",
     "DataLoaderConfigSchema",
@@ -89,6 +92,7 @@ CANONICAL_DATASET_TYPES: tuple[str, ...] = (
     "oracle_bssfp",
     "mrixfields",
     "fmri",
+    "m4raw_triplet",
 )
 
 #: Legacy spellings folded to a canonical type BEFORE dispatch. Because the fold
@@ -113,6 +117,20 @@ DATASET_TYPE_ALIASES: dict[str, str] = {
     "paired_mri": "nifti_paired",
 }
 
+
+
+# Typed default factories: a lambda returning a list literal infers list[str],
+# which a list[Literal[...]] field rejects under strict mypy (#2659).
+_ReferenceTissue = Literal["gm", "wm", "csf", "fat", "lesion_t1", "lesion_t2"]
+_ScanField = Literal["TE", "TR", "TI", "FA", "B0", "contrast_type", "b_value", "bvec"]
+
+
+def _default_reference_tissues() -> list[_ReferenceTissue]:
+    return ["gm", "wm", "csf"]
+
+
+def _default_scan_fields() -> list[_ScanField]:
+    return ["TE", "TR", "FA"]
 
 class AcquisitionParamsSchema(BaseModel):
     """Physical acquisition parameters for a single contrast.
@@ -201,8 +219,8 @@ class ReferenceTissuePanelConfig(BaseModel):
 
     model_config = ConfigDict(protected_namespaces=(), extra="forbid", frozen=True)
 
-    tissues: list[Literal["gm", "wm", "csf", "fat", "lesion_t1", "lesion_t2"]] = Field(
-        default_factory=lambda: ["gm", "wm", "csf"],
+    tissues: list[_ReferenceTissue] = Field(
+        default_factory=_default_reference_tissues,
         description="Reference-tissue names selected from the default panel.",
     )
     n_samples_per_tissue: int = Field(
@@ -231,9 +249,13 @@ class MultiContrastConfigSchema(BaseModel):
     ``enabled=True`` the data pipeline emits a ``contrast_idx`` long tensor
     on every batch and the strategy passes it to ``model.forward(...,
     contrast_idx=...)``. The model is responsible for consuming it (typically
-    via ``nn.Embedding(n_contrasts, embed_dim)`` feeding a FiLM γ/β MLP);
+    via ``nn.Embedding(n_contrasts, ...)`` (width: a ``model_kwargs`` knob) feeding FiLM);
     the Tier-1 audit ``multi_contrast_model_support`` guards against silently
-    selecting a model that ignores the id.
+    selecting a model that ignores the id. It checks **both** consumers --
+    ``model.model_type`` and, when one is declared,
+    ``model.discriminator_component.name`` -- because an unconditioned critic
+    drops ``contrast_idx`` just as silently as an unconditioned generator
+    (#1931).
 
     Distinguish from:
 
@@ -258,14 +280,6 @@ class MultiContrastConfigSchema(BaseModel):
         description=(
             "Cohort cardinality (e.g. 4 = T1/T2/FLAIR/PD). Must match the "
             "model's ``nn.Embedding(n_contrasts, ...)`` lookup table size."
-        ),
-    )
-    embed_dim: int = Field(
-        default=8,
-        ge=1,
-        description=(
-            "Contrast-embedding dimension fed into the FiLM MLP. The model "
-            "may override via ``model_kwargs`` if it needs a different size."
         ),
     )
     contrast_map: dict[str, int] = Field(
@@ -656,7 +670,7 @@ class ModeSamplerSchema(BaseModel):
 class ModeConfigSchema(BaseModel):
     """Per-mode behavior block (one of train/val/infer/eval).
 
-    Phase 3 covers ``sampler`` and ``augmentation_enabled``. Phase 2 adds
+    Phase 3 covers ``sampler``. Phase 2 adds
     ``strict_train_parity`` and ``output``; Phase 1.7 fills in ``role``
     and ``reference_paths`` for ``mode=eval``.
     """
@@ -666,11 +680,6 @@ class ModeConfigSchema(BaseModel):
     sampler: ModeSamplerSchema = Field(
         default_factory=ModeSamplerSchema,
         description="Sampler config for this mode.",
-    )
-    augmentation_enabled: bool = Field(
-        default=False,
-        description="Whether to apply augmentation pipeline in this mode. "
-        "Train defaults true; val/infer/eval default false.",
     )
     transforms_override: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -1244,8 +1253,8 @@ class AcquisitionMetadataConfigSchema(BaseModel):
         "HDF5 root attributes (FastMRI-style). ``yaml_inline`` uses the "
         "``defaults`` dict below — primarily for smoke tests and synthetic data.",
     )
-    fields: list[Literal["TE", "TR", "TI", "FA", "B0", "contrast_type", "b_value", "bvec"]] = Field(
-        default_factory=lambda: ["TE", "TR", "FA"],
+    fields: list[_ScanField] = Field(
+        default_factory=_default_scan_fields,
         description="Which scan parameters to read. ``TI`` only meaningful for "
         "inversion-recovery sequences; ``b_value``/``bvec`` only for DWI.",
     )
@@ -2209,7 +2218,30 @@ class OracleBssfpConfigSchema(BaseModel):
 #: Every phase-9 sub-block. ``forbid`` even though the parent ``data:`` block is
 #: ``ignore``: a new block has no legacy corpus to protect, and `ignore` is
 #: precisely what let keys disappear silently (#550).
-_DATA_SUBBLOCK = {"extra": "forbid", "frozen": True}
+_DATA_SUBBLOCK = ConfigDict(extra="forbid", frozen=True)
+
+#: ``data.sampling.subject_prefetch`` value that sizes the queue's subject
+#: prefetch to one refill (resolved in ``data/builders/prefetching_queue.py``).
+SUBJECT_PREFETCH_AUTO: Final = "auto"
+
+
+def validate_subject_prefetch(value: object) -> int | str:
+    """The one rule for ``subject_prefetch``: ``"auto"`` or an int >= 1, else raise.
+
+    Shared by the schema field and the queue builder so a config that bypasses
+    the schema (a test stub, a hand-built ``TorchIOQueueConfig``) meets the same
+    check. ``bool`` is rejected because ``True`` is an ``int`` and would read as 1.
+    """
+    if isinstance(value, str) and value == SUBJECT_PREFETCH_AUTO:
+        return SUBJECT_PREFETCH_AUTO
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"subject_prefetch must be {SUBJECT_PREFETCH_AUTO!r} or an integer >= 1, "
+            f"got {value!r} ({type(value).__name__})."
+        )
+    if value < 1:
+        raise ValueError(f"subject_prefetch must be >= 1, got {value}.")
+    return value
 
 
 class DataLoaderConfigSchema(BaseModel):
@@ -2248,9 +2280,24 @@ class DataLoaderConfigSchema(BaseModel):
         ),
     )
 
+    reserved_cores: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "Cores per rank withheld from the worker clamp for the main training "
+            "process and its pin-memory / TensorBoard / writer threads (the nodes have "
+            "no SMT, so those threads otherwise contend with the decoders). The clamp "
+            "ceiling becomes max(1, cpus_per_rank - reserved_cores); it never raises "
+            "num_workers."
+        ),
+    )
+
     persistent_workers: bool = Field(
-        default=False,
-        description="If True, the data loader will not shutdown the worker processes after a dataset has been consumed once.",
+        default=True,
+        description=(
+            "Keep worker processes alive between epochs instead of respawning them. "
+            "The director forces it off for any loader whose clamped worker count is 0."
+        ),
     )
 
     prefetch_factor: int = Field(
@@ -2307,6 +2354,26 @@ class DataSamplingConfigSchema(BaseModel):
         ge=1,
         description="TorchIO patch queue buffer size (RAM vs CPU balance).",
     )
+    subject_prefetch: Literal["auto"] | int = Field(
+        default=SUBJECT_PREFETCH_AUTO,
+        description=(
+            "Subjects each worker of the training queue's subject loader keeps "
+            "loading ahead (its DataLoader prefetch_factor). 'auto' sizes it to one "
+            "queue refill, ceil(ceil(queue_length / samples_per_volume) / num_workers), "
+            "floored at torch's default 2, so the next refill's subjects load while the "
+            "current patches train (#2673). An int >= 1 sets it explicitly. It changes "
+            "how many subjects are in flight, not which are drawn or their order. Host "
+            "RAM grows by (prefetch - 2) x num_workers whole subjects over the old "
+            "behaviour. Unread when num_workers is 0 (subjects load in the main process). "
+            "Applies to the train queue whether queue_length comes from here or from "
+            "data.modes.train.sampler."
+        ),
+    )
+
+    @field_validator("subject_prefetch", mode="before")
+    @classmethod
+    def _check_subject_prefetch(cls, value: object) -> int | str:
+        return validate_subject_prefetch(value)
 
     enable_slab_mode: bool = Field(
         default=False,
@@ -2408,6 +2475,37 @@ class DataPairingConfigSchema(BaseModel):
         ),
     )
 
+    cross_contrast_source: Literal["T1", "T2", "FLAIR"] = Field(
+        default="T1",
+        description=(
+            "M4Raw cross-contrast route only: the one contrast every pair takes its "
+            "source from. One per arm, because the model is not told which contrast "
+            "the reference is. Distinct from `contrasts`, which filters manifest records."
+        ),
+    )
+
+    cross_contrast_targets: list[Literal["T1", "T2", "FLAIR"]] | None = Field(
+        default=None,
+        description=(
+            "M4Raw cross-contrast route only: the contrasts paired against "
+            "cross_contrast_source; None pairs every other contrast."
+        ),
+    )
+
+    source_layout: Literal["stacked", "separate", "target_only"] = Field(
+        default="stacked",
+        description=(
+            "M4Raw cross-contrast route (single_contrast: false) only: how the "
+            "source contrast reaches the model. 'stacked' concatenates it onto "
+            "the target along the channel axis. 'separate' serves a target-only "
+            "input/target and the source's acquired repetition as "
+            "batch['kspace_source'], which a cold-diffusion generator consumes "
+            "through model.model_kwargs.reference_channels. 'target_only' serves "
+            "the same target without the source: the no-prior control on the "
+            "same pairs."
+        ),
+    )
+
     bidirectional_mode: Literal["ulf_to_hf", "hf_to_ulf", "hf_to_hf", "ulf_to_ulf"] = Field(
         default="ulf_to_hf",
         description=(
@@ -2435,12 +2533,42 @@ class DataPairingConfigSchema(BaseModel):
     allow_unpaired: bool = Field(
         default=False,
         description=(
-            "Allow samples without a corresponding target (inference/val mode). "
-            "When True, subjects with no target_path are included as inference-only samples. "
-            "Should be True for validation splits of the ULF-paired dataset, where more ULF "
-            "subjects exist than HF subjects."
+            "Admit target-less ULF records into the val, test and infer splits. "
+            "Those samples carry has_target=False, and a supervised train or validation "
+            "step raises on them, so set this true only for an arm whose val/test/infer "
+            "consumer does not score against a target. Train never admits them here "
+            "(see unpaired_training)."
         ),
     )
+
+    unpaired_training: bool = Field(
+        default=False,
+        description=(
+            "Train on independent domain draws: each training sample pairs a domain-A "
+            "(primary) volume with a domain-B (target) volume drawn from the same pool "
+            "without regard to subject. Required by the cyclegan/cut unpaired batch "
+            "contract. Admits target-less records to the train split only; val and "
+            "test follow allow_unpaired."
+        ),
+    )
+
+    disjoint_subjects: bool = Field(
+        default=False,
+        description=(
+            "With unpaired_training: split the training subjects into two alternating "
+            "halves, drawing domain A only from one and domain B only from the other, "
+            "so no subject supplies both sides."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _disjoint_requires_unpaired_training(self) -> "DataPairingConfigSchema":
+        if self.disjoint_subjects and not self.unpaired_training:
+            raise ValueError(
+                "pairing.disjoint_subjects: true only has meaning with "
+                "pairing.unpaired_training: true (paired training has no A/B pools to split)."
+            )
+        return self
 
 
 class DataSourceConfigSchema(BaseModel):
@@ -2499,8 +2627,19 @@ class DataSourceConfigSchema(BaseModel):
             "on, never the ones that select the checkpoint (that is validation). "
             "Must differ from index_path and validation_index_path; the "
             "`held_out_test_split_disjoint` witness checks the records too. "
+            "A finished run scores it once on its final weights (`pipelines/test_pass.py`) and "
+            "writes `final_eval.json`; it never feeds checkpoint selection. "
             "Declaring it is a protocol change (cohort review 2026-09-02, T0.3): "
             "numbers stop being comparable with runs that reported on validation."
+        ),
+    )
+
+    test_pass: Literal["train_end", "infer"] = Field(
+        default="train_end",
+        description=(
+            "When `test_index_path` is scored. 'train_end': once, on the finished run's "
+            "weights. 'infer': only on request, by `spectramr infer --test-split` (or "
+            "`train --validate-only`), so a training run never reads the test set."
         ),
     )
 
@@ -2619,7 +2758,7 @@ class DataProcessingConfigSchema(BaseModel):
         le=1.0,
         description="Percentile (0-1) used for k-space normalization",
     )
-    kspace_scale_domain: Literal["kspace", "image"] = Field(
+    kspace_scale_domain: Literal["kspace", "image", "acs", "acs_window"] = Field(
         default="kspace",
         description=(
             "Where KSpaceNormalizationTransform measures the robust scale. "
@@ -2628,7 +2767,26 @@ class DataProcessingConfigSchema(BaseModel):
             "Parseval-compliant: the percentile of the coil-RSS magnitude AFTER "
             "ifft2c, so the reconstructed IMAGE lands at ~unit scale — the right "
             "choice when losses/metrics are graded in the image domain. "
-            "'image' ignores log_scaling_center_fraction (a k-space notion)."
+            "'image' ignores log_scaling_center_fraction (a k-space notion). "
+            "'acs' is 'image' over only the centred log_scaling_center_fraction "
+            "band of phase-encode lines, so the scale is the same at every rung "
+            "and at inference; the audit checks the band lies inside the top "
+            "rung's mask. 'acs_window' is 'image' over the centred n x n window, "
+            "n = round(log_scaling_center_fraction * W), that every 2-D repetition "
+            "mask (Poisson-disc, radial, spiral) contains."
+        ),
+    )
+    kspace_scale_reference: Literal["target", "input"] = Field(
+        default="target",
+        description=(
+            "Which k-space image of the subject KSpaceNormalizationTransform "
+            "measures the robust scale on; every k-space image is then divided by "
+            "it. 'target' takes the first of kspace/target/input present (the "
+            "historical order; on a paired route `kspace` is the target). 'input' "
+            "measures it on the input as acquired (under target_mode r2r / "
+            "nullspace_r2r, the repetition before the split) and raises if the "
+            "subject has no input, which is what prediction must do because "
+            "deployment has no target."
         ),
     )
     enable_log_scaling: bool = Field(
@@ -2639,7 +2797,23 @@ class DataProcessingConfigSchema(BaseModel):
         default=0.25,
         ge=0.0,
         le=1.0,
-        description="Fraction of center patch used for log_scaling computation",
+        description=(
+            "Fraction of center patch used for log_scaling computation; under "
+            "kspace_scale_domain 'acs', the fraction of phase-encode lines in the scale band; "
+            "under 'acs_window', the window's side as a fraction of W."
+        ),
+    )
+
+    image_domain_crop_or_pad: tuple[PositiveInt, PositiveInt] | None = Field(
+        default=None,
+        description=(
+            "Resize raw k-space to this [height, width] field of view by centre-"
+            "cropping or zero-padding its IMAGE (ifft2c -> crop -> fft2c) at load "
+            "time, before coil processing. fastMRI stores a 2x oversampled readout "
+            "(640 rows) whose reference reconstructions are the centre 320 x 320. "
+            "Served only by the fastMRI/universal k-space loader; any other route "
+            "raises. None keeps the stored matrix."
+        ),
     )
 
     # --- image-domain normalisation ---
@@ -2674,6 +2848,23 @@ class DataProcessingConfigSchema(BaseModel):
         default=(0.0, 100.0),
         description="Source percentiles for rescaling (min, max). Use (0.5, 99.5) to reject outliers.",
     )
+
+    @model_validator(mode="after")
+    def _rescale_range_is_never_read(self) -> "DataProcessingConfigSchema":
+        """Refuse ``rescale_range``: nothing reads it (#2739).
+
+        The image normaliser takes its output range from ``normalization_kwargs.out_range``.
+        30 arms declared ``rescale_range: [-1, 1]`` beside ``data_range: 2.0`` and trained on
+        (0, 1), so their PSNR read about 6 dB high.
+        """
+        if "rescale_range" in self.model_fields_set:
+            raise ValueError(
+                "data.processing.rescale_range is read by nothing: minmax and percentile take "
+                "their output range from data.processing.normalization_kwargs.out_range "
+                "(#2739). Declare it there, set data_range to its span, and remove "
+                "rescale_range."
+            )
+        return self
 
     # --- downstream ---
     data_range: float | None = Field(
@@ -2783,7 +2974,9 @@ class DataSplitConfigSchema(BaseModel):
 
     model_config = _DATA_SUBBLOCK
 
-    type: Literal["auto", "directory", "manifest", "random", "loso", "loso_subject"] = Field(
+    type: Literal[
+        "auto", "directory", "manifest", "random", "loso", "loso_subject", "subjects"
+    ] = Field(
         default="auto",
         description=(
             "How to partition data into train/val splits. "
@@ -2793,6 +2986,7 @@ class DataSplitConfigSchema(BaseModel):
             "'loso': leave-one-SITE-out, requires holdout_site. "
             "'loso_subject': leave-one-SUBJECT-out, requires holdout_subject or "
             "loso_fold. "
+            "'subjects': explicit subject ids in val_subjects / test_subjects. "
             "'auto': infers from available config (backward-compatible cascade).\n\n"
             "NOTE the two 'loso' spellings are different designs and the "
             "collision is deliberate-but-dangerous: 'loso' holds out a SITE "
@@ -2840,6 +3034,22 @@ class DataSplitConfigSchema(BaseModel):
             "hand-writing each subject id. Deterministic: the sort is on the id "
             "string, not on manifest order, so the same fold means the same "
             "subject across runs and machines."
+        ),
+    )
+    val_subjects: list[str] | None = Field(
+        default=None,
+        description=(
+            "Subject ids held out for validation under type='subjects' (paired-manifest route). "
+            "Every record of a listed subject, repeat scans included, goes to validation."
+        ),
+    )
+    test_subjects: list[str] | None = Field(
+        default=None,
+        description=(
+            "Subject ids held out as the TEST partition on the paired-manifest route. "
+            "Under type='subjects' they are the explicit list; under 'loso_subject' they are "
+            "the test set beside the held-out validation subject. Test records are never "
+            "unpaired."
         ),
     )
 
@@ -2930,6 +3140,16 @@ class DataExposeConfigSchema(BaseModel):
             "from the mrixfields paired dataset — read by MRIxFieldsPairedDataset to "
             "gate emission and required by cross-field / field-flow validation. "
             "Pairs with expose_field_strength (source field)."
+        ),
+    )
+
+    field_strength_pair: bool = Field(
+        default=False,
+        description=(
+            "Stamp batch['field_strength_source_t'] (input-domain B0) and "
+            "batch['field_strength_t'] (target-domain B0) on NIfTI ULF pairs from the "
+            "records' input_field / target_field. Raises if a record lacks one. Needed "
+            "by the B0-conditioned generator; per-record, unlike field_strength_target."
         ),
     )
 
@@ -3119,6 +3339,54 @@ class MRIxFieldsDataConfigSchema(BaseModel):
     )
 
 
+class DataStagingConfigSchema(BaseModel):
+    """Where a run reads its input files from: the shared filesystem or a node-local copy.
+
+    A random slice read from the shared filesystem costs 25-90 ms on the clusters
+    (sabine, 2026-10-21); node-local disk does not. The copy is made once, in the main
+    process, before any DataLoader worker exists.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mode: Literal["off", "node_local"] = Field(
+        default="off",
+        description=(
+            "'off' (default) reads in place. 'node_local' copies every k-space file the "
+            "train, validation and test indices name under `root`, and reads the copies."
+        ),
+    )
+    root: str = Field(
+        default="/tmp",
+        description=(
+            "Read only with mode 'node_local': the node-local directory the copies go "
+            "under. Not $TMPDIR, which is a per-job scratch path on some clusters."
+        ),
+    )
+    min_free_gb: float = Field(
+        default=20.0,
+        ge=0.0,
+        description=(
+            "Read only with mode 'node_local': free space that must remain on `root` "
+            "after the copy."
+        ),
+    )
+    when_full: Literal["raise", "read_in_place"] = Field(
+        default="raise",
+        description=(
+            "Read only with mode 'node_local': what a copy that does not fit does. "
+            "'raise' (default) stops the run; 'read_in_place' warns and reads the "
+            "shared filesystem, which is the slow path this block exists to avoid."
+        ),
+    )
+    threads: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description="Read only with mode 'node_local': parallel file copies (I/O bound).",
+    )
+
+
 class CoilsConfigSchema(BaseModel):
     """How multi-coil data is reduced before it reaches the model.
 
@@ -3130,9 +3398,19 @@ class CoilsConfigSchema(BaseModel):
 
     model_config = _DATA_SUBBLOCK
 
-    processing_mode: Literal["none", "flatten", "svd", "magnitude", "rss", "rss_image"] = Field(
+    processing_mode: Literal[
+        "none", "flatten", "svd", "magnitude", "rss", "rss_per_channel", "rss_image"
+    ] = Field(
         default="none",
-        description="How to handle multi-coil data: 'none' keeps original, 'flatten' splits real/imag per coil, 'svd' compresses to virtual coils, 'magnitude' gives real-only RSS in source domain, 'rss' returns 2-ch real/imag of the RSS-combined k-space (applies IFFT-RSS-FFT for k-space inputs), 'rss_image' returns 1-ch RSS magnitude image (applies IFFT then RSS for k-space inputs; identity for image inputs)",
+        description=(
+            "How to handle multi-coil data: 'none' keeps original, 'flatten' splits "
+            "real/imag per coil, 'svd' compresses to virtual coils, 'rss_per_channel' "
+            "returns 2-ch real/imag of the k-space of an image whose real and imaginary "
+            "channels were each RSS-reduced over coils (Shen 2024's combination), "
+            "'rss_image' returns 1-ch RSS magnitude image (applies IFFT then RSS for "
+            "k-space inputs; identity for image inputs). 'rss' and 'magnitude' declare "
+            "that the source is ALREADY combined and mount no transform -- see #2093."
+        ),
     )
 
     num_virtual_coils: int = Field(
@@ -3235,6 +3513,8 @@ class DataConfigSchema(BaseModel):
     loader: DataLoaderConfigSchema = Field(default_factory=DataLoaderConfigSchema)
     expose: DataExposeConfigSchema = Field(default_factory=DataExposeConfigSchema)
     mrixfields: MRIxFieldsDataConfigSchema = Field(default_factory=MRIxFieldsDataConfigSchema)
+    m4raw_triplet: M4RawTripletConfigSchema | None = None
+    staging: DataStagingConfigSchema = Field(default_factory=DataStagingConfigSchema)
     coils: CoilsConfigSchema = Field(default_factory=CoilsConfigSchema)
     split: DataSplitConfigSchema = Field(default_factory=DataSplitConfigSchema)
     domain: DataDomainConfigSchema = Field(default_factory=DataDomainConfigSchema)
@@ -3242,6 +3522,16 @@ class DataConfigSchema(BaseModel):
     sampling: DataSamplingConfigSchema = Field(default_factory=DataSamplingConfigSchema)
     pairing: DataPairingConfigSchema = Field(default_factory=DataPairingConfigSchema)
     source: DataSourceConfigSchema = Field(default_factory=DataSourceConfigSchema)
+    # No default instance: an absent block means "not declared", and a phase or
+    # readout line mask then raises at build instead of guessing an axis (#2160).
+    acquisition: DataAcquisitionSchema | None = Field(
+        default=None,
+        description=(
+            "The dataset's phase-encode axis and acquired phase-encode lines; "
+            "required by undersampling.mask_direction: phase/readout. See "
+            "config/schemas/data_acquisition.py."
+        ),
+    )
 
     __folded_input_keys__ = folded_input_keys("data")
     __folded_input_paths__ = folded_input_paths("data")
@@ -3256,8 +3546,14 @@ class DataConfigSchema(BaseModel):
     # place: the key stops working AND stops being visible. Promoting a
     # drained record in a block without this validator converts a working
     # fold into exactly that.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("data")))
-    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("data")))
+    # The factories return untyped (cls, data) callables; pydantic accepts the
+    # classmethod at runtime, and its protocol types cannot describe one built here.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("data"))  # type: ignore[arg-type]
+    )
+    _fold_renamed = model_validator(mode="before")(
+        classmethod(fold_renamed_keys("data"))  # type: ignore[arg-type]
+    )
 
     # --- 1. The Source ---
     dataset_type: str = Field(
@@ -3520,10 +3816,27 @@ class DataConfigSchema(BaseModel):
         default=False,
         description="Return image domain target for perceptual losses (SSIM/LPIPS)",
     )
-    target_mode: Literal["complex_mean", "phase_aligned_mean", "rep_pair"] = Field(
+    target_mode: Literal[
+        "complex_mean", "phase_aligned_mean", "rep_pair", "r2r", "nullspace_r2r"
+    ] = Field(
         default="complex_mean",
         description=(
-            "M4Raw NEX target. 'complex_mean' plain-averages complex k-space "
+            "M4Raw NEX target. 'r2r' is Recorrupted-to-Recorrupted (Pang 2021): "
+            "BOTH halves are built from the input repetition alone as "
+            "input = y + alpha*z, target = y - z/alpha with z ~ CN(0, Sigma_n) "
+            "drawn fresh per sample, so Cov(input, target) = Sigma_n - Sigma_z = 0 "
+            "and the L1/L2 minimiser is the clean image. 'nullspace_r2r' builds "
+            "the same pair with NO drawn noise: it projects the whitened coil "
+            "vector onto two orthogonal unit vectors mixing the ESPIRiT "
+            "direction with a null-space direction at data.r2r_split_angle_deg, "
+            "so the halves share the clean image and have uncorrelated noise "
+            "(R2R with tau = tan(angle)), each re-expanded to the rank-one coil "
+            "image. These two are the only modes that need ONE excitation, so "
+            "they are the only ones deployable on a single-repetition scan. Both "
+            "are second-moment constructions: a "
+            "per-acquisition artefact appears in both halves with the same sign "
+            "and is PRESERVED, not removed -- use 'rep_pair' to decorrelate that. "
+            "'complex_mean' plain-averages complex k-space "
             "(legacy; cancels signal under inter-rep phase drift). "
             "'phase_aligned_mean' corrects each rep's global phase to rep0 first. "
             "'rep_pair' is the Noise2Noise target: ONE other repetition, phase-"
@@ -3532,6 +3845,206 @@ class DataConfigSchema(BaseModel):
             "repetition; it requires nex_target_exclude_input: true and >= 2 "
             "repetitions per group (a 1-repetition group has no pair and raises "
             "whatever nex_fallback says)."
+        ),
+    )
+    val_target_mode: Literal["complex_mean", "phase_aligned_mean", "rep_pair"] | None = Field(
+        default=None,
+        description=(
+            "M4Raw NEX target for the VALIDATION split only. None (default) "
+            "serves data.target_mode on both splits. 'r2r' is excluded here at "
+            "the TYPE level, and that exclusion is the reason the knob exists: "
+            "r2r draws a fresh z on every __getitem__, so an r2r validation "
+            "target is a different random image each epoch. PSNR against it "
+            "measures the draw rather than the model, and best-checkpoint "
+            "selection (track_best_metric) would keep whichever epoch drew the "
+            "kindest noise. Declaring the SAME val_target_mode across a cohort "
+            "is also what makes its arms comparable: the validation reference "
+            "is then ONE fixed definition while the training target varies per "
+            "arm, so a PSNR difference is attributable to the training target. "
+            "Read by dataset_type 'm4raw' only."
+        ),
+    )
+    r2r_alpha: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Recorruption strength for data.target_mode='r2r'. Read ONLY under "
+            "that mode. alpha CANCELS from the decorrelation identity "
+            "(Cov(y + alpha*z, y - z/alpha) = Sigma_n - Sigma_z for every "
+            "alpha > 0), so it does not trade bias -- it trades VARIANCE between "
+            "the two halves: the input carries (1 + alpha^2)*Sigma_n and the "
+            "target (1 + 1/alpha^2)*Sigma_n. alpha=1.0 (default) splits it evenly "
+            "at 2*Sigma_n each; alpha<1 gives a cleaner input and a noisier "
+            "target, alpha>1 the reverse."
+        ),
+    )
+    r2r_covariance_source: Literal["committed", "self_calibrated"] = Field(
+        default="committed",
+        description=(
+            "Where data.target_mode='r2r' gets the Sigma_n it draws from. Read "
+            "ONLY under that mode. 'committed' (default) uses the matrix in "
+            "m4raw_noise.py, which scopes itself to 7 subjects from one M4Raw "
+            "study series and warns that receiver gain may differ elsewhere -- "
+            "and R2R's decorrelation Cov(y + a*z, y - z/a) = Sigma_n - Sigma_z "
+            "is exact only where the two match, so every arm inherits that "
+            "scope. 'self_calibrated' fits Sigma_n per scan from that scan's own "
+            "coil null space, where a physical image is rank one and the "
+            "residual is pure noise, and needs no second repetition. Measured "
+            "against a known Sigma on synthetic 4-coil data: ~1% relative "
+            "Frobenius error and unbiased from 0.5x to 2x the committed noise "
+            "level, degrading to ~22% with a 13% high bias at 4x, where ESPIRiT's "
+            "own maps blur and the null space starts to contain signal. Under "
+            "'self_calibrated' the validation split also fits and publishes each "
+            "scan's Sigma_n as `noise_covariance` (one fit per group per loader "
+            "worker), so validation.scoring.recorrupted_inference draws from the "
+            "same source training did."
+        ),
+    )
+    r2r_split_angle_deg: float = Field(
+        default=45.0,
+        gt=0.0,
+        lt=90.0,
+        description=(
+            "Split angle theta for data.target_mode='nullspace_r2r', read ONLY "
+            "under that mode. The input half carries 1/cos^2(theta) and the "
+            "target half 1/sin^2(theta) times the SENSE-combined noise variance, "
+            "i.e. R2R with tau = tan(theta); 45.0 (default) is the symmetric "
+            "tau = 1 split. The open interval is enforced because at either end "
+            "one half divides by zero."
+        ),
+    )
+    r2r_whitening: Literal["none", "committed", "self_calibrated"] = Field(
+        default="committed",
+        description=(
+            "Whitener for data.target_mode='nullspace_r2r', read ONLY under that "
+            "mode. The halves are uncorrelated when the whitener matches the "
+            "scan's Sigma_n up to a SCALAR: the residual correlation is "
+            "u1^H (S^-1/2 Sigma S^-1/2 - I) u2, zero for a pure receiver-gain "
+            "error. 'committed' (the default) uses the matrix in m4raw_noise.py, "
+            "whose shape is what matters, and the mode runs only on the array "
+            "that matrix describes; 'none' (W = I) is exact only for white noise, "
+            "so on M4Raw it is the planted violation, never a default; "
+            "'self_calibrated' fits Sigma_n per scan from its coil null space."
+        ),
+    )
+    emit_alternate_input: bool = Field(
+        default=False,
+        description=(
+            "M4Raw only. Under an averaging target ('complex_mean' / "
+            "'phase_aligned_mean', typically the validation split's "
+            "val_target_mode), also publish `input_alt`: repetition 1, "
+            "phase-aligned to the input repetition, in the input's interleaved "
+            "layout, so a consumer can grade the model's output across two real "
+            "repetitions. A split-mode (r2r) training split emits nothing. Needs "
+            "use_repetitions and >= 2 repetitions per group; the loader refuses "
+            "a group with fewer."
+        ),
+    )
+    n2n_pairing: Literal["random_pair", "one_vs_rest_mean", "ordered"] | None = Field(
+        default=None,
+        description=(
+            "M4Raw single-contrast route, training split only. When set, the loader "
+            "serves no target: it publishes `kspace_reps`, a stack whose slot 0 is the "
+            "input and whose other slots are every other repetition in the input's "
+            "frame ('random_pair' needs target_mode 'rep_pair'; 'one_vs_rest_mean' "
+            "needs 'phase_aligned_mean') or a split mode's target half ('ordered' "
+            "needs 'r2r' or 'nullspace_r2r'). NoiseToNoiseStrategy forms the training "
+            "target from that stack: a random other repetition per sample, the mean of "
+            "the others, or the target half as given. Validation keeps val_target_mode."
+        ),
+    )
+    coil_maps_root: str | None = Field(
+        default=None,
+        description=(
+            "M4Raw single-contrast route only. Directory of per-scan ESPIRiT coil "
+            "maps written by scripts/precompute_m4raw_coil_maps.py, one "
+            "<patient>_<contrast>.pt per repetition group, estimated from the "
+            "phase-aligned mean of every repetition. When set, every subject on "
+            "both splits carries `sensitivity_complex`/`sensitivity` from that "
+            "file, `nullspace_r2r` splits with it instead of running ESPIRiT per "
+            "load, and a declared `espirit_sensitivity` transform only checks it. "
+            "A file whose slice count, coil count, matrix size or calibration "
+            "(acs 24, kernel 6, threshold 0.95) differs raises. Needs "
+            "coils.processing_mode: none."
+        ),
+    )
+    coil_maps_missing: Literal["raise", "estimate"] = Field(
+        default="raise",
+        description=(
+            "Read only with data.coil_maps_root: what a group whose map file does "
+            "not exist does. 'raise' (default) stops the run, so an unpopulated "
+            "cache cannot hide behind a silent recompute; 'estimate' runs the same "
+            "recipe in the loader (0.8-2.3 s per slice, per load) and logs the "
+            "first miss once per worker. A file that exists but mismatches raises "
+            "under either."
+        ),
+    )
+    coil_maps_recipe: Literal["all_reps_mean", "input_repetition"] = Field(
+        default="all_reps_mean",
+        description=(
+            "Read only with data.coil_maps_root: which repetitions the stored maps "
+            "were estimated from. 'all_reps_mean' (default; every file written "
+            "before the recipe was recorded) is the phase-aligned mean of every "
+            "repetition. 'input_repetition' is the repetition served as `input` "
+            "alone, for an arm graded against the leave-one-out mean of the others, "
+            "whose maps must not be estimated from that reference. A file written "
+            "with the other recipe raises; scripts/precompute_m4raw_coil_maps.py "
+            "--recipe writes either."
+        ),
+    )
+    coil_maps_acs_size: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Read only with data.coil_maps_root: the ESPIRiT ACS width the stored "
+            "maps were estimated with (precompute --acs-size). Unset keeps the "
+            "per-scan default (24). Set it to the masked input's ACS band "
+            "(round(W * center_fraction)) so the stored maps equal what ESPIRiT on "
+            "the masked input would return. A file with another width raises."
+        ),
+    )
+    coil_maps_reference_root: str | None = Field(
+        default=None,
+        description=(
+            "M4Raw single-contrast route only. A coil-map store (all-repetitions "
+            "recipe, per-scan default calibration) whose maps are published on the "
+            "VALIDATION split only, under `reference_sensitivity_complex`, for the "
+            "SENSE image metrics (sense_psnr, sense_ssim, the sense_magnitude "
+            "transform) to combine with, so arms that train on different maps are "
+            "scored on one map set (#2664). No operator, loss or training input "
+            "reads that key: maps averaged over every repetition contain the "
+            "leave-one-out reference (#2510). A missing or mismatched file raises."
+        ),
+    )
+    noise_fit_support_policy: Literal["band", "acs"] = Field(
+        default="band",
+        description=(
+            "Which phase-encode columns the per-scan Sigma_n fit uses (the "
+            "self-calibrated r2r draw, and the self-calibrated nullspace_r2r "
+            "whitener; read only there). 'band' (default) requires one contiguous "
+            "band and raises on anything else, because scattered undersampling "
+            "aliases signal into the coil null space (2-5x the true trace, "
+            "measured). 'acs' fits a non-band support on its contiguous run "
+            "through the k-space centre, corrects by that run's fraction, and "
+            "logs the leak bound mean|d s_hat|/f_ACS from the maps (PAPER.md "
+            "Proposition 14). A band is fitted whole under either."
+        ),
+    )
+    noise_covariance_root: str | None = Field(
+        default=None,
+        description=(
+            "M4Raw, where a per-scan Sigma_n is fitted (see noise_fit_support_policy): "
+            "directory holding noise_covariance.json from "
+            "scripts/precompute_m4raw_noise_covariance.py. The loader reads each group's "
+            "Sigma_n from it instead of fitting it in every DataLoader worker (#3117). A "
+            "store fitted with another support policy, slice window or calibration raises."
+        ),
+    )
+    noise_covariance_missing: Literal["raise", "fit"] = Field(
+        default="raise",
+        description=(
+            "Read only with data.noise_covariance_root: what a group absent from the "
+            "store does. 'raise' (default) stops the run; 'fit' runs the loader's own fit."
         ),
     )
     nex_target_exclude_input: bool = Field(
@@ -3558,6 +4071,80 @@ class DataConfigSchema(BaseModel):
             "average over two reference definitions and the paper must say so."
         ),
     )
+    nex_registration: Literal["none", "translation"] = Field(
+        default="none",
+        description=(
+            "M4Raw: register the repetitions of a group onto the input repetition "
+            "before the NEX target is averaged from them (#2849). 'translation' "
+            "estimates one in-plane shift per repetition from the group's central "
+            "slices and undoes it as a k-space phase ramp, so subject motion "
+            "between repetitions does not superpose shifted images in the target "
+            "(on the kspace_filling manifests 25 of 60 groups moved more than "
+            "0.5 px). 'none' (default) averages them as acquired. Through-plane "
+            "motion and rotation are not corrected."
+        ),
+    )
+    nex_shift_root: str | None = Field(
+        default=None,
+        description=(
+            "M4Raw, with nex_registration 'translation': directory holding nex_shifts.json "
+            "from scripts/precompute_m4raw_nex_shifts.py. The loader reads each group's "
+            "shifts from it instead of estimating them in every DataLoader worker, every "
+            "epoch (#2977). A store made with another window or upsampling raises."
+        ),
+    )
+    nex_shifts_missing: Literal["raise", "estimate"] = Field(
+        default="raise",
+        description=(
+            "Read only with data.nex_shift_root: what a group absent from the store does. "
+            "'raise' (default) stops the run; 'estimate' runs the loader's own estimate."
+        ),
+    )
+    input_repetition: Literal["first", "random"] = Field(
+        default="first",
+        description=(
+            "M4Raw, training split only: which acquired repetition is the model "
+            "input. 'first' (default) serves repetition 0 as the loader always "
+            "has. 'random' draws one loaded repetition per sample (a private "
+            "generator seeded from torch.initial_seed(), so ranks, workers and "
+            "epochs draw independently and no global RNG is consumed), and the "
+            "phase_aligned_mean target, still the mean over ALL repetitions, is "
+            "aligned to the drawn repetition's phase frame. The validation split "
+            "always serves repetition 0, so scores stay comparable. Requires "
+            "dataset_type 'm4raw', target_mode 'phase_aligned_mean', "
+            "pairing.single_contrast true, repetitions loaded, no leave-one-out "
+            "target and no coil maps; anything else raises."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _random_input_repetition_is_honoured(self) -> "DataConfigSchema":
+        """``input_repetition: random`` must reach a loader that rotates the input.
+
+        Every refused combination is one where the M4Raw loader would serve
+        repetition 0 anyway or leave another quantity in repetition 0's frame, so
+        the knob would sit in the YAML unread (non-negotiable 8).
+        """
+        if self.input_repetition != "random":
+            return self
+        reasons = []
+        if self.dataset_type != "m4raw":
+            reasons.append(f"dataset_type={self.dataset_type!r} has one acquisition per slice")
+        if self.target_mode != "phase_aligned_mean":
+            reasons.append(f"target_mode={self.target_mode!r} is not phase_aligned_mean")
+        if self.use_repetitions is False:
+            reasons.append("use_repetitions: false loads repetition 0 only")
+        if not self.pairing.single_contrast:
+            reasons.append("the cross-contrast route serves repetition 0 of each contrast")
+        if self.nex_target_exclude_input:
+            reasons.append("the leave-one-out target excludes repetition 0, not the drawn input")
+        if self.coil_maps_root is not None or self.coil_maps_reference_root is not None:
+            reasons.append("coil maps sit in repetition 0's coil phase frame")
+        if reasons:
+            raise ValueError(
+                "data.input_repetition: random is unread here: " + "; ".join(reasons) + "."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -3569,6 +4156,42 @@ class DataConfigSchema(BaseModel):
         never made (CLAUDE.md non-negotiable 8).
         """
         if isinstance(data, dict):
+            mode = data.get("target_mode")
+            if mode != "r2r" and "r2r_covariance_source" in data:
+                raise ValueError(
+                    "data.r2r_covariance_source is read only under "
+                    "data.target_mode='r2r' (it selects the Sigma_n that mode "
+                    f"draws from); declaring it with target_mode={mode!r} states a "
+                    "calibration choice nothing acts on (non-negotiable 8). Remove "
+                    "it, or set target_mode: r2r."
+                )
+            if mode != "r2r" and "r2r_alpha" in data:
+                raise ValueError(
+                    "data.r2r_alpha is read only under data.target_mode='r2r' (it "
+                    "scales the recorruption that mode draws); declaring it with "
+                    f"target_mode={mode!r} advertises a choice that is never made "
+                    "(CLAUDE.md non-negotiable 8). Drop it, or select 'r2r'."
+                )
+            for knob in ("r2r_split_angle_deg", "r2r_whitening"):
+                if mode != "nullspace_r2r" and knob in data:
+                    raise ValueError(
+                        f"data.{knob} is read only under data.target_mode="
+                        f"'nullspace_r2r' (it shapes that mode's coil split); "
+                        f"declaring it with target_mode={mode!r} advertises a "
+                        "choice that is never made (non-negotiable 8). Drop it, "
+                        "or select 'nullspace_r2r'."
+                    )
+            if mode in ("r2r", "nullspace_r2r") and data.get("val_target_mode") is None:
+                raise ValueError(
+                    f"data.target_mode={mode!r} builds a FRESH random split on every "
+                    "__getitem__, so a validation target in that mode is a different "
+                    "random image each epoch: PSNR against it measures the draw, "
+                    "not the model, and best-checkpoint selection would keep the "
+                    "luckiest epoch rather than the best one. Declare "
+                    "data.val_target_mode (e.g. 'phase_aligned_mean') to give the "
+                    "validation split a fixed reference; the split stays on the "
+                    "training split, which is the only split that needs it."
+                )
             if data.get("target_mode") == "rep_pair" and not data.get(
                 "nex_target_exclude_input", False
             ):
@@ -3588,6 +4211,56 @@ class DataConfigSchema(BaseModel):
         return data
 
     @model_validator(mode="after")
+    def _r2r_requires_a_linear_path_to_the_loss(self) -> "DataConfigSchema":
+        """R2R decorrelation survives linear maps only.
+
+        ``Cov(A a, A b) = A Cov(a, b) A^H``, so the identity
+        ``Cov(input, target) = 0`` that makes the L1/L2 minimiser the CLEAN image
+        is preserved by every linear stage between injection and loss -- the
+        percentile divide (one scalar per subject, applied to both halves),
+        ``ifft2c`` (unitary), channel interleaving. It is destroyed by a
+        nonlinearity, and destroyed SILENTLY: training converges, the loss falls,
+        and the network has learned the wrong fixed point.
+
+        Two stages in this pipeline are nonlinear, so under ``r2r`` both raise
+        rather than degrade (CLAUDE.md non-negotiable 3):
+
+        * ``coils.processing_mode`` other than ``none``. ``rss`` computes
+          ``|I|_rss * exp(j*angle(I_ref))`` -- phase-preserving, but the MODULUS
+          is nonlinear. It maps Gaussian to Rician, so ``E[|target|] != |x|``.
+          ``magnitude``/``rss_image`` are worse, ``svd`` fits its basis to the
+          data so it is not a fixed linear map either.
+        * ``processing.enable_log_scaling``. ``log1p`` on magnitude is nonlinear.
+
+        ``nullspace_r2r`` is held to the same two, and for a second reason on
+        the first: it splits the PHYSICAL coil vector, which a combine removes.
+        """
+        if self.target_mode not in ("r2r", "nullspace_r2r"):
+            return self
+        if self.coils.processing_mode != "none":
+            raise ValueError(
+                f"data.target_mode={self.target_mode!r} requires "
+                "data.coils.processing_mode='none', "
+                f"got {self.coils.processing_mode!r}. R2R decorrelates the two "
+                "halves in the second moment, which survives LINEAR maps only; a "
+                "coil combine that takes a magnitude turns the Gaussian residual "
+                "Rician, so E[target] is no longer the clean image and the trained "
+                "fixed point is wrong. Nothing downstream can detect this -- the "
+                "loss still falls. Serve the coils uncombined (4 coils -> 8 "
+                "interleaved real channels for M4Raw)."
+            )
+        if self.processing.enable_log_scaling:
+            raise ValueError(
+                f"data.target_mode={self.target_mode!r} is incompatible with "
+                "data.processing.enable_log_scaling=True: log1p on magnitude is "
+                "nonlinear, so it breaks the R2R decorrelation the same way a "
+                "magnitude coil combine does. The percentile divide alone is safe "
+                "(one scalar per subject, applied to both halves, and a common "
+                "scalar divides out of the covariance)."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _slice_level_records_is_read_by_m4raw_only(self) -> "DataConfigSchema":
         """``slice_level_records`` is consumed only by the m4raw route.
 
@@ -3604,6 +4277,162 @@ class DataConfigSchema(BaseModel):
                 "set dataset_type: m4raw."
             )
         return self
+
+    @model_validator(mode="after")
+    def _nex_shift_knobs_are_read(self) -> "DataConfigSchema":
+        """The shift store is read only by a registering run, and its policy only with a store."""
+        if self.nex_shift_root is not None and self.nex_registration == "none":
+            raise ValueError(
+                "data.nex_shift_root holds registration shifts and data.nex_registration is "
+                "'none'; nothing would read them. Declare nex_registration: translation."
+            )
+        if "nex_shifts_missing" in self.model_fields_set and self.nex_shift_root is None:
+            raise ValueError(
+                "data.nex_shifts_missing is read only with data.nex_shift_root; without a "
+                "store there is no entry to be missing."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _coil_map_knobs_are_read(self) -> "DataConfigSchema":
+        """The precomputed-map and noise-fit knobs, refused where nothing reads them.
+
+        ``coil_maps_root`` is read by the m4raw single-contrast loader over the
+        physical coils; ``coil_maps_missing`` only with a root; the support
+        policy only where a per-scan Sigma_n is fitted (non-negotiable 8).
+        """
+        if "coil_maps_missing" in self.model_fields_set and self.coil_maps_root is None:
+            raise ValueError(
+                "data.coil_maps_missing is read only with data.coil_maps_root; "
+                "without a map directory there is no file to be missing."
+            )
+        stray = self.model_fields_set & {"coil_maps_recipe", "coil_maps_acs_size"}
+        if stray and self.coil_maps_root is None:
+            raise ValueError(
+                f"data.{sorted(stray)[0]} is read only with data.coil_maps_root; it "
+                "describes the stored maps, and without a map directory there are none."
+            )
+        on_cross_route = self.dataset_type == "m4raw" and not self.pairing.single_contrast
+        declared = self.pairing.model_fields_set & {"cross_contrast_source", "cross_contrast_targets"}
+        if declared and not on_cross_route:
+            raise ValueError(
+                f"data.pairing.{sorted(declared)[0]} is read only by the m4raw "
+                "cross-contrast route (dataset_type: m4raw, single_contrast: false)."
+            )
+        targets = self.pairing.cross_contrast_targets
+        if targets is not None and (not targets or self.pairing.cross_contrast_source in targets):
+            raise ValueError(
+                f"data.pairing.cross_contrast_targets={targets!r} must be non-empty and "
+                f"exclude cross_contrast_source={self.pairing.cross_contrast_source!r}."
+            )
+        if self.pairing.source_layout != "stacked" and (
+            self.dataset_type != "m4raw" or self.pairing.single_contrast
+        ):
+            raise ValueError(
+                "data.pairing.source_layout is read only by the m4raw cross-contrast "
+                f"route (dataset_type={self.dataset_type!r}, "
+                f"single_contrast={self.pairing.single_contrast!r})."
+            )
+        if self.coil_maps_reference_root is not None and (
+            self.dataset_type != "m4raw"
+            or not self.pairing.single_contrast
+            or self.coils.processing_mode != "none"
+        ):
+            raise ValueError(
+                "data.coil_maps_reference_root holds maps of the PHYSICAL coils and is "
+                "read only by the m4raw single-contrast route with coils.processing_mode: "
+                f"none (dataset_type={self.dataset_type!r}, single_contrast="
+                f"{self.pairing.single_contrast!r}, processing_mode="
+                f"{self.coils.processing_mode!r})."
+            )
+        if self.coil_maps_root is not None:
+            if self.dataset_type != "m4raw" or not self.pairing.single_contrast:
+                raise ValueError(
+                    "data.coil_maps_root is read only by the m4raw single-contrast "
+                    f"route (dataset_type={self.dataset_type!r}, "
+                    f"single_contrast={self.pairing.single_contrast!r})."
+                )
+            if self.coils.processing_mode != "none":
+                raise ValueError(
+                    "data.coil_maps_root holds maps of the PHYSICAL coils; "
+                    f"coils.processing_mode={self.coils.processing_mode!r} would serve "
+                    "a different array. Set processing_mode: none."
+                )
+        fits_sigma = (
+            self.target_mode == "r2r" and self.r2r_covariance_source == "self_calibrated"
+        ) or (self.target_mode == "nullspace_r2r" and self.r2r_whitening == "self_calibrated")
+        if "noise_fit_support_policy" in self.model_fields_set and not fits_sigma:
+            raise ValueError(
+                "data.noise_fit_support_policy is read only where a per-scan Sigma_n is "
+                "fitted (target_mode r2r with r2r_covariance_source: self_calibrated, "
+                "or nullspace_r2r with r2r_whitening: self_calibrated)."
+            )
+        if self.noise_covariance_root is not None and not fits_sigma:
+            raise ValueError(
+                "data.noise_covariance_root holds per-scan Sigma_n fits and nothing here "
+                "fits one (target_mode r2r with r2r_covariance_source: self_calibrated, "
+                "or nullspace_r2r with r2r_whitening: self_calibrated)."
+            )
+        if "noise_covariance_missing" in self.model_fields_set and self.noise_covariance_root is None:
+            raise ValueError(
+                "data.noise_covariance_missing is read only with data.noise_covariance_root; "
+                "without a store there is no entry to be missing."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _emit_alternate_input_needs_a_second_repetition(self) -> "DataConfigSchema":
+        """``emit_alternate_input`` is read by an m4raw split with an averaging target.
+
+        It publishes repetition 1, so it needs repetitions loaded; and only an
+        averaging target (on either split) ever emits it, so any other
+        combination would leave the knob unread (non-negotiable 8).
+        """
+        if not self.emit_alternate_input:
+            return self
+        averaging = {"complex_mean", "phase_aligned_mean"}
+        served = {self.target_mode, self.val_target_mode or self.target_mode}
+        if self.dataset_type != "m4raw":
+            reason = f"dataset_type={self.dataset_type!r} never builds it"
+        elif self.use_repetitions is False:
+            reason = "use_repetitions: false loads only the first repetition"
+        elif not served & averaging:
+            reason = (
+                f"neither split averages repetitions (target_mode={self.target_mode!r}, "
+                f"val_target_mode={self.val_target_mode!r}), and only an averaging "
+                "split publishes input_alt"
+            )
+        else:
+            return self
+        raise ValueError(f"data.emit_alternate_input: true is unread here: {reason}.")
+
+    @model_validator(mode="after")
+    def _n2n_pairing_matches_its_target(self) -> "DataConfigSchema":
+        """``n2n_pairing`` is read by the m4raw single-contrast route, and each
+        pairing names the training ``target_mode`` that builds what it draws from."""
+        if self.n2n_pairing is None:
+            return self
+        required = {
+            "random_pair": {"rep_pair"},
+            "one_vs_rest_mean": {"phase_aligned_mean"},
+            "ordered": {"r2r", "nullspace_r2r"},
+        }[self.n2n_pairing]
+        if self.dataset_type != "m4raw":
+            reason = f"dataset_type={self.dataset_type!r} never publishes a repetition stack"
+        elif self.use_repetitions is False:
+            reason = "use_repetitions: false loads only the first repetition"
+        elif not self.pairing.single_contrast:
+            reason = "only the single-contrast route publishes the stack"
+        elif self.target_mode not in required:
+            reason = (
+                f"target_mode={self.target_mode!r}, but {self.n2n_pairing!r} draws from "
+                f"what target_mode in {sorted(required)} builds"
+            )
+        elif self.n2n_pairing == "one_vs_rest_mean" and not self.nex_target_exclude_input:
+            reason = "the mean of the OTHER repetitions needs nex_target_exclude_input: true"
+        else:
+            return self
+        raise ValueError(f"data.n2n_pairing={self.n2n_pairing!r} is invalid here: {reason}.")
 
     # [ARCHITECT ADD] Explicit Data Range (for Metrics)
 
@@ -3626,7 +4455,9 @@ class DataConfigSchema(BaseModel):
         description=(
             "Opt-in: enable per-sample contrast-id conditioning so a single "
             "model can handle T1/T2/FLAIR/PD by reading a `contrast_idx` "
-            "tensor on every batch. Requires `model.model_type` to declare "
+            "tensor on every batch. Requires every model the batch reaches "
+            "-- `model.model_type` and, when declared, "
+            "`model.discriminator_component.name` -- to declare "
             "`supports_contrast_conditioning=True`; the Tier-1 audit check "
             "`multi_contrast_model_support` enforces this. Datasets that "
             "expose contrast metadata (M4Raw, slice, contrast_aware_paired) "
@@ -3971,6 +4802,33 @@ class DataConfigSchema(BaseModel):
             ValueError: If required companion fields are missing.
         """
         strategy = self.split.type
+        if self.enable_test_split and not (
+            self.source.test_index_path or self.source.paired_manifest_path
+        ):
+            raise ValueError(
+                "data.enable_test_split: true declares a held-out test split, but there is no "
+                "route for it: set data.source.test_index_path, or a paired_manifest_path whose "
+                "partition the config owns (split.type 'random' or 'loso_subject')."
+            )
+        val_ids = set(self.split.val_subjects or [])
+        test_ids = set(self.split.test_subjects or [])
+        if strategy == "subjects" and not (val_ids or test_ids):
+            raise ValueError(
+                "split.type='subjects' requires split.val_subjects and/or split.test_subjects; "
+                "with neither, every subject would land in training."
+            )
+        if val_ids & test_ids:
+            raise ValueError(
+                f"split.val_subjects and split.test_subjects overlap on {sorted(val_ids & test_ids)}: "
+                "a subject in both splits leaks the held-out test set into validation."
+            )
+        if val_ids and strategy != "subjects":
+            raise ValueError("split.val_subjects is only read under split.type='subjects'.")
+        if test_ids and strategy not in ("subjects", "loso_subject"):
+            raise ValueError(
+                "split.test_subjects is only read under split.type='subjects' or 'loso_subject'."
+            )
+        strategy = self.split.type
         if strategy == "loso_subject" and (self.split.holdout_subject is None) == (
             self.split.loso_fold is None
         ):
@@ -4038,15 +4896,14 @@ class DataConfigSchema(BaseModel):
 
         - ``train``: sampler=uniform, samples_per_volume from
           ``self.sampling.samples_per_volume``, queue_length from
-          ``self.sampling.queue_length``, shuffle=True, augmentation from
-          ``self.augmentation.enabled``.
+          ``self.sampling.queue_length``, shuffle=True.
         - ``val``:   sampler from ``self.use_queue_for_validation``
-          (True → uniform, False → full), shuffle=False,
-          augmentation_enabled=False.
-        - ``infer``: sampler=full, shuffle=False,
-          augmentation_enabled=False.
-        - ``eval``:  sampler=full, shuffle=False,
-          augmentation_enabled=False, role=clean_reference.
+          (True → uniform, False → full), shuffle=False.
+        - ``infer``: sampler=full, shuffle=False.
+        - ``eval``:  sampler=full, shuffle=False, role=clean_reference.
+
+        Augmentation is not a per-mode setting: ``data.augmentation.enabled``
+        gates the train chain, and the val chain builds none.
 
         A user-supplied ``data.modes.<mode>`` block wins entirely —
         the validator never merges partial overrides; if you declare
@@ -4083,7 +4940,6 @@ class DataConfigSchema(BaseModel):
                     queue_length=self.sampling.queue_length,
                     shuffle=True,
                 ),
-                augmentation_enabled=bool(self.augmentation.enabled),
             )
 
         if derived_val is None:
@@ -4102,19 +4958,16 @@ class DataConfigSchema(BaseModel):
                     queue_length=self.sampling.queue_length,
                     shuffle=False,
                 ),
-                augmentation_enabled=False,
             )
 
         if derived_infer is None:
             derived_infer = ModeConfigSchema(
                 sampler=ModeSamplerSchema(type="full", shuffle=False),
-                augmentation_enabled=False,
             )
 
         if derived_eval is None:
             derived_eval = ModeConfigSchema(
                 sampler=ModeSamplerSchema(type="full", shuffle=False),
-                augmentation_enabled=False,
                 role="clean_reference",
             )
 
@@ -4147,7 +5000,7 @@ class DataConfigSchema(BaseModel):
         Returns:
             The fully resolved :class:`ModeConfigSchema` for that mode.
         """
-        cfg = getattr(self.modes, mode, None)
+        cfg: ModeConfigSchema | None = getattr(self.modes, mode, None)
         if cfg is None:
             # Should be unreachable after derive_modes_from_legacy runs.
             # Surface loudly if invariant breaks (CLAUDE.md #9).

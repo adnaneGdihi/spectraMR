@@ -51,11 +51,10 @@ def _validate_training_mode_dispatchable(config: dict[str, Any]) -> list[str]:
     """`training.training_mode` must name a strategy the factory can resolve.
 
     This is the SSOT for training-mode *existence*. It lives here, rather than
-    beside the objective-constraint rule in ``config/schemas/validator_registry``,
-    because the answer is owned by ``STRATEGY_CLASS_PATHS`` in ``infrastructure/``
+    in ``config/schemas/validator_registry``, because the answer is owned by ``STRATEGY_CLASS_PATHS`` in ``infrastructure/``
     and ``config/`` may not import ``infrastructure/`` (non-negotiable #5).
 
-    Previously existence rode on membership of ``TRAINING_MODE_CONSTRAINTS``, a
+    Previously existence rode on membership of ``TRAINING_MODE_CONSTRAINTS`` (since deleted), a
     hand-maintained copy that had drifted 90 keys behind the dispatch table --
     so real configs (``physics_driven``, ``cyclegan``, ``meta_learning``) were
     rejected as "Unknown training mode" while genuinely-undispatchable ones

@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import torch.nn.functional as F  # noqa: E402, N812
+import torch.nn.functional as F  # noqa: E402
 
 from spectramr.models.losses.elementary import (  # noqa: E402
     resolve_elementary_loss,

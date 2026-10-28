@@ -8,11 +8,60 @@ Metrics can be optionally computed during loss calculation by setting
 `compute_metrics=True` in the constructor.
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
 from spectramr.models.losses.metrics_aware_loss import MetricsAwareLossMixin
 from spectramr.models.losses.registry import register_loss
+
+#: VGG19 ``features`` index of each ReLU output, shared by every extractor here.
+VGG19_RELU_INDICES: dict[str, int] = {
+    "relu1_1": 1,
+    "relu1_2": 3,
+    "relu2_1": 6,
+    "relu2_2": 8,
+    "relu3_1": 11,
+    "relu3_2": 13,
+    "relu3_3": 15,
+    "relu3_4": 17,
+    "relu4_1": 20,
+    "relu4_2": 22,
+    "relu4_3": 24,
+    "relu4_4": 26,
+    "relu5_1": 29,
+    "relu5_2": 31,
+    "relu5_3": 33,
+    "relu5_4": 35,
+}
+
+
+def rss_magnitude(x: torch.Tensor) -> torch.Tensor:
+    """Root-sum-of-squares magnitude over the channel axis, kept as one channel.
+
+    A real ``[B, C, ...]`` input with even ``C`` is read as interleaved
+    ``[R1, I1, R2, I2, ...]``; a complex input is used as is. ``vector_norm`` is
+    used rather than ``sqrt(sum(|z|**2))`` because its gradient at an all-zero
+    pixel is zero, where the square root's is NaN.
+    """
+    if x.is_complex():
+        mag: torch.Tensor = torch.linalg.vector_norm(x, dim=1, keepdim=True)
+        return mag
+    b, c = x.shape[:2]
+    pairs = x.reshape(b, c // 2, 2, *x.shape[2:])
+    mag = torch.linalg.vector_norm(pairs, dim=(1, 2))
+    return mag.unsqueeze(1)
+
+
+def _check_layer_names(names: Any, owner: str) -> None:
+    """Raise on a VGG19 layer name the index table does not know."""
+    unknown = sorted(set(names) - set(VGG19_RELU_INDICES))
+    if unknown:
+        raise ValueError(
+            f"{owner}: unknown VGG19 layer(s) {unknown}; expected names from "
+            f"{sorted(VGG19_RELU_INDICES)}."
+        )
 
 
 @register_loss(name="perceptual", aliases=["PerceptualLoss", "vgg", "content"], domain="image")
@@ -29,6 +78,9 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
     .. math::
 
         \mathcal{L}_{Perceptual} = \sum_l w_l \| \Phi_l(\hat{y}) - \Phi_l(y) \|_2^2"""
+
+    mean: torch.Tensor
+    std: torch.Tensor
 
     def __init__(
         self,
@@ -49,7 +101,7 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
             compute_metrics: Whether to compute metrics during forward pass.
         """
         try:
-            from torchvision import models
+            from torchvision import models  # type: ignore[import-untyped]
         except (ImportError, RuntimeError) as exc:  # pragma: no cover
             raise ImportError(
                 "PerceptualLoss requires torchvision, which is a core dependency "
@@ -66,11 +118,14 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
 
         if layer_weights is None:
             layer_weights = {"relu5_4": 1.0}
+        # An unknown name would contribute nothing and train the term at zero.
+        _check_layer_names(layer_weights, "PerceptualLoss")
         self.layer_weights = layer_weights
         self.use_input_norm = use_input_norm
         self.range_norm = range_norm
         self.compute_metrics_flag = compute_metrics
 
+        self.criterion: nn.Module
         if criterion == "l1":
             self.criterion = nn.L1Loss()
         elif criterion == "mse":
@@ -99,31 +154,7 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        # Map layer names to indices
-        # VGG19 features structure:
-        # 0: conv1_1, 1: relu1_1
-        # ...
-        # 34: conv5_4, 35: relu5_4
-        # We need to find the indices for requested layers
-        # VGG19 relu layer indices (complete mapping for all 16 relu activations)
-        self.layer_indices = {
-            "relu1_1": 1,
-            "relu1_2": 3,
-            "relu2_1": 6,
-            "relu2_2": 8,
-            "relu3_1": 11,
-            "relu3_2": 13,
-            "relu3_3": 15,
-            "relu3_4": 17,
-            "relu4_1": 20,
-            "relu4_2": 22,
-            "relu4_3": 24,
-            "relu4_4": 26,
-            "relu5_1": 29,
-            "relu5_2": 31,
-            "relu5_3": 33,
-            "relu5_4": 35,
-        }
+        self.layer_indices = dict(VGG19_RELU_INDICES)
 
     def forward(
         self, x: torch.Tensor, y: torch.Tensor
@@ -156,21 +187,10 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
             y = (y + 1) / 2
 
         # Auto-detect complex multi-channel input [B, C, H, W] where C is even
-        if x.shape[1] % 2 == 0 and not x.is_complex():
-            B, C, H, W = x.shape
-            x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            x_complex = torch.view_as_complex(x_reshaped).permute(0, 3, 1, 2)
-            x = torch.sqrt(torch.sum(x_complex.abs() ** 2, dim=1, keepdim=True))
-        elif x.is_complex():
-            x = torch.sqrt(torch.sum(x.abs() ** 2, dim=1, keepdim=True))
-
-        if y.shape[1] % 2 == 0 and not y.is_complex():
-            B, C, H, W = y.shape
-            y_reshaped = y.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            y_complex = torch.view_as_complex(y_reshaped).permute(0, 3, 1, 2)
-            y = torch.sqrt(torch.sum(y_complex.abs() ** 2, dim=1, keepdim=True))
-        elif y.is_complex():
-            y = torch.sqrt(torch.sum(y.abs() ** 2, dim=1, keepdim=True))
+        if x.is_complex() or x.shape[1] % 2 == 0:
+            x = rss_magnitude(x)
+        if y.is_complex() or y.shape[1] % 2 == 0:
+            y = rss_magnitude(y)
 
         # Handle grayscale (1 channel) -> RGB (3 channels)
         if x.shape[1] == 1:
@@ -187,7 +207,9 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
         # the term vanish on exactly the batches that carried it, and the run
         # continued with a corrupted model (2026-09-03, non-negotiable 3).
         if not torch.isfinite(x).all():
-            raise ValueError("PerceptualLoss: non-finite values in the prediction after normalisation.")
+            raise ValueError(
+                "PerceptualLoss: non-finite values in the prediction after normalisation."
+            )
         if not torch.isfinite(y).all():
             raise ValueError("PerceptualLoss: non-finite values in the target after normalisation.")
 
@@ -209,22 +231,16 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
         return loss
 
     def _extract_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Extract features from VGG layers."""
-        features = {}
-        for name, layer in self.vgg_layers._modules.items():
+        """Extract the requested layers, running VGG only as deep as the last one."""
+        wanted = {self.layer_indices[name]: name for name in self.layer_weights}
+        last = max(wanted)
+        features: dict[str, torch.Tensor] = {}
+        for idx, layer in enumerate(self.vgg_layers):
             x = layer(x)
-            # Check if this layer corresponds to one we need
-            # The names in _modules are usually '0', '1', etc.
-            # We map indices to our names
-            idx = int(name)
-            for key, val in self.layer_indices.items():
-                if val == idx:
-                    features[key] = x
-
-            # Stop if we went past the last layer we need
-            if idx > max(self.layer_indices.values()):
+            if idx in wanted:
+                features[wanted[idx]] = x
+            if idx >= last:
                 break
-
         return features
 
     def compute_metrics(
@@ -232,7 +248,7 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute perceptual-specific metrics.
 
@@ -274,38 +290,33 @@ class PerceptualLoss(MetricsAwareLossMixin, nn.Module):
     def forward_to_layers(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
         """Extract features at specified layers.
 
+        One pass through VGG serves every requested layer; restarting at layer 0
+        per name would feed a later layer's activations back into ``conv1_1``.
+
         Args:
             x: Input tensor
 
         Returns:
             Dictionary mapping layer names to feature tensors
         """
-        features = {}
-
         # Normalize input
         if self.range_norm:
             x = (x + 1) / 2
         if self.use_input_norm:
             x = (x - self.mean) / self.std
 
-        # Pass through VGG layers
         with torch.no_grad():
-            for layer_name in self.layer_weights.keys():
-                layer_idx = self.layer_indices.get(layer_name)
-                if layer_idx is not None:
-                    for i, layer in enumerate(self.vgg_layers):
-                        x = layer(x)
-                        if i == layer_idx:
-                            features[layer_name] = x.detach()
-                            break
-
-        return features
+            features = self._extract_features(x)
+        return {name: feat.detach() for name, feat in features.items()}
 
 
 class VGGFeatureExtractor(nn.Module):
     """VGG19 Feature Extractor for Perceptual Loss."""
 
-    def __init__(self, layers=None, use_input_norm=True):
+    mean: torch.Tensor
+    std: torch.Tensor
+
+    def __init__(self, layers: list[str] | None = None, use_input_norm: bool = True) -> None:
         """__init__.
 
         Args:
@@ -354,27 +365,9 @@ class VGGFeatureExtractor(nn.Module):
         # Default layers if None
         if layers is None:
             layers = ["relu1_1", "relu2_1", "relu3_1", "relu4_1", "relu5_1"]
+        _check_layer_names(layers, "VGGFeatureExtractor")
         self.output_layers = layers
-
-        # VGG19 relu layer indices (complete mapping for all 16 relu activations)
-        self.layer_indices = {
-            "relu1_1": 1,
-            "relu1_2": 3,
-            "relu2_1": 6,
-            "relu2_2": 8,
-            "relu3_1": 11,
-            "relu3_2": 13,
-            "relu3_3": 15,
-            "relu3_4": 17,
-            "relu4_1": 20,
-            "relu4_2": 22,
-            "relu4_3": 24,
-            "relu4_4": 26,  # etc
-            "relu5_1": 29,
-            "relu5_2": 31,
-            "relu5_3": 33,
-            "relu5_4": 35,
-        }
+        self.layer_indices = dict(VGG19_RELU_INDICES)
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """forward.
@@ -401,14 +394,17 @@ class VGGFeatureExtractor(nn.Module):
         if self.use_input_norm:
             x = (x - self.mean) / self.std
 
-        outputs = []
-        for name, layer in self.vgg_layers._modules.items():
+        # Outputs come back in network order, one per requested name; the layers
+        # past the deepest requested one are not evaluated.
+        wanted = [self.layer_indices[name] for name in self.output_layers]
+        last = max(wanted)
+        outputs: list[torch.Tensor] = []
+        for idx, layer in enumerate(self.vgg_layers):
             x = layer(x)
-            idx = int(name)
-            # Check if this index matches any requested layer
-            for out_name in self.output_layers:
-                if self.layer_indices.get(out_name) == idx:
-                    outputs.append(x)
+            for _ in range(wanted.count(idx)):
+                outputs.append(x)
+            if idx >= last:
+                break
         return outputs
 
 
@@ -420,7 +416,10 @@ class VGGPerceptualLoss(nn.Module):
     through sequential blocks, accumulating loss at each scale.
     """
 
-    def __init__(self, feature_layers: list[int] | None = None, use_l1: bool = True):
+    mean: torch.Tensor
+    std: torch.Tensor
+
+    def __init__(self, feature_layers: list[int] | None = None, use_l1: bool = True) -> None:
         """__init__.
 
         Args:
@@ -470,7 +469,7 @@ class VGGPerceptualLoss(nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def normalize(self, x):
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
         # Assume x is [0, 1] or similar scale.
         # If input is [-1, 1], shift first. We assume [0, 1] for now or handle outside.
         # PerceptualLoss standard behavior.
@@ -483,13 +482,8 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Any: Description.
         """
-        if x.shape[1] % 2 == 0 and not x.is_complex():
-            B, C, H, W = x.shape
-            x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            x_complex = torch.view_as_complex(x_reshaped).permute(0, 3, 1, 2)
-            x = torch.sqrt(torch.sum(x_complex.abs() ** 2, dim=1, keepdim=True))
-        elif x.is_complex():
-            x = torch.sqrt(torch.sum(x.abs() ** 2, dim=1, keepdim=True))
+        if x.is_complex() or x.shape[1] % 2 == 0:
+            x = rss_magnitude(x)
 
         # 1-channel to 3-channel
         if x.shape[1] == 1:
@@ -497,7 +491,7 @@ class VGGPerceptualLoss(nn.Module):
 
         return (x - self.mean) / self.std
 
-    def forward(self, pred, target):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """forward.
 
         Args:
@@ -556,6 +550,9 @@ class DISTS(nn.Module):
         - DISTS: Balances both simultaneously
     """
 
+    mean: torch.Tensor
+    std: torch.Tensor
+
     def __init__(self, backbone: str = "vgg19", requires_grad: bool = False):
         """Initialize DISTS loss.
 
@@ -610,7 +607,9 @@ class DISTS(nn.Module):
 
         self.num_layers = len(self.layer_names)
 
-    def _extract_features(self, x: torch.Tensor, layers: list | None = None) -> list:
+    def _extract_features(
+        self, x: torch.Tensor, layers: list[int] | None = None
+    ) -> list[torch.Tensor]:
         """Extract multi-scale features from VGG.
 
         Args:
@@ -629,10 +628,10 @@ class DISTS(nn.Module):
 
         x = (x - self.mean) / self.std
 
-        features = []
+        features: list[torch.Tensor] = []
         layer_idx = 0
 
-        for name, module in self.features.named_children():
+        for module in self.features.children():
             x = module(x)
 
             # Collect at specific ReLU layers
@@ -648,7 +647,7 @@ class DISTS(nn.Module):
         x_pred: torch.Tensor,
         x_target: torch.Tensor,
         return_components: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute DISTS loss.
 
         Args:
@@ -675,21 +674,10 @@ class DISTS(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Ensure RGB
         # Auto-detect complex multi-channel input [B, C, H, W] where C is even
-        if x_pred.shape[1] % 2 == 0 and not x_pred.is_complex():
-            B, C, H, W = x_pred.shape
-            x_reshaped = x_pred.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            x_complex = torch.view_as_complex(x_reshaped).permute(0, 3, 1, 2)
-            x_pred = torch.sqrt(torch.sum(x_complex.abs() ** 2, dim=1, keepdim=True))
-        elif x_pred.is_complex():
-            x_pred = torch.sqrt(torch.sum(x_pred.abs() ** 2, dim=1, keepdim=True))
-
-        if x_target.shape[1] % 2 == 0 and not x_target.is_complex():
-            B, C, H, W = x_target.shape
-            y_reshaped = x_target.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            y_complex = torch.view_as_complex(y_reshaped).permute(0, 3, 1, 2)
-            x_target = torch.sqrt(torch.sum(y_complex.abs() ** 2, dim=1, keepdim=True))
-        elif x_target.is_complex():
-            x_target = torch.sqrt(torch.sum(x_target.abs() ** 2, dim=1, keepdim=True))
+        if x_pred.is_complex() or x_pred.shape[1] % 2 == 0:
+            x_pred = rss_magnitude(x_pred)
+        if x_target.is_complex() or x_target.shape[1] % 2 == 0:
+            x_target = rss_magnitude(x_target)
 
         if x_pred.shape[1] == 1:
             x_pred = x_pred.repeat(1, 3, 1, 1)

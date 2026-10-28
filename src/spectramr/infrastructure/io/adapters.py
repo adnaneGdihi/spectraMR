@@ -94,7 +94,8 @@ def load_nifti(file_path: str | Path, slice_index: int | None = None) -> np.ndar
     """
     nibabel = get_nibabel()
     img = nibabel.load(str(file_path))
-    image = np.array(img.dataobj).astype(np.float32)
+    # np.array() passes copy= to the proxy's __array__, which nibabel does not accept under numpy 2.
+    image = np.asarray(img.dataobj, dtype=np.float32)
 
     # Select a single slice only when explicitly requested; otherwise serve the
     # whole volume (all slices) rather than silently collapsing to the middle one

@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.infrastructure.physics.forward_operator import (
-    DataConsistencyLayer,
+    MultiCoilDataConsistency,
     MultiCoilForwardOperator,
 )
 from spectramr.models.registry import register_model
@@ -261,7 +261,7 @@ class ManifoldConstrainedCM(nn.Module):
         self.sigma_max = sigma_max
 
         if forward_operator is not None:
-            self.dc_layer = DataConsistencyLayer(forward_operator, mode="hard")
+            self.dc_layer = MultiCoilDataConsistency(forward_operator, mode="hard")
         else:
             self.dc_layer = None
 

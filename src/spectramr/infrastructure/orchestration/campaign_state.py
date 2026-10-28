@@ -29,6 +29,8 @@ StatusType = Literal[
     "failed",
     "cancelled",
     "timeout",
+    # The job ended, but its run is mid-conversion; polled again until converted.
+    "conversion_pending",
 ]
 
 
@@ -60,6 +62,9 @@ class ExperimentStatus(BaseModel):
     output_dir: str | None = None
     checkpoint_path: str | None = None
     metrics_csv_path: str | None = None
+    #: ``validation_batches*.csv`` files (rank 0 first): one row per slice per
+    #: pass, the only validation source the evaluator pairs across arms (#2478).
+    slice_rows_paths: list[str] = Field(default_factory=list)
 
     # Sequential campaign support
     stage_group: str | None = Field(
@@ -108,6 +113,10 @@ class CampaignState(BaseModel):
     campaign_dir: str
     description: str = ""
     test_manifest: str = ""
+    # How this submission treated existing checkpoints: "resume", "fresh" or
+    # "default" (array arms chain under --prod, other arms start fresh). Empty
+    # on states written before the field existed.
+    resume_mode: Literal["", "resume", "fresh", "default"] = ""
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     last_updated: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -278,6 +287,7 @@ class CampaignState(BaseModel):
                 "failed": "❌",
                 "cancelled": "🚫",
                 "timeout": "⏰",
+                "conversion_pending": "⏸",
             }
             icon = status_icons.get(exp.status, "?")
             status_str = f"{icon} {exp.status}"
@@ -286,4 +296,8 @@ class CampaignState(BaseModel):
                 f"{exp.name:<40} {exp.role:<10} {status_str:<12} {job_str:<10} {psnr_str:<10}"
             )
 
+        held = [e for e in self.experiments if e.status == "conversion_pending"]
+        if held:
+            lines += ["", "Held until their checkpoint conversion finishes:"]
+            lines += [f"  {e.name}: {e.error_message}" for e in held]
         return "\n".join(lines)

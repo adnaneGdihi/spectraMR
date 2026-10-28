@@ -1,0 +1,26 @@
+{
+  "unit_id": "hyperfine_swoop_lumc",
+  "software_version": "unknown",
+  "ball_radius_mm": 100.0,
+  "center_mm": [0.0, 0.0, 0.0],
+  "pairs": [
+    {
+      "subject_id": "sub-01",
+      "sessions": [
+        "ses-01",
+        "ses-02"
+      ],
+      "omega": [
+        0.0,
+        0.0,
+        0.05
+      ],
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "residual_path": null
+    }
+  ]
+}

@@ -165,3 +165,74 @@ def test_image_dataset_has_no_authoritative_keys(tmp_path, monkeypatch) -> None:
         in_kspace_keys={"prediction"},
     )
     assert captured["authoritative_kspace_keys"] == set()
+
+
+# ── domain_exact: an image-domain model_input on a k-space loader (#3043) ──
+
+
+def _image_2ch() -> torch.Tensor:
+    """A smooth 2-channel (real, imag) image, as ``A^H y`` hands an image network."""
+    yy, xx = torch.meshgrid(torch.arange(64.0), torch.arange(64.0), indexing="ij")
+    img = torch.exp(-(((yy - 32) ** 2 + (xx - 32) ** 2) / 300)) * (1 + 0.3 * torch.sin(xx / 3))
+    return torch.stack([img, 0.2 * img]).unsqueeze(0)
+
+
+def test_domain_exact_skips_the_canonical_union(tmp_path, monkeypatch) -> None:
+    """An image network's ``model_input`` is not k-space even though the loader is."""
+    _set_targets_kspace(monkeypatch, True)
+    captured = _capture(monkeypatch)
+    _bare(tmp_path).save_debug_snapshot(
+        {"model_input": _image_2ch()},
+        step=0,
+        tag="ei_model_input",
+        in_kspace_keys=set(),
+        domain_exact=True,
+    )
+    assert captured["in_kspace_keys"] == set()
+    assert captured["authoritative_kspace_keys"] == set()
+
+
+def test_empty_set_without_domain_exact_still_unions_model_input(tmp_path, monkeypatch) -> None:
+    """EDM, flow matching, stochastic interpolants and the VF twin pass ``set()`` and
+    rely on the union: ``x_t`` lives in the target's domain."""
+    _set_targets_kspace(monkeypatch, True)
+    captured = _capture(monkeypatch)
+    _bare(tmp_path).save_debug_snapshot(
+        {"model_input": torch.zeros(1, 2, 8, 8)},
+        step=0,
+        tag="diffusion_step",
+        in_kspace_keys=set(),
+    )
+    assert "model_input" in captured["in_kspace_keys"]
+    assert "model_input" in captured["authoritative_kspace_keys"]
+
+
+def test_declared_domain_exact_reaches_the_wrapper_and_is_consumed(tmp_path, monkeypatch) -> None:
+    _set_targets_kspace(monkeypatch, True)
+    captured = _capture(monkeypatch)
+    s = _bare(tmp_path)
+    s.snapshot_prepared_is_model_input = False
+    s.snapshot_model_input_tag = "ei_model_input"
+    s._declared_model_input = None
+    s._model_input_snapshot_done = False
+    s._model_input_width = (2, "test")
+    s._model_input_contract_warned = False
+    s._declare_model_input(
+        {"model_input": _image_2ch()},
+        extra={"model_input_key": "model_input"},
+        in_kspace_keys=set(),
+        domain_exact=True,
+    )
+    s._snapshot_declared_model_input(step=1)
+    assert captured["authoritative_kspace_keys"] == set()
+    assert s._declared_domain_exact is False  # one step's declaration never leaks into the next
+
+
+def test_image_model_input_renders_as_an_image_not_a_dot() -> None:
+    """The planted violation: the union's output (authoritative IFFT of an image) is a
+    single pixel; the domain-exact output is the image."""
+    x = _image_2ch()
+    broken = ds_mod._render_image_preview(x, in_kspace=True, authoritative=True)
+    fixed = ds_mod._render_image_preview(x, in_kspace=False)
+    assert (broken > 0.5).float().mean() < 0.01
+    assert (fixed > 0.5).float().mean() > 0.10

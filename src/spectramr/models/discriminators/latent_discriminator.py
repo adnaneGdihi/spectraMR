@@ -12,7 +12,12 @@ from spectramr.models.interfaces.models import IDiscriminator
 from spectramr.models.registry import register_model
 
 
-@register_model(name="latent_discriminator", training_mode="gan")
+# Scores a latent VECTOR ([B, latent_dim]), not a signal: ``forward(self, z)``. ``latent``
+# is outside ``critic_domain.TRANSFORMABLE``, so an image/k-space generator paired with
+# this critic raises rather than transforming a latent.
+@register_model(
+    role="discriminator", name="latent_discriminator", training_mode="gan", input_domain="latent"
+)
 class LatentDiscriminator(IDiscriminator, nn.Module):
     """Discriminator for latent space in Latent GAN.
 

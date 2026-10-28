@@ -154,14 +154,28 @@ def check_parallel_strategy(*, settings: Any, target: str) -> None:
         f"initialized torch.distributed process group, and `spectramr profile` "
         f"launches a single process. The run would build the whole training "
         f"environment and then raise from _require_process_group.\n"
-        f"  Fix: profile a parallelism-off COPY of the arm — copy the YAML and "
-        f"set `parallel.strategy: none` (plus the matching sub-block flag, e.g. "
-        f"`fsdp.enabled: false`), then point --config at the copy.\n"
-        f"  Note `-O parallel.strategy=none` does NOT work: the override parser "
-        f"coerces the string 'none' to None before the field is known "
-        f"(issue #1480), so the copy has to be a real file.\n"
+        f"  Fix: pass --single-process, which profiles the arm with "
+        f"parallel.strategy=none and its {strategy} block disabled. The profile "
+        f"then measures one plain rank, not the {strategy} optimizer path.\n"
         f"  Strategies that profile as-is: none, dp."
     )
+
+
+def single_process_overrides(settings: Any) -> list[str]:
+    """The ``--override`` argv that turns the arm's parallelism off, or ``[]``.
+
+    Empty for a strategy that needs no process group, so the flag is safe on a
+    whole folder. The sub-block named like the strategy (``fsdp``, ``deepspeed``)
+    carries the ``enabled`` flag the schema requires to agree with ``strategy``.
+    """
+    parallel = getattr(settings, "parallel", None)
+    strategy = getattr(parallel, "strategy", None)
+    if strategy is None or strategy not in process_group_strategies():
+        return []
+    argv = ["--override", "parallel.strategy=none"]
+    if getattr(getattr(parallel, strategy, None), "enabled", False):
+        argv += ["--override", f"parallel.{strategy}.enabled=false"]
+    return argv
 
 
 def check_validation_interval(*, settings: Any, target: str) -> None:
@@ -215,7 +229,7 @@ def check_validation_interval(*, settings: Any, target: str) -> None:
         f"validation.schedule.interval_steps={eval_interval} exceeds this run's "
         f"whole budget of {max_iterations} iterations, so the validation gate "
         f"can NEVER fire: the profiled run would train to completion, evaluate "
-        f"early stopping zero times, write no checkpoint_best.pt, and the loop "
+        f"early stopping zero times, write no best checkpoint, and the loop "
         f"would raise ConfigurationError after the environment is built.\n"
         f"  Fix: pass `-O validation.schedule.interval_steps={suggested}` "
         f"(>= 2 events) alongside the budget you already set. "
@@ -228,6 +242,32 @@ def check_validation_interval(*, settings: Any, target: str) -> None:
     )
 
 
+def check_parameter_free(*, config: Any, target: str) -> None:
+    """Refuse to profile training of a classical solver: ``train`` raises on it.
+
+    The model class declares ``parameter_free``; the dispatcher already answers
+    that per arm (:func:`manifest_dispatch.declares_parameter_free_arm`), so the
+    verdict is reused, not restated. Without this, the child builds the data
+    pipeline (minutes on M4Raw) and only then raises "nothing to train".
+    """
+    if target not in PARALLELISM_TARGETS:
+        return
+    from spectramr.cli.manifest_dispatch import declares_parameter_free_arm
+
+    try:
+        parameter_free = declares_parameter_free_arm(config)
+    except ImportError as exc:
+        logger.warning("Parameter-free check skipped: %s is not importable.", exc.name)
+        return
+    if parameter_free:
+        raise ValueError(
+            f"{config} names a parameter-free model: there is nothing to train, so "
+            f"there is no training loop to profile. Grade it with "
+            f"`spectramr train --config {config} --validate-only`, and leave it "
+            f"out of the profile array (EXCLUDE='*<name>*')."
+        )
+
+
 def run_preflight(args: argparse.Namespace, settings: Any) -> None:
     """Every pre-flight check, against the settings the child will actually see.
 
@@ -238,15 +278,18 @@ def run_preflight(args: argparse.Namespace, settings: Any) -> None:
     resolved = effective_settings(settings, getattr(args, "extra", None))
     check_parallel_strategy(settings=resolved, target=args.target)
     check_validation_interval(settings=resolved, target=args.target)
+    check_parameter_free(config=args.config, target=args.target)
 
 
 __all__ = [
     "INTERVAL_TARGETS",
     "PARALLELISM_TARGETS",
     "check_parallel_strategy",
+    "check_parameter_free",
     "check_validation_interval",
     "effective_settings",
     "extract_overrides",
     "process_group_strategies",
     "run_preflight",
+    "single_process_overrides",
 ]

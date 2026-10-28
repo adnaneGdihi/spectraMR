@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .renames import reject_renamed_keys
+
 #: The one version a config should declare. Everything that *writes* a version —
 #: the migrator, the defaults provider, the reference template — writes this.
 #:
@@ -85,7 +87,6 @@ __all__ = [
     "EXPERIMENT_STATUSES",
     "LAUNCH_REFUSED_STATUSES",
     "LEGACY_CONFIG_VERSIONS",
-    "ArtifactConfig",
     "BiophysicalFlowObjectiveConfig",
     "DeepSpeedConfigSchema",
     "DiffusionObjectiveConfig",
@@ -211,7 +212,7 @@ class ExperimentMetadataSchema(BaseModel):
     # is capability to wire, not dead code to delete.
     version: str | None = Field(default=None)
     created_at: str | None = Field(default=None)
-    tags: Any = Field(default_factory=dict)
+    tags: Any = Field(default_factory=lambda: {})
     timestamp: str | None = Field(default=None)
     # `author`, `source_experiment`, `generated_from` and `roadmap_phase` were declared
     # here with no reader in src/ (2026-09-02 review). They load as free-form extras;
@@ -261,10 +262,19 @@ class ExperimentMetadataSchema(BaseModel):
         default=None,
         description="Why the status is what it is (the old free-text status, or a note).",
     )
+    #: A property of the arm that a reader of its numbers must know, printed as a
+    #: § footnote on its row of the ``report --compare`` main-results table.
+    comparison_note: str | None = Field(
+        default=None,
+        description=(
+            "One sentence the cross-run comparison table prints as a footnote on this "
+            "arm's row (read from the run's resolved_config.json)."
+        ),
+    )
 
     @field_validator("tags")
     @classmethod
-    def validate_tags(cls, value):
+    def validate_tags(cls, value: Any) -> Any:
         """Convert list of tags to dict for backward compatibility."""
         if isinstance(value, list):
             return {tag: tag for tag in value}
@@ -547,32 +557,6 @@ class SSLConfigSchema(BaseModel):
     multi_contrast_contrastive: MultiContrastContrastiveConfigSchema | None = Field(default=None)
 
 
-class ArtifactConfig(BaseModel):
-    """Persistent artifact storage location.
-
-    Historical note (2026-05-19 cleanup): this schema previously declared
-    ``runtime_root``, ``sync_interval_minutes``, and ``sync_on_failure``
-    fields to describe a tiered ephemeral→persistent storage system with
-    periodic rsync. None of those fields ever had a runtime consumer in
-    ``src/spectramr/`` (verified by grep + dynamic-dispatch scan covering
-    ``getattr``, string-key access, and registered background tasks).
-    PyTorch does not provide built-in tiered checkpoint storage either —
-    the community pattern is to use ``$TMPDIR`` / Slurm ``--tmp`` plus a
-    final ``cp`` in the job epilog. The three fields were removed to
-    eliminate dead schema surface area. If tiered storage is reintroduced
-    later, wire it through ``infrastructure/training/checkpoint*`` with
-    an explicit ``RuntimeArtifactsManager`` service and an integration
-    test that exercises the runtime-tier write path.
-    """
-
-    model_config = {"protected_namespaces": (), "extra": "forbid", "frozen": True}
-
-    persistent_root: str | None = Field(
-        default="./experiments",
-        description="Final persistent storage location for artifacts after training.",
-    )
-
-
 class ServicesConfigSchema(BaseModel):
     """Configuration for optional services."""
 
@@ -660,12 +644,47 @@ class FSDPConfigSchema(BaseModel):
     )
     cpu_offload: bool = Field(default=False)
     mixed_precision: Literal["fp16", "bf16"] | None = Field(
-        default="bf16",
-        description="null | fp16 | bf16 — wrapped via MixedPrecision policy.",
+        default=None,
+        description="null | bf16 — an override of FSDP's MixedPrecision policy (fp16 is "
+        "refused). null follows optimization.precision, the arm's one precision decision: "
+        "off is float32, enabled with no dtype is float16 (refused under FSDP), and "
+        "bfloat16 must be declared. The clusters mix Ada and V100 nodes, which have no "
+        "native bf16, so bf16 is never a default.",
+    )
+    reduce_dtype: Literal["float32", "match_param"] = Field(
+        default="float32",
+        description="Precision of the gradient reduce-scatter. float32 (default) "
+        "keeps the reduction exact while parameters and activations run in "
+        "mixed_precision; match_param reduces in the parameter dtype, which halves "
+        "the traffic and loses gradient precision. Ignored when mixed_precision "
+        "is null.",
+    )
+    buffer_dtype: Literal["float32", "match_param"] = Field(
+        default="float32",
+        description="Precision of module buffers (BatchNorm running statistics). "
+        "float32 (default) keeps them out of half precision. Ignored when "
+        "mixed_precision is null.",
     )
     activation_checkpointing: bool = Field(default=False)
     limit_all_gathers: bool = Field(default=True)
     use_orig_params: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def _fp16_needs_a_sharded_grad_scaler(self) -> "FSDPConfigSchema":
+        """fp16 gradients underflow without loss scaling, and none is wired for FSDP.
+
+        The scaler the loop builds is a plain ``GradScaler``: each rank decides
+        independently whether to skip a step, so shards disagree and diverge. The
+        sharded scaler is not wired, so fp16 is refused rather than run unscaled.
+        """
+        if self.enabled and self.mixed_precision == "fp16":
+            raise ValueError(
+                "fsdp.mixed_precision='fp16' is refused: it needs a ShardedGradScaler, "
+                "which is not wired, so gradients would underflow unscaled (or ranks "
+                "would disagree on skipping a step). Use 'bf16' on Ampere or newer, or "
+                "null to run in float32."
+            )
+        return self
 
     @model_validator(mode="after")
     def _transformer_policy_needs_layer_classes(self) -> "FSDPConfigSchema":
@@ -898,6 +917,11 @@ class DeepSpeedConfigSchema(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
+    # Removed keys (removals.py) are refused with the reason, not pydantic's bare extra error.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("parallel.deepspeed"))  # type: ignore[arg-type]
+    )
+
     enabled: bool = Field(default=False)
     zero_stage: Literal[0, 1, 2, 3] = Field(
         default=0,
@@ -917,14 +941,7 @@ class DeepSpeedConfigSchema(BaseModel):
     stage3_gather_16bit_weights_on_model_save: bool = Field(
         default=True,
         description="Lets save_16bit_model() emit a consolidated checkpoint under "
-        "ZeRO-3. Required for save_consolidated_best at stage 3.",
-    )
-    save_consolidated_best: bool = Field(
-        default=True,
-        description="Additionally write a single-file checkpoint_best.pt beside the "
-        "sharded tag directory, so discover_best_checkpoint, campaign evaluation "
-        "and `spectramr infer` keep working without understanding ZeRO shards. "
-        "Disabling it makes the run resume-only; the audit warns.",
+        "ZeRO-3.",
     )
     allow_multi_engine: bool = Field(
         default=False,
@@ -975,6 +992,17 @@ class DeepSpeedConfigSchema(BaseModel):
             raise ValueError(
                 "parallel.deepspeed.zenflow.offload requires overlap_comm: true "
                 "(DeepSpeed asserts this in ZenFlowZeroOptimizer)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _round_robin_is_a_stage2_feature(self) -> "DeepSpeedConfigSchema":
+        """``round_robin_gradients`` only exists in the ZeRO-2 reduction path."""
+        if self.round_robin_gradients and self.zero_stage != 2:
+            raise ValueError(
+                f"parallel.deepspeed.round_robin_gradients is a ZeRO stage-2 option; "
+                f"zero_stage={self.zero_stage} never reads it, so it would be "
+                "advertised and inert. Set zero_stage: 2, or remove it."
             )
         return self
 
@@ -1088,6 +1116,15 @@ class ParallelismConfigSchema(BaseModel):
     fsdp: FSDPConfigSchema = Field(default_factory=FSDPConfigSchema)
     peft: PEFTConfigSchema = Field(default_factory=PEFTConfigSchema)
     deepspeed: DeepSpeedConfigSchema = Field(default_factory=DeepSpeedConfigSchema)
+    timeout_seconds: int | None = Field(
+        default=None,
+        gt=0,
+        description="Process-group collective timeout in seconds, passed to "
+        "init_process_group. null keeps torch's backend default. It bounds how "
+        "long peers wait on a rank that died before a collective (a raise on one "
+        "rank leaves the others blocked until this expires); raise it only if "
+        "rank-0-only validation or checkpointing legitimately exceeds it.",
+    )
 
     @model_validator(mode="after")
     def _strategy_matches_subblocks(self) -> "ParallelismConfigSchema":

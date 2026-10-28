@@ -240,3 +240,45 @@ def test_report_cases_knobs_default():
     s = LoggingConfigSchema()
     assert s.report_cases.enabled is True
     assert s.report_cases.subdir == "report_cases"
+
+
+class TestDistributedAndProgressBlocks:
+    """`logging.distributed`, `logging.progress` and `logging.sinks.console_stream`."""
+
+    def test_defaults_are_rank0_only_split_and_auto(self):
+        from spectramr.config.schemas.enums import ConsoleStream, LogLevel, ProgressMode, RankScope
+
+        cfg = LoggingConfigSchema()
+        assert cfg.distributed.console_ranks is RankScope.RANK0
+        assert cfg.distributed.secondary_level is LogLevel.ERROR
+        assert cfg.distributed.file_ranks is RankScope.RANK0
+        assert cfg.sinks.console_stream is ConsoleStream.SPLIT
+        assert cfg.progress.mode is ProgressMode.AUTO
+        assert cfg.progress.log_every_n_iterations == 1500
+
+    def test_values_load_from_yaml_shaped_dicts(self):
+        cfg = LoggingConfigSchema(
+            distributed={"console_ranks": "all", "secondary_level": "warning", "file_ranks": "all"},
+            progress={"mode": "lines", "log_every_n_iterations": 30},
+            sinks={"console_stream": "stderr"},
+        )
+        assert cfg.distributed.console_ranks.value == "all"
+        assert cfg.progress.log_every_n_iterations == 30
+        assert cfg.sinks.console_stream.value == "stderr"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"distributed": {"console_ranks": "some"}},
+            {"distributed": {"secondary_level": "loud"}},
+            {"distributed": {"typo": 1}},
+            {"progress": {"mode": "fancy"}},
+            {"progress": {"log_every_n_iterations": 0}},
+            {"progress": {"log_every_n_iterations": -5}},
+            {"progress": {"typo": 1}},
+            {"sinks": {"console_stream": "stdin"}},
+        ],
+    )
+    def test_a_bad_value_or_unknown_key_raises(self, bad):
+        with pytest.raises(ValidationError):
+            LoggingConfigSchema(**bad)

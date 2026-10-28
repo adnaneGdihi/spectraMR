@@ -48,7 +48,7 @@ class PhaseStegoScoreLoss(nn.Module):
     sampling drift.
     """
 
-    def __init__(self, sigma_M: float = 0.05, basis: str = "fourier") -> None:
+    def __init__(self, sigma_M: float = 0.05, basis: str = "fourier") -> None:  # noqa: N803
         super().__init__()
         if sigma_M <= 0:
             raise ValueError(f"sigma_M must be > 0; got {sigma_M}.")
@@ -85,7 +85,8 @@ class PhaseStegoScoreLoss(nn.Module):
         # geometry without the magnitude confound.
         phase_unit = torch.complex(torch.cos(phase), torch.sin(phase))
         if self.basis == "fourier":
-            return torch.fft.fftn(phase_unit, dim=(-2, -1), norm="ortho")
+            spectrum: torch.Tensor = torch.fft.fftn(phase_unit, dim=(-2, -1), norm="ortho")
+            return spectrum
         # Haar-style 2-D wavelet via stride-2 convolutions (LL band).
         # Avoids a hard dependency on PyWavelets.
         device, dtype = phase_unit.device, phase_unit.dtype

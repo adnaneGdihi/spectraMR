@@ -30,7 +30,7 @@ from typing import ClassVar
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812 — torch convention
+import torch.nn.functional as F
 
 from spectramr.infrastructure.physics.structured_covariance import lowrank_from_basis
 from spectramr.models.registry import register_model

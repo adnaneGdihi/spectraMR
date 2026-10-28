@@ -19,7 +19,7 @@ it is testable without a trainer -- the same seam as ``bloch_field`` and
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -89,6 +89,14 @@ def compute_dispersion_bloch_ae_loss(
 class DispersionBlochAEStrategy(ReconstructionTrainingStrategy):
     """Train the dispersion-latent Bloch autoencoder (DL-BAE, M4)."""
 
+    #: Both physics terms are computed inline at the weights in
+    #: ``training.dispersion_bloch_ae``; the fold skips them so a declared
+    #: ``image_losses`` entry is not added a second time (#1710).
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset(
+        {"multifield_data_consistency", "dispersion_monotonicity"}
+    )
+    folds_image_losses: ClassVar[bool | None] = True
+
     def _setup_strategy_specific_components(self) -> None:
         """Bind the ``training.dispersion_bloch_ae`` block and build the loss modules."""
         self._verify_strategy_config(expected_modes=("dispersion_bloch_ae", "reconstruction"))
@@ -102,14 +110,14 @@ class DispersionBlochAEStrategy(ReconstructionTrainingStrategy):
                 "in the arm YAML."
             )
         fields = tuple(float(b) for b in getattr(cfg, "fields_present", ()))
-        n_pools = int(getattr(cfg, "n_pools", 1))
+        n_pools = int(getattr(cfg, "num_pools", 1))
         required = 2 * n_pools + 1
         if len(fields) < required:
             # Belt and braces: the Tier-1 check catches this at audit time, but a
             # strategy constructed programmatically must not train a rank-deficient
             # fit to a meaningless optimum (pitfall #9).
             raise ValueError(
-                f"DL-BAE is under-determined: n_pools={n_pools} needs M >= {required} "
+                f"DL-BAE is under-determined: num_pools={n_pools} needs M >= {required} "
                 f"distinct fields, but fields_present names {len(fields)} ({fields!r})."
             )
         self._dlbae_dc_weight = float(getattr(cfg, "data_consistency_weight", 1.0))

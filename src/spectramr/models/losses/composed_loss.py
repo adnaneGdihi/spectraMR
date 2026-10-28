@@ -3,6 +3,8 @@
 Simplifies loss composition with metrics tracking and flexible weighting.
 """
 
+from typing import Any, Self
+
 import torch
 import torch.nn as nn
 
@@ -34,7 +36,7 @@ class WeightedLoss:
         target: torch.Tensor,
         *,
         want_metrics: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, float] | None]:
         """Compute loss, and metrics only when the caller asked for them.
 
@@ -64,10 +66,13 @@ class WeightedLoss:
             no ``forward_with_metrics``.
         """
         metrics: dict[str, float] | None = None
-        if want_metrics and hasattr(self.loss_fn, "forward_with_metrics"):
-            loss, metrics = self.loss_fn.forward_with_metrics(pred, target, **kwargs)
+        # ``Any``: ``forward_with_metrics`` is duck-typed, and ``nn.Module``'s
+        # ``__getattr__`` would type the bound method as a ``Tensor``.
+        loss_fn: Any = self.loss_fn
+        if want_metrics and hasattr(loss_fn, "forward_with_metrics"):
+            loss, metrics = loss_fn.forward_with_metrics(pred, target, **kwargs)
         else:
-            loss = self.loss_fn(pred, target, **kwargs)
+            loss = loss_fn(pred, target, **kwargs)
 
         # Single unwrap owner for both branches. A loss constructed with
         # `compute_metrics=True` (SSIMLoss, LPIPSLoss, PerceptualLoss, L1Loss
@@ -80,7 +85,17 @@ class WeightedLoss:
         if isinstance(loss, tuple):
             loss = loss[0]
 
-        return loss * self.weight, metrics
+        weighted: torch.Tensor = loss * self.weight
+        return weighted, metrics
+
+
+def _zero_total(pred: torch.Tensor) -> torch.Tensor:
+    """The accumulator seed: ``pred``'s device, and its REAL dtype.
+
+    ``pred.dtype`` itself made the total complex for complex MRI data, and a complex
+    scalar cannot be backpropagated. For every real dtype the two are identical.
+    """
+    return torch.zeros((), device=pred.device, dtype=pred.dtype.to_real())
 
 
 class ComposedLoss(nn.Module, MetricsAwareLossMixin):
@@ -125,7 +140,7 @@ class ComposedLoss(nn.Module, MetricsAwareLossMixin):
         # Register loss modules with nn.ModuleList for proper state management
         self.loss_modules = nn.ModuleList([loss.loss_fn for loss in losses])
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute total loss (sum of weighted components).
 
         Args:
@@ -149,7 +164,7 @@ class ComposedLoss(nn.Module, MetricsAwareLossMixin):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        total_loss = _zero_total(pred)
 
         for loss_obj in self.losses:
             loss_val, _ = loss_obj.compute(pred, target, **kwargs)
@@ -162,7 +177,7 @@ class ComposedLoss(nn.Module, MetricsAwareLossMixin):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute metrics from all component losses.
 
@@ -186,7 +201,7 @@ class ComposedLoss(nn.Module, MetricsAwareLossMixin):
         return metrics
 
     def forward_with_metrics(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Forward pass returning (loss, metrics).
 
@@ -227,7 +242,7 @@ class ComposedLoss(nn.Module, MetricsAwareLossMixin):
         """
         return {loss.name: loss.weight for loss in self.losses}
 
-    def to(self, *args, **kwargs):
+    def to(self, *args: Any, **kwargs: Any) -> Self:
         """Move all loss modules to device.
 
         Overrides nn.Module.to() to ensure all sub-losses move too.
@@ -294,7 +309,7 @@ class ConditionalComposedLoss(ComposedLoss):
         """
         return self.enabled.get(loss_name, False)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute total loss (sum of enabled weighted components).
 
         Args:
@@ -305,7 +320,7 @@ class ConditionalComposedLoss(ComposedLoss):
         Returns:
             Total weighted loss (enabled components only)
         """
-        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        total_loss = _zero_total(pred)
 
         for loss_obj in self.losses:
             if self.is_enabled(loss_obj.name):
@@ -319,7 +334,7 @@ class ConditionalComposedLoss(ComposedLoss):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute metrics from enabled component losses.
 

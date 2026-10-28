@@ -74,10 +74,6 @@ def test_the_summary_does_not_claim_the_crash_is_deterministic():
     [
         ("empty", ""),
         (
-            "cuda_oom",
-            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
-        ),
-        (
             "segfault_elsewhere",
             "!!!!!!! Segfault encountered !!!!!!!\n"
             '  File "<unknown>", line 0, in c10::cuda::CUDACachingAllocator::malloc()',
@@ -308,3 +304,31 @@ def test_the_oom_summary_does_not_claim_gpu_memory():
     sig = next(s for s in KNOWN_FAILURES if s.name == "child_killed_sigkill")
     assert "host RAM" in sig.summary
     assert "not GPU memory" in sig.summary
+
+
+@pytest.mark.parametrize(
+    ("line", "name"),
+    [
+        (
+            "ERROR spectramr.main: Pipeline failed: metadata.status='needs_implementation': this arm",
+            "arm_refuses_to_run",
+        ),
+        (
+            "ERROR spectramr.main: Pipeline failed: Data root not found: /p/hcp/T1w (resolved: /p)",
+            "data_root_missing",
+        ),
+        (
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 994.00 MiB.",
+            "cuda_out_of_memory",
+        ),
+    ],
+)
+def test_pipeline_failure_families_are_recognised_from_their_real_log_lines(line, name) -> None:
+    sig = classify_failure(f"...progress...\n{line}\n", exit_code=1)
+    assert sig is not None
+    assert sig.name == name
+    assert sig.name != "scalene_torch_profiler_segfault"
+
+
+def test_a_pipeline_log_that_only_mentions_oom_in_passing_is_not_classified() -> None:
+    assert classify_failure("setting expandable_segments to avoid CUDA out of memory", 1) is None

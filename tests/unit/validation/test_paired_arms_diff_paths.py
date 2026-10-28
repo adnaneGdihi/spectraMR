@@ -47,3 +47,62 @@ class TestAllowListSpellings:
     def test_every_entry_is_dotted_and_stripped(self) -> None:
         bad = sorted(p for p in DEFAULT_DIFF_PATHS if p != p.strip() or not p)
         assert not bad, f"malformed allow-list entries: {bad}"
+
+
+class TestNexTargetAblationIsRepresentable:
+    """The list enumerates the factors an ablation may vary, not just identity.
+
+    Before ``data.target_mode`` / ``data.r2r_alpha`` landed it carried three
+    ``data.*`` paths and none was a target mode, so **no** repetition-target
+    ablation could pass however cleanly it was built. The n2n cohort varies
+    exactly those two and was reported as three spurious diffs across its three
+    pairs -- a finding about the allow-list, not about the cohort.
+    """
+
+    def test_the_nex_ablation_factors_are_exempt(self) -> None:
+        for path in (
+            "data.target_mode",
+            "data.r2r_alpha",
+            "data.r2r_split_angle_deg",
+            "data.r2r_whitening",
+            "data.emit_alternate_input",
+            "data.processing.transforms",
+            "validation.scoring.coil_manifold_projection",
+            "losses.complex_losses",
+            "training.equivariant_imaging.measurement_target",
+            "training.strategy_class",
+            "training.ssdu.noise_std_source",
+            "data.coil_maps_root",
+            "data.coil_maps_missing",
+            "data.coil_maps_recipe",
+            "data.coil_maps_acs_size",
+            "validation.scoring.recorrupted_inference",
+            "metadata.expected_outcome",
+        ):
+            assert path in DEFAULT_DIFF_PATHS, f"{path} is not exempt"
+
+    def test_the_n2n_cohort_passes_on_every_pair(self) -> None:
+        """The corpus leg: a list entry that matches nothing exempts nothing."""
+        import itertools
+        from pathlib import Path
+
+        import pytest
+
+        from spectramr.infrastructure.validation.paired_arms_audit import audit_paired_arms
+
+        cohort = Path(__file__).resolve().parents[3] / "experiments/inprogress/n2n"
+        arms = sorted(cohort.glob("*.yaml"))
+        if len(arms) < 2:
+            pytest.skip("n2n cohort not present")
+
+        for a, b in itertools.combinations(arms, 2):
+            report = audit_paired_arms(str(a), str(b))
+            assert report.passed, (
+                f"{a.stem} vs {b.stem} reports unexempted diffs: "
+                f"{getattr(report, 'diffs', None)}"
+            )
+
+    def test_an_unrelated_knob_is_still_caught(self) -> None:
+        """Anti-vacuity: the exemptions must not have blanketed ``data.*``."""
+        assert "data.loader.batch_size" not in DEFAULT_DIFF_PATHS
+        assert "data.coils.processing_mode" not in DEFAULT_DIFF_PATHS

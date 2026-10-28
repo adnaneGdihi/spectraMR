@@ -158,3 +158,133 @@ class TestDeterminism:
         second = list(sampler)
         assert first != second
         assert sorted(first) == sorted(second)
+
+
+def _shard(index_map, container_volumes, world: int, **kw):
+    return [
+        VolumeBlockedSliceSampler(
+            index_map, container_volumes, max_resident_volumes=6, rank=r, num_replicas=world, **kw
+        )
+        for r in range(world)
+    ]
+
+
+class TestSharding:
+    """A data-parallel group must see every sample, once, in equal numbers per rank.
+
+    Equal counts are not cosmetic: FSDP and ZeRO-3 forwards are collectives, so ranks that
+    disagree on batch count hang. The IO property is the other half: sharding must not
+    scatter a volume's containers across ranks and bring the decode cost back.
+    """
+
+    def test_ranks_partition_the_samples_and_pad_to_equal_length(self) -> None:
+        index_map, container_volumes = _corpus(groups=3)
+        shards = _shard(index_map, container_volumes, 2)
+        orders = [list(s) for s in shards]
+
+        assert len({len(o) for o in orders}) == 1, "every rank must iterate the same count"
+        assert [len(s) for s in shards] == [len(o) for o in orders]
+        # Padding repeats a rank's own samples, so the ranks' sets stay disjoint.
+        assert set(orders[0]).isdisjoint(orders[1])
+        assert set(orders[0]) | set(orders[1]) == set(range(len(index_map)))
+
+    def test_planted_uneven_split_is_padded_not_truncated(self) -> None:
+        """3 groups over 2 ranks is 2 + 1: the short rank repeats, nobody drops a sample."""
+        index_map, container_volumes = _corpus(groups=3, slices=4)
+        shards = _shard(index_map, container_volumes, 2)
+        assert len(shards[0]) == len(shards[1]) == 2 * 20 * 4
+        owned = [len(set(s)) for s in map(list, shards)]
+        assert sorted(owned) == [20 * 4, 2 * 20 * 4]
+
+    def test_describe_states_how_much_of_the_epoch_is_padding(self) -> None:
+        """2 + 1 groups: 240 distinct samples fill 320 slots, so a quarter is repeats."""
+        index_map, container_volumes = _corpus(groups=3, slices=4)
+        shards = _shard(index_map, container_volumes, 2)
+        assert "25% of each epoch is repeated samples" in shards[0].describe()
+        balanced = _shard(*_corpus(groups=4, slices=4), 2)
+        assert "repeated samples" not in balanced[0].describe()
+
+    def test_a_rank_with_no_samples_is_refused_at_construction(self) -> None:
+        """A container with no slices counts toward the split but gives its rank nothing to
+        repeat, which used to surface as a ZeroDivisionError inside the first epoch."""
+        index_map = [(0, s) for s in range(4)]
+        container_volumes = [{"a"}, {"b"}]
+        with pytest.raises(ValueError, match="would own no slice samples"):
+            _shard(index_map, container_volumes, 2)
+
+    def test_a_volume_is_decoded_on_one_rank_when_groups_allow(self) -> None:
+        index_map, container_volumes = _corpus(groups=4)
+        shards = _shard(index_map, container_volumes, 2)
+        per_rank = [
+            {v for i in set(s) for v in container_volumes[index_map[i][0]]} for s in shards
+        ]
+        assert per_rank[0].isdisjoint(per_rank[1])
+
+    def test_sharding_keeps_the_io_property(self) -> None:
+        index_map, container_volumes = _corpus(groups=4)
+        whole = _decodes(
+            list(VolumeBlockedSliceSampler(index_map, container_volumes, max_resident_volumes=6)),
+            index_map,
+            container_volumes,
+            budget=6,
+        )
+        sharded = sum(
+            _decodes(list(s), index_map, container_volumes, budget=6)
+            for s in _shard(index_map, container_volumes, 2)
+        )
+        # The total across ranks is the unsharded cost (each volume decoded once), not N times it.
+        assert sharded <= whole + 2 * 5
+        import random
+
+        shuffled = list(range(len(index_map)))
+        random.Random(0).shuffle(shuffled)
+        plain = _decodes(shuffled, index_map, container_volumes, budget=6)
+        assert sharded < plain / 10
+
+    def test_fewer_groups_than_ranks_falls_back_to_splitting_containers(self) -> None:
+        index_map, container_volumes = _corpus(groups=1)
+        shards = _shard(index_map, container_volumes, 4)
+        orders = [list(s) for s in shards]
+        assert len({len(o) for o in orders}) == 1
+        assert set().union(*map(set, orders)) == set(range(len(index_map)))
+
+    def test_more_ranks_than_containers_is_refused(self) -> None:
+        index_map, container_volumes = _corpus(groups=1, fields=2)  # 2 containers
+        with pytest.raises(ValueError, match="cannot be split"):
+            VolumeBlockedSliceSampler(
+                index_map, container_volumes, max_resident_volumes=2, rank=0, num_replicas=3
+            )
+
+    def test_rank_outside_the_group_is_refused(self) -> None:
+        index_map, container_volumes = _corpus()
+        with pytest.raises(ValueError, match="outside num_replicas"):
+            VolumeBlockedSliceSampler(
+                index_map, container_volumes, max_resident_volumes=6, rank=2, num_replicas=2
+            )
+
+    def test_set_epoch_reorders_but_never_reassigns(self) -> None:
+        index_map, container_volumes = _corpus(groups=4)
+        shard = _shard(index_map, container_volumes, 2)[0]
+        first = list(shard)
+        shard.set_epoch(1)
+        second = list(shard)
+        assert first != second
+        assert set(first) == set(second)
+
+    def test_sharded_is_the_same_as_constructing_with_a_rank(self) -> None:
+        index_map, container_volumes = _corpus(groups=4)
+        base = VolumeBlockedSliceSampler(index_map, container_volumes, max_resident_volumes=6)
+        direct = _shard(index_map, container_volumes, 2)[1]
+        assert list(base.sharded(1, 2)) == list(direct)
+
+    def test_every_rank_derives_the_same_assignment(self) -> None:
+        """No communication: each rank computes the whole split locally."""
+        index_map, container_volumes = _corpus(groups=5)
+        a = [list(s) for s in _shard(index_map, container_volumes, 3)]
+        b = [list(s) for s in _shard(index_map, container_volumes, 3)]
+        assert a == b
+
+    def test_describe_reports_the_ranks_own_share(self) -> None:
+        index_map, container_volumes = _corpus(groups=4)
+        text = _shard(index_map, container_volumes, 2)[0].describe()
+        assert f"{len(index_map) // 2} slice samples" in text

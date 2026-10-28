@@ -1,8 +1,7 @@
 """Campaign Report Generator — HTML dashboards and comparison plots.
 
-Extends the existing MetricsReportGenerator pattern for cross-experiment
-comparison visualisations.
-"""
+Cross-experiment campaign dashboards; paper comparison figures are in
+``infrastructure.reporting.comparison``."""
 
 from __future__ import annotations
 

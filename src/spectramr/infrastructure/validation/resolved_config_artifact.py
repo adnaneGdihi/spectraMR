@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FAILURE_SENTINEL_NAME",
+    "LR_SCHEDULE_KEY",
     "RESOLVED_CONFIG_NAME",
     "build_resolved_config_payload",
     "resolved_config_run_name",
@@ -52,6 +53,8 @@ FAILURE_SENTINEL_NAME = "_ledger_write_FAILED.json"
 
 #: The additive top-level key holding the run's declared (unset-excluded) config.
 DECLARED_KEY = "_declared"
+
+LR_SCHEDULE_KEY = "_lr_schedule"  #: the LR schedule the run actually builds
 
 #: The artifact's file name, as ``write_resolved_config`` writes it.
 RESOLVED_CONFIG_FILENAME = "resolved_config.json"
@@ -94,7 +97,14 @@ def settings_from_resolved_config(path: str | Path) -> Any:
     Raises ``ValueError`` when the artifact predates the block: the resolved
     dump it holds does not re-validate (see ``build_resolved_config_payload``),
     so the caller must fall back to the training YAML explicitly.
+
+    This is the one place a run's snapshot becomes settings again, so it alone
+    drops keys retired (``removals.py``) after the run was written, with one
+    warning naming each. Nothing read such a key, so the rebuilt run is the run
+    that trained; an authored YAML still has the key refused. Any other key the
+    schema refuses, a moved one included, still raises.
     """
+    from spectramr.config.schemas.removals import strip_removed_keys
     from spectramr.config.settings import TrainingSettings
 
     payload = json.loads(Path(path).read_text())
@@ -104,6 +114,15 @@ def settings_from_resolved_config(path: str | Path) -> Any:
             f"{path} carries no {DECLARED_KEY!r} block (written before 2026-09-03), so the "
             "run's settings cannot be rebuilt from it; pass the training YAML with "
             "--config and --from-yaml."
+        )
+    declared, dropped = strip_removed_keys(declared)
+    if dropped:
+        logger.warning(
+            "[config] %s declares %d key(s) removed since the run was written; they are "
+            "dropped, and the rebuilt settings are unchanged because nothing read them: %s",
+            path,
+            len(dropped),
+            "; ".join(f"`{rec.legacy}` (removed {rec.since}: {rec.reason})" for rec in dropped),
         )
     return TrainingSettings.model_validate(declared)
 
@@ -143,6 +162,7 @@ def build_resolved_config_payload(
     payload: dict[str, Any] = (
         settings.model_dump(mode="json") if hasattr(settings, "model_dump") else {}
     )
+    _stamp_resolved_schedule(settings, payload)
     ledger = ExecutionLedger.current_or_begin(source=ledger_source)
     if health_report is not None:
         ledger.attach_health_report(health_report)
@@ -166,6 +186,25 @@ def build_resolved_config_payload(
         # is the first to refuse). ``predict`` rebuilds from this block (#1379).
         payload[DECLARED_KEY] = settings.model_dump(mode="json", exclude_unset=True)
     return payload
+
+
+def _stamp_resolved_schedule(settings: Any, payload: dict[str, Any]) -> None:
+    """Replace a defaulted ``lr_scheduler_strategy`` (never built from, #662) by the
+    scheduler actually built, so the dump cannot report a constant LR as cosine (#2760)."""
+    from spectramr.domain.exceptions import ConfigurationError
+    from spectramr.infrastructure.training.scheduler_resolution import resolved_schedule_record
+
+    optimization, dumped = getattr(settings, "optimization", None), payload.get("optimization")
+    if optimization is None or not isinstance(dumped, dict):
+        return
+    # The audit builds this payload for every arm: record an unresolvable scheduler, never raise.
+    try:
+        payload[LR_SCHEDULE_KEY] = record = resolved_schedule_record(settings)
+    except ConfigurationError as exc:
+        payload[LR_SCHEDULE_KEY] = {"unresolved": str(exc)}
+        return
+    if "lr_scheduler_strategy" not in getattr(optimization, "model_fields_set", ()):
+        dumped["lr_scheduler_strategy"] = record["scheduler"]
 
 
 def _declared_config_version(payload: dict[str, Any]) -> str | None:

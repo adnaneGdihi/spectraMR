@@ -5,14 +5,10 @@ prediction and target volumes (cubical complex on the foreground
 mask), then takes the Wasserstein-2 distance between them as the
 loss.
 
-Stability guarantee (Cohen-Steiner, Edelsbrunner, Harer 2007):
-
-.. math::
-
-    W_2(\\mathrm{Dgm}(\\hat I), \\mathrm{Dgm}(I)) \\le \\| \\hat I - I \\|_2
-
-so this term is well-conditioned with respect to the L2 reconstruction
-loss.
+Stability: the bottleneck distance obeys :math:`d_B \\le \\|\\hat I - I\\|_\\infty`
+(Cohen-Steiner, Edelsbrunner, Harer 2007). The p-Wasserstein analogue (Skraba
+and Turner, arXiv:2006.16824) sums over all cells of the complex, so for voxel
+images it carries a constant up to :math:`3^{d/p}`.
 
 Backend: :mod:`gudhi` for the cubical PH computation, :mod:`POT` for
 the Wasserstein-2 distance. Both are pulled in via the
@@ -122,8 +118,14 @@ class CubicalPHWassersteinLoss(nn.Module):
             raise ImportError(_install_hint())
         if wasserstein_p < 1:
             raise ValueError(f"wasserstein_p must be >= 1, got {wasserstein_p}")
-        if stratify_subvolumes < 1:
-            raise ValueError(f"stratify_subvolumes must be >= 1, got {stratify_subvolumes}")
+        if stratify_subvolumes != 1:
+            # Declared but unimplemented: the loss runs PH on whole slices.
+            raise ValueError(
+                "stratify_subvolumes > 1 is not implemented (PH runs on whole slices); "
+                f"set 1, got {stratify_subvolumes}"
+            )
+        if not homology_dims or not set(homology_dims) <= {0, 1, 2}:
+            raise ValueError(f"homology_dims must be a non-empty subset of {{0,1,2}}: {homology_dims}")
         self.homology_dims = tuple(homology_dims)
         self.wasserstein_p = wasserstein_p
         self.stratify_subvolumes = stratify_subvolumes
@@ -199,108 +201,92 @@ class CubicalPHWassersteinLoss(nn.Module):
     # ------------------------------------------------------------------
 
     def _slice_loss(self, pred_slice: torch.Tensor, target_slice: torch.Tensor) -> torch.Tensor:
-        """Compute the W2 loss for a single slice with autograd."""
-        # Compute persistence diagrams on detached numpy views.
-        pred_np = pred_slice.detach().cpu().numpy()
-        target_np = target_slice.detach().cpu().numpy()
-
-        pred_dgm, pred_birth_voxels, pred_death_voxels = self._persistence_with_voxels(pred_np)
-        target_dgm, _, _ = self._persistence_with_voxels(target_np)
-
-        if pred_dgm.size == 0:
-            # No finite pred features to match or penalise (constant volume /
-            # fully masked-out slice). Zero loss with zero gradient is correct.
-            # NOTE: we do NOT early-return when only the *target* diagram is
-            # empty — a topologically-trivial target with a hallucinating pred
-            # must still be penalised (every pred feature matches the diagonal),
-            # else the loss is blind to spurious topology (F2).
-            return torch.zeros((), device=pred_slice.device, dtype=pred_slice.dtype)
-
-        # POT expects (n, 2) float64 arrays for diagrams.
-        assert _ot is not None  # narrowed by __init__ guard
-        a = pred_dgm.astype("float64")
-        b = target_dgm.astype("float64")
-
-        # Wasserstein matching between diagrams. Use POT's optimal
-        # transport on the diagram point cloud against itself + a
-        # diagonal projection (standard PH-W2 trick).
-        _cost, transport = _wasserstein_matching(a, b, p=self.wasserstein_p, ot_module=_ot)
-
-        # Re-form the loss as a sum of per-pair tensor terms so that
-        # autograd routes back through pred_slice via the birth AND
-        # death voxels. Using the birth voxel for both diffs (the
-        # previous "standard simplification" cited Carrière et al.
-        # §3.2) double-counts the persistence: when pred == target the
-        # match pairs each point with itself, target_death == pred_death,
-        # but flat_pred[birth_voxel] == pred_birth, so the death term
-        # contributes (pred_birth - pred_death)^p = persistence^p
-        # instead of 0. Tracking the death voxel makes the loss vanish
-        # at the optimum (the contract pinned by
-        # tests/.../test_cubical_ph_w2_loss::test_identity_loss_is_near_zero).
-        loss = torch.zeros((), device=pred_slice.device, dtype=pred_slice.dtype)
+        """Two-sided W_p over each homology dimension, summed as p-th powers."""
+        pred_dgms = self._persistence_with_voxels(pred_slice.detach().cpu().numpy())
+        target_dgms = self._persistence_with_voxels(target_slice.detach().cpu().numpy())
         flat_pred = pred_slice.reshape(-1)
-        n_b = b.shape[0]
-        for i, j in transport:
-            birth_idx = pred_birth_voxels[i]
-            death_idx = pred_death_voxels[i]
-            if birth_idx < 0:
-                # No source voxel to backprop into; gradient is zero anyway.
+
+        total = flat_pred.sum() * 0.0  # keeps the graph attached when no pair is finite
+        for dim in self.homology_dims:
+            p_pairs, p_birth, p_death = pred_dgms[dim]
+            t_pairs, _, _ = target_dgms[dim]
+            if len(p_pairs) == 0 and len(t_pairs) == 0:
                 continue
-            if j < n_b:
-                # Matched to a genuine target feature: pull pred's (birth, death)
-                # toward the target's, under the L_infinity ground metric raised
-                # to p -- max(|d_birth|, |d_death|)^p (matches the cost matrix in
-                # _wasserstein_matching). Summing the coordinates would compute an
-                # L_1 cost instead.
-                target_birth = float(b[j, 0])
-                target_death = float(b[j, 1])
-                diff_b = flat_pred[birth_idx] - target_birth
-                if death_idx >= 0:
-                    diff_d = flat_pred[death_idx] - target_death
-                else:
-                    diff_d = torch.zeros((), device=flat_pred.device, dtype=flat_pred.dtype)
-                pair_cost = torch.maximum(diff_b.abs(), diff_d.abs())
-            else:
-                # Matched to the DIAGONAL: pred has a feature the target lacks
-                # (hallucinated topology). The L_infinity distance of a point
-                # ``(b, d)`` to the diagonal is ``(d - b) / 2``; penalising it
-                # here pushes birth up / death down, shrinking the spurious
-                # feature's persistence to zero. Differentiable through both
-                # pred voxels (F2 — previously this term was dropped, so the
-                # loss was blind to hallucinated features).
-                if death_idx < 0:
-                    continue
-                pair_cost = (flat_pred[death_idx] - flat_pred[birth_idx]).abs() / 2.0
-            loss = loss + (pair_cost**self.wasserstein_p)
+            total = total + self._dim_cost(flat_pred, p_pairs, p_birth, p_death, t_pairs)
 
-        # W_p distance is the p-th root of the matching cost. sqrt / pow(1/p)
-        # have an INFINITE derivative at 0, so a perfect slice (loss == 0, i.e.
-        # pred == target) would yield a NaN gradient (∞·0). Guard so the optimum
-        # is an exact-zero loss with a finite (zero) gradient (F5); the identity
-        # test previously never called .backward() so this was latent.
-        positive = loss > 0
-        safe = torch.where(positive, loss, torch.ones_like(loss))
+        # W_p = (sum of p-th powers)^(1/p); sqrt / pow(1/p) has an infinite slope
+        # at 0, so a perfect slice is guarded to an exact zero with zero gradient (F5).
+        positive = total > 0
+        safe = torch.where(positive, total, torch.ones_like(total))
         exponent = 0.5 if self.wasserstein_p == 2 else 1.0 / self.wasserstein_p
-        root = safe.pow(exponent)
-        return torch.where(positive, root, torch.zeros_like(loss))
+        return torch.where(positive, safe.pow(exponent), torch.zeros_like(total))
 
-    def _persistence_with_voxels(self, vol_np: Any) -> tuple[Any, list[int], list[int]]:
-        """Compute persistence diagram + birth/death voxel indices for each pair.
+    def _dim_cost(
+        self,
+        flat_pred: torch.Tensor,
+        pred_dgm: Any,
+        birth_vox: Any,
+        death_vox: Any,
+        target_dgm: Any,
+    ) -> torch.Tensor:
+        """p-th power of the augmented matching cost for one homology dimension.
 
-        Returns:
-            pairs: array of shape ``(n_pairs, 2)`` with (birth, death).
-            birth_voxels: list of length ``n_pairs`` where each entry is
-                the flat index in ``vol_np`` of the top-dimensional cell
-                that *generates* the birth of the feature.
-            death_voxels: same, for the cell generating the death.
+        Every prediction feature contributes through its birth and death voxels.
+        A target feature with no prediction partner contributes its diagonal cost,
+        which does not depend on the prediction, so the value is two-sided.
+        """
+        import numpy as np
 
-        Cells are located via gudhi's ``cofaces_of_persistence_pairs``
-        (the actual critical cells), not by ``argmin(|flat - value|)``:
-        under value ties (a large flat or masked-out background) the
-        value heuristic collapsed to the first/corner voxel, so the
-        death gradient was scattered to the wrong voxel (F6). Tracking
-        both cells is required so the W2 loss vanishes at ``pred ==
-        target`` (see ``_slice_loss`` for the birth-only failure mode).
+        assert _ot is not None  # narrowed by __init__ guard
+        n_b = len(target_dgm)
+        _cost, pairs = _wasserstein_matching(
+            np.asarray(pred_dgm, dtype="float64").reshape(-1, 2),
+            np.asarray(target_dgm, dtype="float64").reshape(-1, 2),
+            p=self.wasserstein_p,
+            ot_module=_ExactAssignment,
+        )
+        p = self.wasserstein_p
+        dev, dt = flat_pred.device, flat_pred.dtype
+        rows = np.asarray([i for i, _ in pairs], dtype=np.int64)
+        cols = np.asarray([j for _, j in pairs], dtype=np.int64)
+        births = flat_pred[torch.as_tensor(np.asarray(birth_vox, dtype=np.int64), device=dev)]
+        deaths = flat_pred[torch.as_tensor(np.asarray(death_vox, dtype=np.int64), device=dev)]
+        rows_t = torch.as_tensor(rows, device=dev)
+        pb, pd = births[rows_t], deaths[rows_t]
+        genuine = cols < n_b
+        genuine_t = torch.as_tensor(genuine, device=dev)
+
+        total = flat_pred.new_zeros(())
+        if genuine.any():
+            g_cols = cols[genuine]
+            tb = torch.as_tensor(target_dgm[g_cols, 0], dtype=dt, device=dev)
+            td = torch.as_tensor(target_dgm[g_cols, 1], dtype=dt, device=dev)
+            # L_inf ground metric; the sum of coordinates would be an L_1 cost.
+            pair_cost = torch.maximum((pb[genuine_t] - tb).abs(), (pd[genuine_t] - td).abs())
+            total = total + pair_cost.pow(p).sum()
+        if (~genuine).any():
+            # Erasing a prediction feature costs its distance to the diagonal.
+            erased_cost = ((pd[~genuine_t] - pb[~genuine_t]).abs() / 2.0).pow(p)
+            total = total + erased_cost.sum()
+
+        matched = set(cols[genuine].tolist())
+        unmatched = [j for j in range(n_b) if j not in matched]
+        if unmatched:
+            t_pers = np.abs(target_dgm[unmatched, 1] - target_dgm[unmatched, 0]) / 2.0
+            total = total + float((t_pers**p).sum())
+        return total
+
+    def _persistence_with_voxels(self, vol_np: Any) -> dict[int, tuple[Any, Any, Any]]:
+        """Per-dimension persistence pairs with their generating birth/death voxels.
+
+        Returns ``{dim: (pairs, birth_voxels, death_voxels)}`` for each dimension
+        in ``homology_dims``. ``pairs`` is ``(n, 2)`` float64 (birth, death);
+        the voxel arrays give the flat index of the top-dimensional cell that
+        generates each birth and death.
+
+        Cells come from gudhi's ``cofaces_of_persistence_pairs`` (the actual
+        critical cells), not from value matching: under ties (a flat or masked
+        background) value matching sends the gradient to the wrong voxel (F6).
         """
         import numpy as np
 
@@ -309,94 +295,100 @@ class CubicalPHWassersteinLoss(nn.Module):
         cc.compute_persistence()
         flat = vol_np.reshape(-1)
 
-        # cofaces_of_persistence_pairs() -> (regular, essential). ``regular`` is
-        # grouped by homology dimension; each entry is an (n, 2) array of
-        # (birth_cell, death_cell) flat indices into ``vol_np``. ``essential``
-        # holds the infinite-persistence classes, which we drop for a finite
-        # diagram W_p matching (the previous ``np.isfinite`` filter did the same).
+        # ``regular`` is grouped by homology dimension, each an (n, 2) array of
+        # (birth_cell, death_cell). gudhi numbers top-dimensional cells in Fortran
+        # order; re-index to the C order that ``flat`` uses.
         regular, _essential = cc.cofaces_of_persistence_pairs()
+        out: dict[int, tuple[Any, Any, Any]] = {}
+        for dim in self.homology_dims:
+            arr = regular[dim] if dim < len(regular) else []
+            pairs: list[tuple[float, float]] = []
+            births: list[int] = []
+            deaths: list[int] = []
+            if len(arr) > 0:
+                c_order = np.ravel_multi_index(
+                    np.unravel_index(np.asarray(arr, dtype=np.int64), vol_np.shape, order="F"),
+                    vol_np.shape,
+                )
+                for row in c_order:
+                    birth_cell, death_cell = int(row[0]), int(row[1])
+                    birth_val = float(flat[birth_cell])
+                    death_val = float(flat[death_cell])
+                    if not (np.isfinite(birth_val) and np.isfinite(death_val)):
+                        # Pair touching a masked (+inf) region: no finite feature.
+                        continue
+                    pairs.append((birth_val, death_val))
+                    births.append(birth_cell)
+                    deaths.append(death_cell)
+            out[dim] = (
+                np.asarray(pairs, dtype="float64").reshape(-1, 2),
+                np.asarray(births, dtype=np.int64),
+                np.asarray(deaths, dtype=np.int64),
+            )
+        return out
 
-        pairs = []
-        birth_voxels: list[int] = []
-        death_voxels: list[int] = []
-        for dim, arr in enumerate(regular):
-            if dim not in self.homology_dims:
-                continue
-            for row in arr:
-                birth_cell = int(row[0])
-                death_cell = int(row[1])
-                birth_val = float(flat[birth_cell])
-                death_val = float(flat[death_cell])
-                if not (np.isfinite(birth_val) and np.isfinite(death_val)):
-                    # Pair touching a masked (+inf) region — no finite feature.
-                    continue
-                pairs.append((birth_val, death_val))
-                birth_voxels.append(birth_cell)
-                death_voxels.append(death_cell)
 
-        return (
-            np.asarray(pairs, dtype="float64").reshape(-1, 2),
-            birth_voxels,
-            death_voxels,
-        )
+class _ExactAssignment:
+    """Exact square assignment behind the ``emd`` interface.
+
+    POT's ``emd`` stops at an iteration cap and returns a non-optimal plan on
+    large diagrams (a 3k x 3k cost matrix gave 192 where the optimum is 6.6), so
+    the loss silently over-reported W_p. With uniform marginals the optimal plan
+    is a permutation, which ``linear_sum_assignment`` solves exactly.
+    """
+
+    @staticmethod
+    def emd(weights_a: Any, weights_b: Any, cost: Any) -> Any:
+        import numpy as np
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(cost)
+        plan = np.zeros_like(cost, dtype="float64")
+        plan[rows, cols] = weights_a[0]
+        return plan
 
 
 def _wasserstein_matching(
     a: Any, b: Any, p: int, ot_module: Any
 ) -> tuple[float, list[tuple[int, int]]]:
-    """Match two persistence diagrams under W_p; return (cost, pairs).
+    """Two-sided augmented matching of diagrams ``a`` and ``b`` under W_p.
 
-    Uses the augmented-with-diagonal trick: each diagram is padded
-    with the orthogonal projection of the other diagram's points
-    onto the diagonal, so the resulting matching always pairs
-    every off-diagonal point with either an off-diagonal point in
-    the other diagram or its own diagonal projection.
+    Both diagrams are augmented with the diagonal, as in the Edelsbrunner-Harer
+    reduction. A point's cost to the diagonal is its own distance to it, the
+    same for every diagonal copy, and the diagonal-to-diagonal block costs 0.
+    Returns the matching cost (sum of p-th powers over the chosen permutation)
+    and the pairs ``(i, j)`` for every point ``i`` of ``a``. ``j >= len(b)``
+    means ``a[i]`` is erased to the diagonal. The caller reads the unmatched
+    target features from the pairs.
     """
     import numpy as np
 
     n_a, n_b = a.shape[0], b.shape[0]
-    # Diagonal projections.
-    a_diag = np.column_stack([(a.sum(axis=1) / 2.0)] * 2)
-    b_diag = np.column_stack([(b.sum(axis=1) / 2.0)] * 2)
+    a_mid = a.sum(axis=1) / 2.0
+    b_mid = b.sum(axis=1) / 2.0
+    a_diag = np.column_stack([a_mid, a_mid])
+    b_diag = np.column_stack([b_mid, b_mid])
 
-    # Stacked source / target sets (size n_a + n_b each).
+    # Rows: a then b's diagonal copies. Columns: b then a's diagonal copies.
     src = np.vstack([a, b_diag])
     tgt = np.vstack([b, a_diag])
-
-    # Cost matrix: per-pair cost is the L_infinity ground metric raised to p,
-    # i.e. max(|d_birth|, |d_death|)^p. This is the standard ground metric for
-    # the persistence-diagram p-Wasserstein distance under which the
-    # Cohen-Steiner stability theorem holds; the L_1 sum used previously
-    # over-counts and breaks that bound. Since x -> x^p is monotone on x >= 0,
-    # (|d|^p).max == (max|d|)^p.
-    diff = src[:, None, :] - tgt[None, :, :]
-    cost_matrix = (np.abs(diff) ** p).max(axis=2)
-
-    # The diagonal<->diagonal block matches proj(b_l) against proj(a_k) — both
-    # points lie ON the diagonal, so in the augmented-assignment reduction for
-    # diagram W_p (Edelsbrunner-Harer; Kerber-Morozov-Nigmetov "Hera") its cost
-    # must be identically 0. Leaving it at the true L_inf value adds a spurious,
-    # matching-dependent penalty that mis-routes a genuine feature to the
-    # diagonal (~9% of random diagrams) and flips the gradient direction (F2).
+    # L_inf ground metric, built per coordinate to avoid an (n, n, 2) temporary.
+    d_birth = np.abs(src[:, None, 0] - tgt[None, :, 0])
+    d_death = np.abs(src[:, None, 1] - tgt[None, :, 1])
+    cost_matrix = np.maximum(d_birth, d_death) ** p
+    erase_a = (np.abs(a[:, 1] - a[:, 0]) / 2.0) ** p
+    erase_b = (np.abs(b[:, 1] - b[:, 0]) / 2.0) ** p
+    cost_matrix[:n_a, n_b:] = erase_a[:, None]
+    cost_matrix[n_a:, :n_b] = erase_b[None, :]
     cost_matrix[n_a:, n_b:] = 0.0
 
-    # Uniform marginals -> exact OT via linear assignment.
+    # Uniform marginals on a square matrix: the optimal plan is a permutation.
     n = n_a + n_b
     weights = np.ones(n) / n
     transport_plan = ot_module.emd(weights, weights, cost_matrix)
-
-    # Greedy decoding of the (sparse) transport plan into integer pairs. Every
-    # off-diagonal pred point ``i`` is emitted, including those matched to the
-    # diagonal (``j >= n_b``): the caller must penalise a pred feature the
-    # target lacks by pushing it toward the diagonal (zero persistence), so
-    # dropping those pairs here made the differentiable loss blind to
-    # hallucinated topology (F2). ``j >= n_b`` flags a diagonal match.
-    pairs: list[tuple[int, int]] = []
-    for i in range(n_a):  # off-diagonal source points (pred diagram)
-        j = int(np.argmax(transport_plan[i]))
-        pairs.append((i, j))
-
-    cost = float((cost_matrix * transport_plan).sum())
+    cols = np.argmax(transport_plan, axis=1)
+    cost = float(sum(cost_matrix[r, cols[r]] for r in range(n)))
+    pairs = [(i, int(cols[i])) for i in range(n_a)]
     return cost, pairs
 
 

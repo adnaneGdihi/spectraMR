@@ -55,12 +55,9 @@ src/spectramr/infrastructure/physics/multi_acquisition.py::MultiAcquisitionSimul
 src/spectramr/infrastructure/physics/pinn.py::get_pde  # 3 branches
 src/spectramr/infrastructure/physics/sampling.py::KSpaceAccelerator.timestep_for_acceleration  # 3 branches
 src/spectramr/infrastructure/physics/sampling.py::UniformCartesianKSpaceAccelerator.get_acceleration_mask  # 3 branches
-src/spectramr/infrastructure/physics/scanner_profile.py::axis_kwargs  # 3 branches
 src/spectramr/infrastructure/physics/severity.py::shape_severity_ratio  # 3 branches
 src/spectramr/infrastructure/physics/trajectories.py::get_trajectory  # 4 branches
 src/spectramr/infrastructure/reporting/style.py::use_default_style  # 3 branches
-src/spectramr/infrastructure/services/checkpoint_service.py::CheckpointService._load_safetensors  # 5 branches
-src/spectramr/infrastructure/services/checkpoint_service.py::CheckpointService._save_safetensors  # 5 branches
 src/spectramr/infrastructure/services/coil_sensitivity_service.py::CoilSensitivityEstimationService.estimate_sensitivity_maps  # 5 branches
 src/spectramr/infrastructure/services/device_manager.py::DeviceManager._setup_device  # 3 branches
 src/spectramr/infrastructure/training/builders/loss_builder.py::LossBuilder._build_list_based_losses  # 4 branches
@@ -70,7 +67,7 @@ src/spectramr/infrastructure/training/loss_scheduler.py::LossScheduler.compute_s
 src/spectramr/infrastructure/training/strategies/diffusion.py::DiffusionTrainingStrategy.sample_timesteps  # 4 branches
 src/spectramr/infrastructure/training/strategies/guided_sr_strategy.py::GuidedSuperResolutionStrategy._extract_reference  # 4 branches
 src/spectramr/infrastructure/training/strategies/mixins/kspace.py::KspaceMixin._prepare_model_input  # 4 branches
-src/spectramr/infrastructure/training/strategies/mixins/metrics_mixin.py::MetricsMixin._apply_metric_transforms  # 3 branches
+src/spectramr/infrastructure/training/strategies/mixins/metrics_mixin.py::MetricsMixin._metric_transform_views  # 3 branches
 src/spectramr/infrastructure/training/strategies/physics_equivariant_ssl_strategy.py::_apply_operator  # 3 branches
 src/spectramr/infrastructure/training/strategies/pipeline_strategy.py::MultiTrainingStrategy._execute_flow  # 4 branches
 src/spectramr/infrastructure/training/strategies/pipeline_strategy.py::MultiTrainingStrategy._resolve  # 3 branches
@@ -81,7 +78,6 @@ src/spectramr/infrastructure/validation/config_health_checker.py::ConfigHealthCh
 src/spectramr/infrastructure/validation/forward_probe.py::synthetic_forward_probe  # 4 branches
 src/spectramr/models/blocks/adapters/shape_adapters.py::LatentReshape2D.forward  # 6 branches
 src/spectramr/models/blocks/adapters/shape_adapters.py::LatentReshape3D.forward  # 6 branches
-src/spectramr/models/blocks/attention.py::LinearAttention.__init__  # 4 branches
 src/spectramr/models/blocks/cfg_schedule.py::make_schedule  # 5 branches
 src/spectramr/models/blocks/cross_scan_3d.py::CrossScan3D._flatten_axis  # 3 branches
 src/spectramr/models/blocks/cross_scan_3d.py::CrossScan3D._unflatten_axis  # 3 branches
@@ -92,7 +88,6 @@ src/spectramr/models/blocks/residual.py::UnifiedResidualBlock.__init__  # 3 bran
 src/spectramr/models/blocks/triton_scan.py::selective_scan  # 5 branches
 src/spectramr/models/blocks/upsampling.py::UnifiedUpsampleBlock.__init__  # 5 branches
 src/spectramr/models/classifiers/guidance_free_classifier.py::GuidanceFreeClassifier._build_model  # 4 branches
-src/spectramr/models/diffusion/architectures/enhanced_deep_unet.py::create_diffusion_model  # 3 branches
 src/spectramr/models/diffusion/cold_diffusion.py::ColdDiffusion.__init__  # 4 branches
 src/spectramr/models/diffusion/cold_diffusion.py::ColdDiffusion._degrade  # 4 branches
 src/spectramr/models/diffusion/diffusion_parts/swin_transformer_parts.py::EnhancedLayerNorm.forward  # 4 branches
@@ -120,10 +115,7 @@ src/spectramr/models/layers/kan/wavelet_basis.py::WaveletBasis.__init__  # 4 bra
 src/spectramr/models/lora.py::mark_only_lora_as_trainable  # 3 branches
 src/spectramr/models/losses/_legacy_weights.py::legacy_effective_weight  # 4 branches
 src/spectramr/models/losses/gan_loss_library.py::get_gan_loss  # 3 branches
-src/spectramr/models/losses/kspace_physics_losses.py::FrequencyWeightedL1Loss.forward  # 3 branches
-src/spectramr/models/losses/kspace_physics_losses.py::SobolevKSpaceLoss.forward  # 3 branches
 src/spectramr/models/losses/latent_losses.py::LatentRegularizationLoss.forward  # 3 branches
-src/spectramr/models/losses/loss_recommender.py::LossRecommender._generate_config  # 6 branches
 src/spectramr/models/losses/optimal_transport_losses.py::SinkhornDistance.forward  # 3 branches
 src/spectramr/models/mamba/d2_mamba.py::D2MambaBlock.forward  # 3 branches
 src/spectramr/models/model_cards.py::ModelCardGenerator.save_model_card  # 3 branches

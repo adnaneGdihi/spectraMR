@@ -7,6 +7,7 @@ and complex-aware activations (ModReLU).
 Designed for pure k-space processing where phase preservation is critical.
 """
 
+import logging
 from typing import Any
 
 import torch
@@ -16,6 +17,17 @@ from torch.utils.checkpoint import checkpoint
 
 from spectramr.models.blocks.attention import CrossContrastOLMPA
 from spectramr.models.blocks.attention_domains import validate_feature_domain
+from spectramr.models.blocks.complex_channel_gain import ComplexChannelGain
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
+from spectramr.models.blocks.kspace_geometry_gain import KSpaceGeometryGain
+from spectramr.models.blocks.radial_band_tokens import (
+    DEFAULT_MAX_LOG_SCALE,
+    RadialBandTokens,
+)
+from spectramr.models.blocks.timestep_embedding import (
+    sinusoidal_timestep_embedding,
+    validate_timestep_scale,
+)
 from spectramr.models.generators.kspace_cold_diffusion_generator import (
     KSpaceDownsampleBlock,
     KSpaceUNetBlock,
@@ -24,6 +36,8 @@ from spectramr.models.generators.kspace_cold_diffusion_generator import (
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.layers.complex_norm import ComplexRMSNorm
 from spectramr.models.registry import register_model
+
+logger = logging.getLogger(__name__)
 
 # Advertised values for the ``kspace_feature_norm`` model_kwarg. Validated at
 # build (pitfall #15): an unknown value RAISES rather than silently no-op'ing.
@@ -134,6 +148,8 @@ class ComplexUNet(nn.Module):
         self.features = features
         self.time_embedding_dim = time_embedding_dim
         self.feature_domain = validate_feature_domain(feature_domain)
+        # The "no max_timesteps" check in forward() runs once per instance, not per step.
+        self._warned_no_max_timesteps = False
 
         # Inter-layer scale control. The pure-k-space backbone has no normalization
         # (spatial BN/GN flatten the 1/f spectrum), so activation magnitude drifts
@@ -205,6 +221,8 @@ class ComplexUNet(nn.Module):
             activation="modrelu",
             padding_mode=padding_mode,
         )
+        # The bottleneck was the one stage without timestep conditioning.
+        self.bottleneck_gain = ComplexChannelGain(time_embedding_dim, current_channels * 2)
 
         # CC-OLMPA attention at bottleneck resolution (lowest spatial dims)
         if self.use_cc_olmpa:
@@ -280,6 +298,103 @@ class ComplexUNet(nn.Module):
         # forward must stay allocation-identical to the pre-checkpointing one.
         self.grad_checkpointing = False
 
+        # [RADIAL BAND TOKENS] Opt-in per-annulus, per-rung conditioning read at
+        # every up-step, where the radial attenuation is introduced (#2117).
+        # Built LAST: a module constructed earlier consumes RNG draws and shifts
+        # every later init, so the arm would stop being bit-identical to its
+        # control for a reason unrelated to the mechanism. Literal pop keys, never
+        # a loop -- check_model_kwargs_are_read harvests those literals.
+        bands = int(kwargs.pop("radial_band_tokens_bands", 0) or 0)
+        rungs = kwargs.pop("radial_band_tokens_rungs", None)
+        token_dim = int(kwargs.pop("radial_band_tokens_dim", 64))
+        max_log = float(kwargs.pop("radial_band_tokens_max_log", DEFAULT_MAX_LOG_SCALE))
+        self.radial_band_tokens = self._build_band_tokens(
+            bands, rungs, token_dim, max_log, features, kwargs
+        )
+        # Geometry planes as a per-bin gain at every stage, never as input channels:
+        # an additive plane is a measurement-independent k-space term (see the block).
+        geometry_planes = int(kwargs.pop("kspace_geometry_gain_planes", 0) or 0)
+        if geometry_planes and self.feature_domain != "kspace":
+            raise ValueError(
+                "ComplexUNet: kspace_geometry_gain_planes needs feature_domain='kspace'; "
+                f"the planes index k-space bins, not {self.feature_domain!r} pixels."
+            )
+        self.geometry_gain = (
+            KSpaceGeometryGain(
+                geometry_planes,
+                (features[0], *features[1:], features[-1] * 2, *reversed(features)),
+            )
+            if geometry_planes
+            else None
+        )
+
+    def _build_band_tokens(
+        self,
+        bands: int,
+        rungs: Any,
+        token_dim: int,
+        max_log: float,
+        features: tuple[int, ...],
+        leftover_kwargs: dict[str, Any],
+    ) -> RadialBandTokens | None:
+        """The block, or ``None``, refusing a knob in its namespace it cannot read.
+
+        This constructor ends in ``**kwargs``, so a misspelled knob is otherwise
+        absorbed and the arm runs as its control silently: the advertised-options
+        audit skips a signature carrying ``**kwargs``, and the inert-knob scan
+        sees declared parameters only.
+        """
+        unknown = sorted(k for k in leftover_kwargs if k.startswith("radial_band_tokens"))
+        if unknown:
+            raise ValueError(
+                f"ComplexUNet: unrecognised radial band token knob(s) {unknown}. A knob in "
+                "this namespace that nothing reads is indistinguishable from one that works."
+            )
+        if not bands:
+            return None
+        if self.feature_domain != "kspace":
+            raise ValueError(
+                "ComplexUNet: radial_band_tokens_bands needs feature_domain='kspace'; a "
+                f"radial annulus is not defined on {self.feature_domain!r} feature maps."
+            )
+        if rungs is None:
+            raise ValueError(
+                "ComplexUNet: radial_band_tokens_bands was declared without a rung count. "
+                "The generator derives it from num_timesteps; a direct caller must pass "
+                "radial_band_tokens_rungs so the bank cannot disagree with the process."
+            )
+        return RadialBandTokens(
+            level_channels=tuple(reversed(features)),
+            n_bands=bands,
+            n_rungs=int(rungs),
+            token_dim=token_dim,
+            max_log_scale=max_log,
+        )
+
+    def _up_step(
+        self,
+        level: int,
+        trunk: torch.Tensor,
+        skip: torch.Tensor,
+        emb: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        rung: torch.Tensor,
+        full_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """One up-step, band tokens applied AFTER the stage norm -- before it,
+        ``ComplexRMSNorm``'s per-sample scalar divides the contribution back out.
+        """
+        out = self.norm_ups[level](self.ups[level](trunk, skip, emb, mask))
+        return self.radial_band_tokens(out, rung, level=level, full_size=full_size)
+
+    def _geometry(
+        self, features: torch.Tensor, geometry: torch.Tensor | None, stage: int
+    ) -> torch.Tensor:
+        """Apply the stage's geometry gain, after its norm, when one was built."""
+        if self.geometry_gain is None or geometry is None:
+            return features
+        return self.geometry_gain(features, geometry, stage)
+
     def _make_stage_norm(self, complex_channels: int) -> nn.Module:
         """ComplexRMSNorm for ``kspace_feature_norm='rms'``, else identity."""
         if self.kspace_feature_norm == "rms":
@@ -350,53 +465,104 @@ class ComplexUNet(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
         """
         t_emb = None
-        if timesteps is not None:
-            # ✅ CRITICAL FIX: Normalize timesteps to roughly [0, 1] range before sinusoidal embedding.
-            # In diffusion models with t ~ U(0, 1000), large max values destroy high-frequency sinusoidal
-            # components causing Identity Collapse (zero gradients across time batches).
-            if timesteps.max() > 1.0:
-                # Default max timesteps is typically 1000 in this framework
-                max_t = kwargs.get("max_timesteps", 1000.0)
-                timesteps_scaled = timesteps.float() / max_t
-            else:
-                timesteps_scaled = timesteps.float()
+        scale = validate_timestep_scale(kwargs.get("timestep_scale", "unit_interval"))
+        if timesteps is not None and scale == "integer":
+            # The private sinusoid rounds differently from the canonical owner (up to
+            # 1.9e-6 on 23% of entries), so integer keeps it and trained checkpoints
+            # keep their exact codes (#2315).
+            t_emb = self.time_mlp(
+                self._get_sinusoidal_embedding(timesteps.float(), self.time_embedding_dim)
+            )
+        elif timesteps is not None and scale != "unit_interval":
+            # A derived ladder has no trained predecessor, so it resolves through the
+            # canonical owner and needs the horizon it is derived from.
+            t_emb = self.time_mlp(
+                sinusoidal_timestep_embedding(
+                    timesteps,
+                    self.time_embedding_dim,
+                    max_timesteps=kwargs.get("max_timesteps"),
+                    scale=scale,
+                )
+            )
+        elif timesteps is not None:
+            # Normalise per-sample by the declared horizon, never by what else
+            # shares the batch: gating the division on the batch maximum
+            # embedded the reverse sampler's uniform t=1 as 1.0, the code for
+            # the LAST rung, while the same t=1 scaled correctly in training
+            # whenever a larger t happened to share its batch.
+            max_t = kwargs.get("max_timesteps")
+            if max_t is None:
+                # The legacy 1000-step ceiling stands in for an undeclared horizon and is
+                # logged once (one host sync, first eager call) unless t is all zero -- the
+                # reconstruction seam's constant, which scales to 0 under any horizon.
+                if not self._warned_no_max_timesteps and not torch.compiler.is_compiling():
+                    self._warned_no_max_timesteps = True
+                    if bool(timesteps.any()):
+                        logger.warning(
+                            "[ComplexUNet] No max_timesteps supplied; assuming the "
+                            "legacy 1000-step ceiling (suppressing further "
+                            "occurrences for this instance). Pass "
+                            "max_timesteps=<diffusion horizon> to condition on the "
+                            "arm's actual schedule."
+                        )
+                max_t = 1000.0
+            elif max_t <= 0:
+                raise ValueError(
+                    f"ComplexUNet received max_timesteps={max_t!r}; it must be "
+                    "a positive diffusion horizon, not a value to guess around."
+                )
+            timesteps_scaled = timesteps.float() / float(max_t)
 
             # [STABILIZATION FIX] Use proper sinusoidal embeddings
             t_sin = self._get_sinusoidal_embedding(timesteps_scaled, self.time_embedding_dim)
             t_emb = self.time_mlp(t_sin)
 
-        contrast_emb = kwargs.get("contrast_emb")
-        combined_emb = t_emb
-        if contrast_emb is not None:
-            # Fix batch mismatch: contrast_emb may have training batch size
-            # while t_emb has validation batch size during cascading validation
-            if t_emb is not None and contrast_emb.shape[0] != t_emb.shape[0]:
-                contrast_emb = contrast_emb[: t_emb.shape[0]]
-            combined_emb = (t_emb + contrast_emb) if t_emb is not None else contrast_emb
+        # The acquisition mask reaches the attention blocks as a forward argument
+        # rather than module state, so a block that consumes it is unit-testable in
+        # isolation. It is the FULL-resolution mask: each block center-crops it onto
+        # its own grid, matching the KSpaceCrop the encoder downsamples with.
+        mask = kwargs.get("mask")
+        geometry = kwargs.get("geometry")
+        if (geometry is None) != (self.geometry_gain is None):
+            raise ValueError(
+                "ComplexUNet: geometry planes and kspace_geometry_gain_planes must come "
+                f"together; got planes={geometry is not None}, gain built="
+                f"{self.geometry_gain is not None}."
+            )
+
+        combined_emb = fuse_contrast_embedding(
+            t_emb, kwargs.get("contrast_emb"), owner="ComplexUNet"
+        )
 
         # Initial Conv (normalized once, reused as the deepest skip)
-        x_start = self.norm_initial(self.initial_conv(x))
+        x_start = self._geometry(self.norm_initial(self.initial_conv(x)), geometry, 0)
 
         ckpt = self._checkpointing_active()
 
-        # Encoder — normalize the serial (depth) path where magnitude compounds
+        # Encoder, bottleneck and decoder all see time + contrast; an encoder fed the
+        # time embedding alone left every skip feature contrast-blind.
         skips = [x_start]
         current = x_start
         for idx, down_block in enumerate(self.downs):
             if ckpt:
-                current, skip = checkpoint(down_block, current, t_emb, use_reentrant=False)
+                current, skip = checkpoint(
+                    down_block, current, combined_emb, mask, use_reentrant=False
+                )
             else:
-                current, skip = down_block(current, t_emb)
-            current = self.norm_downs[idx](current)
+                current, skip = down_block(current, combined_emb, mask)
+            current = self._geometry(self.norm_downs[idx](current), geometry, idx + 1)
             skips.append(skip)
 
-        # Bottleneck
+        current = self.bottleneck_gain(current, combined_emb)
         if ckpt:
             current = self.norm_bottleneck(
                 checkpoint(self.bottleneck, current, use_reentrant=False)
             )
         else:
             current = self.norm_bottleneck(self.bottleneck(current))
+
+        up_stage = len(self.downs) + 2
+        current = self._geometry(current, geometry, up_stage - 1)
 
         # CC-OLMPA: cross-contrast attention at bottleneck resolution
         if self.cc_olmpa is not None:
@@ -415,13 +581,34 @@ class ComplexUNet(nn.Module):
             current = torch.cat([source_feat, target_feat], dim=1)
 
         # Decoder
+        if self.radial_band_tokens is not None and timesteps is None:
+            raise ValueError(
+                "ComplexUNet: the radial band tokens are rung-indexed, but this forward "
+                "received no timesteps. A bank silently defaulted to rung 0 is a global "
+                "embedding that still reports as wired."
+            )
+        full_size = (x.shape[-2], x.shape[-1])
         for i, up_block in enumerate(self.ups):
             skip = skips[-(i + 1)]
+            if self.radial_band_tokens is not None:
+                # One checkpointed unit so the per-level scale tensor is
+                # recomputed, not retained; widened only when the block is built,
+                # so an arm without it keeps the boundary its tests measured.
+                args = (i, current, skip, combined_emb, mask, timesteps, full_size)
+                current = (
+                    checkpoint(self._up_step, *args, use_reentrant=False)
+                    if ckpt
+                    else self._up_step(*args)
+                )
+                current = self._geometry(current, geometry, up_stage + i)
+                continue
             if ckpt:
-                block_out = checkpoint(up_block, current, skip, combined_emb, use_reentrant=False)
+                block_out = checkpoint(
+                    up_block, current, skip, combined_emb, mask, use_reentrant=False
+                )
             else:
-                block_out = up_block(current, skip, combined_emb)
-            current = self.norm_ups[i](block_out)
+                block_out = up_block(current, skip, combined_emb, mask)
+            current = self._geometry(self.norm_ups[i](block_out), geometry, up_stage + i)
 
         # Final Output
         out = self.final_conv(current)

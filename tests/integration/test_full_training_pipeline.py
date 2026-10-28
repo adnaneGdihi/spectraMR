@@ -4,7 +4,7 @@ Tests end-to-end training with:
 - Real configuration loading (TrainingSettings.from_yaml)
 - Actual training strategies (GAN, Diffusion, VAE, Reconstruction)
 - Real data loaders with physics transforms
-- Checkpoint saving/loading via CheckpointService
+- Checkpoint saving/loading via CheckpointStore
 - Validation metrics computation
 - DI container initialization
 
@@ -252,6 +252,9 @@ class TestFullTrainingIntegration:
 
         checkpoint_service = resolve_service(ICheckpointService)
         assert checkpoint_service is not None
+        from spectramr.infrastructure.checkpointing.facade import CheckpointStore
+
+        assert isinstance(checkpoint_service, CheckpointStore)
 
         # NOTE: Full strategy testing requires running actual training pipeline
         # This test validates config loading and DI container setup
@@ -452,7 +455,7 @@ class TestDataLeakPreventionInTraining:
     def test_noise_simulation_active_in_data_consistency(self):
         """Test that data consistency layer adds noise during training."""
         from spectramr.config.schemas.physics import DataConsistencyConfig
-        from spectramr.infrastructure.physics.data_consistency import DataConsistencyLayer
+        from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 
         # Create DC layer with noise enabled
         dc_config = DataConsistencyConfig(
@@ -462,7 +465,7 @@ class TestDataLeakPreventionInTraining:
             noise_type="gaussian",
         )
 
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=dc_config.train_noise_level,
             eval_noise_level=dc_config.eval_noise_level,
             noise_type=dc_config.noise_type,

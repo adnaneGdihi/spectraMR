@@ -109,3 +109,34 @@ def test_submit_one_arm_slurm_uses_generate_job_script(tmp_path):
     )
     assert status.status == "submitted"
     assert status.slurm_job_id == 0  # dry-run submit_job returns 0
+
+
+@pytest.mark.parametrize(
+    ("flags", "resumes"), [({}, False), ({"fresh": True}, False), ({"resume": True}, True)]
+)
+def test_container_and_per_arm_paths_agree_on_resume(monkeypatch, tmp_path, flags, resumes):
+    """Only --resume spells a checkpoint resume on the non-array paths (#2542)."""
+    seen = {}
+
+    def fake_run(self, inv, res, *, dry_run=False):
+        seen["args"] = inv.to_cli_args()
+        return backends_mod.RunHandle("docker", returncode=0)
+
+    monkeypatch.setattr(backends_mod.DockerBackend, "run", fake_run)
+    CampaignOrchestrator(where="docker", **flags)._run_arm_in_container(
+        name="a", cfg_path="x.yaml", exp_output=tmp_path, slurm_params={}, role="v"
+    )
+    assert ("--resume" in seen["args"]) is resumes
+
+    orch = CampaignOrchestrator(where="slurm", dry_run=True, **flags)
+    scripts: list[str] = []
+    orch.slurm.submit_job = lambda script, **kw: scripts.append(script) or 0  # type: ignore[method-assign]
+    orch._submit_one_arm(
+        name="a",
+        cfg_path="x.yaml",
+        exp_output=tmp_path,
+        slurm_params={},
+        test_manifest_path=None,
+        role="v",
+    )
+    assert ("--resume auto" in scripts[0]) is resumes

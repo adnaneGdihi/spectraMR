@@ -407,12 +407,12 @@ class HybridFourierKANEmbedding(nn.Module):
 class KANTimeEmbedding(nn.Module):
     """KAN-based time embedding using advanced KAN layers"""
 
-    def __init__(self, dim: int, max_timesteps: int = 1000, kan_type: str = "fast"):
+    def __init__(self, dim: int, max_timesteps: int, kan_type: str = "fast"):
         """__init__.
 
         Args:
             dim (int): Description.
-            max_timesteps (int): Description.
+            max_timesteps (int): Diffusion horizon the positional code spans.
             kan_type (str): Description.
         """
         super().__init__()

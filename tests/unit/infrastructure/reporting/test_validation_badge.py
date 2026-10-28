@@ -252,3 +252,78 @@ def test_audit_hook_reports_both_missing_and_failed_gates() -> None:
     assert "hallucination" in result.failed_gates
     assert "missing" in result.message
     assert "failed" in result.message
+
+
+# ── from_certificate_paths: upstream JSON -> gates, failing closed (#3041) ─────
+
+
+def _write(tmp_path, name, payload) -> str:
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def test_missing_artefacts_fail_every_required_gate(tmp_path) -> None:
+    badge = ValidationBadge.from_certificate_paths({}, required_gates=DEFAULT_REQUIRED_GATES)
+    assert badge.eligible is False
+    assert set(badge.failed_gates) == set(DEFAULT_REQUIRED_GATES)
+    assert badge.missing_gates == ()
+
+
+def test_unreadable_and_absent_artefacts_are_failed_not_skipped(tmp_path) -> None:
+    bad = tmp_path / "r1.json"
+    bad.write_text("{not json", encoding="utf-8")
+    badge = ValidationBadge.from_certificate_paths(
+        {"r1_cdfc": str(bad), "r5_pac_bayes": str(tmp_path / "gone.json")},
+        required_gates=("conformal_coverage", "pac_bayes"),
+    )
+    assert set(badge.failed_gates) == {"conformal_coverage", "pac_bayes"}
+    assert badge.gates["conformal_coverage"].details.startswith("r1_cdfc: unreadable")
+
+
+def test_each_certificate_maps_to_its_gate(tmp_path) -> None:
+    upstream = {
+        "r1_cdfc": _write(
+            tmp_path, "r1.json", {"alpha": 0.1, "empirical_coverage": 0.93}
+        ),
+        "r2_chd": _write(
+            tmp_path,
+            "r2.json",
+            {"beta": 0.05, "empirical_fpr": 0.02, "bound_is_tight": True},
+        ),
+        "r4_prc": _write(tmp_path, "r4.json", {"is_certified": True}),
+        "r5_pac_bayes": _write(tmp_path, "r5.json", {"is_non_vacuous": False, "bound": 1.4}),
+    }
+    badge = ValidationBadge.from_certificate_paths(
+        upstream,
+        required_gates=("conformal_coverage", "hallucination", "pathology_recall", "pac_bayes"),
+    )
+    assert badge.gates["conformal_coverage"].passed is True
+    assert badge.gates["hallucination"].passed is True
+    assert badge.gates["pathology_recall"].passed is True
+    assert badge.gates["pac_bayes"].passed is False
+    assert badge.failed_gates == ("pac_bayes",)
+
+
+def test_chd_with_a_loose_dkw_bound_fails_the_hallucination_gate(tmp_path) -> None:
+    upstream = {
+        "r2_chd": _write(
+            tmp_path, "r2.json", {"beta": 0.05, "empirical_fpr": 0.01, "bound_is_tight": False}
+        )
+    }
+    badge = ValidationBadge.from_certificate_paths(upstream, required_gates=("hallucination",))
+    assert badge.gates["hallucination"].passed is False
+
+
+def test_unknown_certificate_letter_raises(tmp_path) -> None:
+    with pytest.raises(ValueError, match="unknown certificate letter 'r9_x'"):
+        ValidationBadge.from_certificate_paths({"r9_x": "x.json"})
+
+
+def test_malformed_artefact_fails_its_gate_instead_of_raising(tmp_path) -> None:
+    upstream = {"r1_cdfc": _write(tmp_path, "r1.json", {"empirical_coverage": 0.95})}
+    badge = ValidationBadge.from_certificate_paths(
+        upstream, required_gates=("conformal_coverage",)
+    )
+    assert badge.gates["conformal_coverage"].passed is False
+    assert "malformed artefact" in badge.gates["conformal_coverage"].details

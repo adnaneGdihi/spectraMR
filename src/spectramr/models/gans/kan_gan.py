@@ -1,5 +1,6 @@
 from torch import nn
 
+from spectramr.models.discriminators.patchgan_discriminator import PatchGANDiscriminator
 from spectramr.models.layers.kan.kanu_net import KANU_Net
 from spectramr.models.registry import register_model
 
@@ -28,17 +29,17 @@ def get_generator(
 def get_discriminator(in_channels=1, **kwargs):
     """Gets the PatchGAN discriminator.
     For a fair comparison, we can use the same discriminator across models.
-    """
-    try:
-        from ..discriminators.patchgan_discriminator import PatchGANDiscriminator
-    except ImportError:
-        from ..discriminators.patchgan_discriminator import PatchGANDiscriminator
 
-    return PatchGANDiscriminator(in_channels)
+    ``**kwargs`` reaches ``PatchGANDiscriminator``: ``ndf``, ``n_layers`` and
+    ``spectral_norm`` are real knobs there, and dropping them made every one
+    unreachable through this getter (non-negotiable 8). An unknown key now raises
+    from the constructor rather than being discarded (non-negotiable 3).
+    """
+    return PatchGANDiscriminator(in_channels, **kwargs)
 
 
 @register_model(name="kan_gan", training_mode="gan")
-class KANGenerator:
+class KANGenerator(nn.Module):
     """KAN-based generator wrapper class."""
 
     def __init__(
@@ -59,6 +60,7 @@ class KANGenerator:
             norm_layer (type[nn.Module]): Description.
             opt (dict | None): Description.
         """
+        super().__init__()
         self.model = get_generator(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -67,16 +69,6 @@ class KANGenerator:
             opt=opt,
             **kwargs,
         )
-
-    def __call__(self, x):
-        """__call__.
-
-        Args:
-            x (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return self.model(x)
 
     def forward(self, x):
         """forward.
@@ -89,8 +81,11 @@ class KANGenerator:
         return self.model(x)
 
 
-@register_model(name="kan_discriminator", training_mode="gan")
-class KANDiscriminator:
+# ``input_domain`` is deliberately LEFT UNDECLARED (#1920): this is a thin wrapper whose
+# input space is whatever ``get_discriminator()`` returns, which the wrapper does not
+# constrain.
+@register_model(role="discriminator", name="kan_discriminator", training_mode="gan")
+class KANDiscriminator(nn.Module):
     """KAN-based discriminator wrapper class."""
 
     def __init__(self, in_channels=1, **kwargs):
@@ -99,17 +94,8 @@ class KANDiscriminator:
         Args:
             in_channels (Any): Description.
         """
+        super().__init__()
         self.model = get_discriminator(in_channels, **kwargs)
-
-    def __call__(self, x):
-        """__call__.
-
-        Args:
-            x (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return self.model(x)
 
     def forward(self, x):
         """forward.

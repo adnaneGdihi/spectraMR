@@ -15,7 +15,7 @@ Categories:
 - ``patience_min_iterations`` overrides check-based patience
 - ``on_improvement`` callback fires on improvement
 - ``reset`` returns to initial state
-- ``should_check`` respects ``check_interval``
+- no check cadence of its own: every ``update`` is a check (#1555)
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ def test_constructor_persists_config_fields() -> None:
         patience=5,
         metric="val_loss",
         min_delta=0.01,
-        check_interval=100,
         mode=MetricMode.MIN,
     )
     svc = EarlyStoppingService(config=cfg)
@@ -47,7 +46,6 @@ def test_constructor_persists_config_fields() -> None:
     assert svc.patience == 5
     assert svc.monitor == "val_loss"
     assert svc.min_delta == 0.01
-    assert svc.check_interval == 100
     assert svc.mode == MetricMode.MIN
 
 
@@ -194,19 +192,25 @@ def test_callback_fires_on_improvement() -> None:
 
 
 # ---------------------------------------------------------------------------
-# should_check
+# Check cadence
 # ---------------------------------------------------------------------------
 
 
-def test_should_check_respects_interval() -> None:
-    """``should_check`` returns True only every ``check_interval`` iterations."""
-    cfg = EarlyStoppingConfigSchema(enabled=True, check_interval=100)
-    svc = EarlyStoppingService(cfg)
-    assert svc.should_check(0) is False  # iteration 0 excluded
-    assert svc.should_check(50) is False
-    assert svc.should_check(100) is True
-    assert svc.should_check(200) is True
-    assert svc.should_check(150) is False
+def test_every_update_is_a_check_with_no_interval_gate() -> None:
+    """Planted (#1555): the service has no cadence of its own to leave unread.
+
+    The training loop calls ``update`` once per validation pass, so patience counts
+    passes. ``should_check``/``check_interval`` advertised a second cadence that no
+    production path consulted; they are gone, and an off-grid iteration still counts.
+    """
+    svc = EarlyStoppingService(EarlyStoppingConfigSchema(enabled=True, patience=2))
+    assert not hasattr(svc, "should_check")
+    assert not hasattr(svc, "check_interval")
+    svc.update(1.0, iteration=7)
+    svc.update(1.0, iteration=13)
+    assert svc.should_stop() is False
+    svc.update(1.0, iteration=29)
+    assert svc.should_stop() is True
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +267,6 @@ def test_get_state_returns_documented_keys() -> None:
         "patience",
         "patience_min_iterations",
         "min_delta",
-        "check_interval",
         "best_value",
         "best_iteration",
         "wait_count",
@@ -358,3 +361,80 @@ class TestModeIsReconciledWithTheDirectionSSOT:
     def test_disabled_early_stopping_is_not_policed(self):
         """A disabled block's `mode` decides nothing, so it cannot be wrong."""
         assert self._build("val_psnr", "min", enabled=False) is not None
+
+
+class TestStateSurvivesAResume:
+    """#2304: a fresh service after a resume counted its first validation as
+    an improvement, so the best-checkpoint gate (``wait_count == 0``) fired
+    and overwrote the best checkpoint with a worse model."""
+
+    @staticmethod
+    def _svc(**kw) -> EarlyStoppingService:
+        base = {"enabled": True, "metric": "val_hfen_mean", "mode": MetricMode.MIN, "patience": 5}
+        base.update(kw)
+        return EarlyStoppingService(EarlyStoppingConfigSchema(**base))
+
+    def test_a_worse_first_validation_after_resume_is_not_an_improvement(self) -> None:
+        before = self._svc()
+        before.update(0.060, iteration=3000)
+        before.update(0.070, iteration=4000)
+        before.update(0.065, iteration=5000)
+
+        resumed = self._svc()
+        resumed.load_state_dict(before.state_dict())
+        resumed.update(0.075, iteration=6000)
+
+        assert resumed.best_value == pytest.approx(0.060)
+        assert resumed.best_iteration == 3000
+        assert resumed.wait_count == 3  # the gate for the best checkpoint stays shut
+
+    def test_a_fresh_service_is_the_defect(self) -> None:
+        """What resume did without the state: the same worse value 'improves'."""
+        fresh = self._svc()
+        fresh.update(0.075, iteration=6000)
+        assert fresh.wait_count == 0
+
+    def test_a_best_checkpoint_record_seeds_the_best(self) -> None:
+        resumed = self._svc()
+        resumed.load_state_dict(
+            {"monitor": "val_hfen_mean", "best_value": 0.060, "best_iteration": 3000}
+        )
+        resumed.update(0.075, iteration=6000)
+        assert resumed.wait_count == 1
+        assert resumed.best_value == pytest.approx(0.060)
+
+    @pytest.mark.parametrize("recorded", ["hfen_mean", "val_hfen_mean_2x", "hfen_mean_32x"])
+    def test_a_best_checkpoint_record_under_a_resolved_alias_seeds_the_best(
+        self, recorded
+    ) -> None:
+        """save_best records the val_metrics key the monitor resolved to."""
+        resumed = self._svc()
+        resumed.load_state_dict({"monitor": recorded, "best_value": 0.060, "best_iteration": 3000})
+        assert resumed.best_value == pytest.approx(0.060)
+
+    def test_a_full_state_under_an_alias_still_raises(self) -> None:
+        """A saved state_dict names the configured monitor, so an alias there is a real change."""
+        record = {"monitor": "hfen_mean", "mode": "min", "best_value": 0.06, "best_iteration": 1}
+        with pytest.raises(ValueError, match="monitors 'val_hfen_mean'"):
+            self._svc().load_state_dict(record)
+
+    def test_a_latched_stop_survives(self) -> None:
+        before = self._svc(patience=1)
+        before.update(0.06, iteration=1)
+        before.update(0.07, iteration=2)
+        assert before.should_stop()
+        resumed = self._svc(patience=1)
+        resumed.load_state_dict(before.state_dict())
+        assert resumed.should_stop()
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"monitor": "val_psnr", "mode": "min", "best_value": 30.0, "best_iteration": 1},
+            {"monitor": "val_hfen_mean", "mode": "max", "best_value": 0.1, "best_iteration": 1},
+            {"monitor": "val_psnr", "best_value": 30.0, "best_iteration": 1},
+        ],
+    )
+    def test_state_for_another_metric_or_direction_raises(self, record) -> None:
+        with pytest.raises(ValueError, match="monitors 'val_hfen_mean'"):
+            self._svc().load_state_dict(record)

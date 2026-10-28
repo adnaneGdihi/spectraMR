@@ -32,6 +32,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.data_consistency import ConformalDataConsistency
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
@@ -54,6 +55,13 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
     objective and the regulariser still constrains the SFC head.
     """
 
+    # parallel_compat: The SFC block is an owned module, DDP-wrapped and run via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: object) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("sfc", OWNED_MODULE),)
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "adaptive_sfc_hssc", None)
@@ -64,9 +72,9 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
         self.sfc = BeltramiSFCBlock(grid_size=grid_size, in_channels=in_channels)
         if self.device is not None:
             self.sfc = self.sfc.to(self.device)
-        # The Beltrami SFC head is learnable (mu_head Conv2d stack). Move it to
-        # device (else a CUDA input hits a CPU head) and register it on opt_g
-        # (else its regulariser gradients are never stepped).
+        # The Beltrami SFC head is learnable: register it for DDP, then put its
+        # parameters on opt_g (else its regulariser gradients are never stepped).
+        self.register_owned_module("sfc", self.sfc)
         opt = getattr(self.env, "opt_g", None)
         if opt is not None:
             existing = {p for g in opt.param_groups for p in g["params"]}
@@ -86,7 +94,7 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
         # reconstructor itself sees the unrestricted input.
         gs = self.sfc.grid_size
         x_sfc = F.interpolate(input_batch, size=(gs, gs), mode="bilinear", align_corners=False)
-        sfc_out = self.sfc(x_sfc)
+        sfc_out = self.call_owned("sfc", x_sfc)
         # Only pass ``sfc_indices`` to generators whose ``forward`` advertises it
         # (or accepts ``**kwargs``). A strict ``forward(self, x)`` generator would
         # otherwise raise ``TypeError`` — the docstring promise is that models
@@ -131,6 +139,10 @@ class ConformalDiffusionReconStrategy(BaseTrainingStrategy):
     guarantees the wiring is exercised even while the Jacobian is trivial.
     """
 
+    # parallel_compat: Builds no parameters (ConformalDataConsistency holds a float alpha); the
+    # generator runs only through its wrapped forward.
+    parallel_compat = frozenset({"replicated"})
+
     # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
     # tensor, not the prepared input; declared here and emitted under the tag.
     snapshot_prepared_is_model_input: bool = False
@@ -160,7 +172,7 @@ class ConformalDiffusionReconStrategy(BaseTrainingStrategy):
         )
         sigma = (log_lo + torch.rand(b, device=device) * (log_hi - log_lo)).exp()
         noisy = target_batch + sigma.view(-1, 1, 1, 1) * torch.randn_like(target_batch)
-        self._declare_model_input({"noisy": noisy, "sigma": sigma})
+        self._declare_model_input({"noisy": noisy, "sigma": sigma}, extra={"model_input_key": "noisy"})
         recon = self.generator_model(noisy)
         batch = kwargs.get("batch", {})
         mask = batch.get("mask")

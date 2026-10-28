@@ -32,7 +32,7 @@ def make(
 ) -> Path | None:
     if df is None or df.empty or not {"nominal", "empirical"} <= set(df.columns):
         return None
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), column_width("single")))
     ax.plot([0, 1], [0, 1], color="#999999", lw=0.7, ls="--", label="ideal")
     methods = df["method"].unique() if "method" in df.columns else [None]

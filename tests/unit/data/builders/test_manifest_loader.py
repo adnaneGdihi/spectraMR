@@ -137,6 +137,18 @@ class TestRandomSplitDelegation:
         assert train_paths.isdisjoint(val_paths)
         assert len(val_paths) == 2 and len(train_paths) == 8
 
+    def test_random_split_keeps_each_subject_on_one_side(self, monkeypatch):
+        from spectramr.data.builders.manifest_loader import ManifestLoader
+
+        # Two volumes per subject; a by-file split cut subject p4 in half.
+        full = [{"primary_path": f"{i}.h5", "subject_id": f"p{i // 2}"} for i in range(10)]
+        self._patch_seams(monkeypatch, full)
+        train, val = ManifestLoader.load_fastmri_splits(self._config(0.3))
+        train_subjects = {r["subject_id"] for r in train}
+        val_subjects = {r["subject_id"] for r in val}
+        assert train_subjects.isdisjoint(val_subjects)
+        assert len(train) + len(val) == 10
+
 
 class TestOnTheFlySplitRouting:
     """B19: ``_build_on_the_fly_index``'s per-source ``split`` routing.

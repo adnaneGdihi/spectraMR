@@ -26,9 +26,14 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.training.backward_guard import ensure_backward_ready
 from spectramr.infrastructure.training.memory_context_managers import (
     gpu_memory_monitor,
     memory_cleanup_context,
+)
+from spectramr.infrastructure.training.nonfinite_monitor import (
+    NonFiniteMonitor,
+    guard_nonfinite_loss,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +98,9 @@ class StepExecutor:
         self.amp_helper = amp_helper
         self.amp_policy = amp_policy
         self.enable_memory_monitoring = enable_memory_monitoring
+        # Attached by the training loop for its run; None keeps the guard's
+        # synchronous raise for every other caller.
+        self.nonfinite_monitor: NonFiniteMonitor | None = None
 
         # Capability negotiation, read once. Polymorphism on an injected object,
         # NOT a backend name test -- an engine-owned backend (DeepSpeed) divides
@@ -121,6 +129,9 @@ class StepExecutor:
             getattr(self.amp_policy, "owns_gradient_accumulation", False) is True
         )
         self._policy_owns_zero_grad = getattr(self.amp_policy, "owns_zero_grad", False) is True
+        self._policy_owns_lr_scheduler = (
+            getattr(self.amp_policy, "owns_lr_scheduler", False) is True
+        )
         self.gradient_accumulation_steps = (
             1 if self._policy_owns_accumulation else self.requested_gradient_accumulation_steps
         )
@@ -154,25 +165,36 @@ class StepExecutor:
     def _guard_loss(self, loss: Any, *, name: str, global_step: int) -> None:
         """Run the policy's pre-backward loss guard, or the default one.
 
-        The rule (fail fast without a GradScaler, defer to the scaler with one)
-        lives on ``IStepPolicy.guard_loss`` so a backend with its own overflow
-        handling can no-op it. But the executor keeps a fallback for a policy
-        object that predates the ABC: dropping the guard because an injected
-        object lacks a method would silently reinstate the exact failure it
-        exists to prevent -- non-finite loss -> non-finite grads that
-        clip_grad_norm_ does NOT clamp -> optimizer.step() poisons the weights.
+        The rule lives on ``IStepPolicy.guard_loss`` so a backend with its own
+        overflow handling can no-op it; a policy object that predates the ABC
+        gets the same default, ``guard_nonfinite_loss``, rather than no guard.
+        ``nonfinite_monitor`` is attached by the training loop and handed to the
+        guard per call, so a guarded step records a device flag instead of
+        syncing to raise.
         """
         scaler = self.amp_helper.scaler
         guard = getattr(self.amp_policy, "guard_loss", None)
-        if callable(guard):
-            guard(loss, name=name, global_step=global_step, scaler=scaler)
-            return
-        if scaler is None and not torch.isfinite(loss).all():
-            raise RuntimeError(
-                f"Non-finite loss for config {name!r} at step {global_step} "
-                "before backward; refusing to poison weights (check coil maps / "
-                "fidelity terms)."
-            )
+        if not callable(guard):
+            guard = guard_nonfinite_loss
+        guard(
+            loss,
+            name=name,
+            global_step=global_step,
+            scaler=scaler,
+            monitor=self.nonfinite_monitor,
+        )
+
+        # Second invariant, and deliberately NOT delegated to the policy: the
+        # loss must be connected to the autograd graph. DeepSpeed legitimately
+        # no-ops the finite check above (it owns its own overflow detect + step
+        # skip), but no backend can make a severed graph correct, so routing
+        # this through ``guard_loss`` would make it silently absent on exactly
+        # one backend -- the failure shape it exists to prevent. Runs last so a
+        # loss that is both non-finite and severed still reports the
+        # numerically actionable failure first. Runs here, before the
+        # accumulation divide and before ``scaler.scale()``, because both are
+        # multiplies that give a leaf a ``grad_fn`` and hide it (#1952).
+        ensure_backward_ready(loss, name=name, global_step=global_step)
 
     def execute_step(
         self,
@@ -237,8 +259,15 @@ class StepExecutor:
             ):
                 optimizer.zero_grad(set_to_none=True)
 
+            # Whether THIS micro-batch is the accumulation boundary. Needed before the
+            # forward: DDP arms its reducer (prepare_for_backward) when the forward runs,
+            # so a ``no_sync`` entered only around backward() is too late and every
+            # micro-batch still all-reduces.
+            perform_step = (global_step + 1) % self.gradient_accumulation_steps == 0
+
             # 2. Forward pass & loss inside AMP context.
             with contextlib.ExitStack() as stack:
+                stack.enter_context(_suppress_ddp_sync(model, perform_step))
                 if self.enable_memory_monitoring:
                     stack.enter_context(
                         memory_cleanup_context(description=f"trainer_step_{name}", log_memory=False)
@@ -260,11 +289,8 @@ class StepExecutor:
 
             # Record loss for metrics before scaling
             if loss is not None:
-                # Pre-backward finite guard. The rule (fail fast without a
-                # GradScaler, defer to the scaler with one) now lives on the
-                # policy as ``guard_loss``, so a backend with its own overflow
-                # handling can no-op it instead of having a raise it cannot
-                # reach hardcoded into the executor.
+                # Pre-backward finite guard; the rule lives on the policy so a
+                # backend with its own overflow handling can no-op it.
                 self._guard_loss(loss, name=name, global_step=global_step)
 
                 losses_record[f"{name}_loss"] = loss.detach()
@@ -272,8 +298,6 @@ class StepExecutor:
                 # Handle Gradient Accumulation scaling
                 if self.gradient_accumulation_steps > 1:
                     loss = loss / self.gradient_accumulation_steps
-
-                perform_step = (global_step + 1) % self.gradient_accumulation_steps == 0
 
                 # 3. Backward & Step via AMP policy
                 clip_fn = self._make_clip_fn(clip_and_log_fn, model, epoch, global_step, name)
@@ -287,7 +311,9 @@ class StepExecutor:
                 # (averaging is linear, so reducing N times and reducing once
                 # over the accumulated buffer agree), but it removes N-1 of
                 # every N all-reduces -- the dominant cost of a
-                # gradient_accumulation_steps > 1 DDP run.
+                # gradient_accumulation_steps > 1 DDP run. It is entered around the
+                # forward above for DDP; this one covers FSDP, which reads the flag
+                # at backward time.
                 with _suppress_ddp_sync(model, perform_step):
                     self.amp_policy.backward_and_step(
                         loss=loss,

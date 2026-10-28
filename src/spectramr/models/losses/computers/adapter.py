@@ -13,7 +13,11 @@ from typing import Any
 
 import torch
 
-from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.computers.base import (
+    DEFAULT_LOSS_DEVICE,
+    BaseLossComputer,
+    LossOutput,
+)
 
 
 class LossComputerAdapter(BaseLossComputer):
@@ -27,7 +31,7 @@ class LossComputerAdapter(BaseLossComputer):
         self,
         legacy_loss_computer: Any,
         config: Any,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = DEFAULT_LOSS_DEVICE,
     ):
         """Initialize adapter.
 
@@ -90,8 +94,8 @@ class LossComputerAdapter(BaseLossComputer):
             total_loss = total_loss.detach().requires_grad_(True)
 
         # Separate components from metrics
-        components = {}
-        metrics = {}
+        components: dict[str, torch.Tensor] = {}
+        metrics: dict[str, float | torch.Tensor] = {}
 
         for key, value in losses_dict.items():
             if isinstance(value, torch.Tensor):

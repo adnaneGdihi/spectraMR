@@ -83,6 +83,6 @@ def test_the_generators_own_default_pattern_is_renderable() -> None:
     from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
 
     default = inspect.signature(KSpaceMaskGenerator).parameters["default_pattern"].default
-    generator = KSpaceMaskGenerator(default_pattern=default)
+    generator = KSpaceMaskGenerator(num_timesteps=1000, default_pattern=default)
     mask = generator.generate_mask((1, 1, 16, 16), seed=0)
     assert mask.shape[-2:] == (16, 16)

@@ -76,6 +76,8 @@ class IdentityPreservationLoss(nn.Module):
 
     def __init__(self, norm: str = "l1") -> None:
         super().__init__()
+        # Validated as in CycleConsistencyLoss; an unknown norm would otherwise run MSE.
+        _resolve_norm(norm)
         self.norm = norm
 
     def forward(

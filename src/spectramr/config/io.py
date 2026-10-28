@@ -27,6 +27,55 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+
+
+class DuplicateKeyError(ConstructorError):
+    """A mapping in a config YAML repeats a key; PyYAML would keep the last one silently."""
+
+
+class StrictSafeLoader(yaml.SafeLoader):
+    """``SafeLoader`` that raises on a repeated mapping key at any depth.
+
+    Each mapping is checked once, as written, before merging rewrites it in place: an
+    override of a merged key (``<<: *anchor`` then the key) stays legal at any depth.
+    Unhashable keys are left to PyYAML's own ``ConstructorError``.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._checked: set[int] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if id(node) not in self._checked:
+            self._checked.add(id(node))
+            self._reject_duplicates(node)
+        super().flatten_mapping(node)
+
+    def _reject_duplicates(self, node: yaml.MappingNode) -> None:
+        seen: dict[Any, int] = {}
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node)
+            line = key_node.start_mark.line + 1
+            try:
+                repeated = key in seen
+            except TypeError:
+                continue  # unhashable: construct_mapping raises PyYAML's error for it
+            if repeated:
+                raise DuplicateKeyError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r} on line {line} (first on line {seen[key]})",
+                    key_node.start_mark,
+                )
+            seen[key] = line
+
+
+def load_yaml_strict(stream: Any) -> Any:
+    """Parse YAML like ``yaml.safe_load`` but raise :class:`DuplicateKeyError` on a repeated key."""
+    return yaml.load(stream, Loader=StrictSafeLoader)
 
 
 def read_yaml_dict(path: str | Path) -> dict[str, Any]:
@@ -49,7 +98,7 @@ def read_yaml_dict(path: str | Path) -> dict[str, Any]:
     if not p.exists():
         raise FileNotFoundError(f"YAML file not found: {p}")
     with p.open() as f:
-        data = yaml.safe_load(f)
+        data = load_yaml_strict(f)
     return data or {}
 
 
@@ -70,4 +119,10 @@ def write_yaml_dict(data: dict[str, Any], path: str | Path) -> Path:
     return out
 
 
-__all__ = ["read_yaml_dict", "write_yaml_dict"]
+__all__ = [
+    "DuplicateKeyError",
+    "StrictSafeLoader",
+    "load_yaml_strict",
+    "read_yaml_dict",
+    "write_yaml_dict",
+]

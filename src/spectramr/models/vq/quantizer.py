@@ -71,23 +71,22 @@ class VQQuantizer(nn.Module):
         # Flatten input for quantization
         z_flattened = z.view(-1, self.embedding_dim)
 
-        # Compute distances to codebook entries
-        distances = torch.sum(
-            (z_flattened.unsqueeze(1) - self.embeddings.unsqueeze(0)) ** 2,
-            dim=2,
-        )
+        # ||z - e||^2 = ||z||^2 + ||e||^2 - 2 z.e: an (N, K) matmul. The broadcast
+        # difference ``(z - e)**2`` materialises (N, K, D) -- 32 GiB for the 64x64
+        # latent, K=1024, D=256 of experiment_54, which OOMs a 16 GiB card. Autocast is
+        # off because a half-precision matmul would flip the argmin on near-ties.
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            zf = z_flattened.float()
+            emb = self.embeddings.float()
+            distances = (
+                zf.pow(2).sum(1, keepdim=True) + emb.pow(2).sum(1).unsqueeze(0) - 2 * zf @ emb.t()
+            )
 
         # Find closest embeddings
         encoding_indices = torch.argmin(distances, dim=1)
-        encodings = torch.zeros(
-            encoding_indices.shape[0],
-            self.num_embeddings,
-            device=z.device,
-        )
-        encodings.scatter_(1, encoding_indices.unsqueeze(1), 1)
 
         # Quantize
-        quantized = torch.matmul(encodings, self.embeddings)
+        quantized = F.embedding(encoding_indices, self.embeddings)
 
         # Reshape back to original shape
         quantized = quantized.view(z.shape)
@@ -116,6 +115,8 @@ class VQQuantizer(nn.Module):
 
         # Update codebook with EMA
         if self.training:
+            # The dense one-hot exists only for the EMA update's two reductions.
+            encodings = F.one_hot(encoding_indices, self.num_embeddings).to(z_flattened.dtype)
             self._update_codebook(z_flattened, encodings)
 
         # No perplexity is computed here. A `torch.exp(-sum(p log p))` over the

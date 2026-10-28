@@ -44,7 +44,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from spectramr.core.resources import (
     allocated_gpus_per_node,
@@ -241,6 +241,32 @@ class RunTopology:
         )
 
 
+def resolve_rank(environ: Mapping[str, str] | None = None) -> tuple[int | None, str]:
+    """The global rank of this process and where it came from; the one rule for it.
+
+    ``RANK`` first (torchrun always sets it). A hand-rolled ``srun`` sets ``SLURM_PROCID``
+    instead, trusted only beside an explicit ``WORLD_SIZE``: without one, ``srun -n N`` runs N
+    independent single-process jobs and PROCID is not a rank in any group. ``LOCAL_RANK`` is
+    NOT a fallback: it numbers the processes on one node, so used as a global rank it makes
+    every node's first process rank 0 (#2701).
+
+    Returns:
+        ``(rank, source)``, or ``(None, "unresolved")`` when the launch declares none.
+
+    Raises:
+        TopologyResolutionError: ``RANK`` or ``SLURM_PROCID`` is set but not a valid integer.
+    """
+    env = os.environ if environ is None else environ
+    rank = _int_or_raise(env, "RANK", default=None)
+    if rank is not None:
+        return rank, "env:RANK"
+    if _int_or_raise(env, "WORLD_SIZE", default=None) is not None:
+        rank = _int_or_raise(env, "SLURM_PROCID", default=None)
+        if rank is not None:
+            return rank, "env:SLURM_PROCID"
+    return None, "unresolved"
+
+
 def resolve_run_topology(
     environ: Mapping[str, str] | None = None,
     *,
@@ -273,7 +299,9 @@ def resolve_run_topology(
             than total ranks.
     """
     env = os.environ if environ is None else environ
-    probe = cpu_resources if cpu_probe is None else cpu_probe
+    probe = cast(
+        "Callable[..., dict[str, Any]]", cpu_probe if cpu_probe is not None else cpu_resources
+    )
     exists = os.path.exists if path_exists is None else path_exists
     gpus = visible_gpu_count if gpu_probe is None else gpu_probe
 
@@ -290,11 +318,10 @@ def resolve_run_topology(
     if world_size < 1:
         raise TopologyResolutionError(f"WORLD_SIZE={world_size} must be >= 1.")
 
-    rank = _int_or_raise(env, "RANK", default=None)
+    rank, rank_source = resolve_rank(env)
     if rank is None:
-        rank, sources["rank"] = 0, "default"
-    else:
-        sources["rank"] = "env:RANK"
+        rank, rank_source = 0, "default"
+    sources["rank"] = rank_source
     if rank >= world_size:
         raise TopologyResolutionError(
             f"RANK={rank} is outside WORLD_SIZE={world_size} (valid: 0..{world_size - 1})."

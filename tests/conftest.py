@@ -329,6 +329,16 @@ except ImportError as _torch_import_err:
     import torch
 
 
+@pytest.fixture
+def slurm_account(monkeypatch):
+    """A site allocation account, for tests that render sbatch directives.
+
+    The tree ships no default account (it is site-specific), so rendering a job
+    script raises unless ``$SPECTRAMR_SLURM_ACCOUNT`` is set.
+    """
+    monkeypatch.setenv("SPECTRAMR_SLURM_ACCOUNT", "test_alloc")
+
+
 @pytest.fixture(autouse=True)
 def clean_mocks():
     """Ensure mocks are cleaned up before/after each test to prevent pollution."""
@@ -528,9 +538,7 @@ def ensure_di_container_initialized():
 
     from spectramr.domain.interfaces.service_interfaces import ILoggingService
     from spectramr.infrastructure.di.di_container import init_container
-    from spectramr.infrastructure.services.logging_service import (
-        ComprehensiveLoggingService,
-    )
+    from tests.utils.logging_service import make_logging_service
 
     try:
         # Initialize container if not already done
@@ -541,7 +549,7 @@ def ensure_di_container_initialized():
             if not container.has_service(ILoggingService):
                 # Create temp directory for test logs
                 test_log_dir = tempfile.gettempdir()
-                logging_service = ComprehensiveLoggingService(log_dir=test_log_dir)
+                logging_service = make_logging_service(test_log_dir)
                 container.register(ILoggingService, logging_service)
         except ValueError:
             # Service already registered - this is OK
@@ -716,15 +724,13 @@ def setup_di_container(tmp_path):
         IMetricsService,
     )
     from spectramr.infrastructure.di.di_container import init_container
-    from spectramr.infrastructure.services.checkpoint_service import CheckpointService
-    from spectramr.infrastructure.services.logging_service import (
-        ComprehensiveLoggingService,
-    )
+    from spectramr.infrastructure.checkpointing.facade import CheckpointStore
     from spectramr.infrastructure.services.memory_optimization_service import (
         NoOpMemoryOptimizationService,
     )
     from spectramr.models.factories.model_factory import ModelFactory
     from spectramr.models.interfaces.models import IModelFactory
+    from tests.utils.logging_service import make_logging_service
 
     # Ensure a clean slate by resetting the global container
     di_module._global_container = None
@@ -736,10 +742,10 @@ def setup_di_container(tmp_path):
     log_dir.mkdir()
     container.register(
         ILoggingService,
-        provider=lambda: ComprehensiveLoggingService(log_dir=str(log_dir)),
+        provider=lambda: make_logging_service(str(log_dir)),
     )
     container.register(IMemoryOptimizationService, NoOpMemoryOptimizationService)
-    container.register(ICheckpointService, CheckpointService)
+    container.register(ICheckpointService, CheckpointStore)
     container.register(IMetricsService, MetricsService)
     container.register(IModelCardService, ModelCardService)
     container.register(IModelFactory, ModelFactory, singleton=True)

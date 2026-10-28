@@ -242,3 +242,30 @@ class TestTask2SpecificPhysics:
         bad_marker = torch.randn(1, 2, 16, 16, dtype=torch.complex64)
         with pytest.raises(ValueError, match="does not evenly divide"):
             model(x, marker_prior=bad_marker)
+
+
+class TestFourierShiftCorrectionKnob:
+    """``correction: none`` is the matched-compute uncorrected control."""
+
+    def test_rejects_unknown_correction(self) -> None:
+        with pytest.raises(ValueError, match="correction"):
+            FourierShiftOperator(correction="learned")
+
+    def test_none_ignores_marker_prior(self) -> None:
+        torch.manual_seed(0)
+        model = FourierShiftOperator(correction="none").eval()
+        x = torch.randn(1, 2, 32, 32)
+        marker = torch.randn(1, 1, 32, 32)
+        with torch.no_grad():
+            assert torch.allclose(model(x, marker_prior=marker), model(x))
+
+    def test_none_equals_zero_shift_and_differs_from_a_nonzero_shift(self) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(1, 2, 32, 32)
+        uncorrected = FourierShiftOperator(correction="none").eval()
+        zero = FourierShiftOperator(correction="marker").eval()
+        shifted = FourierShiftOperator(correction="marker").eval()
+        with torch.no_grad():
+            shifted.delta_x.fill_(0.3)
+            assert torch.allclose(uncorrected(x), zero(x), atol=1e-6)
+            assert not torch.allclose(uncorrected(x), shifted(x), atol=1e-4)

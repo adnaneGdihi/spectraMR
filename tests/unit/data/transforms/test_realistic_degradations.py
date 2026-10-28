@@ -247,3 +247,98 @@ def test_random_b0_distortion_single_forward_pass() -> None:
         "RandomB0Distortion must perform exactly one B0GeometricDistortion "
         f"forward pass per image; got {mock_forward.call_count}"
     )
+
+
+# ── Sampling-grid correctness (identity, axis order) ─────────────────────────
+
+
+class TestWarpGridIdentity:
+    """Zero field must be the exact identity on a non-cubic (D, H, W) volume."""
+
+    SHAPE = (4, 6, 8)
+
+    def _vol(self):
+        return torch.rand(1, 2, *self.SHAPE)
+
+    @pytest.mark.parametrize("shift_dim", [3, 4])
+    def test_b0_zero_field_is_identity(self, shift_dim):
+        from spectramr.data.transforms.realistic_degradations import B0GeometricDistortion
+
+        x = self._vol()
+        out = B0GeometricDistortion(strength=1.0, shift_dim=shift_dim)(x, torch.zeros(1, 1, *self.SHAPE))
+        torch.testing.assert_close(out, x, atol=1e-6, rtol=0)
+
+    @pytest.mark.parametrize("shift_dim", [3, 4])
+    def test_b0_shift_moves_only_along_shift_dim(self, shift_dim):
+        from spectramr.data.transforms.realistic_degradations import B0GeometricDistortion
+
+        x = torch.zeros(1, 1, *self.SHAPE)
+        idx = [slice(None)] * 5
+        idx[shift_dim] = 2
+        x[tuple(idx)] = 1.0  # plane at index 2 along shift_dim
+        b0 = torch.ones(1, 1, *self.SHAPE)  # +1 pixel everywhere
+        out = B0GeometricDistortion(strength=1.0, shift_dim=shift_dim)(x, b0)
+        other = [d for d in (2, 3, 4) if d != shift_dim]
+        # Profile along every other axis stays constant (no transposition).
+        for d in other:
+            ref = out.select(d, 0)
+            for i in range(1, out.shape[d]):
+                torch.testing.assert_close(out.select(d, i), ref, atol=1e-6, rtol=0)
+        prof = out.sum(dim=tuple(d for d in (2, 3, 4) if d != shift_dim)).flatten()
+        # Pull-back out(r) = x(r + 1): the whole plane lands one voxel lower, none above.
+        full = float(x.sum())
+        assert prof[1].item() == pytest.approx(full, abs=1e-5)
+        assert prof[2].item() < 1e-6 and prof[3].item() < 1e-6
+
+    @pytest.mark.parametrize("bad", [0, 1, 2, 5, -1])
+    def test_b0_rejects_other_shift_dim(self, bad):
+        from spectramr.data.transforms.realistic_degradations import B0GeometricDistortion
+
+        with pytest.raises(ValueError, match=r"3 \(H\) or 4 \(W\)"):
+            B0GeometricDistortion(strength=1.0, shift_dim=bad)
+
+    def test_b0_requires_shift_dim(self):
+        from spectramr.data.transforms.realistic_degradations import B0GeometricDistortion
+
+        with pytest.raises(TypeError):
+            B0GeometricDistortion(strength=1.0)
+
+    def test_elastic_zero_flow_is_identity(self, monkeypatch):
+        from spectramr.data.transforms.realistic_degradations import ElasticDeformation3D
+
+        monkeypatch.setattr(torch, "randn", lambda *a, **k: torch.zeros(*a, **k))
+        x = self._vol()
+        out = ElasticDeformation3D(alpha=1.0)(x)
+        torch.testing.assert_close(out, x, atol=1e-6, rtol=0)
+
+    def test_random_b0_tio_round_trip_strength_zero(self):
+        data = torch.rand(1, 8, 6, 4)  # TorchIO (C, W, H, D), non-cubic
+        subject = tio.Subject(img=tio.ScalarImage(tensor=data.clone()))
+        out = RandomB0Distortion(max_displacement=0.0, p=1.0)(subject)["img"].data
+        torch.testing.assert_close(out, data, atol=1e-6, rtol=0)
+
+
+def test_random_b0_distortion_leaves_excluded_target_untouched() -> None:
+    """The warp is an artefact of the degraded scan; the clean target must stay put."""
+    torch.manual_seed(0)
+    transform = RandomB0Distortion(max_displacement=2.0, p=1.0, exclude=("target",))
+    vol = torch.rand(1, 16, 16, 2)
+    subject = tio.Subject(
+        input=tio.ScalarImage(tensor=vol.clone()), target=tio.ScalarImage(tensor=vol.clone())
+    )
+    out = transform(subject)
+    assert torch.equal(out["target"].data, vol)
+    assert not torch.equal(out["input"].data, vol)
+
+
+def test_random_b0_distortion_draws_one_field_per_subject() -> None:
+    """Two copies of the same scan get the same warp, so they stay registered."""
+    torch.manual_seed(0)
+    transform = RandomB0Distortion(max_displacement=2.0, p=1.0)
+    vol = torch.rand(1, 16, 16, 2)
+    subject = tio.Subject(
+        image=tio.ScalarImage(tensor=vol.clone()), input=tio.ScalarImage(tensor=vol.clone())
+    )
+    out = transform(subject)
+    assert torch.equal(out["image"].data, out["input"].data)
+    assert not torch.equal(out["input"].data, vol)

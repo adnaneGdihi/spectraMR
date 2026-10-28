@@ -237,6 +237,82 @@ class TestCaching:
         )
 
 
+    def test_cache_write_is_observed_on_disk(
+        self, cache_dir, synthetic_multicoil_kspace
+    ):
+        """A miss writes ``<key>.pt``; the next call reads it back and nothing warns."""
+        from unittest.mock import MagicMock
+
+        logging_service = MagicMock()
+        svc = CoilSensitivityEstimationService(
+            logging_service=logging_service,
+            cache_dir=str(cache_dir),
+            enable_cache=True,
+        )
+        kspace, _ = synthetic_multicoil_kspace
+
+        first = svc.estimate_sensitivity_maps(kspace, method="fallback")
+        written = list(cache_dir.glob("*.pt"))
+        second = svc.estimate_sensitivity_maps(kspace, method="fallback")
+
+        assert not first.cached
+        assert len(written) == 1
+        assert not list(cache_dir.glob("*.tmp"))
+        assert second.cached
+        logging_service.log_warning.assert_not_called()
+
+    def test_programming_error_in_cache_write_raises(
+        self, service, synthetic_multicoil_kspace, monkeypatch
+    ):
+        """Only an I/O failure is downgraded to a warning (#2860).
+
+        The cache used to call a method no checkpoint service implements, and a
+        blanket ``except Exception`` turned the AttributeError into a warning.
+        """
+
+        def _broken_save(*_args, **_kwargs):
+            raise AttributeError("save_payload_to_path")
+
+        monkeypatch.setattr(torch, "save", _broken_save)
+        kspace, _ = synthetic_multicoil_kspace
+        with pytest.raises(AttributeError, match="save_payload_to_path"):
+            service.estimate_sensitivity_maps(kspace, method="fallback")
+
+    def test_disk_failure_in_cache_write_warns(
+        self, cache_dir, synthetic_multicoil_kspace, monkeypatch
+    ):
+        """A full disk must not abort estimation; the result is still returned."""
+        from unittest.mock import MagicMock
+
+        logging_service = MagicMock()
+        svc = CoilSensitivityEstimationService(
+            logging_service=logging_service,
+            cache_dir=str(cache_dir),
+            enable_cache=True,
+        )
+
+        # The message torch.save raises when writing to /dev/full.
+        def _full_disk(*_args, **_kwargs):
+            raise RuntimeError("basic_ios::clear: iostream error")
+
+        monkeypatch.setattr(torch, "save", _full_disk)
+        kspace, _ = synthetic_multicoil_kspace
+        result = svc.estimate_sensitivity_maps(kspace, method="fallback")
+
+        assert result.sensitivity_maps.shape[0] == kspace.shape[0]
+        logging_service.log_warning.assert_called_once()
+        assert "Failed to save cache" in logging_service.log_warning.call_args.args[0]
+
+    def test_checkpoint_service_is_not_a_constructor_argument(self, cache_dir):
+        """The cache owns its own write; no checkpoint service is accepted."""
+        with pytest.raises(TypeError, match="checkpoint_service"):
+            CoilSensitivityEstimationService(
+                logging_service=None,
+                cache_dir=str(cache_dir),
+                checkpoint_service=object(),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------

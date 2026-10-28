@@ -31,26 +31,41 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.training.step_io import accepts_step_io
+from spectramr.models.blocks.kspace_geometry_encoding import support_forward_kwargs
 
 from .reconstruction import ReconstructionTrainingStrategy
 
 logger = logging.getLogger(__name__)
 
 
-def _split_calibration_test(
-    batches: list[Any],
-) -> tuple[list[Any], list[Any] | None]:
-    """Split a materialised calibration cohort into disjoint calibrate/test halves.
+def _batch_size(batch: Any) -> int:
+    """Number of images a calibration batch carries (batch axis of its input)."""
+    x, _ = _calibration_input_target(batch)
+    return len(x)
 
-    Empirical coverage is only valid on data **disjoint** from the calibration
-    fit, so the conformal runner needs a held-out test split. Fewer than two
-    batches cannot be split — returns ``(all, None)`` and coverage stays ``None``.
+
+def _select_images(batch: Any, keep: list[int]) -> Any:
+    """Keep the images at batch-axis positions ``keep`` from a dict or tuple batch.
+
+    Tensors and per-image lists whose length is the batch size are indexed; any other
+    field (scalars, shared metadata) is carried through unchanged.
     """
-    if len(batches) < 2:
-        return batches, None
-    mid = len(batches) // 2
-    return batches[:mid], batches[mid:]
+    n = _batch_size(batch)
+    index = torch.as_tensor(keep, dtype=torch.long)
+
+    def pick(value: Any) -> Any:
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == n:
+            return value[index]
+        if isinstance(value, (list, tuple)) and len(value) == n:
+            return type(value)(value[i] for i in keep)
+        return value
+
+    if isinstance(batch, dict):
+        return {k: pick(v) for k, v in batch.items()}
+    return type(batch)(pick(v) for v in batch)
 
 
 def _calibration_input_target(batch: Any) -> tuple[Any, Any]:
@@ -69,6 +84,57 @@ def _calibration_input_target(batch: Any) -> tuple[Any, Any]:
     raise ValueError(
         "conformal calibration batch must be a dict with input/target or a "
         f"(input, target) tuple; got {type(batch).__name__}"
+    )
+
+
+def _count_images(batches: list[Any]) -> int:
+    return sum(_batch_size(b) for b in batches)
+
+
+def _cap_images(batches: list[Any], n_requested: int) -> tuple[list[Any], int]:
+    """Keep exactly ``n_requested`` images from ``batches``; raise when there are fewer."""
+    available = _count_images(batches)
+    if available < n_requested:
+        raise ValueError(
+            f"n_calibration={n_requested} but the calibration half holds {available} "
+            "images; lower n_calibration or enlarge the calibration cohort."
+        )
+    kept: list[Any] = []
+    left = n_requested
+    for batch in batches:
+        if left == 0:
+            break
+        size = _batch_size(batch)
+        if size <= left:
+            kept.append(batch)
+            left -= size
+        else:
+            kept.append(_select_images(batch, list(range(left))))
+            left = 0
+    return kept, n_requested
+
+
+def _batch_to_device(batch: Any, device: torch.device) -> Any:
+    """Move the tensor fields of a dict or tuple batch to ``device``."""
+    if isinstance(batch, dict):
+        return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+    return type(batch)(v.to(device) if isinstance(v, torch.Tensor) else v for v in batch)
+
+
+def _lesion_recall_inputs(model: Any, batches: list[Any], classes: list[str]) -> dict:
+    """Per-class ``(empirical_recall, n_positives)``. No lesion detector exists (#3041)."""
+    raise NotImplementedError(
+        "pathology_recall needs a lesion detector that turns reconstructions into "
+        f"empirical_recall for {classes}; none is implemented, so the certificate is not "
+        "computable (#3041)."
+    )
+
+
+def _pac_bayes_inputs(model: Any, batches: list[Any]) -> tuple[float, float, int]:
+    """``(empirical_risk, KL(Q||P), n)``. No KL(Q||P) estimator exists (#3041)."""
+    raise NotImplementedError(
+        "pac_bayes needs a KL(Q||P) estimator for the posterior; none is implemented, so the "
+        "certificate is not computable (#3041)."
     )
 
 
@@ -184,89 +250,117 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
             logger.warning("No generator on context — cannot run calibration.")
             return reports
 
-        # Materialise the calibration cohort once: (a) it is re-iterable across
-        # every certificate below (a one-shot generator would be exhausted by
-        # the first cert), and (b) the conformal certificate splits it into a
-        # disjoint calibrate/test half so empirical coverage can actually be
-        # measured. The calibration split is held-out and small by design.
+        # Materialise the cohort once: every certificate re-iterates it. Calibration
+        # and test are split by subject (no subject on both sides), seeded from run.seed.
         batches: list[Any] = list(dataloader)
+        calib_all: list[Any] = []
+        test_all: list[Any] = []
+        split_info: dict[str, Any] = {}
+        if {"conformal", "chd"} & set(self._enabled_certs):
+            calib_all, test_all, split_info = self._subject_split(batches, int(self.config.run.seed))
 
-        # Conformal / R1 — dispatch the score function through the
-        # calibration-score registry. score_kwargs (e.g. marker_basis_path
-        # for the vf_residual score) are pulled from the conformal block.
+        # Conformal / R1 — score function from the calibration-score registry.
         if "conformal" in self._enabled_certs:
-            raw_score = resolve_calibration_score(cert_cfg.conformal.score_fn)
+            cc = cert_cfg.conformal
+            raw_score = resolve_calibration_score(cc.score_fn)
             score_kwargs: dict[str, Any] = {}
-            if getattr(cert_cfg.conformal, "marker_basis_path", None) is not None:
-                score_kwargs["marker_basis_path"] = cert_cfg.conformal.marker_basis_path
+            if getattr(cc, "marker_basis_path", None) is not None:
+                score_kwargs["marker_basis_path"] = cc.marker_basis_path
 
             def _bound_score(pred, target, _fn=raw_score, _kw=score_kwargs):
                 return _fn(pred, target, **_kw)
 
-            calibrator = ConformalCalibrator(score_fn=_bound_score, alpha=cert_cfg.conformal.alpha)
+            calibrator = ConformalCalibrator(
+                score_fn=_bound_score,
+                alpha=cc.alpha,
+                foreground_threshold=cc.foreground_threshold,
+            )
             runner = ConformalCalibrationRunner(
                 model=model,
                 calibrator=calibrator,
                 device=self.device,
                 unpack_batch=_calibration_input_target,
             )
-            # Hold out a disjoint test split so empirical_coverage is actually
-            # MEASURED, not left None. A coverage-certifying arm that never
-            # computes coverage is pitfall #18 (metric <-> claim mismatch): the
-            # arm grades on empirical_coverage, so it must be produced.
-            calib_batches, test_batches = _split_calibration_test(batches)
-            if test_batches is None:
-                logger.warning(
-                    "conformal calibration: only %d batch(es) — too few to hold "
-                    "out a test split; empirical_coverage will be None.",
-                    len(batches),
-                )
-            report = runner.run(calib_batches, test_batches)
-            payload = (
-                report.to_dict()
-                if hasattr(report, "to_dict")
-                else {
-                    "quantile": report.quantile,
-                    "n_calibration": report.n_calibration,
-                    "alpha": report.alpha,
-                    "empirical_coverage": report.empirical_coverage,
-                    "avg_set_size": report.avg_set_size,
-                    "score_fn": cert_cfg.conformal.score_fn,
-                }
-            )
+            calib_batches, n_calib_images = _cap_images(calib_all, cc.n_calibration)
+            report = runner.run(calib_batches, test_all)
+            payload = {
+                "quantile": report.quantile,
+                "alpha": report.alpha,
+                "empirical_coverage": report.empirical_coverage,
+                "avg_set_size": report.avg_set_size,
+                "score_fn": cc.score_fn,
+                "foreground_threshold": cc.foreground_threshold,
+                "n_calibration_requested": cc.n_calibration,
+                "n_calibration_images": n_calib_images,
+                "n_calibration_pixels": report.n_calibration,
+                "n_test_images": _count_images(test_all),
+                **split_info,
+            }
             reports["r1_cdfc"] = payload
-            self._write_artefact(cert_cfg.conformal.output_artefact, payload)
+            self._write_artefact(cc.output_artefact, payload)
 
-        # CHD / R2
+        # CHD / R2 — threshold fit on calibration pixels (taken as non-hallucinated, H=0),
+        # FPR measured on the disjoint test half.
         if "chd" in self._enabled_certs:
-            detector = CalibratedHallucinationDetector(
-                beta=cert_cfg.chd.beta, delta=cert_cfg.chd.delta
+            ch = cert_cfg.chd
+            calib_batches, n_calib_images = _cap_images(calib_all, ch.n_calibration)
+            cal_scores = self._foreground_scores(calib_batches, model, ch.foreground_threshold)
+            test_scores = self._foreground_scores(test_all, model, ch.foreground_threshold)
+            detector = CalibratedHallucinationDetector(beta=ch.beta, delta=ch.delta).fit(
+                cal_scores
             )
-            report = detector.calibrate(model, batches, device=self.device)
-            reports["r2_chd"] = report.to_dict() if hasattr(report, "to_dict") else report
-            self._write_artefact(cert_cfg.chd.output_artefact, reports["r2_chd"])
+            payload = {
+                "beta": ch.beta,
+                "delta": ch.delta,
+                "threshold": detector.threshold,
+                "fpr_upper_bound": detector.fpr_upper_bound,
+                "dkw_slack": detector.fpr_upper_bound - ch.beta,
+                "bound_is_tight": detector.bound_is_tight,
+                "empirical_fpr": detector.empirical_fpr(test_scores),
+                "score_fn": "absolute_residual",
+                "foreground_threshold": ch.foreground_threshold,
+                "n_calibration_requested": ch.n_calibration,
+                "n_calibration_images": n_calib_images,
+                "n_calibration_pixels": detector.n_calibration,
+                "n_test_images": _count_images(test_all),
+                **split_info,
+            }
+            reports["r2_chd"] = payload
+            self._write_artefact(ch.output_artefact, payload)
 
-        # Pathology recall / R4
+        # Pathology recall / R4 — per class, Hoeffding lower bound on lesion recall.
+        # The lesion detector that yields empirical_recall does not exist; the config
+        # schema rejects enabled=true, and the input helper refuses if reached anyway.
         if "pathology_recall" in self._enabled_certs:
-            cert = PathologyRecallCertificate(
-                classes=cert_cfg.pathology_recall.classes,
-                delta=cert_cfg.pathology_recall.delta,
-                target_recall=cert_cfg.pathology_recall.target_recall,
-            )
-            report = cert.evaluate(model, batches, device=self.device)
-            reports["r4_prc"] = report.to_dict() if hasattr(report, "to_dict") else report
-            self._write_artefact(cert_cfg.pathology_recall.output_artefact, reports["r4_prc"])
+            prc = cert_cfg.pathology_recall
+            recalls = _lesion_recall_inputs(model, batches, prc.classes)
+            per_class: dict[str, dict[str, Any]] = {}
+            for cls in prc.classes:
+                empirical_recall, n_positives = recalls[cls]
+                cert = PathologyRecallCertificate(
+                    pathology_class=cls, target_recall=prc.target_recall, delta=prc.delta
+                )
+                per_class[cls] = cert.certify(empirical_recall, n_positives).to_dict()
+            payload = {
+                "classes": per_class,
+                "is_certified": all(r["is_certified"] for r in per_class.values()),
+            }
+            reports["r4_prc"] = payload
+            self._write_artefact(prc.output_artefact, payload)
 
-        # PAC-Bayes / R5
+        # PAC-Bayes / R5 — McAllester bound. KL(Q||P) has no estimator; the config schema
+        # rejects enabled=true, and the input helper refuses if reached anyway.
         if "pac_bayes" in self._enabled_certs:
+            pac = cert_cfg.pac_bayes
+            risk, kl, n = _pac_bayes_inputs(model, batches)
             cert = PACBayesCertificate(
-                delta=cert_cfg.pac_bayes.delta,
-                tv_tolerance_tau=cert_cfg.pac_bayes.tv_tolerance_tau,
-                loss_bound_M=cert_cfg.pac_bayes.loss_bound_M,
+                delta=pac.delta,
+                loss_bound_M=pac.loss_bound_M,
+                tv_tolerance=pac.tv_tolerance_tau,
             )
-            report = cert.evaluate(model, batches, device=self.device)
-            reports["r5_pac_bayes"] = report.to_dict() if hasattr(report, "to_dict") else report
-            self._write_artefact(cert_cfg.pac_bayes.output_artefact, reports["r5_pac_bayes"])
+            payload = cert.certify(risk, kl, n).to_dict()
+            reports["r5_pac_bayes"] = payload
+            self._write_artefact(pac.output_artefact, payload)
 
         # Dice-risk RCPS / B-1.7 — segment pred+target over the calibration cohort,
         # certify a Hoeffding upper bound on the expected Dice-risk (1 - Dice).
@@ -289,7 +383,7 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
                     "certification.dice_risk.checkpoint_path is required: certifying "
                     "the Dice-risk of an uninitialised/untrained synthesiser is "
                     "scientifically meaningless (pitfall #20). Point it at the trained "
-                    "synthesis arm's <output_dir>/checkpoints/best.pt."
+                    "synthesis arm's <output_dir>/checkpoints/best.<format>."
                 )
             self._load_generator_checkpoint(model, ckpt_path)
             segmenter = get_segmenter(dr.segmenter_backend, n_classes=dr.n_classes)
@@ -350,6 +444,65 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
 
         return reports
 
+    def _subject_split(self, batches: list[Any], seed: int) -> tuple[list[Any], list[Any], dict]:
+        """Split the cohort into disjoint calibration and test halves by subject.
+
+        Subjects are shuffled with ``seed`` and the first half calibrates. Every image
+        of a subject lands on one side, so the test half is exchangeable with, but
+        never the same subject as, the calibration half.
+        """
+        from spectramr.data.batch_types import read_batch_field
+
+        if any(read_batch_field(b, "subject_id") is None for b in batches):
+            raise ValueError(
+                "conformal/CHD calibration splits by subject and needs batch['subject_id'] on "
+                "the calibration (validation) loader; the M4Raw k-space val loader must emit it."
+            )
+        per_batch = [self._subject_ids(b, _batch_size(b)) for b in batches]
+        subjects = sorted({sid for ids in per_batch for sid in ids})
+        if len(subjects) < 2:
+            raise ValueError(
+                "conformal calibration splits by subject and needs at least 2 subjects; "
+                f"the cohort has {len(subjects)}."
+            )
+        order = torch.randperm(len(subjects), generator=torch.Generator().manual_seed(seed))
+        n_cal = len(subjects) // 2
+        cal_subjects = {subjects[i] for i in order[:n_cal].tolist()}
+        calib: list[Any] = []
+        test: list[Any] = []
+        for batch, ids in zip(batches, per_batch, strict=True):
+            cal_idx = [i for i, sid in enumerate(ids) if sid in cal_subjects]
+            test_idx = [i for i, sid in enumerate(ids) if sid not in cal_subjects]
+            if cal_idx:
+                calib.append(_select_images(batch, cal_idx))
+            if test_idx:
+                test.append(_select_images(batch, test_idx))
+        info = {
+            "split_unit": "subject",
+            "split_seed": seed,
+            "subjects_calibration_pool": n_cal,
+            "subjects_test": len(subjects) - n_cal,
+        }
+        return calib, test, info
+
+    def _foreground_scores(self, batches: list[Any], model: Any, threshold: float | None) -> Any:
+        """Absolute-residual scores of the foreground pixels over ``batches``."""
+        from spectramr.infrastructure.calibration.conformal import foreground_mask
+
+        if hasattr(model, "eval"):
+            model.eval()
+        parts: list[torch.Tensor] = []
+        with torch.no_grad():
+            for batch in batches:
+                on_device = _batch_to_device(batch, self.device)
+                pred, target = self._unpack_calibration_pair(on_device, model)
+                if pred is None:
+                    raise ValueError("CHD calibration batch carries no input/target pair.")
+                residual = (pred - target).abs()
+                mask = foreground_mask(target, threshold)
+                parts.append(residual[mask] if mask is not None else residual.flatten())
+        return torch.cat(parts)
+
     @staticmethod
     def _subject_ids(batch: Any, count: int) -> list[str]:
         """One subject id per scored image, from ``batch['subject_id']`` (raises when absent).
@@ -398,7 +551,7 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         # real error) and pass the batch's target field (or source as fallback).
         import inspect
 
-        fwd = getattr(model, "forward", model)
+        fwd = getattr(unwrap_model(model), "forward", model)
         fwd_kwargs: dict[str, Any] = {}
         try:
             params = inspect.signature(fwd).parameters
@@ -410,6 +563,10 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
                 fs = batch.get("field_strength_target", batch.get("field_strength"))
             if fs is not None:
                 fwd_kwargs["field_strength"] = fs
+        # A geometry-plane generator raises without ``mask=``; the batch holds only the
+        # zero-filled measurement, whose non-zero support is the observation mask.
+        if isinstance(x, torch.Tensor):
+            fwd_kwargs.update(support_forward_kwargs(unwrap_model(model), x))
         pred = model(x, **fwd_kwargs)
         if isinstance(pred, tuple):
             pred = pred[0]
@@ -421,44 +578,23 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
     def _load_generator_checkpoint(model: Any, path: str) -> None:
         """Load a trained generator state-dict into ``model`` in place.
 
-        Handles the checkpoint key formats the trainer/EMA writers emit
-        (``generator_state_dict`` / ``model_state_dict`` / ``ema_state_dict`` /
-        ``state_dict``) and a raw tensor state-dict. RAISES on a missing file,
-        an unrecognised format, or a model with no ``load_state_dict`` — never
-        silently leaves the model at its random init (pitfall #9/#20).
+        Reads the generator part of a RunState, strictly. RAISES on a missing file,
+        a file with no generator part, a partial state, or a model with no
+        ``load_state_dict`` — never silently leaves the model at its random init
+        (pitfall #9/#20).
         """
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(
                 f"dice_risk checkpoint not found: {path}. Train the synthesis arm "
-                "first (its <output_dir>/checkpoints/best.pt) before certifying."
+                "first (its <output_dir>/checkpoints/best.<format>) before certifying."
             )
         if not hasattr(model, "load_state_dict"):
             raise TypeError(
                 f"Cannot load a checkpoint into {type(model).__name__}: no "
                 "load_state_dict. The generator must be an nn.Module to be certified."
             )
-        ckpt = torch.load(p, map_location="cpu")
-        state = None
-        if isinstance(ckpt, dict):
-            for key in (
-                "generator_state_dict",
-                "model_state_dict",
-                "ema_state_dict",
-                "state_dict",
-            ):
-                if key in ckpt and isinstance(ckpt[key], dict):
-                    state = ckpt[key]
-                    break
-            if state is None and all(torch.is_tensor(v) for v in ckpt.values()):
-                state = ckpt  # raw {param_name: tensor}
-        if state is None:
-            raise ValueError(
-                f"Unrecognised checkpoint format at {path}: expected a dict with "
-                "generator_state_dict/model_state_dict/ema_state_dict/state_dict or a "
-                "raw tensor state-dict."
-            )
-        model.load_state_dict(state)
+        weights(p, "generator", model, policy="exact")
         logger.info("dice_risk: loaded synthesiser checkpoint %s", path)
 
     @staticmethod

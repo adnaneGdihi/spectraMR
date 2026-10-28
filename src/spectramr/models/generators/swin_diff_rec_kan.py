@@ -15,11 +15,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditioning
-from spectramr.infrastructure.physics.data_consistency_layer import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 from spectramr.models.blocks.complex_blocks import ComplexResBlock
 from spectramr.models.blocks.swin import SwinBlock
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.kan.complex_kan import ComplexFastKANConvLayer
 from spectramr.models.registry import register_model
@@ -131,7 +133,7 @@ class KANResBlock(nn.Module):
 
 
 @register_model(name="swin_diff_rec_kan", training_mode="diffusion")
-class SwinDiffRecKAN(nn.Module, IGenerator):
+class SwinDiffRecKAN(GradCheckpointingMixin, nn.Module, IGenerator):
     """
     Swin-Diff-Rec-KAN Backbone.
 
@@ -279,7 +281,8 @@ class SwinDiffRecKAN(nn.Module, IGenerator):
         self.final_conv = nn.Conv2d(base_channels, out_channels, 3, padding=1)
 
         # 5. Data Consistency
-        self.dc_layer = DataConsistencyLayer()
+        self.dc_layer = MaskedReplacementDataConsistency()
+
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """get_output_shape.
@@ -337,12 +340,13 @@ class SwinDiffRecKAN(nn.Module, IGenerator):
 
         emb = self.time_pos_enc(cond_input.float())
 
+        ckpt = self._checkpointing_active()
         h = self.start_conv(x)
         skips = [h]
 
         for i, blocks in enumerate(self.down_blocks):
             for block in blocks:
-                h = block(h, emb)
+                h = checkpoint(block, h, emb, use_reentrant=False) if ckpt else block(h, emb)
             skips.append(h)
             if i < len(self.downs):
                 h = self.downs[i](h)
@@ -351,9 +355,17 @@ class SwinDiffRecKAN(nn.Module, IGenerator):
         h_flat = h.flatten(2).transpose(1, 2)
 
         for swin_block in self.swin_blocks:
-            h_flat = swin_block(h_flat, input_resolution=(H, W))
+            h_flat = (
+                checkpoint(swin_block, h_flat, (H, W), use_reentrant=False)
+                if ckpt
+                else swin_block(h_flat, input_resolution=(H, W))
+            )
         for swin_block in self.swin_blocks:
-            h_flat = swin_block(h_flat, input_resolution=(H, W))
+            h_flat = (
+                checkpoint(swin_block, h_flat, (H, W), use_reentrant=False)
+                if ckpt
+                else swin_block(h_flat, input_resolution=(H, W))
+            )
 
         h = h_flat.transpose(1, 2).view(B, C, H, W)
 
@@ -373,7 +385,7 @@ class SwinDiffRecKAN(nn.Module, IGenerator):
                 h = torch.cat([h, skip], dim=1)
 
             for block in blocks:
-                h = block(h, emb)
+                h = checkpoint(block, h, emb, use_reentrant=False) if ckpt else block(h, emb)
 
         h = self.final_norm(h)
         h = self.final_act(h)

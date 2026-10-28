@@ -18,9 +18,11 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.domain.interfaces.service_interfaces import ILoggingService
 from spectramr.infrastructure.physics.coordinate_utils import CoordinateSampler
 
+from .loss_folding import declared_loss_weights
 from .reconstruction import ReconstructionTrainingStrategy
 
 # Hoisted to module scope (NN#9): ``_generate_predictions`` runs every training
@@ -96,6 +98,10 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
         device: Torch device (typically CUDA)
         _b0_simulator: Optional B0 field map simulator
     """
+
+    # parallel_compat: Calls the generator only through its wrapped forward and builds no parameters;
+    # a permission is not inherited from the reconstruction parent, so it is stated here.
+    parallel_compat = frozenset({"replicated"})
 
     def __init__(
         self,
@@ -222,7 +228,7 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
                 lr_image = lr_image.float()
 
             # [HYBRID-AWARE] Handle coordinate sampling for continuous resolution models
-            if getattr(self.env.generator, "use_coordinate_sampling", False):
+            if getattr(unwrap_model(self.env.generator), "use_coordinate_sampling", False):
                 # We use the full grid for standard training context.
                 # In optimized pipelines, this could be a subset of points.
                 forward_kwargs["query_coords"] = CoordinateSampler.get_full_grid(
@@ -307,9 +313,6 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
                 hr_fakes = hr_fakes[0]
 
             intermediate_outputs = None
-            if hasattr(self.env.generator, "forward_with_intermediates"):
-                # Re-implement safety check if needed, or assume main generator is enough
-                pass
 
             # [DC CONSOLIDATION] DC is now applied internally by the generator
             # if 'kspace_measured' and 'mask' are passed in kwargs.
@@ -352,10 +355,20 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
         # Call Parent for Standard Reconstruction Losses (L1, SSIM, Perceptual)
         losses = super()._compute_losses_impl(input_batch, target_batch, epoch, **kwargs)
 
-        # Check if Bloch Residual is enabled in Objectives (SSOT: config.losses.physics)
-        lambda_bloch = 0.0
-        if self.config.losses and self.config.losses.physics:
-            lambda_bloch = self.config.losses.physics.lambda_bloch_residual
+        # Bloch-residual weight comes from the loss-weight SSOT, NOT from
+        # ``config.losses.physics`` directly. That read (which the comment here used
+        # to call the SSOT) was wrong in both directions:
+        #   * ``lambda_bloch_residual`` DEFAULTS to 1.0 while ``enable_bloch_residual``
+        #     defaults to False, so an arm that never mentions the term saw 1.0 > 0 and
+        #     RAN a loss its own config disables;
+        #   * an arm on the declarative paradigm (``losses.kspace_losses: [bloch_residual]``,
+        #     no ``physics:`` block) has ``config.losses.physics is None``, so the guard
+        #     short-circuited and the term was SILENTLY SKIPPED at whatever weight the
+        #     rest of the system was applying.
+        # ``build_loss_weight_table`` reads both surfaces, honours the enable flag, and
+        # raises when they disagree. ``.get(..., 0.0)`` — not ``_get_loss_weight``, which
+        # RAISES on an undeclared loss — keeps "undeclared means off" intact.
+        lambda_bloch = declared_loss_weights(self.config).get("bloch_residual", 0.0)
 
         if lambda_bloch > 0:
             # We need T1, T2 maps and M_pred.

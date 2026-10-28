@@ -5,13 +5,13 @@ based on training paradigm and configuration.
 """
 
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint  # [FIX] Added for gradient checkpointing
 
 from spectramr.config.settings import TrainingSettings
-from spectramr.core.module_utils import resolve_state_dict
 from spectramr.infrastructure.builders.generator_kwargs import (
     apply_gradient_checkpointing,
     resolve_generator_kwargs,
@@ -22,6 +22,7 @@ from spectramr.infrastructure.builders.leaf.model_builders import (
     EncoderBuilder,
     GeneratorBuilder,
 )
+from spectramr.infrastructure.checkpointing.restore import read_part, weights
 from spectramr.infrastructure.optimization.ema import ModelEma  # [FIX] Added for EMA
 
 from .base import Builder
@@ -52,15 +53,20 @@ class ModelBuilder(Builder):
         >>> generator = models["generator"]
     """
 
-    def __init__(self, config: TrainingSettings, device: torch.device):
+    def __init__(
+        self, config: TrainingSettings, device: torch.device, *, warm_start: bool = False
+    ):
         """Initialize ModelBuilder.
 
         Args:
             config: Immutable training configuration
             device: Device where models will be placed
+            warm_start: Load the stage-1 VAE and ``model.checkpoint_path`` into the
+                generator. Only the training environment director sets it.
         """
         self._config = config
         self._device = device
+        self._warm_start_enabled = warm_start
         self._models: dict[str, nn.Module] = {}
         self._ema: ModelEma | None = None
 
@@ -101,12 +107,15 @@ class ModelBuilder(Builder):
                 generator_builder.with_parameter(k, v)
 
             generator = generator_builder.validate().build()
-            generator.train()  # Set to training mode
 
-            # Warm-start from another model's checkpoint if model.checkpoint_path
-            # is set (the sequential-campaign injection target — transfer-init /
-            # conditioning, NOT a training resume).
-            self._load_init_checkpoint(generator)
+            # Before gradient checkpointing wraps any module, so the state-dict names
+            # still match the checkpoint's, and before train(), which also puts a
+            # frozen stage-1 autoencoder back in training mode.
+            if self._warm_start_enabled:
+                self._warm_start(generator)
+            else:
+                self._freeze_stage1_vae(generator)
+            generator.train()
 
             apply_gradient_checkpointing(generator, self._config)
 
@@ -117,45 +126,49 @@ class ModelBuilder(Builder):
 
         return self
 
-    def _load_init_checkpoint(self, generator: nn.Module) -> None:
-        """Warm-start ``generator`` from ``config.model.checkpoint_path`` if set.
+    def _warm_start(self, generator: nn.Module) -> None:
+        """Train path only: the stage-1 VAE, then ``model.checkpoint_path`` (transfer-init).
 
-        Loads ANOTHER model's weights into the freshly built generator as
-        transfer-init / conditioning (the sequential-campaign injection target,
-        ``inject_as: model.checkpoint_path``). Weights only — this is NOT a
-        training resume (no optimizer/scheduler state).
-
-        Uses ``strict=False`` so a partially-overlapping architecture (a cascade
-        stage that grew a head) still transfers its shared trunk, but **raises**
-        if NOTHING matched — a silently-dropped warm-start (``strict=False``
-        swallowing every key) is the Method-C facade where the run trains from
-        scratch while looking warm-started (CLAUDE.md pitfalls #9/#16).
+        Not a resume: weights only. ``overlap`` keeps a partially matching trunk and
+        raises on zero shared names, the Method-C facade (pitfalls #9/#16). Inference
+        builders never warm-start: they load their own checkpoint next.
         """
         model_cfg = getattr(self._config, "model", None)
+        vae, freeze = self._stage1_vae()
+        if vae:
+            loader = _autoencoder_loader(generator)
+            try:
+                state = read_part(vae, "generator")
+            except FileNotFoundError as exc:
+                # A missing stage-1 VAE would leave stage 2 training in a random latent space.
+                raise FileNotFoundError(
+                    f"vae_checkpoint_path={vae} does not exist. Stage 2 LDM requires a "
+                    "frozen Stage-1 VAE checkpoint. Training writes "
+                    "'checkpoints/best.<format>'; convert a pre-1.0 run first with "
+                    "scripts/migrations/convert_checkpoints_v1.py."
+                ) from exc
+            loader(state, freeze=freeze, source=str(vae))
         ckpt_path = getattr(model_cfg, "checkpoint_path", None)
-        if not ckpt_path:
-            return
+        if ckpt_path:
+            weights(ckpt_path, "generator", generator, policy="overlap")
 
-        payload = torch.load(ckpt_path, map_location=self._device)
-        model_keys = set(generator.state_dict().keys())
-        # Envelope unwrap + wrapper-prefix strip + zero-overlap raise now live in
-        # core.module_utils. This was the only correct reader of the six in the
-        # repo, so it became the SSOT the others adopted rather than staying a
-        # local fix (#1310). Prefix stripping is new here and only widens what
-        # warm-starts: a checkpoint written by a compiled/DDP run shared zero
-        # keys with a bare generator and raised below.
-        state = resolve_state_dict(payload, model_keys, source=f"model.checkpoint_path={ckpt_path}")
-        overlap = model_keys & set(state)
+    def _stage1_vae(self) -> tuple[str | None, bool]:
+        """The builder's one reader of ``vae_checkpoint_path`` and ``freeze_vae`` (default on)."""
+        model_kwargs = getattr(getattr(self._config, "model", None), "model_kwargs", None) or {}
+        return model_kwargs.get("vae_checkpoint_path"), bool(model_kwargs.get("freeze_vae", True))
 
-        missing, unexpected = generator.load_state_dict(state, strict=False)
-        logger.info(
-            "Warm-started generator from %s: %d/%d params loaded (%d missing, %d unexpected)",
-            ckpt_path,
-            len(overlap),
-            len(model_keys),
-            len(missing),
-            len(unexpected),
-        )
+    def _freeze_stage1_vae(self, generator: nn.Module) -> None:
+        """Freeze the stage-1 VAE of a build that loads its own checkpoint next.
+
+        The generator's current autoencoder is passed back through its loader, so the
+        freeze is the warm-start's and no file is read; the checkpoint supplies the
+        weights afterwards. The constructor froze it on every build before #2880.
+        """
+        vae, freeze = self._stage1_vae()
+        if vae and freeze:
+            _autoencoder_loader(generator)(
+                generator.state_dict(), freeze=True, source=f"{vae} (frozen before loading)"
+            )
 
     def build_discriminator(self) -> "ModelBuilder":
         """Build discriminator (GAN paradigms only).
@@ -444,70 +457,6 @@ class ModelBuilder(Builder):
 
         return self
 
-    def compile(self) -> "ModelBuilder":
-        """Apply torch.compile optimization (PyTorch 2.0+).
-
-        **Compilation failure raises.** This used to be wrapped in a blanket
-        ``except Exception`` that logged a warning and continued in eager mode,
-        which meant a ``compile_model: true`` arm could run to completion, report
-        success, and never have been compiled — the arm was simply slower than
-        its own provenance claimed (#619 F2). Combined with the previously
-        unvalidated ``compile_mode``/``compile_backend`` (now closed vocabularies,
-        rejected at Tier 0), a single typo produced exactly that outcome.
-
-        ``compile.enabled: false`` is how you ask for eager execution.
-
-        Ordering note: this runs BEFORE ``build_ema()`` and before ``build()``'s
-        FSDP wrap, so EMA deep-copies an ``OptimizedModule`` and FSDP wraps one.
-        ``FSDP(torch.compile(m))`` is the reverse of PyTorch's recommended
-        ``torch.compile(FSDP(m))``; the audit warns on the combination.
-
-        Returns:
-            self: For method chaining
-
-        Raises:
-            RuntimeError: If compilation is requested but unavailable or fails.
-        """
-        # Check if compilation is enabled in config
-        if (
-            not hasattr(self._config, "optimization")
-            or not self._config.optimization.compile.enabled
-        ):
-            return self
-
-        if not hasattr(torch, "compile"):
-            raise RuntimeError(
-                "optimization.compile.enabled=true but torch.compile is unavailable "
-                f"(torch {getattr(torch, '__version__', 'unknown')}; requires 2.0+). "
-                "Install a newer torch or set compile.enabled: false — silently "
-                "running eager would misreport what this arm executed."
-            )
-
-        mode = self._config.optimization.compile.mode
-        backend = self._config.optimization.compile.backend
-        logger.info(f"Compiling models with mode='{mode}', backend='{backend}'")
-
-        for name, model in self._models.items():
-            logger.info(f"Compiling model: {name}")
-            try:
-                self._models[name] = torch.compile(
-                    model,
-                    mode=mode,
-                    backend=backend,
-                    fullgraph=self._config.optimization.compile.fullgraph,
-                    dynamic=self._config.optimization.compile.dynamic,
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    f"torch.compile failed for model {name!r} "
-                    f"(mode={mode!r}, backend={backend!r}): {e}. "
-                    "Refusing to fall back to eager: the run would report success "
-                    "while executing something other than what was configured. "
-                    "Set optimization.compile.enabled: false to run eager on purpose."
-                ) from e
-
-        return self
-
     def build(self) -> dict[str, nn.Module]:
         """Return validated, immutable model dict.
 
@@ -551,3 +500,13 @@ class ModelBuilder(Builder):
                 self._models[name] = inject_peft(model, peft_cfg)
 
         return dict(self._models)  # Return copy for immutability
+
+
+def _autoencoder_loader(generator: nn.Module) -> Any:
+    loader = getattr(generator, "load_autoencoder_state", None)
+    if loader is None:
+        raise ValueError(
+            f"model.model_kwargs.vae_checkpoint_path is set but "
+            f"{type(generator).__name__} loads no stage-1 autoencoder."
+        )
+    return loader

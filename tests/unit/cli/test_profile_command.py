@@ -18,6 +18,7 @@ import pytest
 from spectramr.cli.profile_command import (
     FOCUS_PRESETS,
     OUTPUT_INJECTION,
+    PROFILE_CHILD_OVERRIDES,
     PROFILE_MODES,
     PROFILE_TARGETS,
     build_scalene_command,
@@ -25,6 +26,7 @@ from spectramr.cli.profile_command import (
     program_path,
     require_scalene,
 )
+from spectramr.cli.val_batches import VAL_BATCHES_OVERRIDE_KEY
 
 
 def _ns(**over) -> argparse.Namespace:
@@ -35,6 +37,7 @@ def _ns(**over) -> argparse.Namespace:
         "config": Path("experiments/validated/dummy_gan.yaml"),
         "device": None,
         "val_batches": None,
+        "iterations": None,
         "extra": [],
     }
     base.update(over)
@@ -239,7 +242,43 @@ def test_val_batches_appends_an_override_without_losing_the_output_redirect():
     child = _child_argv(argv)
     overrides = [child[i + 1] for i, tok in enumerate(child) if tok == "--override"]
     assert "training.output_dir=experiments/results/exp_11" in overrides
-    assert "validation.loader.num_batches=4" in overrides
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}=4" in overrides
+
+
+@pytest.mark.parametrize("target", ["train", "sanity_check"])
+def test_child_loads_in_process_and_skips_the_test_pass(target):
+    child = _child_argv(
+        build_scalene_command(_ns(target=target), child_run_dir=Path("r"), outfile=Path("p.json"))
+    )
+    assert set(PROFILE_CHILD_OVERRIDES) <= set(_overrides(child))
+
+
+def test_the_log_sink_follows_the_profile_run():
+    """Left alone, the sink named the arm's experiment and split the run over two trees."""
+    child = _child_argv(
+        build_scalene_command(_ns(), child_run_dir=Path("r"), outfile=Path("p.json"))
+    )
+    assert f"logging.sinks.dir={Path('r') / 'logs'}" in _overrides(child)
+
+
+def test_infer_gets_no_training_overrides():
+    child = _child_argv(
+        build_scalene_command(_ns(target="infer"), child_run_dir=Path("r"), outfile=Path("p.json"))
+    )
+    assert "--override" not in child
+
+
+def test_extra_overrides_win_over_the_child_defaults():
+    """Later `--override` wins in the child, so an operator can re-enable workers."""
+    child = _child_argv(
+        build_scalene_command(
+            _ns(extra=["--override", "data.loader.num_workers=4"]),
+            child_run_dir=Path("r"),
+            outfile=Path("p.json"),
+        )
+    )
+    workers = [ov for ov in _overrides(child) if ov.startswith("data.loader.num_workers=")]
+    assert workers[-1] == "data.loader.num_workers=4"
 
 
 def test_no_val_batches_adds_no_override():
@@ -257,7 +296,45 @@ def test_val_batches_targets_a_key_the_framework_actually_reads():
         build_scalene_command(_ns(val_batches=2), child_run_dir=Path("r"), outfile=Path("p.json"))
     )
     assert not any("validation.enabled" in tok for tok in child)
-    assert "validation.loader.num_batches=2" in child
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}=2" in child
+
+
+# ----------------------------------------------------------------- --iterations
+
+
+def _overrides(child: list[str]) -> list[str]:
+    return [child[i + 1] for i, tok in enumerate(child) if tok == "--override"]
+
+
+def test_iterations_caps_both_the_budget_and_the_validation_interval(tmp_path):
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  max_iterations: 5000\nvalidation:\n  schedule:\n    interval_steps: 2500\n")
+    child = _child_argv(
+        build_scalene_command(
+            _ns(iterations=100, config=cfg), child_run_dir=Path("r"), outfile=Path("p.json")
+        )
+    )
+    over = _overrides(child)
+    assert "training.max_iterations=100" in over
+    assert "validation.eval_interval=100" in over, "a short run must still reach validation"
+
+
+def test_iterations_never_inflates_a_shorter_arm(tmp_path):
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  max_iterations: 20\nvalidation:\n  schedule:\n    interval_steps: 10\n")
+    over = _overrides(
+        _child_argv(
+            build_scalene_command(
+                _ns(iterations=100, config=cfg), child_run_dir=Path("r"), outfile=Path("p.json")
+            )
+        )
+    )
+    assert not any(o.startswith("training.max_iterations") for o in over)
+
+
+def test_no_iterations_adds_no_cap():
+    child = _child_argv(build_scalene_command(_ns(), child_run_dir=Path("r"), outfile=Path("p.json")))
+    assert not any("max_iterations" in tok for tok in child)
 
 
 # --------------------------------------------------------------------------

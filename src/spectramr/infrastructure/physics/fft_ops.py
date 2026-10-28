@@ -16,6 +16,9 @@ from collections.abc import Callable
 
 import torch
 
+from spectramr.core.compile_fences import dynamo_disable
+
+from .coil_sensitivity import coil_combine_sense
 from .interfaces import IPhysicsOperator
 
 logger = logging.getLogger(__name__)
@@ -102,6 +105,19 @@ def _to_ri(x: torch.Tensor) -> torch.Tensor:
     return torch.view_as_real(x)
 
 
+def centred_freqs(
+    n: int, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Cycles-per-pixel of each sample on a ``fft2c`` axis of length ``n`` (DC at ``n // 2``).
+
+    The grid that makes ``fft2c(x) * exp(-2j*pi*f*d)`` an exact shift by ``d`` pixels.
+    ``linspace(-0.5, 0.5, n)`` is not this grid: its spacing is ``1/(n-1)`` and it has no
+    zero at the DC sample.
+    """
+    return (torch.arange(n, device=device, dtype=dtype) - n // 2) / n
+
+
+@dynamo_disable
 def fft2c(x: torch.Tensor) -> torch.Tensor:
     """Centered 2D FFT with orthonormal normalization.
 
@@ -127,6 +143,7 @@ def fft2c(x: torch.Tensor) -> torch.Tensor:
         return k
 
 
+@dynamo_disable
 def ifft2c(k: torch.Tensor) -> torch.Tensor:
     """Centered 2D inverse FFT with orthonormal normalization.
 
@@ -259,8 +276,11 @@ def ifft2c_masked(k: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Te
 def spatial_dims(x: torch.Tensor) -> tuple[int, ...]:
     """Spatial axes of a ``[B, C, *spatial]`` tensor (2-D or 3-D).
 
+    The spatial axes are the trailing ones in tensor order; canonical volumes
+    are ``(B, C, D, H, W)``.
+
     Args:
-        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
 
     Returns:
         The trailing axis indices, i.e. ``(2, 3)`` or ``(2, 3, 4)``.
@@ -271,7 +291,7 @@ def spatial_dims(x: torch.Tensor) -> tuple[int, ...]:
     """
     ndim = x.ndim - 2
     if ndim not in (2, 3):
-        raise ValueError(f"expected [B, C, H, W] or [B, C, H, W, D], got shape {tuple(x.shape)}")
+        raise ValueError(f"expected [B, C, H, W] or [B, C, D, H, W], got shape {tuple(x.shape)}")
     return tuple(range(2, x.ndim))
 
 
@@ -282,6 +302,7 @@ def _resolve_dims(x: torch.Tensor, dims: tuple[int, ...] | None) -> tuple[int, .
     return tuple(a % x.ndim for a in dims)
 
 
+@dynamo_disable
 def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     """CENTRED N-D FFT over the spatial axes, each channel independently.
 
@@ -302,7 +323,7 @@ def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     channel-layout change into what should be a centering-only fix.
 
     Args:
-        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
         dims: Axes to transform. Defaults to every spatial axis. Pass an
             explicit tuple (e.g. ``(-2, -1)``) for an in-plane transform of a
             volume, where the default would give a 3-D transform instead.
@@ -311,16 +332,18 @@ def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
         Complex centred spectrum of the same shape.
     """
     d = _resolve_dims(x, dims)
-    z = torch.fft.ifftshift(x.to(torch.complex64), dim=d)
-    k = torch.fft.fftn(z, dim=d, norm="ortho")
-    return torch.fft.fftshift(k, dim=d)
+    with torch.amp.autocast("cuda", enabled=False):
+        z = torch.fft.ifftshift(x.to(torch.complex64), dim=d)
+        k = torch.fft.fftn(z, dim=d, norm="ortho")
+        return torch.fft.fftshift(k, dim=d)
 
 
+@dynamo_disable
 def ifftnc(k: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     """Inverse of :func:`fftnc` -- CENTRED N-D inverse FFT.
 
     Args:
-        k: Centred spectrum shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        k: Centred spectrum shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
         dims: Axes to transform; must match the forward call. Defaults to every
             spatial axis.
 
@@ -328,9 +351,10 @@ def ifftnc(k: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor
         Complex image of the same shape.
     """
     d = _resolve_dims(k, dims)
-    z = torch.fft.ifftshift(k.to(torch.complex64), dim=d)
-    x = torch.fft.ifftn(z, dim=d, norm="ortho")
-    return torch.fft.fftshift(x, dim=d)
+    with torch.amp.autocast("cuda", enabled=False):
+        z = torch.fft.ifftshift(k.to(torch.complex64), dim=d)
+        x = torch.fft.ifftn(z, dim=d, norm="ortho")
+        return torch.fft.fftshift(x, dim=d)
 
 
 def coil_combine_rss(img_coils: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -410,6 +434,8 @@ def sense_adjoint(
     smaps: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
     combine_rss: bool = False,
+    normalize: bool = False,
+    min_support_frac: float = 1e-2,
 ) -> torch.Tensor:
     """Adjoint operator A^H: k-space -> image.
 
@@ -419,6 +445,16 @@ def sense_adjoint(
         mask: optional sampling mask
         combine_rss: if True and smaps provided, return RSS magnitude;
             else SENSE combine
+        normalize: divide by ``sum_c |S_c|^2``, turning the matched-filter
+            adjoint ``(sum_c|S_c|^2) * m`` into an estimate of ``m`` itself.
+            Default ``False`` keeps A^H, which is what a physics expression
+            means by "adjoint"; ``True`` is what a *readout* or an image-domain
+            fidelity term wants, because the shading is otherwise a spatial
+            weight nobody chose. Delegates to ``coil_combine_sense``, the
+            measured owner of that divide and of its support floor
+            (non-negotiable 17) -- do not re-derive the denominator here.
+        min_support_frac: forwarded to ``coil_combine_sense``; inert unless
+            ``normalize``.
     Returns:
         complex image (B, 1 or C, H, W) if smaps provided; else complex image
         matching input channels
@@ -430,6 +466,8 @@ def sense_adjoint(
         smaps_c = _to_complex(smaps)
         if combine_rss:
             return coil_combine_rss(img)
+        if normalize:
+            return coil_combine_sense(img, smaps_c, min_support_frac=min_support_frac)
         # SENSE combine: sum over coils of conj(smaps) * img_coil
         img = (img * torch.conj(smaps_c)).sum(dim=1, keepdim=True)
     return img
@@ -446,15 +484,12 @@ def coil_combine(
     if method == "sense":
         if smaps is None:
             raise ValueError("coil_combine method='sense' requires smaps")
-        # Roemer/SENSE-optimal combine = (sum_c conj(S_c) I_c) / (sum_c |S_c|^2).
-        # The denominator is what distinguishes the *combine* (an unbiased
-        # magnetization estimate) from the matched-filter *adjoint*
-        # (``sense_adjoint``, which correctly omits it). Without it the result is
-        # shaded by sum_c|S_c|^2 unless the maps are unit-RSS-normalized.
-        smaps_c = _to_complex(smaps)
-        num = (_to_complex(coil_imgs) * torch.conj(smaps_c)).sum(dim=1, keepdim=True)
-        denom = (smaps_c.abs() ** 2).sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return (num / denom).abs()
+        # Roemer: the divide is what distinguishes the *combine* (an unbiased
+        # magnetization estimate) from the matched-filter *adjoint*, which
+        # correctly omits it. ``coil_combine_sense`` owns that divide and the
+        # relative support floor it needs -- an additive Tikhonov term in its
+        # place measures 1.7e-2 relative error against the clamp's 6.7e-8.
+        return coil_combine_sense(_to_complex(coil_imgs), _to_complex(smaps)).abs()
     raise ValueError(f"Unknown coil combine method {method!r}. Valid: rss, sense.")
 
 
@@ -738,6 +773,7 @@ __all__ = [
     "_to_complex",
     "_to_ri",
     "apply_mask",
+    "centred_freqs",
     "coil_combine",
     "coil_combine_rss",
     "fft1_uncentered",

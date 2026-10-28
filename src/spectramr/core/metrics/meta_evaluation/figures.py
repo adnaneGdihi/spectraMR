@@ -32,23 +32,13 @@ import logging
 import math
 from pathlib import Path
 
-try:  # optional in degraded cluster envs (a REQUIRED dep in pyproject)
-    import matplotlib
-
-    matplotlib.use("Agg")  # must precede pyplot import
-    import matplotlib.pyplot as plt
-
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only without matplotlib
-    matplotlib = None  # type: ignore[assignment]
-    plt = None  # type: ignore[assignment]
-    MATPLOTLIB_AVAILABLE = False
-
 import numpy as np
 
 from . import _report_style as rs
 from .normalization import direction_aware_minmax
 from .pipeline import MetaEvaluationOutput
+
+MATPLOTLIB_AVAILABLE = rs.MATPLOTLIB_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +264,7 @@ def sfa_polar(output: MetaEvaluationOutput, out_dir: Path) -> Path | None:
     radii = np.abs(scores) + 0.05
 
     fig, ax = rs.figure(figsize=(6, 6), polar=True)
-    cmap = plt.cm.tab10
+    cmap = rs.pyplot().cm.tab10
     for i, name in enumerate(names):
         ax.plot(
             [angles[i], angles[i]],
@@ -596,7 +586,7 @@ def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
     out_dir = _ensure_dir(out_dir)
     traj_dir = _ensure_dir(out_dir / "trajectories")
 
-    cmap = plt.cm.tab10
+    cmap = rs.pyplot().cm.tab10
     families_global = sorted({s.degradation_family for s in dataset.samples})
     family_color = {f: cmap(i % 10) for i, f in enumerate(families_global)}
 

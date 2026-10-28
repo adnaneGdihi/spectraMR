@@ -6,6 +6,7 @@ Integration of Fourier-KAN into Swin Backbone for MRI Reconstruction.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 
 from spectramr.models.registry import register_model
@@ -98,14 +99,10 @@ class WindowAttention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
         # Relative position bias logic omitted for brevity in minimal impl
         # Ideally would add relative_position_bias here
-
-        attn = self.softmax(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         return x
 

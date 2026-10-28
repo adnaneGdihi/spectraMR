@@ -457,7 +457,7 @@ class TestKANTimeEmbedding:
             patch("spectramr.models.blocks.embeddings.FastKAN", create=True),
         ):
             dim = 128
-            embed = KANTimeEmbedding(dim)
+            embed = KANTimeEmbedding(dim, max_timesteps=1000)
 
             assert embed.fourier_kan.dim == dim
             assert isinstance(embed.fourier_kan, AdvancedKANPositionalEmbedding)
@@ -466,14 +466,14 @@ class TestKANTimeEmbedding:
         """Test initialization when KAN is unavailable (fallback)."""
         with patch("spectramr.models.blocks.embeddings.KAN_AVAILABLE", False):
             dim = 128
-            embed = KANTimeEmbedding(dim)
+            embed = KANTimeEmbedding(dim, max_timesteps=1000)
 
             assert embed.fourier_kan.dim == dim
             assert isinstance(embed.fourier_kan, FourierKANPositionalEmbedding)
 
     def test_forward_pass_single_timestep(self):
         """Test forward pass with single timestep."""
-        embed = KANTimeEmbedding(dim=64)
+        embed = KANTimeEmbedding(dim=64, max_timesteps=1000)
         time = torch.tensor([5])
 
         output = embed(time)
@@ -481,7 +481,7 @@ class TestKANTimeEmbedding:
 
     def test_forward_pass_batch_timesteps(self):
         """Test forward pass with batch of timesteps."""
-        embed = KANTimeEmbedding(dim=128)
+        embed = KANTimeEmbedding(dim=128, max_timesteps=1000)
         time = torch.tensor([1, 10, 100])
 
         output = embed(time)
@@ -489,7 +489,7 @@ class TestKANTimeEmbedding:
 
     def test_forward_pass_gradient_flow(self):
         """Test that gradients flow through KAN time embedding."""
-        embed = KANTimeEmbedding(dim=64)
+        embed = KANTimeEmbedding(dim=64, max_timesteps=1000)
         time = torch.tensor([10.0], requires_grad=True)
 
         output = embed(time)
@@ -501,7 +501,7 @@ class TestKANTimeEmbedding:
     def test_forward_pass_different_dims(self):
         """Test forward pass with different embedding dimensions."""
         for dim in [32, 64, 128]:
-            embed = KANTimeEmbedding(dim)
+            embed = KANTimeEmbedding(dim, max_timesteps=1000)
             time = torch.tensor([42])
 
             output = embed(time)

@@ -95,9 +95,6 @@ THEMED_GENERIC_COMPONENTS: dict[str, dict[str, set[str]]] = {
     "frontdoor_scanner": {"losses": {"frontdoor_criterion"}, "models": set()},
     "stein_federated": {"losses": {"stein_discrepancy"}, "models": set()},
     "fisher_rao_flow": {"losses": {"fisher_rao_geodesic"}, "models": set()},
-    # ---- Group A: diffusion-process primitives wrapped as consistency losses ----
-    "resetting_diffusion": {"losses": {"resetting_consistency"}, "models": set()},
-    "levy_diffusion": {"losses": {"levy_score_consistency"}, "models": set()},
 }
 
 

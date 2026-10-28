@@ -36,6 +36,13 @@ except ImportError:
     )
 
 
+#: Integration steps of the continuous mode, and blocks of the fixed-depth control.
+_STEPS = 10
+
+#: ``model_kwargs.depth_mode`` vocabulary of :class:`NeuralODEGenerator`.
+DEPTH_MODES = ("continuous", "fixed")
+
+
 class ConvODEDerivative(nn.Module):
     """ODE Function f(t, h) - Convolutional Derivative Network"""
 
@@ -102,6 +109,7 @@ class NeuralODEGenerator(nn.Module, IGenerator):
         out_channels: int = 1,
         features: int = 64,
         integration_time: float = 1.0,
+        depth_mode: str = "continuous",
     ):
         """__init__.
 
@@ -110,8 +118,15 @@ class NeuralODEGenerator(nn.Module, IGenerator):
             out_channels (int): Description.
             features (int): Description.
             integration_time (float): Description.
+            depth_mode: ``continuous`` integrates one derivative network with RK4
+                over ``_STEPS`` steps; ``fixed`` is the fixed-depth control, a ResNet
+                of ``_STEPS`` untied residual blocks of the same network. Anything
+                else raises.
         """
         super().__init__()
+        if depth_mode not in DEPTH_MODES:
+            raise ValueError(f"neural_ode depth_mode={depth_mode!r}; expected one of {DEPTH_MODES}.")
+        self.depth_mode = depth_mode
 
         # Handle list features input (take first element)
         if isinstance(features, (list, tuple)):
@@ -123,7 +138,12 @@ class NeuralODEGenerator(nn.Module, IGenerator):
         self.integration_time = integration_time
 
         self.feature_extract = nn.Conv2d(in_channels, features, 3, padding=1)
-        self.ode_func = ConvODEDerivative(features)
+        self.ode_func = ConvODEDerivative(features) if depth_mode == "continuous" else None
+        self.residual_blocks = (
+            nn.ModuleList(ConvODEDerivative(features) for _ in range(_STEPS))
+            if depth_mode == "fixed"
+            else None
+        )
         self.reconstruct = nn.Conv2d(features, out_channels, 3, padding=1)
 
     def forward(self, x: torch.Tensor, t_eval: torch.Tensor = None) -> torch.Tensor:
@@ -148,9 +168,15 @@ class NeuralODEGenerator(nn.Module, IGenerator):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Initial state
         h = self.feature_extract(x)
+        if self.residual_blocks is not None:
+            if t_eval is not None:
+                raise ValueError("depth_mode='fixed' has no continuous time to evaluate at.")
+            for block in self.residual_blocks:
+                h = h + block(None, h)
+            return self.reconstruct(h)
 
         # RK4 Solver (4th-order Runge-Kutta)
-        steps = 10
+        steps = _STEPS
         dt = self.integration_time / steps
 
         if HAVE_TORCHDIFFEQ:

@@ -13,7 +13,7 @@ This enables training on UNPAIRED data (T1 from Patient A, T2 from Patient B).
 """
 
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,9 @@ from spectramr.models.constants import (
 )
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
+
+#: Width of the [TR, TE, TI, B0] vector the disentangled_vae strategy conditions on.
+PHYSICS_VECTOR_DIM = 4
 
 
 class BiasFieldGenerator(nn.Module):
@@ -949,6 +952,9 @@ class DisentangledMRI(nn.Module, IGenerator):
 
         self.enc_c = ContentEncoder(eff_in_channels, dim, n_downsample)
         self.enc_s = StyleEncoder(eff_in_channels, dim, style_dim, use_vae=use_vae)
+        # The disentangled_vae strategy conditions on [TR, TE, TI, B0]; built here so the
+        # optimizer and a fresh state_dict both see the projection (#2388).
+        self.phys_to_style_proj = nn.Linear(PHYSICS_VECTOR_DIM, style_dim)
         self.gen = Generator(
             self.enc_c.output_dim,
             style_dim,
@@ -1200,17 +1206,7 @@ class DisentangledMRI(nn.Module, IGenerator):
         # skip the StyleEncoder (which uses Conv2d and requires 4D image input).
         # Use the vector directly as the style code.
         if x_style_source.ndim == 2:
-            # Pre-computed physics vector — use directly as style
-            style_dim = self.enc_s.output_dim
-            if x_style_source.shape[-1] != style_dim:
-                # Project to style_dim if dimensions don't match
-                if not hasattr(self, "_phys_to_style_proj"):
-                    self._phys_to_style_proj = torch.nn.Linear(
-                        x_style_source.shape[-1], style_dim
-                    ).to(x_style_source.device)
-                style_output = self._phys_to_style_proj(x_style_source)
-            else:
-                style_output = x_style_source
+            style_output = self._style_from_vector(x_style_source)
             # In VAE mode, create dummy logvar for compatibility
             if self.use_vae:
                 style_output = (style_output, torch.zeros_like(style_output))
@@ -1230,40 +1226,8 @@ class DisentangledMRI(nn.Module, IGenerator):
             logvar = torch.zeros_like(style)
             self._check_nan(style, "StyleEncoder Output")
 
-        # 3. Add Condition Label (if provided)
-        if class_idx is not None and self.class_embedding is not None:
-            # [FIX] Clamp indices to valid range to prevent CUDA device-side assert.
-            # Dataset contrast labels may exceed num_classes (e.g. PD=4, unknown=5
-            # when num_classes=4). Clamp maps unseen classes to the last valid bin.
-            class_idx = class_idx.clamp(0, self.class_embedding.num_embeddings - 1)
-            cond_emb = self.class_embedding(class_idx)
-            style = style + cond_emb
-
-        # 3. Synthesize Image or Tissue Parameters
-        output = self.gen(content, style)
-        self._check_nan(output, "Generator Output")
-
-        # 3.5 [FIX] Architectural Refinement: Sequence params predicted from style
-        # at model level, NOT inside the tissue decoder. This enforces strict
-        # decoupling: tissue decoder → biology only, style → scanner physics only.
-        if isinstance(output, dict) and self.output_tissue_params:
-            seq_params = self.sequence_mlp(style)
-            output.update(seq_params)
-
-        # 4. [NEW] Apply bias field if enabled
-        if self.enable_bias_field:
-            bias_field = self.bias_field_generator(content)
-            self._check_nan(bias_field, "BiasFieldGenerator Output")
-
-            # If output is a dict (tissue params), add bias_field to it
-            if isinstance(output, dict):
-                output["bias_field"] = bias_field
-                # Apply multiplicative bias field to any synthetic images
-                # (will be done in Bloch synthesis during training strategy)
-            # If output is a tensor (direct image), apply bias field directly
-            elif isinstance(output, torch.Tensor):
-                output = output * bias_field
-                self._check_nan(output, "BiasField-Applied Output")
+        style = self.condition_style(style, class_idx)
+        output = self.decode_tissue(content, style)
 
         # Reshape output backward to 5D if we received 5D with depth > 1
         if isinstance(output, dict) and len(original_shape_a) == 5 and original_shape_a[2] > 1:
@@ -1310,33 +1274,52 @@ class DisentangledMRI(nn.Module, IGenerator):
         """Extract style (contrast) code."""
         return self.enc_s(x)
 
+    def _style_from_vector(self, vec: torch.Tensor) -> torch.Tensor:
+        """A 2-D style input: already a style code, or the physics vector to project."""
+        style_dim = self.enc_s.output_dim
+        if vec.shape[-1] == style_dim:
+            return vec
+        if vec.shape[-1] == PHYSICS_VECTOR_DIM:
+            return self.phys_to_style_proj(vec)
+        raise ValueError(
+            f"style vector has width {vec.shape[-1]}; expected style_dim={style_dim} "
+            f"or the {PHYSICS_VECTOR_DIM}-element physics vector"
+        )
+
     def decode(self, content: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         """Decode content + style to image.
 
         Automatically projects physics vectors to style_dim if needed.
         """
-        # Ensure style has the correct dimension
-        style_dim = self.enc_s.output_dim
-        if style.ndim == 2 and style.shape[-1] != style_dim:
-            if not hasattr(self, "_phys_to_style_proj"):
-                self._phys_to_style_proj = torch.nn.Linear(style.shape[-1], style_dim).to(
-                    style.device
-                )
-            style = self._phys_to_style_proj(style)
+        if style.ndim == 2:
+            style = self._style_from_vector(style)
+        return self.decode_tissue(content, style)
 
+    def condition_style(self, style: torch.Tensor, class_idx: torch.Tensor | None) -> torch.Tensor:
+        """Add the contrast-class embedding; out-of-range labels clamp to the last bin."""
+        if class_idx is None or self.class_embedding is None:
+            return style
+        idx = class_idx.to(style.device).clamp(0, self.class_embedding.num_embeddings - 1)
+        return style + self.class_embedding(idx)
+
+    def decode_tissue(self, content: torch.Tensor, style: torch.Tensor) -> Any:
+        """The one decode: gen, then sequence params (tissue mode), then the bias field.
+
+        forward, decode and the disentangled training strategy all go through here, so
+        training, validation and inference decode the same way.
+        """
         output = self.gen(content, style)
-
+        self._check_nan(output, "Generator Output")
         if isinstance(output, dict) and self.output_tissue_params:
-            seq_params = self.sequence_mlp(style)
-            output.update(seq_params)
-
+            # Sequence params come from the style code, never from the tissue decoder.
+            output.update(self.sequence_mlp(style))
         if self.enable_bias_field:
             bias_field = self.bias_field_generator(content)
+            self._check_nan(bias_field, "BiasFieldGenerator Output")
             if isinstance(output, dict):
-                output["bias_field"] = bias_field
-            elif isinstance(output, torch.Tensor):
+                output["bias_field"] = bias_field  # applied once, at render time
+            else:
                 output = output * bias_field
-
         return output
 
     def generate(

@@ -64,3 +64,17 @@ def test_registered_under_canonical_name() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "spectral_band_split" in list_available()
+
+
+def test_unknown_high_loss_type_raises() -> None:
+    """``high_loss_type`` is validated; a typo no longer silently selects L1."""
+    with pytest.raises(ValueError, match="high_loss_type"):
+        SpectralBandSplitLoss(high_loss_type="mse")
+
+
+@pytest.mark.parametrize("bad", [0.0, 1.0, -0.1, 1.5])
+def test_center_fraction_outside_unit_interval_raises(bad: float) -> None:
+    from spectramr.models.losses.spectral_band_split_loss import SpectralBandSplitLoss
+
+    with pytest.raises(ValueError, match="center_fraction"):
+        SpectralBandSplitLoss(center_fraction=bad)

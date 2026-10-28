@@ -1077,12 +1077,11 @@ class WindowAttention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=getattr(self.dropout, "p", 0.0) if self.training else 0.0,
+            scale=self.scale,
+        )
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 

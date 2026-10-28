@@ -237,6 +237,11 @@ def _legacy_inline(config_root: Any, name: str) -> float:
 
 def _legacy_folding(loss_config: Any, name: str) -> float:
     """``loss_folding.declared_loss_weights`` — the list weight, defaulting to 1.0."""
+    # FROZEN at three lists, deliberately NOT LOSS_LIST_DOMAINS (#1924). This module
+    # is the oracle for what the PRE-SSOT code did, and the pre-SSOT code did not
+    # look at ``latent_losses``. Deriving this from the live SSOT would let the
+    # oracle drift with the implementation it exists to check, which is the whole
+    # point of freezing it. It dies with this module (see the module docstring).
     for list_name in ("image_losses", "kspace_losses", "complex_losses"):
         for entry in getattr(loss_config, list_name, None) or []:
             raw = getattr(entry, "name", None)

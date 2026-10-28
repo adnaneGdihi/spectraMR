@@ -45,6 +45,7 @@ __all__ = [
     "SUPPORTED_NOISE_TYPES",
     "DCKnobReadership",
     "inert_dc_knobs",
+    "schema_defaults",
     "resolve_effective_dc",
     "ssot_pairs",
 ]
@@ -81,7 +82,9 @@ SUPPORTED_NOISE_TYPES: frozenset[str] = frozenset({"gaussian"})
 DCKnobReadership: dict[str, frozenset[str]] = {
     # Every branch that passes the value somewhere: lambda_init / beta /
     # hf_lambda / weight. 'hard' is deliberately NOT here.
-    "dc_weight": frozenset({"soft", "noise_adjusted", "noise_adaptive", "target_aware_fsdc"}),
+    "dc_weight": frozenset(
+        {"soft", "noise_adjusted", "noise_adaptive", "target_aware_fsdc", "wiener_gain"}
+    ),
     # Only the layers whose constructors accept a noise level: HardDataConsistency
     # and the SimpleDataConsistency fallback. The learned/soft layers do not.
     "train_noise_level": frozenset({"hard"}),
@@ -101,6 +104,7 @@ _EXPLICIT_METHODS = frozenset(
         "noise_adaptive",
         "hard",
         "target_aware_fsdc",
+        "wiener_gain",
     }
 )
 
@@ -198,6 +202,19 @@ def resolve_effective_dc(config: Any) -> ResolvedDC:
     return ResolvedDC(enabled=enabled, method=method, values=values, source=source)
 
 
+def schema_defaults() -> dict[str, Any]:
+    """Generator kwarg -> ``DataConsistencyConfig`` default, for every SSOT row.
+
+    Read off the schema rather than restated: a copy here kept the noise levels
+    at 0.01 / 0.005 after the schema moved them to 0.0, so every non-hard arm was
+    reported for noise knobs it never declared.
+    """
+    from spectramr.config.schemas.physics import DataConsistencyConfig
+
+    fields = DataConsistencyConfig.model_fields
+    return {kwarg: fields[field].default for kwarg, field in DC_SSOT_KEYS}
+
+
 def inert_dc_knobs(config: Any) -> tuple[tuple[str, Any, str], ...]:
     """DC knobs this arm declares that its resolved ``dc_method`` cannot read.
 
@@ -216,12 +233,7 @@ def inert_dc_knobs(config: Any) -> tuple[tuple[str, Any, str], ...]:
     if not resolved.enabled or resolved.method is None:
         return ()
 
-    defaults = {
-        "dc_weight": 1.0,
-        "train_noise_level": 0.01,
-        "eval_noise_level": 0.005,
-        "noise_type": "gaussian",
-    }
+    defaults = schema_defaults()
     findings = []
     for knob in DCKnobReadership:
         if knob not in resolved.values:

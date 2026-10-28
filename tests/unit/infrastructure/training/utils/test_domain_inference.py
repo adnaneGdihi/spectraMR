@@ -44,8 +44,10 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.utils.domain_inference import (
     IMAGE_DOMAIN_COIL_MODES,
     infer_output_domain,
+    loader_serves_kspace,
     metric_transform_produced_image,
     needs_ifft_for_visualization,
+    resolve_output_domain,
 )
 from tests.utils.corpus import tracked_yamls
 from tests.utils.data_config_stub import DataConfigStub
@@ -220,6 +222,37 @@ def test_a_flat_only_config_still_resolves() -> None:
 
 
 @pytest.mark.unit
+def test_declared_kspace_output_is_kspace_without_normalisation() -> None:
+    """The dataset obeys ``domain.output``, so the predicate must too.
+
+    An m4raw arm with k-space normalisation off receives k-space; reading it as image
+    left ``_ensure_image_domain_target`` a no-op on the kspace_filling baselines.
+    """
+    config = _config(dataset_type="m4raw", output_domain="kspace", normalize_kspace=False)
+
+    assert loader_serves_kspace(config) is True
+    assert needs_ifft_for_visualization(config)[1] is True
+
+
+@pytest.mark.unit
+def test_declared_kspace_output_still_yields_to_an_image_coil_mode() -> None:
+    """``rss_image`` IFFTs inside the dataset, whatever ``domain.output`` says."""
+    config = _config(
+        dataset_type="m4raw", output_domain="kspace", coil_processing_mode="rss_image"
+    )
+
+    assert loader_serves_kspace(config) is False
+
+
+@pytest.mark.unit
+def test_defaulted_domain_output_does_not_count_as_kspace() -> None:
+    """``domain.output`` defaults to ``'image'``; only a declaration may flip the answer."""
+    config = _config(dataset_type="m4raw", normalize_kspace=False)
+
+    assert loader_serves_kspace(config) is False
+
+
+@pytest.mark.unit
 def test_absent_data_block_does_not_raise() -> None:
     """The helper is used on partially-built configs during the audit probe."""
     config = SimpleNamespace(data=None, model=None, physics=None)
@@ -379,3 +412,101 @@ class TestDeclarationsOutrankLegacyTables:
             physics=None,
         )
         assert infer_output_domain(cfg) == "image"
+
+
+class TestTheKspaceToImageBridgeHasAnOwner:
+    """``needs_kspace_to_image_bridge`` answers "must the strategy apply A^H?".
+
+    Until it existed the answer rode on ``use_dc``, so a k-space arm over a plain
+    U-Net with no DC layer got raw k-space into its ``forward`` and rendered the
+    DC-spike blob (``ei_unet_m4raw_r4``, cluster run 2026-09-20).
+    """
+
+    @staticmethod
+    def _cfg(model_type: str, *, dataset_type: str = "kspace", coil_mode: str = "none"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model=SimpleNamespace(model_type=model_type),
+            data=SimpleNamespace(
+                dataset_type=dataset_type,
+                processing=SimpleNamespace(enable_kspace_normalization=True),
+                coils=SimpleNamespace(processing_mode=coil_mode),
+            ),
+            physics=None,
+        )
+
+    def test_an_image_domain_model_over_a_kspace_loader_needs_it(self):
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("standard_unet")) is True
+
+    def test_a_kspace_native_model_does_not(self):
+        """``complex_unet`` declares ``input_domain='kspace'`` — the n2n backbone."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("complex_unet")) is False
+
+    def test_an_unannotated_model_is_not_guessed_at(self):
+        """443 of 593 registered models declare no ``input_domain``; "nobody said"
+        must not resolve to "image"."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        assert needs_kspace_to_image_bridge(self._cfg("varnet")) is False
+
+    def test_an_image_domain_coil_mode_vetoes_it(self):
+        """``rss_image`` IFFTs inside the dataset's TorchIO chain, so the batch is
+        already an image even though ``dataset_type`` still reads kspace."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        cfg = self._cfg("standard_unet", coil_mode="rss_image")
+        assert needs_kspace_to_image_bridge(cfg) is False
+
+    def test_loader_serves_kspace_is_the_one_owner_the_visualiser_also_reads(self):
+        """Three call sites recomputed this predicate inline from the same four
+        leaves. One owner, so they cannot drift (non-negotiable 17)."""
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            loader_serves_kspace,
+            needs_ifft_for_visualization,
+        )
+
+        for coil_mode in ("none", "rss_image"):
+            cfg = self._cfg("standard_unet", coil_mode=coil_mode)
+            assert needs_ifft_for_visualization(cfg)[1] is loader_serves_kspace(cfg)
+
+
+@pytest.mark.unit
+def test_a_loader_heuristic_is_not_reported_as_a_declaration() -> None:
+    """P6 (the loader serves k-space) guesses; ``_save_output`` must not raise on a guess."""
+    decision = resolve_output_domain(_config(dataset_type="kspace", coil_processing_mode="svd"))
+
+    assert (decision.domain, decision.tier, decision.declared) == ("kspace", 6, False)
+
+
+@pytest.mark.unit
+def test_a_target_domain_declaration_is_reported_as_one() -> None:
+    config = SimpleNamespace(
+        data=DataConfigStub(dataset_type="kspace"),
+        model=SimpleNamespace(target_domain="kspace"),
+        physics=None,
+    )
+    decision = resolve_output_domain(config)
+
+    assert (decision.domain, decision.tier, decision.declared) == ("kspace", 1, True)
+    assert infer_output_domain(config) == decision.domain

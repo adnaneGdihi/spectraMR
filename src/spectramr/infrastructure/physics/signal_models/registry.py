@@ -5,7 +5,7 @@ three regimes off LIVE:
 
 * A :class:`~spectramr.infrastructure.physics.registry.BaseForwardOperator` is a
   **linear measurement operator** (``fft2d``, ``nufft``, ``phase_contrast``). Its
-  contract *promises* ``adjoint()``, and generic callers — ``DataConsistencyLayer``,
+  contract *promises* ``adjoint()``, and generic callers — ``OperatorProjectionDataConsistency``,
   ``FISTAMBIRSolver``, ``NullSpaceProjection`` — consume that promise assuming
   ``<Ax, y> = <x, A'y>``.
 * A **signal model** is the other kind: ``parameters -> signal``, nonlinear,

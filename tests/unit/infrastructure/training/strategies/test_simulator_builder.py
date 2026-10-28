@@ -17,12 +17,13 @@ torch = pytest.importorskip("torch")
 from spectramr.config.schemas.data import DataConfigSchema  # noqa: E402
 from spectramr.config.schemas.physics import DigitalTwinConfig  # noqa: E402
 from spectramr.infrastructure.training.strategies.simulator_builder import (  # noqa: E402
+    require_epi_profile,
     build_simulator_from_config,
     undersampling_mask_kwargs,
 )
 
 
-def _config(dt: DigitalTwinConfig) -> SimpleNamespace:
+def _config(dt: DigitalTwinConfig, field_strength: float = 3.0) -> SimpleNamespace:
     """Stub settings carrying the two blocks the builder reads.
 
     ``data`` is the **real** ``DataConfigSchema`` rather than a hand-rolled
@@ -32,7 +33,7 @@ def _config(dt: DigitalTwinConfig) -> SimpleNamespace:
     the schema.
     """
     return SimpleNamespace(
-        physics=SimpleNamespace(digital_twin=dt),
+        physics=SimpleNamespace(digital_twin=dt, field_strength=field_strength),
         data=DataConfigSchema(),
     )
 
@@ -54,6 +55,34 @@ def test_builder_defaults_single_motion_constant_amplitude() -> None:
     )
     assert sim.motion_composite == []
     assert sim._motion_severity == pytest.approx(1.0)
+
+
+def test_builder_builds_the_acquisition_profile_at_physics_field_strength() -> None:
+    dt = DigitalTwinConfig(
+        enabled=True, acquisition={"readout_bw_hz_per_px": 200.0, "sequence": "gre"}
+    )
+    sim = build_simulator_from_config(_config(dt, field_strength=0.55), torch.device("cpu"))
+    assert sim.scanner_profile.b0_T == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize("sequence", ["spin_echo", "gre"])
+def test_vf_field_score_rejects_a_non_epi_profile(sequence) -> None:
+    dt = DigitalTwinConfig(
+        enabled=True, acquisition={"readout_bw_hz_per_px": 200.0, "sequence": sequence}
+    )
+    sim = build_simulator_from_config(_config(dt), torch.device("cpu"))
+    with pytest.raises(ValueError, match="EPI"):
+        require_epi_profile(sim)
+
+
+def test_vf_field_score_accepts_epi_or_no_profile() -> None:
+    epi = DigitalTwinConfig(
+        enabled=True, acquisition={"readout_bw_hz_per_px": 200.0, "sequence": "epi"}
+    )
+    require_epi_profile(build_simulator_from_config(_config(epi), torch.device("cpu")))
+    require_epi_profile(
+        build_simulator_from_config(_config(DigitalTwinConfig(enabled=True)), torch.device("cpu"))
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -170,6 +170,29 @@ def test_content_and_marker_arms_are_capacity_matched() -> None:
     assert n["none"] < n["content"]  # inherent to removing the mechanism
 
 
+@pytest.mark.parametrize(("keys", "expected_passes"), [("content", 1), ("none", 1), ("marker", 2)])
+def test_instrument_stream_is_encoded_only_when_marker_keys_read_it(
+    keys: str, expected_passes: int
+) -> None:
+    """Content and none keys discard the instrument features, so encoding them is wasted compute."""
+    model = _gen(
+        attention_keys=keys,
+        instrument_channels=True,
+        conditioning_per_stream=2,
+        scale=3,
+    )
+    calls = []
+    original = model._encode_streams
+
+    def counting(x, cond=None):
+        calls.append(x.shape[1])
+        return original(x, cond)
+
+    model._encode_streams = counting
+    model(torch.randn(2, 32, 24, 24))
+    assert len(calls) == expected_passes
+
+
 def test_attention_keys_selects_the_instrument_keyed_block() -> None:
     """Leaving it unset keeps the legacy boolean behaviour untouched."""
     assert isinstance(

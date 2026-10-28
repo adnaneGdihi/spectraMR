@@ -133,12 +133,32 @@ class HRFLikelihoodLoss(nn.Module):
                     f"target of shape [B, T]; got {type(target)!r} / "
                     f"{tuple(target.shape) if target is not None else '-'}."
                 )
-            # 1-D convolution per sample, treating pred[B, T_hrf] as filter.
+            if design.dim() != 2 or pred.dim() != 2:
+                raise ValueError(
+                    "hrf_likelihood's GLM path needs design_matrix [B, T] and an HRF "
+                    f"prediction [B, T_hrf]; got {tuple(design.shape)} and "
+                    f"{tuple(pred.shape)}."
+                )
+            n_batch = design.shape[0]
+            hrf = pred.expand(n_batch, -1) if pred.shape[0] == 1 else pred
+            if hrf.shape[0] != n_batch:
+                raise ValueError(
+                    f"HRF batch {pred.shape[0]} does not match design_matrix batch {n_batch}."
+                )
+            # Grouped conv convolves each sample's design with its OWN HRF; an
+            # ungrouped conv1d crosses every design with every HRF and the result
+            # then broadcasts against the target instead of raising.
             sim = F.conv1d(
-                design.unsqueeze(1),
-                pred.flip(-1).unsqueeze(1),
-                padding=pred.shape[-1] - 1,
-            ).squeeze(1)[..., : target.shape[-1]]
+                design.unsqueeze(0),
+                hrf.flip(-1).unsqueeze(1),
+                padding=hrf.shape[-1] - 1,
+                groups=n_batch,
+            ).squeeze(0)[..., : target.shape[-1]]
+            if sim.shape != target.shape:
+                raise ValueError(
+                    f"GLM-predicted BOLD {tuple(sim.shape)} does not match the observed "
+                    f"series {tuple(target.shape)}."
+                )
             residual = F.mse_loss(sim, target)
         else:
             canonical = context.get("canonical_hrf")

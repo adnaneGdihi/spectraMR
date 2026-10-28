@@ -20,7 +20,7 @@ import torch
 
 from spectramr.config.schemas.physics import DataConsistencyConfig
 from spectramr.infrastructure.physics.data_consistency import (
-    DataConsistencyLayer,
+    NoiseSimulatingDataConsistency,
     HardDataConsistency,
     SimpleDataConsistency,
 )
@@ -36,7 +36,7 @@ class TestDataConsistencyNoiseSimulation:
 
     def test_data_consistency_adds_noise_in_training_mode(self):
         """Basic DC layer must add noise when training=True."""
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.01, eval_noise_level=0.0, noise_type="gaussian"
         )
         dc_layer.train()  # Set to training mode
@@ -46,7 +46,7 @@ class TestDataConsistencyNoiseSimulation:
         predicted_image = torch.randn(2, 1, 64, 64, dtype=torch.complex64)
         mask = torch.ones(2, 1, 64, 64)  # Fully sampled
 
-        # Forward pass (DataConsistencyLayer expects (predicted_img, measured_kspace, mask))
+        # Forward pass (NoiseSimulatingDataConsistency expects (predicted_img, measured_kspace, mask))
         output = dc_layer(predicted_image, measured_kspace, mask)
 
         # Validation: Output should differ from perfect input (noise added in k-space)
@@ -114,7 +114,7 @@ class TestDataConsistencyNoiseSimulation:
 
     def test_noise_level_zero_disables_noise_addition(self):
         """When noise_level=0.0, no noise should be added (for ablation studies)."""
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.0, eval_noise_level=0.0, noise_type="gaussian"
         )
         dc_layer.train()
@@ -210,7 +210,7 @@ class TestTrainValDistributionMatch:
 
     def test_dc_noise_level_differs_between_train_and_eval(self):
         """DC layer should use higher noise at train time for robustness."""
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.02,
             eval_noise_level=0.005,  # Lower noise at eval for realistic measurements
             noise_type="gaussian",
@@ -224,7 +224,7 @@ class TestTrainValDistributionMatch:
 
     def test_dc_respects_training_mode_flag(self):
         """DC layer must switch noise levels based on .train() / .eval() mode."""
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.02, eval_noise_level=0.005, noise_type="gaussian"
         )
 
@@ -267,7 +267,7 @@ class TestMetricsConsistency:
 
     def test_metrics_reproducible_with_same_seed(self):
         """Metrics computed twice with same seed should be identical."""
-        dc_layer = DataConsistencyLayer(
+        dc_layer = NoiseSimulatingDataConsistency(
             train_noise_level=0.01, eval_noise_level=0.005, noise_type="gaussian"
         )
         dc_layer.eval()
@@ -369,7 +369,7 @@ class TestDataLeakSmokeSuite:
 
     def test_dc_smoke_training_adds_noise(self):
         """[SMOKE] DC layer in training mode adds noise."""
-        dc = DataConsistencyLayer(train_noise_level=0.01, eval_noise_level=0.0)
+        dc = NoiseSimulatingDataConsistency(train_noise_level=0.01, eval_noise_level=0.0)
         dc.train()
 
         measured = torch.randn(1, 1, 32, 32, dtype=torch.complex64)
@@ -381,7 +381,7 @@ class TestDataLeakSmokeSuite:
 
     def test_dc_smoke_eval_mode_works(self):
         """[SMOKE] DC layer in eval mode works."""
-        dc = DataConsistencyLayer(train_noise_level=0.01, eval_noise_level=0.005)
+        dc = NoiseSimulatingDataConsistency(train_noise_level=0.01, eval_noise_level=0.005)
         dc.eval()
 
         measured = torch.randn(1, 1, 32, 32, dtype=torch.complex64)

@@ -56,7 +56,6 @@ training:
   input_domain: image
   output_domain: image
   strategy_class: spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy
-  enable_gradient_checkpointing: true
   batch_size: 2
   max_iterations: 100000
   epochs: 100
@@ -134,7 +133,6 @@ validation:
 checkpoint:
   enabled: true
   save_interval: 1000
-  checkpoint_dir: ./checkpoints/experiment_96_sde_diffusion
 logging:
   log_validation_graphs: true
   save_images_per_epoch: 8

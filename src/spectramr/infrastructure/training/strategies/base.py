@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from spectramr.infrastructure.training.debug_snapshot import ChannelSegment
 
 
+from spectramr.infrastructure.builders.leaf.adapter_builders import apply_pre_model
+
 # Phase 2: Use frozen TrainingEnvironment from builders (SSOT)
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.loop_state import LoopState
@@ -49,17 +51,23 @@ from spectramr.infrastructure.training.strategies.mixins.utils import (  # noqa:
     _callable_accepts_kwarg,
     _get_config_value,
     pick_present,
+    reduce_on_device,
 )
 from spectramr.infrastructure.training.strategies.mixins.validation import ValidationMixin
-from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
+from spectramr.infrastructure.training.strategies.rng_streams import (
+    generator_states,
+    restore_generator_states,
+)
 from spectramr.infrastructure.training.utils.transform_ops import (
     ComplexTensorHandler,
     FFTTransformer,
 )
 from spectramr.models.capabilities import StrategyCapabilities
+from spectramr.models.losses.reporting import active_loss_names, format_loss_objective
 from spectramr.models.losses.weights import (
     LossWeightTable,
     build_loss_weight_table,
+    canonical_loss_name,
     resolve_loss_weight,
 )
 
@@ -309,18 +317,47 @@ class BaseTrainingStrategy(
     #: name such as ``cocycle_consistency`` when the strategy owns that term).
     #: ``None`` = ownership not declared: the audit's
     #: ``image_losses_reach_the_objective`` witness reports such a strategy as
-    #: UNVERIFIED and errors only on declared ones. The fold
+    #: UNVERIFIED and errors only on declared ones, and ``LossBuilder.validate()``
+    #: refuses its empty loss stack -- silence is not a claim of ownership. Declared
+    #: here alongside ``folds_image_losses = False``, an empty stack is the design
+    #: instead and the build proceeds (``loss_folding.declares_inline_objective``,
+    #: the one owner of that pairing). The fold
     #: (``loss_folding.fold_builder_image_losses``) skips exactly this set, so a
     #: declared inline term is never counted twice (mrixfields review 2026-09-03).
     inline_losses: ClassVar[frozenset[str] | None] = None
 
-    #: True when every other ``losses.image_losses`` entry reaches the objective:
-    #: through the parent's builder path (``super()._compute_losses_impl``) or the
-    #: strategy's own ``_apply_builder_image_losses`` call. ``test_loss_ownership``
-    #: pins the value against the source; a strategy that overrides
-    #: ``_compute_losses_impl`` with neither route declares False, and the witness
-    #: then rejects any declared entry outside ``inline_losses`` as a decoy.
+    #: True when every other ``losses.image_losses`` entry reaches the objective.
+    #: There are FIVE routes, all enumerated in ``test_loss_ownership.ROUTE_MARKERS``
+    #: (the one owner of that vocabulary): the parent's builder path
+    #: (``super()._compute_losses_impl``), the strategy's own
+    #: ``_apply_builder_image_losses`` call, the shared ``fold_builder_image_losses``
+    #: helper, forwarding ``env.losses`` as ``losses_dict`` to a unified loss
+    #: computer, and iterating ``env_losses.items()`` to accumulate
+    #: ``weight * loss``. A strategy that overrides ``_compute_losses_impl`` with
+    #: none of them declares False, and the witness then rejects any declared entry
+    #: outside ``inline_losses`` as a decoy.
+    #:
+    #: The fourth route is a HAND-OFF, not a fold: it only reaches the objective if
+    #: the receiving computer reads the dict. ``UnifiedMAELossComputer`` and
+    #: ``UnifiedDisentangledLossComputer`` accept ``losses_dict`` and discard it, so
+    #: a strategy handing off to either declares False (issue #1918).
+    #:
+    #: ``test_loss_ownership`` pins a True value against the source for every one of
+    #: the 153 strategy classes. The pin is ONE-DIRECTIONAL by design: declaring
+    #: False costs you nothing but honesty -- the witness then reports every
+    #: non-inline declared entry through ``unreachable_image_losses`` -- while
+    #: declaring True buys a silent PASS. Only the silent direction is gated, which
+    #: also lets a strategy whose fold is FILTERED (``SSDUReconstructionStrategy``
+    #: runs only names containing ``ssdu``) declare False truthfully even though it
+    #: matches a route marker textually.
     folds_image_losses: ClassVar[bool | None] = None
+
+    #: Which parallel backends this strategy declares it can run under -- a subset
+    #: of ``{"replicated", "sharded"}`` (see
+    #: :mod:`spectramr.infrastructure.distributed.strategy_compat`). ``None`` is
+    #: undeclared. Restrictions are inherited, permissions are not, so a subclass
+    #: redeclares rather than inheriting a parent's audit.
+    parallel_compat: ClassVar[frozenset[str] | None] = None
 
     logging_service: ILoggingService
 
@@ -333,6 +370,54 @@ class BaseTrainingStrategy(
     #: "Model outputs 2 channels, but target dataset provided 1"). The Open-Closed
     #: replacement for the hard-coded ``evidential_unet`` model-type escape.
     predicts_distribution_params: ClassVar[bool] = False
+
+    #: True when the target holds the acquired series the strategy RENDERS from the
+    #: model's output (e.g. tissue maps rendered into T1w/T2w/FLAIR), so its width is
+    #: the number of series, not ``out_channels``. The width guard then defers; the
+    #: input guard still applies, unlike ``synthesises_model_input``.
+    renders_target_series: ClassVar[bool] = False
+
+    #: True when the strategy synthesises the generator's input itself instead of
+    #: passing ``input_batch`` through (the virtual-fiducial family real-stacks a
+    #: digital-twin-corrupted complex image; multi-coil EI applies ``A^H``). The
+    #: channel guard in :meth:`train_step` is then skipped, since it would compare
+    #: a tensor the model never consumes. Read through
+    #: :meth:`builds_own_model_input`, which a strategy overrides when the answer
+    #: depends on its configuration.
+    synthesises_model_input: ClassVar[bool] = False
+
+    #: True when the step dict carries ``self.loss_computer``'s
+    #: ``LossOutput.components`` verbatim. The CSV header resolver
+    #: (``training_loop.resolve_producer_declared_columns``) then declares the
+    #: computer's ``stamped_component_keys``, which no config traversal can name
+    #: (e.g. ``loss_nonfinite_substitutions``, #2546).
+    forwards_loss_components: ClassVar[bool] = False
+
+    #: Names of the ``torch.Generator`` attributes that drive training-step
+    #: randomness (a k-space split, a group or operator draw). The base
+    #: ``strategy_state_dict`` carries them through the checkpoint, so a resume
+    #: continues each stream; build them with ``rng_streams.rank_seeded_generator``
+    #: so data-parallel ranks draw differently. Declared rather than discovered:
+    #: a stream reseeded on every call, or built lazily after a checkpoint, must
+    #: not be saved.
+    checkpointed_streams: ClassVar[tuple[str, ...]] = ()
+    #: Integer schedule counters (e.g. a step count that anneals a knob) carried through
+    #: the checkpoint, so a resume continues the schedule instead of restarting it.
+    checkpointed_counters: ClassVar[tuple[str, ...]] = ()
+
+    def builds_own_model_input(self) -> bool:
+        """Whether this strategy constructs the generator input itself."""
+        return type(self).synthesises_model_input
+
+    @classmethod
+    def standalone_infer_blocker(cls, config: object) -> str | None:
+        """Why ``infer`` cannot serve this arm, or ``None``.
+
+        A strategy that builds the network input in its own step (``A^H y`` from a
+        mask, a measurement and coil maps) names it here; ``infer`` has no such
+        builder and would feed the raw file to the model.
+        """
+        return None
 
     def __init__(
         self,
@@ -372,6 +457,10 @@ class BaseTrainingStrategy(
         # SSOT: config from environment
         self.config = self.env.config
 
+        # Modules this strategy builds itself, see register_owned_module (#2629).
+        self._owned_modules: dict[str, nn.Module] = {}
+        self._owned_wrappers: dict[str, nn.Module] = {}
+
         # Model-output debug-snapshot capture (parity with the pre-forward
         # ``first_steps`` auto-snapshot). A lazily-registered forward hook on
         # the generator stashes its latest output so ``_compute_losses`` can
@@ -409,6 +498,7 @@ class BaseTrainingStrategy(
         # sidecar treatment, same reason. ``None`` keeps the historical
         # "every declared-k-space tensor is decompressed" default.
         self._declared_log_scaled_keys: set[str] | None = None
+        self._declared_domain_exact: bool = False
         self._model_input_snapshot_done: bool = False
         # Backbone input width, resolved lazily and cached. The resolution walks
         # ``modules()``, and the wrapper that needs it runs on EVERY step (the
@@ -525,7 +615,6 @@ class BaseTrainingStrategy(
             fft_transformer=FFTTransformer(device=self.device),
             complex_handler=ComplexTensorHandler(),
             loss_fn=losses,
-            mask_generator=KSpaceMaskGenerator(device=self.device),
         )
 
         self._g_losses_pool: dict[str, torch.Tensor] = {}
@@ -568,8 +657,9 @@ class BaseTrainingStrategy(
         ).build()
 
         # Call the strategy-specific setup hook.
-        # Strategies that also call this in their own __init__ will execute it
-        # twice, but all setup methods are idempotent (re-assign attributes).
+        # A hook is NOT idempotent when it adds an optimizer param group or builds a module,
+        # so a strategy must not call it again; the ones that still do are baselined in
+        # test_no_double_strategy_setup.py.
         self._setup_strategy_specific_components()
 
     def _sync_schedulers_after_param_group_addition(self, new_lr: float) -> None:
@@ -767,6 +857,7 @@ class BaseTrainingStrategy(
         log_scaled_keys: set[str] | None = None,
         channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None,
         model_input_key: str | None = None,
+        domain_exact: bool = False,
     ) -> None:
         """Paradigm-agnostic per-step debug snapshot.
 
@@ -829,83 +920,55 @@ class BaseTrainingStrategy(
         logging_cfg = getattr(self.config, "logging", None)
 
         # Mark which tensors carry k-space so the previewer IFFTs them for a
-        # human-readable image. Two gaps motivated the config-derived union:
-        #  * the "first_steps" auto-snapshot passes ``in_kspace_keys=None``, so
-        #    the module fell back to a ``"kspace"``-substring match that misses
-        #    the canonical names ``input_raw`` / ``input_prepared`` / ``target``
-        #    (May 2026 experiment_11 "black with white dot").
-        #  * the diffusion "model_output" snapshot passes an EXPLICIT set that
-        #    omitted ``"target"``, so its ``target.png`` rendered as raw
-        #    k-space (2026-06-17 downloaded-run triage).
-        # Fix both: when the config says the dataloader yields k-space, UNION
-        # the canonical k-space key names into whatever the caller supplied
-        # (mark every key when the caller supplied none). The previewer's
-        # spectrum-based check (``_is_in_kspace_domain``) still corrects any
-        # image-domain tensor mis-flagged here, so over-marking is safe.
+        # human-readable image: when the config says the dataloader yields
+        # k-space, the canonical key names are UNIONed into the caller's set.
+        # ``model_output`` follows the model's declared output domain instead of
+        # the loader's, because an image-emitting network on a k-space loader
+        # (EI ``standard_unet``, SSDU ``unrolled_reconstruction``) otherwise has
+        # its image IFFT'd into a centred crosshair.
         try:
             from spectramr.infrastructure.training.utils.domain_inference import (
                 needs_ifft_for_visualization,
             )
 
-            _, targets_are_kspace = needs_ifft_for_visualization(self.config)
+            preds_are_kspace, targets_are_kspace = needs_ifft_for_visualization(self.config)
         except Exception as exc:
             logger.debug("first_steps in_kspace inference skipped: %s", exc)
-            targets_are_kspace = False
-        # Keys whose k-space domain is declared by the config SSOT (not a name
-        # guess). The previewer IFFTs these UNCONDITIONALLY, bypassing the
-        # fragile spectrum veto that false-negated on real normalized multicoil
-        # M4Raw k-space and rendered experiment_11 ``input_prepared`` /
-        # ``model_output`` as raw, off-centre k-space (2026-06-27 audit).
+            preds_are_kspace = targets_are_kspace = False
+        # Keys whose k-space domain the config SSOT declares. The previewer IFFTs
+        # these unconditionally, bypassing a spectrum veto that false-negates on
+        # normalized multicoil M4Raw k-space, so nothing whose domain depends on
+        # the branch belongs here (``noisy_images`` can hold a diffusion latent).
         authoritative_kspace_keys: set[str] = set()
-        if targets_are_kspace:
+        # ``domain_exact`` makes the caller's ``in_kspace_keys`` the whole answer. The
+        # canonical union below assumes ``model_input`` lives in the target's domain,
+        # which an image network fed ``A^H y`` contradicts.
+        if targets_are_kspace and not domain_exact:
             _canonical = {
                 "input",
                 "input_raw",
                 "input_prepared",
                 "target",
-                # Mixed-domain in at least one paradigm: cold diffusion's
-                # ``model_input`` is ``cat([x_t, smaps], dim=1)``, so half its
-                # channels are k-space and half are image-domain coil maps.
-                # Membership here is still right -- the k-space half genuinely
-                # needs the veto bypassed, and the veto false-negates on this
-                # very data -- but a whole-tensor render then IFFTs the maps too
-                # and draws the experiment_11 crosshair. The emitter declares
-                # ``channel_segments`` so each half renders in its own domain;
-                # see ``debug_snapshot._split_channel_segments``.
+                # Cold diffusion's ``cat([x_t, smaps])``; the emitter declares
+                # ``channel_segments`` so the image-domain maps are not IFFT'd.
                 "model_input",
-                "model_output",
-                # The cold-diffusion forward process degrades k-space by
-                # zero-filling (``q_sample`` is ``x_0 * mask``), so its output
-                # is k-space by construction under exactly the same SSOT that
-                # declares ``input``/``target`` to be. Without this the ONLY
-                # snapshot carrying the tensor the model is actually fed fell
-                # back to the spectrum veto -- the same veto the 2026-06-27
-                # audit above records as false-negating on this very data --
-                # and rendered the accelerated input as raw, off-centre k-space
-                # instead of the zero-filled image it is.
-                #
-                # ``noisy_kspace`` ONLY. Not ``noisy_images``: no emitter writes
-                # that key (the diffusion capture names it ``noisy_kspace``), and
-                # the name is bound to a LATENT in the latent-diffusion branch
-                # -- ``q_sample(latent_z0, ...)`` at diffusion.py. Membership
-                # here bypasses the veto unconditionally, so a latent added
-                # under its own variable name would be IFFT'd with nothing left
-                # to catch it. "Over-marking is safe" is true of
-                # ``in_kspace_keys``, which the veto still corrects; it is not
-                # true of this set. ``noisy_images`` stays in the veto-corrected
-                # set at diffusion._save_debug_snapshots, which is the right
-                # home for a name whose domain depends on the branch.
                 "noisy_kspace",
-                # diffusion pre/post-DC outputs are k-space by construction;
-                # without them the veto renders them as raw k-space over image tiles.
+                "model_output_backbone",
+                "model_output_backbone_projected",
                 "model_output_pre_dc",
                 "model_output_post_dc",
             }
+            if preds_are_kspace:
+                _canonical.add("model_output")
             authoritative_kspace_keys = _canonical & set(tensors.keys())
             if in_kspace_keys is None:
                 in_kspace_keys = set(tensors.keys())
             else:
                 in_kspace_keys = set(in_kspace_keys) | authoritative_kspace_keys
+            if not preds_are_kspace:
+                # A declared image output is not left to the veto either: an
+                # untrained network's output has no DC peak and reads as k-space.
+                in_kspace_keys.discard("model_output")
 
         # A strategy that emits its OWN model-output snapshot (diffusion's
         # richer pre/post-DC capture, tagged ``model_output_dc``) marks the step
@@ -1063,8 +1126,17 @@ class BaseTrainingStrategy(
     _declared_channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None
     #: Companion to the above, defaulted here for the same reason.
     _declared_log_scaled_keys: set[str] | None = None
+    _declared_domain_exact: bool = False
 
-    def _first_steps_extra(self, epoch: int) -> dict[str, Any]:
+    def _snapshot_mask_pattern(self) -> str | None:
+        """The pattern this strategy passes on each mask call, for the provenance.
+
+        ``None`` means its ``mask_generator`` masks with its own default; a
+        strategy that names the pattern per call overrides this.
+        """
+        return None
+
+    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
         """Context stamped on the ``first_steps`` snapshot.
 
         States the canonical-key contract in the artifact itself:
@@ -1082,6 +1154,14 @@ class BaseTrainingStrategy(
         if not prepared_is_input:
             tag = self.snapshot_model_input_tag or "see strategy docs"
             extra["model_input_snapshot_tag"] = tag
+        if batch is not None:
+            from spectramr.infrastructure.training.snapshot_provenance import (
+                realised_acceleration,
+            )
+
+            # Deferred: the writer resolves it only past its budget gate, so the
+            # host read never runs on a step that writes nothing (#2382).
+            extra["realised_acceleration"] = lambda: realised_acceleration(batch)
         return extra
 
     def _snapshot_provenance(self, source: str = "train") -> dict[str, Any] | None:
@@ -1118,6 +1198,8 @@ class BaseTrainingStrategy(
                 dataset=getattr(loader, "dataset", None),
                 model=getattr(self.env, "generator", None),
                 source=source,
+                mask_generator=getattr(self, "mask_generator", None),
+                mask_pattern=self._snapshot_mask_pattern(),
             )
         except Exception as exc:
             logger.debug("snapshot provenance unavailable (source=%s): %s", source, exc)
@@ -1337,6 +1419,7 @@ class BaseTrainingStrategy(
         in_kspace_keys: set[str] | None = None,
         channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None,
         log_scaled_keys: set[str] | None = None,
+        domain_exact: bool = False,
     ) -> None:
         """Hand the wrapper the tensor the model is ACTUALLY fed.
 
@@ -1378,8 +1461,13 @@ class BaseTrainingStrategy(
                 ``fft2c``'d S-maps) gets ``expm1`` applied to a spectrum that
                 never saw ``log1p``, which flattens every bin above
                 ``DECOMPRESS_MAGNITUDE_CEILING`` onto one value.
+            domain_exact: Treat ``in_kspace_keys`` as complete, skipping the
+                canonical-key union. Set it when ``model_input`` is declared
+                image-domain on a k-space loader (an image network fed ``A^H y``);
+                the union would otherwise IFFT it into a single central pixel.
         """
         self._declared_model_input = (tensors, extra, in_kspace_keys)
+        self._declared_domain_exact = domain_exact
         # Deliberately NOT a fourth tuple slot: several strategies' tests
         # unpack this triple positionally, so widening it breaks modules
         # whose own paired test never runs here. Set and cleared in lockstep
@@ -1424,9 +1512,11 @@ class BaseTrainingStrategy(
         # Read the sidecar BEFORE clearing it -- it is consumed further down.
         declared_segments = self._declared_channel_segments
         declared_log_keys = self._declared_log_scaled_keys
+        declared_domain_exact = getattr(self, "_declared_domain_exact", False)
         self._declared_model_input = None  # Never pin one step's tensors.
         self._declared_channel_segments = None
         self._declared_log_scaled_keys = None
+        self._declared_domain_exact = False
 
         tag = self.snapshot_model_input_tag
         if not tag:
@@ -1466,6 +1556,7 @@ class BaseTrainingStrategy(
                 model_input_key=(
                     extra.get("model_input_key") if isinstance(extra, Mapping) else None
                 ),
+                domain_exact=declared_domain_exact,
             )
             return
 
@@ -1649,52 +1740,16 @@ class BaseTrainingStrategy(
             _ri[:, 1::2] = target_batch.imag
             target_batch = _ri
 
-        # [CoilAdapter] v6.0 ``adapters.pre_model`` opt-in: when the YAML
-        # declares a ``pre_model:`` chain (e.g. ``rss_coils_to_magnitude``
-        # to collapse the m4raw dataset's cross-contrast 4-ch tensor down
-        # to the 1-ch image-magnitude that image-domain reconstruction
-        # models expect), apply it to **both** the input and target
-        # *before* the strict DomainMismatch check below.  Without this
-        # early application the audit would pass (it derives channels from
-        # the declarative chain) but the runtime check at lines 633-663
-        # would still see the un-adapted shape and crash.  Idempotent
-        # adapters (rss_coils_to_magnitude is identity on 1-ch input)
-        # mean re-running them later in the loss path is safe; chains
-        # declared exclusively under ``pre_loss_pred`` / ``pre_loss_target``
-        # (e.g. the bloch-cycle iFFT+magnitude+RSS chain that is **not**
-        # idempotent) are untouched here because they live on different
-        # hooks.
-        if self.adapter_chains.get("pre_model"):
-            if input_batch_prepared is not None:
-                input_batch_prepared = self.apply_adapters("pre_model", input_batch_prepared)
-            if target_batch is not None:
-                target_batch = self.apply_adapters("pre_model", target_batch)
-
-        # [FIX] Channel adaptation guard: strict domain mismatch check.
-        # - actual != expected: Raise ValueError to prevent doomed GPU runs.
-        # We no longer apply 1x1 convs or zero-padding, as this destroys
-        # physics integrity (e.g. multi-coil k-space into single-channel models).
-        #
-        # Complex-stacking strategies (distillation / virtual-fiducial family)
-        # IGNORE ``input_batch`` and synthesise the model input internally from
-        # the target — they real-stack the digital-twin-corrupted complex image
-        # via cat([real, imag]), so the model sees 2× the raw dataset channels
-        # (e.g. a 1-ch rss_image magnitude → 2-ch model input). Checking the raw
-        # ``input_batch_prepared`` width against ``in_channels`` here is checking
-        # a tensor the model never consumes, so it wrongly rejected the correct
-        # in_channels=2 for eval_c2/eval_c3/eval_c7/exp_c4 (cluster smoke
-        # 20260605). The real check is deferred to the generator's first conv
-        # (and to the audit's strategy-aware domain_alignment). Mirror of
-        # config_health_checker._COMPLEX_STACKING_STRATEGY_MARKERS — keep in sync.
-        _own_input_markers = (
-            "virtual_fiducial_strategy",
-            "motion_meta_strategy",
-            "vf_admm_strategy",
-            "ib_vf_strategy",
-            "distillation_strategy",
+        # pre_model runs before the channel guard; validation applies the same chain.
+        input_batch_prepared, target_batch = apply_pre_model(
+            self.adapter_chains, input_batch_prepared, target_batch
         )
-        _strategy_class = getattr(self.config.training, "strategy_class", None) or ""
-        _builds_own_model_input = any(m in _strategy_class for m in _own_input_markers)
+
+        # Strict channel guard: a width mismatch raises rather than being
+        # adapted, because a 1x1 conv or zero-pad over multi-coil k-space destroys
+        # the physics. Skipped for strategies that build the model input
+        # themselves, where ``input_batch_prepared`` is not what the model sees.
+        _builds_own_model_input = self.builds_own_model_input()
         if (
             input_batch_prepared is not None
             and hasattr(self.config.model, "in_channels")
@@ -1730,8 +1785,10 @@ class BaseTrainingStrategy(
                 # The strategy validates its own channel contract (e.g.
                 # HeteroscedasticULFStrategy._as_mean_logvar), so the strict width
                 # guard must defer to it rather than reject (mrixfields b29).
-                if self.config.model.model_type == "evidential_unet" or getattr(
-                    self, "predicts_distribution_params", False
+                if (
+                    self.config.model.model_type == "evidential_unet"
+                    or getattr(self, "predicts_distribution_params", False)
+                    or getattr(self, "renders_target_series", False)
                 ):
                     pass
                 else:
@@ -1768,7 +1825,7 @@ class BaseTrainingStrategy(
                 # tensor the model receives; saying so here is what stops a
                 # reader concluding the arm was fed fully-sampled data (the
                 # experiment_11 report that produced this contract).
-                extra=self._first_steps_extra(epoch),
+                extra=self._first_steps_extra(epoch, batch=batch),
             )
         except Exception as _exc:
             logger.debug("Auto debug-snapshot skipped: %s", _exc)
@@ -1850,7 +1907,8 @@ class BaseTrainingStrategy(
         columns for exactly that reason.
 
         Base declares nothing, so this is a no-op for every strategy that does
-        not override it.
+        not override it. A loss computer's own stamped keys are declared through
+        :attr:`forwards_loss_components` instead.
         """
         return frozenset()
 
@@ -1899,7 +1957,8 @@ class BaseTrainingStrategy(
         edit. Objects reachable from ``self.env`` are excluded — they round-trip
         through their own checkpoint paths and must not be double-saved. Handles
         both ``nn.Module`` (state-dict) and bare ``nn.Parameter`` (e.g. spin_sde's
-        diffusion coefficient).
+        diffusion coefficient). The random streams named in
+        :attr:`checkpointed_streams` are saved under ``generators``.
         """
         env_ids = self._env_owned_param_ids()
         modules: dict[str, Any] = {}
@@ -1913,27 +1972,151 @@ class BaseTrainingStrategy(
                 # Owns state iff it has >=1 parameter the env does not.
                 if any(id(p) not in env_ids for p in obj.parameters()):
                     modules[name] = obj.state_dict()
-        return {"modules": modules, "params": params}
+        generators = generator_states(self, type(self).checkpointed_streams)
+        counters = {name: int(getattr(self, name)) for name in type(self).checkpointed_counters}
+        return {"modules": modules, "params": params, "generators": generators, "counters": counters}
 
-    def load_strategy_state_dict(self, state: dict[str, Any] | None) -> None:
+    def owned_modules(self) -> dict[str, nn.Module]:
+        """Modules this strategy registered with :meth:`register_owned_module`, by name."""
+        return dict(self._owned_modules)
+
+    def register_owned_module(self, name: str, module: nn.Module) -> nn.Module:
+        """Record a module the strategy built outside ``env.models``; return it unchanged.
+
+        Under ``ddp`` the module is wrapped so its gradients are all-reduced, and its forward
+        must then go through :meth:`call_owned`. Under ``fsdp`` or ``deepspeed`` this raises,
+        because the module is built after the optimizer and cannot be sharded into it.
+        Every rank must register at the same point of the run, since DDP construction
+        broadcasts parameters.
+        """
+        from spectramr.infrastructure.distributed.distributed_training import RankUtility
+        from spectramr.infrastructure.distributed.owned_modules import wrap_owned_module
+
+        wrapper = wrap_owned_module(
+            module,
+            owner=type(self).__name__,
+            name=name,
+            parallel=getattr(self.config, "parallel", None),
+            device=self.device,
+        )
+        self._owned_modules[name] = module
+        if wrapper is None:
+            self._owned_wrappers.pop(name, None)
+        else:
+            self._owned_wrappers[name] = wrapper
+            if RankUtility.is_main_rank():
+                logger.info("[Parallel] %s.%s wrapped with DDP", type(self).__name__, name)
+        return module
+
+    def call_owned(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """Run an owned module's forward, through its DDP wrapper when it has one."""
+        return self._owned_wrappers.get(name, self._owned_modules[name])(*args, **kwargs)
+
+    def inner_for_call(self, model: nn.Module, name: str) -> nn.Module:
+        """The inner module of ``model``, to call ``name`` on outside its wrapped forward.
+
+        With gradients on, such a call skips the wrapper's reducer, so it is refused under
+        ddp, fsdp and deepspeed (``refuse_outside_forward_call``, the same verdict the audit
+        gives a declared ``call``); under none and dp it runs on the inner module. Under
+        ``no_grad`` (validation, sampling) nothing is reduced, so any backend may run it.
+        """
+        from spectramr.core.module_utils import unwrap_model
+        from spectramr.infrastructure.distributed.owned_modules import (
+            refuse_outside_forward_call,
+        )
+
+        if torch.is_grad_enabled():
+            refuse_outside_forward_call(
+                getattr(getattr(self, "config", None), "parallel", None),
+                owner=type(self).__name__,
+                name=name,
+            )
+        return unwrap_model(model)
+
+    def forward_of(self, name: str) -> nn.Module:
+        """The module to call for attribute ``name``: its DDP wrapper when the strategy
+        registered and wrapped it, else the attribute itself.
+
+        For a strategy whose networks are either its own (registered) or aliases of an
+        ``env`` model, which the parallel backend already wrapped.
+        """
+        wrapper = self._owned_wrappers.get(name)
+        return wrapper if wrapper is not None else getattr(self, name)
+
+    def checkpoint_models(self) -> dict[str, nn.Module]:
+        """Strategy-owned models saved as whole ``models`` entries, keyed ``stage:<name>``.
+
+        Unlike :meth:`strategy_state_dict`, each entry is a model in its own right: the
+        checkpoint gathers it like the generator and ``weights(ref, key, ...)`` reads it.
+        The base owns none.
+        """
+        return {}
+
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Build the owned modules a fresh strategy creates lazily, before restore.
+
+        A strategy that builds a module or parameter after ``__init__`` (sized by
+        the first batch, or copied from the generator) overrides this to rebuild
+        each saved entry, registering any ``opt_g`` param group in the order
+        training added it. The default builds nothing.
+        """
+
+    def check_strategy_state(self, state: dict[str, Any] | None) -> None:
+        """Refuse a ``strategy`` part this strategy cannot restore whole.
+
+        ``resume`` calls it before loading anything, with ``None`` when the file has no
+        strategy part, so a refusal leaves the run untouched. The base accepts all.
+        """
+
+    def load_strategy_state_dict(
+        self, state: dict[str, Any] | None, *, load_optimizer: bool = True
+    ) -> None:
         """Restore owned modules / parameters captured by ``strategy_state_dict``.
 
+        ``load_optimizer`` is resume's ``checkpoint.load_optimizer_state`` gate, for a
+        strategy that owns optimizers (#2964); the base owns none and ignores it.
+
         A no-op for ``None``/empty state (older checkpoints, or strategies that own
-        nothing), so it is forward/backward compatible. Modules are restored via
+        nothing), so it is forward/backward compatible. Lazily built entries are
+        first rebuilt by :meth:`_materialize_owned_state`. Modules are restored via
         ``load_state_dict``; bare parameters via an in-place ``copy_`` onto the
-        live (already re-created in ``__init__``) parameter so the optimizer's
-        param references stay valid."""
+        live parameter so the optimizer's param references stay valid. Random
+        streams are restored by
+        :func:`~spectramr.infrastructure.training.strategies.rng_streams.restore_generator_states`
+        (rank 0 resumes its saved stream, other ranks reseed from it).
+
+        Raises:
+            RuntimeError: A saved module or parameter has no live attribute of the
+                same kind to restore into.
+        """
         if not state:
             return
+        self._materialize_owned_state(state)
+        expected = {"modules": nn.Module, "params": nn.Parameter}
+        unplaced = [
+            f"{kind}.{name}"
+            for kind, cls in expected.items()
+            for name in state.get(kind, {})
+            if not isinstance(getattr(self, name, None), cls)
+        ]
+        if unplaced:
+            # Skipping these would resume with freshly initialised weights while
+            # reporting a successful restore (#2820).
+            raise RuntimeError(
+                f"Strategy state entries {unplaced} have no target of the saved kind on "
+                f"{type(self).__name__}. A module built after __init__ must be rebuilt "
+                "in _materialize_owned_state."
+            )
+        restore_generator_states(self, state.get("generators"))
+        # Checkpoints written before counters were saved carry no "counters" key and skip this.
+        for name, value in state.get("counters", {}).items():
+            setattr(self, name, int(value))
         for name, sd in state.get("modules", {}).items():
-            module = getattr(self, name, None)
-            if isinstance(module, nn.Module):
-                module.load_state_dict(sd)
+            getattr(self, name).load_state_dict(sd)
         for name, tensor in state.get("params", {}).items():
-            param = getattr(self, name, None)
-            if isinstance(param, nn.Parameter):
-                with torch.no_grad():
-                    param.copy_(tensor.to(param.device))
+            param = getattr(self, name)
+            with torch.no_grad():
+                param.copy_(tensor.to(param.device))
 
     # ------------------------------------------------------------------
     # Hook methods for subclasses to override
@@ -2143,6 +2326,7 @@ class BaseTrainingStrategy(
         self._declared_model_input = None
         self._declared_channel_segments = None
         self._declared_log_scaled_keys = None
+        self._declared_domain_exact = False
         with self._capture_model_output(
             module=None,
             input_batch=input_batch,
@@ -2200,10 +2384,13 @@ class BaseTrainingStrategy(
         losses: dict[str, torch.Tensor],
         metrics_tensor: dict[str, torch.Tensor],
         epoch: int,
-    ) -> dict[str, float]:
-        """Handle NaN/Inf detection with fail-fast behavior."""
-        batch_results = self._convert_metrics_to_floats(losses)
-        return batch_results
+    ) -> dict[str, torch.Tensor | float]:
+        """Reduce each loss to a scalar, leaving tensors on the device.
+
+        Runs every step, so no host transfer happens here; the training loop
+        converts at its log gate (#707).
+        """
+        return {k: reduce_on_device(k, v) for k, v in losses.items()}
 
     # ------------------------------------------------------------------
     # Helper methods
@@ -2217,6 +2404,113 @@ class BaseTrainingStrategy(
             table = build_loss_weight_table(getattr(self.config, "losses", None))
             self._loss_weight_table = table
         return table
+
+    @property
+    def _declared_loss_keys(self) -> frozenset[str]:
+        """The loss names THIS strategy must guarantee in its per-step loss dict.
+
+        The CSV header is built ONCE at startup and the row writer drops any key the
+        header lacks (``extrasaction="ignore"``), so a declared loss that never reaches
+        the dict leaves a blank column for the whole run (#1919).
+
+        Derived from the loss-weight SSOT, never hand-listed. The lists this replaced
+        read one schema block each, so they were empty for every arm that declares its
+        objective in ``losses.image_losses`` / ``losses.kspace_losses`` — 58 of the
+        kspace_filling cohort. Builder-owned losses are subtracted via the existing
+        skip-set SSOT so they are not zero-filled here and then reported missing.
+        """
+        keys = getattr(self, "_declared_loss_key_cache", None)
+        if keys is None:
+            # Function-local, mirroring ``infrastructure/loss_audit.py``: the builder
+            # module owns the skip set, and importing it at module scope would put a
+            # builder import into every strategy.
+            from spectramr.infrastructure.training.builders.loss_builder import (
+                STRATEGY_MANAGED_LOSSES,
+            )
+
+            keys = active_loss_names(self._weight_table) - STRATEGY_MANAGED_LOSSES
+            self._declared_loss_key_cache = keys
+        return keys
+
+    @property
+    def _warmup_gated_loss_keys(self) -> frozenset[str]:
+        """Declared keys that are LEGITIMATELY absent while the warm-up gate holds.
+
+        ``adversarial`` is the common case: it is declared active, but
+        :func:`resolve_loss_weight` returns 0.0 while ``iteration <
+        warmup_iterations``, so the branch that would produce it never runs. Absent is a
+        state to report, never to infer (NN18) — but a *gated* absence is expected, and
+        reporting it would emit one line per step for the whole warm-up.
+        """
+        keys = getattr(self, "_warmup_gated_loss_key_cache", None)
+        if keys is None:
+            table = self._weight_table
+            keys = frozenset(
+                name
+                for name in self._declared_loss_keys
+                if name in table and table[name].warmup_gated
+            )
+            self._warmup_gated_loss_key_cache = keys
+        return keys
+
+    def _log_loss_objective(self, prefix: str) -> None:
+        """Announce this arm's declared objective, once, at strategy setup.
+
+        The banner is the only surface that shows the weight the user actually
+        wrote: a strategy-inline term such as ``pre_dc_kspace`` reaches the CSV
+        under a renamed key, and a warm-up-gated term reads back 0.0 from any
+        resolver called at iteration 0.
+        """
+        for line in format_loss_objective(self._weight_table, prefix=prefix):
+            self.logging_service.log_info(line)
+
+    def _ensure_declared_losses_present(
+        self, loss_dict: dict[str, torch.Tensor], *, iteration: int
+    ) -> frozenset[str]:
+        """Zero-fill declared losses this step did not produce; report the real drops.
+
+        Presence is tested on the CANONICAL name: an arm declaring ``mse`` resolves to
+        ``l2`` in the table while the computer may key either, and comparing raw strings
+        would fill a duplicate column and report a phantom miss every step.
+
+        Returns the names that were filled, so callers and tests can assert on it
+        instead of scraping the log.
+        """
+        declared = self._declared_loss_keys
+        if not declared:
+            return frozenset()
+
+        present = {canonical_loss_name(key) for key in loss_dict}
+        missing = declared - present
+        if missing:
+            device = next(
+                (v.device for v in loss_dict.values() if isinstance(v, torch.Tensor)),
+                None,
+            )
+            for loss_name in missing:
+                loss_dict[loss_name] = torch.zeros((), device=device)
+
+        # Anything missing that the warm-up gate does not explain is reported: the arm
+        # declared it at a live weight and this step did not produce it under that name.
+        # Two shapes reach here and the message must not pick one — the term may be
+        # genuinely uncomputed (a silent drop, NN3), or computed and keyed differently
+        # (``losses.diffusion.lambda_mse`` canonicalises to ``l2`` while the computer
+        # emits ``diffusion``). Reported once per distinct set, not per step (NN9).
+        expected_absent = (
+            self._warmup_gated_loss_keys
+            if iteration < self._weight_table.warmup_iterations
+            else frozenset()
+        )
+        unexplained = missing - expected_absent
+        if unexplained and unexplained != getattr(self, "_reported_missing_losses", None):
+            self._reported_missing_losses = unexplained
+            self.logging_service.log_warning(
+                f"[Train] Declared but absent from the loss dict ({len(unexplained)}): "
+                f"{sorted(unexplained)} — filled with 0.0 so the CSV column exists. "
+                "Either nothing on this path computes them, or the producer keys them "
+                "under a different name; both report as zeros for the whole run."
+            )
+        return frozenset(missing)
 
     def _get_loss_weight(self, loss_name: str, epoch: int = 0, **kwargs: Any) -> float:
         """The weight for ``loss_name``. Delegates to the loss-weight SSOT.
@@ -2329,9 +2623,14 @@ class BaseTrainingStrategy(
         Returns:
             Total gradient norm, on the parameters' device.
         """
-        if enable_clip:
-            return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_value)
-        return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float("inf"))
+        max_norm = clip_value if enable_clip else float("inf")
+        # An FSDP root owns the sharded gradients: only its own method reduces the
+        # norm across ranks. The plain utility clips each shard by its local norm,
+        # so every rank would scale by a different factor.
+        sharded_clip = getattr(model, "clip_grad_norm_", None)
+        if callable(sharded_clip):
+            return sharded_clip(max_norm)
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
 
     def _check_and_log_gradient_anomalies(
         self,

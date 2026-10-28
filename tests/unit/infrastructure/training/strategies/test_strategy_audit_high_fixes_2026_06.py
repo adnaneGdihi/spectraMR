@@ -8,7 +8,7 @@ than spinning up a full training environment.
 """
 from __future__ import annotations
 
-from typing import ClassVar
+import inspect
 
 import pytest
 import torch
@@ -111,48 +111,29 @@ def test_ib_active_select_next_line_rejects_unknown_mode() -> None:
 
 
 def test_n2n_single_repetition_raises_explicitly() -> None:
-    from spectramr.infrastructure.training.strategies.n2n_strategy import (
-        NoiseToNoiseStrategy,
-    )
+    from spectramr.infrastructure.training.strategies.n2n_strategy import pair_from_stack
 
-    batch = {"image_reps": torch.zeros(2, 1, 1, 4, 4)}  # shape[1] == 1
-    with pytest.raises(ValueError, match="at least 2"):
-        NoiseToNoiseStrategy._unpack_batch(object(), batch)
+    x = torch.zeros(2, 1, 4, 4)
+    with pytest.raises(ValueError, match="at least two"):
+        pair_from_stack(x, x, "random_pair")  # one slot: nothing to pair with
 
 
 def test_n2n_reads_iteration_kwarg_not_step() -> None:
     """The schedule was frozen at iteration 0 because the strategy read the
-    nonexistent ``step`` kwarg instead of the canonical ``iteration``."""
+    nonexistent ``step`` kwarg. N2N now runs the shared reconstruction step,
+    which reads the canonical ``iteration``."""
     from spectramr.infrastructure.training.strategies.n2n_strategy import (
         NoiseToNoiseStrategy,
     )
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionStepMixin,
+    )
 
-    recorded: dict[str, object] = {}
-
-    class _FakeOut:
-        total = torch.tensor(0.0, requires_grad=True)
-        components: ClassVar[dict[str, torch.Tensor]] = {}
-
-    class _FakeLC:
-        def compute(self, **kwargs: object) -> _FakeOut:
-            recorded.update(kwargs)
-            return _FakeOut()
-
-    class _FakeEnv:
-        losses: ClassVar[dict] = {}
-
-        @staticmethod
-        def generator(x: torch.Tensor) -> torch.Tensor:
-            return x
-
-    s = NoiseToNoiseStrategy.__new__(NoiseToNoiseStrategy)
-    s.env = _FakeEnv()
-    s.loss_computer = _FakeLC()
-    s.device = torch.device("cpu")
-
-    x = torch.zeros(1, 1, 4, 4)
-    s._compute_losses_impl(x, x, epoch=0, iteration=42)
-    assert recorded["iteration"] == 42
+    step = NoiseToNoiseStrategy._compute_losses_impl
+    assert step is ReconstructionStepMixin._compute_losses_impl
+    src = inspect.getsource(step)
+    assert 'kwargs.get("iteration"' in src
+    assert 'kwargs.get("step"' not in src
 
 
 # ---------------------------------------------------------------------------

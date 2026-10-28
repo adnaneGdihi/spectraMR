@@ -6,6 +6,7 @@ SSOT for loss instantiation.
 """
 
 import logging
+import re
 from typing import Any
 
 import torch
@@ -14,11 +15,18 @@ import torch.nn as nn
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.component_signature import signature_contract
 from spectramr.domain.exceptions import ConfigurationError
-from spectramr.models.losses.registry import LossRegistry, create_loss
+from spectramr.models.losses.registry import LossRegistry, create_loss, get_loss_capabilities
 
 from .base import Builder
 
 logger = logging.getLogger(__name__)
+
+#: Bridge mode -> (``return_complex`` for the wrapper, label for the log line). A mode not
+#: listed ('none') leaves the loss in its native domain.
+_BRIDGE_WRAPPERS: dict[str, tuple[bool, str]] = {
+    "ifft_magnitude": (False, "iFFT→magnitude bridge"),
+    "ifft_complex": (True, "iFFT→complex bridge"),
+}
 
 #: Losses that ``LossBuilder`` must NOT instantiate as standalone modules
 #: because a training strategy computes them inline (they need gradients,
@@ -30,6 +38,7 @@ logger = logging.getLogger(__name__)
 STRATEGY_MANAGED_LOSSES: frozenset[str] = frozenset(
     {
         # Strategy-managed (built by the training strategy)
+        "calibrated_gain_bloch",  # CalibratedQMapStrategy: needs the render and gain context
         "commitment",
         "codebook",
         "r1",
@@ -59,8 +68,103 @@ STRATEGY_MANAGED_LOSSES: frozenset[str] = frozenset(
         # ``lambda_gp`` / ``lambda_feat_match`` rather than declarative entries).
         "gradient_penalty",
         "feature_matching",
+        # Strategy-inline, read straight off ``losses.*`` with NO ``enable_*``
+        # gate and no list entry possible. Each is exempt because its read site
+        # was verified, not because it looked unbuilt (#9: a declared exemption,
+        # never a silent fallback).
+        "pre_dc_kspace",  # strategies/diffusion.py:2593 — `lam > 0.0` then inline
+        "pre_dc_acquired",  # same site, the acquired-bin half — `lam > 0.0` then inline
+        "cycle_adv",  # strategies/cycle_bloch_strategy.py:212 — losses.gan.lambda_cycle_adv
+        "cycle_bloch",  # strategies/cycle_bloch_strategy.py:211 — losses.gan.lambda_cycle_bloch
     }
 )
+
+#: Declaration *sources* whose weight a loss **computer** resolves from the weight
+#: table directly, rather than naming a module ``LossBuilder`` must instantiate.
+#: Each entry cites the read site that consumes the weight and computes the term
+#: inline, so refusing the declaration would refuse a term that does train.
+#:
+#: Keyed on the exact ``LossWeightSpec.source`` string and NOT on the loss name.
+#: Several sections canonicalise onto one name -- ``losses.diffusion.lambda_mse``,
+#: ``losses.reconstruction.lambda_l2`` and a future third field would all become
+#: ``l2`` -- and only the fields listed here have had their read site read.
+#: Exempting the name would carry the next such field in unexamined.
+#:
+#: **The exemptions are strategy-blind.** ``udr.py:751/757`` run under
+#: ``UnifiedReconstructionLossComputer`` and ``unified_vae.py:281`` under the VAE
+#: computer; under a different strategy the same lambdas are inert and this guard
+#: now passes them. That bound is shared by every skip set in this module
+#: (``STRATEGY_MANAGED_LOSSES`` included) and is not narrowed here.
+COMPUTER_RESOLVED_LAMBDA_SOURCES: dict[str, str] = {
+    # 4-source resolution chain, ending at the weight table.
+    "losses.diffusion.lambda_mse": (
+        "models/losses/computers/unified_diffusion_reconstruction.py:381-413"
+    ),
+    # Weight-gated only, term computed inline by ``_complex_safe_l1`` /
+    # ``_complex_safe_mse``. ``self.l1_loss_fn`` / ``self.l2_loss_fn`` are assigned
+    # ``None`` at udr.py:716-717 and never read, and
+    # ``UnifiedReconstructionLossComputer._initialize_losses`` is ``pass`` --
+    # no computer asks the builder for an l1 or l2 module.
+    "losses.reconstruction.lambda_l1": (
+        "models/losses/computers/unified_diffusion_reconstruction.py:751-754"
+    ),
+    "losses.reconstruction.lambda_l2": (
+        "models/losses/computers/unified_diffusion_reconstruction.py:757-760"
+    ),
+    # ``lambda_l1`` exists on LatentLossesConfig too and canonicalises to the same
+    # ``l1`` the read site above consumes.
+    "losses.latent.lambda_l1": (
+        "models/losses/computers/unified_diffusion_reconstruction.py:751-754"
+    ),
+    # Weight-gated only; the closed-form KL is computed in the branch itself.
+    "losses.latent.lambda_kl": ("models/losses/computers/unified_vae.py:281-301"),
+}
+
+#: The subset of the above whose computer reads the lambda as a *different knob*
+#: from the table key it canonicalises to. ``losses.diffusion.lambda_mse`` is step
+#: 3 of ``UnifiedDiffusionReconstructionLossComputer._resolve_diffusion_weight``
+#: and means the diffusion-term weight, while the table aliases ``lambda_mse`` to
+#: ``l2`` and joins it to any image or k-space ``mse`` entry. One table key, two
+#: knobs, so such a lambda beside a list entry of the same name is not a duplicate.
+#:
+#: A separate constant because the two questions differ. The set above answers
+#: "would refusing this lambda-only declaration stop a run that trains?" and the
+#: set below answers "is this lambda redundant beside a list entry?". The four
+#: reconstruction and latent sources are in the first and not the second:
+#: ``_get_loss_weight("l1")`` reads the table value a list entry already supplies,
+#: so the lambda beside it adds nothing and ``dual_surface_loss_declarations``
+#: should report it (non-negotiable 17 — one owner per invariant, not one
+#: constant for two).
+REINTERPRETED_LAMBDA_SOURCES: dict[str, str] = {
+    "losses.diffusion.lambda_mse": COMPUTER_RESOLVED_LAMBDA_SOURCES["losses.diffusion.lambda_mse"],
+}
+
+#: Matches ``losses.<section>.lambda_<field>`` or ``losses.<list>[<raw>].weight``.
+_SOURCE_NAME_RE = re.compile(r"lambda_(?P<field>\w+)$|\[(?P<raw>[^\]]+)\]\.weight$")
+
+
+def declared_names_in(source: str) -> set[str]:
+    """The RAW names an author wrote, recovered from a ``LossWeightSpec.source``.
+
+    ``LossWeightSpec.name`` is canonical, while the skip sets in this module are
+    keyed on the spelling the schema uses. Three of the 29
+    ``STRATEGY_MANAGED_LOSSES`` entries canonicalise to something else
+    (``marker`` -> ``marker_corruption``, ``content`` -> ``perceptual``,
+    ``patch_nce`` -> ``cut_patch_nce``), so a canonical-only membership test
+    silently loses those three exemptions — measured as a false raise on
+    ``pillars/exp_pillar_07_vf_fourier_shift.yaml``, whose ``lambda_marker`` the
+    VF strategy applies inline.
+
+    Canonicalising the skip set instead would be worse: it would also exempt
+    ``perceptual``, a real buildable loss that #421 established is a DIFFERENT
+    term from ``content``. Recovering the raw name keeps both spellings exact.
+    """
+    names: set[str] = set()
+    for segment in source.split("+"):
+        m = _SOURCE_NAME_RE.search(segment)
+        if m:
+            names.add(m.group("field") or m.group("raw"))
+    return names
 
 
 class LossBuilder(Builder):
@@ -82,6 +186,43 @@ class LossBuilder(Builder):
         self._device = device
         self._losses: dict[str, nn.Module] = {}
         self._already_built_dynamic = False
+        self._weight_table: Any = None
+
+    def _loss_weight_table(self):
+        """The arm's DECLARED loss weights — built once, shared by every reader.
+
+        One owner (NN17): ``build_loss_weight_table`` keys on written-ness
+        (``model_fields_set``) plus the domain lists, so it answers *what did the
+        author declare*, which is a different question from *what does the schema
+        default to*. A builder reading ``recon_config.lambda_<name>`` raw cannot
+        tell the two apart — see :meth:`_build_composite_gan`.
+        """
+        if self._weight_table is None:
+            from spectramr.models.losses.weights import build_loss_weight_table
+
+            self._weight_table = build_loss_weight_table(self._config.losses)
+        return self._weight_table
+
+    def _declared_weight(self, name: str) -> float:
+        """The weight the author DECLARED for ``name``, or ``0.0`` if they did not.
+
+        The construction-time counterpart to
+        :func:`~spectramr.models.losses.weights.resolve_loss_weight`, and
+        deliberately NOT that function: ``resolve_loss_weight`` applies the
+        warm-up gate against an ``iteration``, which only has an answer inside
+        the training loop. A composite built once, before step 0, that asked it
+        would receive the warm-up ``0.0`` and freeze it in for the whole run.
+
+        ``enabled: false`` already forces ``weight`` to ``0.0`` in the table
+        (``weights.py`` — ``weight=0.0 if not enabled else weight``); the
+        ``enabled`` test here is kept for the case the table admits and that
+        assignment does not cover: an entry that is *present* but disabled by a
+        later list entry.
+        """
+        spec = self._loss_weight_table().get(name)
+        if spec is None or not spec.enabled:
+            return 0.0
+        return spec.weight
 
     def get_enabled_losses(self) -> dict[str, float]:
         """get_enabled_losses.
@@ -138,12 +279,20 @@ class LossBuilder(Builder):
             # fallback below flags its entries as "unmigrated" and refuses the
             # run -- for losses that were in fact built moments earlier.
             from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
+            from spectramr.models.losses.weights import canonical_loss_name
 
-            list_loss_names = {
+            # Raw names AND their canonical twins. The declared entry is what the
+            # author wrote (``mse``), the guard below compares against canonical
+            # names (``l2``); keeping both spellings in one set means the
+            # membership test cannot reject a list entry for being spelled with a
+            # registered alias. Raw names are retained so the ``"adversarial" not
+            # in list_loss_names`` bypass just below keeps its exact meaning.
+            _list_names_raw = {
                 c.name
                 for list_name in LOSS_LIST_DOMAINS
                 for c in getattr(self._config.losses, list_name)
             }
+            list_loss_names = _list_names_raw | {canonical_loss_name(n) for n in _list_names_raw}
             # Build GAN composite if enabled and not in list-based
             if "adversarial" not in list_loss_names and gan_config:
                 if enabled_losses.get("adversarial", 0) > 0:
@@ -192,6 +341,20 @@ class LossBuilder(Builder):
             recon_managed = self._config.losses.reconstruction_managed_losses()
 
             unmigrated: list[tuple[str, float]] = []
+            flagged: set[str] = set()
+
+            def _is_known(loss_name: str) -> bool:
+                """Membership test shared by both passes below."""
+                effective = _fallback_registry_map.get(loss_name, loss_name)
+                return (
+                    loss_name in self._losses
+                    or effective in self._losses
+                    or loss_name in list_loss_names
+                    or effective in list_loss_names
+                    or loss_name in recon_managed
+                    or effective in recon_managed
+                )
+
             for loss_name, weight in enabled_losses.items():
                 if loss_name in strategy_managed:
                     logger.debug(
@@ -205,17 +368,38 @@ class LossBuilder(Builder):
                 # a migrated config that uses the legacy alias while its
                 # registry-name twin sits in the declarative lists is falsely
                 # rejected as "unmigrated". (The map was previously dead.)
-                effective = _fallback_registry_map.get(loss_name, loss_name)
-                known = (
-                    loss_name in self._losses
-                    or effective in self._losses
-                    or loss_name in list_loss_names
-                    or effective in list_loss_names
-                    or loss_name in recon_managed
-                    or effective in recon_managed
-                )
-                if not known and weight > 0:
+                if not _is_known(loss_name) and weight > 0:
                     unmigrated.append((loss_name, weight))
+                    flagged.add(canonical_loss_name(loss_name))
+
+            # ---- second pass: the weight table -----------------------------
+            # ``get_enabled_losses()`` keeps a ``lambda_<name>`` only while its
+            # sibling ``enable_<name>`` is true, and every ``enable_*`` defaults
+            # False -- so a lambda-only declaration never reached the loop above
+            # and this guard could not fire on the very shape its message
+            # describes. ``build_loss_weight_table`` keys on written-ness
+            # (``model_fields_set``), which is the declaration the author made.
+            #
+            # A union, not a replacement: the pass above still owns the
+            # ``enable_x: true`` + defaulted-lambda shape, which the table
+            # reports at its schema default rather than as an author decision.
+            for spec in self._loss_weight_table().values():
+                if not spec.enabled or spec.weight <= 0:
+                    continue
+                raw_names = declared_names_in(spec.source)
+                if spec.name in flagged:
+                    continue
+                if spec.name in strategy_managed or raw_names & strategy_managed:
+                    continue
+                # ``source`` is "+"-joined when a name is declared on more than
+                # one surface. Exempt only when EVERY declaration is
+                # computer-resolved -- one non-exempt surface means a module was
+                # expected and none was built.
+                if all(src in COMPUTER_RESOLVED_LAMBDA_SOURCES for src in spec.source.split("+")):
+                    continue
+                if not _is_known(spec.name) and not any(_is_known(raw) for raw in raw_names):
+                    unmigrated.append((spec.name, spec.weight))
+                    flagged.add(spec.name)
 
             if unmigrated:
                 # Per CLAUDE.md #9 (silent fallbacks are forbidden) and #10
@@ -224,14 +408,16 @@ class LossBuilder(Builder):
                 # is an unambiguous config bug — it would silently train
                 # without that loss. Refuse instead of warn-and-skip.
                 lines = [
-                    f"  • '{n}' (weight={w}) → migrate into objectives.image_losses, "
-                    f"objectives.kspace_losses, or objectives.complex_losses"
+                    f"  • '{n}' (weight={w}) → migrate into losses.image_losses, "
+                    f"losses.kspace_losses, losses.complex_losses or "
+                    f"losses.latent_losses"
                     for n, w in unmigrated
                 ]
                 raise ConfigurationError(
                     "Loss configuration references key(s) that are not in the v6.0 "
                     "declarative list-based losses (kspace_losses / image_losses / "
-                    "complex_losses). Silently skipping them would train without the "
+                    "complex_losses / latent_losses). Silently skipping them would "
+                    "train without the "
                     "advertised supervision — refusing per CLAUDE.md #9. Unmigrated "
                     "key(s):\n" + "\n".join(lines)
                 )
@@ -542,12 +728,49 @@ class LossBuilder(Builder):
                         f"so a `config:` block is silently dropped (issue #468)."
                     )
 
-                if bridge_mode == "ifft_magnitude":
-                    loss_fn = _BridgedLoss(loss_fn, return_complex=False)
-                    logger.info(f"Created {name} loss (weight={weight}) with iFFT→magnitude bridge")
-                elif bridge_mode == "ifft_complex":
-                    loss_fn = _BridgedLoss(loss_fn, return_complex=True)
-                    logger.info(f"Created {name} loss (weight={weight}) with iFFT→complex bridge")
+                # Reject the ZERO bridge, the complement of the guard above. That
+                # one catches a tensor transformed twice; this one catches a loss
+                # that expects an image, sits in a list the builder does not
+                # bridge, and does not bridge itself — so nothing transforms
+                # anything and it reads raw k-space as if it were anatomy. The
+                # symptom is identical to the double bridge: finite values, no
+                # raise, a green run measuring nothing it advertises.
+                #
+                # Only under ``output_domain: kspace``, because that is the one
+                # combination where ``bridge_mode == "none"`` leaves a k-space
+                # tensor; with an image or complex-image output the unbridged
+                # tensor is already what the loss wants.
+                if bridge_mode == "none" and output_domain == "kspace":
+                    caps = get_loss_capabilities(name)
+                    registered_domain = getattr(
+                        getattr(caps, "domain", None), "value", getattr(caps, "domain", None)
+                    )
+                    declared_image = kwargs.get("input_domain") == "image"
+                    if (
+                        declared_image or registered_domain == "image"
+                    ) and not getattr(loss_fn, "use_fourier_bridge", False):
+                        why = (
+                            "kwargs declare input_domain: image"
+                            if declared_image
+                            else f"it is registered domain='{registered_domain}'"
+                        )
+                        raise ConfigurationError(
+                            f"Loss '{name}' expects an IMAGE ({why}) but is declared "
+                            f"under a loss list that adds no bridge for "
+                            f"output_domain='kspace', and it does not bridge itself "
+                            f"(use_fourier_bridge is False) — it would receive raw "
+                            f"k-space and score it as an image. Declare '{name}' under "
+                            f"losses.image_losses (bridge 'ifft_magnitude') or "
+                            f"losses.complex_losses (bridge 'ifft_complex'), or set "
+                            f"kwargs: {{input_domain: kspace}} if it really is meant to "
+                            f"read k-space and bridge itself."
+                        )
+
+                bridge = _BRIDGE_WRAPPERS.get(bridge_mode)
+                if bridge is not None:
+                    return_complex, label = bridge
+                    loss_fn = _BridgedLoss(loss_fn, return_complex=return_complex)
+                    logger.info(f"Created {name} loss (weight={weight}) with {label}")
                 else:
                     logger.info(f"Created {name} loss (weight={weight}) [native domain]")
 
@@ -568,10 +791,7 @@ class LossBuilder(Builder):
             # Image-output model: kspace losses receive image-domain inputs
             # as-is. Some kspace losses self-FFT (e.g. focal_frequency,
             # log_spectral), others (complex_l1) do NOT — those will
-            # silently produce wrong values. The right declarative fix is
-            # to declare an explicit `adapters.pre_loss_pred:
-            # [fft_image_to_kspace]` chain when the model truly outputs
-            # image and kspace losses are wanted.
+            # silently produce wrong values; the loss list must match the model domain.
             kspace_bridge = "none"
             image_bridge = "none"
             complex_bridge = "none"
@@ -694,27 +914,86 @@ class LossBuilder(Builder):
                 )
             adv_strategy = create_loss(adv_name, label_smoothing=gan_config.label_smoothing)
 
-            # Re-use generated perceptual if available
-            perceptual = self._losses.get("perceptual", None)
-            lambda_perceptual = recon_config.lambda_perceptual if recon_config else 0.0
-            if lambda_perceptual > 0 and perceptual is None:
-                try:
+            # Perceptual weight comes from the DECLARED table, never from the
+            # schema default (#1923).
+            #
+            # ``recon_config.lambda_perceptual`` defaults to 10.0 while its
+            # sibling ``enable_perceptual`` defaults False, so reading the field
+            # raw builds — and *trains*, via ``CompositeGANLoss``
+            # ``.compute_generator_loss`` — a VGG perceptual term at weight 10.0
+            # on every GAN arm that never mentioned perceptual. The table keys on
+            # written-ness, so an undeclared name is simply absent from it.
+            #
+            # ``resolve_loss_weight`` is deliberately NOT used here: it applies
+            # the warm-up gate against an ``iteration``, and this composite is
+            # constructed ONCE with a scalar. Resolving at iteration 0 would bake
+            # a warm-up 0.0 in permanently and silently disable perceptual for
+            # the whole run. The static declared weight is the correct value for
+            # a construction-time argument.
+            perceptual_spec = self._loss_weight_table().get("perceptual")
+            if perceptual_spec is None or not perceptual_spec.enabled:
+                perceptual = None
+                lambda_perceptual = 0.0
+            else:
+                lambda_perceptual = perceptual_spec.weight
+                # Reuse the module an earlier pass built. Measured: this is
+                # always the live path -- perceptual can only reach the table via
+                # a domain list (built by ``_build_list_based_losses``) or via a
+                # written ``lambda_perceptual`` (built by the main instantiation
+                # loop, which orders ``perceptual`` before ``adversarial``), so
+                # the fallback below does not fire for any arm that loads today.
+                perceptual = self._losses.get("perceptual", None)
+                if perceptual is None and lambda_perceptual > 0:
+                    # Kept as a build-order safety net, but WITHOUT the
+                    # ``except Exception: logger.debug`` that used to wrap it
+                    # (NN3): a perceptual loss the author DECLARED must fail the
+                    # run when it cannot be constructed, never train at zero.
                     perceptual = create_loss("perceptual").to(self._device, non_blocking=True)
-                except Exception as _exc:
-                    logger.debug("Suppressed exception: %s", _exc)
 
+            # The four reconstruction-side weights come from the same DECLARED
+            # table as perceptual (#1949). They were the last raw readers of
+            # ``recon_config`` here, and ``lambda_l1`` was the damaging one:
+            # its schema default is **10.0** and nothing gates it, so every arm
+            # that never mentioned an L1 was handed one at 10.0 -- and unlike
+            # its six siblings in ``CompositeGANLoss.compute_generator_loss``,
+            # the ``l1_loss`` term carries no ``if self.lambda_l1 > 0`` guard,
+            # so it was added to the generator objective unconditionally.
+            #
+            # That is not a paired-reconstruction default landing in a paired
+            # arm: it lands hardest on the unpaired ones (CycleGAN, CUT,
+            # StarGAN-v2), where ``fake_images`` and ``real_images`` are not the
+            # same subject and an L1 between them is a term nobody chose.
+            #
+            # ``recon_config`` is consequently no longer read for any weight in
+            # this method; it is kept in the signature only because three test
+            # modules call the method positionally.
+            # The last two raw readers, and the same defect as ``lambda_l1``
+            # above wearing an enable flag. ``get_enabled_losses`` pairs
+            # ``lambda_gp`` with ``enable_gradient_penalty`` and
+            # ``feature_matching`` with ``enable_feature_matching``; this builder
+            # -- the surface that actually CONSTRUCTS the term -- read the weight
+            # and ignored the flag, so ``enable_gradient_penalty: false`` bought a
+            # penalty at the schema default of 10.0. That is what killed
+            # ``experiment_11_sense_bridge_critic`` on 2026-09-16: the penalty's
+            # ``autograd.grad`` double-backward is not reducible under DeepSpeed
+            # ZeRO-2 and the run died in ``reduce_ipg_grads``, for a term the arm
+            # had switched off in writing (non-negotiables 8 and 17).
+            lambda_gp = gan_config.lambda_gp if gan_config.enable_gradient_penalty else 0.0
+            lambda_feat_match = (
+                gan_config.feature_matching if gan_config.enable_feature_matching else 0.0
+            )
             gan_loss = create_loss(
                 "gan_composite",
                 adv_strategy=adv_strategy,
                 perceptual_loss=perceptual,
-                lambda_l1=(recon_config.lambda_l1 if recon_config else 10.0),
+                lambda_l1=self._declared_weight("l1"),
                 lambda_perceptual=lambda_perceptual,
                 lambda_adv=gan_config.lambda_adv,
-                lambda_feat_match=gan_config.feature_matching,
-                lambda_gp=gan_config.lambda_gp,
-                lambda_ssim=(recon_config.lambda_ssim if recon_config else 0.0),
-                lambda_ms_ssim=(recon_config.lambda_ms_ssim if recon_config else 0.0),
-                lambda_lpips=(recon_config.lambda_lpips if recon_config else 0.0),
+                lambda_feat_match=lambda_feat_match,
+                lambda_gp=lambda_gp,
+                lambda_ssim=self._declared_weight("ssim"),
+                lambda_ms_ssim=self._declared_weight("ms_ssim"),
+                lambda_lpips=self._declared_weight("lpips"),
             ).to(self._device, non_blocking=True)
 
             self._losses["adversarial"] = gan_loss
@@ -799,24 +1078,114 @@ class LossBuilder(Builder):
         self._build_all_dynamic()
         return self
 
+    def _strategy_class(self) -> type:
+        """The arm's strategy class, resolved through the framework's own dispatcher.
+
+        One owner (NN17): ``TrainingStrategyFactory.get_strategy_class`` is the
+        two-rung resolver the run itself uses (``training.strategy_class`` first,
+        then ``training_mode``), so reading it here cannot disagree with the class
+        the pipeline goes on to instantiate. Imported lazily to match this file's
+        other cross-package readers.
+        """
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        return TrainingStrategyFactory().get_strategy_class(self._config)
+
     def validate(self) -> "LossBuilder":
-        """validate.
+        """Refuse an empty loss stack unless the strategy declares it owns the objective.
+
+        An empty stack is a defect for the arms that expect the builder to feed
+        them and the DESIGN for the arms that compute their objective inline. The
+        two are told apart by the strategy's own declaration, never by guessing.
 
         Returns:
-            'LossBuilder': Description.
+            'LossBuilder': self, for chaining.
+
+        Raises:
+            ConfigurationError: nothing was built and the strategy has not declared
+                inline ownership, or it could not be resolved to ask.
         """
         if not self._losses:
+            from spectramr.infrastructure.training.strategies.loss_folding import (
+                declares_inline_objective,
+            )
+
+            try:
+                strategy_cls = self._strategy_class()
+            except (ConfigurationError, ValueError) as exc:
+                raise ConfigurationError(
+                    "No losses were built by LossBuilder, and the strategy could not be "
+                    f"resolved to ask whether that is by design: {exc}"
+                ) from exc
+
+            if declares_inline_objective(strategy_cls):
+                logger.info(
+                    f"Loss validation passed with an empty stack: {strategy_cls.__name__} "
+                    "declares inline_losses and folds_image_losses=False, so it computes "
+                    "its own objective."
+                )
+                return self
+
             raise ConfigurationError(
-                "No losses were built by LossBuilder. Training cannot proceed. "
-                "Ensure that the configuration has an 'objectives' section with valid enabled losses."
+                f"No losses were built by LossBuilder and {strategy_cls.__name__} does not "
+                "declare that it computes its objective inline. Training cannot proceed. "
+                "Either declare a loss under 'losses:' (image_losses / kspace_losses / "
+                "complex_losses / latent_losses), or set 'inline_losses' and "
+                "'folds_image_losses' on the strategy if it owns its objective."
             )
         logger.info(f"Loss validation passed ({len(self._losses)} losses created)")
         return self
 
+    def _kspace_is_log_scaled(self) -> bool:
+        """Whether the arm's k-space reaches the losses ``log1p``-compressed.
+
+        Read from the same spec the data path normalises with, so the answer is
+        the one the tensors were produced under rather than a second reading of
+        the YAML. The loss-only shims (``loss_audit``, ``domain_validation``) carry
+        no ``data`` block, and with no data there is no compressed k-space.
+        """
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        data = getattr(self._config, "data", None)
+        if data is None:
+            return False
+        return KSpaceNormalizationSpec.from_data_config(data).log_compressed
+
+    def _apply_kspace_log_scaling(self) -> None:
+        """Set ``log_scaled`` on every k-space -> image step in the built stack (#2338).
+
+        A loss that moves its operands to the image domain -- the builder's own
+        bridges, or a loss with ``use_fourier_bridge`` -- must decompress
+        ``log1p``-compressed k-space first, or it scores the inverse FFT of the
+        compressed plane instead of the image. A transform that cannot take the
+        flag raises, so a new self-bridging loss cannot silently skip it.
+        """
+        from spectramr.models.losses.physics_losses import DifferentiableFourierBridge
+
+        log_scaled = self._kspace_is_log_scaled()
+        for name, loss in self._losses.items():
+            if not isinstance(loss, nn.Module):
+                continue
+            for module in loss.modules():
+                bridges = isinstance(module, DifferentiableFourierBridge)
+                if not bridges and getattr(module, "use_fourier_bridge", False) is not True:
+                    continue
+                if hasattr(module, "log_scaled"):
+                    module.log_scaled = log_scaled
+                elif not any(isinstance(m, DifferentiableFourierBridge) for m in module.modules()):
+                    raise ConfigurationError(
+                        f"Loss '{name}' moves k-space to the image domain "
+                        f"({type(module).__name__}.use_fourier_bridge=True) but exposes no "
+                        "`log_scaled` attribute, so it cannot undo the arm's log1p "
+                        "k-space compression. Route its inverse FFT through "
+                        "physics_losses.kspace_to_image and declare `log_scaled`."
+                    )
+
     def build(self) -> dict[str, nn.Module]:
-        """build.
+        """Return the built losses, with every k-space -> image step matched to the data.
 
         Returns:
-            dict[str, nn.Module]: Description.
+            dict[str, nn.Module]: The loss modules by name.
         """
+        self._apply_kspace_log_scaling()
         return dict(self._losses)

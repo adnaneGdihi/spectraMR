@@ -69,3 +69,12 @@ class TestScoutGuard:
         with pytest.raises(ValueError):
             result = s._prepare_generator_inputs({"input": 1})
             assert result == {"sentinel": True}  # pragma: no cover
+
+
+def test_scas_keeps_its_own_ddp_refusal_over_its_migrated_parent():
+    """LOUPE's mask logits are an owned module now; SCAS's bare hypernet group is not."""
+    from spectramr.infrastructure.distributed.strategy_compat import evaluate_parallel_compat
+    from spectramr.infrastructure.training.strategies.loupe_strategy import LOUPEStrategy
+
+    assert not evaluate_parallel_compat(LOUPEStrategy, "ddp").refused
+    assert evaluate_parallel_compat(SCASStrategy, "ddp").refused

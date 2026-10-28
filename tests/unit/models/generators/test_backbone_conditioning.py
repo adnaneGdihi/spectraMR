@@ -158,31 +158,45 @@ class TestContrastWidthProjection:
     """
 
     def test_arm_with_mismatched_widths_runs_contrast_conditioned_forward(self):
-        import yaml
-
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.builders.generator_kwargs import (
+            resolve_full_generator_kwargs,
+        )
         from spectramr.models.generators.kspace_cold_diffusion_generator import (
             KSpaceColdDiffusionGenerator,
         )
 
         path = "experiments/inprogress/kspace_filling/experiment_11e_nafnet.yaml"
-        model_cfg = yaml.safe_load(open(path))["model"]
-        kwargs = model_cfg["model_kwargs"]
+        settings = TrainingSettings.from_yaml(path)
+        # Built through the resolver training uses, so data-derived kwargs such as
+        # ``kspace_log_scaled`` arrive with the declared ones (#2154).
+        kwargs = resolve_full_generator_kwargs(
+            settings, model_cls=KSpaceColdDiffusionGenerator
+        ).kwargs
         # The mismatch this guards: NAFNet width*4 vs contrast_embedding width.
         assert kwargs["base_channels"] * 4 != kwargs["time_embedding_dim"]
 
         torch.manual_seed(0)
+        c = settings.model.in_channels
         g = KSpaceColdDiffusionGenerator(
-            in_channels=model_cfg["in_channels"],
-            out_channels=model_cfg["out_channels"],
-            **kwargs,
+            in_channels=c, out_channels=settings.model.out_channels, **kwargs
         ).eval()
+        # A fresh net is insensitive to conditioning (zero-init gates, small embedding).
+        for p in g.backbone.parameters():
+            if not p.abs().any():
+                p.data.normal_(0, 0.05)
+        torch.nn.init.normal_(g.contrast_embedding.weight)
 
-        c = model_cfg["in_channels"]
         x = torch.randn(1, c, 64, 64) * 0.1
         mask = torch.zeros(1, 1, 64, 64)
         mask[:, :, 28:36, :] = 1
         zero = torch.zeros(1, dtype=torch.long)
-        extra = {"kspace_measured": torch.randn(1, c, 64, 64) * 0.1, "mask": mask}
+        extra = {
+            "kspace_measured": torch.randn(1, c, 64, 64) * 0.1,
+            "mask": mask,
+            # The arm concatenates S-maps (28-channel stem): 4 coils, real/imag.
+            "smaps": torch.randn(1, 2 * kwargs["num_physical_coils"], 64, 64) * 0.1,
+        }
 
         with torch.no_grad():
             a = g(x, zero, contrast_idx=zero, **extra)

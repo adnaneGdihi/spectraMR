@@ -12,30 +12,30 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
-from spectramr.core.metrics.metric_directions import METRIC_HIGHER_IS_BETTER
-from spectramr.core.metrics.statistical_tests import StatisticalTests
+from ._direction import direction
+from ._headline import _IDENTITY, _header, _headline_rows, _tex, spread_note
+from ._significance import paired_significance
 
-
-def _holm_correction(pvals: list[float]) -> list[float]:
-    """Holm-Bonferroni step-down correction.
-
-    Delegates to the metrics SSOT
-    (:meth:`spectramr.core.metrics.statistical_tests.StatisticalTests.holm_bonferroni_correction`).
-    Kept as a thin wrapper so call sites in this table don't need to
-    know the SSOT API surface.
-    """
-    if not pvals:
-        return []
-    out = StatisticalTests.holm_bonferroni_correction(pvals, alpha=0.05)
-    return list(out["corrected_p_values"])
+#: Validation readings of the disentangled strategy (base names, split prefix stripped):
+#: what a comparison of content/style arms is about, shown whenever an arm reports them.
+#: The chance level and the probe-split flag are references, not results, and stay out.
+_DISENTANGLEMENT = {
+    "style_contrast_acc",
+    "content_contrast_leak",
+    "swap_content_distance",
+    "swap_style_distance",
+}
 
 
 def _format_value(mean: float, std: float | None, decimals: int) -> str:
     if std is None or np.isnan(std):
         return f"{mean:.{decimals}f}"
     return f"{mean:.{decimals}f} ± {std:.{decimals}f}"
+
+
+def _sup(text: str) -> str:
+    return text.replace("‡", r"$^\ddagger$").replace("§", r"$^\S$")
 
 
 def make(
@@ -47,6 +47,10 @@ def make(
     higher_is_better: dict[str, bool] | None = None,
     baseline_method: str | None = None,
     decimals: int = 3,
+    view: str = "selected",
+    run_notes: dict[str, str] | None = None,
+    excluded_runs: dict[str, str] | None = None,
+    arm_notes: dict[str, str] | None = None,
 ) -> dict[str, Path] | None:
     """Build the main results table in Markdown + LaTeX.
 
@@ -60,16 +64,26 @@ def make(
             ``hd95``, ``ece``, ``nll``).
         baseline_method: If supplied, run paired t-test of every other
             method against the baseline and Holm-correct.
+        view: Checkpoint view (:mod:`..views`) used when the run has no
+            ``test`` split.
+        run_notes: ``{method: note}`` for tabulated runs whose completion is
+            not confirmed (:mod:`..run_status`); each is marked ‡ and its note
+            printed under the table.
+        excluded_runs: ``{method: note}`` for runs left out of the table,
+            e.g. a crashed arm; named under the table and in the caption.
+        arm_notes: ``{method: note}`` from each arm's ``metadata.comparison_note``;
+            each is marked § and its note printed under the table and in the caption.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if df.empty:
         return None
-    test = df[df["split"] == "test"].copy() if "split" in df.columns else df.copy()
-    if test.empty:
-        # fall back to last value of every metric in val split
-        test = df[df["split"] == "val"].copy() if "split" in df.columns else df.copy()
+    test = _headline_rows(df, view)
+    if "split" in df.columns and cost_metrics:
+        # cost facts (params_m, ...) live in the run split, outside any pass
+        cost = df[(df["split"] == "run") & df["metric"].isin(cost_metrics)]
+        test = pd.concat([test, cost], ignore_index=True) if not cost.empty else test
 
     if metrics is None:
         common = {
@@ -92,60 +106,34 @@ def make(
             "auroc",
             "ece",
         }
-        metrics = sorted(set(test["metric"].unique()) & common)
+        metrics = sorted(set(test["metric"].unique()) & (common | _IDENTITY | _DISENTANGLEMENT))
     if not metrics:
         return None
 
     higher_is_better = higher_is_better or {}
 
-    def hib(m: str) -> bool:
-        # 1. caller override wins
-        if m in higher_is_better:
-            return higher_is_better[m]
-        ml = m.lower()
-        # 2. metric-direction SSOT (exact, then longest-token match) — the same
-        #    source the pipelines layer uses, so a lower-is-better metric whose
-        #    name lacks a hardcoded keyword (cjv, efc, bland_altman_bias,
-        #    ghosting_ratio, …) is no longer bolded as "best" when it's worst.
-        if ml in METRIC_HIGHER_IS_BETTER:
-            return METRIC_HIGHER_IS_BETTER[ml]
-        matches = [(k, v) for k, v in METRIC_HIGHER_IS_BETTER.items() if k in ml]
-        if matches:
-            return max(matches, key=lambda kv: len(kv[0]))[1]
-        # 3. last-resort heuristic for non-registry cost/aux columns
-        lower_keywords = (
-            "loss",
-            "error",
-            "rmse",
-            "nmse",
-            "mae",
-            "fid",
-            "kid",
-            "hd95",
-            "ece",
-            "nll",
-            "lpips",
-            "hfen",
-            "gmsd",
-            "asd",
-        )
-        return not any(kw in ml for kw in lower_keywords)
+    def hib(m: str) -> bool | None:
+        return direction(m, higher_is_better)
 
     methods = sorted(test["method"].unique())
+    tested_methods = set(test.loc[test["split"] == "test", "method"]) if "split" in test else set()
+    mixed_sources = bool(tested_methods) and tested_methods != set(methods)
     rows: list[dict] = []
     for m in methods:
         row: dict = {"method": m}
         for metric in metrics + cost_metrics:
-            vals = (
-                test[(test["method"] == m) & (test["metric"] == metric)]["value"]
-                .dropna()
-                .to_numpy()
-                .astype(float)
+            sel = test[(test["method"] == m) & (test["metric"] == metric)].dropna(subset=["value"])
+            # keyed by subject when the rows carry one, so a paired test pairs subjects
+            key = sel["subject_id"].astype(str) if "subject_id" in sel.columns else None
+            vals = pd.Series(
+                sel["value"].astype(float).to_numpy(),
+                index=key.to_numpy() if key is not None and key.notna().all() else None,
             )
-            if vals.size == 0:
+            if vals.empty:
                 row[metric] = (np.nan, np.nan, np.nan)
             else:
-                row[metric] = (vals.mean(), vals.std(ddof=1) if vals.size > 1 else np.nan, vals)
+                std = vals.std(ddof=1) if vals.size > 1 else np.nan
+                row[metric] = (vals.mean(), std, vals)
         rows.append(row)
 
     # Find best and second-best per metric column
@@ -154,47 +142,40 @@ def make(
     for metric in metrics:
         means = [r[metric][0] for r in rows]
         valid = [(i, v) for i, v in enumerate(means) if not np.isnan(v)]
-        if not valid:
+        # Ranking one entry, a tie, the shared zero-filled reference, or values from
+        # two sources (test split beside a validation pass) is not a result.
+        if (
+            len(valid) < 2
+            or metric.startswith("zf_")
+            or len({v for _, v in valid}) == 1
+            or mixed_sources
+            or hib(metric) is None  # no declared direction: shown, never ranked
+        ):
             continue
-        valid.sort(key=lambda iv: iv[1], reverse=hib(metric))
+        valid.sort(key=lambda iv: iv[1], reverse=bool(hib(metric)))
         best_idx[metric] = valid[0][0]
         if len(valid) > 1:
             second_idx[metric] = valid[1][0]
 
-    # Significance against baseline (paired Wilcoxon → t fallback)
-    sig: dict[tuple[str, str], bool] = {}
-    if baseline_method is not None and baseline_method in methods:
-        base = next(r for r in rows if r["method"] == baseline_method)
-        for metric in metrics:
-            base_arr = base[metric][2]
-            if not isinstance(base_arr, np.ndarray) or base_arr.size < 2:
-                continue
-            pvals: list[float] = []
-            others: list[str] = []
-            for r in rows:
-                if r["method"] == baseline_method:
-                    continue
-                arr = r[metric][2]
-                if not isinstance(arr, np.ndarray) or arr.size < 2:
-                    continue
-                # Paired across the *minimum* common length
-                k = min(arr.size, base_arr.size)
-                try:
-                    res = stats.ttest_rel(arr[:k], base_arr[:k])
-                    pvals.append(float(res.pvalue))
-                    others.append(r["method"])
-                except Exception:
-                    pvals.append(1.0)
-                    others.append(r["method"])
-            adj = _holm_correction(pvals)
-            for i, m in enumerate(others):
-                sig[(m, metric)] = adj[i] < 0.05
+    sig = paired_significance(rows, methods, metrics, baseline_method)
+
+    # A cost column nobody measured is dropped, not printed as a column of dashes.
+    cost_metrics = [c for c in cost_metrics if any(not np.isnan(r[c][0]) for r in rows)]
+    labels = [_header(m, hib(m)) for m in metrics] + [_header(c, None) for c in cost_metrics]
 
     # Render Markdown
-    cols = ["Method"] + metrics + cost_metrics
+    cols = ["Method", *labels]
     md_lines = ["| " + " | ".join(cols) + " |", "|" + "|".join(["---"] * len(cols)) + "|"]
+    notes = {m: n for m, n in (run_notes or {}).items() if m in methods}
+    arm = {m: n for m, n in (arm_notes or {}).items() if m in methods}
+
+    def _name(m: str) -> str:
+        name = f"{m} †" if mixed_sources and m not in tested_methods else m
+        name = f"{name} ‡" if m in notes else name
+        return f"{name} §" if m in arm else name
+
     for i, r in enumerate(rows):
-        cells = [str(r["method"])]
+        cells = [_name(str(r["method"]))]
         for metric in metrics:
             mean, std, _ = r[metric]
             text = _format_value(mean, std, decimals)
@@ -209,22 +190,39 @@ def make(
             mean, _, _ = r[cm]
             cells.append(_format_value(mean, None, 1) if not np.isnan(mean) else "—")
         md_lines.append("| " + " | ".join(cells) + " |")
+    footnotes = [f"‡ {m}: {n}." for m, n in notes.items()]
+    footnotes += [f"§ {m}: {n}." for m, n in arm.items()]
+    footnotes += [f"Not tabulated: {m} ({n})." for m, n in (excluded_runs or {}).items()]
     md_path = out_dir / "tab_2_1_main_results.md"
-    md_path.write_text("\n".join(md_lines))
+    md_path.write_text("\n".join([*md_lines, *(["", *footnotes] if footnotes else [])]))
 
-    # Render LaTeX (IEEE style)
+    # Render LaTeX (IEEE style). The caption names the spread only when one exists.
+    any_test = "split" in df.columns and (df["split"] == "test").any()
+    spread = spread_note(test[test["metric"].isin(metrics)], view, any_test)
+    if mixed_sources:
+        spread += (
+            r" $^\dagger$ read at the " + view + " validation pass, the others on the test split;"
+            " the two are not ranked against each other."
+        )
+    spread += "".join(" " + _sup(_tex(f)) for f in footnotes)
+    tested = (
+        r" * $p<0.05$ vs. " + _tex(str(baseline_method)) + " (paired t-test, Holm-corrected)."
+        if sig
+        else ""
+    )
     tex_lines = [
         r"\begin{table}[t]\centering",
-        r"\caption{Main results. Mean $\pm$ std over seeds; best in \textbf{bold},"
-        r" second-best in \emph{italics}; * $p<0.05$ vs. baseline (Holm-corrected).}",
+        r"\caption{Main results. " + spread + r" Best in \textbf{bold},"
+        r" second-best in \emph{italics}." + tested + "}",
         r"\label{tab:main_results}",
         r"\begin{tabular}{l" + "c" * (len(metrics) + len(cost_metrics)) + "}",
         r"\toprule",
-        " & ".join(cols) + r" \\",
+        " & ".join(_tex(c) for c in cols) + r" \\",
         r"\midrule",
     ]
     for i, r in enumerate(rows):
-        cells = [str(r["method"]).replace("_", r"\_")]
+        name = _tex(_name(str(r["method"])))
+        cells = [_sup(name.replace("†", r"$^\dagger$"))]
         for metric in metrics:
             mean, std, _ = r[metric]
             text = _format_value(mean, std, decimals)
@@ -258,6 +256,10 @@ def make(
             rec[f"{metric}_std"] = std
         for cm in cost_metrics:
             rec[cm] = r[cm][0]
+        if notes:
+            rec["note"] = notes.get(r["method"], "")
+        if arm:
+            rec["arm_note"] = arm.get(r["method"], "")
         flat.append(rec)
     csv_path = emit_table_csv(pd.DataFrame(flat), out_dir, "tab_2_1_main_results")
 

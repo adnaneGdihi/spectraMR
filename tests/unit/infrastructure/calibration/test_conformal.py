@@ -262,3 +262,52 @@ def test_quantile_regression_swapped_quantiles_raises() -> None:
     hi = torch.tensor([0.0])
     with pytest.raises(ValueError, match="swapped"):
         quantile_regression(lo, hi, torch.zeros(1))
+
+
+# ── Foreground mask (#3041): background pixels neither set nor test the radius ─
+
+
+def test_foreground_mask_is_relative_to_each_image_peak() -> None:
+    from spectramr.infrastructure.calibration.conformal import foreground_mask
+
+    target = torch.zeros(2, 1, 2, 2)
+    target[0, 0, 0, 0] = 1.0
+    target[1, 0, 0, 0] = 100.0
+    target[1, 0, 1, 1] = 6.0  # above 5% of its image peak (5.0)
+    mask = foreground_mask(target, threshold=0.05)
+    assert mask[0, 0, 0, 0] and not mask[0, 0, 1, 1]
+    assert mask[1, 0, 0, 0] and mask[1, 0, 1, 1]
+    assert foreground_mask(target, threshold=None) is None
+
+
+def test_background_error_does_not_move_the_masked_radius() -> None:
+    target = torch.zeros(4, 1, 8, 8)
+    target[:, :, 2:6, 2:6] = 1.0
+    pred = target.clone()
+    pred[:, :, 0:2, :] += 50.0  # 25% of pixels: background only, outside the foreground
+    masked = ConformalCalibrator(alpha=0.1, foreground_threshold=0.05)
+    masked.fit([(pred, target)])
+    assert masked.quantile == pytest.approx(0.0)
+    assert masked.n_calibration == 4 * 16
+    unmasked = ConformalCalibrator(alpha=0.1, foreground_threshold=None).fit([(pred, target)])
+    assert unmasked.quantile > 1.0
+
+
+def test_coverage_with_an_empty_foreground_raises() -> None:
+    target = torch.zeros(1, 1, 4, 4)
+    cal = ConformalCalibrator(alpha=0.1, foreground_threshold=0.05)
+    cal.fit([(target, target)])
+    with pytest.raises(ValueError, match="selects no pixels"):
+        cal.empirical_coverage(target, target)
+
+
+def test_foreground_masking_refuses_a_per_sample_score() -> None:
+    """Planted: a per-sample norm (vf_residual-style) cannot be pixel-masked."""
+    target = torch.ones(2, 1, 4, 4)
+
+    def per_sample(pred, tgt):
+        return (pred - tgt).abs().flatten(1).amax(1)
+
+    cal = ConformalCalibrator(score_fn=per_sample, alpha=0.1, foreground_threshold=0.05)
+    with pytest.raises(ValueError, match="needs a per-pixel score"):
+        cal.fit([(target, target)])

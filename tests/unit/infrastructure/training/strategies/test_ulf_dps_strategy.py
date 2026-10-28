@@ -15,6 +15,7 @@ from spectramr.infrastructure.training.strategies.ulf_dps_strategy import (
     ulf_dps_sample,
 )
 from spectramr.infrastructure.training.strategies.ulf_map_strategy import ulf_degrade
+from spectramr.infrastructure.training.strategies.ulf_lowpass_operator import UlfLowpassOperator
 from spectramr.models.generators.field_guided_score_unet import FieldGuidedScoreUNet
 from tests.utils.config_block_stub import block_stub
 
@@ -103,7 +104,7 @@ def test_validation_step_end_to_end_no_batch_context_collision() -> None:
     strat._dps_schedule = "cosine"
     strat._dps_sampling_steps = 5
     strat._dps_likelihood_weight = 1.0
-    strat._dps_blur_cutoff = 0.5
+    strat._ulf_lowpass = UlfLowpassOperator.constant_cutoff(0.5)
     strat._acp_cache = {}
     _cfg = types.SimpleNamespace(
         training=None,
@@ -139,7 +140,7 @@ def _val_strat(rec, val_chunk_size):
     strat._dps_schedule = "cosine"
     strat._dps_sampling_steps = 2
     strat._dps_likelihood_weight = 1.0
-    strat._dps_blur_cutoff = 0.5
+    strat._ulf_lowpass = UlfLowpassOperator.constant_cutoff(0.5)
     strat._acp_cache = {}
     strat.config = types.SimpleNamespace(
         validation=block_stub(
@@ -276,3 +277,32 @@ def test_validation_step_declares_contrast_id_for_pipeline_seam() -> None:
 
     params = inspect.signature(UlfDpsStrategy.validation_step).parameters
     assert "contrast_id" in params
+
+
+_PER_CONTRAST = UlfLowpassOperator(axis_cutoffs={0: (0.15, 0.15), 1: (2.0, 2.0)})
+
+
+def test_dps_likelihood_uses_the_per_contrast_forward_op() -> None:
+    # The DPS residual A(x0)-y runs through the strategy's operator: the same seed and
+    # measurement under two contrast ids give two different samples.
+    acp = make_alphas_cumprod(30, "cosine")
+    m = _net().eval()
+    y = torch.rand(1, 1, 16, 16)
+    kw = {"alphas_cumprod": acp, "n_steps": 4, "likelihood_weight": 5.0, "forward_op": _PER_CONTRAST}
+    torch.manual_seed(0)
+    a = ulf_dps_sample(m, y, torch.tensor([3.0]), contrast_id=torch.tensor([0]), **kw)
+    torch.manual_seed(0)
+    b = ulf_dps_sample(m, y, torch.tensor([3.0]), contrast_id=torch.tensor([1]), **kw)
+    assert not torch.allclose(a, b)
+
+
+def test_setup_raises_without_ulf_lowpass_block() -> None:
+    import pytest
+
+    strat = object.__new__(UlfDpsStrategy)
+    strat._verify_strategy_config = lambda **_: None
+    strat.config = types.SimpleNamespace(
+        training=types.SimpleNamespace(ulf_dps=None, ulf_lowpass=None), data=None
+    )
+    with pytest.raises(ValueError, match=r"training\.ulf_lowpass"):
+        strat._setup_strategy_specific_components()

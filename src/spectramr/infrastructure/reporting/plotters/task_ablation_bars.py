@@ -16,6 +16,10 @@ the mrixfields-specific discovery/grouping lives in
 Degenerate / collapsed arms (measurement-independent output, negative PSNR,
 identity collapse) are shown honestly with their real value and marked with a
 hatch rather than hidden — the anti-facade discipline applied to plots.
+
+Run completion is marked as in the main-results table: a plotted arm whose
+completion is not confirmed carries ‡ on its tick label and a footnote, and an
+arm left out because it crashed is named in a "Not plotted" footnote.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ _REQUIRED_COLS = frozenset({"family", "role", "arm", "metric", "value"})
 
 
 # method / ablation / baseline are not registered method names, so colour_for
-# returns the Okabe-Ito fallback at these distinct indices (blue / vermillion /
+# returns the Okabe-Ito fallback at these distinct indices (blue / vermilion /
 # green). ``baseline`` overlays external pretrained baselines (Task 8).
 _ROLE_FALLBACK: dict[str, int] = {"method": 5, "ablation": 6, "baseline": 2}
 
@@ -96,6 +100,8 @@ def make(
     formats: tuple[str, ...] = ("pdf", "png"),
     dpi: int = 600,
     metadata: RunMetadata | None = None,
+    run_notes: dict[str, str] | None = None,
+    excluded_runs: dict[str, str] | None = None,
 ) -> Path | None:
     """Faceted grouped-bar figure of best validation metrics per method family.
 
@@ -107,6 +113,10 @@ def make(
         degenerate: Arm names to hatch + flag as collapsed / measurement-
             independent output (shown honestly, not hidden).
         title: Figure suptitle (e.g. the task name).
+        run_notes: ``{arm: note}`` for plotted arms whose completion is not
+            confirmed; each tick label gains ‡ and the note becomes a footnote.
+        excluded_runs: ``{arm: note}`` for arms left out (e.g. crashed), named
+            in a footnote so the omission is visible on the figure itself.
 
     Returns:
         Path to the primary (first-format) output, or ``None`` if the frame is
@@ -181,7 +191,11 @@ def make(
         _family_header(top, group_start, len(arm_order) - 1, prev_family)
 
     bottom.set_xticks(x)
-    bottom.set_xticklabels([_arm_label(a) for a in arm_order], rotation=90, fontsize=5)
+    notes = {a: n for a, n in (run_notes or {}).items() if a in arm_order}
+    labels = [f"{_arm_label(a)} ‡" if a in notes else _arm_label(a) for a in arm_order]
+    bottom.set_xticklabels(labels, rotation=90, fontsize=5)
+    footnotes = [f"‡ {_arm_label(a)}: {n}." for a, n in notes.items()]
+    footnotes += [f"Not plotted: {_arm_label(a)} ({n})." for a, n in (excluded_runs or {}).items()]
     bottom.set_xlim(-0.7, len(arm_order) - 0.3)
 
     handles = [
@@ -197,7 +211,10 @@ def make(
 
     if title:
         fig.suptitle(title, fontsize=9, fontweight="bold", y=0.985)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
+    # Reserve a strip below the tick labels for the status footnotes, one line
+    # each, kept clear of the provenance stamp along the bottom edge.
+    foot_h = 0.03 + 0.02 * len(footnotes) if footnotes else 0.0
+    fig.tight_layout(rect=(0.0, foot_h, 1.0, 0.88))
     # Legend outside the data area (a single row below the title) so it never
     # overlaps the bars.
     fig.legend(
@@ -208,6 +225,8 @@ def make(
         frameon=False,
         fontsize=6,
     )
+    if footnotes:
+        fig.text(0.01, 0.025, "\n".join(footnotes), ha="left", va="bottom", fontsize=5)
     if metadata is not None:
         stamp_figure(fig, metadata)
 

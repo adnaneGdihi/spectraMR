@@ -150,9 +150,7 @@ def _make_env(channels: int = 3) -> tuple[MagicMock, _TinyVelocityNet]:
 
 @pytest.fixture(autouse=True)
 def _mock_resolve_service():
-    with patch(
-        "spectramr.infrastructure.di.di_container.resolve_service"
-    ) as mock_resolve:
+    with patch("spectramr.infrastructure.di.di_container.resolve_service") as mock_resolve:
         mock_resolve.return_value = MagicMock()
         yield mock_resolve
 
@@ -201,8 +199,7 @@ class TestComputeLosses:
         assert torch.allclose(out["loss_total"], out["loss_sb_velocity"])
         # the manifold term is computed but contributes zero
         assert out["loss_bloch_manifold"].item() == pytest.approx(0.0, abs=0.0) or (
-            out["loss_total"].item()
-            == pytest.approx(out["loss_sb_velocity"].item(), rel=1e-6)
+            out["loss_total"].item() == pytest.approx(out["loss_sb_velocity"].item(), rel=1e-6)
         )
 
     def test_lambda_positive_increases_total(self) -> None:
@@ -302,9 +299,7 @@ class TestBlochCacheWiring:
     def test_cache_resolution_zero_keeps_exact_path(self) -> None:
         """cache_resolution=0 opts back into the exact (slow) per-point path."""
         env, _ = _make_env()
-        strat = BlochSchrodingerBridgeStrategy(
-            env=env, lambda_bloch=0.1, bloch_cache_resolution=0
-        )
+        strat = BlochSchrodingerBridgeStrategy(env=env, lambda_bloch=0.1, bloch_cache_resolution=0)
         assert strat.manifold.cache_resolution == 0
         assert strat.manifold._cached_grid is None
 
@@ -313,9 +308,7 @@ class TestBlochCacheWiring:
         no silently-ignored knob)."""
         env, _ = _make_env()
         with pytest.raises(ValueError, match="bloch_cache_resolution"):
-            BlochSchrodingerBridgeStrategy(
-                env=env, lambda_bloch=0.1, bloch_cache_resolution=-1
-            )
+            BlochSchrodingerBridgeStrategy(env=env, lambda_bloch=0.1, bloch_cache_resolution=-1)
 
 
 class TestForwardTypeErrorNotSwallowed:
@@ -356,11 +349,11 @@ class TestForwardTypeErrorNotSwallowed:
         cls = BlochSchrodingerBridgeStrategy
 
         class _TimeGen:
-            def forward(self, x, t):  # noqa: ANN001, ANN201
+            def forward(self, x, t):
                 return x
 
         class _NoTimeGen:
-            def forward(self, x):  # noqa: ANN001, ANN201
+            def forward(self, x):
                 return x
 
         assert cls._generator_accepts_time(_TimeGen()) is True
@@ -375,3 +368,17 @@ class TestSample:
         out = strat.sample(lambda x, t: gen(x, t), x0, n_steps=5)
         assert out.shape == x0.shape
         assert torch.isfinite(out).all()
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: mse_loss(pred, true_velocity) regresses the bridge drift, not the target.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert BlochSchrodingerBridgeStrategy.__dict__["folds_image_losses"] is False
+    assert BlochSchrodingerBridgeStrategy.__dict__["inline_losses"] == frozenset()

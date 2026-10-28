@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 from spectramr.config.data_config import DataConfig
 from spectramr.config.schemas.data import MRIxFieldsDataConfigSchema
 from spectramr.data.datasets.universal_dataset import UniversalMRIDataset
-from spectramr.data.split_utils import split_index
+from spectramr.data.split_utils import record_split_key, split_index, split_index_grouped
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,27 @@ from spectramr.data.datasets.registry import (  # noqa: E402
     get_dataset_creator,
     register_dataset,
 )
+
+
+
+def _m4raw_pairing_kwargs(pairing: Any) -> dict[str, Any]:
+    """The cross-contrast source/target choice; the schema refuses it off this route."""
+    kwargs: dict[str, Any] = {"source_contrast": pairing.cross_contrast_source}
+    if pairing.cross_contrast_targets is not None:
+        kwargs["target_contrasts"] = tuple(pairing.cross_contrast_targets)
+    return kwargs
+
+
+def _m4raw_dataset_coil_mode(declared: str) -> str:
+    """The coil mode the M4Raw dataset is built with, given the one the arm declares.
+
+    ``rss_image`` is applied by ``CoilCombineTransform`` (IFFT, then RSS to one real
+    channel), which reads the dataset's real-stacked output as complex coils. The
+    dataset has no such mode and refuses it, so it serves every coil (``none``) for the
+    transform to combine. Any other mode goes through, and the dataset raises on an
+    unknown one.
+    """
+    return "none" if declared == "rss_image" else declared
 
 
 class DatasetInstantiator:
@@ -114,6 +135,12 @@ class DatasetInstantiator:
                 cls._create_quantitative_dataset,
                 False,
                 "quantitative parameter maps (T1/T2/PD)",
+            ),
+            (
+                "m4raw_triplet",
+                cls._create_m4raw_triplet,
+                False,
+                "co-registered M4Raw T1/T2/FLAIR triplets in noise units",
             ),
             ("cine", cls._create_cine_dataset, False, "4-D cine MRI"),
             (
@@ -215,6 +242,7 @@ class DatasetInstantiator:
         # branch at all. Membership in a registry is checkable; a chain is not.
         creator = get_dataset_creator(config.dataset_type)
         if creator is not None:
+            cls._refuse_image_domain_crop(config, route=config.dataset_type)
             if creator.indexed:
                 return creator.fn(config, train_index, val_index, train_transforms, val_transforms)
             return creator.fn(config, train_transforms, val_transforms)
@@ -228,11 +256,13 @@ class DatasetInstantiator:
 
         # (a) manifest_roles is a PREDICATE on the config, not a type.
         if cls._has_valid_manifest_roles(config):
+            cls._refuse_image_domain_crop(config, route="manifest_roles")
             return cls._create_manifest_role_dataset(config, train_transforms, val_transforms)
 
         # (b) ``image`` is a type PLUS a condition: with an index path the same
         #     type routes to the FastMRI/universal loader below.
         if config.dataset_type == "image" and not config.source.index_path:
+            cls._refuse_image_domain_crop(config, route="image_folder")
             return cls._create_image_folder_dataset(config, train_transforms, val_transforms)
 
         if config.dataset_type not in ("kspace", "image"):
@@ -273,7 +303,13 @@ class DatasetInstantiator:
         Returns:
             Tuple of (train_dataset, val_dataset).
         """
-        from spectramr.data.datasets.m4raw_dataset import M4RawRepetitionDataset
+        from spectramr.data.datasets.m4raw_dataset import (
+            _SINGLE_REP_SPLIT_MODES,
+            M4RawRepetitionDataset,
+        )
+        from spectramr.data.metadata.path_resolver import PathResolver
+        from spectramr.data.datasets.m4raw_coil_maps import map_key
+        from spectramr.data.staging import stage_path_lists, stage_subtree
 
         kspace_pct = config.processing.kspace_percentile
         normalize_ks = config.processing.enable_kspace_normalization
@@ -281,6 +317,8 @@ class DatasetInstantiator:
 
         train_h5 = [Path(r["primary_path"]) for r in train_index]
         val_h5 = [Path(r["primary_path"]) for r in val_index]
+        # Before any loader exists, so a worker only opens a finished node-local copy.
+        (train_h5, val_h5), _ = stage_path_lists(config.staging, train_h5, val_h5)
 
         if not val_h5 and config.split.validation_fraction > 0:
             raise ValueError(
@@ -301,8 +339,81 @@ class DatasetInstantiator:
         # M4Raw, because complex-averaging phase-incoherent reps cancels signal
         # rather than averaging it. A bare attribute read fails loud instead.
         target_mode = config.target_mode
+        # The VALIDATION split may serve a different NEX target than training
+        # (#695 follow-up). It exists for r2r, whose target is redrawn every
+        # __getitem__: validating against it would score the noise draw, and
+        # `track_best_metric` would checkpoint the luckiest epoch. None means
+        # "same as training". Bare attribute read, for the reason above.
+        val_target_mode = config.val_target_mode or target_mode
+        # Read unconditionally so the knob is never silently defaulted: the
+        # schema already refuses r2r_alpha under any other target_mode, and a
+        # wrong alpha does not raise anywhere downstream -- it just shifts noise
+        # between the two R2R halves. Bare attribute read, for the reason above.
+        r2r_alpha = config.r2r_alpha
+        # Read unconditionally for the same reason as r2r_alpha: the schema
+        # already refuses it outside r2r, and a source that never reached the
+        # dataset would leave the arm drawing from the committed matrix while
+        # its YAML declared a per-scan fit (non-negotiable 8).
+        r2r_covariance_source = config.r2r_covariance_source
+        # The nullspace_r2r split knobs and the alternate-input switch, read
+        # unconditionally for the same reason: the schema scopes each one, and a
+        # value that never reached the dataset would leave the YAML lying.
+        r2r_split_angle_deg = config.r2r_split_angle_deg
+        r2r_whitening = config.r2r_whitening
+        emit_alternate_input = config.emit_alternate_input
+        # Training split only: validation always scores against val_target_mode.
+        n2n_pairing = config.n2n_pairing
+        noise_fit_support_policy = config.noise_fit_support_policy
+        noise_covariance_root = (
+            None
+            if config.noise_covariance_root is None
+            else PathResolver.resolve(config.noise_covariance_root)
+        )
+        noise_covariance_missing = config.noise_covariance_missing
+        # Resolved like every other data path, so a cluster-relative root works
+        # from any checkout; the schema refuses the knob off this route.
+        coil_maps_root = (
+            None if config.coil_maps_root is None else PathResolver.resolve(config.coil_maps_root)
+        )
+        train_maps = {f"{map_key(p.stem)}.pt" for p in train_h5}
+        val_maps = {f"{map_key(p.stem)}.pt" for p in val_h5}
+        if coil_maps_root is not None:
+            coil_maps_root = stage_subtree(config.staging, coil_maps_root, train_maps | val_maps)
+        coil_maps_missing = config.coil_maps_missing
+        coil_maps_recipe = config.coil_maps_recipe
+        coil_maps_acs_size = config.coil_maps_acs_size
+        # Scoring maps for the validation split only (#2664); the training split
+        # never receives them, which is half of what keeps #2510's leak closed.
+        coil_maps_reference_root = (
+            None
+            if config.coil_maps_reference_root is None
+            else PathResolver.resolve(config.coil_maps_reference_root)
+        )
+        if coil_maps_reference_root is not None:
+            coil_maps_reference_root = stage_subtree(
+                config.staging, coil_maps_reference_root, val_maps
+            )
         nex_exclude_input = config.nex_target_exclude_input
         nex_fallback = config.nex_fallback
+        nex_registration = config.nex_registration
+        nex_shift_root = (
+            None if config.nex_shift_root is None else PathResolver.resolve(config.nex_shift_root)
+        )
+        nex_shifts_missing = config.nex_shifts_missing
+        # Registration aligns the repetitions a target averages, so a split whose
+        # mode builds both halves from one repetition (r2r) has nothing to register:
+        # the n2n arms register their validation reference and train on r2r.
+        train_registers = target_mode not in _SINGLE_REP_SPLIT_MODES
+        if nex_registration != "none" and not train_registers:
+            logger.info(
+                "[M4Raw] nex_registration=%r applies to the validation split only: "
+                "target_mode=%r builds both training halves from one repetition.",
+                nex_registration,
+                target_mode,
+            )
+        # Training split only: validation always serves repetition 0, so scores
+        # stay comparable across arms whatever the training input was.
+        train_input_repetition = config.input_repetition
         # ``use_repetitions`` defaults to None in the schema: the ROUTE decides.
         # On this route the default is True -- the NEX average IS the M4Raw
         # target, and the 46 arms that never declare the knob have always
@@ -320,14 +431,33 @@ class DatasetInstantiator:
             kspace_percentile=kspace_pct,
             transform=train_tfm,
             use_repetitions=use_reps,
-            coil_processing_mode=config.coils.processing_mode,
+            coil_processing_mode=_m4raw_dataset_coil_mode(config.coils.processing_mode),
             num_virtual_coils=num_virtual_coils,
             single_contrast=single_contrast,
+            source_layout=config.pairing.source_layout,
+            **_m4raw_pairing_kwargs(config.pairing),
             log_scaling=config.processing.enable_log_scaling,
             target_mode=target_mode,
+            r2r_alpha=r2r_alpha,
+            r2r_covariance_source=r2r_covariance_source,
+            r2r_split_angle_deg=r2r_split_angle_deg,
+            r2r_whitening=r2r_whitening,
+            emit_alternate_input=emit_alternate_input,
+            n2n_pairing=n2n_pairing,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
+            nex_registration=nex_registration if train_registers else "none",
+            nex_shift_root=nex_shift_root if train_registers else None,
+            nex_shifts_missing=nex_shifts_missing,
             slice_level_records=slice_level_records,
+            coil_maps_root=coil_maps_root,
+            coil_maps_missing=coil_maps_missing,
+            coil_maps_recipe=coil_maps_recipe,
+            coil_maps_acs_size=coil_maps_acs_size,
+            noise_fit_support_policy=noise_fit_support_policy,
+            noise_covariance_root=noise_covariance_root,
+            noise_covariance_missing=noise_covariance_missing,
+            input_repetition=train_input_repetition,
         )
         val_ds = M4RawRepetitionDataset(
             val_h5,
@@ -335,14 +465,33 @@ class DatasetInstantiator:
             kspace_percentile=kspace_pct,
             transform=val_tfm,
             use_repetitions=use_reps,
-            coil_processing_mode=config.coils.processing_mode,
+            coil_processing_mode=_m4raw_dataset_coil_mode(config.coils.processing_mode),
             num_virtual_coils=num_virtual_coils,
             single_contrast=single_contrast,
+            source_layout=config.pairing.source_layout,
+            **_m4raw_pairing_kwargs(config.pairing),
             log_scaling=config.processing.enable_log_scaling,
-            target_mode=target_mode,
+            target_mode=val_target_mode,
+            r2r_alpha=r2r_alpha,
+            r2r_covariance_source=r2r_covariance_source,
+            r2r_split_angle_deg=r2r_split_angle_deg,
+            r2r_whitening=r2r_whitening,
+            emit_alternate_input=emit_alternate_input,
             nex_target_exclude_input=nex_exclude_input,
             nex_fallback=nex_fallback,
+            nex_registration=nex_registration,
+            nex_shift_root=nex_shift_root,
+            nex_shifts_missing=nex_shifts_missing,
             slice_level_records=slice_level_records,
+            coil_maps_root=coil_maps_root,
+            coil_maps_missing=coil_maps_missing,
+            coil_maps_recipe=coil_maps_recipe,
+            coil_maps_acs_size=coil_maps_acs_size,
+            coil_maps_reference_root=coil_maps_reference_root,
+            noise_fit_support_policy=noise_fit_support_policy,
+            noise_covariance_root=noise_covariance_root,
+            noise_covariance_missing=noise_covariance_missing,
+            input_repetition="first",
         )
         unit = "slice records" if slice_level_records else "groups"
         logger.info(
@@ -369,6 +518,7 @@ class DatasetInstantiator:
             ContrastAwarePairedDataset,
             ContrastConfig,
         )
+        from spectramr.data.datasets.unpaired_domain_pair import UnpairedDomainDataset
 
         if not config.input_contrast or not config.target_contrast:
             raise ValueError(
@@ -382,19 +532,34 @@ class DatasetInstantiator:
         bidirectional_mode = config.pairing.bidirectional_mode
         allow_unpaired = config.pairing.allow_unpaired
         hf_resolution = config.pairing.hf_resolution
+        expose_pair = bool(config.expose.field_strength_pair)
 
-        train_ds = ContrastAwarePairedDataset(
-            index=train_index,
-            input_contrast=in_c,
-            target_contrast=tgt_c,
-            io_strategy="nifti",
-            transform=train_tfm,
-            verify_contrast=True,
-            skip_nan_samples=True,
-            max_skip_attempts=10,
-            bidirectional_mode=bidirectional_mode,
-            allow_unpaired=False,  # training always requires paired samples
-        )
+        if config.pairing.unpaired_training:
+            # Independent A/B draws for the cyclegan/cut batch contract. Validation
+            # subjects are excluded from both pools so the held-out cohort cannot leak.
+            train_ds = UnpairedDomainDataset(
+                index=train_index,
+                input_contrast=in_c,
+                target_contrast=tgt_c,
+                transform=train_tfm,
+                disjoint_subjects=config.pairing.disjoint_subjects,
+                exclude_subjects={str(r.get("subject_id")) for r in val_index},
+                expose_field_strength_pair=expose_pair,
+            )
+        else:
+            train_ds = ContrastAwarePairedDataset(
+                index=train_index,
+                input_contrast=in_c,
+                target_contrast=tgt_c,
+                io_strategy="nifti",
+                transform=train_tfm,
+                verify_contrast=True,
+                skip_nan_samples=True,
+                max_skip_attempts=10,
+                bidirectional_mode=bidirectional_mode,
+                allow_unpaired=False,  # paired training: unpaired records never reach a loss
+                expose_field_strength_pair=expose_pair,
+            )
         val_ds = ContrastAwarePairedDataset(
             index=val_index,
             input_contrast=in_c,
@@ -406,6 +571,7 @@ class DatasetInstantiator:
             max_skip_attempts=10,
             bidirectional_mode=bidirectional_mode,
             allow_unpaired=allow_unpaired,  # val may include unpaired ULF subjects
+            expose_field_strength_pair=expose_pair,
         )
         logger.info(
             f"[DATASET] ContrastAwarePairedDataset: input={in_c.name}, target={tgt_c.name}, "
@@ -608,7 +774,13 @@ class DatasetInstantiator:
             patch = config.sampling.patch_size
             slab_depth = int(patch[2]) if patch and len(patch) >= 3 and int(patch[2]) >= 1 else 1
             cache_size = int(getattr(config, "slice_cache_size", 2) or 2)
-            train_ds = SliceVolumeDataset(train_ds, slab_depth=slab_depth, cache_size=cache_size)
+            # Train re-draws augmentation per epoch; a resident volume would freeze it.
+            train_ds = SliceVolumeDataset(
+                train_ds,
+                slab_depth=slab_depth,
+                cache_size=cache_size,
+                redraw=bool(config.augmentation.enabled),
+            )
             val_ds = SliceVolumeDataset(val_ds, slab_depth=slab_depth, cache_size=cache_size)
             logger.info(
                 "[DATASET] slice_2d=True → wrapped in SliceVolumeDataset "
@@ -840,6 +1012,18 @@ class DatasetInstantiator:
         return train_ds, val_ds
 
     @staticmethod
+    def _refuse_image_domain_crop(config, route: str) -> None:
+        """Only the fastMRI/universal loader reads ``image_domain_crop_or_pad``."""
+        size = config.processing.image_domain_crop_or_pad
+        if size is not None:
+            raise ValueError(
+                f"data.processing.image_domain_crop_or_pad={list(size)} is served only "
+                f"by the fastMRI/universal k-space loader, but this arm routes to "
+                f"{route!r}, which would ignore it. Remove the knob or use "
+                "dataset_type 'kspace' / 'fastmri_kspace'."
+            )
+
+    @staticmethod
     def _create_fastmri_universal(
         config,
         train_idx,
@@ -862,8 +1046,17 @@ class DatasetInstantiator:
         Returns:
             Any: Description.
         """
+        from spectramr.data.staging import stage_index_records
+
+        # Before any loader exists, so a worker only opens a finished node-local copy.
+        train_idx, val_idx = stage_index_records(config.staging, train_idx, val_idx)
         svd_cal = getattr(config.coils, "svd_calibration_lines", None)
         coil_proc = getattr(DatasetInstantiator, "_coil_processing", None)
+        # Without the map no sample carries ``contrast_idx`` and a multi-contrast
+        # generator trains unconditioned with no error; records get ``contrast``
+        # from the h5 ``acquisition`` attribute (regenerate_cluster_manifests.py).
+        mc = config.multi_contrast
+        contrast_map = (mc.contrast_map or None) if mc.enabled else None
         train_ds = UniversalMRIDataset(
             index=train_idx,
             io_strategy="fastmri_h5",
@@ -876,6 +1069,8 @@ class DatasetInstantiator:
             normalize_kspace=config.processing.enable_kspace_normalization,
             kspace_percentile=config.processing.kspace_percentile,
             log_scaling=config.processing.enable_log_scaling,
+            image_domain_crop_or_pad=config.processing.image_domain_crop_or_pad,
+            contrast_map=contrast_map,
         )
         val_ds = UniversalMRIDataset(
             index=val_idx,
@@ -889,6 +1084,8 @@ class DatasetInstantiator:
             normalize_kspace=config.processing.enable_kspace_normalization,
             kspace_percentile=config.processing.kspace_percentile,
             log_scaling=config.processing.enable_log_scaling,
+            image_domain_crop_or_pad=config.processing.image_domain_crop_or_pad,
+            contrast_map=contrast_map,
         )
         logger.info("[DATASET] FastMRI UniversalMRIDataset")
         return train_ds, val_ds
@@ -1063,6 +1260,31 @@ class DatasetInstantiator:
         return train_ds, val_ds
 
     @staticmethod
+    def _create_m4raw_triplet(config, train_tfm, val_tfm):
+        """Registered M4Raw T1/T2/FLAIR triplets; the registration trees are the index.
+
+        Transforms are not applied: the triplet is already in noise units, and an
+        intensity transform would put back the per-image scale the noise units remove.
+        """
+        from spectramr.data.datasets import m4raw_triplet_dataset
+
+        block = getattr(config, "m4raw_triplet", None)
+        if block is None:
+            raise ValueError("dataset_type 'm4raw_triplet' requires a data.m4raw_triplet block")
+        roots = (block.t2_registered_root, block.flair_registered_root)
+        if block.raw_repetition_root is not None:
+            from spectramr.data.datasets import m4raw_repetition_triplet
+
+            rep = m4raw_repetition_triplet.M4RawRepetitionTripletDataset
+            raw = block.raw_repetition_root
+            return (
+                rep(*roots, raw, block.train_split, deterministic=False),
+                rep(*roots, raw, block.val_split, deterministic=True),
+            )
+        build = m4raw_triplet_dataset.M4RawTripletDataset
+        return build(*roots, block.train_split), build(*roots, block.val_split)
+
+    @staticmethod
     def _create_quantitative_dataset(config, train_tfm, val_tfm):
         """Build train/val quantitative parameter-map datasets (Phase 4b).
 
@@ -1103,7 +1325,9 @@ class DatasetInstantiator:
                 f"sibling parameter maps named *_T1map.nii.gz, *_T2map.nii.gz, etc."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] Quantitative — maps=%s n_train=%d n_val=%d",
@@ -1174,7 +1398,9 @@ class DatasetInstantiator:
                 "Widen the pattern or check the root."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] Cine 4D — target_source=%s target_suffix=%s "
@@ -1237,7 +1463,9 @@ class DatasetInstantiator:
                 "Expected BART .cfl/.hdr pairs (excluding *_traj.cfl)."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] BART k-space — sampling=%s n_roles=%d n_train=%d n_val=%d",
@@ -1281,7 +1509,9 @@ class DatasetInstantiator:
                 f"contrasts={bids_cfg.contrasts}). No (subject, contrast) pairs found."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] BIDS paired — low=%s high=%s n_pairs=%d n_train=%d n_val=%d",
@@ -1326,7 +1556,9 @@ class DatasetInstantiator:
                 "LR/HR filenames found."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] PNG paired SR — lr=%s hr=%s n_pairs=%d n_train=%d n_val=%d",
@@ -1364,7 +1596,9 @@ class DatasetInstantiator:
             b0_map=fr_cfg.b0_map,
             b1_map=fr_cfg.b1_map,
         )
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] NIfTI field-ref — n_anatomy=%d b0=%s b1=%s n_train=%d n_val=%d",
@@ -1398,7 +1632,9 @@ class DatasetInstantiator:
             raise ValueError("dataset_type='fmri' requires data.fmri.enabled=true.")
 
         index = build_fmri_index(data_root=config.source.root, glob_pattern=fmri_cfg.volume_glob)
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] 4-D BOLD — n_volumes=%d tr=%.3fs pe_axis=%d n_train=%d n_val=%d",
@@ -1451,7 +1687,9 @@ class DatasetInstantiator:
                 stack_glob=ob_cfg.stack_glob,
                 b0_map=ob_cfg.b0_map,
             )
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] oracle_bssfp — n_stacks=%d b0=%s n_train=%d n_val=%d",
@@ -1501,7 +1739,9 @@ class DatasetInstantiator:
                 "(expected .mrd / .h5 files)."
             )
 
-        train_index, val_index = split_index(index, config.split.validation_fraction)
+        train_index, val_index = split_index_grouped(
+            index, config.split.validation_fraction, key=record_split_key
+        )
 
         logger.info(
             "[DATASET] ISMRMRD measured-traj — n_files=%d dcf=%s n_train=%d n_val=%d",
@@ -1621,7 +1861,9 @@ class DatasetInstantiator:
             rng = random.Random(42)  # fixed seed for reproducibility
             rng.shuffle(all_files)
 
-            train_files, val_files = split_index(all_files, config.split.validation_fraction)
+            train_files, val_files = split_index_grouped(
+                all_files, config.split.validation_fraction, key=record_split_key
+            )
 
             # Rebuild train dataset with the reduced file list
             train_ds = SliceDataset(
@@ -1651,3 +1893,15 @@ class DatasetInstantiator:
 # ``register_dataset`` is idempotent for the same callable, so this is safe to
 # re-enter.
 DatasetInstantiator._ensure_registered()
+
+
+def self_indexed_dataset_types() -> frozenset[str]:
+    """Dataset types whose creator builds and splits its own index (``indexed`` is false).
+
+    They skip ``ManifestLoader``'s pre-split. The data director and the split-leakage
+    audit both read this, so the audit replays the split the run actually makes.
+    """
+    from spectramr.data.datasets.registry import DATASET_REGISTRY
+
+    DatasetInstantiator._ensure_registered()
+    return frozenset(name for name, entry in DATASET_REGISTRY.items() if not entry.indexed)

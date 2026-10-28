@@ -196,7 +196,7 @@ def test_train_step_width_guard_allows_distribution_head() -> None:
     channels, but target dataset provided 1`` at iter 1, killing the run before
     any step. The strategy's ``predicts_distribution_params`` flag must make the
     guard defer (mirroring the evidential_unet escape). We assert the guard is
-    not the thing that rejects — downstream optimizer/AMP setup is out of scope.
+    not the thing that rejects, by driving one full step.
     """
     import types
 
@@ -208,19 +208,59 @@ def test_train_step_width_guard_allows_distribution_head() -> None:
         training=types.SimpleNamespace(strategy_class="heteroscedastic_ulf"),
     )
     st.adapter_chains = {}
-    st.env = types.SimpleNamespace(discriminator=None, generator=_TwoChannelNet())
+    st.env = types.SimpleNamespace(
+        discriminator=None, generator=_TwoChannelNet(), opt_g=None
+    )
     st._prepare_model_input = lambda x: x  # type: ignore[method-assign]
+    st.device = torch.device("cpu")
     inp = torch.rand(1, 1, 8, 8)
     tgt = torch.rand(1, 1, 8, 8)  # 1-ch target vs 2-ch out — the guard's trigger
-    try:
-        st.train_step(
-            (inp, tgt), epoch=0, input_batch=inp, target_batch=tgt, iteration=1
-        )
-    except ValueError as exc:  # the guard raises ValueError("[DomainMismatch] ...")
-        assert "DomainMismatch" not in str(exc), (
-            f"width guard wrongly rejected a distribution head: {exc}"
-        )
-    except Exception:
-        # Any non-ValueError from incomplete (stubbed) downstream setup means the
-        # guard already passed — that is exactly what this test asserts.
-        pass
+    # The step must complete: a stub that stops short of the guard would pass
+    # this test without ever exercising it.
+    st.train_step((inp, tgt), epoch=0, input_batch=inp, target_batch=tgt, iteration=1)
+
+
+def test_paired_route_anchor_uses_declared_source_field() -> None:
+    # The paired ULF route stamps no per-sample field_strength; the declared 64 mT
+    # source field must anchor sigma (clamped to max_sigma), not the 3T floor.
+    from spectramr.infrastructure.training.strategies.heteroscedastic_ulf_strategy import (
+        _hoult_sigma_per_sample,
+    )
+
+    sig_ulf = _hoult_sigma_per_sample(None, sigma_floor=0.05, max_sigma=0.2, source_field=0.064)
+    assert abs(float(sig_ulf.max()) - 0.2) < 1e-6
+    sig_hf = _hoult_sigma_per_sample(None, sigma_floor=0.05, max_sigma=0.2, source_field=3.0)
+    assert abs(float(sig_hf.max()) - 0.05) < 1e-6
+
+
+def test_missing_source_field_raises_not_floor() -> None:
+    from spectramr.infrastructure.training.strategies.heteroscedastic_ulf_strategy import (
+        _hoult_sigma_per_sample,
+    )
+
+    with pytest.raises(ValueError, match="source field"):
+        _hoult_sigma_per_sample(None, sigma_floor=0.05, max_sigma=0.2)
+    batch = {"input": torch.rand(2, 1, 16, 16), "target": torch.rand(2, 1, 16, 16)}
+    with pytest.raises(ValueError, match="source field"):
+        compute_heteroscedastic_ulf_losses(_TwoChannelNet(), batch)
+
+
+def test_declared_source_field_anchor_is_built_on_the_requested_device() -> None:
+    from spectramr.infrastructure.training.strategies.heteroscedastic_ulf_strategy import (
+        _hoult_sigma_per_sample,
+    )
+
+    sig = _hoult_sigma_per_sample(
+        None, sigma_floor=0.05, max_sigma=0.2, source_field=0.064, device=torch.device("meta")
+    )
+    assert sig.device.type == "meta"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_paired_route_losses_run_on_cuda_without_device_mix() -> None:
+    net = _TwoChannelNet().cuda()
+    batch = {"input": torch.rand(2, 1, 16, 16).cuda(), "target": torch.rand(2, 1, 16, 16).cuda()}
+    losses = compute_heteroscedastic_ulf_losses(
+        net, batch, lambda_var_prior=0.1, source_field=0.064
+    )
+    assert all(torch.isfinite(v).all() for v in losses.values() if torch.is_tensor(v))

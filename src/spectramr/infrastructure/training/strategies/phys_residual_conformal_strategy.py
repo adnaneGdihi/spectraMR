@@ -28,7 +28,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -178,6 +178,11 @@ def run_phys_residual_calibration(
 
 class PhysResidualConformalStrategy(BaseTrainingStrategy, MetricsMixin, ValidationMixin):
     """No-gradient PR-CC calibration pass over a frozen parameter estimator."""
+
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     def _setup_strategy_specific_components(self) -> None:
         cfg = getattr(self.config.training, "phys_residual_conformal", None)

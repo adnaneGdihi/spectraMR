@@ -34,6 +34,7 @@ class VAE(nn.Module, IModel):
         hidden_dims: tuple[int, ...] = (64, 128, 256, 512),
         use_batch_norm: bool = True,
         dropout_rate: float = 0.0,
+        deterministic: bool = False,
     ):
         """Initialize VAE.
 
@@ -44,9 +45,15 @@ class VAE(nn.Module, IModel):
             hidden_dims: Hidden dimensions for encoder/decoder
             use_batch_norm: Whether to use batch normalization
             dropout_rate: Dropout rate for regularization
+            deterministic: decode ``z = mu`` instead of a reparameterised sample, the
+                deterministic-autoencoder comparator. Pair it with a zero KL weight;
+                ``VAETrainingStrategy`` refuses it otherwise.
 
         """
         super().__init__()
+        if not isinstance(deterministic, bool):
+            raise TypeError(f"vae deterministic must be a bool, got {deterministic!r}.")
+        self.deterministic = deterministic
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -105,8 +112,8 @@ class VAE(nn.Module, IModel):
         # Encode
         mu, log_var = self.encoder(x)
 
-        # Reparameterize
-        z = self.encoder.reparameterize(mu, log_var)
+        # Reparameterize (the deterministic comparator decodes the mean)
+        z = mu if self.deterministic else self.encoder.reparameterize(mu, log_var)
 
         # Decode
         reconstruction = self.decoder(z)

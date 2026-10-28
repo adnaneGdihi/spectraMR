@@ -5,16 +5,53 @@ or building on-the-fly indexes from raw directories.
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 from spectramr.config.data_config import DataConfig
 from spectramr.data.datasets.universal_dataset import parse_fastmri_index
 from spectramr.data.metadata.index_builder import IndexBuilder
+from spectramr.data.metadata.paired_partition import (
+    build_partition_stamp,
+    is_config_owned,
+    manifest_sha256,
+    resolve_paired_partition,
+)
 from spectramr.data.metadata.path_resolver import PathResolver
-from spectramr.data.split_utils import split_index
+from spectramr.data.split_utils import record_split_key, split_index_grouped
 
 logger = logging.getLogger(__name__)
+
+
+#: Manifests are gitignored and never rsynced -- the committed generator is their
+#: SSOT -- so "not found" is almost always "not generated yet on this host", and
+#: naming the path alone costs a cluster round trip to work that out.
+_MANIFEST_GENERATOR = "scripts/data/regenerate_cluster_manifests.py"
+
+
+def _missing_manifest_message(path: str) -> str:
+    """Name the path AND the command that produces it."""
+    stem = Path(path).stem
+    lines = [
+        f"Index file not found at {path}",
+        "",
+        "Manifests are gitignored and generated on the host that holds the data:",
+        f"    python {_MANIFEST_GENERATOR} --data-base <databases> \\",
+        "        --datasets m4raw_multicoil_train m4raw_multicoil_val m4raw_multicoil_test",
+    ]
+    match = re.search(r"_nex(\d+)$", stem)
+    if match:
+        lines += [
+            "",
+            f"This is a repetition-filtered manifest ({stem}), so it also needs the",
+            f"filter that produces it -- the same command with --min-reps {match.group(1)}.",
+            "It keeps only NEX groups with that many repetitions, which a leave-one-out",
+            "target requires, and writes to this '_nex' name rather than the shared one.",
+        ]
+    lines += ["", "Run with --dry-run first to see what would be indexed."]
+    return "\n".join(lines)
+
 
 
 class ManifestLoader:
@@ -169,7 +206,7 @@ class ManifestLoader:
         # 1. Load Primary Manifest
         if resolved_index_path:
             if not Path(resolved_index_path).exists():
-                raise ValueError(f"Index file not found at {resolved_index_path}")
+                raise ValueError(_missing_manifest_message(resolved_index_path))
 
             # BUG FIX: v2 manifests have their own embedded data_root which should always be used
             # NEVER pass config.data_root to parse_fastmri_index for v2 manifests
@@ -238,7 +275,10 @@ class ManifestLoader:
         else:
             val_split = config.split.validation_fraction
             logger.info(f"[DATASET] Using random split (validation_split={val_split})")
-            train_index, val_index = split_index(full_index, val_split)
+            # Grouped on the subject: a by-file split put 49 knee subjects in both splits.
+            train_index, val_index = split_index_grouped(
+                full_index, val_split, key=record_split_key
+            )
 
         if not train_index:
             raise RuntimeError("Train split is empty. Check data paths/manifests.")
@@ -258,7 +298,7 @@ class ManifestLoader:
 
     @classmethod
     def load_paired_nifti_splits(
-        cls, config: DataConfig
+        cls, config: DataConfig, partition_stamp: dict[str, Any] | None = None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Load paired NIfTI splits, dispatching to v4 JSON manifest when available.
 
@@ -287,6 +327,30 @@ class ManifestLoader:
         if paired_manifest_path:
             resolved = PathResolver.resolve(paired_manifest_path)
             logger.info(f"[MANIFEST] Using v4 paired manifest: {resolved}")
+            if is_config_owned(config):
+                # The config owns the partition (one owner, NN 17): the manifest's
+                # split_hint is not read for this arm.
+                part = resolve_paired_partition(Path(resolved), config)
+                if partition_stamp is not None:
+                    partition_stamp.update(part.stamp)
+                logger.info(
+                    "[MANIFEST] config-owned partition (%s): train=%d val=%d test=%d",
+                    part.stamp["strategy"],
+                    len(part.train),
+                    len(part.val),
+                    len(part.test),
+                )
+                train_index, val_index = cls._apply_subject_cap(config, part.train, part.val)
+                cls._log_split_stats(part.train + part.val + part.test, train_index, val_index)
+                return train_index, val_index
+            if config.split.holdout_site or config.enable_test_split:
+                # Reached only with split.type auto/manifest: these are not read on this route.
+                raise ValueError(
+                    "data.split.holdout_site / data.enable_test_split are not applied on the "
+                    "paired route under split.type auto/manifest. Set split.type to 'random', "
+                    "'loso_subject' or 'subjects' so the config owns the partition."
+                )
+            manifest_sha = manifest_sha256(Path(resolved))
             train_index = IndexBuilder.load_paired_bids_manifest(
                 manifest_path=resolved,
                 split="train",
@@ -313,13 +377,26 @@ class ManifestLoader:
             # exist. The SSOT raises there instead.
             if not val_index and train_index:
                 val_frac = config.split.validation_fraction
-                train_index, val_index = split_index(train_index, val_frac)
+                train_index, val_index = split_index_grouped(
+                    train_index, val_frac, key=IndexBuilder._split_group_of_record
+                )
                 logger.info(
                     f"[MANIFEST] Val split was empty — carved {len(val_index)} "
                     f"records from train for validation "
                     f"(train={len(train_index)}, val={len(val_index)})"
                 )
 
+            if partition_stamp is not None:
+                partition_stamp.update(
+                    build_partition_stamp(
+                        route="split_hint",
+                        strategy="auto",
+                        manifest_sha=manifest_sha,
+                        train=train_index,
+                        val=val_index,
+                        test=[],
+                    )
+                )
             train_index, val_index = cls._apply_subject_cap(config, train_index, val_index)
             cls._log_split_stats(train_index + val_index, train_index, val_index)
             return train_index, val_index

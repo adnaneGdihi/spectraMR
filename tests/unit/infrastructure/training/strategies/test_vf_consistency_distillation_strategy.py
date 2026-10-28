@@ -241,8 +241,7 @@ def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
         nonzero = delta_student[i].abs() > 1e-6
         ratios = (delta_teacher[i][nonzero] / delta_student[i][nonzero]).flatten()
         assert torch.allclose(ratios, ratios[0].expand_as(ratios), atol=1e-4), (
-            f"sample {i}: student and teacher must share one noise draw, "
-            "differing only in sigma"
+            f"sample {i}: student and teacher must share one noise draw, differing only in sigma"
         )
 
 
@@ -319,3 +318,48 @@ class TestForwardDispatchIsIntrospectedNotSwallowed:
 
         assert len(calls) == 1, f"resolved {len(calls)}x for a 4-step sample"
         assert out.shape == (2, 1, 16, 16)
+
+
+def test_it_declares_its_own_loss_ownership() -> None:
+    """Issue #1918: the term is a distillation loss against the teacher, not the target.
+
+    Read off ``__dict__``, never the inherited value: this class sits under
+    ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
+    becomes a lie the moment a subclass replaces ``_compute_losses_impl``. An
+    inherited True makes the audit's ``image_losses_reach_the_objective`` witness
+    PASS every declared ``losses.image_losses`` entry on this strategy's arms
+    while the training step discards them.
+    """
+    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is False
+    assert VFConsistencyDistillationStrategy.__dict__["inline_losses"] == frozenset()
+
+
+def test_it_skips_the_channel_guard_because_it_builds_its_own_input() -> None:
+    """Both network inputs are noised copies of ``target``; the channel guard on
+    ``input_batch`` would reject the arm's ifft'd 1-channel batch at iteration 1."""
+    assert VFConsistencyDistillationStrategy.__dict__["synthesises_model_input"] is True
+
+
+def test_a_resume_rebuilds_the_ema_teacher_before_restoring_it() -> None:
+    """The teacher exists only after the first step; a fresh strategy must still load it."""
+    strat, gen = _make_strategy()
+    strat._ensure_ema_teacher(gen)
+    with torch.no_grad():
+        for p in strat._ema_teacher.parameters():
+            p.add_(1.0)
+    state = {"modules": {"_ema_teacher": strat._ema_teacher.state_dict()}}
+
+    fresh, _ = _make_strategy()
+    fresh.env = SimpleNamespace(generator=gen)
+    fresh._owned_modules, fresh._owned_wrappers = {}, {}
+    fresh.load_strategy_state_dict(state)
+    for a, b in zip(fresh._ema_teacher.parameters(), strat._ema_teacher.parameters(), strict=True):
+        assert torch.equal(a, b)
+
+
+def test_the_ema_teacher_copies_the_inner_module_of_a_wrapper() -> None:
+    """A copy of a DataParallel/DDP wrapper would save ``module.``-prefixed keys."""
+    strat, gen = _make_strategy()
+    teacher = strat._ensure_ema_teacher(nn.DataParallel(gen))
+    assert not any(k.startswith("module.") for k in teacher.state_dict())
+    strat._update_ema(nn.DataParallel(gen))

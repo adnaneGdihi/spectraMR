@@ -12,11 +12,15 @@ Direct-import tests covering:
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.physics.fft_ops import fft2c, sense_forward
-from spectramr.models.diffusion.bloch_manifold_dps_sampler import BlochManifoldDPSSampler
+from spectramr.models.diffusion.bloch_manifold_dps_sampler import (
+    BlochManifoldDPSSampler,
+    rescaled_linear_betas,
+)
 from spectramr.models.physics.bloch_manifold_projector import BlochManifoldProjector
 from spectramr.models.registry import MODEL_REGISTRY
 
@@ -167,3 +171,42 @@ def test_trace_returned_and_finite():
     _out, trace = s.sample(y, shape=(b, c, h, w), num_steps=4, generator=g, return_trace=True)
     assert len(trace) >= 1
     assert all(t == t for t in trace)  # no NaN
+
+
+def test_the_schedule_stays_finite_on_a_short_chain():
+    """PLANTED (#2441): unclamped, beta_end = 20/T reaches 1 at T <= 20 and 1/sqrt(abar) is inf."""
+    for horizon in (20, 10, 4):
+        abar = torch.cumprod(1.0 - rescaled_linear_betas(horizon), dim=0)
+        assert (abar > 0).all()
+        assert torch.isfinite(1.0 / abar.sqrt()).all()
+
+
+def test_the_schedule_is_the_reference_one_where_the_clamp_does_not_bite():
+    reference = torch.linspace(1e-4, 2e-2, 1000, dtype=torch.float32)
+    assert torch.equal(rescaled_linear_betas(1000), reference)
+
+
+class _StepSpy(_NearIdentity):
+    def __init__(self) -> None:
+        super().__init__()
+        self.steps: list[int] = []
+
+    def forward(self, x, timesteps=None):
+        self.steps.append(int(timesteps[0]))
+        return super().forward(x, timesteps)
+
+
+def test_the_reverse_loop_strides_the_trained_horizon():
+    """PLANTED (#2441): the schedule and step indices spanned sampling_steps, not the trained T."""
+    spy = _StepSpy()
+    s = _make_sampler(spy, sampling_steps=5, num_timesteps=40, likelihood_weight_zeta=0.0)
+    assert s.alphas_cumprod.shape == (40,)
+    torch.testing.assert_close(s.alphas_cumprod, torch.cumprod(1.0 - rescaled_linear_betas(40), 0))
+    y = fft2c(torch.complex(torch.rand(1, 1, 8, 8), torch.rand(1, 1, 8, 8)) * 0.05)
+    s.sample(y, shape=(1, 1, 8, 8), generator=torch.Generator().manual_seed(0))
+    assert max(spy.steps) == 39 and min(spy.steps) == 0
+
+
+def test_more_reverse_steps_than_the_trained_horizon_raises():
+    with pytest.raises(ValueError, match="sampling_steps=50 must lie in"):
+        _make_sampler(sampling_steps=50, num_timesteps=29)

@@ -99,6 +99,40 @@ KNOWN_FAILURES: tuple[FailureSignature, ...] = (
         ),
     ),
     FailureSignature(
+        name="arm_refuses_to_run",
+        anchors=("Pipeline failed: metadata.status=",),
+        summary=(
+            "the arm's own metadata.status says its mechanism cannot produce a result today "
+            "(needs_implementation / inert), so the pipeline refused to start it."
+        ),
+        remedy=(
+            "Not a defect in the run: the guard is deliberate. Profile another arm, or resolve "
+            "the status the arm names before profiling it."
+        ),
+    ),
+    FailureSignature(
+        name="data_root_missing",
+        anchors=("Data root not found:",),
+        summary="the arm's data root does not exist on this machine.",
+        remedy=(
+            "Put the dataset at the printed path, or point data.source.root at what exists on "
+            "this cluster. The profile cannot start without data."
+        ),
+    ),
+    FailureSignature(
+        name="cuda_out_of_memory",
+        anchors=("torch.OutOfMemoryError: CUDA out of memory",),
+        summary=(
+            "the run exhausted GPU memory (the log's allocated/capacity figures say how far). "
+            "A 'Validation lost N of M batch(es)' line next to it means the step trained and "
+            "validation did not fit."
+        ),
+        remedy=(
+            "Lower validation.loader.chunk_size or the batch size, or run on a larger GPU; "
+            "metrics computed on a whole folded volume (LPIPS) are the usual extra allocation."
+        ),
+    ),
+    FailureSignature(
         name="child_killed_sigkill",
         # No text anchor ON PURPOSE. A cgroup OOM kill is silent: the kernel
         # SIGKILLs the process and the log just stops. Anchoring on a message

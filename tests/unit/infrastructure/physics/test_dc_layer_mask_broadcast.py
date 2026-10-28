@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import torch
 
-from spectramr.infrastructure.physics.data_consistency_layer import DataConsistencyLayer
+from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 
 
 def test_complex_input_broadcasts_full_mask():
     """Single-channel mask broadcasts cleanly without modification."""
-    dc = DataConsistencyLayer()
+    dc = MaskedReplacementDataConsistency()
     image = torch.randn(2, 4, 16, 16, dtype=torch.complex64)
     measured = torch.randn(2, 4, 16, 16, dtype=torch.complex64)
     mask = torch.zeros(2, 1, 16, 16)
@@ -36,7 +36,7 @@ def test_complex_input_broadcasts_full_mask():
 
 def test_complex_mismatched_mask_collapsed():
     """Mask with channels disagreeing with k-space gets collapsed via amax."""
-    dc = DataConsistencyLayer()
+    dc = MaskedReplacementDataConsistency()
     image = torch.randn(2, 8, 16, 16, dtype=torch.complex64)
     measured = torch.randn(2, 8, 16, 16, dtype=torch.complex64)
     # Mask has 4 channels — NOT broadcastable with 8-coil k-space.
@@ -50,7 +50,7 @@ def test_complex_mismatched_mask_collapsed():
 
 def test_real_stacked_mismatched_mask_collapsed():
     """Same guard works for the real-stacked-complex (interleaved) input path."""
-    dc = DataConsistencyLayer()
+    dc = MaskedReplacementDataConsistency()
     # 4-channel real-stacked = 2 complex coils
     image = torch.randn(2, 4, 16, 16)
     measured = torch.randn(2, 4, 16, 16)
@@ -63,7 +63,7 @@ def test_real_stacked_mismatched_mask_collapsed():
 
 def test_bool_mask_converted_and_broadcast():
     """Boolean mask is converted to float and the broadcast rule still applies."""
-    dc = DataConsistencyLayer()
+    dc = MaskedReplacementDataConsistency()
     image = torch.randn(1, 4, 8, 8, dtype=torch.complex64)
     measured = torch.zeros_like(image)
     mask = torch.zeros(1, 1, 8, 8, dtype=torch.bool)

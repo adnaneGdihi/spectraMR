@@ -178,7 +178,6 @@ class ConfigDefaultsProvider:
             },
             # Checkpoint configuration
             "checkpoint": {
-                "checkpoint_dir": "./checkpoints",
                 "save_checkpoints": True,
                 "checkpoint_frequency": 10,
                 "save_interval": 10,

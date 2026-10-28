@@ -4,8 +4,7 @@
 Tutorial 3: Cold Diffusion Training
 ==========================================
 
-This tutorial trains a **k-space Cold Diffusion** model — the same architecture
-used in ``experiment_11_timestep_accelerated_cold_diffusion``. Unlike stochastic
+This tutorial trains a **k-space Cold Diffusion** model. Unlike stochastic
 diffusion (DDPM/DDIM), Cold Diffusion uses **deterministic, physics-grounded
 degradations** (k-space masking and Rician noise) instead of Gaussian noise.
 
@@ -72,12 +71,12 @@ where :math:`\hat{x}_0 = G(x_t, t)` is the direct prediction of the clean
 k-space (``prediction_type: sample``), and :math:`x_t` is the partially-masked
 k-space at step :math:`t`.
 
-==================
+============================
 Step 1: Create Configuration
-==================
+============================
 
-The configuration closely mirrors the experiment_11 YAML. Key choices are
-annotated.
+Save the following as ``experiments/tutorials/tutorial_03_cold_diffusion.yaml``.
+The annotations mark the choices that matter for a diffusion arm.
 
 .. code-block:: yaml
 
@@ -114,7 +113,13 @@ annotated.
 
    data:
      dataset_type: kspace
-     volume_format: h5
+     # Which axis of the training batch carries the phase-encode lines, and
+     # how many were acquired. M4Raw T1/T2/FLAIR: dim -1. Measure your own
+     # data with scripts/physics/measure_phase_encode_axis.py --arm <yaml>;
+     # mask_direction: phase raises without this block.
+     acquisition:
+       phase_encode_axis: -1
+       acquired_pe_lines: {FLAIR: 198, T1: 195, T2: 195}
 
      loader:
        batch_size: 2                      # Reduce to 1 if <16 GB VRAM
@@ -149,7 +154,6 @@ annotated.
      max_iterations: 300000             # 700k for full training
      device: cuda
      output_dir: experiments/results/tutorial_03_cold_diffusion
-     enable_gradient_checkpointing: true
 
      # ── Diffusion Schedule ──────────────────────────────────────────
      diffusion:
@@ -215,7 +219,7 @@ annotated.
      - 25.6
      - 28.444
      - 32.0
-     mask_direction: phase
+     mask_direction: phase             # resolved through data.acquisition below
      schedule_type: step
      schedule_steps: 28
      enable_dynamic_mask: true         # Vary mask across training steps
@@ -266,7 +270,6 @@ annotated.
      compute_phase_mse: true           # Phase fidelity
      compute_psnr: false               # Computed at validation (image domain)
      enable_tracking: true
-     track_best_metric: true
      best_metric_name: lpips
      best_metric_mode: min
 
@@ -289,7 +292,6 @@ annotated.
      enabled: true
      save_interval: 10000
      keep_last_n: 5
-     keep_best_n: 3
 
    early_stopping:
      enabled: true
@@ -308,9 +310,9 @@ annotated.
      tracking:
        enable_tensorboard: true
 
-==================
+===================================
 Step 2: Understand the Key Concepts
-==================
+===================================
 
 Timestep Curriculum
 -------------------
@@ -359,9 +361,9 @@ coil has 2 channels (real + imaginary), so:
 This is verified at startup by the
 :class:`~spectramr.infrastructure.validation.config_health_checker.ConfigHealthChecker`.
 
-==================
+====================
 Step 3: Run Training
-==================
+====================
 
 .. code-block:: bash
 
@@ -371,26 +373,21 @@ Step 3: Run Training
    # Start training
    spectramr train --config experiments/tutorials/tutorial_03_cold_diffusion.yaml
 
-**Expected output (first 1000 iterations):**
+The progress bar carries ``g_total_loss`` and each declared loss term; the
+``[VAL] Results:`` line carries the validation metrics.
 
-.. code-block:: text
+.. warning::
 
-   [Step    100] g_total_loss=0.0431  mse=0.0431  kspace_error=0.182  phase_mse=0.031
-   [Step    200] g_total_loss=0.0318  mse=0.0318  kspace_error=0.141  phase_mse=0.021
-   ...
-   [Step   1000] g_total_loss=0.0091  kspace_error=0.088  phase_mse=0.009
-   [Val  Step 15000] val_psnr=26.4 dB  val_lpips=0.241  (ifft_magnitude domain)
+   The loss here is computed in **k-space**, not on image pixels, so its
+   magnitude is not comparable to an image-domain arm's and does not translate
+   to a PSNR by inspection. Validation metrics are computed after the
+   configured transform brings the prediction into image space — those are the
+   numbers to read. Set ``data.processing.data_range`` or the full-reference
+   metrics are recorded as skipped rather than computed.
 
-.. note::
-
-   ``mse`` here is computed on k-space, not image pixels. A loss of ``0.01``
-   in normalised k-space corresponds to roughly 25–28 dB PSNR in image space
-   (validated every ``eval_interval=15000`` steps using ``ifft_magnitude``
-   transform).
-
-==================
+==========================================
 Step 4: Monitor Diffusion-Specific Metrics
-==================
+==========================================
 
 TensorBoard will show:
 
@@ -413,34 +410,49 @@ TensorBoard will show:
 
 **Healthy convergence looks like:**
 
-- ``g_total_loss`` decreasing monotonically for first 10k steps
-- ``kspace_error`` below 0.05 after 50k iterations
-- ``val_psnr`` steadily climbing; plateau around 200k iterations
+- ``g_total_loss`` decreasing rather than oscillating or diverging
+- ``kspace_error`` falling alongside it
+- ``val_psnr`` climbing, then flattening
 
-==================
+The iteration at which each of these flattens is a property of your corpus,
+your acceleration factor and your schedule, not of the method — read it off
+your own curves rather than expecting a particular step count.
+
+=====================================
 Step 5: Sample From the Trained Model
-==================
+=====================================
 
 After training, run the cold diffusion reverse process:
 
 .. code-block:: bash
 
    spectramr infer \
-       --checkpoint experiments/results/tutorial_03_cold_diffusion/checkpoints/best_ema.pt \
+       --checkpoint experiments/results/tutorial_03_cold_diffusion/checkpoints/step_<NNNNNNNN>.safetensors \
        --input databases/m4raw/data/multicoil_val \
        --output experiments/results/tutorial_03_cold_diffusion/inference
+
+``ls`` the ``checkpoints/`` directory and substitute the file you want.
+A ``best.safetensors`` is written there too once more than one
+validation event has been scored.
 
 The sampler's step count is not a CLI flag — it is read from the config's
 diffusion block, so change it there (or in a copy of the YAML) rather than at
 the command line.
 
-**Expected metrics (200 epochs, M4Raw 4× acceleration):**
+An arm with a phase-encode line axis counts each rung's R over the lines the
+scan acquired, as training did. At predict that support is read from the input
+HDF5 file's ISMRMRD ``encodingLimits/kspace_encoding_step_1`` (``minimum`` to
+``maximum``, inclusive), not from the input's own zero lines. A file without
+``ismrmrd_header``, without those limits, or with data outside them makes
+``infer`` fail for that file with the missing key named; there is no fallback
+to the full plane. M4Raw writes a line count into ``maximum``, so check a file
+with ``scripts/physics/measure_phase_encode_axis.py`` first.
 
-.. code-block:: text
-
-   PSNR:  28.1 ± 1.9 dB
-   SSIM:  0.841 ± 0.032
-   LPIPS: 0.187 ± 0.041
+Inference writes ``final_eval.json`` (aggregated scores),
+``final_eval_manifest.json`` (what was computed and why anything was skipped),
+``inference_metrics.csv`` (one row per input) and ``run_summary.json`` beside
+the reconstructions. Read the manifest first — a diffusion arm scored without
+``data.processing.data_range`` reports its full-reference metrics as skipped.
 
 ==================
 Troubleshooting

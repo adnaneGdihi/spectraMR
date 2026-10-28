@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from spectramr.core.cascading_validation import CASCADING_LEVELS
+from spectramr.infrastructure.physics.coil_sensitivity import resolve_estimation_settings
 from spectramr.infrastructure.training.builders.optimization_builder import (
     OptimizationBuilder,
 )
@@ -16,6 +17,7 @@ from spectramr.infrastructure.training.strategies import diffusion as diffusion_
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
 )
+from spectramr.models.diffusion.cold_rung import level_is_declared
 from tests.utils.mock_environment import create_mock_training_env
 
 
@@ -308,17 +310,44 @@ class TestDiffusionStrategyComponents:
         strategy = DiffusionTrainingStrategy(env=training_env)
         assert hasattr(strategy, "loss_computer")
 
-    def test_mask_generator_initialization(self, mock_diffusion_config, training_env):
-        """Test k-space mask generator initialization."""
+    def test_mask_generator_is_taken_from_the_models_process(
+        self, mock_diffusion_config, training_env
+    ):
+        """The strategy borrows; it no longer builds a second generator (#2056).
+
+        The generator carries the process in production -- every ``model_type``
+        the guard matches resolves to ``KSpaceColdDiffusionGenerator``, which
+        builds one unconditionally -- so attaching one here is what makes this
+        fixture the shape the strategy actually meets.
+        """
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
         mock_diffusion_config.training_mode = "kspace_cold_diffusion"
-        # Also need model type to reflect this for _is_cold_diffusion logic
         training_env.model_type = "kspace_cold_diffusion"
         mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+        process = KSpaceUndersamplingProcess(num_timesteps=28)
+        training_env.generator.kspace_process = process
 
         strategy = DiffusionTrainingStrategy(env=training_env)
 
-        # Should have mask generator for k-space variants
-        assert hasattr(strategy, "mask_generator")
+        assert strategy.mask_generator is process.mask_generator
+
+    def test_a_model_without_a_process_fails_setup_rather_than_masking_wrong(
+        self, mock_diffusion_config, training_env
+    ):
+        """Anti-vacuity for the test above, and non-negotiable 3.
+
+        Declaring cold diffusion while the generator cannot degrade k-space is
+        a mis-wiring. Building a strategy-side generator instead -- what this
+        path did until #2056 -- produced masks from a second resolution of the
+        same block that nothing compared against.
+        """
+        mock_diffusion_config.training_mode = "kspace_cold_diffusion"
+        training_env.model_type = "kspace_cold_diffusion"
+        mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+
+        with pytest.raises(ValueError, match="kspace_process"):
+            DiffusionTrainingStrategy(env=training_env)
 
 
 class TestDiffusionStrategyConfiguration:
@@ -384,6 +413,12 @@ class TestDiffusionStrategyLossComputation:
 
         # Disable logging for cleaner output
         strategy.log_batch_info = MagicMock()
+        # This test is about the loss computer. The train-metrics path reads declared
+        # fields (cadence, metric transform) that a bare MagicMock config answers with
+        # auto-mocks, which the real validation then rejects; it is not under test here.
+        strategy._compute_training_metrics = MagicMock(return_value={})
+        # Likewise the logging cadence KAN telemetry compares with the step.
+        strategy._cached_log_interval = 100
 
         input_batch = torch.randn(2, 1, 32, 32)
         target_batch = torch.randn(2, 1, 32, 32)
@@ -444,7 +479,7 @@ class TestDiffusionStrategyErrorHandling:
         """
         mock_diffusion_config.training.diffusion.noise_schedule = "invalid"
 
-        with pytest.raises(ValueError, match="[Uu]nknown beta schedule"):
+        with pytest.raises(ValueError, match=r"(?i)unknown beta schedule"):
             DiffusionTrainingStrategy(env=training_env)
 
 
@@ -463,10 +498,15 @@ class TestDiffusionStrategyIntegration:
         training_env.model_type = "diffusion"
         strategy1 = DiffusionTrainingStrategy(env=training_env)
 
-        # Test k-space cold diffusion
+        # Test k-space cold diffusion. The generator carries the undersampling
+        # process because every real one does, and the strategy takes its mask
+        # generator from there rather than building a second (#2056).
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
         mock_diffusion_config.training_mode = "kspace_cold_diffusion"
         training_env.model_type = "kspace_cold_diffusion"
         mock_diffusion_config.model.model_type = "kspace_cold_diffusion"
+        training_env.generator.kspace_process = KSpaceUndersamplingProcess(num_timesteps=1000)
         strategy2 = DiffusionTrainingStrategy(env=training_env)
 
         # Both should be initialized
@@ -572,14 +612,48 @@ class TestInputDependenceGate:
         assert out.shape == (2, 1, 8, 8)
         assert torch.all(out >= 0)  # magnitude is non-negative
 
+    def test_cascade_image_decompresses_log_scaled_kspace(
+        self, mock_diffusion_config, training_env
+    ):
+        """#2341: the gate must see the image the metrics see, not iFFT(compressed k)."""
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        strategy = DiffusionTrainingStrategy(env=training_env)
+        strategy.config = mock_diffusion_config
+        torch.manual_seed(0)
+        img = torch.randn(1, 2, 16, 16, dtype=torch.complex64)
+        k = fft2c(img) * 30.0
+        k_real = torch.view_as_real(k).permute(0, 1, 4, 2, 3).reshape(1, 4, 16, 16)
+        linear = strategy._cascade_prediction_image(k_real, needs_ifft=True)
+        compressed = compress_kspace_log(k_real, channel_dim=1)
+        flagged = strategy._cascade_prediction_image(compressed, needs_ifft=True, decompress=True)
+        unflagged = strategy._cascade_prediction_image(compressed, needs_ifft=True)
+        torch.testing.assert_close(flagged, linear, rtol=1e-3, atol=1e-3)
+        assert float((unflagged - linear).norm() / linear.norm()) > 0.1
+
+    def test_the_gate_call_site_passes_the_log_scaling_it_resolved(self):
+        """Pin the wiring: a helper that can decompress but is never told to is the defect."""
+        import inspect
+
+        src = inspect.getsource(DiffusionTrainingStrategy.validation_step)
+        assert "decompress=_l4_decompress" in src
+        # The decision is the target's, taken by the same helper the metrics use.
+        assert "decompress_scored_against(\n                    target_batch" in src
+        assert "_l4_decompress = _target_view is not target_batch" in src
+
 
 class TestPreDcFidelity:
     """OPT-IN pre-DC fidelity supervision (DC-blob L1+)."""
 
     @staticmethod
-    def _strategy(training_env, mock_diffusion_config, lam):
+    def _strategy(training_env, mock_diffusion_config, lam, lam_acquired=0.0):
         strategy = DiffusionTrainingStrategy(env=training_env)
         mock_diffusion_config.losses.reconstruction.lambda_pre_dc_kspace = lam
+        # Set explicitly, always. `MagicMock.__float__` returns 1.0, so an
+        # unset weight on this fixture reads as ENABLED rather than as the
+        # schema default -- a landmine for every knob added to this block.
+        mock_diffusion_config.losses.reconstruction.lambda_pre_dc_acquired = lam_acquired
         strategy.config = mock_diffusion_config
         strategy._loss_dict_reuse = {}
         return strategy
@@ -1047,133 +1121,121 @@ class TestXDiffusionCrossModalConditioning:
         assert out["g_total_loss"].requires_grad
 
 
+def _estimation_config(**estimation):
+    from spectramr.config.settings import TrainingSettings
+
+    return TrainingSettings(
+        data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 1},
+        model={"model_type": "unet"},
+        optimization={"learning_rate": 1e-4},
+        logging={},
+        physics={"coil_processing": {"estimation": estimation}},
+    )
+
+
 class TestSmapsFallbackHonorsConfig:
-    """The runtime smaps fallback must dispatch on the configured estimation
-    method, not a hardcoded ``power_iter`` (CLAUDE.md pitfall #15)."""
+    """The runtime smaps fallback dispatches on the configured estimation method,
+    not a hardcoded ``power_iter`` (CLAUDE.md pitfall #15), through the physics
+    owner ``resolve_estimation_settings`` (non-negotiable 17)."""
 
     def test_default_when_no_config(self) -> None:
-        # No config attribute at all (bare __new__): falls back to the default.
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        assert s._configured_estimation_method() == "power_iter"
-        assert s._configured_estimation_method(default="espirit") == "espirit"
+        # A bare __new__ strategy has no config; the call site passes None.
+        assert resolve_estimation_settings(None) == ("power_iter", {})
+        assert resolve_estimation_settings(None, default="espirit") == ("espirit", {})
 
     def test_reads_configured_method(self) -> None:
-        import types as _types
-
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = _types.SimpleNamespace(
+        config = _types.SimpleNamespace(
             physics=_types.SimpleNamespace(
                 coil_processing=_types.SimpleNamespace(
                     estimation=_types.SimpleNamespace(method="espirit")
                 )
             )
         )
-        assert s._configured_estimation_method() == "espirit"
+        assert resolve_estimation_settings(config)[0] == "espirit"
 
     def test_none_method_maps_to_default(self) -> None:
-        # estimation.method == "none" in a maps-required branch → default,
-        # never None (which would break the downstream DC step).
-        import types as _types
-
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = _types.SimpleNamespace(
-            physics=_types.SimpleNamespace(
-                coil_processing=_types.SimpleNamespace(
-                    estimation=_types.SimpleNamespace(method="none")
-                )
-            )
-        )
-        assert s._configured_estimation_method() == "power_iter"
+        # "none" in a maps-required branch -> default, never None.
+        method, _ = resolve_estimation_settings(_estimation_config(method="none"))
+        assert method == "power_iter"
 
     def test_real_config_chain_matches_schema(self) -> None:
-        # Guard the attribute path against schema drift: the chain
-        # config.physics.coil_processing.estimation.method must exist on a real
-        # TrainingSettings.
-        from spectramr.config.settings import TrainingSettings
+        assert resolve_estimation_settings(_estimation_config(method="rss"))[0] == "rss"
 
-        config = TrainingSettings(
-            data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 1},
-            model={"model_type": "unet"},
-            optimization={"learning_rate": 1e-4},
-            logging={},
-            physics={"coil_processing": {"estimation": {"method": "rss"}}},
-        )
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = config
-        assert s._configured_estimation_method() == "rss"
+    def test_the_strategy_has_no_second_resolver(self) -> None:
+        for name in ("_configured_estimation_method", "_configured_estimation_kwargs"):
+            assert not hasattr(DiffusionTrainingStrategy, name)
+        for fn in (
+            DiffusionTrainingStrategy._estimate_smaps_from_acs,
+            DiffusionTrainingStrategy._generate_validation_prediction,
+        ):
+            assert "resolve_estimation_settings(" in inspect.getsource(fn)
 
 
 class TestEstimationKwargsHonorConfig:
-    """The smaps fallback must thread estimation sub-knobs (kernel_size/acs_size/
-    eigen_threshold/maps_path) from config, not hardcode them (pitfall #15)."""
-
-    def test_empty_when_no_config(self) -> None:
-        # Bare __new__ (no config) → {} so estimate_smaps uses its own defaults
-        # (kernel_size=6) → bit-identical to the old hardcoded path.
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        assert s._configured_estimation_kwargs() == {}
+    """The smaps fallback threads estimation sub-knobs (kernel_size/acs_size/
+    eigen_threshold/maps_path) from config, not hardcoded (pitfall #15)."""
 
     def test_reads_sub_knobs_from_config(self) -> None:
-        from spectramr.config.settings import TrainingSettings
-
-        config = TrainingSettings(
-            data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 1},
-            model={"model_type": "unet"},
-            optimization={"learning_rate": 1e-4},
-            logging={},
-            physics={
-                "coil_processing": {
-                    "estimation": {
-                        "method": "espirit",
-                        "kernel_size": 8,
-                        "acs_size": 32,
-                        "eigen_threshold": 0.9,
-                    }
-                }
-            },
+        _, kw = resolve_estimation_settings(
+            _estimation_config(method="espirit", kernel_size=8, acs_size=32, eigen_threshold=0.9)
         )
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = config
-        kw = s._configured_estimation_kwargs()
         assert kw["kernel_size"] == 8
         assert kw["acs_size"] == 32
         assert kw["eigen_threshold"] == 0.9
-        # maps_path defaults to None → omitted so estimate_smaps default applies.
+        # maps_path defaults to None -> omitted so estimate_smaps' default applies.
         assert "maps_path" not in kw
 
     def test_default_config_reproduces_kernel_size_6(self) -> None:
-        # A config with the default estimation block must yield kernel_size=6
-        # (parity with the previous hardcoded call site).
-        from spectramr.config.settings import TrainingSettings
-
-        config = TrainingSettings(
-            data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 1},
-            model={"model_type": "unet"},
-            optimization={"learning_rate": 1e-4},
-            logging={},
-            physics={"coil_processing": {"estimation": {"method": "power_iter"}}},
-        )
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = config
-        assert s._configured_estimation_kwargs()["kernel_size"] == 6
+        _, kw = resolve_estimation_settings(_estimation_config(method="power_iter"))
+        assert kw["kernel_size"] == 6
 
     def test_maps_path_included_when_set(self) -> None:
-        from spectramr.config.settings import TrainingSettings
-
-        config = TrainingSettings(
-            data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 1},
-            model={"model_type": "unet"},
-            optimization={"learning_rate": 1e-4},
-            logging={},
-            physics={
-                "coil_processing": {
-                    "estimation": {"method": "file", "maps_path": "/tmp/maps.pt"}
-                }
-            },
+        _, kw = resolve_estimation_settings(
+            _estimation_config(method="file", maps_path="/tmp/maps.pt")
         )
-        s = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
-        s.config = config
-        assert s._configured_estimation_kwargs()["maps_path"] == "/tmp/maps.pt"
+        assert kw["maps_path"] == "/tmp/maps.pt"
+
+    def test_the_sub_knobs_reach_the_estimator(self, monkeypatch) -> None:
+        seen = {}
+
+        def fake(acs, **kwargs):
+            seen.update(kwargs)
+            return torch.ones(acs.shape, dtype=torch.complex64)
+
+        monkeypatch.setattr(diffusion_mod, "estimate_smaps_calibrated", fake)
+        strat = object.__new__(DiffusionTrainingStrategy)
+        strat.config = _estimation_config(method="espirit", kernel_size=8, acs_size=32)
+        strat._kspace_log_scaled_for_maps = lambda: False
+        strat._estimate_smaps_from_acs(torch.ones(1, 2, 16, 16, dtype=torch.complex64), 16, 16)
+        assert seen["method"] == "espirit"
+        assert seen["kernel_size"] == 8 and seen["acs_size"] == 32
+
+
+def _cohort_arms() -> list:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[5] / "experiments/inprogress/kspace_filling"
+    arms = sorted(root.rglob("*.yaml"))
+    reference = [a for a in arms if a.name == "experiment_11_kspace_cold_diffusion.yaml"]
+    return reference + arms[:: max(1, len(arms) // 12)]
+
+
+@pytest.mark.parametrize("arm", _cohort_arms(), ids=lambda p: p.stem)
+def test_the_owner_resolves_cohort_arms_as_the_retired_strategy_copy_did(arm) -> None:
+    """Characterization kept from the consolidation: on real arms the owner gives
+    the method (``none`` -> ``power_iter``) and the set sub-knobs, read from the
+    loaded settings exactly as the deleted ``_configured_estimation_*`` did."""
+    from spectramr.config.settings import TrainingSettings
+
+    config = TrainingSettings.from_yaml(str(arm))
+    est = config.physics.coil_processing.estimation
+    method = est.method if est.method and est.method != "none" else "power_iter"
+    kwargs = {
+        k: getattr(est, k)
+        for k in ("kernel_size", "acs_size", "eigen_threshold", "maps_path")
+        if getattr(est, k, None) is not None
+    }
+    assert resolve_estimation_settings(config) == (method, kwargs)
 
 
 class TestTimestepSamplingStrategyRaisesOnUnknown:
@@ -1482,8 +1544,15 @@ class TestMultiStepColdSamplingWiring:
         chunked_src = inspect.getsource(
             DiffusionTrainingStrategy._sample_multistep_chunked
         )
-        assert "gen.sample(" in chunked_src
-        assert "measurement=" in chunked_src
+        # The loop itself moved out of the strategy into ``sample_reverse_path``: the
+        # wrapper delegates to it, and that function is what calls ``gen.sample`` on the
+        # measurement.
+        assert "sample_reverse_path(" in chunked_src
+        from spectramr.models.diffusion import reverse_path
+
+        reverse_src = inspect.getsource(reverse_path)
+        assert "gen.sample(" in reverse_src
+        assert "measurement=" in reverse_src
         # The single deterministic forward remains the fallback (default path).
         assert "_forward_chunked(" in src
 
@@ -1522,56 +1591,66 @@ def test_diffusion_override_feeds_report_case_recorder():
     assert "_report_case_recorder" in src
 
 
-class TestSmapsContentCache:
-    """ESPIRiT smaps are memoized on the ACS content (2026-06-12 compute audit).
+class TestSmapsEstimateHasNoHostSync:
+    """The training-path map estimate makes no host read (#1244).
 
-    The estimate is an SVD-class op that was re-run every step / every
-    reverse-sampling iteration; the content key makes it run once per distinct
-    ACS input while being leak-proof (a content key cannot alias across
-    train/val contexts).
+    The content fingerprint it used to be memoized on took ``mag.sum().item()``
+    and ``mag.amax().item()`` on every step for a lookup that could not hit.
+    The memo is gone, so each call estimates, and nothing on the call reads a
+    device value into Python.
     """
 
     @staticmethod
-    def _fake_estimate(monkeypatch):
+    def _counting_estimator(monkeypatch):
         calls = {"n": 0}
 
-        def fake_estimate_smaps(acs, **kwargs):
+        def fake(acs, **kwargs):
             calls["n"] += 1
             return torch.ones(acs.shape, dtype=torch.complex64)
 
-        monkeypatch.setattr(
-            "spectramr.infrastructure.training.strategies.diffusion.estimate_smaps",
-            fake_estimate_smaps,
-        )
+        monkeypatch.setattr(diffusion_mod, "estimate_smaps_calibrated", fake)
         return calls
 
-    def test_same_acs_estimates_once(self, monkeypatch) -> None:
-        calls = self._fake_estimate(monkeypatch)
+    @staticmethod
+    def _strategy():
         strat = object.__new__(DiffusionTrainingStrategy)
-        acs = torch.complex(torch.randn(2, 4, 16, 16), torch.randn(2, 4, 16, 16))
-        s1 = strat._estimate_smaps_cached(acs, 16, 16)
-        s2 = strat._estimate_smaps_cached(acs, 16, 16)
-        assert calls["n"] == 1  # second call hit the cache
-        assert torch.equal(s1, s2)
+        strat._kspace_log_scaled_for_maps = lambda: False
+        return strat
 
-    def test_different_acs_reestimates(self, monkeypatch) -> None:
-        calls = self._fake_estimate(monkeypatch)
-        strat = object.__new__(DiffusionTrainingStrategy)
-        torch.manual_seed(0)
-        acs_a = torch.complex(torch.randn(2, 4, 16, 16), torch.randn(2, 4, 16, 16))
-        acs_b = torch.complex(torch.randn(2, 4, 16, 16), torch.randn(2, 4, 16, 16))
-        strat._estimate_smaps_cached(acs_a, 16, 16)
-        strat._estimate_smaps_cached(acs_b, 16, 16)
-        assert calls["n"] == 2  # distinct content → re-estimated
+    @staticmethod
+    def _acs() -> torch.Tensor:
+        g = torch.Generator().manual_seed(0)
+        re, im = (torch.randn(2, 4, 16, 16, generator=g) for _ in range(2))
+        return torch.complex(re, im)
 
-    def test_cache_is_bounded(self, monkeypatch) -> None:
-        self._fake_estimate(monkeypatch)
-        strat = object.__new__(DiffusionTrainingStrategy)
-        torch.manual_seed(1)
-        for _ in range(DiffusionTrainingStrategy._SMAPS_CACHE_MAX + 5):
-            acs = torch.complex(torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8))
-            strat._estimate_smaps_cached(acs, 8, 8)
-        assert len(strat._smaps_cache) <= DiffusionTrainingStrategy._SMAPS_CACHE_MAX
+    @staticmethod
+    def _host_reads_raise(monkeypatch):
+        def _raise(*_a, **_k):
+            raise RuntimeError("host sync on the training path")
+
+        for slot in ("item", "tolist", "__float__", "__bool__", "__int__"):
+            monkeypatch.setattr(torch.Tensor, slot, _raise)
+
+    def test_each_call_estimates_through_the_owner(self, monkeypatch) -> None:
+        calls = self._counting_estimator(monkeypatch)
+        strat, acs = self._strategy(), self._acs()
+        strat._estimate_smaps_from_acs(acs, 16, 16)
+        strat._estimate_smaps_from_acs(acs, 16, 16)
+        assert calls["n"] == 2
+        assert not hasattr(DiffusionTrainingStrategy, "_SMAPS_CACHE_MAX")
+
+    def test_the_training_path_makes_no_host_read(self, monkeypatch) -> None:
+        self._counting_estimator(monkeypatch)
+        strat, acs = self._strategy(), self._acs()
+        self._host_reads_raise(monkeypatch)
+        strat._estimate_smaps_from_acs(acs, 16, 16)
+
+    def test_the_guard_is_red_on_the_content_fingerprint(self, monkeypatch) -> None:
+        """Planted: the pre-#1244 key, reduced to its two reductions."""
+        mag = self._acs().abs()
+        self._host_reads_raise(monkeypatch)
+        with pytest.raises(RuntimeError, match="host sync"):
+            (round(float(mag.sum().item()), 3), round(float(mag.amax().item()), 6))
 
 
 class TestCurriculumRMax:
@@ -1638,6 +1717,12 @@ class TestConditionOnInput:
             training=SimpleNamespace(diffusion=SimpleNamespace(condition_on_input=flag))
         )
         return s
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_channel_guard_defers_only_when_the_condition_is_concatenated(self, flag) -> None:
+        s = self._strategy(flag)
+        assert s.builds_own_model_input() is flag
 
     @pytest.mark.unit
     def test_flag_on_standard_path_concats_input(self) -> None:
@@ -1715,11 +1800,14 @@ class TestConditionOnInput:
 
 
 def _fake_smaps_self():
+    estimation = _types.SimpleNamespace(method="power_iter", kernel_size=7, acs_size=16)
     return _types.SimpleNamespace(
-        _smaps_cache=None,
-        _SMAPS_CACHE_MAX=8,
-        _configured_estimation_method=lambda: "power_iter",
-        _configured_estimation_kwargs=lambda: {"kernel_size": 7, "acs_size": 16},
+        _kspace_log_scaled_for_maps=lambda: False,
+        config=_types.SimpleNamespace(
+            physics=_types.SimpleNamespace(
+                coil_processing=_types.SimpleNamespace(estimation=estimation)
+            )
+        ),
     )
 
 
@@ -1728,13 +1816,13 @@ class TestSmapsCalibrationFromFullySampled:
     undersampled input or the diffusion-degraded tensor (g-factor overlap fix)."""
 
     @pytest.mark.unit
-    def test_estimate_smaps_cached_crops_to_acs(self) -> None:
+    def test_estimate_smaps_from_acs_crops_to_acs(self) -> None:
         # acs_only is wired into the cached path → out-of-ACS corruption of the
         # calibration source cannot change the maps.
         torch.manual_seed(0)
         k = torch.randn(1, 4, 64, 64, dtype=torch.complex64)
         torch.manual_seed(1)
-        clean = DiffusionTrainingStrategy._estimate_smaps_cached(
+        clean = DiffusionTrainingStrategy._estimate_smaps_from_acs(
             _fake_smaps_self(), k, 64, 64
         )
         corrupt = k.clone()
@@ -1742,15 +1830,16 @@ class TestSmapsCalibrationFromFullySampled:
         outside[24:40, 24:40] = False
         corrupt[:, :, outside] = corrupt[:, :, outside] + 100.0
         torch.manual_seed(1)
-        after = DiffusionTrainingStrategy._estimate_smaps_cached(
+        after = DiffusionTrainingStrategy._estimate_smaps_from_acs(
             _fake_smaps_self(), corrupt, 64, 64
         )
         torch.testing.assert_close(clean, after)
 
     @pytest.mark.unit
-    def test_cached_estimate_passes_acs_only(self) -> None:
-        src = inspect.getsource(DiffusionTrainingStrategy._estimate_smaps_cached)
-        assert "acs_only=True" in src
+    def test_cached_estimate_calibrates_through_the_owner(self) -> None:
+        """ACS confinement lives in ``estimate_smaps_calibrated`` (#2213), not here."""
+        src = inspect.getsource(DiffusionTrainingStrategy._estimate_smaps_from_acs)
+        assert "estimate_smaps_calibrated(" in src
 
     @pytest.mark.unit
     def test_training_calibration_uses_target_not_noisy_images(self) -> None:
@@ -1766,7 +1855,10 @@ class TestSmapsCalibrationFromFullySampled:
         )
         assert "acs_kspace_t = input_batch" not in src  # undersampled source removed
         assert "acs_kspace = target_batch" in src
-        assert "acs_only=True" in src
+        # The calibration goes through the one shared owner (which confines the estimator
+        # to the dense centre), not a per-call ``acs_only`` switch that no longer exists.
+        assert "estimate_smaps_calibrated(\n                    acs_kspace_t," in src
+        assert "acs_only=True" not in src
 
 
 class TestCascadeCompleteness:
@@ -1811,16 +1903,16 @@ class TestCascadeCompleteness:
         """R=8 is simply not a rung this ladder has: a config LIMITATION.
 
         ``timestep_for_acceleration`` raises, and skipping is the honest answer —
-        so ``_level_is_declared`` must say False and let the cascade continue.
+        so ``level_is_declared`` must say False and let the cascade continue.
         """
         accel = self._accelerator(10, [2.0, 4.0, 16.0, 32.0])
         with pytest.raises(ValueError):
             accel.timestep_for_acceleration(8.0)
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 8) is False
+        assert level_is_declared(accel, 8) is False
         # ...and the rungs it does declare are still declared, so the predicate
         # is not simply returning False for everything.
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 2) is True
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 32) is True
+        assert level_is_declared(accel, 2) is True
+        assert level_is_declared(accel, 32) is True
 
     @pytest.mark.unit
     def test_declared_but_unrealised_level_is_declared(self) -> None:
@@ -1835,7 +1927,7 @@ class TestCascadeCompleteness:
         accel = self._accelerator(2, [2.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0])
         with pytest.raises(ValueError, match="realised at NO"):
             accel.timestep_for_acceleration(8.0)
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 8) is True
+        assert level_is_declared(accel, 8) is True
 
     @pytest.mark.unit
     def test_both_subcases_raise_the_same_exception_type(self) -> None:
@@ -1865,7 +1957,7 @@ class TestCascadeCompleteness:
         rungs = [2.0, 4.0, 8.0, 16.0, 32.0]
         accel = self._accelerator(len(rungs), rungs)
         for level in CASCADING_LEVELS:
-            assert DiffusionTrainingStrategy._level_is_declared(accel, level) is True
+            assert level_is_declared(accel, level) is True
             accel.timestep_for_acceleration(float(level))  # must not raise
 
     @pytest.mark.unit
@@ -1881,7 +1973,7 @@ class TestCascadeCompleteness:
         accel = self._accelerator(4, [2.0, 8.0, 16.0, 32.0])
         assert getattr(accel, "acceleration_range", None) is None
         assert accel.accelerator.acceleration_range == [2.0, 8.0, 16.0, 32.0]
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 8) is True
+        assert level_is_declared(accel, 8) is True
 
     @pytest.mark.unit
     def test_no_explicit_range_means_nothing_is_declared(self) -> None:
@@ -1902,7 +1994,7 @@ class TestCascadeCompleteness:
             accelerator_kwargs={"acceleration_schedule": "step", "max_acceleration": 32.0},
         )
         accel = gen._get_accelerator(None)
-        assert DiffusionTrainingStrategy._level_is_declared(accel, 8) is False
+        assert level_is_declared(accel, 8) is False
 
     # ---- a partial mean may not occupy the complete mean's column name ------
 
@@ -2020,7 +2112,11 @@ class TestCascadeCompleteness:
         assert "val_cascade_complete" in src
         # The held-out branch keeps its skip; the in-distribution one raises.
         assert "raise RuntimeError(" in src
-        assert "_level_is_declared" in src
+        assert "rung_for_acceleration" in src
+        # ...and the rung mask over the acquired lines comes from the owner predict
+        # calls too (#2883), so the two cannot build different masks at one R.
+        prelude = inspect.getsource(DiffusionTrainingStrategy._generate_validation_prediction)
+        assert "rung_mask(" in prelude
 
     @pytest.mark.unit
     def test_completeness_stamps_are_all_three(self) -> None:

@@ -28,12 +28,20 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
+
 from .diffusion import DiffusionTrainingStrategy
 from .mixins.utils import pick_present
+from .owned_param_groups import add_owned_param_group
 
 
 class CoordKSpaceGenStrategy(DiffusionTrainingStrategy):
     """Coordinate-conditioned k-space generative strategy with SIREN INR."""
+
+    # parallel_compat: The SIREN is a bare group on opt_g, refused under ddp. It is built and run
+    # only for a batch that carries k-space, and rebuilt when coords/contrast_id change, so
+    # whether a rank enters the DDP construction or forward depends on its batch.
+    parallel_compat = frozenset({"replicated"})
 
     siren_hidden: int = 256
     siren_layers: int = 4
@@ -45,6 +53,10 @@ class CoordKSpaceGenStrategy(DiffusionTrainingStrategy):
         super().__init__(*args, **kwargs)
         self._siren: torch.nn.Module | None = None
         self._siren_in_features: int = 2
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("_siren", OWNED_PARAM_GROUP))
 
     def _ensure_siren(self, in_features: int, device: torch.device) -> torch.nn.Module:
         if self._siren is None or self._siren_in_features != in_features:
@@ -60,7 +72,12 @@ class CoordKSpaceGenStrategy(DiffusionTrainingStrategy):
             self._siren_in_features = in_features
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
-                opt.add_param_group({"params": list(self._siren.parameters()), "lr": 1e-4})
+                add_owned_param_group(
+                    self,
+                    opt,
+                    {"params": list(self._siren.parameters()), "lr": 1e-4},
+                    owner="its SIREN",
+                )
         return self._siren
 
     @staticmethod

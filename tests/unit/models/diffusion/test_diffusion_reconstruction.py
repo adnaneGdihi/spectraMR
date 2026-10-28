@@ -155,3 +155,38 @@ class TestDiffusionReconstruction:
         config = create_diffusion_reconstruction_config(method="pnp")
         assert config["method"] == "pnp"
         assert "num_iterations" in config
+
+
+# --- #801: the high-level interface is an nn.Module -------------------------
+
+
+def test_reconstruction_with_diffusion_prior_is_an_nn_module():
+    """It was a plain class holding ``self.reconstructor``, registered as a model."""
+    assert issubclass(ReconstructionWithDiffusionPrior, nn.Module)
+
+
+def test_call_is_not_shadowed_and_forward_exists():
+    """``__call__`` WAS the entry point here; it is now ``forward``.
+
+    Left as ``__call__`` on an ``nn.Module`` it would shadow ``_call_impl``, so
+    hooks would never fire on the one method the class actually implements.
+    """
+    assert "__call__" not in vars(ReconstructionWithDiffusionPrior)
+    assert ReconstructionWithDiffusionPrior.__call__ is nn.Module.__call__
+    assert callable(ReconstructionWithDiffusionPrior.forward)
+
+
+@pytest.mark.parametrize("method", ["pnp", "red", "posterior"])
+def test_the_wrapped_diffusion_models_weights_reach_parameters(method):
+    """The registration is load-bearing, not cosmetic.
+
+    Probed with a real two-layer model rather than the ``None`` default, which
+    would report zero parameters whether or not the child registered.
+    """
+    dm = nn.Sequential(nn.Conv2d(1, 4, 3, padding=1), nn.Conv2d(4, 1, 3, padding=1))
+    expected = sum(1 for _ in dm.parameters())
+    model = ReconstructionWithDiffusionPrior(method=method, diffusion_model=dm)
+
+    assert "reconstructor" in dict(model.named_children())
+    assert sum(1 for _ in model.parameters()) == expected
+    assert all(k.startswith("reconstructor.") for k in model.state_dict())

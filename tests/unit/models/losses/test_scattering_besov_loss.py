@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 from spectramr.models.losses.scattering_besov_loss import ScatteringBesovLoss
 
@@ -89,3 +89,20 @@ def test_registered_and_creatable() -> None:
     assert "scattering_besov" in LossRegistry._custom_losses
     inst = LossRegistry.create("scattering_besov")
     assert isinstance(inst, ScatteringBesovLoss)
+
+
+@pytest.mark.parametrize(("n_scales", "n_orientations"), [(3, 4), (2, 5), (1, 1)])
+def test_besov_band_slices_match_the_scale_index_mask(n_scales: int, n_orientations: int) -> None:
+    """Scale j's channels are the contiguous slice the boolean mask selected."""
+    loss = ScatteringBesovLoss(n_scales=n_scales, n_orientations=n_orientations)
+    gen = torch.Generator().manual_seed(0)
+    pred = torch.rand(2, 1, 24, 24, generator=gen)
+    target = torch.rand(2, 1, 24, 24, generator=gen)
+    cos_p, _ = loss._responses(pred)
+    cos_t, _ = loss._responses(target)
+    reference = pred.new_zeros(())
+    for j in range(n_scales):
+        mask = loss.scale_index == j
+        diff = (cos_p[:, mask] - cos_t[:, mask]).abs().mean()
+        reference = reference + loss.besov_scale_weights[j] * diff
+    torch.testing.assert_close(loss.compute(pred, target)["loss_besov"], reference / n_scales)

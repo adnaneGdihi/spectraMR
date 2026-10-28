@@ -84,7 +84,7 @@ from . import (
 )
 ```
 
-The repo's "pitfall 9" rule (no silent fallbacks) is exactly this
+The no-silent-fallbacks rule is exactly this
 case: a `@register_loss` decorator that nothing imports is silently dead.
 
 A cold-subprocess regression test in
@@ -145,18 +145,9 @@ to list `latent` in their `compatible_with`).
 
 ### Option C — explicit adapter
 
-If your model outputs k-space but the loss expects image, declare the
-bridge explicitly:
-
-```yaml
-adapters:
-  pre_loss_pred:
-    - {name: ifft_kspace_to_image}
-    - {name: magnitude_from_complex}
-  pre_loss_target:
-    - {name: ifft_kspace_to_image}
-    - {name: magnitude_from_complex}
-```
+If your model outputs k-space but the loss expects image, make the loss list
+match the model's output domain. The former `adapters.pre_loss_pred:` hook is
+retired (#1777) and no adapter bridges that gap.
 
 The adapter chain runs before each loss is computed. See
 `src/spectramr/data/adapters/registry.py` for the available bridges.
@@ -184,4 +175,4 @@ The adapter chain runs before each loss is computed. See
 
 - [Add a model](add_model.md) — the registration pattern is similar.
 - [Add a paradigm](add_paradigm.md) — how to use multiple losses in one training loop.
-- [Registries reference](../reference/registries.md) — list every registered loss in the repo.
+- [Losses reference](../losses_reference.rst) — the registered loss catalogue.

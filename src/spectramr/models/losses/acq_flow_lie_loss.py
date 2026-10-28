@@ -39,6 +39,7 @@ from spectramr.models.losses.registry import register_loss
 # Clean contrast labels handled by the analytic generator (no normalisation
 # coupling, so the per-voxel derivative is exact and local).
 _SUPPORTED_CONTRASTS = ("spin_echo", "se", "t2", "inversion_recovery", "ir", "flair")
+_RELAXATION_FLOOR_MS = 1e-3
 
 
 def _signal(
@@ -93,8 +94,11 @@ def acquisition_flow_generator(
     if wrt not in ("TR", "TE", "TI"):
         raise ValueError(f"wrt must be one of TR/TE/TI, got {wrt!r}.")
     rho = params[:, 0:1]
-    t1 = params[:, 1:2]
-    t2 = params[:, 2:3]
+    # Background voxels of a parameter atlas carry T1 = T2 = 0, where the
+    # derivative of exp(-TR/T1) is 0 * inf = NaN; the floored value gives the
+    # physical limit (a zero generator) instead.
+    t1 = params[:, 1:2].clamp_min(_RELAXATION_FLOOR_MS)
+    t2 = params[:, 2:3].clamp_min(_RELAXATION_FLOOR_MS)
 
     base = {
         "TR": float(acquisition["TR"]),
@@ -104,8 +108,17 @@ def acquisition_flow_generator(
     full = {key: torch.full_like(rho, val) for key, val in base.items()}
     full[wrt] = full[wrt].clone().requires_grad_(True)
 
-    signal = _signal(contrast_type, rho, t1, t2, full["TR"], full["TE"], full["TI"])
-    (grad,) = torch.autograd.grad(signal.sum(), full[wrt], create_graph=False)
+    with torch.enable_grad():
+        signal = _signal(contrast_type, rho, t1, t2, full["TR"], full["TE"], full["TI"])
+        # A contrast that does not depend on ``wrt`` (TI under spin echo) has a
+        # zero generator, which is the "no constraint" case the module promises.
+        if not signal.requires_grad:
+            return torch.zeros_like(rho)
+        (grad,) = torch.autograd.grad(
+            signal.sum(), full[wrt], create_graph=False, allow_unused=True
+        )
+    if grad is None:
+        return torch.zeros_like(rho)
     return grad
 
 

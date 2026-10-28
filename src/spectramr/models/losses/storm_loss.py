@@ -15,11 +15,16 @@ Manifolds (SToRM)," IEEE TMI 35(4), 2016.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import torch
 import torch.nn as nn
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.models.losses.registry import register_loss
+
+if TYPE_CHECKING:
+    from spectramr.models.geometric.storm import ManifoldLaplacian
 
 # Imported lazily inside ``__init__`` so the losses package can be
 # imported before the geometric package has finished initialising
@@ -104,10 +109,11 @@ class SToRMRegularizer(nn.Module):
         learn_laplacian: bool = True,
         num_frames: int = 20,
         nav_dim: int = 64,
-    ):
+    ) -> None:
         super().__init__()
         self.lambda_manifold = lambda_manifold
         self.learn_laplacian = learn_laplacian
+        self.manifold: ManifoldLaplacian | None
         if learn_laplacian:
             # Lazy import to avoid losses ↔ geometric circular dependency
             # at package-load time.
@@ -120,13 +126,18 @@ class SToRMRegularizer(nn.Module):
     def forward(
         self,
         X: torch.Tensor,
+        target: torch.Tensor | None = None,
+        *,
         navigators: torch.Tensor | None = None,
         L: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Compute the manifold-smoothness penalty.
 
         Args:
             X: ``[B, T, C, H, W]`` dynamic image sequence.
+            target: Unused. The registry calls ``loss(prediction, target)``;
+                taking it here keeps the target from binding to ``navigators``.
             navigators: ``[B, T, D]`` navigator signals when
                 ``learn_laplacian`` is True.
             L: ``[B, T, T]`` pre-computed Laplacian; mutually exclusive
@@ -151,28 +162,17 @@ class SToRMRegularizer(nn.Module):
                         "learn_laplacian=False to choose the uniform Laplacian on "
                         "purpose."
                     )
+                assert self.manifold is not None
                 L, _ = self.manifold(navigators)
             else:
                 L = _uniform_temporal_laplacian(B, T, device=X.device, dtype=X.dtype)
 
-        X_flat = X.view(B, T, -1)  # [B, T, P], P = C*H*W
+        x_flat = X.reshape(B, T, -1)  # [B, T, P], P = C*H*W
 
-        # Tr(X^T L X) WITHOUT materialising X^T L X.
-        #
-        # The previous form built [B, P, P] via two bmms and then read only its
-        # diagonal — allocating P^2 to use P of it. P = C*H*W, so on realistic
-        # dynamic MRI that is 4.3 GB at 128^2 and 68.7 GB at 256^2: a guaranteed
-        # OOM on the exact data this regulariser is FOR. (The identity below is
-        # exact, not an approximation — verified bit-identical, max abs diff 0.0.)
-        #
-        #   sum_p (X^T L X)[p, p] = sum_{i,j,p} X[i,p] L[i,j] X[j,p]
-        #                         = sum_{i,p} X[i,p] * (L X)[i,p]
-        #
-        # so contracting L with X first keeps everything at [B, T, P] — 8.4 MB
-        # where the old form wanted 68.7 GB — and costs O(B*T*P) instead of
-        # O(B*T*P^2).
-        lx = torch.bmm(L, X_flat)  # [B, T, P]
-        loss = (X_flat * lx).sum(dim=(1, 2)).mean()
+        # Tr(X^T L X) = sum_{i,p} X[i,p] (L X)[i,p]: contracting L with X first stays
+        # at [B, T, P], where the [B, P, P] product needs 68.7 GB at 256^2.
+        lx = torch.bmm(L, x_flat)  # [B, T, P]
+        loss = (x_flat * lx).sum(dim=(1, 2)).mean()
         return self.lambda_manifold * loss
 
 

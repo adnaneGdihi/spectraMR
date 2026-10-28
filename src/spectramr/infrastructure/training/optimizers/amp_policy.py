@@ -143,6 +143,27 @@ class AMPPolicy(IAMPPolicy):
         # re-implementing the enable/threshold gating.
         self.clip_gradients(model, self.max_grad_norm)
 
+    def _ensure_gradients_arrived(self, optimizer: torch.optim.Optimizer, model_name: str) -> None:
+        """Raise when the first boundary backward gave none of *optimizer*'s parameters a gradient.
+
+        The executor's pre-backward guard reads only ``loss.grad_fn``, so a severed
+        loss that went through one more op (``leaf * weight``, ``sum([leaf])``)
+        reached backward and stepped nothing (#2309). The graph is fixed per step
+        config, so this runs once per name, on host-side ``grad is None`` checks.
+        """
+        checked: set[str] = self.__dict__.setdefault("_gradients_checked", set())
+        if model_name in checked:
+            return
+        trainable = [p for g in optimizer.param_groups for p in g["params"] if p.requires_grad]
+        if trainable and all(p.grad is None for p in trainable):
+            raise RuntimeError(
+                f"Step config {model_name!r}: backward() ran but none of its optimizer's "
+                f"{len(trainable)} trainable parameters received a gradient, so this step "
+                "would train nothing. The loss is disconnected from the model -- e.g. a "
+                "detached or constant term scaled by a weight, or summed with Python sum()."
+            )
+        checked.add(model_name)
+
     def backward_and_step(
         self,
         loss: torch.Tensor,
@@ -190,6 +211,7 @@ class AMPPolicy(IAMPPolicy):
             scaler.scale(loss).backward()
 
             if perform_step:
+                self._ensure_gradients_arrived(optimizer, model_name)
                 # Unscale gradients to fp32 for clipping and inf/nan checking
                 scaler.unscale_(optimizer)
 
@@ -235,6 +257,7 @@ class AMPPolicy(IAMPPolicy):
             loss.backward()
 
             if perform_step:
+                self._ensure_gradients_arrived(optimizer, model_name)
                 if gradient_clipping_fn:
                     gradient_clipping_fn(model)
                 else:

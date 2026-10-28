@@ -13,11 +13,11 @@ Mounted on the ``training_mode`` discriminated union as
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..renames import reject_renamed_keys
 from .diffusion import TrainingConfigDiffusion
 
 # Pulse sequences the projector / Bloch forward map understands. Kept in
@@ -96,9 +96,10 @@ class BlochManifoldDPSConfig(BaseModel):
         default="epsilon",
         description="Whether the score net predicts noise or the clean image.",
     )
-    pretrained_score_checkpoint: Path = Field(
-        ...,
-        description="Required: pretrained DDPM score-network checkpoint.",
+
+    # Retired prior-checkpoint field (#647); the refusal names the removal record.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.bloch_manifold_dps"))  # type: ignore[arg-type]
     )
 
     @model_validator(mode="after")

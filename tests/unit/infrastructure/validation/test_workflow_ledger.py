@@ -106,10 +106,12 @@ def test_structural_is_declared_by_exactly_one_strategy() -> None:
     # Pinned set, so a new declarer stays a deliberate decision. PILOT and BALD
     # are learnable-acquisition arms over structural MRI; both carry their own
     # `capabilities` (verified above, not inherited from Reconstruction), which
-    # is exactly the explicit opt-in the ledger asks for.
+    # is exactly the explicit opt-in the ledger asks for. Noise2Noise denoises
+    # structural repetitions and declares the same on its own body.
     assert sorted(declarers) == sorted(
         [
             "ReconstructionTrainingStrategy",
+            "NoiseToNoiseStrategy",
             "PILOTStrategy",
             "BALDAcquisitionStrategy",
         ]

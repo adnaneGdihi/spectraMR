@@ -46,8 +46,9 @@ class SlurmDefaultsSchema(BaseModel):
 class CheckpointFromSchema(BaseModel):
     """Cross-stage checkpoint injection.
 
-    Used in sequential campaigns to wire a parent stage's best checkpoint
-    into a child experiment's config at submission time.
+    Used in sequential campaigns to wire a parent stage's best checkpoint, else its
+    latest step, into a child experiment's config. The file is chosen when the child
+    job starts, after the parent finished; a parent that left none fails the child.
     """
 
     model_config = {"extra": "forbid", "frozen": True}

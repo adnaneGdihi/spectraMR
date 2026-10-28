@@ -12,8 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import pandas as pd
 
+from spectramr.infrastructure.reporting.legend import reserve_legend_space, shared_legend, sparse_ticks
 from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figure, write_sidecar
 from spectramr.infrastructure.reporting.style import (
     colour_for,
@@ -101,9 +103,14 @@ def make(
         ax.set_xlabel(pretty_label("step"))
         if n > 1:
             panel_label(ax, chr(ord("a") + i))
-        if i == 0:
-            ax.legend(frameon=False, fontsize=6, loc="best")
-    fig.tight_layout()
+        sparse_ticks(ax)
+    # colour names the metric; line style names the split
+    shared_legend(
+        fig,
+        [Line2D([], [], color="#555555", lw=1.0), Line2D([], [], color="#555555", lw=1.0, ls="--")],
+        ["train", "validation"],
+    )
+    fig.tight_layout(rect=(0, reserve_legend_space(fig), 1, 1))
     if metadata is not None:
         stamp_figure(fig, metadata)
     written = save_figure(fig, out_path.parent, out_path.stem, formats=formats, dpi=dpi)

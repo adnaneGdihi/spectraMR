@@ -23,17 +23,13 @@ def test_motion_meta_drops_identity_fft_roundtrip() -> None:
 
 
 def test_n2n_picks_two_distinct_repetitions() -> None:
-    from spectramr.infrastructure.training.strategies.n2n_strategy import (
-        NoiseToNoiseStrategy,
-    )
+    from spectramr.infrastructure.training.strategies.n2n_strategy import pair_from_stack
 
-    # reps[:, k] is filled with the constant k → distinct reps have distinct means.
-    reps = torch.stack(
-        [torch.full((1, 1, 4, 4), float(k)) for k in range(3)], dim=1
-    )  # [B=1, N=3, C=1, H=4, W=4]
-    batch = {"image_reps": reps}
-    for _ in range(8):  # randomized pick — distinctness must hold every time
-        inp, tgt = NoiseToNoiseStrategy._unpack_batch(object(), batch)
+    # Slot k is filled with the constant k, so distinct slots have distinct means.
+    stack = torch.cat([torch.full((1, 1, 4, 4), float(k)) for k in range(3)], dim=1)
+    inp = stack[:, :1]
+    for _ in range(8):  # randomized pick: distinctness must hold every time
+        tgt = pair_from_stack(inp, stack, "random_pair")
         assert inp.mean().item() != tgt.mean().item()
 
 

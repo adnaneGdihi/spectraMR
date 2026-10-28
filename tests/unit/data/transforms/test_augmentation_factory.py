@@ -159,3 +159,153 @@ class TestGammaIsParameterisedInLogSpace:
             )
             is None
         )
+
+
+class TestDegradationsSkipTheTarget:
+    """Intensity degradations hit ``input`` only; the ground truth stays clean."""
+
+    _DEGRADATIONS = (
+        "enable_gamma",
+        "enable_brightness",
+        "enable_contrast",
+        "enable_noise",
+        "enable_bias_field",
+        "enable_rician_noise",
+        "enable_motion_blur",
+        "enable_blur",
+        "enable_ghosting",
+        "enable_spike",
+        "enable_anisotropy",
+    )
+
+    @staticmethod
+    def _subject(x):
+        import torchio as tio
+
+        return tio.Subject(
+            input=tio.ScalarImage(tensor=x.clone()),
+            target=tio.ScalarImage(tensor=x.clone()),
+            mri=tio.ScalarImage(tensor=x.clone()),
+        )
+
+    @staticmethod
+    def _only(flag: str) -> AugmentationConfigSchema:
+        off = dict.fromkeys(TestDegradationsSkipTheTarget._DEGRADATIONS, False)
+        return AugmentationConfigSchema(enabled=True, probability=1.0, **{**off, flag: True})
+
+    @pytest.mark.parametrize("flag", _DEGRADATIONS)
+    def test_target_and_mri_alias_are_untouched(self, flag: str) -> None:
+        import torch
+
+        torch.manual_seed(0)
+        x = torch.rand(1, 16, 16, 8)
+        pipeline = TorchIOAugmentationFactory.build(self._only(flag), dataset_type="nifti_paired")
+        assert pipeline is not None
+        input_moved = False
+        for _ in range(5):  # a single spike draw can land on a no-op coefficient
+            out = pipeline(self._subject(x))
+            assert torch.equal(out["target"].data, x)
+            assert torch.equal(out["mri"].data, x)
+            input_moved |= not torch.equal(out["input"].data, x)
+        assert input_moved, f"{flag} left the input unchanged"
+
+    def test_spatial_transforms_still_move_the_pair_together(self) -> None:
+        import torch
+
+        torch.manual_seed(0)
+        x = torch.rand(1, 16, 16, 1)
+        cfg = AugmentationConfigSchema(
+            enabled=True, probability=1.0, enable_flip=True, prob_flip=1.0, flip_axes=[0, 1]
+        )
+        out = TorchIOAugmentationFactory.build(cfg, dataset_type="nifti_paired")(self._subject(x))
+        assert torch.equal(out["input"].data, out["target"].data)
+        assert not torch.equal(out["input"].data, x)
+
+    def test_a_single_image_subject_is_still_degraded(self) -> None:
+        import torch
+        import torchio as tio
+
+        torch.manual_seed(0)
+        x = torch.rand(1, 16, 16, 1)
+        out = TorchIOAugmentationFactory.build(self._only("enable_noise"), dataset_type="nifti")(
+            tio.Subject(input=tio.ScalarImage(tensor=x.clone()))
+        )
+        assert not torch.equal(out["input"].data, x)
+
+
+class TestForwardOperatorAugmentation:
+    """``enable_forward_operator`` swaps the input for a ULF image simulated from the target."""
+
+    @staticmethod
+    def _subject():
+        import numpy as np
+        import torch
+        import torchio as tio
+
+        torch.manual_seed(0)
+        target = torch.rand(1, 16, 16, 4)
+        return tio.Subject(
+            input=tio.ScalarImage(tensor=torch.zeros_like(target), affine=np.eye(4)),
+            target=tio.ScalarImage(tensor=target, affine=np.eye(4)),
+        )
+
+    @staticmethod
+    def _only(prob: float, **kwargs):
+        cfg = AugmentationConfigSchema(
+            enabled=True,
+            enable_forward_operator=True,
+            prob_forward_operator=prob,
+            forward_operator_kwargs=kwargs,
+        )
+        return TorchIOAugmentationFactory.build(cfg)
+
+    def test_the_input_becomes_a_simulation_of_the_target_and_the_target_is_kept(self) -> None:
+        import torch
+
+        from spectramr.data.transforms.synthetic_ulf_simulator import SimulateULFFromHF
+
+        pipeline = self._only(1.0, target_snr_db=20.0, b0_distortion_strength=0.0)
+        (sim,) = pipeline.transforms
+        assert isinstance(sim, SimulateULFFromHF) and sim.target_snr_db == 20.0
+        subject = self._subject()
+        target = subject["target"].data.clone()
+        out = pipeline(subject)
+        assert torch.equal(out["target"].data, target)
+        assert not torch.equal(out["input"].data, torch.zeros_like(target))
+        assert torch.corrcoef(torch.stack([out["input"].data.flatten(), target.flatten()]))[0, 1] > 0.5
+
+    def test_probability_zero_leaves_the_measured_input(self) -> None:
+        import torch
+
+        out = self._only(0.0)(self._subject())
+        assert torch.equal(out["input"].data, torch.zeros(1, 16, 16, 4))
+
+    def test_it_is_built_by_the_train_chain_only(self) -> None:
+        from spectramr.data.builders.torchio_transform_builder import TorchIOTransformBuilder
+
+        train = inspect.getsource(TorchIOTransformBuilder.build_train_transforms)
+        val = inspect.getsource(TorchIOTransformBuilder.build_val_transforms)
+        assert "TorchIOAugmentationFactory.build" in train
+        assert "TorchIOAugmentationFactory" not in val
+
+    def test_refusals(self) -> None:
+        with pytest.raises(ValueError, match="may not set"):
+            AugmentationConfigSchema(enable_forward_operator=True, forward_operator_kwargs={"p": 1})
+        with pytest.raises(ValueError, match="nothing reads it"):
+            AugmentationConfigSchema(forward_operator_kwargs={"target_snr_db": 9.0})
+        with pytest.raises(TypeError):
+            self._only(0.5, no_such_knob=1)
+        cfg = AugmentationConfigSchema(enabled=True, enable_forward_operator=True)
+        with pytest.raises(ValueError, match="cannot run on dataset_type"):
+            TorchIOAugmentationFactory.build(cfg, dataset_type="kspace")
+
+
+def test_factory_b0_distortion_excludes_the_target() -> None:
+    from spectramr.config.schemas.augmentation import AugmentationConfigSchema
+    from spectramr.data.transforms.augmentation_factory import TorchIOAugmentationFactory
+    from spectramr.data.transforms.realistic_degradations import RandomB0Distortion
+
+    cfg = AugmentationConfigSchema(enabled=True, enable_b0_distortion=True, b0_prob=1.0)
+    pipeline = TorchIOAugmentationFactory.build(cfg)
+    (b0,) = [t for t in pipeline.transforms if isinstance(t, RandomB0Distortion)]
+    assert "target" in b0.exclude

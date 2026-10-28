@@ -7,15 +7,16 @@ Training Strategies — Architectural Reference
 .. sectionauthor:: spectraMR Research
 
 spectraMR's training strategies implement the **Template Method** design pattern
-through ``BaseTrainingStrategy``. Each
+through ``BaseTrainingStrategy``. Each strategy encapsulates paradigm-specific
+training logic while inheriting common infrastructure (checkpointing, EMA,
+gradient clipping, AMP, metrics).
 
 .. note::
 
-   **This page is hand-written and not exhaustive.** It documents a subset of of the
-   153 strategy classes the registry holds, so a name's absence here is **not** evidence
-   that it does not exist -- check the registry before concluding one is
-   unavailable. Counts are deliberately not restated in the prose above: a frozen
-   number in a hand-maintained page drifts silently, and this one had -- it read 34.
+   **This page is hand-written and not exhaustive.** It documents a subset of
+   the strategy classes the registry holds, so a name's absence here is **not**
+   evidence that it does not exist — ask the registry before concluding a
+   strategy is unavailable:
 
    .. code-block:: python
 
@@ -24,12 +25,7 @@ through ``BaseTrainingStrategy``. Each
       )
 
       paths = TrainingStrategyFactory.STRATEGY_CLASS_PATHS  # a CLASS attribute
-      len(paths), len(set(paths.values()))   # 206 keys -> 153 classes
-
-   Tracked as issue #1643 -- these pages should be generated from the
-   registries, the way ``docs/config_key_reference.rst`` already is.
-strategy encapsulates paradigm-specific training logic while inheriting
-common infrastructure (checkpointing, EMA, gradient clipping, AMP, metrics).
+      len(paths), len(set(paths.values()))
 
 .. contents:: Table of Contents
    :depth: 2
@@ -46,7 +42,7 @@ Most reconstruction-derived strategies get their objective from the declarative
 override ``_compute_losses_impl`` and compute their objective **inline** (e.g.
 ``F.l1_loss`` plus a themed term whose weights live under ``training.<strategy>.*``).
 For those strategies the declarative ``losses:`` block is, by itself, an inert
-**decoy** — adding a term there changes nothing (pitfall #16 at the config layer).
+**decoy** — adding a term there changes nothing.
 
 To let an inline strategy also honour the declarative block, the base class exposes
 a seam, ``ReconstructionTrainingStrategy._apply_builder_image_losses``. The strategy
@@ -61,6 +57,45 @@ sharpness terms on top. Do **not** also list the strategy's inline term (e.g.
 ``l1``) in the declarative block, or it double-counts.
 
 
+Random streams across ranks and resumes
+=======================================
+
+A strategy whose training step draws from its own ``torch.Generator`` (the SSDU
+and ambient-diffusion splits, the EI group draw, the physics-equivariant SSL
+operator draw) builds it with
+:func:`~spectramr.infrastructure.training.strategies.rng_streams.rank_seeded_generator`,
+which seeds ``seed + rank`` so data-parallel ranks draw different elements, and
+names the attribute in the ``checkpointed_streams`` class tuple. The base
+``strategy_state_dict`` then saves that stream under ``generators`` and
+``load_strategy_state_dict`` restores it: rank 0 resumes its saved state exactly,
+and every other rank reseeds from it plus its rank. Streams are declared, not
+discovered, because a generator that is reseeded on every call (a seeded
+validation draw) or built lazily after the first checkpoint must not be saved.
+
+
+Modules sized by the first forward
+==================================
+
+A strategy-owned module whose shape depends on the data cannot be built in
+``__init__``. The physics-equivariant SSL projection maps the encoder's flattened
+output, ``out_channels × H × W``, to ``latent_dim``, so its input width is known
+only after the first batch. Such a module is added to ``opt_g`` as a new param
+group when it is built. On resume, the base ``load_strategy_state_dict`` first
+calls the strategy's ``_materialize_owned_state`` hook, which rebuilds each such
+module from its saved weights' shape and registers the same group again, in the
+order training added it. ``checkpointing.resume`` restores strategy state
+**before** any optimizer state, so the saved ``opt_g`` state finds the same param
+groups in the same order. The PE-SSL projection, the LOUPE mask logits, the JEPA
+predictor and target encoder and the multi-contrast momentum encoder are rebuilt
+this way.
+
+After the hook has run, the base restore raises on any saved module or parameter
+that has no live attribute of the same kind, before it restores anything. A
+strategy that renames an owned module, or builds one lazily without rebuilding it
+in the hook, therefore fails the resume instead of continuing from freshly
+initialised weights.
+
+
 The lifecycle contract
 ======================
 
@@ -70,15 +105,6 @@ driven by
 :class:`~spectramr.infrastructure.training.strategies.lifecycle.StrategyLifecycleDriver`,
 which the training loop constructs once above the iteration loop and polls at
 each boundary.
-
-.. warning::
-
-   Until #1353 **nothing under** ``src/spectramr`` **called any of the four**
-   (audit dossier D12 §3.1). Every override — and both of the schema-declared
-   YAML features implemented inside one — was inert on every arm. If you are
-   reading a run log from before that change, ``end_to_end_finetune_epoch`` and
-   per-stage ``early_stopping`` did not run, however active the startup log
-   made them look.
 
 When each hook fires
 --------------------
@@ -210,9 +236,7 @@ All strategies compose shared behavior via ISP-compliant mixins:
    * - ``EMAMixin``
      - Empty marker class. The actual EMA shadow update runs once per
        training step in ``src/spectramr/pipelines/train.py``
-       (``pipeline.ema.update(pipeline.generator)``). The historical
-       ``_update_ema`` method had a ``pass`` body and was never called —
-       see ``TODO/audit/05_strategies_core_mixins_builders.md`` F3.
+       (``pipeline.ema.update(pipeline.generator)``).
    * - ``KspaceMixin``
      - FFT/IFFT transforms, k-space mask generation, data consistency
    * - ``MetricsMixin``
@@ -220,13 +244,14 @@ All strategies compose shared behavior via ISP-compliant mixins:
    * - ``OptimizerMixin``
      - Builds the optimizer stepper (``_build_optimizer_stepper``). Runtime
        gradient ops (``_zero_gradients`` / ``_clip_and_log_gradients`` /
-       ``_backward_and_step``) live on ``BaseTrainingStrategy``; the mixin
-       used to advertise shadowed copies that never won MRO dispatch — see
-       ``TODO/audit/05_strategies_core_mixins_builders.md`` F2.
+       ``_backward_and_step``) live on ``BaseTrainingStrategy``, not on the
+       mixin.
    * - ``AdversarialMixin``
      - Discriminator forward/backward, gradient penalty computation
    * - ``ReconstructionMixin``
-     - Supervised image loss computation (L1, SSIM, perceptual, etc.)
+     - Batch-context assembly (``_prepare_batch_context_reconstruction``), implicit-model
+       detection and coordinate grids. Generator input preparation is owned by
+       ``ReconstructionTrainingStrategy._prepare_generator_inputs``, not the mixin.
    * - ``ValidationMixin``
      - Validation step orchestration, image saving
    * - ``ModelValidationMixin``
@@ -390,7 +415,17 @@ skip discriminator or generator steps to prevent mode collapse.
            loss_type: hinge      # vanilla | lsgan | hinge | wgan
      gan:
        disc_updates: 2           # canonical home for "D updates per G step"
+       disc_update_interval: 1   # update D only every N-th iteration (disc_updates times); 1 = every step
        gan_loss_type: wgan-gp    # see GANLossesConfig in src/spectramr/config/schemas/loss.py
+
+``disc_updates`` and ``disc_update_interval`` are read in one place,
+``mixins/adversarial._resolve_disc_updates``, by the GAN, diffusion,
+adversarial-mixin and disentangled strategies alike.
+
+The WGAN-GP gradient penalty constrains the critic's per-sample score, which is the mean
+over a patch critic's output map and is the value ``WGANLoss`` scores. The critic's
+Wasserstein terms arrive scaled by ``lambda_adv`` but the penalty does not, so the
+penalty-to-critic ratio inside the critic loss is ``lambda_gp / lambda_adv``.
 
 
 DiffusionTrainingStrategy
@@ -657,6 +692,9 @@ enforcing that the output is physically realizable.
      training_mode: reconstruction
      strategy_class: ...strategies.cycle_bloch_strategy.CycleBlochStrategy
 
+This strategy **requires a discriminator**: declare ``model.discriminator``, or
+use ``CycleConsistencyStrategy`` if you do not want an adversarial term.
+
 
 CycleGANTrainingStrategy
 ------------------------
@@ -670,7 +708,7 @@ discriminators (``disc_a``, ``disc_b``) are trained **without paired
 supervision**: the batch ``target`` is a *real B-domain sample* for ``disc_b`` and
 for B-side cycle/identity self-consistency, **never** a pixel-L1 target for
 ``gen_ab(input)`` (a paired term would silently collapse the arm to a supervised
-denoiser — pitfall #16).
+denoiser).
 
 **Training Objective:**
 
@@ -713,7 +751,7 @@ cycle-consistency with a patch-wise InfoNCE (``cut_patch_nce``). ONE generator `
 (``cyclegan_generator``) + ONE PatchGAN discriminator (``patch_gan``). The batch
 ``target`` is used **only** as a real B-domain sample for ``D``; there is **no**
 pixel-L1 between ``G(input)`` and ``target`` (a paired term would collapse the arm to
-a supervised denoiser — pitfall #16).
+a supervised denoiser).
 
 **Training Objective:**
 
@@ -728,8 +766,8 @@ scales plus the first ResnetBlocks) to capture ``feat_source = E(x)`` and
 The PatchNCE projection head (``cut_patch_nce``'s ``_PatchSampleMLP``) builds its
 per-channel MLPs **lazily**, so ``setup_models`` runs a no-grad warm-up to materialise
 them and folds their parameters into ``opt_g`` (CUT's ``optimizer_F`` merged into the
-generator optimizer) — otherwise the NCE would fire but never learn its projection
-(pitfall #16). ``lambda_nce`` is read from the config SSOT ``config.losses.gan``.
+generator optimizer) — otherwise the NCE would fire but never learn its projection.
+``lambda_nce`` is read from the config SSOT ``config.losses.gan``.
 ``_compute_losses_impl`` returns ``{g_total_loss, adv_g, nce}`` (the discriminator loss
 is owned by the D-closure); validation forward is ``generator(input)``.
 
@@ -761,8 +799,7 @@ nearest level by :meth:`_field_to_domain` (vectorised nearest-neighbour →
 generator ``G(x, s)`` (``stargan_v2_generator``), the mapping network ``F(z, y)``,
 the style encoder ``E(x, y)``, and the multi-domain discriminator ``D(x, y)``
 (``stargan_v2_discriminator``). There is **no** paired pixel-L1 between the fake and
-the real target — the only reconstruction anchor is the CYCLE back to the source
-(pitfall #16).
+the real target — the only reconstruction anchor is the CYCLE back to the source.
 
 **Training Objective (generator side):**
 
@@ -784,8 +821,8 @@ gradient penalty on the real image.
 ``D`` separately. ``setup_models`` reuses the env ``stargan_v2_generator`` /
 ``stargan_v2_discriminator`` when present, always builds the (unregistered)
 mapping-network + style-encoder, and folds their parameters into ``opt_g`` — so an
-unoptimised mapping net can never silently collapse the arm to a plain AdaIN denoiser
-(pitfall #16, asserted by the gradient test). ``_compute_losses_impl`` returns
+unoptimised mapping net can never silently collapse the arm to a plain AdaIN denoiser.
+``_compute_losses_impl`` returns
 ``{g_total_loss, adv_g, style, diversity, cycle}`` (each already lambda-weighted);
 validation forward renders at the sample's target field — reference-guided
 ``G(x, E(target, y_t))`` when a reference is available, else latent-guided
@@ -933,6 +970,58 @@ DisentangledTrainingStrategy
 Content codes from the same anatomy should match; style codes from different
 contrasts should diverge.
 
+**Validation readings of the factorisation.** MSE cannot show that the codes separate: a
+decoder that ignores the style reconstructs as well. When the batches carry
+``contrast_idx`` (the M4Raw multi-contrast route), ``finalize_validation`` adds four keys to
+the validation row; a pass that saw fewer than two contrasts raises instead of reporting.
+
+* ``val_style_contrast_acc`` (high is good) — held-out accuracy of a ridge probe predicting
+  the contrast from the style code; ``val_style_contrast_chance`` is the constant predictor.
+* ``val_content_contrast_leak`` (low is good) — the same probe on the content code, minus
+  chance.
+* ``val_swap_content_distance`` and ``val_swap_style_distance`` (0 is a clean swap) — decode
+  row *i*'s content with row *j*'s style, render, and encode again: the relative error of
+  the recovered content against *i*'s and of the recovered style against *j*'s. At most 12
+  ordered pairs of different contrasts are decoded per pass.
+
+The probes train on the first half of the subjects and test on the rest, using the batch's
+``subject_id``, so no volume is on both sides (a probe that has seen a volume recognises it
+and reads its label back: a fingerprint, not a contrast). ``val_probe_split_by_subject`` is
+1 when that split was used; 0 means the batches carried no subject id and the probes fell
+back to the first and second half of the rows, which is subject-disjoint only if the
+validation order is by subject. The arithmetic is in ``spectramr.core.metrics.disentanglement``;
+they are not ``MetricsRegistry`` entries because the registry contract is a
+``(pred, target)`` image pair.
+
+**Echo-train render and its protocol.** For spin-echo and inversion-recovery rows
+(``model_kwargs.bloch_sequence_by_contrast``) the tissue maps are rendered as an echo train
+of 16 echoes read at the middle one. ``model_kwargs.bloch_protocol_by_contrast`` declares the
+acquisition each contrast was scanned with, in ms::
+
+   bloch_protocol_by_contrast:
+     T1: {TR: 500.0, TE: 18.4}
+     FLAIR: {TR: 7500.0, TE: 98.0, TI: 1655.0}
+
+The render then spaces the train at ``TE / 8`` per row and weights the signal by
+``1 - exp(-TR/T1)`` (spin echo) or ``|1 - 2 exp(-TI/T1) + exp(-TR/T1)|`` (inversion recovery),
+so contrasts render as they were scanned. With a declared protocol the protocol owns the contrast: the tissue-map render takes no
+style code, so the swap is row *i*'s content under row *j*'s protocol, and only the content
+readings (``val_content_contrast_leak``, ``val_swap_content_distance``) are reported; the
+style readings would describe the encoder alone. The susceptibility (``chi``) dephasing term
+``exp(-R2' TE)`` acts on gradient-echo rows only: a spin echo refocuses static dephasing.
+These replace the style code's predicted TR/TE/TI,
+which no data term constrains and which would trade off against the tissue maps. Every
+declared contrast needs an entry, ``TI`` belongs to inversion-recovery contrasts only, and
+rows without an echo-train render raise. Without the key the render keeps its protocol-free
+defaults (one 10 ms echo train for every row), which is what arms that predate it were
+trained with.
+
+**FNO-EPG surrogate.** ``use_fno_epg: true`` renders through a Fourier-neural-operator
+surrogate of the analytic EPG. It needs ``model_kwargs.fno_epg_weights``, a file written by
+``scripts/physics/pretrain_fno_epg.py`` (fitted over T1, T2, B1+ and echo spacing, scored on
+held-out voxels, refused above ``--max-mae``); a default-initialised surrogate is a random
+function and the strategy does not build one. It is loaded frozen.
+
 
 DisentangledVAETrainingStrategy
 -------------------------------
@@ -973,15 +1062,15 @@ optional ``training.diffusion.cross_modal`` block:
          num_contrasts: 2
 
 When the block is present, every key is **read, validated, and stamped** into
-``XDiffusionTrainingStrategy.cross_modal_provenance`` (pitfall #15). A
+``XDiffusionTrainingStrategy.cross_modal_provenance``. A
 strategy-owned condition encoder (a plain ``nn.Module`` attribute — the strategy
 itself is not an ``nn.Module``) encodes ``input_batch`` to a spatial ``z_cond``
 embedding, has its parameters registered on the generator optimizer via
 ``opt_g.add_param_group`` (so it actually trains), and the embedding is fed to
 the generator's ``forward`` through its ``cond`` / ``context`` / ``condition``
 kwarg. If cross-modal is enabled but the generator accepts none of those kwargs,
-construction/step **raises** rather than silently dropping the condition
-(pitfall #9). When the block is absent the strategy degrades to a plain
+construction/step **raises** rather than silently dropping the condition.
+When the block is absent the strategy degrades to a plain
 single-modality denoiser and advertises no unread knob.
 
 Conditions the diffusion reverse process on a reference contrast:
@@ -1139,21 +1228,18 @@ or contrasts in 5–10 inner gradient steps.
   set, at ``adaptation_lr``
 - **Outer loop**: meta-gradient on the held-out query set
 
-**Implementation (2026-05-31).** Model-agnostic **second-order MAML** via
-:py:func:`torch.func.functional_call` against the model's *real*
-``forward`` — there is **no** ``adapt_to_domain`` interface (no registered
-model, including ``meta_varnet``, implements one; an earlier fail-loud
-guard requiring it made the paradigm raise against its own model and never
-train). The loop is wrapped in :py:func:`torch.enable_grad` because it
+**Implementation.** Model-agnostic **second-order MAML** via
+:py:func:`torch.func.functional_call` against the model's *real* ``forward``.
+There is **no** ``adapt_to_domain`` interface — no registered model implements
+one. The loop is wrapped in :py:func:`torch.enable_grad` because it
 differentiates *through* the forward pass. Set ``first_order: true`` for
 the cheaper FOMAML. Hyperparameters are scanned across **every** config
-home so the knobs are never a silent no-op (pitfall #15):
-``model.adaptation_config`` (v6 ``AdaptationConfig`` —
-``adaptation_lr`` / ``adaptation_steps``), the legacy ``training.meta``
-block (``first_order``), and ``model.model_kwargs`` (``meta_lr_inner`` /
-``inner_steps``, as used by ``exp_meta_varnet.yaml``).
+home so the knobs are never a silent no-op:
+``model.adaptation_config`` (``AdaptationConfig`` — ``adaptation_lr`` /
+``adaptation_steps``), the ``training.meta`` block (``first_order``), and
+``model.model_kwargs`` (``meta_lr_inner`` / ``inner_steps``).
 
-**Key config (v6):**
+**Key config:**
 
 .. code-block:: yaml
 
@@ -1165,7 +1251,6 @@ block (``first_order``), and ``model.model_kwargs`` (``meta_lr_inner`` /
        adaptation_lr: 0.01
        adaptation_steps: 5
 
-Reference config: ``experiments/training/umr/exp_meta_varnet.yaml``.
 
 
 ConcreteDistillationStrategy
@@ -1526,9 +1611,6 @@ driver that calls them is not distributed, so build the report from the module:
    :members: commutator_interaction_matrix, severity_field
    :no-index:
 
-See ``experiments/inprogress/operator_id/bch_m4raw.yaml`` for a runnable arm
-and :file:`IMPL_MAP_proposal1_bch_operator_id.md` for the full design.
-
 
 AcquisitionHypernetworkStrategy (LCAH)
 ---------------------------------------
@@ -1540,8 +1622,7 @@ AcquisitionHypernetworkStrategy (LCAH)
 **Purpose:** Train :class:`~spectramr.models.encoders.lcah_encoder.LCAHEncoder`, a
 spectral-normalised hypernetwork :math:`h_\psi` that maps the continuous
 acquisition vector :math:`\varphi=(\mathrm{TE},\mathrm{TR},\mathrm{TI},\alpha,B_0)`
-to FiLM modulation for a target :math:`f_\theta` (M3 of the 2026-06-29
-contrast/field-agnostic bundle design).
+to FiLM modulation for a target :math:`f_\theta`.
 
 **What is actually new** is the *certificate*, not the conditioning — HyperMorph
 and neural-CDE acquisition-independent estimators already condition on
@@ -1563,8 +1644,6 @@ acquisition vector, via ``data.acquisition_metadata.enabled`` (per-sample) or
 ``data.multi_contrast.acquisition_params`` (fixed per contrast); Tier-1
 ``acq_vector_present`` **errors** otherwise, because a hypernetwork with no
 conditioning vector trains a constant FiLM while still carrying the claim.
-
-Runnable arm: ``experiments/inprogress/acq_hypernetwork/lcah_recon_multifield.yaml``.
 
 
 DispersionBlochAEStrategy (DL-BAE)
@@ -1591,106 +1670,10 @@ keeping :math:`\partial T_1/\partial B_0 \ge 0`.
 **Config:** ``training.dispersion_bloch_ae``
 (``TrainingConfigDispersionBlochAE``). Identifiability is a hard constraint:
 Tier-1 ``dispersion_identifiability`` **errors** when
-``2*n_pools + 1 > len(fields_present)``, and the model constructor raises on the
+``2*num_pools + 1 > len(fields_present)``, and the model constructor raises on the
 same condition, because an under-determined fit converges to a meaningless
 latent rather than failing visibly.
 
-Runnable arm:
-``experiments/inprogress/dispersion_bloch_ae/dlbae_brain_5field.yaml``.
-
-
----
-
-Audit-2026-05-14 round-2 fixes (strategy-side)
-==============================================
-
-Three classes of regressions in ``BaseTrainingStrategy`` and concrete
-strategies surfaced in the 2026-05-14 smoke run; the round-2 fixes are
-documented here so a future contributor can find the rationale from
-the docs tree without spelunking the ``TODO/audit/`` directory.
-
-Base ``_compute_losses`` kwarg dedup (F3 / E4)
------------------------------------------------
-
-``BaseTrainingStrategy._compute_losses`` forwards ``input_batch``,
-``target_batch`` and ``epoch`` to the strategy-specific
-``_compute_losses_impl`` via explicit kwargs plus a ``**kwargs`` splat.
-When a caller higher up the stack also routes those reserved names
-through ``**kwargs`` (the pattern observed in ``configurable_unet``),
-the inner call raised
-``TypeError: ... got multiple values for argument 'input_batch'``.
-
-The fix pops the three reserved names from ``kwargs`` before
-forwarding. Pinned by
-:py:mod:`tests.unit.strategies.test_base_compute_losses_kwarg_dedup` (3
-tests: source-presence of the pop loop, dedup behaviour via dict
-splat, normal-path regression).
-
-JEPA fail-loud raises (E3)
---------------------------
-
-:py:class:`spectramr.infrastructure.training.strategies.jepa_strategy.JEPAStrategy`
-previously emitted ``{"loss_total": torch.tensor(0.0, device=...)}`` as
-a silent fallback whenever the generator, the batch dict, or
-``_ensure_modules`` was unavailable. The orchestrator then called
-``loss.backward()`` and raised the cryptic ``RuntimeError: element 0
-of tensors does not require grad and does not have a grad_fn``.
-
-CLAUDE.md pitfall #9 forbids silent fallbacks. The fix replaces each
-early return with an explicit ``RuntimeError`` / ``TypeError`` /
-``KeyError`` naming the actual misconfiguration (missing generator,
-non-dict batch, missing ``input`` / ``image`` key). Also adds a
-``**kwargs`` resolution path so the orchestrator's ``input_batch=...``
-call binds correctly into the strategy's ``batch`` parameter. Pinned
-by :py:mod:`tests.unit.strategies.test_jepa_fail_loud` (4 tests).
-
-TTO schema field + dict-coercion (E19)
---------------------------------------
-
-:py:class:`spectramr.infrastructure.training.strategies.tto_strategy.ConcreteTTOStrategy`
-reads ``config.training.tto.lambda_tv`` and ``.lambda_dc``. Before the
-round-2 fix the base
-:py:class:`spectramr.config.schemas.training.base.TrainingStrategyConfigSchema`
-did not declare a ``tto`` attribute, so strategy setup raised
-``AttributeError: 'TrainingStrategyConfigSchema' object has no
-attribute 'tto'``.
-
-The fix declares ``tto: Any = Field(default=None)`` on the base schema
-— typed as ``Any`` deliberately, to avoid a circular import with
-:py:mod:`spectramr.config.schemas.training.tto`. The strategy's ``setup``
-then coerces the raw value (``dict`` / ``None`` / ``TTOConfig``) into
-a strongly-typed ``TTOConfig`` before float access. Pinned by
-:py:mod:`tests.unit.config.test_tto_schema_field` (8 tests).
-
-PINN losses null-guard (E21)
-----------------------------
-
-:py:class:`spectramr.infrastructure.training.strategies.pinn_strategy.ConcretePINNSensitivityStrategy`
-reads ``self.config.losses.pinn.lambda_unit_norm_coil``. The schema
-defines ``losses.pinn: PINNLossesConfig | None`` with
-``default=None`` — a YAML that omits ``losses.pinn`` produced the
-cryptic ``AttributeError: 'NoneType' object has no attribute
-'lambda_unit_norm_coil'``.
-
-The fix adds an explicit ``if self.pinn_losses_cfg is None: raise
-ValueError(...)`` guard whose message names the missing YAML keys
-(``losses.pinn.{lambda_unit_norm_coil, lambda_pde, lambda_magnitude_tv,
-lambda_pinn_dc}``). Pinned by
-:py:mod:`tests.unit.strategies.test_pinn_null_guard` (3 tests).
-
-CycleBlochStrategy missing-discriminator message (E2)
------------------------------------------------------
-
-:py:class:`spectramr.infrastructure.training.strategies.cycle_bloch_strategy.CycleBlochStrategy`
-hard-requires a discriminator. The pre-fix ``raise ValueError("CycleBlochStrategy
-requires a discriminator")`` left users without a concrete YAML pointer.
-The round-2 fix replaces the message with a 6-line explanation that
-names the two YAML-side fixes (declare ``model.discriminator`` OR
-switch to ``CycleConsistencyStrategy``). Source-only change — no test
-needed beyond the source-inspection in the JEPA fail-loud suite, which
-documents the same fail-loud pattern.
-
----
 
 Pipeline Execution Flow
 =======================
@@ -1886,19 +1869,39 @@ list. The strategy raises if no ``ssdu`` / ``multi_mask_ssdu`` loss is wired
    without fully sampled reference data," *MRM* 84(6), 2020.
 
 **Robust SSDU (Noisier2Noise).** The ``robust_ssdu`` key selects the same
-strategy with ``ssdu.noisier2noise_correction = true``. For NOISY sub-sampled
-training data (Millard & Chiew 2024), the network is fed a *noisier* measurement
-:math:`\mathbf{z} = \mathbf{y} + \tilde{\mathbf{n}}`, with
-:math:`\tilde{\mathbf{n}} \sim \mathcal{CN}(0, \sigma^2)` injected on the
-acquired support (``ssdu_strategy.inject_noisier_kspace``), while the held-out
-:math:`\Theta` loss target stays the original (less-noisy) :math:`\mathbf{y}` —
-the Noisier2Noise principle (train noisier → less-noisy). The noise
-:math:`\sigma` is wired via ``ssdu.noise_std_estimate`` (fail-closed: the schema
-validator and the strategy raise if the correction is on without it), and the
-dataset-driven ``ssdu.noise_model`` (``gaussian_kspace`` / ``ncchi_magnitude``)
-is shared with the T1 keystone. **Corner case:** at :math:`\sigma \to 0` the
-injected noise vanishes and Robust SSDU reduces exactly to vanilla SSDU, so the
-repair provably generalizes the base method. The ``robust_ssdu_key_matches_correction``
+strategy with ``ssdu.noisier2noise_correction = true`` (Millard & Chiew,
+arXiv:2210.01696). Plain SSDU under measurement noise fills the missing lines but
+passes the acquired lines' noise through. Robust SSDU corrupts the input again
+before the split,
+
+.. math::
+
+   \tilde{\mathbf{y}} = \mathbf{M}_\Lambda(\mathbf{y} + \tilde{\mathbf{n}}),\qquad
+   \tilde{\mathbf{n}} \sim \mathcal{CN}(0, \alpha^2\sigma^2),
+
+scores the prediction on **all** of :math:`\Omega` with the residual on
+:math:`\Lambda` weighted by :math:`(1+\alpha^2)/\alpha^2`, and at validation feeds
+:math:`\mathbf{y}` and applies the Noisier2Noise correction on the acquired lines,
+
+.. math::
+
+   \hat{\mathbf{y}}_0 = \mathbf{M}_\Omega\,
+     \frac{(1+\alpha^2)\,\mathbf{F}\mathbf{S}\hat{\mathbf{x}} - \mathbf{y}}{\alpha^2}
+     + (\mathbf{I}-\mathbf{M}_\Omega)\,\mathbf{F}\mathbf{S}\hat{\mathbf{x}} .
+
+:math:`\alpha` is ``ssdu.alpha`` (default 0.75); :math:`\sigma` is
+``ssdu.noise_std_estimate`` or, under ``noise_std_source: self_calibrated``, a
+per-batch fit from the coil null space. The correction is derived for
+complex-Gaussian k-space noise, so the schema refuses ``noise_model:
+ncchi_magnitude`` with it on. The estimator and its tests live in
+``strategies/robust_ssdu.py``; the derivation is in
+``experiments/inprogress/self_supervised/PAPER.md``.
+
+The strategy owns the operator: the network is handed :math:`A^H\tilde{\mathbf{y}}`
+(SENSE-combined with the batch's complex coil maps), the model's data consistency
+receives :math:`\tilde{\mathbf{y}}`, :math:`\Lambda` and the maps, and the ``ssdu``
+loss applies :math:`\mathbf{F}\mathbf{S}` itself. Multi-coil SSDU therefore needs the
+``espirit_sensitivity`` transform. The ``robust_ssdu_key_matches_correction``
 audit refuses ``training_mode: robust_ssdu`` with the correction off, and
 ``ssdu_selection_density_range`` warns when ``theta_fraction`` leaves
 ``[0.2, 0.5]``.
@@ -1920,8 +1923,8 @@ group element :math:`T_g` drawn from a brain-appropriate group (dihedral
 
 scored by the registered ``EquivariantSSLReconLoss``. The strategy emits both
 branches via ``context["transformed_recon"]`` (the reference branch
-:math:`T_g f(A^{*}\mathbf{y})`) — without this the loss is an **inert facade**
-(pitfall #16), the state the P1.2 un-trap repaired. A measurement-consistency
+:math:`T_g f(A^{*}\mathbf{y})`) — without this the loss is an **inert facade**.
+A measurement-consistency
 anchor :math:`\lVert A f(A^{*}\mathbf{y}) - \mathbf{y}\rVert^2` (or the nc-χ
 GSURE term of the T1 keystone when ``robust_correction`` is set) prevents the
 trivial :math:`f \equiv \text{const}` solution.
@@ -1938,9 +1941,20 @@ reaching the network — the mechanism-fires guard.
 
 Configure via the ``training.equivariant_imaging`` sub-block (``group``,
 ``alpha_equivariance``, ``n_group_samples``, ``robust_correction``,
-``noise_std_estimate``, ``noise_model``, ``n_coils``). Corner case:
-``alpha_equivariance: 0`` reduces EI to a measurement-consistency
-reconstruction.
+``noise_std_estimate``, ``noise_model``, ``n_coils``, ``multicoil_operator``,
+``measurement_target``). Corner case: ``alpha_equivariance: 0`` reduces EI to a
+measurement-consistency reconstruction.
+
+``multicoil_operator: true`` inverts :math:`A = M F S` with the batch's complex coil
+maps, in training and at validation. ``measurement_target: alternate_repetition``
+(Rep-EI) scores the anchor with the declared ``masked_kspace_l2`` against a second
+repetition on the lines ``loss_mask`` selects, instead of against :math:`\mathbf{y}`;
+a k-space network (``complex_unet``) is supported, its output SENSE-combined before
+the group acts. The measurement :math:`\mathbf{y}` is read from the batch's
+``measured_kspace`` key, which the masking transforms write; the ``kspace`` key is
+the fully sampled reference on both k-space routes. An image network over a k-space
+loader declares ``validation.scoring.output_transform: ifft_target_magnitude`` so
+that only the target is brought to the image domain.
 
 .. automodule:: spectramr.infrastructure.training.strategies.equivariant_imaging_strategy
    :members:
@@ -1949,9 +1963,7 @@ reconstruction.
 
 .. note::
 
-   EI assumes a single (coil-combined) complex forward operator :math:`A = M F`;
-   multi-coil EI (:math:`A = M F S` via ``sense_forward``) is a future
-   extension. References: Chen *et al.*, "Equivariant imaging: Learning beyond
+   References: Chen *et al.*, "Equivariant imaging: Learning beyond
    the range space," *ICCV* 2021; Chen *et al.*, "Robust equivariant imaging,"
    *CVPR* 2022; Tachella *et al.*, sensing theorems, *JMLR* 2023.
 
@@ -2007,8 +2019,7 @@ Strategy Authoring Contract
 
 These four invariants are enforced by the base orchestrator and the DI
 environment. Violating any of them produces a *crash on the first training
-step* or a *silent no-op* — both of which escape import-time smoke checks and
-were the dominant defect class found in the 2026-05-31 strategy audit. New
+step* or a *silent no-op* — both of which escape import-time smoke checks. New
 strategies (and edits to existing ones) must follow them.
 
 1. ``_compute_losses_impl`` signature is keyword-only
@@ -2083,20 +2094,67 @@ multi-element tensor raises *"Boolean value of Tensor … is ambiguous"*
 (``a or b`` semantics are fine only for dict/int operands such as
 ``kwargs.get("batch") or {}``). And do not wrap correctness-critical work
 (normalization, domain/shape guards) in a bare ``except`` that returns a
-default — surface the failure (CLAUDE.md non-negotiable #3, pitfall #10).
+default — surface the failure.
 
-**Concrete fixes (July 2026).** Two strategies violated this and were repaired:
+**Two shapes this takes.**
 
-- ``diff_siren.py`` (``DIFFSirenStrategy``) wrapped its two *distinctive* terms
-  — the cross-contrast LNCC and the SIREN PDE Laplacian — in
-  ``except Exception:`` that zeroed / dropped them, so any shape/NaN/AMP error
-  collapsed the arm to a plain reconstruction while smoke still PASSed. The
-  ``except`` blocks were removed; a genuine failure now raises. It also read the
-  loop iteration from ``kwargs.get("step", 0)`` (a key the loop never sets,
-  freezing step-gated schedules at 0) — now ``resolve_loop_iteration(self)``.
-- ``distillation_strategy.py`` (``ConcreteDistillationStrategy``) caught a
-  teacher-checkpoint load failure and set ``self._teacher = None``, silently
-  training the student as a plain reconstruction even when
-  ``checkpoint.resume_from`` was explicitly configured. It now **raises** on a
-  configured-but-unloadable teacher; the genuinely-optional no-teacher path
-  still returns early (INFO log) before reaching the load.
+- Wrapping a strategy's *distinctive* terms — a cross-contrast LNCC, a SIREN PDE
+  Laplacian — in an ``except Exception:`` that zeroes or drops them. Any
+  shape / NaN / AMP error then collapses the arm to a plain reconstruction while
+  smoke still PASSes. A genuine failure must raise. (Reading the loop iteration
+  from a frozen ``step`` key has the same silent-collapse effect on step-gated
+  schedules — section 5 below owns that rule and enumerates all three spellings.)
+- Catching a teacher-checkpoint load failure and setting ``self._teacher = None``,
+  which trains the student as a plain reconstruction even though
+  ``training.distillation.teacher_checkpoint`` was configured. A configured-but-unloadable teacher
+  must raise; the genuinely-optional no-teacher path returns early, before the
+  load is attempted.
+
+5. Read the loop iteration from ``loop_state``, never from ``env.step``
+-----------------------------------------------------------------------
+
+:class:`~spectramr.infrastructure.training.contexts.TrainingEnvironment` is
+``frozen=True`` and declares **no** ``step`` field, and the training loop passes
+``iteration=`` into every step hook — never ``step=``. So all three of these read a
+constant ``0`` for the whole run:
+
+.. code-block:: python
+
+   getattr(self.env, "step", 0)     # frozen: no such field
+   self.env.step                    # frozen: no such field
+   kwargs.get("step", 0)            # the loop passes `iteration=`, not `step=`
+
+The single owner is
+:func:`~spectramr.infrastructure.training.loop_state.resolve_loop_iteration`, which
+reads the ``LoopState`` the loop writes at every step:
+
+.. code-block:: python
+
+   from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
+
+   iteration = resolve_loop_iteration(self)
+
+Frozen at ``0`` the damage takes two forms. A metric throttle
+(``current_step % train_metric_interval``) fires on **every** batch, because
+``0 % n == 0`` for every ``n``. And a warm-up gate never opens: ``resolve_loss_weight``
+returns ``0.0`` while ``iteration < warmup_iterations`` (default 1000), and the
+computers gate on ``if lambda_x > 0`` — so the term is **absent from** ``components``,
+not scaled to zero, and nothing reports it.
+
+**Concrete fixes (September 2026, issue #1937).** Five holdouts were migrated:
+``vae.py`` (``VQVAETrainingStrategy``), ``disentangled_vae_strategy.py``,
+``slice_to_volume_strategy.py``, ``pinn_strategy.py`` and ``vf_admm_strategy.py``.
+The last was live on five ``vf`` arms, where the shut gate removed ``l1`` — a loss
+those arms never declare, resolved from the ``lambda_l1`` schema default of ``10.0``
+against ``1.0`` each for the only two terms they enable — from every training step.
+
+Two spellings are **not** violations and are left alone:
+``kwargs.get("iteration", kwargs.get("step", 0))`` reaches the real value through the
+first key, and ``int(kwargs.get("iteration", 0) or 0)`` reads what the loop actually
+passes. Note the inverted form ``kwargs.get("step", kwargs.get("iteration", 0))``
+*is* a violation — it resolves to ``0`` before ever consulting ``iteration``.
+
+The corpus guard is ``tests/architecture/test_strategies_read_live_iteration.py``,
+which scans ``infrastructure/training/`` by AST. It must stay AST-based: ten lines
+under ``strategies/`` spell these forms inside *comments* describing the historical
+defect, and a text scan false-positives on all ten.

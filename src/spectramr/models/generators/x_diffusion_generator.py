@@ -6,12 +6,12 @@ Adapted for spectraMR project following SOLID principles.
 """
 
 import logging
-import math
 from typing import Any
 
 import torch
 from torch import nn
 
+from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -29,7 +29,7 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         out_channels (int): Number of output channels
         resolution_2d (Tuple[int, int]): 2D resolution
         resolution_3d (Tuple[int, int, int]): 3D resolution
-        diffusion_steps (int): Number of diffusion steps
+        num_timesteps (int | None): Diffusion horizon T the time code spans
         cross_attention_dim (int): Cross-attention feature dimension
 
     """
@@ -40,7 +40,7 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         out_channels: int = 1,
         resolution_2d: tuple[int, int] = (256, 256),
         resolution_3d: tuple[int, int, int] = (64, 128, 128),
-        diffusion_steps: int = 1000,
+        num_timesteps: int | None = None,
         cross_attention_dim: int = 512,
         conditioning_dim: int = 768,  # For DINOv2 or other conditioning
         num_layers: int = 8,
@@ -55,7 +55,8 @@ class XDiffusionGenerator(IGenerator, nn.Module):
             out_channels: Number of output channels
             resolution_2d: 2D resolution (H, W)
             resolution_3d: 3D resolution (D, H, W)
-            diffusion_steps: Number of diffusion steps
+            num_timesteps: Diffusion horizon T, injected by the builder from
+                ``training.diffusion.timesteps``. Required to embed a nonzero step.
             cross_attention_dim: Cross-attention feature dimension
             conditioning_dim: Dimension of conditioning features
             num_layers: Number of transformer layers
@@ -71,7 +72,7 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         # Explicit type annotations for static type checkers
         self.resolution_2d: tuple[int, int] = resolution_2d
         self.resolution_3d: tuple[int, int, int] = resolution_3d
-        self.diffusion_steps = diffusion_steps
+        self.num_timesteps = num_timesteps
         self.cross_attention_dim = cross_attention_dim
         self.conditioning_dim = conditioning_dim
         self.diffusion_process = diffusion_process
@@ -185,12 +186,19 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         """Returns the model name."""
         return self._name
 
-    def forward(self, x: torch.Tensor, conditioning: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        conditioning: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward pass through X-Diffusion generator.
 
         Args:
             x: Input tensor (2D image or 3D volume)
             conditioning: Optional conditioning features (e.g., DINOv2 embeddings)
+            timesteps: ``[B]`` diffusion steps of ``x``; ``None`` is the clean
+                endpoint ``t = 0``, the one-shot synthesis :meth:`generate` runs.
 
         Returns:
             Generated output in the target modality
@@ -209,14 +217,14 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if x.dim() == 4:  # 2D input -> 3D output
-            output = self._generate_3d_from_2d(x, conditioning)
+            output = self._generate_3d_from_2d(x, conditioning, timesteps)
             expected_shape = self.get_output_shape(x.shape)
             assert output.shape == expected_shape, (
                 f"Output shape {output.shape} != expected {expected_shape}"
             )
             return output
         if x.dim() == 5:  # 3D input -> 2D output
-            output = self._generate_2d_from_3d(x, conditioning)
+            output = self._generate_2d_from_3d(x, conditioning, timesteps)
             expected_shape = self.get_output_shape(x.shape)
             assert output.shape == expected_shape, (
                 f"Output shape {output.shape} != expected {expected_shape}"
@@ -224,28 +232,42 @@ class XDiffusionGenerator(IGenerator, nn.Module):
             return output
         raise ValueError(f"Unsupported input dimension: {x.dim()}")
 
+    def _time_embedding(self, features: torch.Tensor, timesteps: torch.Tensor | None) -> torch.Tensor:
+        """Embed the strategy's steps on the horizon-derived sinusoid (#2440)."""
+        batch = features.shape[0]
+        if timesteps is None:
+            # At t = 0 every phase is zero, so the code is the same on any ladder.
+            code = sinusoidal_timestep_embedding(
+                torch.zeros(batch, device=features.device), features.shape[-1], scale="integer"
+            )
+        else:
+            if timesteps.shape[0] != batch:
+                raise ValueError(
+                    f"XDiffusionGenerator received {timesteps.shape[0]} timesteps "
+                    f"for a batch of {batch}."
+                )
+            if self.num_timesteps is None:
+                raise ValueError(
+                    "XDiffusionGenerator needs num_timesteps to embed a diffusion step; "
+                    "the builder injects training.diffusion.timesteps."
+                )
+            code = sinusoidal_timestep_embedding(
+                timesteps,
+                features.shape[-1],
+                max_timesteps=float(self.num_timesteps),
+                scale="horizon_band",
+            )
+        return self.time_embed(code.to(features.dtype))
+
     def _generate_3d_from_2d(
-        self, x_2d: torch.Tensor, conditioning: torch.Tensor | None = None
+        self,
+        x_2d: torch.Tensor,
+        conditioning: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate 3D volume from 2D image."""
-        # Encode 2D input
         features_2d = self.encoder_2d(x_2d)  # (B, cross_attention_dim)
-
-        # Sinusoidal time embedding (DDPM-style)
-        # Sample random timestep for training, or use t=0 for inference
-        batch_size = x_2d.shape[0]
-        if self.training:
-            t = torch.randint(0, 1000, (batch_size,), device=x_2d.device)
-        else:
-            t = torch.zeros(batch_size, device=x_2d.device, dtype=torch.long)
-
-        # Sinusoidal positional encoding for time
-        half_dim = features_2d.shape[-1] // 2
-        emb_scale = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=x_2d.device) * -emb_scale)
-        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
-        time_emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        time_emb = self.time_embed(time_emb.to(features_2d.dtype))
+        time_emb = self._time_embedding(features_2d, timesteps)
 
         # Prepare conditioning for cross-attention
         cond_features = None
@@ -272,14 +294,14 @@ class XDiffusionGenerator(IGenerator, nn.Module):
         return output_3d
 
     def _generate_2d_from_3d(
-        self, x_3d: torch.Tensor, conditioning: torch.Tensor | None = None
+        self,
+        x_3d: torch.Tensor,
+        conditioning: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate 2D image from 3D volume."""
-        # Encode 3D input
         features_3d = self.encoder_3d(x_3d)  # (B, cross_attention_dim)
-
-        # Add time embedding
-        time_emb = self.time_embed(features_3d)
+        time_emb = self._time_embedding(features_3d, timesteps)
 
         # Prepare conditioning for cross-attention
         cond_features = None

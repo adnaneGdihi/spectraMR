@@ -16,6 +16,10 @@ from torch.utils.data import Dataset
 from spectramr.infrastructure.physics.fft_ops import FFTTransformer
 from spectramr.infrastructure.training.utils.kspace_masks import create_kspace_mask_generator
 
+#: Rungs of the mask ladder a requested acceleration is quantised onto. It is a mask
+#: resolution, not a model's diffusion horizon, and the generator and the mapping must share it.
+MASK_LADDER_STEPS = 1000
+
 
 class MetaLearningDataset(Dataset):
     """Dataset wrapper for meta-learning that samples tasks.
@@ -87,7 +91,7 @@ class MetaLearningDataset(Dataset):
 
         # Initialize physics tools
         self.mask_generator = create_kspace_mask_generator(
-            num_timesteps=1000,
+            num_timesteps=MASK_LADDER_STEPS,
             device=torch.device("cpu"),  # Dataset usually runs on CPU
             default_pattern="linear",
         )
@@ -150,11 +154,10 @@ class MetaLearningDataset(Dataset):
         Assumes LinearKSpaceAccelerator with max_acceleration=64.0.
         """
         max_acc = 64.0
-        num_timesteps = 1000
         # Linear mapping: acc = 1.0 + ratio * (max - 1.0)
         ratio = (acceleration - 1.0) / (max_acc - 1.0)
         ratio = max(0.0, min(1.0, ratio))
-        return int(ratio * (num_timesteps - 1))
+        return int(ratio * (MASK_LADDER_STEPS - 1))
 
     def _fetch_and_process_batch(
         self, indices: list[int], task_params: dict[str, Any]

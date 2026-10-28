@@ -55,6 +55,11 @@ class MultiFieldDataConsistency(nn.Module):
         else:
             if any(w < 0 for w in field_weights):
                 raise ValueError(f"field_weights must be non-negative; got {field_weights!r}.")
+            if sum(field_weights) <= 0:
+                raise ValueError(
+                    f"field_weights must not all be zero; got {field_weights!r}. The "
+                    "weighted mean would read 0 and train nothing."
+                )
             self.register_buffer("field_weights", torch.tensor(field_weights, dtype=torch.float32))
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

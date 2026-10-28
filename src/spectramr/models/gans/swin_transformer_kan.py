@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
@@ -249,14 +250,13 @@ class SimpleWindowAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = (rearrange(t, "b n (h d) -> b h n d", h=h) for t in qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
+        attn_mask = None
         if mask is not None:
-            mask_value = -torch.finfo(dots.dtype).max
-            dots.masked_fill_(~mask.bool(), mask_value)
+            # Additive form keeps the old fully-masked-row behaviour (uniform, not NaN).
+            neg = torch.full((), -torch.finfo(q.dtype).max, dtype=q.dtype, device=q.device)
+            attn_mask = torch.where(mask.bool(), torch.zeros_like(neg), neg)
 
-        attn = dots.softmax(dim=-1)
-        out = torch.matmul(attn, v)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
 

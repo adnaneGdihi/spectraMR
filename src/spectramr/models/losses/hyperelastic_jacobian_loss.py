@@ -31,6 +31,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
 
@@ -109,7 +111,7 @@ class HyperelasticJacobianLoss(nn.Module):
         s = (slice(None), slice(None), slice(1, -1), slice(1, -1), slice(1, -1))
 
         du = []
-        for dim_idx, spatial_dim in enumerate([2, 3, 4]):
+        for spatial_dim in (2, 3, 4):
             sl_fwd = list(s)
             sl_bwd = list(s)
             sl_fwd[spatial_dim] = slice(2, None)
@@ -140,7 +142,7 @@ class HyperelasticJacobianLoss(nn.Module):
         prediction: Tensor,
         target: Tensor | None = None,
         intermediate_outputs: list[Tensor] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Tensor:
         """Compute the hyperelastic Jacobian loss.
 

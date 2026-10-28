@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,10 +31,27 @@ from spectramr.data.builders.eval_dataset_builder import (
     load_per_sample_metrics,
     load_uncertainty_bundle,
 )
+from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.orchestration.campaign_state import (
     CampaignState,
     ExperimentStatus,
 )
+from spectramr.infrastructure.reporting.per_slice import (
+    SlicePass,
+    early_stopping_iteration,
+    find_rows_files,
+    read_pass,
+    run_root,
+    slice_values,
+    subject_means,
+    summarise,
+)
+from spectramr.infrastructure.reporting.per_subject_stats import (
+    PairedSubjects,
+    compare_subjects,
+    pair_on_slices,
+)
+from spectramr.infrastructure.validation.inference_settings import resolve_inference_settings
 
 logger = logging.getLogger(__name__)
 __all__ = [
@@ -57,6 +73,7 @@ class PairwiseResult:
     wilcoxon: dict[str, float] = field(default_factory=dict)
     effect_size: dict[str, Any] = field(default_factory=dict)
     bootstrap_ci: dict[str, float] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def p_value(self) -> float:
@@ -103,6 +120,7 @@ class CampaignReport:
                     "wilcoxon": pr.wilcoxon,
                     "effect_size": pr.effect_size,
                     "bootstrap_ci": pr.bootstrap_ci,
+                    "provenance": pr.provenance,
                 }
                 for pr in self.pairwise_results
             ],
@@ -135,6 +153,10 @@ class CampaignEvaluator:
 
     def __init__(self, eval_config: EvaluationConfigSchema | None = None) -> None:
         self.config = eval_config or EvaluationConfigSchema()
+        # Arms read from per-slice rows, and the column each metric resolved to.
+        self._slice_passes: dict[str, SlicePass] = {}
+        self._row_columns: dict[tuple[str, str], str] = {}
+        self._nonfinite: dict[tuple[str, str], int] = {}
 
     # ── Main entry point ─────────────────────────────────────────
 
@@ -271,30 +293,9 @@ class CampaignEvaluator:
         out_dir.mkdir(parents=True, exist_ok=True)
         npz_path = out_dir / "per_sample_metrics.npz"
 
-        # Loading the checkpoint sits OUTSIDE the try below, deliberately.
-        #
-        # A checkpoint may hold a pickled module (older exports) or, far more
-        # commonly, parameters under a container key. Which key is not this
-        # reader's business: `resolve_state_dict` owns the envelope vocabulary,
-        # so both writers' spellings and the bare-state-dict case are handled in
-        # one place. This site used to try `model_state_dict` then `model` -- a
-        # fourth private vocabulary that missed the `generator` key every GAN
-        # checkpoint is written with, so `campaign evaluate` returned None on
-        # ordinary runs (#1310) and quietly degraded to CSV-only metrics.
-        #
-        # Keeping it outside means a checkpoint that cannot be loaded raises
-        # instead of being folded into the blanket `except Exception -> None`
-        # below, which would make the new strictness cosmetic. It surfaces one
-        # level up, at `_run_inference_all`'s per-experiment handler: the
-        # campaign still evaluates its other arms, but this arm is reported at
-        # ERROR against its own name rather than silently missing from the
-        # leaderboard.
-        payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        direct = payload.get("model") if isinstance(payload, Mapping) else None
-        if isinstance(direct, torch.nn.Module):
-            model = direct
-        else:
-            model = self._reconstruct_model_from_config(config_path, payload, device)
+        # Outside the try below: a checkpoint that cannot be loaded raises against this
+        # arm's name instead of folding into the blanket `except -> None`.
+        model = self._reconstruct_model_from_config(config_path, checkpoint_path, device)
         model = model.to(device).eval()
 
         try:
@@ -356,7 +357,7 @@ class CampaignEvaluator:
     @staticmethod
     def _reconstruct_model_from_config(
         config_path: str,
-        payload: Any,
+        checkpoint_path: str,
         device: torch.device,
     ) -> torch.nn.Module:
         """Rebuild the arm's generator and load the checkpoint into it.
@@ -376,42 +377,35 @@ class CampaignEvaluator:
         that declares something else was silently evaluated at the wrong width.
 
         Args:
-            config_path: Path to the experiment training YAML.
-            payload: Whatever ``torch.load`` returned -- envelope included.
+            config_path: Path to the experiment training YAML; the run's
+                ``resolved_config.json`` beside the checkpoint wins when present.
+            checkpoint_path: The run's checkpoint; its ``generator`` part is loaded.
             device: Target device for the model.
 
         Returns:
             Loaded model in eval mode.
 
         Raises:
-            ValueError: If the checkpoint shares no parameter name with the
-                model the config describes -- previously this loaded nothing
-                and reported success.
+            ZeroOverlapError: If the checkpoint shares no parameter name with the
+                model the config describes (a ``ValueError``).
         """
-        from spectramr.config.settings import TrainingSettings
-        from spectramr.core.module_utils import resolve_state_dict
         from spectramr.infrastructure.training.builders.model_builder import ModelBuilder
 
-        settings = TrainingSettings.from_yaml(config_path)
+        settings, _source = resolve_inference_settings(config_path, checkpoint_path)
         model = ModelBuilder(settings, device).build_generator().validate().build()["generator"]
 
-        # strict=False stays: an EMA shadow or a buffer whose shape moved
-        # between versions should not sink an evaluation. What makes it safe is
-        # that `resolve_state_dict` has already raised if the overlap is empty,
-        # so the "loaded nothing, reported success" facade (pitfalls #9/#16)
-        # cannot happen here any more.
-        state = resolve_state_dict(
-            payload, model.state_dict().keys(), source=f"checkpoint for {config_path}"
-        )
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
+        # overlap, as before: missing or extra names are logged, not fatal; zero shared
+        # names and shape mismatches still raise.
+        report = weights(checkpoint_path, "generator", model, policy="overlap")
+        if report.missing:
             logger.warning(
                 f"Missing keys when loading {settings.model.model_type}: "
-                f"{len(missing)} keys (e.g., {missing[:3]})"
+                f"{len(report.missing)} keys (e.g., {list(report.missing[:3])})"
             )
-        if unexpected:
+        if report.unexpected:
             logger.debug(
-                f"Unexpected keys when loading {settings.model.model_type}: {len(unexpected)} keys"
+                f"Unexpected keys when loading {settings.model.model_type}: "
+                f"{len(report.unexpected)} keys"
             )
 
         model = model.to(device).eval()
@@ -542,11 +536,39 @@ class CampaignEvaluator:
     # ── Metric Loading ───────────────────────────────────────────
 
     def _load_all_metrics(self, state: CampaignState) -> dict[str, dict[str, np.ndarray]]:
+        """Per-sample (NPZ) or per-subject (per-slice rows) values for every arm.
+
+        Raises:
+            ValueError: an arm has only pass rows, or the arms mix NPZ and rows.
+        """
+        self._slice_passes.clear()
+        self._row_columns.clear()
+        self._nonfinite.clear()
         result: dict[str, dict[str, np.ndarray]] = {}
+        pass_rows_only: list[str] = []
         for exp in state.evaluable:
             m = self._load_experiment_metrics(exp)
             if m:
                 result[exp.name] = m
+            elif exp.name in self._slice_passes:
+                continue
+            elif exp.metrics_csv_path and Path(exp.metrics_csv_path).exists():
+                pass_rows_only.append(exp.name)
+        if pass_rows_only:
+            raise ValueError(
+                f"{pass_rows_only} have only validation_metrics.csv, one row per "
+                "validation pass; passes are not samples, so no leaderboard spread or "
+                "paired test can be computed from them (#2478). Enable "
+                "validation.per_batch_rows with validation.loader.batch_size: 1, or "
+                "evaluation.per_sample_inference."
+            )
+        from_rows = {n for n in result if n in self._slice_passes}
+        if from_rows and from_rows != set(result):
+            raise ValueError(
+                f"{sorted(from_rows)} are read from per-slice validation rows and "
+                f"{sorted(set(result) - from_rows)} from per-sample NPZ; the two score "
+                "different sets and cannot be paired (#2478)."
+            )
         logger.info(f"Loaded metrics for {len(result)} experiments")
         return result
 
@@ -640,41 +662,40 @@ class CampaignEvaluator:
             except Exception as e:
                 logger.warning(f"Failed to load NPZ {exp.per_sample_metrics_path}: {e}")
 
-        # Priority 2: validation CSV
-        if exp.metrics_csv_path:
-            p = Path(exp.metrics_csv_path)
-            if p.exists():
-                try:
-                    df = pd.read_csv(p)
-                    columns = [str(c) for c in df.columns]
-                    for mn in self.config.metrics:
-                        col, reason = self._resolve_metric_column(columns, mn)
-                        if col is None:
-                            # Loud, not silent: an omitted metric must be
-                            # explicable from the log, because downstream every
-                            # missing metric is simply an absent leaderboard row.
-                            logger.warning(
-                                "Campaign metric %r not loaded from %s -- %s",
-                                mn,
-                                p,
-                                reason,
-                            )
-                            continue
-                        logger.debug("Campaign metric %r -> column %r (%s)", mn, col, reason)
-                        vals = pd.to_numeric(df[col], errors="coerce").dropna()
-                        if len(vals) > 0:
-                            metrics[mn] = vals.to_numpy()
-                        else:
-                            logger.warning(
-                                "Campaign metric %r resolved to column %r in %s but "
-                                "it holds no numeric values.",
-                                mn,
-                                col,
-                                p,
-                            )
-                except Exception as e:
-                    logger.warning(f"Failed to load CSV {p}: {e}")
+        # Priority 2: per-slice validation rows, reduced to subjects. The
+        # one-row-per-pass validation CSV is never a sample (#2478).
+        rows = self._slice_pass(exp)
+        if rows is None:
+            return metrics
+        self._slice_passes[exp.name] = rows
+        for mn in self.config.metrics:
+            col, reason = self._resolve_metric_column(rows.metric_columns, mn)
+            if col is None:
+                logger.warning(
+                    "Campaign metric %r not loaded from %s -- %s", mn, rows.files[0], reason
+                )
+                continue
+            values, dropped = slice_values(rows, col)
+            if dropped:
+                logger.warning(
+                    "%s: %d non-finite %r slice values dropped", exp.name, dropped, col
+                )
+            self._row_columns[(exp.name, mn)] = col
+            self._nonfinite[(exp.name, mn)] = dropped
+            metrics[mn] = subject_means(values)
         return metrics
+
+    @staticmethod
+    def _slice_pass(exp: ExperimentStatus) -> SlicePass | None:
+        """The arm's per-slice rows at its early-stopping pass, if it wrote any."""
+        files = [Path(p) for p in exp.slice_rows_paths if Path(p).is_file()]
+        if not files and exp.output_dir:
+            files = find_rows_files(exp.output_dir)
+        if not files and exp.metrics_csv_path:
+            files = find_rows_files(Path(exp.metrics_csv_path).parent)
+        if not files:
+            return None
+        return read_pass(files, early_stopping_iteration(run_root(files[0])))
 
     # ── Leaderboard ──────────────────────────────────────────────
 
@@ -682,16 +703,20 @@ class CampaignEvaluator:
         rows = []
         for exp_name, metrics in all_metrics.items():
             for mn, vals in metrics.items():
-                rows.append(
-                    {
-                        "experiment": exp_name,
-                        "metric": mn,
+                if exp_name in self._slice_passes:
+                    col = self._row_columns[(exp_name, mn)]
+                    stats = summarise(vals, col)
+                    stats["iteration"] = self._slice_passes[exp_name].iteration
+                    stats["nonfinite_dropped"] = self._nonfinite[(exp_name, mn)]
+                else:
+                    stats = {
                         "mean": float(np.mean(vals)),
                         "std": float(np.std(vals)),
                         "median": float(np.median(vals)),
                         "n": len(vals),
+                        "unit": "samples",
                     }
-                )
+                rows.append({"experiment": exp_name, "metric": mn, **stats})
         df = pd.DataFrame(rows)
         if df.empty:
             return df
@@ -734,6 +759,8 @@ class CampaignEvaluator:
         metric: str,
     ) -> PairwiseResult:
         r = PairwiseResult(experiment_a=a, experiment_b=b, metric=metric)
+        if a in self._slice_passes and b in self._slice_passes:
+            return self._compare_rows(r)
         n = min(len(va), len(vb))
         if n < 2:
             return r
@@ -759,6 +786,37 @@ class CampaignEvaluator:
             )
         except Exception as e:
             logger.debug(f"Bootstrap CI failed ({a} vs {b}): {e}")
+        return r
+
+    def _pair_rows(self, a: str, b: str, metric: str) -> PairedSubjects | None:
+        """Two row-sourced arms joined on slice identity; ``None`` if a column is missing."""
+        col_a = self._row_columns.get((a, metric))
+        col_b = self._row_columns.get((b, metric))
+        if col_a is None or col_b is None:
+            return None
+        return pair_on_slices(self._slice_passes[a], self._slice_passes[b], col_a, col_b)
+
+    def _compare_rows(self, r: PairwiseResult) -> PairwiseResult:
+        paired = self._pair_rows(r.experiment_a, r.experiment_b, r.metric)
+        if paired is None:
+            return r
+        r.provenance = paired.describe()
+        if paired.n_subjects < 2:
+            logger.warning(
+                "%s vs %s on %s: %d subject(s) scored by both; no paired test",
+                r.experiment_a,
+                r.experiment_b,
+                r.metric,
+                paired.n_subjects,
+            )
+            return r
+        tests = compare_subjects(
+            paired, n_bootstrap=self.config.n_bootstrap, confidence=self.config.confidence
+        )
+        r.paired_ttest = tests["paired_ttest"]
+        r.wilcoxon = tests["wilcoxon"]
+        r.effect_size = tests["effect_size"]
+        r.bootstrap_ci = tests["bootstrap_ci"]
         return r
 
     # ── Correction ───────────────────────────────────────────────
@@ -802,6 +860,11 @@ class CampaignEvaluator:
                 vj = all_m[names[j]].get(metric)
                 if vi is None or vj is None:
                     continue
+                if names[i] in self._slice_passes:
+                    paired = self._pair_rows(names[i], names[j], metric)
+                    if paired is None:
+                        continue
+                    vi, vj = paired.table["a"].to_numpy(), paired.table["b"].to_numpy()
                 k = min(len(vi), len(vj))
                 if k < 2:
                     continue

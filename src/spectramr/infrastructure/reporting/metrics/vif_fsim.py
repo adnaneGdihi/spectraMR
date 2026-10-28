@@ -8,25 +8,54 @@ FSIM — L. Zhang *et al.*, "FSIM: A feature similarity index for image
 quality assessment," IEEE TIP, 20(8), 2011. Top performer on motion /
 noise / undersampling MRI.
 
-Both implementations are pixel-space approximations: the full GSM /
-phase-congruency formulations are ~200 lines apiece, so we use the
-canonical `sewar` library when available and fall back to compact
-NumPy approximations otherwise. Higher is better for both.
+VIF comes from ``sewar.vifp`` and FSIM from ``piq.fsim`` (both in the ``iqa``
+extra). No released ``sewar`` has an ``fsim``; calling it raised on every
+input (#2499). Without the package, each metric falls back to a compact NumPy
+approximation and logs that it did. Higher is better for both.
 """
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+import torch
 from scipy import ndimage, signal
 
+logger = logging.getLogger(__name__)
 
-def _try_sewar() -> object | None:
-    try:
-        import sewar  # type: ignore
 
-        return sewar
-    except Exception:
-        return None
+# One import per package (non-negotiable 18): VIF and FSIM come from different
+# libraries, and one missing must not disable the other.
+try:
+    import sewar  # type: ignore
+
+    HAVE_SEWAR = True
+except ImportError:
+    HAVE_SEWAR = False
+try:
+    import piq  # type: ignore
+
+    HAVE_PIQ = True
+except ImportError:
+    HAVE_PIQ = False
+
+_warned: set[str] = set()
+
+
+def _as_image_tensor(image: np.ndarray, span: float) -> torch.Tensor:
+    """``(1, 1, H, W)`` float tensor clipped to ``[0, span]``, the range piq requires."""
+    return torch.from_numpy(np.clip(np.asarray(image, dtype=np.float32), 0.0, span))[None, None]
+
+
+def _warn_once(package: str, metric: str) -> None:
+    if package not in _warned:
+        _warned.add(package)
+        logger.warning(
+            "%s is not installed; %s uses the NumPy approximation (pip install '.[iqa]')",
+            package,
+            metric,
+        )
 
 
 def visual_information_fidelity(
@@ -35,9 +64,9 @@ def visual_information_fidelity(
     """VIF (Sheikh & Bovik 2006). Range typically [0, 1]; higher = better."""
     if pred.shape != target.shape:
         raise ValueError(f"shape mismatch {pred.shape} vs {target.shape}")
-    sewar = _try_sewar()
-    if sewar is not None:
-        return float(sewar.vifp(target, pred))  # type: ignore[attr-defined]
+    if HAVE_SEWAR:
+        return float(sewar.vifp(target, pred))
+    _warn_once("sewar", "VIF")
 
     # Pyramid-free approximation: per-block GSM information ratio.
     p = pred.astype(np.float64) / max(data_range, 1e-12)
@@ -90,9 +119,19 @@ def feature_similarity_index(
     """FSIM (Zhang et al. 2011). Higher is better."""
     if pred.shape != target.shape:
         raise ValueError(f"shape mismatch {pred.shape} vs {target.shape}")
-    sewar = _try_sewar()
-    if sewar is not None:
-        return float(sewar.fsim(target, pred))  # type: ignore[attr-defined]
+    if HAVE_PIQ:
+        # piq expects [0, data_range]; magnitude images already are, and a value
+        # outside it is clipped rather than letting the library raise mid-report.
+        lo = min(float(np.min(pred)), float(np.min(target)), 0.0)
+        hi = max(float(np.max(pred)), float(np.max(target)), float(data_range))
+        span = max(hi - lo, 1e-12)
+        # piq needs [0, data_range]; a joint shift keeps a negative (z-scored)
+        # image's differences instead of clipping them to zero.
+        p_t, t_t = (
+            _as_image_tensor(np.asarray(a, dtype=np.float32) - lo, span) for a in (pred, target)
+        )
+        return float(piq.fsim(p_t, t_t, data_range=span, chromatic=False))
+    _warn_once("piq", "FSIM")
 
     p = pred.astype(np.float64) / max(data_range, 1e-12) * 255.0
     t = target.astype(np.float64) / max(data_range, 1e-12) * 255.0

@@ -1,0 +1,22 @@
+{
+  "checkpoint_step_4.pth": {
+    "epoch": 1,
+    "step": 4,
+    "timestamp": "2026-10-10T15:39:05.222703",
+    "loss": 0.25,
+    "metric_name": "val_psnr",
+    "metric_value": 21.5,
+    "is_best": false,
+    "is_last": false
+  },
+  "checkpoint_best.pth": {
+    "epoch": 1,
+    "step": 4,
+    "timestamp": "2026-10-10T15:39:05.224077",
+    "loss": 0.25,
+    "metric_name": "val_psnr",
+    "metric_value": 21.5,
+    "is_best": true,
+    "is_last": false
+  }
+}

@@ -1,8 +1,7 @@
 """Regression: previously-unregistered training modes are now in the allow-list.
 
 The `privileged_learning`/`privileged` and `multi` strategies were dispatchable
-via an explicit ``strategy_class`` but absent from ``VALID_TRAINING_MODES`` /
-``TRAINING_MODE_CONSTRAINTS``, so an experiment selecting them by
+via an explicit ``strategy_class`` but absent from ``VALID_TRAINING_MODES``, so an experiment selecting them by
 ``training_mode`` would fail the audit. 2026-05-31: registered them so their
 experiments can be audit-clean.
 """
@@ -11,7 +10,6 @@ from __future__ import annotations
 
 from spectramr.config.validation_constants import (
     CONTRAST_THREADED_STRATEGIES,
-    TRAINING_MODE_CONSTRAINTS,
     VALID_TRAINING_MODES,
 )
 
@@ -45,39 +43,16 @@ def test_contrast_threaded_strategies_is_the_ssot_set() -> None:
 def test_privileged_and_multi_modes_registered():
     for mode in ("privileged_learning", "privileged", "multi"):
         assert mode in VALID_TRAINING_MODES, f"{mode} missing from VALID_TRAINING_MODES"
-        assert mode in TRAINING_MODE_CONSTRAINTS, f"{mode} missing from constraints"
-        # Each constraint entry must declare the three contract keys.
-        c = TRAINING_MODE_CONSTRAINTS[mode]
-        assert "required_objectives" in c
-        assert "optional_objectives" in c
-        assert "requires_discriminator" in c
 
 
-def test_generative_mode_in_constraints():
-    """Regression WS1-core-01: ``generative`` is a valid mode AND must have a
-    constraints entry, else ``_validate_training_mode_compatibility`` raises a
-    false 'Unknown training mode' error for the normalizing-flow arms (glow,
-    equivariant_flow) that use ``training_mode: generative``.
-    """
+def test_generative_mode_is_valid():
+    """Regression WS1-core-01: the normalizing-flow arms (glow, equivariant_flow)
+    use ``training_mode: generative``."""
     assert "generative" in VALID_TRAINING_MODES
-    assert "generative" in TRAINING_MODE_CONSTRAINTS
-    c = TRAINING_MODE_CONSTRAINTS["generative"]
-    assert "required_objectives" in c
-    assert "optional_objectives" in c
-    assert "requires_discriminator" in c
-    # Density models do not use a discriminator.
-    assert c["requires_discriminator"] is False
 
 
 def test_multi_acquisition_mode_registered() -> None:
-    from spectramr.config.validation_constants import (
-        TRAINING_MODE_CONSTRAINTS,
-        VALID_TRAINING_MODES,
-    )
-
     assert "multi_acquisition" in VALID_TRAINING_MODES
-    assert "multi_acquisition" in TRAINING_MODE_CONSTRAINTS
-    assert TRAINING_MODE_CONSTRAINTS["multi_acquisition"]["requires_discriminator"] is False
 
 
 def test_orphan_training_modes_are_gone() -> None:
@@ -95,7 +70,6 @@ def test_orphan_training_modes_are_gone() -> None:
 
     for mode in ("kan", "pretraining", "sensitivity_estimation"):
         assert mode not in VALID_TRAINING_MODES
-        assert mode not in TRAINING_MODE_CONSTRAINTS
         assert mode not in TrainingStrategyFactory.STRATEGY_CLASS_PATHS
 
 

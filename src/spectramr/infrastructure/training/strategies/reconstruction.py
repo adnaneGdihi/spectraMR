@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.config.schemas.enums import Regime, Task
+from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.physics.pinn import PINNModule
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategy_helpers import (
@@ -22,13 +23,17 @@ from spectramr.models.capabilities import StrategyCapabilities
 from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
 
 from ..utils.training_utils import clamp_to_range
+from .equivariant_imaging_ops import aligned_validation_context
 from .loss_folding import (
     declared_inline_losses,
     declared_loss_weights,
     fold_builder_image_losses,
     inline_managed_with,
 )
+from .mixins.reconstruction import AUX_KEY_MAPPING, _as_aux_mapping
 from .mixins.utils import _callable_accepts_kwarg, pick_present
+from .tall_locality import add_tall_locality, arm_tall_locality, tall_locality_term
+from .validation_chunking import forward_in_chunks, reconstruction_output
 
 if TYPE_CHECKING:
     pass
@@ -41,101 +46,34 @@ from .mixins.model_validation import ModelValidationMixin
 from .mixins.reconstruction import ReconstructionMixin
 
 
-class ReconstructionTrainingStrategy(
-    ModelValidationMixin, ReconstructionMixin, BaseTrainingStrategy
-):
-    """Reconstruction training strategy for supervised MRI image reconstruction.
+class ReconstructionStepMixin:
+    """The supervised reconstruction step, shared by every strategy that trains on an
+    ``(input, target)`` pair through the generator.
 
-    This strategy implements pure reconstruction-only training without adversarial
-    components. It supports multiple loss functions (L1, L2, SSIM, perceptual) and
-    optional physics-informed neural network (PINN) constraints for k-space consistency.
-
-    Multislice Support:
-    - Uses explicit `data.multislice_enabled` config flag to avoid ambiguous shape heuristics
-    - Automatically reshapes multi-slice data from (B, num_slices*2, H, W) to (B*num_slices, 2, H, W)
-    - Handles auxiliary tensors (k-space, masks, sensitivities) consistently with slice reshaping
-
-    Typical use cases:
-    - Baseline reconstruction models (U-Net, Vision Mamba, Swin Transformer)
-    - Transfer learning initialization before adversarial fine-tuning
-    - Fast convergence when paired data is available
-    - Physics-driven reconstruction with data consistency layers
-
-    Loss Components:
-    - **L1**: Mean absolute error (MAE) reconstruction loss
-    - **L2**: Mean squared error (MSE) reconstruction loss
-    - **SSIM**: Structural similarity index for perceptual quality
-    - **Perceptual**: VGG/LPIPS-based perceptual loss
-    - **K-space**: Frequency domain reconstruction fidelity
-    - **PINN**: Physics-informed constraints (optional)
-
-    Attributes:
-        loss_computer: Unified loss computation module handling all reconstruction losses.
-        fft_transformer: FFT/IFFT utilities for k-space operations.
-        config: Training configuration (read-only).
-        device: PyTorch device (CPU or CUDA).
-
-    Config Requirements:
-        ```yaml
-        training:
-          training_mode: reconstruction
-        objectives:
-          reconstruction:
-            lambda_l1: 1.0          # L1 loss weight
-            lambda_l2: 0.0          # L2 loss weight (optional)
-            lambda_ssim: 0.1        # SSIM loss weight (optional)
-            lambda_perceptual: 0.01 # Perceptual loss weight (optional)
-        ```
-
-    Raises:
-        ValueError: If training_mode is not 'reconstruction'.
-        AttributeError: If required config sections are missing.
-
-    Example:
-        >>> from spectramr.infrastructure.training.strategies.reconstruction import ReconstructionTrainingStrategy
-        >>> from spectramr.infrastructure.training.contexts import TrainingEnvironment
-        >>>
-        >>> env = TrainingEnvironment(config=TrainingSettings.from_yaml('config.yaml'))
-        >>> strategy = ReconstructionTrainingStrategy(env=env)
-        >>>
-        >>> # Training step
-        >>> losses = strategy.train_step(batch, epoch=0, step=100)
-        >>> print(losses['g_total_loss'].item())  # Total weighted loss
-        >>> print(losses['loss_l1'].item())       # L1 component
-
-    Note:
-        This strategy does NOT include:
-        - Adversarial losses (use GANTrainingStrategy)
-        - VAE KL divergence (use VAETrainingStrategy)
-        - Diffusion denoising (use DiffusionTrainingStrategy)
+    Holds the forward path (batch context, k-space bridge, depth fold, coil maps), the
+    loss computation and the validation seams. Base-less, so a strategy composes it at
+    the same inheritance depth as :class:`ReconstructionTrainingStrategy`; policy
+    attributes (``capabilities``, ``parallel_compat``, loss ownership) belong to each
+    concrete strategy; the mixin's own ``parallel_compat`` records what its calls were
+    audited for.
     """
 
-    # Domain axes this paradigm can populate from the batch (via data.expose_*).
-    # Widens ConditioningMixin's empty default so model.conditioning passes the
-    # Tier-1 conditioning_sources_supported audit on recon arms. severity_vec is
-    # deliberately excluded — it is a virtual-fiducial-only quantity.
-    _SUPPORTED_CONDITION_SOURCES = (
-        "field_strength",
-        "scanner_id",
-        "site_id",
-        "contrast_id",
-    )
+    # Its forward path calls _apply_input_conditioning, so the conditioner is built here.
+    consumes_input_conditioning = True
 
-    #: Loss ownership (mrixfields review 2026-09-03). The base reconstruction path
-    #: computes every declared ``losses.image_losses`` entry through the builder:
-    #: nothing inline, everything folded. A subclass that overrides
-    #: ``_compute_losses_impl`` re-declares both, and ``test_loss_ownership`` pins
-    #: ``folds_image_losses`` against the source (a call to
-    #: ``super()._compute_losses_impl`` or ``_apply_builder_image_losses``).
-    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
-    folds_image_losses: ClassVar[bool | None] = True
+    # parallel_compat: the backends the step's own generator calls
+    # (forward_with_intermediates) were audited for; each strategy still declares its permission.
+    parallel_compat = frozenset({"replicated", "sharded"})
 
-    #: Workflow tags: structural MRI reconstruction. This is what backs the
-    #: ``mri_structural`` regime's LIVE claim in the maturity ledger.
-    capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
-        workflows=frozenset({Regime.STRUCTURAL}),
-        tasks=frozenset({Task.RECONSTRUCTION}),
-    )
+    #: The k-space -> image bridge decision, resolved on first use and cached:
+    #: `needs_kspace_to_image_bridge` reads the registry and the config, neither of
+    #: which moves inside a run. Declared on the CLASS, not in `__init__`, because
+    #: derived strategies and the validation harnesses build instances that never
+    #: run it -- an `__init__`-only attribute turns every such path into an
+    #: AttributeError on the forward seam.
+    _kspace_bridge: bool | None = None
+    _kspace_bridge_checked: bool = False
+    _model_accepts_complex: bool | None = None
 
     def __init__(
         self,
@@ -222,6 +160,14 @@ class ReconstructionTrainingStrategy(
 
         self._setup_strategy_specific_components()
 
+    def declared_metric_keys(self) -> frozenset[str]:
+        """``nig_epistemic_var``, which every evidential_unet step stamps (#1682)."""
+        parent = getattr(super(), "declared_metric_keys", None)
+        keys = set(parent() if callable(parent) else ())
+        if self.config.model.model_type == "evidential_unet":
+            keys.add("nig_epistemic_var")
+        return frozenset(keys)
+
     def _setup_strategy_specific_components(self) -> None:
         """Initialize reconstruction-specific components and perform
         validation."""
@@ -229,8 +175,25 @@ class ReconstructionTrainingStrategy(
         self._verify_strategy_config(
             expected_modes=("reconstruction", "mae_pretraining", "volumetric")
         )
+        self._refuse_inert_diffusion_knobs()
         if self.logging_service:
             self._log_config_features(self.logging_service)
+
+    def _refuse_inert_diffusion_knobs(self) -> None:
+        """Refuse diffusion-only knobs that this strategy never reads."""
+        training = getattr(self.config, "training", None)
+        if training is None:
+            return
+        inert = []
+        if "diffusion" in training.model_fields_set:
+            inert.append("training.diffusion")
+        if "num_timesteps" in (training.model_extra or {}):
+            inert.append("training.num_timesteps")
+        if inert:
+            raise ValueError(
+                f"{', '.join(inert)} is set but ReconstructionTrainingStrategy never reads it; "
+                "remove it or route the arm to a diffusion strategy."
+            )
 
     # _is_implicit_model and _generate_coordinate_grid handled by ReconstructionMixin
 
@@ -264,10 +227,17 @@ class ReconstructionTrainingStrategy(
         # Prepare input tensors and forward kwargs (CC=4)
         lr_image, forward_kwargs = self._prepare_generator_inputs(batch_context, input_batch)
 
+        # TALL locality weight (0.0 unless model_type is tall_sr; validated at config load).
+        tall_cfg = self.config.training.tall_sr
+        locality_weight = tall_cfg.lambda_locality if tall_cfg is not None else 0.0
+        arm_tall_locality(cast(nn.Module, self.env.generator), locality_weight)
+
         # Generate predictions with intermediates (CC=3)
         hr_fakes, intermediate_outputs = self._generate_predictions(
             lr_image, forward_kwargs, batch_context
         )
+        # Read the TALL traversal now: any later generator call overwrites it.
+        locality = tall_locality_term(cast(nn.Module, self.env.generator), locality_weight)
 
         # Apply physics constraints and compute specialized losses (CC=5)
 
@@ -305,13 +275,15 @@ class ReconstructionTrainingStrategy(
 
         target = batch_context["hr"]
 
-        # Evidential UNets output 4 parameters (mean, var, alpha, beta)
-        # We only want to compute structural losses (L1, Perceptual) on the predicted mean
+        # Evidential UNets output 4 parameters (gamma, nu, alpha, beta). Structural
+        # losses see the mean (gamma); the full NIG tensor rides as ``nig_params``.
+        nig_params = None
         if (
             self.config.model.model_type == "evidential_unet"
             and hr_fakes.shape[1] > target.shape[1]
         ):
             eval_fakes = hr_fakes[:, : target.shape[1]]
+            nig_params = hr_fakes
         else:
             eval_fakes = hr_fakes
 
@@ -326,6 +298,19 @@ class ReconstructionTrainingStrategy(
         # Dynamic loss-schedule overrides are published to ``self.loss_computer``
         # by the paradigm-agnostic ``BaseTrainingStrategy.sync_scheduled_loss_weights``
         # (called by the training loop each step) -- no per-strategy copy needed.
+        # Coil maps travel as a loss kwarg, not just a model one. `_call_safe_loss`
+        # filters by signature, so a declared term that needs the coil geometry
+        # (`coil_subspace_residual`) receives it and every other term is untouched.
+        # Without this the term is built, invoked as `(pred, target)`, and raises --
+        # the maps reach `_prepare_generator_inputs` and stop there.
+        loss_context: dict[str, Any] = {}
+        if batch_context.get("coil_sensitivities") is not None:
+            loss_context["coil_sensitivities"] = batch_context["coil_sensitivities"]
+        if batch_context.get("loss_mask") is not None:
+            loss_context["loss_mask"] = batch_context["loss_mask"]
+        if nig_params is not None:
+            loss_context["nig_params"] = nig_params
+
         loss_output = self.loss_computer.compute(
             pred=eval_fakes,
             target=target,
@@ -334,6 +319,7 @@ class ReconstructionTrainingStrategy(
             losses_dict=env_losses,
             pinn_loss=pinn_loss,
             intermediate_outputs=intermediate_outputs,
+            **loss_context,
         )
 
         total_loss = loss_output.total
@@ -343,8 +329,15 @@ class ReconstructionTrainingStrategy(
         self._loss_dict_reuse.clear()
         if total_loss is None:
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        total_loss = add_tall_locality(total_loss, self._loss_dict_reuse, locality)
         self._loss_dict_reuse["g_total_loss"] = total_loss
         self._loss_dict_reuse.update(components)
+        if nig_params is not None:
+            # Epistemic variance beta / (nu (alpha - 1)), on device and detached.
+            nu, alpha, beta = nig_params[:, 1:2], nig_params[:, 2:3], nig_params[:, 3:4]
+            self._loss_dict_reuse["nig_epistemic_var"] = (
+                (beta / (nu * (alpha - 1.0)).clamp(min=1e-6)).mean().detach()
+            )
 
         # Ensure 'loss' exists (alias for g_total_loss)
         if "loss" not in self._loss_dict_reuse:
@@ -359,6 +352,7 @@ class ReconstructionTrainingStrategy(
             target=target_batch,
             config=self.config,
             current_step=iteration,
+            batch_data=kwargs.get("batch"),
         )
         # Convert metrics to tensor for consistent return type
         for k, v in train_metrics.items():
@@ -445,8 +439,8 @@ class ReconstructionTrainingStrategy(
             )
         return float(weight)
 
-    # _prepare_batch_context and _prepare_generator_inputs handled by ReconstructionMixin
-    # We define alias methods to satisfy internal calls or override Base hooks if needed
+    # The batch context is assembled by ReconstructionMixin; generator input
+    # preparation is owned here (``_prepare_generator_inputs``), not by the mixin.
 
     def _prepare_batch_context(
         self,
@@ -454,8 +448,134 @@ class ReconstructionTrainingStrategy(
         target_batch: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Delegate to ReconstructionMixin."""
-        return self._prepare_batch_context_reconstruction(input_batch, target_batch, **kwargs)
+        """Delegate to ReconstructionMixin, then lift the loss-only keys it does not map.
+
+        ``loss_mask`` (the CoNEX second-repetition lines, emitted by
+        ``complementary_rep_masking``) is read by a loss and never by the model,
+        so it is carried here rather than in the mixin's model-kwarg table.
+        """
+        context = self._prepare_batch_context_reconstruction(input_batch, target_batch, **kwargs)
+        raw = _as_aux_mapping(kwargs.get("batch", {}))
+        loss_mask = raw.get("loss_mask") if isinstance(raw, dict) else None
+        if isinstance(loss_mask, dict):
+            loss_mask = loss_mask.get("data")
+        if isinstance(loss_mask, torch.Tensor):
+            context["loss_mask"] = loss_mask.to(input_batch.device, non_blocking=True)
+        return context
+
+    def validation_batch_context(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        batch_data: Any,
+    ) -> dict[str, Any] | None:
+        """The context ``_validation_forward`` runs on, or ``None`` for the bare default.
+
+        ``validation_step`` and the loop's image capture both call this, so the
+        rendered prediction is the one the metrics graded (#2431).
+        """
+        if not self.validates_on_batch_context or batch_data is None:
+            return None
+        return aligned_validation_context(
+            self._prepare_batch_context(input_batch, target_batch, batch=batch_data),
+            input_batch,
+        )
+
+    def _needs_kspace_adjoint(self, batch_context: dict[str, Any]) -> bool:
+        r"""Must this batch be ``ifft2c``'d before the network sees it?
+
+        The adjoint :math:`A^H` and data consistency are two different questions,
+        and until #2233 they shared one answer: the ``ifft2c`` below ran ``if
+        use_dc``, and ``use_dc`` is ``dc_layer is not None``. A plain U-Net owns
+        no DC module, so ``initialize_data_consistency`` cleared the flag — with
+        a warning, not a raise — and took the domain bridge down with it. The
+        network was then handed raw k-space while the loss, the metrics and the
+        previewer all read its output as an image, which renders as the DC-spike
+        blob (``ei_unet_m4raw_r4``, cluster run 2026-09-20).
+
+        A strategy that has already applied the adjoint itself — the multi-coil
+        EI operator's :meth:`MulticoilEIOperator.prepare` — says so by stamping
+        ``kspace_adjoint_applied``, because clearing ``use_dc`` no longer
+        suppresses the bridge on its own.
+        """
+        if batch_context.get("kspace_adjoint_applied"):
+            return False
+        if self._kspace_bridge is None:
+            from spectramr.infrastructure.training.utils.domain_inference import (
+                needs_kspace_to_image_bridge,
+            )
+
+            self._kspace_bridge = needs_kspace_to_image_bridge(self.config)
+            if self._kspace_bridge:
+                logger.info(
+                    "[DomainBridge] %s consumes the image domain over a k-space "
+                    "loader: applying ifft2c to the model input (A^H y).",
+                    self.config.model.model_type,
+                )
+        return self._kspace_bridge
+
+    def _match_declared_input_layout(self, image: torch.Tensor) -> torch.Tensor:
+        """Hand the network the complex layout it registered for.
+
+        ``ifft2c`` always returns complex, and a real-valued backbone cannot
+        consume that — ``standard_unet`` declares ``accepts_complex=False`` and
+        ``in_channels: 2``, i.e. one coil as ``(real, imag)``. Interleaved per
+        coil rather than ``cat([real, imag])``: the two differ from two coils up.
+
+        Reuses ``attention_domains.complex_to_interleaved`` rather than adding a
+        second one (non-negotiable 17). That function's contract is 4-D; on 5-D
+        it interleaves a different axis than a volumetric caller would want, so
+        the rank is checked here instead of assumed.
+        """
+        if not torch.is_complex(image):
+            return image
+        if self._model_accepts_complex is None:
+            from spectramr.models.registry import get_model_capabilities
+
+            caps = get_model_capabilities(str(self.config.model.model_type))
+            self._model_accepts_complex = bool(getattr(caps, "accepts_complex", False) or False)
+        if self._model_accepts_complex:
+            return image
+        if image.ndim != 4:
+            raise ValueError(
+                "[DomainBridge] the k-space adjoint returned a "
+                f"{image.ndim}-D tensor; complex_to_interleaved's contract is "
+                "[B, C, H, W]. A volumetric arm needs its own layout step rather "
+                "than this one applied to the wrong axis."
+            )
+        from spectramr.models.blocks.attention_domains import complex_to_interleaved
+
+        return complex_to_interleaved(image)
+
+    def _verify_kspace_bridge_once(self, kspace: torch.Tensor) -> None:
+        """Confirm the declared bridge against the first batch, then never again.
+
+        ``looks_like_kspace`` needs a host sync, which is forbidden in the loop
+        (non-negotiable 9) — so this runs on **one** batch and caches. It raises
+        rather than vetoing: a config that declares a k-space loader while the
+        loader serves images would otherwise train on a silently IFFT'd image
+        and report success (pitfall #9).
+        """
+        if self._kspace_bridge_checked:
+            return
+        self._kspace_bridge_checked = True
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            looks_like_kspace,
+        )
+
+        probe = kspace.detach()
+        if looks_like_kspace(probe.abs()):
+            return
+        raise ValueError(
+            "[DomainBridge] The config declares a k-space loader feeding an "
+            f"image-domain model ({self.config.model.model_type}), so the "
+            "strategy is about to apply ifft2c to the model input — but the "
+            f"tensor it received (shape={tuple(probe.shape)}) carries no "
+            "k-space DC signature, i.e. it is already an image. IFFT-ing it "
+            "would train the model on a Hermitian-symmetric 'doubled brain'. "
+            "Fix data.dataset_type / data.coils.processing_mode, or the "
+            "model's registered input_domain."
+        )
 
     def _prepare_generator_inputs(
         self,
@@ -467,7 +587,11 @@ class ReconstructionTrainingStrategy(
         """Prepare input tensors and forward kwargs (CC=4 extracted)."""
         multimodal_inputs = batch_context.get("multimodal_inputs")
         measured_kspace = batch_context.get("measured_kspace")
-        use_dc = batch_context["use_dc"]
+        # Two questions, two answers (non-negotiable 17): `use_dc` says a data
+        # consistency layer exists; `_needs_kspace_adjoint` says the network
+        # consumes images over a k-space loader. Either one requires the bridge.
+        needs_bridge = self._needs_kspace_adjoint(batch_context)
+        use_dc = batch_context["use_dc"] or needs_bridge
 
         # Handle multimodal inputs
         if multimodal_inputs is not None:
@@ -526,12 +650,7 @@ class ReconstructionTrainingStrategy(
                 else:
                     ktraj = trajectory
 
-                # Get expected image size
-                im_size = (256, 256)
-                if batch_context.get("hr") is not None:
-                    im_size = batch_context["hr"].shape[-2:]
-                elif hasattr(self.env.generator, "im_size"):
-                    im_size = self.env.generator.im_size
+                im_size = self._declared_im_size(batch_context)
 
                 # Check cache for adjoint operator
                 if not hasattr(self, "_cached_adj_op") or self._cached_adj_op.im_size != im_size:
@@ -561,6 +680,8 @@ class ReconstructionTrainingStrategy(
                 # But BaseTrainingStrategy does NOT guarantee fft_transformer attribute.
                 # reconstruction.py sets it in __init__.
                 # We should check for it safely.
+                if needs_bridge:
+                    self._verify_kspace_bridge_once(kspace_for_input)
                 fft_transformer = getattr(self, "fft_transformer", None)
                 if fft_transformer:
                     lr_image = fft_transformer.ifft2c(kspace_for_input)
@@ -572,6 +693,8 @@ class ReconstructionTrainingStrategy(
 
                     transformer = FFTTransformer(device=self.device)
                     lr_image = transformer.ifft2c(kspace_for_input)
+                if needs_bridge:
+                    lr_image = self._match_declared_input_layout(lr_image)
 
         # Track if we reshapped slices (for reshaping auxiliary tensors)
         num_slices = 1
@@ -704,7 +827,9 @@ class ReconstructionTrainingStrategy(
         # Build forward kwargs
         forward_kwargs: dict[str, Any] = {}
         generator = cast(nn.Module, self.env.generator)
-        generator_forward = getattr(generator, "forward", None)
+        # Signature gating reads the inner module: a DDP/DP wrapper's forward is
+        # ``(*args, **kwargs)``, so every kwarg would be injected into every model.
+        generator_forward = getattr(unwrap_model(generator), "forward", None)
 
         if generator_forward is not None:
             if measured_kspace is not None and _callable_accepts_kwarg(
@@ -732,19 +857,13 @@ class ReconstructionTrainingStrategy(
             ):
                 forward_kwargs["slice_indices"] = batch_context["slice_indices"]
 
-            # Inject timesteps if model requires it (e.g. for time-conditioned reconstruction or LPD)
+            # This generic forward is not a diffusion process (time-conditioned
+            # subclasses draw their own t), so every split gets the t=0 that every
+            # existing checkpoint already saw at validation and predict.
             if _callable_accepts_kwarg(generator_forward, "timesteps"):
-                # Use batch size from lr_image
-                B = lr_image.shape[0]
-                if validation:
-                    # Deterministic eval time so validation metrics are
-                    # reproducible across runs/epochs — a fresh random draw each
-                    # val pass made the early-stopping / best monitor noisy.
-                    timesteps = torch.zeros((B,), device=lr_image.device)
-                else:
-                    # Random timesteps [0, 1] for training.
-                    timesteps = torch.rand((B,), device=lr_image.device)
-                forward_kwargs["timesteps"] = timesteps
+                forward_kwargs["timesteps"] = torch.zeros(
+                    (lr_image.shape[0],), device=lr_image.device
+                )
 
             # Field-strength conditioning for cross-field renderers
             # (``AnatomyFieldRenderer`` / ``CrossFieldRenderer`` & friends) that
@@ -761,9 +880,7 @@ class ReconstructionTrainingStrategy(
             # generic validation forward with no field-aware override, so before
             # this injection the renderer raised "missing 1 required keyword-only
             # argument: 'field_strength'" -> zero successful validation batches
-            # (CLAUDE.md #10). NOTE: the look-alike ``_prepare_generator_inputs_
-            # reconstruction`` in mixins/reconstruction.py carries the same block
-            # but has no callers — THIS method is the one the run actually uses.
+            # (CLAUDE.md #10).
             if _callable_accepts_kwarg(generator_forward, "field_strength"):
                 fs = batch_context.get("field_strength_target", batch_context.get("field_strength"))
                 if fs is not None:
@@ -774,6 +891,17 @@ class ReconstructionTrainingStrategy(
                 forward_kwargs["contrast_id"] = batch_context["contrast_id"]
 
         return lr_image, forward_kwargs
+
+    def _declared_im_size(self, batch_context: dict[str, Any]) -> Any:
+        """Image grid for the NUFFT adjoint: the target's, else the generator's, else 256.
+
+        The generator is read through ``unwrap_model``: a DDP/DP wrapper does not
+        forward attribute reads, so ``im_size`` would silently fall back to 256.
+        """
+        hr = batch_context.get("hr")
+        if hr is not None:
+            return hr.shape[-2:]
+        return getattr(unwrap_model(self.env.generator), "im_size", (256, 256))
 
     def _generate_predictions(
         self,
@@ -795,7 +923,21 @@ class ReconstructionTrainingStrategy(
             hr_fakes = hr_fakes[0]
 
         intermediate_outputs = None
-        if hasattr(generator, "forward_with_intermediates"):
+        inner = unwrap_model(generator)
+        if hasattr(inner, "forward_with_intermediates") and inner is not generator:
+            # Calling the inner method bypasses DDP/DP.forward (no reducer arming, no
+            # gradient all-reduce), so it can never run under a wrapper. Deep
+            # supervision is refused when configured; otherwise the wrapper's forward
+            # output stands, since no loss consumes the intermediates.
+            if self.config.losses.lambda_deep_supervision > 0:
+                raise RuntimeError(
+                    "The generator is wrapped (DistributedDataParallel / DataParallel), "
+                    f"which hides forward_with_intermediates from the strategy, but "
+                    f"losses.lambda_deep_supervision={self.config.losses.lambda_deep_supervision} "
+                    "needs its intermediate outputs. Set losses.lambda_deep_supervision: 0 "
+                    "or run without DDP/DP."
+                )
+        elif hasattr(inner, "forward_with_intermediates"):
             try:
                 intermediate_outputs = generator.forward_with_intermediates(
                     lr_image, **forward_kwargs
@@ -837,6 +979,336 @@ class ReconstructionTrainingStrategy(
         )
         generator = cast(nn.Module, self.env.generator)
         lr_image = self._apply_input_conditioning(lr_image, batch_context)
-        hr_fakes = generator(lr_image, **forward_kwargs)
+        window = self._validation_window(lr_image, forward_kwargs)
+        if window is not None:
+            loader = getattr(getattr(self.config, "data", None), "loader", None)
+            per_call = int(getattr(loader, "batch_size", 1) or 1)
+            return self._windowed_forward(generator, lr_image, forward_kwargs, window, per_call)
+        window_2d = self._validation_window_2d(lr_image, forward_kwargs)
+        if window_2d is not None:
+            return self._windowed_forward_2d(generator, lr_image, forward_kwargs, window_2d)
+        # A flattened volume is every slice at once; chunking caps the peak (no_grad,
+        # so activation checkpointing cannot).
+        validation = self.config.validation
+        if validation is None or lr_image.shape[0] <= validation.loader.chunk_size:
+            return generator(lr_image, **forward_kwargs)
+        return forward_in_chunks(
+            lambda x, _t, kw: reconstruction_output(generator(x, **kw)),
+            lr_image,
+            None,
+            forward_kwargs,
+            validation.loader.chunk_size,
+        )
 
-        return hr_fakes
+    def _validation_window(
+        self, x: torch.Tensor, forward_kwargs: dict[str, Any]
+    ) -> tuple[int, int, int] | None:
+        """The training patch, when a 3-D volume is larger than it; None when it fits.
+
+        A volumetric model trained on patches is graded at the shape it trained on:
+        a whole volume can exceed memory, or the fixed input shape of the network.
+        """
+        sampling = getattr(getattr(self.config, "data", None), "sampling", None)
+        patch = getattr(sampling, "patch_size", None)
+        if x.ndim != 5 or not isinstance(patch, (list, tuple)) or len(patch) != 3:
+            return None
+        window = (int(patch[0]), int(patch[1]), int(patch[2]))
+        if all(s <= w for s, w in zip(x.shape[2:], window, strict=True)):
+            return None
+        spatial = [
+            k for k, v in forward_kwargs.items() if isinstance(v, torch.Tensor) and v.ndim >= 5
+        ]
+        if spatial:
+            raise ValueError(
+                f"Validation would window a {tuple(x.shape[2:])} volume into {window} patches, "
+                f"but generator inputs {spatial} are whole volumes that cannot be windowed."
+            )
+        return window
+
+    def _validation_window_2d(
+        self, x: torch.Tensor, forward_kwargs: dict[str, Any]
+    ) -> tuple[int, int] | None:
+        """The training crop, when folded slices (N, C, H, W) are larger than it; None when they fit.
+
+        A 2-D model trained on ``patch_size: [h, w, 1]`` crops is graded at the size it trained on.
+        """
+        sampling = getattr(getattr(self.config, "data", None), "sampling", None)
+        patch = getattr(sampling, "patch_size", None)
+        if x.ndim != 4 or not isinstance(patch, (list, tuple)) or len(patch) != 3 or patch[2] != 1:
+            return None
+        window = (int(patch[0]), int(patch[1]))
+        if all(s <= w for s, w in zip(x.shape[2:], window, strict=True)):
+            return None
+        spatial = [
+            k for k, v in forward_kwargs.items() if isinstance(v, torch.Tensor) and v.ndim >= 4
+        ]
+        if spatial:
+            raise ValueError(
+                f"Validation would window {tuple(x.shape[2:])} slices into {window} crops, "
+                f"but generator inputs {spatial} are whole slices that cannot be windowed."
+            )
+        return window
+
+    def _windowed_forward_2d(
+        self,
+        generator: nn.Module,
+        x: torch.Tensor,
+        forward_kwargs: dict[str, Any],
+        window: tuple[int, int],
+    ) -> torch.Tensor:
+        """Overlapping training-sized crops, Gaussian-weighted back into each slice."""
+        from spectramr.infrastructure.inference.sliding_window import sliding_window_inference_2d
+
+        validation = self.config.validation
+        chunk = validation.loader.chunk_size if validation is not None else x.shape[0]
+
+        def predict(crop: torch.Tensor) -> torch.Tensor:
+            out = forward_in_chunks(
+                lambda c, _t, kw: reconstruction_output(generator(c, **kw)),
+                crop,
+                None,
+                forward_kwargs,
+                chunk,
+            )
+            if out.shape[2:] != crop.shape[2:]:
+                raise ValueError(
+                    f"Windowed validation needs an output the shape of its input crop; "
+                    f"the generator mapped {tuple(crop.shape[2:])} to {tuple(out.shape[2:])}."
+                )
+            return out
+
+        return sliding_window_inference_2d(x, window, predict, overlap=0.25)
+
+    @staticmethod
+    def _windowed_forward(
+        generator: nn.Module,
+        x: torch.Tensor,
+        forward_kwargs: dict[str, Any],
+        window: tuple[int, int, int],
+        per_call: int = 1,
+    ) -> torch.Tensor:
+        """Overlapping training-sized patches, Gaussian-weighted back into the volume.
+
+        ``per_call`` windows share a forward: the training batch size, so the no-grad
+        call is no larger than a training step's.
+        """
+        from spectramr.infrastructure.inference.sliding_window import sliding_window_inference
+
+        batch = x.shape[0]
+
+        def predict(patch: torch.Tensor) -> torch.Tensor:
+            # Windows are stacked along dim 0, each carrying the whole batch.
+            n = patch.shape[0] // batch
+            kwargs = {
+                k: v.repeat(n, *([1] * (v.ndim - 1)))
+                if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == batch
+                else v
+                for k, v in forward_kwargs.items()
+            }
+            out = reconstruction_output(generator(patch, **kwargs))
+            if out.shape[2:] != patch.shape[2:]:
+                raise ValueError(
+                    f"Windowed validation needs an output the shape of its input patch; "
+                    f"the generator mapped {tuple(patch.shape[2:])} to {tuple(out.shape[2:])}."
+                )
+            return out
+
+        return sliding_window_inference(
+            x, window, predict, sw_batch_size=max(1, per_call // batch), overlap=0.25
+        )
+
+
+class ReconstructionTrainingStrategy(
+    ReconstructionStepMixin, ModelValidationMixin, ReconstructionMixin, BaseTrainingStrategy
+):
+    """Reconstruction training strategy for supervised MRI image reconstruction.
+
+    This strategy implements pure reconstruction-only training without adversarial
+    components. It supports multiple loss functions (L1, L2, SSIM, perceptual) and
+    optional physics-informed neural network (PINN) constraints for k-space consistency.
+
+    Multislice Support:
+    - Uses explicit `data.multislice_enabled` config flag to avoid ambiguous shape heuristics
+    - Automatically reshapes multi-slice data from (B, num_slices*2, H, W) to (B*num_slices, 2, H, W)
+    - Handles auxiliary tensors (k-space, masks, sensitivities) consistently with slice reshaping
+
+    Typical use cases:
+    - Baseline reconstruction models (U-Net, Vision Mamba, Swin Transformer)
+    - Transfer learning initialization before adversarial fine-tuning
+    - Fast convergence when paired data is available
+    - Physics-driven reconstruction with data consistency layers
+
+    Loss Components:
+    - **L1**: Mean absolute error (MAE) reconstruction loss
+    - **L2**: Mean squared error (MSE) reconstruction loss
+    - **SSIM**: Structural similarity index for perceptual quality
+    - **Perceptual**: VGG/LPIPS-based perceptual loss
+    - **K-space**: Frequency domain reconstruction fidelity
+    - **PINN**: Physics-informed constraints (optional)
+
+    Attributes:
+        loss_computer: Unified loss computation module handling all reconstruction losses.
+        fft_transformer: FFT/IFFT utilities for k-space operations.
+        config: Training configuration (read-only).
+        device: PyTorch device (CPU or CUDA).
+
+    Config Requirements:
+        ```yaml
+        training:
+          training_mode: reconstruction
+        objectives:
+          reconstruction:
+            lambda_l1: 1.0          # L1 loss weight
+            lambda_l2: 0.0          # L2 loss weight (optional)
+            lambda_ssim: 0.1        # SSIM loss weight (optional)
+            lambda_perceptual: 0.01 # Perceptual loss weight (optional)
+        ```
+
+    Raises:
+        ValueError: If training_mode is not 'reconstruction'.
+        AttributeError: If required config sections are missing.
+
+    Example:
+        >>> from spectramr.infrastructure.training.strategies.reconstruction import ReconstructionTrainingStrategy
+        >>> from spectramr.infrastructure.training.contexts import TrainingEnvironment
+        >>>
+        >>> env = TrainingEnvironment(config=TrainingSettings.from_yaml('config.yaml'))
+        >>> strategy = ReconstructionTrainingStrategy(env=env)
+        >>>
+        >>> # Training step
+        >>> losses = strategy.train_step(batch, epoch=0, step=100)
+        >>> print(losses['g_total_loss'].item())  # Total weighted loss
+        >>> print(losses['loss_l1'].item())       # L1 component
+
+    Note:
+        This strategy does NOT include:
+        - Adversarial losses (use GANTrainingStrategy)
+        - VAE KL divergence (use VAETrainingStrategy)
+        - Diffusion denoising (use DiffusionTrainingStrategy)
+    """
+
+    # parallel_compat: a permission is never inherited (strategy_compat), so the
+    # strategy declares its own; the FSDP arm is workflow_baselines/b2_structural_recon_m4raw_fsdp.yaml.
+    parallel_compat = frozenset({"replicated", "sharded"})
+
+    # Domain axes this paradigm can populate from the batch (via data.expose_*).
+    # Widens ConditioningMixin's empty default so model.conditioning passes the
+    # Tier-1 conditioning_sources_supported audit on recon arms. severity_vec is
+    # deliberately excluded — it is a virtual-fiducial-only quantity.
+    _SUPPORTED_CONDITION_SOURCES = (
+        "field_strength",
+        "scanner_id",
+        "site_id",
+        "contrast_id",
+    )
+
+    #: Loss ownership (mrixfields review 2026-09-03). The base reconstruction path
+    #: computes every declared ``losses.image_losses`` entry through the builder:
+    #: nothing inline, everything folded. A subclass that overrides
+    #: ``_compute_losses_impl`` redeclares both, and ``test_loss_ownership`` pins
+    #: ``folds_image_losses`` against the source (a call to
+    #: ``super()._compute_losses_impl`` or ``_apply_builder_image_losses``).
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = True
+
+    #: The base step returns ``loss_computer``'s components verbatim, so the CSV
+    #: header declares the computer's stamped keys (``loss_nonfinite_substitutions``
+    #: was discarded on every CoNEX step). A subclass that replaces the step does not
+    #: forward them unless it says so.
+    forwards_loss_components: ClassVar[bool] = True
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "forwards_loss_components" not in cls.__dict__:
+            cls.forwards_loss_components = (
+                cls._compute_losses_impl is ReconstructionStepMixin._compute_losses_impl
+            )
+
+    #: Whether ``_validation_forward`` needs the batch's own measurement, mask and
+    #: coil maps. Off, validation keeps the mixin's bare context; on, both the
+    #: metric pass and the image capture build it through
+    #: :meth:`validation_batch_context`.
+    validates_on_batch_context: ClassVar[bool] = False
+
+    #: Workflow tags: structural MRI reconstruction. This is what backs the
+    #: ``mri_structural`` regime's LIVE claim in the maturity ledger.
+    capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
+        workflows=frozenset({Regime.STRUCTURAL}),
+        tasks=frozenset({Task.RECONSTRUCTION}),
+    )
+
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Validate with the batch's contrast id, which the training step already passes.
+
+        The mixin's bare validation context carried no ``contrast_id``, so a
+        contrast-conditioned generator (or ``model.conditioning`` on
+        ``contrast_id``) trained conditioned and was graded contrast-agnostic.
+        Only ``contrast_id`` is lifted; the k-space, mask and coil-map context
+        stays behind ``validates_on_batch_context``.
+        """
+        if kwargs.get("batch_context") is None and batch_data is not None:
+            contrast = _batch_contrast_id(batch_data, input_batch)
+            if contrast is not None:
+                kwargs["batch_context"] = {
+                    "use_dc": False,
+                    "measured_kspace": None,
+                    "contrast_id": contrast,
+                }
+        return super().validation_step(input_batch, target_batch, batch_data=batch_data, **kwargs)
+
+    def _validation_loss(
+        self,
+        raw_prediction: torch.Tensor,
+        target_batch: torch.Tensor,
+        batch_context: dict[str, Any],
+        batch_data: Any,
+    ) -> torch.Tensor | None:
+        """The declared losses on the batch's ``loss_mask``, as training scores them.
+
+        Only for an arm whose objective is masked (CoNEX); any other arm keeps the
+        mixin's L1. On validation the target is ``val_target_mode``'s reference,
+        not the training repetition, so the value is the objective against it.
+        """
+        raw = _as_aux_mapping(batch_data) if batch_data is not None else {}
+        loss_mask = raw.get("loss_mask") if isinstance(raw, dict) else None
+        if isinstance(loss_mask, dict):
+            loss_mask = loss_mask.get("data")
+        if not isinstance(loss_mask, torch.Tensor):
+            return None
+        loss_context: dict[str, Any] = {"loss_mask": loss_mask.to(raw_prediction.device)}
+        maps = (batch_context or {}).get("coil_sensitivities")
+        if maps is not None:
+            loss_context["coil_sensitivities"] = maps
+        # Past every warm-up gate: the curve is the full objective, not its ramp.
+        output = self.loss_computer.compute(
+            pred=raw_prediction,
+            target=target_batch,
+            epoch=0,
+            iteration=10**9,
+            losses_dict=(getattr(self.env, "losses", None) or {}) if self.env else {},
+            **loss_context,
+        )
+        return output.total if isinstance(output.total, torch.Tensor) else None
+
+
+def _batch_contrast_id(batch_data: Any, input_batch: torch.Tensor) -> torch.Tensor | None:
+    """The batch's contrast id under the ``AUX_KEY_MAPPING`` spellings, or ``None``."""
+    raw = _as_aux_mapping(batch_data)
+    for key in AUX_KEY_MAPPING["contrast_id"]:
+        value = raw.get(key)
+        if isinstance(value, torch.Tensor):
+            if value.shape[0] != input_batch.shape[0]:
+                raise ValueError(
+                    f"validation batch carries {value.shape[0]} contrast_id value(s) for "
+                    f"{input_batch.shape[0]} input rows; refusing to broadcast a contrast "
+                    "onto rows it was not recorded for."
+                )
+            return value.to(input_batch.device, non_blocking=True)
+    return None

@@ -48,9 +48,10 @@ def test_integrate_recovers_toward_m_eq_not_one() -> None:
 
 def test_diffusion_prior_is_learnable() -> None:
     src = inspect.getsource(SpinSDEStrategy)
-    # The prior uses the learnable parameter (grad-carrying), and the parameter
-    # is registered on the optimizer in __init__.
-    assert "self.diffusion.pow(2)" in src
+    # The prior uses the learnable parameter through its owned-module holder, and the
+    # parameter is registered on the optimizer in __init__.
+    assert "diffusion.pow(2)" in src
+    assert 'self.call_owned("diffusion")' in src
     assert "torch.nn.Parameter" in src
     assert "add_param_group" in src
 
@@ -125,3 +126,38 @@ def test_readout_cache_rejects_changed_contrast_count() -> None:
     assert s._resolve_readout_steps(3) == first  # cached, same object/value
     with pytest.raises(ValueError, match="constant across the run"):
         s._resolve_readout_steps(4)
+
+
+def test_diffusion_is_an_owned_module_with_an_unchanged_checkpoint_key(monkeypatch) -> None:
+    """#2629: the DDP holder is not an attribute, so the checkpoint keeps
+    ``params.diffusion`` and the loss reaches it through ``call_owned``."""
+    from tests.unit.infrastructure.training.strategies.test_multi_param_mapping_strategy import (
+        _built_via_init,
+    )
+
+    s = _built_via_init(monkeypatch, SpinSDEStrategy)
+    assert s.owned_modules()["diffusion"].value is s.diffusion
+    assert sorted(s.strategy_state_dict()["params"]) == ["_log_sigmas", "diffusion"]
+
+    calls: list[str] = []
+    real = type(s).call_owned
+
+    def _spy(self, name, *a, **k):
+        calls.append(name)
+        return real(self, name, *a, **k)
+
+    monkeypatch.setattr(SpinSDEStrategy, "call_owned", _spy)
+    shape = (1, 1, 4, 4)
+    x = torch.randn(1, 2, 4, 4)
+    batch = {
+        "observed_contrasts": x,
+        "t1": torch.zeros(shape),
+        "t2": torch.ones(shape),
+        "T1_map": torch.full(shape, 0.5),
+        "T2_map": torch.full(shape, 0.1),
+        "M0_map": torch.ones(shape),
+        "multi_contrast_signal": torch.rand(1, 2, 4, 4),
+    }
+    s._compute_losses_impl(x, x, 0, batch=batch)["loss_total"].backward()
+    assert sorted(calls) == ["_log_sigmas", "diffusion"]  # one DDP forward each per step
+    assert s.diffusion.grad is not None

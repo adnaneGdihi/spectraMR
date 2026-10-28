@@ -132,6 +132,7 @@ def _strategy(
         marker_channels=marker_channels,
         relax=relax,
     )
+    st.config.model.out_channels = out_ch
     st.device = torch.device("cpu")
     st._to_device = lambda t: t  # type: ignore[method-assign]
     st._setup_strategy_specific_components()
@@ -598,6 +599,7 @@ def test_recovered_rung_never_reads_the_ground_truth() -> None:
         echoes=res.echoes,
         shifts=torch.zeros_like(res.shifts),
         marker_stack=res.marker_stack,
+        marker_hr=res.marker_hr,
     )
     x_blanked = st._condition_on_shifts(blanked)
     assert torch.allclose(x_ref, x_blanked, atol=1e-6)
@@ -801,6 +803,43 @@ def test_channel_contract_accounts_for_the_marker_block() -> None:
         )
 
 
+def _blind_marker_strategy() -> ConcreteMultiAcquisitionStrategy:
+    return _strategy(
+        "subvoxel_sr",
+        _SUBVOXEL["model_name"],
+        32,
+        1,
+        {"scale": 2, "dim": 24},
+        shift_source="blind",
+        marker_channels=True,
+    )
+
+
+def test_blind_marker_channels_carry_the_marker_and_zero_maps() -> None:
+    """VFU-08: under 'blind' the marker is still synthesised and fed, while the
+    shift maps stay zero, so the marker is the only registration source."""
+    st = _blind_marker_strategy()
+    assert st.macq.marker_enabled
+    res = st.macq(st._clean_magnitude(_disk_kspace(b=2, h=32, w=32)))
+    x = st._condition_on_shifts(res)
+    n = res.stack.shape[1]
+    assert float(x[:, n : 2 * n].std()) > 0.0
+    assert torch.equal(x[:, 2 * n :], torch.zeros_like(x[:, 2 * n :]))
+
+
+def test_blind_marker_channels_change_the_model_output() -> None:
+    """The marker block reaches the network: zeroing it moves the prediction."""
+    st = _blind_marker_strategy()
+    res = st.macq(st._clean_magnitude(_disk_kspace(b=2, h=32, w=32)))
+    x = st._condition_on_shifts(res)
+    n = res.stack.shape[1]
+    ablated = x.clone()
+    ablated[:, n : 2 * n] = 0.0
+    with torch.no_grad():
+        delta = (st.generator_model(x) - st.generator_model(ablated)).abs().max()
+    assert float(delta) > 0.0
+
+
 def test_band_probe_matches_the_model_width_when_marker_channels_are_on() -> None:
     """The exp_vfulf_02 cohort enables BOTH. The probe feeds the fiducial as the
     signal under test, so with marker channels it must occupy the instrument
@@ -814,15 +853,228 @@ def test_band_probe_matches_the_model_width_when_marker_channels_are_on() -> Non
     assert "snf_super_nyquist" in st._last_band_spectrum
 
 
+# ── per-sample marker realisations (VFU-02) ───────────────────────────────────
+
+
+def _per_sample_strategy(target: str = "matched", lambda_band: float = 0.1, realisation="per_sample"):
+    st = _probe_strategy(lambda_band=lambda_band)
+    macq = st.config.physics.multi_acquisition
+    macq.subvoxel_registration = SubvoxelRegistrationConfig(
+        shift_source="recovered",
+        marker_grid_spacing=16,
+        marker_sigma=2.0,
+        marker_jitter=0.35,
+        max_shift_px=1.0,
+        marker_realisation=realisation,
+    )
+    macq.band_probe = BandProbeConfig(
+        enabled=True, lambda_band=lambda_band, target_realisation=target
+    )
+    st._setup_strategy_specific_components()
+    return st
+
+
+def test_training_draws_a_fresh_even_seed_per_sample_and_step() -> None:
+    st = _per_sample_strategy()
+    a = st._marker_seeds("train", 0, 2)
+    b = st._marker_seeds("train", 0, 2)
+    assert len(set(a + b)) == 4 and all(x % 2 == 0 for x in a + b)
+    assert st._marker_seeds("train", 1, 2) != a  # a new epoch restarts the ordinals elsewhere
+
+
+def test_validation_markers_are_odd_stable_and_keyed_on_batch_idx() -> None:
+    st = _per_sample_strategy()
+    v = st._marker_seeds("val", 0, 2, batch_idx=3)
+    assert v == st._marker_seeds("val", 0, 2, batch_idx=3)
+    assert all(x % 2 == 1 for x in v)
+    with pytest.raises(ValueError, match="batch_idx"):
+        st._marker_seeds("val", 0, 2)
+
+
+def test_fixed_realisation_draws_no_seeds() -> None:
+    assert _per_sample_strategy(realisation="fixed")._marker_seeds("train", 0, 2) is None
+
+
+def test_registration_stays_accurate_on_per_sample_markers() -> None:
+    """Every consumer reads res.marker_hr; a stale fixed reference would wreck this."""
+    st = _per_sample_strategy()
+    m0 = st._clean_magnitude(_disk_kspace(b=2, h=32, w=32))
+    res = st.macq(m0, marker_seeds=st._marker_seeds("train", 0, 2))
+    st._condition_on_shifts(res)
+    assert float(st._last_shift_mae) < 0.1 * float(res.shifts.abs().mean())
+
+
+def test_per_sample_markers_change_the_probe_target() -> None:
+    torch.manual_seed(0)
+    fixed = _per_sample_strategy(realisation="fixed")
+    torch.manual_seed(0)
+    per = _per_sample_strategy()
+    per.env.generator.load_state_dict(fixed.generator_model.state_dict())
+    target = _disk_kspace(b=2, h=32, w=32)
+    torch.manual_seed(0)
+    fixed._field_loss(target)
+    torch.manual_seed(0)
+    per._field_loss(target, marker_seeds=per._marker_seeds("train", 0, 2))
+    assert not torch.allclose(fixed._last_band_loss, per._last_band_loss)
+
+
+def test_mismatched_target_changes_the_loss_not_the_reported_spectrum() -> None:
+    """Wrong-marker control: same input, same weights, a wrong optimisation
+    target; the reported val_snf_* still score the matched marker."""
+    torch.manual_seed(0)
+    matched = _per_sample_strategy()
+    torch.manual_seed(0)
+    wrong = _per_sample_strategy(target="mismatched")
+    wrong.env.generator.load_state_dict(matched.generator_model.state_dict())
+    target = _disk_kspace(b=2, h=32, w=32)
+    seeds = (2, 4)
+    torch.manual_seed(0)
+    matched._field_loss(target, marker_seeds=seeds)
+    torch.manual_seed(0)
+    wrong._field_loss(target, marker_seeds=seeds)
+    assert not torch.allclose(matched._last_band_loss, wrong._last_band_loss)
+    assert matched._last_band_spectrum["snf_super_nyquist"] == pytest.approx(
+        wrong._last_band_spectrum["snf_super_nyquist"], abs=1e-6
+    )
+
+
+def test_validation_step_runs_on_the_held_out_family() -> None:
+    st = _per_sample_strategy()
+    val = st.validation_step(_disk_kspace(b=2, h=32, w=32), _disk_kspace(b=2, h=32, w=32), batch_idx=0)
+    assert st._last_result.marker_seeds is not None
+    assert all(s % 2 == 1 for s in st._last_result.marker_seeds)
+    assert "val_snf_super_nyquist" in val
+
+
+# ── held-out-subject conformal calibration (VFU-09) ───────────────────────────
+
+
+def _heldout_strategy():
+    from spectramr.config.schemas.physics import AnchorConformalConfig
+
+    st = _strategy(
+        "subvoxel_sr",
+        _SUBVOXEL["model_name"],
+        _SUBVOXEL["in_ch"],
+        _SUBVOXEL["out_ch"],
+        _SUBVOXEL["mk"],
+        shift_source="recovered",
+    )
+    st.config.physics.multi_acquisition.anchor_conformal = AnchorConformalConfig(
+        enabled=True, n_strata=1, calibration_source="held_out_subjects"
+    )
+    st._setup_strategy_specific_components()
+    return st
+
+
+def _val(st, subject: str, idx: int) -> dict:
+    target = _disk_kspace(b=2, h=32, w=32)
+    return st.validation_step(target, target, batch_idx=idx, batch_data={"subject_id": [subject] * 2})
+
+
+def test_heldout_calibration_reports_once_per_pass_on_other_subjects() -> None:
+    st = _heldout_strategy()
+    st.reset_validation_metrics()
+    per_batch = _val(st, "s1", 0)
+    _val(st, "s2", 1)
+    assert not any(k.startswith("val_conformal") for k in per_batch)  # no per-batch refit
+    out = st.finalize_validation()
+    assert out["val_conformal_n_calibration_subjects"] == 1.0
+    assert out["val_conformal_n_test_subjects"] == 1.0
+    assert "val_conformal_worst_coverage" in out
+
+
+def test_heldout_calibration_raises_on_a_training_subject() -> None:
+    st = _heldout_strategy()
+    target = _disk_kspace(b=2, h=32, w=32)
+    st._compute_losses_impl(None, target, 0, batch={"subject_id": ["s1", "s1"]})
+    st.reset_validation_metrics()
+    _val(st, "s1", 0)
+    _val(st, "s2", 1)
+    with pytest.raises(ValueError, match="overlaps training"):
+        st.finalize_validation()
+
+
+def test_heldout_calibration_needs_subject_ids() -> None:
+    st = _heldout_strategy()
+    target = _disk_kspace(b=2, h=32, w=32)
+    with pytest.raises(ValueError, match="needs subject_id"):
+        st.validation_step(target, target, batch_idx=0)
+
+
+# ── acquired 64 mT input stream (VFU-07) ──────────────────────────────────────
+
+
+def _stream_strategy(stream: str, fov_mask: str = "acquired_support"):
+    st = _strategy(
+        "subvoxel_sr", _SUBVOXEL["model_name"], 24, 1, _SUBVOXEL["mk"], shift_source="blind"
+    )
+    macq = st.config.physics.multi_acquisition
+    macq.n_frames = 1
+    macq.input_stream = stream
+    macq.fov_mask = fov_mask
+    st.config.model.in_channels = 3
+    st.env = SimpleNamespace(
+        generator=get_model_class(_SUBVOXEL["model_name"])(
+            in_channels=3, out_channels=1, **_SUBVOXEL["mk"]
+        )
+    )
+    st._setup_strategy_specific_components()
+    return st
+
+
+def _half_fov(x: torch.Tensor) -> torch.Tensor:
+    """An image-domain ULF stand-in whose right half lies outside the FOV (exact 0)."""
+    from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+
+    img = ifft2c(x).abs()
+    img[..., img.shape[-1] // 2 :] = 0.0
+    return fft2c(img.to(torch.complex64))
+
+
+def test_acquired_stream_feeds_the_loaded_input_not_the_target() -> None:
+    """The model input is the pooled 64 mT slice: at a fixed target, changing the
+    INPUT moves the prediction on the acquired stream and not on the twin one."""
+    target = _disk_kspace(b=2, h=32, w=32)
+    inputs = (_disk_kspace(b=2, h=32, w=32), _half_fov(target))
+    for stream, fov, moves in (("acquired", "acquired_support", True), ("twin", "none", False)):
+        st = _stream_strategy(stream, fov)
+        preds = []
+        for x in inputs:
+            torch.manual_seed(0)
+            preds.append(st._field_loss(target, acquired_input=x)[1])
+        assert (not torch.allclose(*preds)) == moves, stream
+    res = _stream_strategy("acquired")._acquired_result(
+        torch.ones(2, 1, 32, 32), torch.ones(2, 1, 32, 32)
+    )
+    assert res.stack.shape == (2, 1, 16, 16) and float(res.shifts.abs().sum()) == 0.0
+
+
+def test_fov_mask_zeroes_both_sides_outside_the_ulf_field_of_view() -> None:
+    st = _stream_strategy("acquired")
+    target = _disk_kspace(b=2, h=32, w=32)
+    _l, pred_field, field = st._field_loss(target, acquired_input=_half_fov(target))
+    right = (..., slice(16, None))
+    assert float(pred_field[right].abs().max()) == 0.0
+    assert float(field[right].abs().max()) == 0.0
+    assert float(field[..., :16].abs().max()) > 0.0
+
+
+def test_acquired_stream_without_an_input_raises() -> None:
+    with pytest.raises(ValueError, match="need the loaded 64 mT input"):
+        _stream_strategy("acquired")._field_loss(_disk_kspace(b=2, h=32, w=32))
+
+
 # ── relaxometric fiducial calibration (PR-3) ──────────────────────────────────
 
 _ACQ = {"tr_ms": 500.0, "te_ms": 15.0, "flip_deg": 90.0}
 
 
-def _relax_cfg(factored: bool) -> RelaxometricCalibrationConfig:
+def _relax_cfg(factored: bool, factor_form: str = "scalar") -> RelaxometricCalibrationConfig:
     return RelaxometricCalibrationConfig(
         enabled=True,
         factored=factored,
+        factor_form=factor_form,
         source={"field_strength_t": 0.064, **_ACQ},
         target={"field_strength_t": 3.0, **_ACQ},
         marker_t1_ms=500.0,
@@ -841,6 +1093,71 @@ def _relax_strategy(factored: bool) -> ConcreteMultiAcquisitionStrategy:
         shift_source="recovered",
         relax=_relax_cfg(factored),
     )
+
+
+def _tissue_strategy(out_ch: int = 4) -> ConcreteMultiAcquisitionStrategy:
+    return _strategy(
+        "subvoxel_sr",
+        _SUBVOXEL["model_name"],
+        _SUBVOXEL["in_ch"],
+        out_ch,
+        _SUBVOXEL["mk"],
+        shift_source="recovered",
+        relax=_relax_cfg(True, factor_form="tissue_map"),
+    )
+
+
+def test_tissue_map_head_scales_g_by_a_per_pixel_declared_gain() -> None:
+    """VFU-05: pred = g(x) * kappa(x), kappa(x) a softmax over the DECLARED
+    per-tissue gains taken from channels 1..3, so it varies per pixel."""
+    from spectramr.infrastructure.physics.tissue_factor import tissue_kappa_map
+
+    st = _tissue_strategy()
+    target = _disk_kspace(b=2, h=32, w=32)
+    torch.manual_seed(0)
+    _l, pred_field, _f = st._field_loss(target)
+    torch.manual_seed(0)
+    res = st.macq(st._clean_magnitude(target))
+    with torch.no_grad():
+        raw = st.generator_model(st._condition_on_shifts(res))
+    kappa = tissue_kappa_map(raw[:, 1:4], st._tissue_gains)
+    assert torch.allclose(pred_field.detach(), raw[:, :1] * kappa, atol=1e-5)
+    lo, hi = float(st._tissue_gains.min()), float(st._tissue_gains.max())
+    assert lo - 1e-6 <= float(kappa.min()) and float(kappa.max()) <= hi + 1e-6
+    assert float(kappa.std()) > 0.0
+
+
+def test_tissue_map_differs_from_the_scalar_control_on_the_same_weights() -> None:
+    torch.manual_seed(0)
+    tissue = _tissue_strategy()
+    scalar = _strategy(
+        "subvoxel_sr",
+        _SUBVOXEL["model_name"],
+        _SUBVOXEL["in_ch"],
+        4,
+        _SUBVOXEL["mk"],
+        shift_source="recovered",
+        relax=_relax_cfg(True),
+    )
+    scalar.env.generator.load_state_dict(tissue.generator_model.state_dict())
+    target = _disk_kspace(b=2, h=32, w=32)
+    torch.manual_seed(0)
+    loss_t, _p, _f = tissue._field_loss(target)
+    torch.manual_seed(0)
+    loss_s, _p, _f = scalar._field_loss(target)
+    assert not torch.allclose(loss_t, loss_s)
+
+
+def test_tissue_map_refuses_a_one_channel_model() -> None:
+    with pytest.raises(ValueError, match="out_channels=4"):
+        _tissue_strategy(out_ch=1)
+
+
+def test_tissue_map_reports_class_agreement() -> None:
+    val = _tissue_strategy().validation_step(
+        _disk_kspace(b=2, h=32, w=32), _disk_kspace(b=2, h=32, w=32)
+    )
+    assert 0.0 <= val["val_kappa_class_agreement"] <= 1.0
 
 
 def test_declared_gain_is_recovered_from_the_data_on_marker_support() -> None:
@@ -1007,8 +1324,96 @@ def _psf_strategy(source: str = "measured", true_sigma: float | None = 2.4):
         kernel_size=9,
         mu=1e-3,
     )
+    # +1 input channel: the forward-PSF |OTF| map the model is conditioned on.
+    st.config.model.in_channels = _SUBVOXEL["in_ch"] + 1
+    st.env = SimpleNamespace(
+        generator=get_model_class(_SUBVOXEL["model_name"])(
+            in_channels=_SUBVOXEL["in_ch"] + 1, out_channels=_SUBVOXEL["out_ch"], **_SUBVOXEL["mk"]
+        )
+    )
     st._setup_strategy_specific_components()
     return st
+
+
+def _conditioned_psf(st, seed: int = 0):
+    torch.manual_seed(seed)
+    res = st.macq(st._clean_magnitude(_disk_kspace(b=2, h=32, w=32)))
+    return res, st._condition_on_shifts(res)
+
+
+def test_psf_channel_is_the_last_input_channel_on_both_sources() -> None:
+    """VFU-01: same channel count on both arms; only the kernel content differs."""
+    for source in ("assumed", "measured"):
+        st = _psf_strategy(source=source)
+        res, x = _conditioned_psf(st)
+        n = res.stack.shape[1]
+        assert x.shape[1] == 3 * n + 1
+        h, w = x.shape[-2:]
+        assert torch.allclose(x[:, -1, h // 2, w // 2], torch.ones(2), atol=1e-5)
+
+
+def test_assumed_psf_channel_is_rendered_once_per_grid() -> None:
+    """The assumed kernel is constant, so its |OTF| is cached, not rebuilt per step."""
+    from spectramr.infrastructure.physics.psf_conditioning import otf_channel
+
+    st = _psf_strategy(source="assumed")
+    res, _x = _conditioned_psf(st)
+    first = st._last_psf_channel
+    _conditioned_psf(st, seed=1)
+    assert st._last_psf_channel.data_ptr() == first.data_ptr()
+    h, w = res.stack.shape[-2:]
+    assert torch.equal(first[:1], otf_channel(st._assumed_lr_kernel, (h, w)))
+
+
+def test_measured_psf_channel_tracks_the_true_blur_not_the_assumption() -> None:
+    """With true_sigma != sigma, the measured channel sits nearer the true MTF
+    than the assumed channel does -- the information the assumed arm lacks."""
+    from spectramr.infrastructure.physics.psf_conditioning import otf_channel
+    from spectramr.infrastructure.physics.psf_estimation import gaussian_psf
+
+    _assumed_res, assumed_x = _conditioned_psf(_psf_strategy(source="assumed"))
+    _measured_res, measured_x = _conditioned_psf(_psf_strategy(source="measured"))
+    h, w = assumed_x.shape[-2:]
+    truth = otf_channel(gaussian_psf(9, 2.4 / 2).reshape(1, 1, 1, 9, 9), (h, w))
+    err_assumed = (assumed_x[:, -1:] - truth).abs().mean()
+    err_measured = (measured_x[:, -1:] - truth).abs().mean()
+    assert err_measured < 0.5 * err_assumed
+
+
+def test_psf_source_changes_the_model_output() -> None:
+    """The declared source reaches the network: same weights, same frames,
+    a different PSF channel, a different prediction."""
+    st = _psf_strategy(source="assumed")
+    _res, x = _conditioned_psf(st)
+    measured = _psf_strategy(source="measured")
+    _res_m, x_m = _conditioned_psf(measured)
+    swapped = x.clone()
+    swapped[:, -1:] = x_m[:, -1:]
+    with torch.no_grad():
+        delta = (st.generator_model(x) - st.generator_model(swapped)).abs().max()
+    assert float(delta) > 0.0
+
+
+def test_null_control_channels_agree_when_the_assumption_is_exact() -> None:
+    """true_sigma unset: the simulator applies the assumed blur, so the two
+    sources disagree only by estimation error -- well under the gap a real
+    model error opens (0.06 against 0.14 on this 32x32, 4-peak marker)."""
+
+    def gap(true_sigma):
+        _r, a = _conditioned_psf(_psf_strategy(source="assumed", true_sigma=true_sigma))
+        _r, m = _conditioned_psf(_psf_strategy(source="measured", true_sigma=true_sigma))
+        return float((a[:, -1] - m[:, -1]).abs().mean())
+
+    assert gap(None) < 0.6 * gap(2.4)
+
+
+def test_psf_conditioning_refuses_a_control_grid() -> None:
+    from pydantic import ValidationError
+
+    from spectramr.config.schemas.physics import ForwardPsfConfig
+
+    with pytest.raises(ValidationError, match="control_rows/control_cols must be 1"):
+        ForwardPsfConfig(enabled=True, source="measured", control_rows=2, control_cols=2)
 
 
 def test_measured_psf_tracks_the_simulated_blur_not_the_assumption() -> None:

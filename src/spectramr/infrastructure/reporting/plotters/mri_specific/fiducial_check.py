@@ -41,7 +41,7 @@ from spectramr.infrastructure.reporting.plotters._comparison_helpers import (
     add_image_panel,
     add_residual_panel,
 )
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import use_default_style, save_plot
 
 
 def _build_fiducial_mask(
@@ -100,6 +100,8 @@ def make(
     grid_spacing: int = 16,
     sigma: float = 2.0,
     mask_threshold: float = 0.25,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path | None:
     """Render the per-case fiducial-preservation grid.
@@ -182,9 +184,4 @@ def make(
 
     if metadata is not None:
         stamp_figure(fig, metadata)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi, metadata=metadata)

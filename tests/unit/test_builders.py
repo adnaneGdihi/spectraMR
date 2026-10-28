@@ -156,7 +156,7 @@ class TestOptimizationBuilder:
         The scaler that scales this run's losses is built by
         `MixedPrecisionIntegrationHelper` on the strategy -- a different object
         of a different class. The unused one was not merely wasted:
-        `CheckpointDirector` persisted its `scaler_state`, so every fp16
+        the pre-1.0 checkpoint writer persisted its `scaler_state`, so every fp16
         checkpoint carried an untouched scale of 65536 and a zero growth-tracker
         while the live scale was dropped, and a resumed run re-converged its loss
         scale from scratch, overflowing and skipping steps -- with a
@@ -173,7 +173,7 @@ class TestOptimizationBuilder:
 
         optimizers, schedulers, scaler = chained.build()
         assert scaler is None, (
-            "build_grad_scaler must stay a no-op; CheckpointDirector._resolve_scaler "
+            "build_grad_scaler must stay a no-op; checkpointing.capture.resolve_scaler "
             "is the single reader of the run's real scaler"
         )
 

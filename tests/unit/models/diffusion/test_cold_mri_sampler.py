@@ -275,3 +275,114 @@ def test_seed_offset_defaults_to_the_legacy_stream() -> None:
     sampler.sample(measurement=torch.zeros(1, 2, 4, 4), mask=torch.ones(1, 1, 4, 4))
 
     assert spy.call_args.kwargs["seed_offset"] == 0
+
+
+def test_sample_signature_exposes_measured_lines() -> None:
+    """Shape A: ``generator.sample`` RAISES when a line-structured arm's sampler lacks it.
+
+    Validation hands ``measured_lines`` to every arm whose mask has a line axis,
+    and the generator refuses a sampler whose signature does not name it, so a
+    wrapper without the parameter crashes the first validation of 242 arms.
+    """
+    assert "measured_lines" in inspect.signature(ColdMRISampler.sample).parameters
+
+
+def test_measured_lines_reaches_the_wrapped_diffusion() -> None:
+    """Shape B: the value must ARRIVE at ``PhysicsInformedColdDiffusion.sample``."""
+    sampler = _make_sampler()
+    spy = Mock(return_value=torch.zeros(1, 2, 4, 4))
+    sampler._diffusion.sample = spy
+    lines = torch.ones(1, 4, dtype=torch.bool)
+
+    sampler.sample(
+        measurement=torch.zeros(1, 2, 4, 4), mask=torch.ones(1, 1, 4, 4), measured_lines=lines
+    )
+
+    assert spy.call_args.kwargs["measured_lines"] is lines
+
+
+def test_measured_lines_defaults_to_full_support() -> None:
+    sampler = _make_sampler()
+    spy = Mock(return_value=torch.zeros(1, 2, 4, 4))
+    sampler._diffusion.sample = spy
+
+    sampler.sample(measurement=torch.zeros(1, 2, 4, 4), mask=torch.ones(1, 1, 4, 4))
+
+    assert spy.call_args.kwargs["measured_lines"] is None
+
+
+def test_integrity_check_reaches_the_wrapped_diffusion() -> None:
+    """A wrapper that dropped the argument would construct with the check off."""
+    sampler = get_sampler(
+        "cold_mri", kspace_log_scaled=False, model=Mock(), num_timesteps=7, integrity_check="raise"
+    )
+    assert sampler._diffusion.integrity_check == "raise"
+    with pytest.raises(ValueError, match="reverse_integrity_check"):
+        get_sampler(
+            "cold_mri", kspace_log_scaled=False, model=Mock(), num_timesteps=7, integrity_check="x"
+        )
+
+
+def test_reverse_physics_reaches_the_wrapped_diffusion() -> None:
+    """The four physics knobs pass the wrapper's parameter list, and an illegal one still raises."""
+    sampler = get_sampler(
+        "cold_mri",
+        kspace_log_scaled=False,
+        model=Mock(),
+        num_timesteps=7,
+        reverse_mode="support_ordered_dc",
+        dc_method="noise_adaptive",
+        decay_envelope="batch_pooled",
+        projection="joint_tv",
+        dc_trust="fitted_decay",
+        support_radius=2,
+    )
+    physics = sampler._diffusion.physics
+    assert (physics.decay_envelope, physics.projection) == ("batch_pooled", "joint_tv")
+    assert (physics.dc_trust, physics.support_radius) == ("fitted_decay", 2)
+    assert physics.reverse_dc == "per_step"
+    unconstrained = get_sampler(
+        "cold_mri",
+        kspace_log_scaled=False,
+        model=Mock(),
+        num_timesteps=7,
+        reverse_mode="replace_freeze_dc",
+        reverse_dc="unconstrained",
+    )
+    assert unconstrained._diffusion.physics.reverse_dc == "unconstrained"
+    with pytest.raises(ValueError, match="reverse_projection"):
+        get_sampler(
+            "cold_mri", kspace_log_scaled=False, model=Mock(), num_timesteps=7, projection="grappa"
+        )
+
+
+def test_refine_alpha_reaches_the_wrapped_diffusion() -> None:
+    """The wrapper's parameter list is the filter: ``refine_alpha`` must pass it.
+
+    Declared under a mode that does not read it, the inner constructor refuses;
+    a wrapper that dropped the argument would construct silently instead.
+    """
+    with pytest.raises(ValueError, match="reverse_refine_alpha"):
+        get_sampler(
+            "cold_mri",
+            kspace_log_scaled=False,
+            model=Mock(),
+            num_timesteps=7,
+            reverse_mode="replace_freeze_dc",
+            refine_alpha=0.5,
+        )
+
+
+def test_the_sampler_requires_the_trained_horizon():
+    """PLANTED (#2443): a 1000-step default stood in for the model's own T."""
+    assert inspect.signature(ColdMRISampler).parameters["num_timesteps"].default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="num_timesteps"):
+        ColdMRISampler(Mock())  # type: ignore[call-arg]
+
+
+def test_an_undeclared_step_count_is_the_shared_default_not_the_horizon() -> None:
+    """PLANTED (#1176): ``None`` became the full horizon, 1000 steps on a default arm."""
+    from spectramr.models.diffusion.kspace_process import DEFAULT_SAMPLING_STEPS
+
+    assert _make_sampler(num_timesteps=1000)._diffusion.sampling_steps == DEFAULT_SAMPLING_STEPS
+    assert _make_sampler(num_timesteps=10)._diffusion.sampling_steps == 10

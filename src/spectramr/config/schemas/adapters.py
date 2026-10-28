@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AdapterStepSchema(BaseModel):
@@ -64,10 +64,6 @@ class AdaptersConfigSchema(BaseModel):
         default_factory=list,
         description="Applied to model output before downstream stages.",
     )
-    pre_loss_pred: list[AdapterStepSchema] = Field(
-        default_factory=list,
-        description="Bridges model output to loss-side prediction (e.g. FFT for image→kspace).",
-    )
     pre_loss_target: list[AdapterStepSchema] = Field(
         default_factory=list,
         description="Bridges dataset target to loss-side target (e.g. RSS coils→magnitude).",
@@ -77,13 +73,25 @@ class AdaptersConfigSchema(BaseModel):
         description="Applied to (pred, target) before metric computation.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_retired_hooks(cls, data: Any) -> Any:
+        """Refuse the retired ``pre_loss_pred`` hook (#1777): declared, never applied."""
+        if isinstance(data, dict) and "pre_loss_pred" in data:
+            raise ValueError(
+                "adapters.pre_loss_pred is retired (#1777): the hook was declared in YAML but "
+                "never applied to the loss path. Remove the pre_loss_pred block. A model/loss "
+                "domain mismatch must be fixed by changing losses.output_domain or the model, "
+                "not bridged by an adapter."
+            )
+        return data
+
     def all_steps(self) -> list[tuple[str, AdapterStepSchema]]:
         """Flat ``(hook, step)`` list across all hooks. Order: declaration."""
         out: list[tuple[str, AdapterStepSchema]] = []
         for hook in (
             "pre_model",
             "post_model",
-            "pre_loss_pred",
             "pre_loss_target",
             "pre_metric",
         ):
@@ -97,7 +105,6 @@ class AdaptersConfigSchema(BaseModel):
             for h in (
                 "pre_model",
                 "post_model",
-                "pre_loss_pred",
                 "pre_loss_target",
                 "pre_metric",
             )

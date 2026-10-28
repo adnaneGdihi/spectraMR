@@ -563,6 +563,33 @@ class TestWorkflowsAccessor:
         assert all(MetricsRegistry.applies_to_regime("psnr", r) for r in Regime)
 
 
+class TestInputSignatureAccessor:
+    """The 3-D sim2rank sweep routes a metric to the volume or per slice by this."""
+
+    def test_declared_volume_signature_is_returned(self) -> None:
+        assert MetricsRegistry.input_signature("through_plane_fwhm") == "volume_3d"
+        assert MetricsRegistry.input_signature("tp_fwhm") == "volume_3d"
+
+    def test_undeclared_signature_is_an_image_pair(self) -> None:
+        saved = MetricsRegistry.snapshot()
+        try:
+
+            @MetricsRegistry.register("_sig_probe")
+            class _Probe:
+                higher_is_better = True
+
+                def __call__(self, prediction, target, **kwargs):
+                    return 0.0
+
+            assert MetricsRegistry.input_signature("_sig_probe") == "image_pair"
+        finally:
+            MetricsRegistry.restore(saved)
+
+    def test_unknown_name_raises(self) -> None:
+        with pytest.raises(KeyError, match="Unknown metric"):
+            MetricsRegistry.input_signature("_no_such_metric")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The kwarg filter must trust __init__ OWNERSHIP, not the advertised signature
 # ─────────────────────────────────────────────────────────────────────────────

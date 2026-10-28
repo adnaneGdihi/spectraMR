@@ -1,11 +1,11 @@
 """Extended tests for integration.py (critical-partial module).
 
-integration.py composes physics primitives into a DataConsistencyLayer
+integration.py composes physics primitives into a OperatorProjectionDataConsistency
 (with IForwardOperator) and CoilSensitivityEstimator. The existing canary in
 test_physics_modules.py only asserts the module is non-None.
 
 New coverage:
-  - DataConsistencyLayer (integration variant) instantiates with an FFT operator
+  - OperatorProjectionDataConsistency (integration variant) instantiates with an FFT operator
   - CoilSensitivityEstimator instantiates and estimate_rss works
   - create_operator factory function works for 'fft' type
   - Module imports are clean even when optional sigpy/torchkbnufft absent
@@ -70,16 +70,16 @@ def test_canary_coil_sensitivity_estimator_rss():
 
 
 # ---------------------------------------------------------------------------
-# DataConsistencyLayer (integration variant) — instantiation only
+# OperatorProjectionDataConsistency (integration variant) — instantiation only
 # ---------------------------------------------------------------------------
 
 @pytest.mark.physics
 def test_integration_dc_layer_instantiates():
-    """integration.DataConsistencyLayer can be constructed with an FFT operator."""
-    from spectramr.infrastructure.physics.integration import DataConsistencyLayer
+    """integration.OperatorProjectionDataConsistency can be constructed with an FFT operator."""
+    from spectramr.infrastructure.physics.integration import OperatorProjectionDataConsistency
     from spectramr.infrastructure.physics.registry import create_operator
     op = create_operator("fft2d")
-    dc = DataConsistencyLayer(operator=op, lambda_dc=1.0)
+    dc = OperatorProjectionDataConsistency(operator=op, lambda_dc=1.0)
     assert dc is not None
 
 

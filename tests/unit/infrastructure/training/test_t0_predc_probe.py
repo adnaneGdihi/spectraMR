@@ -11,7 +11,10 @@ would still produce a plausible number:
 * relying on the generator's stashed sensitivity maps produces a number
   conditioned on whatever ran last, correct only by call order;
 * a key-set that varies makes the DDP all-reduce misalign metric values onto
-  other metrics' names -- never an error.
+  other metrics' names -- never an error;
+* a chunked forward whose per-row kwargs stay full-batch conditions every chunk
+  on row 0, because `complex_unet` truncates the longer embedding instead of
+  raising (#2055).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from spectramr.infrastructure.training.t0_predc_probe import (
     generator_exposes_pre_dc,
     rename_to_probe_namespace,
     run_t0_predc_probe,
+    slice_row_kwargs,
     t0_predc_key,
 )
 
@@ -190,7 +194,7 @@ class TestRunT0PredcProbe:
         gen = StubGenerator(pre_dc_fill=7.0)
         x = torch.zeros(1, 2, 4, 4)
         out = run_t0_predc_probe(
-            generator=gen, model_input=x, forward_kwargs=_kwargs(), score=score
+            generator=gen, model_input=x, forward_kwargs=_kwargs(), score=score, chunk_size=2
         )
         assert torch.equal(seen["pred"], torch.full_like(x, 7.0))
         assert torch.equal(seen["t"], torch.zeros(1, dtype=torch.long))
@@ -206,6 +210,7 @@ class TestRunT0PredcProbe:
             model_input=torch.zeros(1, 2, 4, 4),
             forward_kwargs=_kwargs(),
             score=lambda p, t: called.append(1) or {},
+            chunk_size=2,
         )
         assert out == {}
         assert called == []
@@ -224,6 +229,7 @@ class TestRunT0PredcProbe:
             model_input=x,
             forward_kwargs=_kwargs(),
             score=score,
+            chunk_size=2,
         )
 
 
@@ -278,3 +284,180 @@ def test_a_timesteps_key_in_the_kwargs_does_not_collide_with_the_positional():
     )
     assert out.shape == x.shape
     assert torch.equal(gen.received_timesteps, t), "the positional t=0 must win"
+
+
+class RecordingGenerator(StubGenerator):
+    """Records one entry per forward, so chunk boundaries are observable.
+
+    ``StubGenerator`` keeps only the last call; the chunking contract is about
+    how many calls happen and what each one saw.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.calls: list[dict] = []
+
+    def __call__(self, x, timesteps=None, *, return_pre_dc=False, **kwargs):
+        self.calls.append(
+            {
+                "rows": int(x.shape[0]),
+                "x": x.clone(),
+                "timesteps": None if timesteps is None else timesteps.clone(),
+                "kwargs": {
+                    k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+                },
+            }
+        )
+        return super().__call__(x, timesteps, return_pre_dc=return_pre_dc, **kwargs)
+
+
+def _row_kwargs(batch: int) -> dict:
+    """Production-shaped kwargs: one per-row entry per rank of tensor that occurs."""
+    return {
+        "sensitivity_maps": torch.arange(batch, dtype=torch.float32).view(batch, 1, 1, 1)
+        * torch.ones(batch, 2, 4, 4),
+        "contrast_idx": torch.arange(batch, dtype=torch.long),
+        "mask": torch.ones(batch, 1, 4, 4),
+        "return_attention": False,
+    }
+
+
+class TestSliceRowKwargs:
+    def test_per_row_tensors_are_sliced_and_stay_aligned(self):
+        out = slice_row_kwargs(_row_kwargs(6), batch_size=6, start=2, stop=4)
+        assert torch.equal(out["contrast_idx"], torch.tensor([2, 3]))
+        assert out["sensitivity_maps"].shape[0] == 2
+        assert out["mask"].shape[0] == 2
+
+    def test_non_tensor_values_pass_through_untouched(self):
+        out = slice_row_kwargs(_row_kwargs(6), batch_size=6, start=0, stop=2)
+        assert out["return_attention"] is False
+
+    def test_a_broadcastable_leading_one_is_not_treated_as_per_row(self):
+        # A (1, ...) map broadcasts over the whole batch; slicing it to the
+        # chunk's row range would hand rows 2..3 an empty tensor.
+        kw = {"smaps": torch.ones(1, 2, 4, 4)}
+        out = slice_row_kwargs(kw, batch_size=6, start=2, stop=4)
+        assert out["smaps"].shape[0] == 1
+
+    def test_a_tensor_whose_leading_dim_is_not_the_batch_passes_through(self):
+        kw = {"schedule": torch.ones(29)}
+        out = slice_row_kwargs(kw, batch_size=6, start=0, stop=2)
+        assert out["schedule"].shape[0] == 29
+
+    def test_every_key_survives_the_slice(self):
+        kw = _row_kwargs(6)
+        assert set(slice_row_kwargs(kw, batch_size=6, start=0, stop=2)) == set(kw)
+
+
+class TestChunkedProbeForward:
+    """The probe honours ``validation.loader.chunk_size`` like every other
+    validation forward, and its per-row kwargs chunk with the rows."""
+
+    def test_batch_is_split_into_chunk_sized_forwards(self):
+        gen = RecordingGenerator()
+        run_t0_predc_probe(
+            generator=gen,
+            model_input=torch.zeros(36, 2, 4, 4),
+            forward_kwargs=_row_kwargs(36),
+            score=lambda pred, t: {"val_psnr": 1.0},
+            chunk_size=1,
+        )
+        assert [c["rows"] for c in gen.calls] == [1] * 36
+
+    def test_contrast_idx_chunks_with_the_rows_it_labels(self):
+        # THE pin. A full-batch `contrast_idx` beside a one-row `x` is not an
+        # error: complex_unet truncates the embedding, so every chunk would run
+        # as contrast 0 and the arm would still report a number (#2055).
+        gen = RecordingGenerator()
+        run_t0_predc_probe(
+            generator=gen,
+            model_input=torch.zeros(6, 2, 4, 4),
+            forward_kwargs=_row_kwargs(6),
+            score=lambda pred, t: {"val_psnr": 1.0},
+            chunk_size=2,
+        )
+        seen = torch.cat([c["kwargs"]["contrast_idx"] for c in gen.calls])
+        assert torch.equal(seen, torch.arange(6)), (
+            "chunks were not conditioned on their own rows' contrast"
+        )
+        for call in gen.calls:
+            assert call["kwargs"]["contrast_idx"].shape[0] == call["rows"]
+            assert call["kwargs"]["sensitivity_maps"].shape[0] == call["rows"]
+            assert call["timesteps"].shape[0] == call["rows"]
+
+    def test_a_ragged_final_chunk_is_carried_not_dropped(self):
+        gen = RecordingGenerator()
+        run_t0_predc_probe(
+            generator=gen,
+            model_input=torch.zeros(5, 2, 4, 4),
+            forward_kwargs=_row_kwargs(5),
+            score=lambda pred, t: {"val_psnr": 1.0},
+            chunk_size=2,
+        )
+        assert [c["rows"] for c in gen.calls] == [2, 2, 1]
+
+    def test_chunked_output_equals_the_unchunked_one(self):
+        # Chunking is a memory decision, never a numerical one.
+        def run(chunk):
+            seen = {}
+            run_t0_predc_probe(
+                generator=RecordingGenerator(pre_dc_fill=3.0),
+                model_input=torch.arange(24, dtype=torch.float32).view(6, 1, 2, 2),
+                forward_kwargs=_row_kwargs(6),
+                score=lambda pred, t: seen.update(pred=pred.clone(), t=t.clone()) or {},
+                chunk_size=chunk,
+            )
+            return seen
+
+        chunked, whole = run(2), run(6)
+        assert torch.equal(chunked["pred"], whole["pred"])
+        assert torch.equal(chunked["t"], whole["t"])
+
+    def test_a_chunk_at_or_above_the_batch_is_one_forward(self):
+        # The pre-change behaviour, so arms that set a large chunk are unmoved.
+        gen = RecordingGenerator()
+        run_t0_predc_probe(
+            generator=gen,
+            model_input=torch.zeros(4, 2, 4, 4),
+            forward_kwargs=_row_kwargs(4),
+            score=lambda pred, t: {"val_psnr": 1.0},
+            chunk_size=8,
+        )
+        assert [c["rows"] for c in gen.calls] == [4]
+
+    def test_scoring_sees_the_whole_batch_once_not_once_per_chunk(self):
+        # The metrics seam is full-batch; a per-chunk call would emit a row per
+        # chunk and rename each into the same probe key.
+        scored = []
+        run_t0_predc_probe(
+            generator=RecordingGenerator(),
+            model_input=torch.zeros(6, 2, 4, 4),
+            forward_kwargs=_row_kwargs(6),
+            score=lambda pred, t: scored.append(int(pred.shape[0])) or {"val_psnr": 1.0},
+            chunk_size=2,
+        )
+        assert scored == [6]
+
+    def test_non_positive_chunk_clamps_to_one_row(self):
+        # Mirrors the multi-step sampler's `max(1, int(...))`. The schema pins
+        # the field at ge=1, so this is unreachable from config -- it exists so
+        # a caller bug degrades to the safe direction rather than `split(0)`.
+        gen = RecordingGenerator()
+        run_t0_predc_probe(
+            generator=gen,
+            model_input=torch.zeros(3, 2, 4, 4),
+            forward_kwargs=_row_kwargs(3),
+            score=lambda pred, t: {"val_psnr": 1.0},
+            chunk_size=0,
+        )
+        assert [c["rows"] for c in gen.calls] == [1, 1, 1]
+
+    def test_chunk_size_is_required_so_omitting_it_cannot_run_full_batch(self):
+        with pytest.raises(TypeError, match="chunk_size"):
+            run_t0_predc_probe(
+                generator=RecordingGenerator(),
+                model_input=torch.zeros(2, 2, 4, 4),
+                forward_kwargs=_row_kwargs(2),
+                score=lambda pred, t: {},
+            )

@@ -11,7 +11,7 @@ from spectramr.infrastructure.physics.chain_fitter import (
     warm_start_theta,
 )
 from spectramr.infrastructure.physics.degradation_chain import ChainLink, DegradationChain
-from spectramr.infrastructure.physics.digital_twin_extensions import DEGRADATION_REGISTRY
+from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 from spectramr.infrastructure.physics.quality_descriptors import measure_attributes
 
 ATTRS = ["tenengrad_variance"]
@@ -34,9 +34,7 @@ def test_warm_start_inverts_the_declared_affine_severity():
     # PhysicalParam.value_at is affine, so the inverse is exact.
     spec = DEGRADATION_REGISTRY["complex_gaussian"].severity
     midpoint = spec.primary.value_at(0.5)
-    assert warm_start_theta("complex_gaussian", midpoint) == pytest.approx(
-        0.5, abs=1e-6
-    )
+    assert warm_start_theta("complex_gaussian", midpoint) == pytest.approx(0.5, abs=1e-6)
 
 
 def test_warm_start_handles_a_decreasing_axis():
@@ -263,6 +261,40 @@ def test_acquisition_warm_start_matches_the_declared_affine_inverse():
 
     spec = DEGRADATION_REGISTRY["complex_gaussian"].severity.primary
     delta = spec.value_at(0.25) - spec.at_theta_min
-    assert acquisition_warm_start(["complex_gaussian"], delta)[0] == pytest.approx(
-        0.25, abs=1e-6
+    assert acquisition_warm_start(["complex_gaussian"], delta)[0] == pytest.approx(0.25, abs=1e-6)
+
+
+def test_fit_raises_when_the_residual_exceeds_the_absolute_ceiling():
+    # Planted: a fit that closes its gap relatively but misses the target absolutely.
+    # min_gap_closed=0 lets only the ceiling decide.
+    from spectramr.infrastructure.physics.chain_fitter import DegenerateFitError
+
+    x = _volume()
+    truth = DegradationChain(links=(ChainLink(axis="complex_gaussian", theta=0.5),))
+    target = measure_attributes(_degrade(truth, x, seed=1), attributes=["tenengrad_variance"])
+    with pytest.raises(DegenerateFitError, match="absolute ceiling"):
+        fit_chain(
+            x,
+            axes=["complex_gaussian"],
+            target={k: 10.0 * v for k, v in target.items()},
+            attributes=["tenengrad_variance"],
+            seed=1,
+            max_evals=40,
+            min_gap_closed=0.0,
+            max_residual=1e-6,
+        )
+
+
+def test_fit_without_a_ceiling_is_unchanged_by_the_new_knob():
+    x = _volume()
+    truth = DegradationChain(links=(ChainLink(axis="complex_gaussian", theta=0.5),))
+    target = measure_attributes(_degrade(truth, x, seed=1), attributes=["tenengrad_variance"])
+    result = fit_chain(
+        x,
+        axes=["complex_gaussian"],
+        target=target,
+        attributes=["tenengrad_variance"],
+        seed=1,
+        max_evals=60,
     )
+    assert result.residual >= 0.0

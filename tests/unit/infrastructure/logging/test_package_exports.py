@@ -13,6 +13,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 import spectramr.infrastructure.logging as pkg
 
 _INIT = (
@@ -43,7 +45,7 @@ def test_all_contains_eager_and_lazy_names() -> None:
     eager = {
         "banner",
         "phase",
-        "smart_progress",
+        "make_progress",
         "collect_run_provenance",
         "count_parameters",
         "format_provenance_lines",
@@ -54,11 +56,8 @@ def test_all_contains_eager_and_lazy_names() -> None:
     }
     lazy = {
         "LoggingService",
-        "ComprehensiveLoggingService",
         "LoggingServiceFactory",
-        "create_logging_service",
         "MetricsTracker",
-        "TrainingLogDelegate",
         "ColoredConsoleFormatter",
         "bootstrap_console_logging",
     }
@@ -73,3 +72,23 @@ def test_every_all_name_is_resolvable() -> None:
         assert getattr(pkg, name) is not None, (
             f"{name!r} is in __all__ but cannot be resolved on the package."
         )
+
+
+def test_bootstrap_import_failure_names_the_real_cause(monkeypatch) -> None:
+    """A broken transitive import must not read as a missing ``bootstrap_console_logging``."""
+    import builtins
+    import sys
+
+    monkeypatch.delitem(
+        sys.modules, "spectramr.infrastructure.services.logging_service", raising=False
+    )
+    real_import = builtins.__import__
+
+    def failing(name, *args, **kwargs):
+        if name == "spectramr.infrastructure.services.logging_service":
+            raise ImportError("torch 2.7.1 is older than required")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing)
+    with pytest.raises(ImportError, match=r"torch 2\.7\.1 is older than required"):
+        pkg.__getattr__("bootstrap_console_logging")

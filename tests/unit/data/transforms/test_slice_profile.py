@@ -26,11 +26,12 @@ import torchio as tio
 from spectramr.data.transforms.slice_profile import (
     SliceProfileTransform,
     _convolve_along_axis,
+)
+from spectramr.infrastructure.physics.degradations.blocks.slice_physics import (
     _gauss_kernel,
     _sinc_gauss_kernel,
     _slr_kernel,
 )
-
 
 # ---------------------------------------------------------------------------
 # Construction
@@ -327,3 +328,33 @@ class TestSliceProfileActsOnlyOnZ:
         t = build_transform("slice_profile", keys=["input", "target"])
         s = tio.Subject(input=tio.ScalarImage(tensor=torch.rand(1, 4, 4, 8)))
         assert "input" in t(s)
+
+
+# Captured from the pre-move slice_profile.py at commit b1428b57d: the output of
+# SliceProfileTransform(profile, slice_thickness_mm=3.0) on rand(1, 1, 2, 12) (seed 0),
+# one value per decimated slice (each repeats 3 times along z). Profiles differ by >= 0.06.
+_GOLDEN_B1428B57D = {
+    "sinc_gauss": [
+        0.39484092593193054, 0.22085776925086975, 0.6116795539855957, 0.5172286033630371,
+        0.06707239151000977, 0.5014984607696533, 0.3994806110858917, 0.6912357807159424,
+    ],
+    "gauss": [
+        0.3436369299888611, 0.28191494941711426, 0.5914779901504517, 0.5127658843994141,
+        0.08453066647052765, 0.483359694480896, 0.4552137851715088, 0.6454957127571106,
+    ],
+    "shinnar_le_roux": [
+        0.17473796010017395, 0.2667175531387329, 0.43821290135383606, 0.419354647397995,
+        0.07392837107181549, 0.3036385774612427, 0.443697065114975, 0.4545450210571289,
+    ],
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("profile", sorted(_GOLDEN_B1428B57D))
+def test_output_matches_pre_move_golden(profile: str) -> None:
+    vol = torch.rand(1, 1, 2, 12, generator=torch.Generator().manual_seed(0))
+    subject = tio.Subject(input=tio.ScalarImage(tensor=vol))
+    t = SliceProfileTransform(profile=profile, slice_thickness_mm=3.0, keys=("input",))
+    out = t(subject)["input"].data
+    expected = torch.tensor(_GOLDEN_B1428B57D[profile]).view(2, 4).repeat_interleave(3, dim=-1)
+    # Bit-identical on the capturing machine; 1e-6 leaves room for another CPU's conv1d order.
+    torch.testing.assert_close(out, expected.view(1, 1, 2, 12), rtol=0.0, atol=1e-6)

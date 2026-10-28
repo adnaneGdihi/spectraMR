@@ -29,7 +29,6 @@ class PhysicsBuilder(Builder):
         >>> builder = PhysicsBuilder(config, torch.device("cuda"))
         >>> physics = (builder
         ...     .build_fft_transformer()
-        ...     .build_mask_generator()
         ...     .build_data_consistency()
         ...     .build())
         >>> fft = physics["fft"]
@@ -62,62 +61,6 @@ class PhysicsBuilder(Builder):
         except Exception as e:
             logger.error(f"Failed to create FFT transformer: {e}")
             raise
-
-        return self
-
-    def build_mask_generator(self) -> "PhysicsBuilder":
-        """Create k-space undersampling mask generator.
-
-        Creates mask generator for undersampling simulations.
-
-        Returns:
-            self: For method chaining
-        """
-        try:
-            from spectramr.infrastructure.training.utils.kspace_masks import (
-                KSpaceMaskGenerator,
-            )
-            from spectramr.models.diffusion.kspace_process import (
-                accelerator_kwargs_from_config,
-            )
-
-            # Extract acceleration config if available
-            accel_config = self._config.undersampling
-
-            # The schedule length lives at `training.diffusion.timesteps`.
-            # A second branch used to read `training.num_timesteps` — a path no
-            # schema has ever carried, so it could not fire even when the block
-            # above was absent. Removed rather than repointed: the flat legacy
-            # spelling folds at load, so anything the arm declares arrives here
-            # already nested.
-            num_timesteps = 1000  # Default
-            if (
-                self._config.training
-                and hasattr(self._config.training, "diffusion")
-                and self._config.training.diffusion
-            ):
-                num_timesteps = getattr(self._config.training.diffusion, "timesteps", 1000)
-
-            kwargs = {}
-            default_pattern = "linear"
-
-            if accel_config:
-                # Was ``accel_config.model_dump()`` verbatim — every schema
-                # field, defaults included, splatted into the accelerator
-                # constructor, and ``mask_seed`` never translated to ``seed``.
-                # Same defect as the strategy mixin had; same shared allowlist
-                # fixes it, so all three generators build alike.
-                default_pattern, kwargs = accelerator_kwargs_from_config(accel_config)
-
-            self._components["mask_generator"] = KSpaceMaskGenerator(
-                num_timesteps=num_timesteps,
-                device=self._device,
-                default_pattern=default_pattern,
-                accelerator_kwargs=kwargs,
-            )
-            logger.info(f"Created k-space mask generator (pattern={default_pattern})")
-        except Exception as e:
-            logger.warning(f"Failed to create mask generator: {e}")
 
         return self
 

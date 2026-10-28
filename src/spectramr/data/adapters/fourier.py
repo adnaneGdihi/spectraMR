@@ -3,8 +3,7 @@
 Promotes the implicit FFT/iFFT auto-bridge already inside ``LossBuilder``
 to a declarative, audited adapter. When ``losses.output_domain == 'image'``
 but the YAML lists kspace_losses, today the LossBuilder silently inserts
-an FFT — making the same pattern declarable as ``adapters.pre_loss_pred:
-[fft_image_to_kspace]`` is what brings audit visibility to the bridge.
+an FFT. Declaring it as an adapter brings audit visibility to the bridge.
 
 Phase 3: register and surface in the Spec Card. Phase 4 will rewire
 LossBuilder to honor the explicit chain when present.
@@ -28,7 +27,7 @@ from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
     # → kspace_cold_diffusion). The audit's ``data_model_compatibility``
     # check expects an explicit adapter at that hook to cover the
     # domain bridge per CLAUDE.md #9 (no silent rescue).
-    insertion_points=("pre_model", "pre_loss_pred", "pre_loss_target"),
+    insertion_points=("pre_model", "pre_loss_target"),
     invertible=True,
     side_effects=("amp_autocast_handled_by_fft_ops",),
 )
@@ -44,7 +43,7 @@ class FFTImageToKspace(nn.Module):
         # Coercion is delegated to fft2c's SSOT ``_to_complex``, which
         # de-interleaves a real/imag-interleaved ``[B, 2C, H, W]`` tensor into
         # ``[B, C, H, W]`` complex. A manual ``x.to(complex64)`` here would
-        # PRE-EMPT that, misreading 2-channel real_interleaved data as 2
+        # PREEMPT that, misreading 2-channel real_interleaved data as 2
         # zero-imaginary complex channels — the 2ch→4ch doubling that crashed
         # exp_vf_method_a/c + ib_infonce (cluster VF smoke 2026-06-16).
         return fft2c(x)
@@ -63,7 +62,6 @@ class FFTImageToKspace(nn.Module):
     insertion_points=(
         "pre_model",
         "post_model",
-        "pre_loss_pred",
         "pre_loss_target",
         "pre_metric",
     ),
@@ -87,4 +85,30 @@ class IFFTKspaceToImage(nn.Module):
         return ifft2c(x)
 
 
-__all__ = ["FFTImageToKspace", "IFFTKspaceToImage"]
+@register_adapter(
+    name="kspace_to_real_imag_interleave",
+    bridges_from={"domain": "kspace"},
+    bridges_to={"domain": "kspace"},
+    # Feeds a k-space model that takes 2-channel real-interleaved input (e.g. FNO)
+    # from a complex k-space tensor produced by ``fft_image_to_kspace``.
+    insertion_points=("pre_model",),
+    invertible=True,
+    side_effects=(),
+)
+class KSpaceToRealImagInterleave(nn.Module):
+    """Complex ``[B, C, H, W]`` k-space -> real ``[B, 2C, H, W]`` interleaved (Re, Im)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.is_complex(x):
+            raise ValueError(
+                "kspace_to_real_imag_interleave expects a complex k-space tensor; "
+                f"got real dtype={x.dtype}, shape={tuple(x.shape)}."
+            )
+        b, c, *spatial = x.shape
+        out = x.new_zeros((b, c * 2, *spatial), dtype=torch.float32)
+        out[:, 0::2] = x.real
+        out[:, 1::2] = x.imag
+        return out
+
+
+__all__ = ["FFTImageToKspace", "IFFTKspaceToImage", "KSpaceToRealImagInterleave"]

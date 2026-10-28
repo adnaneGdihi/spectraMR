@@ -55,3 +55,11 @@ def test_dict_input_paths() -> None:
 def test_invalid_reduction_raises() -> None:
     with pytest.raises(ValueError):
         NLLBitsPerDim(reduction="median")
+
+
+@pytest.mark.parametrize("bad", [torch.full((4,), 16.0), 16.0, 0, True])
+def test_num_dims_must_be_a_positive_int(bad: object) -> None:
+    """A ``loss(pred, target)`` call puts the target where ``num_dims`` goes; it
+    must raise rather than broadcast into a per-element divisor."""
+    with pytest.raises(TypeError, match="num_dims"):
+        NLLBitsPerDim()(torch.full((4,), -10.0), num_dims=bad)  # type: ignore[arg-type]

@@ -1,51 +1,30 @@
-from abc import ABC, abstractmethod
-from typing import Any
+"""The checkpoint interface the DI container hands to training.
 
-from torch import nn
+Implemented by ``infrastructure.checkpointing.facade.CheckpointStore``. Domain may not
+import infrastructure, so the signatures carry ``Any`` and keyword arguments; the
+module functions behind the facade own the typed signatures.
+"""
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any
 
 
 class ICheckpointService(ABC):
-    """Interface for model checkpoint management.
-
-    ### Checkpoint Interface Hierarchy
-    ```mermaid
-    classDiagram
-        class ICheckpointService {
-            <<interface>>
-            +save_checkpoint(model, optimizer, epoch, loss, path)
-            +load_checkpoint(model, optimizer, path)
-            +find_latest_checkpoint(dir)
-        }
-        class CheckpointServiceImpl {
-            +save_checkpoint()
-            +load_checkpoint()
-        }
-        ICheckpointService <|.. CheckpointServiceImpl
-    ```
-    """
+    """Write a run's checkpoints and restore from them."""
 
     @abstractmethod
-    def save_checkpoint(
-        self,
-        model: nn.Module,
-        optimizer: Any,
-        epoch: int,
-        loss: float,
-        file_path: str,
-        **kwargs: Any,
-    ) -> None:
-        """Save a model checkpoint."""
+    def save_step(self, pipeline: Any, **kwargs: Any) -> Path:
+        """Write a step checkpoint; see ``checkpointing.store.save_step``."""
 
     @abstractmethod
-    def load_checkpoint(
-        self,
-        model: nn.Module,
-        optimizer: Any,
-        file_path: str,
-        **kwargs: Any,
-    ) -> dict[str, Any] | None:
-        """Load a model checkpoint."""
+    def save_best(self, pipeline: Any, **kwargs: Any) -> Path:
+        """Replace the best checkpoint; see ``checkpointing.store.save_best``."""
 
     @abstractmethod
-    def find_latest_checkpoint(self, checkpoint_dir: str) -> str | None:
-        """Find the latest checkpoint in a directory."""
+    def resume(self, path: str | Path, pipeline: Any, **kwargs: Any) -> Any:
+        """Restore every part; see ``checkpointing.resume.resume``."""
+
+    @abstractmethod
+    def best_weights(self, path: str | Path, pipeline: Any, **kwargs: Any) -> None:
+        """Restore models and EMA only; see ``checkpointing.restore.best_weights``."""

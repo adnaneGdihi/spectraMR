@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from spectramr.infrastructure.physics.forward_operator import (
-    DataConsistencyLayer,
+    MultiCoilDataConsistency,
     MultiCoilForwardOperator,
     NullSpaceProjection,
     create_cartesian_mask,
@@ -265,7 +265,7 @@ class TestNullSpaceProjection:
 
 
 # =============================================================================
-# DataConsistencyLayer Tests
+# MultiCoilDataConsistency Tests
 # =============================================================================
 
 
@@ -274,7 +274,7 @@ class TestDataConsistencyLayer:
 
     def test_soft_dc_reduces_residual(self, forward_operator):
         """Verify soft DC reduces ||Ax - y||."""
-        dc = DataConsistencyLayer(forward_operator, mode="soft", lambda_dc=1.0)
+        dc = MultiCoilDataConsistency(forward_operator, mode="soft", lambda_dc=1.0)
 
         # Create ground truth and measurements
         x_gt = torch.randn(1, 1, 32, 32, dtype=torch.cfloat)
@@ -296,7 +296,7 @@ class TestDataConsistencyLayer:
 
     def test_hard_dc_exact_consistency(self, forward_operator):
         """Verify hard DC makes Ax exactly match y at measured locations."""
-        dc = DataConsistencyLayer(forward_operator, mode="hard")
+        dc = MultiCoilDataConsistency(forward_operator, mode="hard")
 
         x_gt = torch.randn(1, 1, 32, 32, dtype=torch.cfloat)
         y = forward_operator(x_gt)
@@ -330,7 +330,7 @@ class TestDataConsistencyLayer:
 
     def test_hard_dc_idempotent(self, forward_operator):
         """Verify DC(DC(x)) = DC(x) for hard mode."""
-        dc = DataConsistencyLayer(forward_operator, mode="hard")
+        dc = MultiCoilDataConsistency(forward_operator, mode="hard")
 
         x = torch.randn(1, 1, 32, 32, dtype=torch.cfloat)
         y = forward_operator(torch.randn(1, 1, 32, 32, dtype=torch.cfloat))
@@ -346,7 +346,7 @@ class TestDataConsistencyLayer:
     def test_no_nan_dc(self, forward_operator):
         """Directive 4.D.1: No NaN in DC output."""
         for mode in ["soft", "hard"]:
-            dc = DataConsistencyLayer(forward_operator, mode=mode)
+            dc = MultiCoilDataConsistency(forward_operator, mode=mode)
 
             x = torch.randn(2, 1, 32, 32, dtype=torch.cfloat)
             y = torch.randn(2, 4, 32, 32, dtype=torch.cfloat)

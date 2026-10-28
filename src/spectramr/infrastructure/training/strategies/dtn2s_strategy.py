@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.config.schemas.training.strategy_knobs_2026_08 import (
     DTN2STrainingConfigSchema,
 )
@@ -38,10 +39,20 @@ class DTN2SStrategy(BaseTrainingStrategy):
     """Dual-Traversal Noise2Self self-supervised denoising (Spec §10).
 
     The model (``env.generator``) must accept a flat sequence
-    ``(B, C, N)`` and return a same-shape prediction. Receptive-window
-    half-width is read from
+    ``(B, C, N)`` and return a same-shape prediction, and must declare a
+    ``receptive_half_width`` no larger than the window (for example
+    ``windowed_sequence_denoiser``): the mask certifies J-invariance only for a
+    backbone that reads no further than the window, so any other backbone raises
+    instead of being trained on a mask that does not cover it. The window is
     ``config.training.dtn2s.receptive_window`` (default 8 tokens).
     """
+
+    @classmethod
+    def standalone_infer_blocker(cls, config: object) -> str | None:
+        return (
+            "the DTN2S backbone consumes a space-filling-curve sequence, which only this "
+            "strategy builds; `infer` would feed it the raw image."
+        )
 
     def __init__(self, env=None, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
@@ -72,6 +83,13 @@ class DTN2SStrategy(BaseTrainingStrategy):
         ``blocked[permutation]`` is the same set expressed positionally.
         """
         phi_a, phi_b = self._resolve_traversals(x)
+        recv = self._recv()
+        if self._mask is None:
+            blocked_voxels = build_dtn2s_mask(phi_a, phi_b, recv)
+            self._mask = blocked_voxels[phi_a.permutation]
+        return self._mask.to(x.device)
+
+    def _recv(self) -> int:
         # Read the TYPED schema field (`DTN2STrainingConfigSchema`,
         # config/schemas/training/strategy_knobs_2026_08.py:355). This used to
         # be `getattr(_dtn2s_cfg, "receptive_window", 8)` on an untyped object,
@@ -86,11 +104,41 @@ class DTN2SStrategy(BaseTrainingStrategy):
         # literal repeated here. One owner for the default; a declared value is
         # never substituted, only an absent block is filled.
         dtn2s_cfg = self.config.training.dtn2s or DTN2STrainingConfigSchema()
-        recv = int(dtn2s_cfg.receptive_window)
-        if self._mask is None:
-            blocked_voxels = build_dtn2s_mask(phi_a, phi_b, recv)
-            self._mask = blocked_voxels[phi_a.permutation]
-        return self._mask.to(x.device)
+        return int(dtn2s_cfg.receptive_window)
+
+    def _require_j_invariant_backbone(self, generator: Any) -> None:
+        """Raise unless the backbone declares a receptive field inside the mask's window."""
+        declared = getattr(unwrap_model(generator), "receptive_half_width", None)
+        recv = self._recv()
+        if declared is None:
+            raise ValueError(
+                "DTN2S needs a backbone that declares `receptive_half_width`; "
+                f"{type(generator).__name__} does not, so nothing says it reads no further than "
+                f"the mask's window ({recv} tokens). Use model_type: windowed_sequence_denoiser."
+            )
+        if int(declared) > recv:
+            raise ValueError(
+                f"The backbone reads {int(declared)} tokens either side but the J-invariance mask "
+                f"only covers training.dtn2s.receptive_window={recv}: outputs would see their own "
+                "target. Narrow the backbone or widen the window."
+            )
+
+    def _validation_forward(
+        self, input_batch: torch.Tensor, batch_context: dict[str, Any], **kwargs: Any
+    ) -> torch.Tensor:
+        """The J-invariant denoiser as an image: mask, read in phi_A order, write in phi_B order.
+
+        Validation scores the same estimator training fits, so the blocked voxels are zeroed here
+        too; an unmasked pass would let a voxel inform its own prediction.
+        """
+        del batch_context, kwargs
+        generator = self.env.generator
+        self._require_j_invariant_backbone(generator)
+        phi_a, phi_b = self._resolve_traversals(input_batch)
+        mask = self._resolve_mask(input_batch)
+        s_a = phi_a.linearize(input_batch).clone()
+        s_a[..., mask] = 0.0
+        return phi_b.unflatten(generator(s_a), tuple(input_batch.shape[-2:]))
 
     def _compute_losses_impl(
         self,
@@ -106,6 +154,7 @@ class DTN2SStrategy(BaseTrainingStrategy):
         """
         del target_batch
         generator = self.env.generator
+        self._require_j_invariant_backbone(generator)
 
         phi_a, phi_b = self._resolve_traversals(input_batch)
         mask = self._resolve_mask(input_batch)  # (N,) bool

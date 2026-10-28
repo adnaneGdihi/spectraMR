@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as _F
+import torch.nn.functional as F
 
 from spectramr.models.losses.registry import register_loss
 
@@ -90,13 +90,13 @@ class ZeroShotDenoisingLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Global reconstruction loss
-        loss_recon = _F.l1_loss(prediction, target)
+        loss_recon = F.l1_loss(prediction, target)
 
         # Marker-specific anchor loss
         if marker_mask is not None and marker_prior is not None:
             pred_marker = prediction * marker_mask
             target_marker = (marker_prior * marker_mask).expand_as(pred_marker)
-            loss_marker = _F.l1_loss(pred_marker, target_marker)
+            loss_marker = F.l1_loss(pred_marker, target_marker)
             return loss_recon + self.lambda_marker * loss_marker
 
         return loss_recon
@@ -169,24 +169,24 @@ class MarkerMaskedDiscriminatorLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if discriminator is None or marker_mask is None:
-            return _F.l1_loss(prediction, target)
+            return F.l1_loss(prediction, target)
 
         fake_masked = prediction * marker_mask
         real_masked = target * marker_mask
 
-        d_fake = discriminator(fake_masked)
-        d_real = discriminator(real_masked)
+        d_fake: torch.Tensor = discriminator(fake_masked)
+        d_real: torch.Tensor = discriminator(real_masked)
 
         if self.loss_type == "hinge":
             loss_g = -d_fake.mean()
-            loss_d = _F.relu(1.0 - d_real).mean() + _F.relu(1.0 + d_fake.detach()).mean()
+            loss_d = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake.detach()).mean()
         else:
             ones = torch.ones_like(d_real)
             zeros = torch.zeros_like(d_fake)
-            loss_d = _F.binary_cross_entropy_with_logits(
+            loss_d = F.binary_cross_entropy_with_logits(
                 d_real, ones
-            ) + _F.binary_cross_entropy_with_logits(d_fake.detach(), zeros)
-            loss_g = _F.binary_cross_entropy_with_logits(d_fake, ones)
+            ) + F.binary_cross_entropy_with_logits(d_fake.detach(), zeros)
+            loss_g = F.binary_cross_entropy_with_logits(d_fake, ones)
 
         return loss_g + loss_d
 
@@ -270,7 +270,7 @@ class MarkerConditionedVAELoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Reconstruction loss
-        loss_recon = _F.l1_loss(prediction, target)
+        loss_recon = F.l1_loss(prediction, target)
 
         # KL divergence
         loss_kl = torch.tensor(0.0, device=prediction.device)
@@ -280,7 +280,7 @@ class MarkerConditionedVAELoss(nn.Module):
         # Marker anchor
         loss_marker = torch.tensor(0.0, device=prediction.device)
         if marker_mask is not None and marker_prior is not None:
-            loss_marker = _F.l1_loss(prediction * marker_mask, marker_prior * marker_mask)
+            loss_marker = F.l1_loss(prediction * marker_mask, marker_prior * marker_mask)
 
         return loss_recon + self.beta * loss_kl + self.lambda_marker * loss_marker
 
@@ -418,16 +418,20 @@ class DiffusionVarianceCalibrationLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Standard reconstruction loss (complex-safe via abs)
-        loss_recon = _F.l1_loss(torch.abs(prediction), torch.abs(target))
+        loss_recon = F.l1_loss(torch.abs(prediction), torch.abs(target))
 
         if estimated_noise_var is None or marker_mask is None:
             return loss_recon
 
-        # Measure actual noise variance from marker region
-        residual = (prediction - target) * marker_mask
-        n_voxels = marker_mask.sum().clamp(min=1)
-        # Complex-safe squared magnitude: |z|² not z²
-        actual_var = torch.abs(residual).square().sum() / n_voxels
+        # Measure actual noise variance from marker region. It is a measurement the
+        # estimate is calibrated against, so no gradient reaches the prediction
+        # through it: that would reward a larger marker error whenever the
+        # estimated variance exceeds the measured one.
+        with torch.no_grad():
+            residual = (prediction - target) * marker_mask
+            n_voxels = marker_mask.sum().clamp(min=1)
+            # Complex-safe squared magnitude: |z|² not z²
+            actual_var = torch.abs(residual).square().sum() / n_voxels
 
         # Calibration: model's estimate should match measured
         loss_cal = (estimated_noise_var.mean() - actual_var).square()

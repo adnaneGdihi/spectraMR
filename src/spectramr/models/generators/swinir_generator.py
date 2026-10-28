@@ -15,16 +15,6 @@ from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
-class LayerNorm2d(nn.LayerNorm):
-    """LayerNorm for 4D inputs (B, C, H, W)."""
-
-    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, **kwargs):
-        super().__init__(normalized_shape, eps, elementwise_affine, **kwargs)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-
 class RSTB(nn.Module):
     """Residual Swin Transformer Block (RSTB)."""
 
@@ -88,9 +78,9 @@ class RSTB(nn.Module):
             ],
         )
 
-        self.conv = nn.Linear(dim, dim)
+        self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
         """forward.
 
         Args:
@@ -103,7 +93,8 @@ class RSTB(nn.Module):
         Executes PyTorch tensor operations.
 
         Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
+            x (torch.Tensor, shape (B, H*W, C)): Token sequence.
+            x_size (tuple[int, int]): The (H, W) the tokens tile.
 
         Returns:
             torch.Tensor: Output tensor.
@@ -112,8 +103,10 @@ class RSTB(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         res = x
         for block in self.residual_group:
-            res = block(res)
-        return x + self.conv(res)
+            res = block(res, input_resolution=x_size)
+        b, _, c = res.shape
+        res = self.conv(res.transpose(1, 2).reshape(b, c, *x_size))
+        return x + res.flatten(2).transpose(1, 2)
 
 
 class PatchEmbed(nn.Module):
@@ -283,6 +276,11 @@ class SwinIRGenerator(IGenerator, nn.Module):
             patch_norm (bool): Description.
         """
         super().__init__()
+        if patch_size != 1:
+            raise ValueError(
+                f"SwinIR: patch_size={patch_size} is unsupported; the upsampler restores "
+                "only `upscale`, so tokens must tile the input at patch_size=1"
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.upscale = upscale
@@ -319,63 +317,37 @@ class SwinIRGenerator(IGenerator, nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         # stochastic depth decay rule
 
-        # build Residual Swin Transformer blocks (RSTB)
-        self.layers = nn.ModuleList()
-        for i_layer in range(len(depths)):
-            layer = nn.ModuleList(
-                [
-                    RSTB(
-                        dim=int(embed_dim * 2**i_layer),
-                        input_resolution=(
-                            patches_resolution[0] // (2**i_layer),
-                            patches_resolution[1] // (2**i_layer),
-                        ),
-                        depth=depths[i_layer],
-                        num_heads=num_heads[i_layer],
-                        window_size=window_size,
-                        mlp_ratio=mlp_ratio,
-                        qkv_bias=qkv_bias,
-                        qk_scale=qk_scale,
-                        drop=drop_rate,
-                        attn_drop=attn_drop_rate,
-                        drop_path=(
-                            dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])][i]
-                            if isinstance(dpr, list)
-                            else dpr
-                        ),
-                        norm_layer=norm_layer,
-                        img_size=img_size // (2**i_layer),
-                        patch_norm=patch_norm,
-                    )
-                    for i in range(depths[i_layer])
-                ],
+        if len(num_heads) != len(depths):
+            raise ValueError(
+                f"SwinIR: num_heads has {len(num_heads)} entries but depths has {len(depths)}"
             )
 
-            if i_layer < len(depths) - 1:
-                downsample = nn.Sequential(
-                    nn.Conv2d(
-                        int(embed_dim * 2**i_layer),
-                        int(embed_dim * 2 ** (i_layer + 1)),
-                        kernel_size=3,
-                        stride=2,
-                        padding=1,
-                    ),
-                    LayerNorm2d(int(embed_dim * 2 ** (i_layer + 1))),
-                )
-                layer.append(downsample)
+        # Canonical SwinIR: one RSTB per ``depths`` entry, all at the input resolution
+        # and embed_dim, so the output is input * upscale whatever the depth config.
+        self.layers = nn.ModuleList(
+            RSTB(
+                dim=embed_dim,
+                input_resolution=(patches_resolution[0], patches_resolution[1]),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]) : sum(depths[: i_layer + 1])],
+                norm_layer=norm_layer,
+                img_size=img_size,
+                patch_norm=patch_norm,
+            )
+            for i_layer in range(len(depths))
+        )
 
-            self.layers.append(layer)
-
-        self.norm = norm_layer(int(embed_dim * 2 ** (len(depths) - 1)))
+        self.norm = norm_layer(embed_dim)
 
         # build the last conv layer in deep feature extraction
-        self.conv_after_body = nn.Conv2d(
-            int(embed_dim * 2 ** (len(depths) - 1)),
-            embed_dim,
-            3,
-            1,
-            1,
-        )
+        self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
 
         # upsample
         self.conv_before_upsample = nn.Sequential(
@@ -471,42 +443,19 @@ class SwinIRGenerator(IGenerator, nn.Module):
         x = self.check_image_size(x)
 
         # shallow feature extraction
-        x = self.patch_embed(x)  # B, H*W, C
-        pos_embed = self._get_pos_embed(x.shape[1])
-        x = x + pos_embed
+        shallow = self.patch_embed.conv(x)  # B, C, Hp, Wp
+        x_size = (shallow.shape[2], shallow.shape[3])
+        x = self.patch_embed.norm(shallow.flatten(2).transpose(1, 2))  # B, Hp*Wp, C
+        x = x + self._get_pos_embed(x.shape[1])
         x = self.pos_drop(x)
 
         # deep feature extraction
-        for i_layer, layer in enumerate(self.layers):
-            has_downsample = i_layer < len(self.layers) - 1
-            rstb_blocks = layer[:-1] if has_downsample else layer
+        for layer in self.layers:
+            x = layer(x, x_size)
 
-            for block in rstb_blocks:
-                x = block(x)
-
-            if has_downsample:
-                # Convert to spatial for downsampling
-                B, HW, C = x.shape
-                res_h = self.patches_resolution[0] // (2**i_layer)
-                res_w = self.patches_resolution[1] // (2**i_layer)
-                x = x.view(B, res_h, res_w, C)
-                x = x.permute(0, 3, 1, 2)  # B, C, H, W
-                x = layer[-1](x)  # downsample
-                # Convert back to patch sequence
-                x = x.flatten(2).transpose(1, 2)  # B, H*W, C
-
-        x = self.norm(x)  # B, H*W, C
-        res_h_last = self.patches_resolution[0] // (2 ** (len(self.layers) - 1))
-        res_w_last = self.patches_resolution[1] // (2 ** (len(self.layers) - 1))
-
-        x = self.conv_after_body(
-            x.view(
-                x.shape[0],
-                res_h_last,
-                res_w_last,
-                -1,
-            ).permute(0, 3, 1, 2),
-        )
+        x = self.norm(x)  # B, Hp*Wp, C
+        x = self.patch_unembed(x, x_size)
+        x = self.conv_after_body(x) + shallow
 
         # upsample
         x = self.conv_before_upsample(x)

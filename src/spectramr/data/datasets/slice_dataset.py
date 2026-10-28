@@ -12,14 +12,16 @@ Example: sub-0015_FLAIR_slice084.npy
 
 import glob
 import logging
+import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 import torch
 import torchio as tio
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,11 @@ class SliceVolumeDataset(Dataset):
     volume count for a few-volumes / many-slices corpus to hold every volume
     resident.
 
+    A resident volume carries the augmentation drawn when it was loaded, so with
+    ``redraw=True`` (train split, augmentation on) a cached volume is evicted once it
+    has served one epoch's share of its windows in this worker. The next access
+    re-runs the base transform and draws new augmentation.
+
     Note on why the transform is not pushed down: the base's intensity
     normalization (TorchIO ``ZNormalization`` / ``RescaleIntensity``) is
     **volume-level** — it reduces over the whole ``[C,H,W,D]`` subject. Reading
@@ -383,6 +390,9 @@ class SliceVolumeDataset(Dataset):
         slab_depth: number of consecutive slices per window (``1`` = single 2D
             slice; ``>1`` = a thin slab for a 3D model). Must be ``>= 1``.
         cache_size: number of recently-loaded volumes to retain (LRU).
+        redraw: re-run the base transform after a cached volume has served
+            ``ceil(n_windows / num_workers)`` windows, so random augmentation is
+            redrawn about once per epoch instead of once per run.
     """
 
     def __init__(
@@ -392,6 +402,7 @@ class SliceVolumeDataset(Dataset):
         slab_depth: int = 1,
         cache_size: int = 2,
         canonicalize_axes: bool = True,
+        redraw: bool = False,
     ) -> None:
         from collections import OrderedDict
 
@@ -407,6 +418,9 @@ class SliceVolumeDataset(Dataset):
         self.canonicalize_axes = bool(canonicalize_axes)
         self._cache_size = max(1, int(cache_size))
         self._cache: OrderedDict[int, Any] = OrderedDict()
+        self.redraw = bool(redraw)
+        self._served: dict[int, int] = {}
+        self._windows_per_volume: dict[int, int] = {}
 
         index = getattr(base, "index", None)
         if index is None:
@@ -428,6 +442,7 @@ class SliceVolumeDataset(Dataset):
             dropped += depth - n_windows * self.slab_depth
             for w in range(n_windows):
                 self._index_map.append((base_idx, w * self.slab_depth))
+        self._windows_per_volume = dict(Counter(base_idx for base_idx, _ in self._index_map))
         logger.info(
             "[DATASET] SliceVolumeDataset: %d volumes -> %d windows "
             "(slab_depth=%d, axis=%d, dropped %d trailing slices)",
@@ -467,16 +482,27 @@ class SliceVolumeDataset(Dataset):
         images = subject.get_images_dict(intensity_only=False)
         return next(iter(images.values())).tensor
 
+    def _redraw_after(self, base_idx: int) -> int:
+        info = get_worker_info()
+        workers = info.num_workers if info is not None else 1
+        return max(1, math.ceil(self._windows_per_volume.get(base_idx, 1) / workers))
+
     def _load_volume(self, base_idx: int) -> Any:
-        if base_idx in self._cache:
+        if base_idx in self._cache and not (
+            self.redraw and self._served[base_idx] >= self._redraw_after(base_idx)
+        ):
             self._cache.move_to_end(base_idx)
+            self._served[base_idx] += 1
             return self._cache[base_idx]
+        self._cache.pop(base_idx, None)
         subject = self.base[base_idx]
         if self.canonicalize_axes:
             subject = self._canonicalize_subject(subject)
         self._cache[base_idx] = subject
+        self._served[base_idx] = 1
         while len(self._cache) > self._cache_size:
-            self._cache.popitem(last=False)
+            evicted, _ = self._cache.popitem(last=False)
+            self._served.pop(evicted, None)
         return subject
 
     def _canonicalize_subject(self, subject: Any) -> Any:

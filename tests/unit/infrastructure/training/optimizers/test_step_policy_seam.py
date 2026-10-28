@@ -52,6 +52,7 @@ class TestDefaultsPreserveExistingBehaviour:
         policy = _policy()
         assert policy.owns_gradient_accumulation is False
         assert policy.owns_zero_grad is False
+        assert policy.owns_lr_scheduler is False
 
     def test_executor_keeps_the_configured_accumulation(self) -> None:
         executor = StepExecutor(_Helper(), _policy(), gradient_accumulation_steps=4)
@@ -83,6 +84,29 @@ class TestCapabilityNegotiation:
         executor = StepExecutor(_Helper(), self._EngineOwned(max_grad_norm=1.0))
         assert executor._policy_owns_zero_grad is True
         assert executor._policy_owns_accumulation is True
+        assert executor._policy_owns_lr_scheduler is False
+
+    def test_lr_scheduler_ownership_is_read_from_the_policy(self) -> None:
+        class _SchedOwned(AMPPolicy):
+            owns_lr_scheduler = True
+
+        executor = StepExecutor(_Helper(), _SchedOwned(max_grad_norm=1.0))
+        assert executor._policy_owns_lr_scheduler is True
+
+    def test_a_truthy_accident_does_not_hand_over_the_scheduler(self) -> None:
+        from unittest.mock import MagicMock
+
+        executor = StepExecutor(_Helper(), MagicMock())
+        assert executor._policy_owns_lr_scheduler is False
+
+    def test_deepspeed_policy_declares_scheduler_ownership(self) -> None:
+        """Planted shape: engine.step() steps the scheduler it was handed, so a
+        DeepSpeed policy that did not declare this would be stepped twice."""
+        from spectramr.infrastructure.distributed.deepspeed_backend.runtime import (
+            DeepSpeedStepPolicy,
+        )
+
+        assert DeepSpeedStepPolicy.owns_lr_scheduler is True
 
     def test_a_policy_lacking_the_flags_entirely_still_works(self) -> None:
         """Duck-typed: a hand-rolled policy object predating the ABC must not
@@ -134,12 +158,39 @@ class TestGuardLoss:
         survive."""
 
         class _OwnOverflow(AMPPolicy):
-            def guard_loss(self, loss, *, name, global_step, scaler):
+            def guard_loss(self, loss, *, name, global_step, scaler, monitor=None):
                 return
 
         _OwnOverflow(max_grad_norm=1.0).guard_loss(
             torch.tensor(float("nan")), name="g", global_step=1, scaler=None
         )
+
+    def test_the_executor_hands_its_monitor_to_the_policy(self) -> None:
+        """The loop attaches the monitor to the executor, never to the policy, so
+        the policy must receive it per call -- a no-op backend then records
+        nothing, and the default records instead of syncing to raise."""
+        seen = []
+
+        class _Capturing(AMPPolicy):
+            def guard_loss(self, loss, *, name, global_step, scaler, monitor=None):
+                seen.append(monitor)
+
+        executor = StepExecutor(_Helper(), _Capturing(max_grad_norm=1.0))
+        sentinel = object()
+        executor.nonfinite_monitor = sentinel
+        loss = torch.tensor(1.0, requires_grad=True) * 1.0
+        executor._guard_loss(loss, name="g", global_step=3)
+        assert seen == [sentinel]
+
+    def test_the_default_records_into_a_monitor_without_raising(self) -> None:
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        _policy().guard_loss(
+            torch.tensor(float("nan")), name="g", global_step=7, scaler=None, monitor=monitor
+        )
+        monitor.end_step(7)
+        assert monitor.resolve().names == ("g",)
 
 
 class TestGradientClippingIsPolicyOwned:

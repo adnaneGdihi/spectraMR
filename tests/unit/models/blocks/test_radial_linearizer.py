@@ -175,3 +175,12 @@ class TestMambaLayerRadialIntegration:
         x = torch.randn(1, 16, 8, 8)
         out = layer(x)
         assert out.shape == x.shape
+
+
+def test_patch_count_is_reported_without_a_device_round_trip(caplog) -> None:
+    """``total_patches`` comes from ``math.prod`` of the grid, not a tensor ``.item()``."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        MorphologicalRadialLinearizer((32, 32), patch_size=8)
+    assert "total_patches=16" in caplog.text

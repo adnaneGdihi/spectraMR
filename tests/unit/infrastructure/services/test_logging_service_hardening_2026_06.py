@@ -79,3 +79,40 @@ class TestThereIsExactlyOneTensorBoardWriter:
         from spectramr.infrastructure.services import tensorboard_writer
 
         assert "SummaryWriter(" in inspect.getsource(tensorboard_writer)
+
+
+class TestCriticalIsTheFifthRung:
+    """#2254: ``critical`` was in ``_SUPPORTED_LEVELS`` and ``_level_map`` from the
+    start, but no ``log_critical`` wrapper existed. The training loop's divergence
+    tripwire called it anyway, so the one guard that stops a diverged run from
+    corrupting weights raised ``AttributeError`` every time it was right."""
+
+    def test_log_critical_exists_and_routes_to_the_critical_logger(self):
+        svc = _service_with_mock_logger()
+        svc.log_critical("DIVERGENCE DETECTED")
+        svc._logger.critical.assert_called_once()
+        assert svc._logger.critical.call_args[0][0] == "DIVERGENCE DETECTED"
+
+    def test_critical_is_never_throttled(self):
+        """Same exemption the other high-severity rungs get: a recurring divergence
+        must not go quiet after three occurrences."""
+        svc = _service_with_mock_logger()
+        for _ in range(5):
+            svc.log_critical("same message")
+        assert svc._logger.critical.call_count == 5
+
+    def test_critical_flushes_for_crash_durability(self):
+        """A diverged run is about to stop; the record has to survive the stop."""
+        svc = _service_with_mock_logger()
+        svc.log_critical("boom")
+        svc._logger.handlers[0].flush.assert_called()
+
+    def test_the_wrapper_set_covers_every_supported_level(self):
+        """The rung that was missing is the rung that was needed. Pin the whole
+        ladder so the next level added to ``_SUPPORTED_LEVELS`` arrives with its
+        wrapper instead of being discovered by a caller at runtime."""
+        svc = LoggingService()
+        for level in svc._SUPPORTED_LEVELS:
+            assert callable(getattr(svc, f"log_{level}", None)), (
+                f"_SUPPORTED_LEVELS advertises {level!r} with no log_{level} method"
+            )

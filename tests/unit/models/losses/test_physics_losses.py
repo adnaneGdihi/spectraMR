@@ -176,3 +176,111 @@ def test_gradients_flow_through_the_single_bridge(
     assert k_pred.grad is not None
     assert torch.isfinite(k_pred.grad).all()
     assert k_pred.grad.abs().sum() > 0
+
+
+class _SpyLoss(torch.nn.Module):
+    """Records what the bridge hands it; names only ``coil_sensitivities``."""
+
+    def forward(self, pred, target, coil_sensitivities=None):
+        self.received = coil_sensitivities
+        return pred.abs().mean()
+
+
+def test_the_bridge_refiles_the_coil_maps_for_its_inner_loss() -> None:
+    """The bridge is the hop that narrows kwargs to a bridged term.
+
+    The builder's wrapper forwards ``**kwargs`` untouched, so the diffusion
+    strategy's ``smaps`` reaches the bridge intact; a bridge that filtered on the
+    inner signature without reconciling dropped it, and the coil barrier bound
+    ``None`` on every kspace_filling arm.
+    """
+    maps = torch.randn(SHAPE, dtype=torch.complex64)
+    spy = _SpyLoss()
+    bridge = DifferentiableFourierBridge(spatial_loss_fn=spy, return_complex=True)
+    kspace = torch.randn(SHAPE[0], 2 * COILS, SHAPE[2], SHAPE[3])
+
+    bridge(kspace, kspace, smaps=maps, timesteps=torch.zeros(SHAPE[0]))
+
+    assert spy.received is maps
+
+
+# ---------------------------------------------------------------------------
+# #2338: the k-space -> image step undoes the arm's log1p compression
+# ---------------------------------------------------------------------------
+
+
+def _coil_kspace(seed: int = 0, coils: int = 3, n: int = 16) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    img = torch.randn(1, coils, n, n, generator=g) + 1j * torch.randn(1, coils, n, n, generator=g)
+    return fft2c(img.to(torch.complex64))
+
+
+def _interleave(z: torch.Tensor) -> torch.Tensor:
+    b, c, h, w = z.shape
+    return torch.view_as_real(z).permute(0, 1, 4, 2, 3).reshape(b, 2 * c, h, w).contiguous()
+
+
+class TestKspaceToImageDecompresses:
+    def test_log_scaled_returns_the_image_of_the_uncompressed_plane(self):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+        from spectramr.models.losses.physics_losses import kspace_to_image
+
+        k = _coil_kspace()
+        compressed = compress_kspace_log(k)
+        got = kspace_to_image(_interleave(compressed), return_complex=True, log_scaled=True)
+        torch.testing.assert_close(got, ifft2c(k), rtol=1e-4, atol=1e-5)
+
+    def test_without_the_flag_the_compressed_plane_is_not_the_image(self):
+        """The defect the flag closes: iFFT of compressed k-space is another object."""
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+        from spectramr.models.losses.physics_losses import kspace_to_image
+
+        k = _coil_kspace()
+        got = kspace_to_image(_interleave(compress_kspace_log(k)), return_complex=True)
+        rel = (got - ifft2c(k)).abs().norm() / ifft2c(k).abs().norm()
+        assert rel > 0.1
+
+    def test_the_bridge_is_unchanged_when_the_flag_is_off(self):
+        """Arms without log scaling keep the exact pre-#2338 transform."""
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        k = _coil_kspace()
+        bridge = DifferentiableFourierBridge(spatial_loss_fn=lambda a, b: a)
+        assert bridge.log_scaled is False
+        assert torch.equal(bridge._kspace_to_image(_interleave(k)), torch.abs(ifft2c(k)))
+
+    def test_the_bridge_forwards_its_flag(self):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        k = _coil_kspace()
+        bridge = DifferentiableFourierBridge(spatial_loss_fn=lambda a, b: a, log_scaled=True)
+        got = bridge._kspace_to_image(_interleave(compress_kspace_log(k)))
+        torch.testing.assert_close(got, torch.abs(ifft2c(k)), rtol=1e-4, atol=1e-5)
+
+    def test_complex_spatial_gradient_scores_zero_on_the_target_either_way_and_images_when_flagged(self):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+
+        loss = ComplexGradientLoss()
+        k = _coil_kspace()
+        target = _interleave(compress_kspace_log(k))
+        for m in loss.modules():
+            if hasattr(m, "log_scaled"):
+                m.log_scaled = True
+        assert float(loss(target, target)) == pytest.approx(0.0, abs=1e-7)
+
+    def test_sense_adjoint_phase_declares_its_bridge_and_decompresses(self):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.models.losses.physics_losses import SENSEAdjointPhaseLoss
+
+        loss = SENSEAdjointPhaseLoss()
+        assert loss.use_fourier_bridge is True and loss.log_scaled is False
+        k = _coil_kspace()
+        maps = torch.ones_like(k)
+        loss.log_scaled = True
+        flagged = loss(compress_kspace_log(k), k * 0, maps)
+        loss.log_scaled = False
+        unflagged = loss(k, k * 0, maps)
+        torch.testing.assert_close(flagged, unflagged, rtol=1e-4, atol=1e-5)

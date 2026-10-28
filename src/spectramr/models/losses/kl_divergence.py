@@ -24,6 +24,8 @@ class KLDivergenceLoss(nn.Module):
     normal prior, with optional annealing and capacity constraints (β-VAE).
     """
 
+    annealing_weight: torch.Tensor
+
     def __init__(
         self,
         beta: float = 1.0,
@@ -135,7 +137,7 @@ class VQKLLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{VQKLLoss} = \\mathcal{L}_{VQ} + \\lambda_{KL} \text{KL}(q(z) || p(z))"""
+        \\mathcal{L}_{VQKLLoss} = \\mathcal{L}_{VQ} + \\lambda_{KL} \\text{KL}(q(z) || p(z))"""
 
     def __init__(
         self,

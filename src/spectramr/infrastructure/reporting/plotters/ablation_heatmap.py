@@ -31,7 +31,7 @@ def make(
     if df is None or df.empty or not {x, y, value} <= set(df.columns):
         return None
     pivot = df.pivot_table(index=y, columns=x, values=value, aggfunc="mean")
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), column_width("single") * 0.9))
     arr = pivot.to_numpy()
     im = ax.imshow(arr, cmap="viridis", aspect="auto")
@@ -41,12 +41,6 @@ def make(
     ax.set_yticklabels(pivot.index)
     ax.set_xlabel(x)
     ax.set_ylabel(y)
-    # Reuse the single ``arr`` materialisation above: the old loop called
-    # pivot.to_numpy() (a full DataFrame-to-ndarray copy) once per cell, i.e.
-    # rows*cols redundant allocations.
-    for i in range(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            ax.text(j, i, f"{arr[i][j]:.2g}", ha="center", va="center", fontsize=5, color="white")
     attach_colorbar(im, ax, value)
     fig.tight_layout()
     if metadata is not None:

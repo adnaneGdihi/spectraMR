@@ -59,7 +59,7 @@ strategy.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as torch_functional
@@ -92,6 +92,11 @@ class BlochSchrodingerBridgeStrategy(StochasticInterpolantsStrategy):
             Must be a non-negative int — anything else **raises** (pitfall #15).
         **kwargs: Forwarded to :class:`StochasticInterpolantsStrategy`.
     """
+
+    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the bridge DRIFT, not the target
+    #: image; the hook routes to neither the parent nor the computer.
+    inline_losses: ClassVar[frozenset[str]] = frozenset()
+    folds_image_losses: ClassVar[bool] = False
 
     def __init__(
         self,

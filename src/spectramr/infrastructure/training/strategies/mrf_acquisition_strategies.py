@@ -51,6 +51,15 @@ class ConformalMRFDictlessReconStrategy(BaseTrainingStrategy):
     when the embedding model exposes ``jacobian_at``.
     """
 
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
+
+    # parallel_compat: Calls model.jacobian_at outside the wrapped forward, so DDP/ZeRO reduce
+    # no gradient for it and FSDP reads a shard.
+    parallel_compat = frozenset()
+
     #: Fingerprinting: dictionary-free fingerprint matching (MRFDictlessMatcher,
     #: a KD-tree over the learned 5-D Bloch-parameter embedding) IS the defining
     #: MRF operation. Its two siblings here are deliberately UNTAGGED --
@@ -178,6 +187,13 @@ class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
     step.
     """
 
+    #: ``validation_step`` writes the CRLB objective on the held-out prior
+    #: samples itself; the metrics registry cannot, since it needs the generator
+    #: and autograd through the Bloch surrogate.
+    capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
+        emitted_metrics=frozenset({"crlb_objective"}),
+    )
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "crlb_mrf_pulse_design", None)
@@ -218,6 +234,39 @@ class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
         sq_T2 = d_T2.pow(2).sum() if d_T2 is not None else zero
         return sq_T1 + sq_T2
 
+    @classmethod
+    def _crlb_objective(cls, pulse: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """``-Fisher`` (CRLB ≈ 1/Fisher, minimised) of ``pulse`` over the prior ``params``.
+
+        The one definition training and validation share. It differentiates the
+        signal with respect to ``params``, so callers under ``no_grad`` must
+        re-enable gradients around it.
+        """
+        params_req = params.detach().clone().requires_grad_(True)
+        return -cls._toy_fisher_trace(pulse, params_req)
+
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Registry metrics the arm requests, plus ``crlb_objective`` on the val batch."""
+        metrics = super().validation_step(input_batch, target_batch, **kwargs)
+
+        generator = self.generator_model
+        was_training = generator.training
+        generator.eval()
+        try:
+            pulse = generator(input_batch.to(self.device, non_blocking=True)).detach()
+            # The caller validates under no_grad; the Fisher trace needs ∂s/∂θ.
+            with torch.enable_grad():
+                crlb = self._crlb_objective(pulse, target_batch.to(pulse.device))
+        finally:
+            generator.train(was_training)
+        metrics["crlb_objective"] = float(crlb.detach())
+        return metrics
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor,
@@ -227,10 +276,7 @@ class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
     ) -> dict[str, torch.Tensor]:
         del epoch
         pulse = self.generator_model(input_batch)  # [B, T, 2]
-        # Surrogate Fisher trace; CRLB ≈ 1 / Fisher (we minimise –Fisher).
-        target_req = target_batch.detach().clone().requires_grad_(True)
-        fisher = self._toy_fisher_trace(pulse, target_req)
-        crlb = -fisher  # minimisation
+        crlb = self._crlb_objective(pulse, target_batch)
         # Beltrami-style smoothness: penalise large per-step pulse change.
         smooth = (pulse.diff(dim=1)).pow(2).mean()
         total = crlb + self.lambda_beltrami * smooth

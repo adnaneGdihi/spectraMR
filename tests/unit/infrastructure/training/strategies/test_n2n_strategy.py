@@ -1,151 +1,122 @@
-"""Unit tests for NoiseToNoiseStrategy.
+"""Unit tests for :mod:`spectramr.infrastructure.training.strategies.n2n_strategy`.
 
-The N2N strategy was refactored to route loss computation through
-``UnifiedReconstructionLossComputer`` (SSOT). Two behavioural
-consequences the tests below verify:
-
-1. The strategy no longer owns its own ``criterion`` attribute —
-   loss computation lives in the shared loss computer.
-2. Missing or insufficient ``image_reps`` raises ``ValueError`` rather
-   than silently returning a 0-loss (CLAUDE.md pitfall #9 — no silent
-   fallbacks).
+The strategy runs the shared reconstruction step and owns only how the training
+target is formed from the loader's repetition stack (``data.n2n_pairing``). The
+tests pin that the target is never the input's own slot, that each pairing reads
+the slots it names, and that a run without a stack refuses to start.
 """
 
-from unittest.mock import MagicMock, PropertyMock
+from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn as nn
 
-from spectramr.infrastructure.training.strategies.n2n_strategy import NoiseToNoiseStrategy
-from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
+from spectramr.config.schemas.enums import Task
+from spectramr.infrastructure.training.strategies.n2n_strategy import (
+    NoiseToNoiseStrategy,
+    pair_from_stack,
+)
+from spectramr.infrastructure.training.strategies.reconstruction import ReconstructionStepMixin
 
-
-@pytest.fixture
-def mock_model():
-    """Mock generator returning a (B, C, H, W) tensor."""
-    model = MagicMock(spec=nn.Module)
-    model.training = True
-    model.return_value = torch.randn(2, 1, 64, 64)
-    return model
+B, C, H, W = 4, 8, 16, 16
 
 
-@pytest.fixture
-def mock_optimizer():
-    """Mock optimizer."""
-    return MagicMock()
+def _stack(n_slots: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slot s is filled with the value s, so a target names its slot exactly."""
+    slots = torch.stack([torch.full((B, C, H, W, 1), float(s)) for s in range(n_slots)], dim=1)
+    return slots[:, 0], slots.reshape(B, n_slots * C, H, W, 1)
 
 
-@pytest.fixture
-def strategy(mock_model, mock_optimizer):
-    """Instantiate NoiseToNoiseStrategy with a mocked TrainingEnvironment."""
-    from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
-
-    mock_env = MagicMock(spec=TrainingEnvironment)
-    mock_env.models = {"generator": mock_model}
-    mock_env.optimizers = {"main": mock_optimizer}
-    mock_env.losses = {}
-    mock_env.device = torch.device("cpu")
-    mock_env.config = MagicMock()
-
-    mock_env.config.optimization = MagicMock()
-    mock_env.config.optimization.gradient.accumulation_steps = 1
-    mock_env.config.optimization.gradient.clip.enabled = False
-    # mixed_precision.py validates amp_dtype; a bare MagicMock fails it
-    mock_env.config.optimization.precision.dtype = "float32"
-    # schema defaults; bare MagicMock fails StandardOptimizerStepper's raise-on-unknown
-    mock_env.config.optimization.gradient.clip.method = "norm"
-    mock_env.config.optimization.gradient.clip.value = 1.0
-
-    mock_env.config.logging = MagicMock()
-    mock_env.config.logging.log_gradients = False
-    mock_env.config.logging.log_interval = 10
-    # Disable debug-snapshot saving so test runs don't leak
-    # ``MagicMock/mock.config.training.output_dir/<id>/`` directories
-    # into the repo root. The snapshot code uses the (stringified)
-    # mock config path to build its output directory.
-    #
-    # Nested spelling is load-bearing. `_resolve_config` reads
-    # `logging.snapshots`, which a MagicMock auto-creates with truthy,
-    # int-able leaves -- so the retired flat keys below resolved to
-    # `enabled=True, save_images=True, save_json=True`, the exact opposite of
-    # what this block asks for. Nothing went red because nothing asserted it;
-    # `save_debug_snapshot`'s `run_dir` type guard was what still stopped the
-    # leak. Pinned by `test_fixture_actually_disables_snapshots`.
-    mock_env.config.logging.snapshots.enabled = False
-    mock_env.config.logging.snapshots.max_calls = 1
-    mock_env.config.logging.snapshots.save_images = False
-    mock_env.config.logging.snapshots.save_json = False
-    mock_env.config.logging.snapshots.interval_steps = 0
-
-    type(mock_env).generator = PropertyMock(return_value=mock_model)
-    type(mock_env).opt_g = PropertyMock(return_value=mock_optimizer)
-
-    return NoiseToNoiseStrategy(env=mock_env)
+def _bare(pairing: str | None) -> NoiseToNoiseStrategy:
+    strategy = NoiseToNoiseStrategy.__new__(NoiseToNoiseStrategy)
+    strategy.config = SimpleNamespace(data=SimpleNamespace(n2n_pairing=pairing))
+    strategy.logging_service = None
+    return strategy
 
 
-def test_fixture_actually_disables_snapshots(strategy):
-    """The fixture's snapshot off-switch must really be off.
-
-    Asked of the resolver rather than of the attribute the fixture just set --
-    reading back our own assignment is what let this rot unnoticed. After the
-    block decomposition the flat keys stopped being read, and ``_resolve_config``
-    fell through to the MagicMock's auto-vivified ``logging.snapshots``, whose
-    leaves are truthy and int-able: the fixture resolved to snapshots ENABLED,
-    with images and JSON on. No test failed, because none asked. What still
-    prevented the ``MagicMock/`` directory leak this fixture was written to
-    stop was the unrelated ``run_dir`` type guard in ``save_debug_snapshot``.
-    """
-    from spectramr.infrastructure.training.debug_snapshot import _resolve_config
-
-    resolved = _resolve_config(strategy.config.logging)
-    assert resolved.enabled is False
-    assert resolved.save_images is False
-    assert resolved.save_json is False
+def test_ordered_takes_the_second_half():
+    x, stack = _stack(2)
+    assert torch.equal(pair_from_stack(x, stack, "ordered"), torch.ones_like(x))
 
 
-def test_initialization(strategy):
-    """N2N owns a UnifiedReconstructionLossComputer (SSOT loss path)."""
-    assert strategy is not None
-    assert isinstance(strategy.loss_computer, UnifiedReconstructionLossComputer)
+def test_one_vs_rest_mean_averages_the_other_slots():
+    x, stack = _stack(3)
+    assert torch.equal(pair_from_stack(x, stack, "one_vs_rest_mean"), torch.full_like(x, 1.5))
 
 
-def test_unpack_batch_uses_two_distinct_repetitions(strategy):
-    """Input/target are two DISTINCT repetitions drawn from image_reps.
-
-    The source picks two distinct reps at random each step (audit 2026-06: N2N
-    only needs two independent noisy draws, and fixing 0/1 wasted extra reps and
-    biased the pairing). Assert membership + distinctness, NOT fixed indices —
-    a fixed-index assert would be non-deterministically wrong.
-    """
-    reps = torch.randn(2, 3, 1, 64, 64)
-    batch = {"image_reps": reps}
-    input_batch, target_batch = strategy._unpack_batch(batch)
-    assert input_batch.shape == (2, 1, 64, 64)
-    assert target_batch.shape == (2, 1, 64, 64)
-    in_idx = [k for k in range(reps.shape[1]) if torch.equal(input_batch, reps[:, k])]
-    tg_idx = [k for k in range(reps.shape[1]) if torch.equal(target_batch, reps[:, k])]
-    assert len(in_idx) == 1 and len(tg_idx) == 1  # each is exactly one real rep
-    assert in_idx[0] != tg_idx[0]  # and they are two different reps
+def test_random_pair_draws_every_other_slot_and_never_the_input():
+    x, stack = _stack(3)
+    g = torch.Generator().manual_seed(0)
+    seen = set()
+    for _ in range(50):
+        target = pair_from_stack(x, stack, "random_pair", generator=g)
+        values = target.flatten(1)[:, 0]
+        # Each sample's target is one whole slot, drawn per sample.
+        assert torch.equal(target, values.view(B, 1, 1, 1, 1).expand_as(target))
+        seen |= set(values.tolist())
+    assert seen == {1.0, 2.0}
 
 
-def test_compute_losses_raises_on_missing_reps(strategy):
-    """No input/target → ValueError (pitfall #9: no silent fallbacks)."""
-    with pytest.raises(ValueError, match="Noise2Noise strategy requires"):
-        strategy._compute_losses_impl(
-            input_batch=None, target_batch=None, epoch=0
-        )
+@pytest.mark.parametrize(
+    ("n_slots", "pairing", "match"),
+    [
+        (1, "random_pair", "at least two"),
+        (3, "ordered", "two halves"),
+        (2, "bogus", "Unknown n2n pairing"),
+    ],
+)
+def test_pairing_refuses_a_stack_it_cannot_pair(n_slots, pairing, match):
+    x, stack = _stack(n_slots)
+    with pytest.raises(ValueError, match=match):
+        pair_from_stack(x, stack, pairing)
 
 
-def test_compute_losses_raises_on_insufficient_reps(strategy):
-    """Only one repetition → ``_unpack_batch`` itself raises loudly.
+def test_a_stack_that_does_not_tile_the_input_raises():
+    x, stack = _stack(2)
+    with pytest.raises(ValueError, match="not a multiple"):
+        pair_from_stack(x, stack[:, :-1], "ordered")
 
-    Previously single-rep data fell through to the generic mixin path,
-    returned ``(None, None)``, and only failed later with a misleading
-    "requires both" message. The 2026-06 audit fix raises at the right
-    layer with an explicit single-rep diagnostic.
-    """
-    reps = torch.randn(2, 1, 1, 64, 64)  # only 1 rep
-    batch = {"image_reps": reps}
-    with pytest.raises(ValueError, match="at least 2"):
-        strategy._unpack_batch(batch)
+
+def test_strategy_composes_the_shared_step_and_declares_denoising():
+    assert ReconstructionStepMixin in NoiseToNoiseStrategy.__mro__
+    assert NoiseToNoiseStrategy.capabilities.tasks == frozenset({Task.DENOISING})
+
+
+@pytest.mark.parametrize("pairing", [None, "rep_pair"])
+def test_strategy_refuses_to_start_without_a_pairing(pairing):
+    with pytest.raises(ValueError, match=r"data\.n2n_pairing"):
+        _bare(pairing)._setup_strategy_specific_components()
+
+
+def test_unpack_forms_the_target_from_the_stack():
+    strategy = _bare("ordered")
+    strategy._setup_strategy_specific_components()
+    x, stack = _stack(2)
+    inp, target = strategy._unpack_batch({"input": {"data": x}, "kspace_reps": {"data": stack}})
+    assert inp is x
+    assert torch.equal(target, torch.ones_like(x))
+
+
+def test_unpack_without_a_stack_reads_the_served_target():
+    """The validation split serves input/target, never a stack."""
+    strategy = _bare("random_pair")
+    strategy._setup_strategy_specific_components()
+    x, y = torch.zeros(B, C, H, W), torch.ones(B, C, H, W)
+    inp, target = strategy._unpack_batch({"input": {"data": x}, "target": {"data": y}})
+    assert inp is x and target is y
+
+
+def test_loop_batch_round_trips_the_stack_through_the_adapter():
+    """The loop runs BatchAdapter.from_dict before the strategy sees the batch."""
+    from spectramr.data.batch_types import BatchAdapter
+
+    strategy = _bare("ordered")
+    strategy._setup_strategy_specific_components()
+    x, stack = _stack(2)
+    batch = BatchAdapter.from_dict({"input": {"data": x}, "kspace_reps": {"data": stack}})
+    assert batch.target is None
+    inp, target = strategy._unpack_batch(batch.to("cpu"))
+    assert torch.equal(inp, x)
+    assert torch.equal(target, torch.ones_like(x))

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from spectramr.cli import profile_cli
+from spectramr.cli.profile_command import PROFILE_CHILD_OVERRIDES
 
 # ------------------------------------------------------------- registration
 
@@ -89,6 +90,13 @@ def stub_settings(**over):
 def stub_config(monkeypatch):
     """Stub the config load; these tests are about the verb, not the schema."""
     monkeypatch.setattr(profile_cli, "_load_arm", lambda p: stub_settings())
+    # Hermetic: the backend choice must not depend on the GPU of the machine running the tests.
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: False)
+    # The stub path names no file, and the iteration cap reads the raw YAML.
+    monkeypatch.setattr(
+        "spectramr.cli.manifest_dispatch.compute_iter_cap_overrides",
+        lambda cfg, n: (["--override", f"training.max_iterations={n}"], []),
+    )
 
 
 def _args(**over):
@@ -98,10 +106,12 @@ def _args(**over):
         "config": Path("experiments/validated/dummy_gan.yaml"),
         "target": "train",
         "mode": "cpu-only",
+        "backend": "auto",
         "focus": "train-loop",
         "experiment": None,
         "device": "cpu",
         "val_batches": None,
+        "iterations": None,
         "no_phase_split": False,
         "dry_run": True,
         "extra": [],
@@ -124,6 +134,31 @@ def test_dry_run_works_without_scalene(stub_config, monkeypatch, capsys):
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     assert profile_cli.profile(_args()) == 0
     assert "scalene run" in capsys.readouterr().out
+
+
+def test_auto_backend_swaps_scalene_gpu_mode_for_torch_on_cuda(stub_config, monkeypatch, capsys):
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: True)
+    assert profile_cli.profile(_args(mode="full")) == 0
+    out = capsys.readouterr().out
+    assert "profile_torch_runner" in out
+    assert "scalene run" not in out
+
+
+def test_backend_scalene_forces_scalene_even_for_a_gpu_mode(stub_config, monkeypatch, capsys):
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: True)
+    assert profile_cli.profile(_args(mode="full", backend="scalene")) == 0
+    assert "scalene run" in capsys.readouterr().out
+
+
+def test_backend_torch_without_cuda_raises_instead_of_profiling_the_cpu(stub_config):
+    with pytest.raises(RuntimeError, match="no CUDA device"):
+        profile_cli.profile(_args(backend="torch"))
+
+
+def test_backend_torch_rejects_an_iteration_cap_too_short_for_its_window(stub_config, monkeypatch):
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: True)
+    with pytest.raises(ValueError, match="--iterations >= 16"):
+        profile_cli.profile(_args(backend="torch", iterations=10))
 
 
 def test_real_run_raises_without_scalene(stub_config, monkeypatch):
@@ -151,7 +186,7 @@ def _only_profile_dir(profiles_root: Path) -> Path:
 
 
 def test_successful_run_writes_manifest_and_reports_the_modes(fake_run, monkeypatch):
-    def child(argv, log_path):
+    def child(argv, log_path, **_):
         # Stand in for scalene: emit the outfile the real one would write.
         Path(argv[argv.index("--outfile") + 1]).write_text("{}", encoding="utf-8")
         log_path.write_text("ok\n", encoding="utf-8")
@@ -167,18 +202,23 @@ def test_successful_run_writes_manifest_and_reports_the_modes(fake_run, monkeypa
         "exit_code": 0,
         "duration_s": pytest.approx(manifest["outcome"]["duration_s"]),
         "outfile_written": True,
+        "retries": 0,
         # A green run carries no diagnosis. Asserted rather than omitted: a
         # classifier that fired on success would attach a failure explanation to
         # a profile that worked.
         "diagnosis": None,
     }
+    # Arms of one cohort share <experiment>; the arm in the id keeps them apart.
+    assert _only_profile_dir(fake_run).name.startswith("dummy_gan-train-cpu-only-")
+    assert manifest["modes"]["single_process"] == []
+    assert manifest["modes"]["child_overrides"] == list(PROFILE_CHILD_OVERRIDES)
 
 
 def test_manifest_survives_a_child_that_never_returns_a_profile(fake_run, monkeypatch):
     """The manifest is written BEFORE the run, so a killed job still records
     which modes were in flight."""
 
-    def child(argv, log_path):
+    def child(argv, log_path, **_):
         log_path.write_text("boom\n", encoding="utf-8")
         raise KeyboardInterrupt
 
@@ -195,7 +235,7 @@ def test_green_child_with_no_profile_written_is_a_failure(fake_run, monkeypatch,
     """The --program-path failure mode: the run succeeds and reports nothing.
     Exiting 0 there would read as 'nothing was slow'."""
     monkeypatch.setattr(
-        profile_cli, "_run_child", lambda argv, log: log.write_text("", "utf-8") or 0
+        profile_cli, "_run_child", lambda argv, log, **_: log.write_text("", "utf-8") or 0
     )
     assert profile_cli.profile(_args(dry_run=False)) == 1
     assert any("wrote no profile" in r.getMessage() for r in caplog.records)
@@ -203,9 +243,27 @@ def test_green_child_with_no_profile_written_is_a_failure(fake_run, monkeypatch,
 
 def test_child_exit_code_is_propagated(fake_run, monkeypatch):
     monkeypatch.setattr(
-        profile_cli, "_run_child", lambda argv, log: log.write_text("", "utf-8") or 3
+        profile_cli, "_run_child", lambda argv, log, **_: log.write_text("", "utf-8") or 3
     )
     assert profile_cli.profile(_args(dry_run=False)) == 3
+
+
+def test_a_failed_child_that_wrote_a_profile_still_gets_its_reports(fake_run, monkeypatch):
+    """Regression: a late crash (exit 1 after Scalene wrote the outfile) used to skip
+    hotspots.json and the phase split, leaving a 50 MB profile nobody could read."""
+
+    def child(argv, log_path, **_):
+        Path(argv[argv.index("--outfile") + 1]).write_text("{}", encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False)) == 1
+
+    manifest = json.loads((_only_profile_dir(fake_run) / "profile_manifest.json").read_text())
+    assert manifest["outcome"]["exit_code"] == 1
+    assert "hotspots" in manifest
+    assert "phase_split" in manifest
 
 
 def test_a_recognized_crash_is_diagnosed_into_the_manifest(fake_run, monkeypatch, caplog):
@@ -218,7 +276,7 @@ def test_a_recognized_crash_is_diagnosed_into_the_manifest(fake_run, monkeypatch
         "torch::profiler::impl::Result*, (__gnu_cxx::_Lock_policy)2>::_M_dispose()\n"
     )
 
-    def child(argv, log_path):
+    def child(argv, log_path, **_):
         # NOT `log.write_text(...) or 245`: write_text returns the character
         # count, so that idiom yields the exit code only for an empty string.
         log_path.write_text(crash, encoding="utf-8")
@@ -237,7 +295,7 @@ def test_a_recognized_crash_is_diagnosed_into_the_manifest(fake_run, monkeypatch
 def test_an_unrecognized_crash_still_propagates_and_records(fake_run, monkeypatch):
     """The classifier must not swallow a failure it cannot name."""
 
-    def child(argv, log_path):
+    def child(argv, log_path, **_):
         log_path.write_text("odd\n", encoding="utf-8")
         return 7
 
@@ -268,7 +326,7 @@ def _profile_with_stacks() -> str:
 
 
 def _child_writing(payload: str):
-    def child(argv, log_path):
+    def child(argv, log_path, **_):
         Path(argv[argv.index("--outfile") + 1]).write_text(payload, encoding="utf-8")
         log_path.write_text("ok\n", encoding="utf-8")
         return 0
@@ -327,3 +385,249 @@ def test_val_batches_is_refused_where_it_could_not_act(stub_config):
     """`infer` runs no validation loop, so the cap would be silently dropped."""
     with pytest.raises(ValueError, match="--val-batches is meaningless"):
         profile_cli.profile(_args(target="infer", val_batches=4))
+
+
+# ------------------------------------------------------------------ --iterations
+
+
+def test_train_target_defaults_to_the_profile_iteration_budget(stub_config, capsys):
+    from spectramr.cli.profile_command import DEFAULT_PROFILE_ITERATIONS
+
+    assert profile_cli.profile(_args()) == 0
+    assert f"training.max_iterations={DEFAULT_PROFILE_ITERATIONS}" in capsys.readouterr().out
+
+
+def test_iterations_is_rejected_for_a_target_that_runs_no_training_loop(stub_config):
+    with pytest.raises(ValueError, match="--iterations is meaningless"):
+        profile_cli.profile(_args(target="infer", iterations=10))
+
+
+def test_iterations_below_one_is_rejected(stub_config):
+    with pytest.raises(ValueError, match=">= 1"):
+        profile_cli.profile(_args(iterations=0))
+
+
+def test_train_target_defaults_to_a_validation_cap(stub_config, capsys):
+    from spectramr.cli.profile_command import DEFAULT_PROFILE_VAL_BATCHES
+    from spectramr.cli.val_batches import VAL_BATCHES_OVERRIDE_KEY
+
+    assert profile_cli.profile(_args()) == 0
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}={DEFAULT_PROFILE_VAL_BATCHES}" in capsys.readouterr().out
+
+
+def test_an_explicit_val_batches_beats_the_default(stub_config, capsys):
+    from spectramr.cli.val_batches import VAL_BATCHES_OVERRIDE_KEY
+
+    assert profile_cli.profile(_args(val_batches=9)) == 0
+    assert f"{VAL_BATCHES_OVERRIDE_KEY}=9" in capsys.readouterr().out
+
+
+def test_infer_target_gets_no_default_cap(stub_config, capsys):
+    assert profile_cli.profile(_args(target="infer")) == 0
+    assert "max_iterations" not in capsys.readouterr().out
+
+
+def test_torch_backend_run_is_stamped_and_declares_the_reports_it_cannot_make(fake_run, monkeypatch):
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: True)
+
+    def child(argv, log_path, **_):
+        out = Path(argv[argv.index("--out") + 1])
+        (out / "summary.json").write_text("{}", encoding="utf-8")
+        log_path.write_text("ok\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False, mode="full", iterations=100)) == 0
+
+    manifest = json.loads((_only_profile_dir(fake_run) / "profile_manifest.json").read_text())
+    assert manifest["modes"]["backend_requested"] == "auto"
+    assert manifest["modes"]["backend_applied"] == "torch"
+    assert manifest["scalene"] is None
+    assert manifest["torch_profiler"]["wait_warmup_active"] == [10, 5, 20]
+    assert manifest["phase_split"]["status"] == "unavailable"
+    assert manifest["hotspots"]["status"] == "unavailable"
+    assert manifest["outcome"]["outfile_written"] is True
+
+
+def test_torch_backend_run_that_wrote_nothing_is_a_failure_not_a_pass(fake_run, monkeypatch):
+    monkeypatch.setattr(profile_cli, "cuda_visible", lambda: True)
+
+    def child(argv, log_path, **_):
+        log_path.write_text("ok\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False, mode="full", iterations=100)) == 1
+
+
+# ------------------------------------------------------------ intermittent retry
+
+_SEGV = "std::_Sp_counted_ptr<torch::profiler::impl::Result*>::_M_dispose()\n"
+
+
+def test_the_intermittent_profiler_crash_is_rerun_once_and_can_recover(fake_run, monkeypatch):
+    calls = []
+
+    def child(argv, log_path, **_):
+        calls.append(1)
+        if len(calls) == 1:
+            log_path.write_text(_SEGV, encoding="utf-8")
+            return 245
+        log_path.write_text("", encoding="utf-8")
+        Path(argv[argv.index("--outfile") + 1]).write_text(json.dumps({"files": {}}), "utf-8")
+        return 0
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False)) == 0
+    assert len(calls) == 2
+    manifest = json.loads((_only_profile_dir(fake_run) / "profile_manifest.json").read_text())
+    assert manifest["outcome"]["retries"] == 1
+
+
+def test_a_persistent_profiler_crash_is_not_retried_forever(fake_run, monkeypatch):
+    calls = []
+
+    def child(argv, log_path, **_):
+        calls.append(1)
+        log_path.write_text(_SEGV, encoding="utf-8")
+        return 245
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False)) == 245
+    assert len(calls) == 1 + profile_cli.MAX_INTERMITTENT_RETRIES
+
+
+def test_a_retry_spends_only_what_is_left_of_the_cap(fake_run, monkeypatch):
+    """--timeout-min bounds the whole profile: the retry gets the remainder, and
+    none at all once the first attempt used the budget."""
+    from types import SimpleNamespace
+
+    clock = [1000.0]
+    monkeypatch.setattr(profile_cli, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    budgets = []
+
+    def child(argv, log_path, *, timeout_s=None):
+        budgets.append(timeout_s)
+        clock[0] += 50.0
+        log_path.write_text(_SEGV, encoding="utf-8")
+        return 245
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    profile_cli.profile(_args(dry_run=False, timeout_min=1))
+    assert budgets == [60, 10.0]
+
+    budgets.clear()
+    clock[0] = 1000.0
+
+    def slow_child(argv, log_path, *, timeout_s=None):
+        budgets.append(timeout_s)
+        clock[0] += 61.0
+        log_path.write_text(_SEGV, encoding="utf-8")
+        return 245
+
+    monkeypatch.setattr(profile_cli, "_run_child", slow_child)
+    profile_cli.profile(_args(dry_run=False, timeout_min=1))
+    assert budgets == [60]
+
+
+def test_an_unrecognized_failure_is_never_retried(fake_run, monkeypatch):
+    calls = []
+
+    def child(argv, log_path, **_):
+        calls.append(1)
+        log_path.write_text("odd\n", encoding="utf-8")
+        return 7
+
+    monkeypatch.setattr(profile_cli, "_run_child", child)
+    assert profile_cli.profile(_args(dry_run=False)) == 7
+    assert len(calls) == 1
+
+
+# ------------------------------------------------------------ wall-clock cap
+
+
+def test_a_hung_child_is_stopped_at_the_cap(tmp_path, monkeypatch):
+    """Planted violation: a child that never exits (the idle-GPU shape)."""
+    import sys
+    import time
+
+    monkeypatch.setattr(profile_cli, "TIMEOUT_GRACE_S", 5)
+    argv = [sys.executable, "-c", "import time; time.sleep(60)"]
+    started = time.monotonic()
+    code = profile_cli._run_child(argv, tmp_path / "log", timeout_s=0.5)
+    assert code == profile_cli.TIMEOUT_EXIT_CODE
+    assert time.monotonic() - started < 30
+
+
+def test_a_child_that_ignores_the_interrupt_is_killed_after_the_grace(tmp_path, monkeypatch):
+    import sys
+    import time
+
+    monkeypatch.setattr(profile_cli, "TIMEOUT_GRACE_S", 1)
+    deaf = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)"
+    started = time.monotonic()
+    code = profile_cli._run_child([sys.executable, "-c", deaf], tmp_path / "log", timeout_s=0.5)
+    assert code == profile_cli.TIMEOUT_EXIT_CODE
+    assert time.monotonic() - started < 30
+
+
+def test_a_grandchild_holding_the_output_pipe_is_stopped_at_the_cap(tmp_path, monkeypatch):
+    """Planted violation: the child leaves a grandchild that inherits stdout and
+    outlives it, the shape of a DataLoader worker or a Scalene re-exec. Signalling
+    only the child left the read loop blocked on the open pipe until SLURM's limit."""
+    import os
+    import sys
+    import time
+
+    monkeypatch.setattr(profile_cli, "TIMEOUT_GRACE_S", 1)
+    pid_file = tmp_path / "grandchild.pid"
+    child = (
+        "import subprocess, sys, time\n"
+        "g = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(90)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(g.pid))\n"
+        "time.sleep(90)\n"
+    )
+    started = time.monotonic()
+    code = profile_cli._run_child([sys.executable, "-c", child], tmp_path / "log", timeout_s=1)
+    assert code == profile_cli.TIMEOUT_EXIT_CODE
+    assert time.monotonic() - started < 30
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the grandchild outlived the cap")
+
+
+def test_a_child_inside_the_cap_keeps_its_own_exit_code(tmp_path):
+    import sys
+
+    argv = [sys.executable, "-c", "raise SystemExit(3)"]
+    assert profile_cli._run_child(argv, tmp_path / "log", timeout_s=30) == 3
+
+
+def test_a_timed_out_run_is_named_in_the_manifest(fake_run, monkeypatch):
+    monkeypatch.setattr(
+        profile_cli, "_run_child", lambda argv, log, **_: log.write_text("", "utf-8") or 124
+    )
+    assert profile_cli.profile(_args(dry_run=False, timeout_min=5)) == 124
+    manifest = json.loads((_only_profile_dir(fake_run) / "profile_manifest.json").read_text())
+    assert manifest["modes"]["timeout_min"] == 5
+    assert manifest["outcome"]["diagnosis"]["signature"] == "profile_timeout"
+
+
+def test_a_negative_cap_is_refused(stub_config):
+    with pytest.raises(ValueError, match="--timeout-min"):
+        profile_cli.profile(_args(timeout_min=-1))
+
+
+def test_the_cap_is_on_by_default():
+    from spectramr.cli.app import build_parser
+
+    args = build_parser().parse_args(["profile", "--config", "a.yaml"])
+    assert args.timeout_min == profile_cli.DEFAULT_TIMEOUT_MIN > 0

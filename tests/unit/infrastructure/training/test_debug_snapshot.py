@@ -1137,6 +1137,27 @@ class TestDeferredExtra:
         payload = json.loads((out / "snapshot.json").read_text())["extra"]
         assert payload["invocations"] == 1
 
+    def test_a_diverged_snapshot_is_still_strict_json(self, tmp_path):
+        """A NaN output made ``min``/``abs_max`` NaN, written as the bare token
+        ``NaN`` that an RFC 8259 parser rejects."""
+
+        def _reject(token: str) -> None:
+            raise ValueError(f"non-RFC-8259 token {token}")
+
+        _reset_budget()
+        nan = torch.full((1, 2, 4, 4), float("nan"))
+        out = save_debug_snapshot(
+            run_dir=tmp_path,
+            step=0,
+            tag="diverged",
+            tensors={"model_output": nan},
+            config_section=_make_logging(),
+            extra={"abs_max_model_output": float("nan"), "vector": torch.tensor([1.0, float("inf")])},
+        )
+        payload = json.loads((out / "snapshot.json").read_text(), parse_constant=_reject)
+        assert payload["extra"]["abs_max_model_output"] is None
+        assert payload["extra"]["vector"] == [1.0, None]
+
     def test_a_deferred_value_reaches_both_the_json_and_the_text_report(self, tmp_path):
         _reset_budget()
         out = save_debug_snapshot(
@@ -1362,3 +1383,49 @@ class TestRunIdentityReachesTheArtifact:
             assert first["run"]["run_id"] == second["run"]["run_id"]
         finally:
             reset_run_identity()
+
+
+class TestOnlyRankZeroWrites:
+    """Every rank used to write the same snapshot directory, racing and overwriting."""
+
+    @staticmethod
+    def _call(tmp_path: Path, extra=None):
+        return save_debug_snapshot(
+            run_dir=tmp_path,
+            step=0,
+            tag="t",
+            tensors={"input": torch.rand(1, 1, 16, 16)},
+            paradigm="TestParadigm",
+            config_section=_make_logging(),
+            extra=extra,
+        )
+
+    def test_a_non_zero_rank_writes_nothing(self, tmp_path: Path, monkeypatch) -> None:
+        from spectramr.infrastructure.distributed.distributed_training import RankUtility
+
+        _reset_budget()
+        monkeypatch.setattr(RankUtility, "get_rank", staticmethod(lambda: 1))
+        assert self._call(tmp_path) is None
+        assert not (tmp_path / "debug_snapshots").exists()
+
+    def test_a_non_zero_rank_spends_no_budget_and_resolves_no_deferred_extra(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The deferred ``extra`` exists to avoid a device-to-host sync, so a rank that
+        does not write must not pay it either."""
+        from spectramr.infrastructure.distributed.distributed_training import RankUtility
+
+        _reset_budget()
+        resolved: list[int] = []
+        monkeypatch.setattr(RankUtility, "get_rank", staticmethod(lambda: 3))
+        self._call(tmp_path, extra=lambda: resolved.append(1) or {"x": 1.0})
+        assert resolved == []
+        assert not _call_counts
+
+    def test_rank_zero_still_writes(self, tmp_path: Path, monkeypatch) -> None:
+        from spectramr.infrastructure.distributed.distributed_training import RankUtility
+
+        _reset_budget()
+        monkeypatch.setattr(RankUtility, "get_rank", staticmethod(lambda: 0))
+        out = self._call(tmp_path)
+        assert out is not None and (out / "snapshot.json").exists()

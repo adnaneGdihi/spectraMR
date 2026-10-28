@@ -68,7 +68,7 @@ class ProfilePaths:
     and TensorBoard events are filed with the profile that produced them.
 
     They were the same path until this was fixed, which meant a 300-iteration
-    profiling run wrote ``checkpoints/``, ``checkpoint_best.pt``, metrics CSVs
+    profiling run wrote ``checkpoints/`` (``best.<format>`` among them), metrics CSVs
     and provenance directly on top of the arm's real results. Nothing announced
     it: the child's own config-health run reported the injected path as
     on-convention (``check_output_dir_convention`` is a *prefix* test), so a
@@ -180,6 +180,7 @@ def build_profile_manifest(
     config_path: Path,
     declared_output_dir: str | None,
     device: str | None,
+    iterations: int | None,
     argv: list[str],
     scalene_version: str | None,
 ) -> dict[str, Any]:
@@ -209,6 +210,7 @@ def build_profile_manifest(
             "mode": mode,
             "focus": focus,
             "device": device,
+            "iterations": iterations,
         },
         "scalene": {
             "version": scalene_version,

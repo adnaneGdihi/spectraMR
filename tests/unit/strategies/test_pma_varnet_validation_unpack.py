@@ -8,7 +8,7 @@ crashed at line 79 with ``AttributeError: 'TrainingBatch' object has
 no attribute 'shape'`` across 4 experiments:
 
   experiment_pma_01_baseline
-  experiment_pma_02_b0_correction
+  experiment_pma_02_b0_corruption
   experiment_pma_03_full_m4raw
   experiment_jfe_varnet_sota
 
@@ -17,67 +17,45 @@ Fix: call ``self._unpack_batch(val_batch)`` (provided by the
 ``(input_batch, target_batch)`` tensors before they reach
 ``_compute_losses_impl``.
 
-This test pins the unwrap call so a future contributor who reverts
-the line gets caught by CI rather than the cluster.
+This test drives ``validation_step`` with a real ``TrainingBatch``-shaped object and
+checks what reaches ``_compute_losses_impl``, so a revert fails here, not on the cluster.
 """
 from __future__ import annotations
 
-import re
-from pathlib import Path
+from contextlib import nullcontext
+from types import SimpleNamespace
 
-REPO = Path(__file__).resolve().parents[3]
-STRATEGY = REPO / "src" / "spectramr" / "infrastructure" / "training" / "strategies" / "pma_varnet_strategy.py"
+import torch
+
+from spectramr.infrastructure.training.strategies.pma_varnet_strategy import (
+    ConcretePMAVarNetStrategy,
+)
 
 
-def _read() -> str:
-    return STRATEGY.read_text()
+class _Batch:
+    """Stands in for a TrainingBatch: it has no ``.shape``, which is what crashed."""
 
 
 def test_validation_step_unpacks_training_batch() -> None:
-    """The ``validation_step`` body must call ``_unpack_batch`` and pass
-    the unwrapped tensors to ``_compute_losses_impl``.
+    inp, tgt = torch.zeros(1, 2, 4, 4), torch.ones(1, 1, 4, 4)
+    batch = _Batch()
+    seen: dict[str, object] = {}
 
-    Match the full body so a half-revert (e.g. keeping the
-    ``_unpack_batch`` call but reverting the ``_compute_losses_impl``
-    args) still fails the test.
-    """
-    text = _read()
-    # The fix must include both the unpack call AND the threaded args.
-    pattern = re.compile(
-        r"def\s+validation_step\(\s*self,[^)]*\)[^:]*:\s*"
-        r"(?:\"\"\"[\s\S]*?\"\"\"\s*)?"  # tolerate docstring
-        r"torch\.manual_seed\([^)]+\)\s*\n"
-        r"\s*input_batch,\s*target_batch\s*=\s*self\._unpack_batch\(val_batch\)\s*\n"
-        r"\s*return\s+self\._compute_losses_impl\(\s*input_batch\s*,\s*target_batch",
-        re.MULTILINE,
-    )
-    assert pattern.search(text), (
-        "ConcretePMAVarNetStrategy.validation_step must unwrap the "
-        "TrainingBatch via self._unpack_batch(val_batch) and pass the "
-        "tensors as positional args to _compute_losses_impl. "
-        "See TODO/audit/smoke_audit_20260521.md §F3."
-    )
+    s = ConcretePMAVarNetStrategy.__new__(ConcretePMAVarNetStrategy)
+    s._unpack_batch = lambda b: (seen.update(unpacked=b) or (inp, tgt))
+    s.snapshot_source = lambda phase: nullcontext()
+    s._capture_model_output = lambda **kw: nullcontext()
+    s.env = SimpleNamespace(generator=None)
 
+    def _losses(input_batch, target_batch, epoch):
+        seen.update(input=input_batch, target=target_batch)
+        s._last_prediction, s._last_target = tgt, tgt
+        return {"loss": torch.tensor(0.0)}
 
-def test_no_raw_val_batch_passed_to_losses() -> None:
-    """The buggy form ``self._compute_losses_impl(None, val_batch, ...)``
-    must not appear — that's the line that crashed 4 experiments.
-    Pinned so a copy-paste revert from git history doesn't re-introduce it.
-    """
-    text = _read()
-    assert "self._compute_losses_impl(None, val_batch" not in text, (
-        "The buggy ``self._compute_losses_impl(None, val_batch, …)`` "
-        "form passes a TrainingBatch as target_batch and crashes at "
-        ".shape access. Always unwrap via _unpack_batch first."
-    )
+    s._compute_losses_impl = _losses
+    s._get_validation_metrics_computer = lambda cfg: SimpleNamespace(compute=lambda p, t: {})
+    s.config = None
 
-
-def test_audit_anchor_present() -> None:
-    """The F3 fix must carry the dated comment anchor + audit doc
-    reference so a future cleanup doesn't strip the unpack call as
-    redundant."""
-    text = _read()
-    assert "F3/E22 (2026-05-21" in text, (
-        "F3 fix must reference the audit doc by code+date so the "
-        "fix's purpose stays traceable."
-    )
+    s.validation_step(batch, batch_idx=0)
+    assert seen["unpacked"] is batch
+    assert seen["input"] is inp and seen["target"] is tgt

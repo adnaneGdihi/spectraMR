@@ -1,3 +1,5 @@
+import typing
+
 import pytest
 from pydantic import ValidationError
 
@@ -5,10 +7,10 @@ from spectramr.config.schemas.physics import (
     B0CorrectionConfig,
     B0SimulationConfig,
     BlochSimulationConfig,
-    DigitalTwinConfig,
     CoilSensitivityConfig,
     CompressedSensingConfig,
     DataConsistencyConfig,
+    DigitalTwinConfig,
     IterativeRefinementConfig,
     KSpaceConfig,
     MotionCorrectionConfig,
@@ -44,12 +46,32 @@ class TestDataConsistencyConfig:
         assert schema.enabled is False
         assert schema.weight == 1.0
 
+    @pytest.mark.parametrize("key", ["acs_mask_center_fraction", "enable_acs_replacement"])
+    def test_an_unread_acs_knob_is_refused_at_load(self, key):
+        """#563: the block is extra="ignore", so deleting the field alone would drop it."""
+        with pytest.raises(ValidationError, match=f"`physics.data_consistency.{key}` was removed"):
+            DataConsistencyConfig(**{key: True if key.startswith("enable") else 0.08})
+
+    def test_both_retired_knobs_are_named_in_one_error(self):
+        both = r"(?s)acs_mask_center_fraction.*enable_acs_replacement"
+        with pytest.raises(ValidationError, match=both):
+            DataConsistencyConfig(acs_mask_center_fraction=0.08, enable_acs_replacement=True)
+
+    def test_the_refusal_reaches_the_physics_block(self):
+        with pytest.raises(ValidationError, match="enable_acs_replacement` was removed"):
+            PhysicsConfigSchema(data_consistency={"enabled": True, "enable_acs_replacement": True})
+
 
 class TestCoilSensitivityConfig:
     def test_defaults(self):
         schema = CoilSensitivityConfig()
         assert schema.enable_estimation is False
-        assert schema.estimation_method == "espirit"
+        assert "estimation_method" not in CoilSensitivityConfig.model_fields
+
+    def test_the_unread_estimation_method_is_refused_naming_the_live_key(self):
+        """#306: the estimator is chosen by physics.coil_processing.estimation.method."""
+        with pytest.raises(ValidationError, match=r"coil_processing\.estimation\.method"):
+            CoilSensitivityConfig(estimation_method="espirit")
 
 
 class TestKSpaceConfig:
@@ -541,17 +563,38 @@ def test_marker_channels_off_by_default() -> None:
     assert MultiAcquisitionConfig(enabled=True, method="afi").marker_channels is False
 
 
-def test_marker_channels_require_the_recovered_rung() -> None:
-    """Without a fiducial the extra channels would be zeros under a name that
-    says otherwise — pitfall #16 at the input layer."""
-    for source in ("blind", "oracle"):
-        with pytest.raises(ValidationError, match="shift_source='recovered'"):
-            MultiAcquisitionConfig(
-                enabled=True,
-                method="subvoxel_sr",
-                marker_channels=True,
-                subvoxel_registration={"shift_source": source},
-            )
+def test_marker_channels_refuse_the_oracle_rung() -> None:
+    """Under 'oracle' the true offsets are handed over, so the marker cannot be
+    the registration source the arm would claim."""
+    with pytest.raises(ValidationError, match="'recovered' or 'blind'"):
+        MultiAcquisitionConfig(
+            enabled=True,
+            method="subvoxel_sr",
+            marker_channels=True,
+            subvoxel_registration={"shift_source": "oracle"},
+        )
+
+
+def test_marker_channels_accepted_on_the_blind_rung() -> None:
+    """VFU-08: blind + marker_channels makes the marker the only registration
+    source, which is what the content-vs-marker keying pair has to test."""
+    cfg = MultiAcquisitionConfig(
+        enabled=True,
+        method="subvoxel_sr",
+        marker_channels=True,
+        subvoxel_registration={"shift_source": "blind"},
+    )
+    assert cfg.marker_channels is True
+
+
+def test_blind_marker_channels_still_need_a_jittered_marker() -> None:
+    with pytest.raises(ValidationError, match="marker_jitter > 0"):
+        MultiAcquisitionConfig(
+            enabled=True,
+            method="subvoxel_sr",
+            marker_channels=True,
+            subvoxel_registration={"shift_source": "blind", "marker_jitter": 0.0},
+        )
 
 
 def test_marker_channels_reject_methods_with_no_fiducial() -> None:
@@ -725,7 +768,7 @@ class TestDegradationSchedules:
         assert d.degradation_schedules["motion"].value == "power_law"
 
     def test_unknown_axis_raises(self):
-        """Validated against known_degradation_axes() -- the 14 native plus the 31
+        """Validated against known_degradation_axes() -- the 14 native plus the 32
         registry operators -- rather than a hand-written set, so a newly registered
         degradation is legal the day it lands."""
         from spectramr.config.schemas.physics import DigitalTwinConfig
@@ -751,3 +794,248 @@ class TestDegradationSchedules:
         from spectramr.config.schemas.physics import DigitalTwinConfig
 
         assert DigitalTwinConfig(degradation_schedules={"motion": "step"})
+
+
+class TestDigitalTwinAcquisition:
+    """``physics.digital_twin.acquisition``: the scanner profile the twin simulates."""
+
+    _CUSTOM: typing.ClassVar[dict] = {"readout_bw_hz_per_px": 200.0, "sequence": "spin_echo"}
+
+    def test_absent_by_default(self):
+        assert DigitalTwinConfig().acquisition is None
+
+    def test_frozen_and_extra_forbid(self):
+        from spectramr.config.schemas.physics import DigitalTwinAcquisitionConfig
+
+        acq = DigitalTwinAcquisitionConfig(**self._CUSTOM)
+        with pytest.raises(ValidationError):
+            acq.readout_bw_hz_per_px = 400.0
+        with pytest.raises(ValidationError, match="extra"):
+            DigitalTwinAcquisitionConfig(**self._CUSTOM, slice_thicknes_mm=3.0)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("mode", "volume_4d"),
+            ("slice_order", "random"),
+            ("line_order", "spiral"),
+            ("sequence", "flash"),
+        ],
+    )
+    def test_unknown_enum_value_raises_at_load(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            DigitalTwinConfig(acquisition={**self._CUSTOM, field: value})
+
+    def test_enum_vocabularies_equal_the_physics_enums(self):
+        """The schema cannot import infrastructure, so its Literals are checked here."""
+        from spectramr.config.schemas.physics import DigitalTwinAcquisitionConfig
+        from spectramr.infrastructure.physics.degradations.geometry import (
+            AcquisitionMode,
+            LineOrder,
+            SliceOrder,
+        )
+        from spectramr.infrastructure.physics.scanner_profile import Sequence
+
+        fields = DigitalTwinAcquisitionConfig.model_fields
+        for name, enum in [
+            ("mode", AcquisitionMode),
+            ("slice_order", SliceOrder),
+            ("line_order", LineOrder),
+            ("sequence", Sequence),
+        ]:
+            literal = next(a for a in typing.get_args(fields[name].annotation) if a is not None)
+            assert set(typing.get_args(literal)) == {m.value for m in enum}, name
+
+    @pytest.mark.parametrize("missing", ["readout_bw_hz_per_px", "sequence"])
+    def test_without_a_preset_bandwidth_and_sequence_are_required(self, missing):
+        block = {k: v for k, v in self._CUSTOM.items() if k != missing}
+        with pytest.raises(ValidationError, match=missing):
+            DigitalTwinConfig(acquisition=block)
+
+    def test_a_preset_supplies_the_required_fields(self):
+        dt = DigitalTwinConfig(acquisition={"scanner_profile": "fastmri_3T"})
+        assert dt.acquisition.readout_bw_hz_per_px is None
+
+    def test_unknown_preset_raises(self):
+        with pytest.raises(ValidationError, match="scanner_profile"):
+            DigitalTwinConfig(acquisition={"scanner_profile": "siemens_7T"})
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("voxel_mm", (1.0, 0.0, 1.0)),
+            ("slice_thickness_mm", 0.0),
+            ("slice_gap_mm", -1.0),
+            ("readout_bw_hz_per_px", 0.0),
+        ],
+    )
+    def test_non_physical_numbers_raise(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            DigitalTwinConfig(acquisition={**self._CUSTOM, field: value})
+
+    @pytest.mark.parametrize(
+        ("field", "value", "reading_modes"),
+        [
+            ("voxel_mm", (3.0, 1.0, 1.0), {"slice_2d", "multislice_2d", "volume_3d"}),
+            ("slice_thickness_mm", 1.0, {"multislice_2d"}),
+            ("slice_order", "sequential", {"multislice_2d"}),
+            ("line_order", "kz_inner", {"volume_3d"}),
+        ],
+    )
+    @pytest.mark.parametrize("mode", [None, "slice_2d", "multislice_2d", "volume_3d"])
+    def test_a_geometry_knob_loads_only_in_a_mode_that_reads_it(
+        self, field, value, reading_modes, mode
+    ):
+        """Ruling 48: a knob no operator reads in the declared mode is refused, not inert."""
+        block = {**self._CUSTOM, "mode": mode, "voxel_mm": (3.0, 1.0, 1.0), field: value}
+        if (mode or "slice_2d") in reading_modes:
+            assert getattr(DigitalTwinConfig(acquisition=block).acquisition, field) == value
+        else:
+            with pytest.raises(ValidationError, match=field):
+                DigitalTwinConfig(acquisition=block)
+
+    @pytest.mark.parametrize("mode", [None, "slice_2d", "multislice_2d", "volume_3d"])
+    def test_slice_gap_is_refused_in_every_mode(self, mode):
+        """No operator reads the gap: the stack spacing is voxel_mm[0]."""
+        block = {**self._CUSTOM, "mode": mode, "voxel_mm": (4.0, 1.0, 1.0), "slice_gap_mm": 1.0}
+        with pytest.raises(ValidationError, match="slice_gap_mm"):
+            DigitalTwinConfig(acquisition=block)
+
+    def test_slice_thickness_without_a_voxel_size_is_refused(self):
+        """The through-slice factor reads thickness / voxel_mm[0], so thickness alone is inert."""
+        block = {**self._CUSTOM, "mode": "multislice_2d", "slice_thickness_mm": 3.0}
+        with pytest.raises(ValidationError, match="voxel_mm"):
+            DigitalTwinConfig(acquisition=block)
+
+    def test_slice_stack_fields_load_in_multislice_mode(self):
+        block = {
+            **self._CUSTOM,
+            "mode": "multislice_2d",
+            "voxel_mm": (4.0, 1.0, 1.0),
+            "slice_thickness_mm": 3.0,
+        }
+        assert DigitalTwinConfig(acquisition=block).acquisition.slice_thickness_mm == 3.0
+
+    def test_preset_field_strength_conflict_raises(self):
+        """physics.field_strength is the one B0 owner; a preset at another field contradicts it."""
+        with pytest.raises(ValidationError, match="field_strength"):
+            PhysicsConfigSchema(
+                field_strength=3.0,
+                digital_twin={"acquisition": {"scanner_profile": "m4raw_0.3T"}},
+            )
+
+    def test_preset_at_the_declared_field_loads(self):
+        physics = PhysicsConfigSchema(
+            field_strength=0.3,
+            digital_twin={"acquisition": {"scanner_profile": "m4raw_0.3T"}},
+        )
+        assert physics.digital_twin.acquisition.scanner_profile == "m4raw_0.3T"
+
+    def test_preset_field_table_equals_the_physics_presets(self):
+        from spectramr.config.schemas.physics import SCANNER_PRESET_FIELD_STRENGTH_T
+        from spectramr.infrastructure.physics.scanner_presets import PRESETS
+
+        assert {n: p.b0_T for n, p in PRESETS.items()} == SCANNER_PRESET_FIELD_STRENGTH_T
+
+
+def test_subvoxel_input_channels_counts_every_block() -> None:
+    """One owner of the subvoxel_sr input width (strategy setup + health check)."""
+    from spectramr.config.schemas.physics import subvoxel_input_channels
+
+    base = {"enabled": True, "method": "subvoxel_sr", "n_frames": 8}
+    rec = {"shift_source": "recovered"}
+    assert subvoxel_input_channels(MultiAcquisitionConfig(**base)) == 24
+    marker = MultiAcquisitionConfig(**base, marker_channels=True, subvoxel_registration=rec)
+    assert subvoxel_input_channels(marker) == 32
+    psf = MultiAcquisitionConfig(
+        **base, subvoxel_registration=rec, forward_psf={"enabled": True, "true_sigma_px": 2.4}
+    )
+    assert subvoxel_input_channels(psf) == 25
+
+
+def test_tissue_map_factor_form_requires_a_factored_arm() -> None:
+    """VFU-05: an unfactored arm applies no kappa, so a kappa shape is inert there."""
+    acq = {"tr_ms": 500.0, "te_ms": 15.0, "flip_deg": 90.0}
+    block = {
+        "enabled": True,
+        "source": {"field_strength_t": 0.064, **acq},
+        "target": {"field_strength_t": 3.0, **acq},
+        "factor_form": "tissue_map",
+    }
+    with pytest.raises(ValidationError, match="requires factored=True"):
+        _relax(**block)
+    assert _relax(**block, factored=True).factor_form == "tissue_map"
+    with pytest.raises(ValidationError):
+        _relax(**{**block, "factor_form": "per_voxel"}, factored=True)
+
+
+def test_per_sample_markers_need_a_synthesised_fiducial() -> None:
+    """VFU-02: with no marker there is nothing to realise per sample."""
+    with pytest.raises(ValidationError, match="needs a synthesised fiducial"):
+        MultiAcquisitionConfig(
+            enabled=True,
+            method="subvoxel_sr",
+            subvoxel_registration={"shift_source": "blind", "marker_realisation": "per_sample"},
+        )
+    cfg = MultiAcquisitionConfig(
+        enabled=True,
+        method="subvoxel_sr",
+        subvoxel_registration={"shift_source": "recovered", "marker_realisation": "per_sample"},
+    )
+    assert cfg.subvoxel_registration.marker_realisation == "per_sample"
+
+
+def test_mismatched_probe_target_needs_the_instrument_term() -> None:
+    """The wrong target only enters lambda_band; at 0 the control would be inert."""
+    rec = {"shift_source": "recovered"}
+    with pytest.raises(ValidationError, match="requires lambda_band > 0"):
+        MultiAcquisitionConfig(
+            enabled=True,
+            method="subvoxel_sr",
+            subvoxel_registration=rec,
+            band_probe={"enabled": True, "target_realisation": "mismatched"},
+        )
+    MultiAcquisitionConfig(
+        enabled=True,
+        method="subvoxel_sr",
+        subvoxel_registration=rec,
+        band_probe={"enabled": True, "lambda_band": 0.1, "target_realisation": "mismatched"},
+    )
+
+
+def test_heldout_subject_calibration_needs_no_fiducial() -> None:
+    """VFU-09: anatomy residuals of held-out subjects calibrate; the marker is not read."""
+    cfg = MultiAcquisitionConfig(
+        enabled=True,
+        method="subvoxel_sr",
+        anchor_conformal={"enabled": True, "calibration_source": "held_out_subjects"},
+    )
+    assert cfg.anchor_conformal.calibration_subject_count == 1
+    with pytest.raises(ValidationError, match="shift_source='recovered'"):
+        MultiAcquisitionConfig(
+            enabled=True, method="subvoxel_sr", anchor_conformal={"enabled": True}
+        )
+    with pytest.raises(ValidationError):
+        MultiAcquisitionConfig(
+            enabled=True,
+            method="subvoxel_sr",
+            anchor_conformal={"enabled": True, "calibration_source": "validation"},
+        )
+
+
+def test_acquired_input_stream_is_one_blind_unmarked_frame() -> None:
+    """VFU-07: the real 64 mT scan has one frame, no dither and no fiducial."""
+    ok = MultiAcquisitionConfig(
+        enabled=True, method="subvoxel_sr", n_frames=1, input_stream="acquired",
+        fov_mask="acquired_support",
+    )
+    assert ok.input_stream == "acquired"
+    for bad in (
+        {"n_frames": 8},
+        {"subvoxel_registration": {"shift_source": "recovered"}},
+        {"fov_mask": "none"},
+        {"band_probe": {"enabled": True, "lambda_band": 0.1}},
+    ):
+        kw = {"n_frames": 1, "fov_mask": "acquired_support", **bad}
+        with pytest.raises(ValidationError, match="input_stream='acquired' is inconsistent"):
+            MultiAcquisitionConfig(enabled=True, method="subvoxel_sr", input_stream="acquired", **kw)

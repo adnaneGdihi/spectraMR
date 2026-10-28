@@ -250,3 +250,43 @@ class TestAdapterEscapeHatchIsNarrow:
         )
         result = _check(Regime.STRUCTURAL, "kspace", "mrixfields", adapters=adapters)
         assert not result.passed
+
+
+class TestTheReconstructionStrategyBridgesKspaceToImage:
+    """#2296: an image network over a k-space loader is served ``A^H y`` by the
+    reconstruction strategy, so the check must compare the bridged domain -- and
+    must still fire where no strategy applies that adjoint."""
+
+    @staticmethod
+    def _ei_arm(strategy_class: str | None = None):
+        from pathlib import Path
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.models.init_registry import populate_model_registry
+
+        populate_model_registry()
+        root = Path(__file__).resolve().parents[4]
+        config = TrainingSettings.from_yaml(
+            root / "experiments/inprogress/self_supervised/ei_unet_m4raw_r4.yaml"
+        )
+        if strategy_class is not None:
+            training = config.training.model_copy(
+                update={"strategy_class": strategy_class, "training_mode": "diffusion"}
+            )
+            config = config.model_copy(update={"training": training})
+        return config
+
+    def test_the_ei_arm_passes_through_the_strategy_bridge(self) -> None:
+        checker = ConfigHealthChecker.__new__(ConfigHealthChecker)
+        result = checker.check_workflow_dataset_signal_domain(self._ei_arm())
+        assert result.passed, result.message
+        assert "adjoint" in result.message
+
+    def test_a_strategy_without_the_bridge_is_still_rejected(self) -> None:
+        """The planted violation: same data and model, a strategy that feeds k-space."""
+        checker = ConfigHealthChecker.__new__(ConfigHealthChecker)
+        config = self._ei_arm(
+            "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
+        )
+        result = checker.check_workflow_dataset_signal_domain(config)
+        assert not result.passed and result.severity == "error"

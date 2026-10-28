@@ -1,8 +1,10 @@
 """Logging and experiment tracking configuration schema."""
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from .enums import LogLevel, TrackingService
+from .enums import ConsoleStream, LogLevel, ProgressMode, RankScope, TrackingService
 from .renames import (
     fold_renamed_keys,
     folded_input_keys,
@@ -12,9 +14,11 @@ from .renames import (
 
 __all__ = [
     "LoggingConfigSchema",
+    "LoggingDistributedConfigSchema",
     "LoggingIdentityConfigSchema",
     "LoggingImagesConfigSchema",
     "LoggingIntervalsConfigSchema",
+    "LoggingProgressConfigSchema",
     "LoggingReportCasesConfigSchema",
     "LoggingSinksConfigSchema",
     "LoggingSnapshotsConfigSchema",
@@ -55,7 +59,7 @@ class LoggingIdentityConfigSchema(BaseModel):
         description="Name of this particular run; None derives one.",
     )
     notes: str | None = Field(default=None, description="Free-text run notes.")
-    tags: dict = Field(default_factory=dict, description="Key/value run tags.")
+    tags: dict[str, Any] = Field(default_factory=dict, description="Key/value run tags.")
 
 
 class LoggingSinksConfigSchema(BaseModel):
@@ -72,9 +76,65 @@ class LoggingSinksConfigSchema(BaseModel):
         description="Logging level: debug, info, warning, error, critical.",
     )
     silent: bool = Field(default=False, description="Suppress logging output.")
-    to_console: bool = Field(default=True, description="Log to stdout.")
+    to_console: bool = Field(default=True, description="Log to the console.")
+    console_stream: ConsoleStream = Field(
+        default=ConsoleStream.SPLIT,
+        description=(
+            "Console stream: `split` (INFO and below to stdout, WARNING and above to "
+            "stderr), `stdout`, or `stderr`."
+        ),
+    )
     to_file: bool = Field(default=True, description="Log to a file under `dir`.")
     dir: str = Field(default="./logs", description="Directory for log files.")
+
+
+class LoggingDistributedConfigSchema(BaseModel):
+    """What the ranks of a distributed launch write.
+
+    By default only rank 0 logs. The other ranks still print ``secondary_level``
+    and above, so a rank-specific failure (OOM, NaN) is not invisible; set
+    ``console_ranks: all`` to give every rank the full level.
+    """
+
+    model_config = _LOG_SUBBLOCK
+
+    console_ranks: RankScope = Field(
+        default=RankScope.RANK0,
+        description="`rank0`: other ranks are held to `secondary_level`. `all`: every rank logs at the full level.",
+    )
+    secondary_level: LogLevel = Field(
+        default=LogLevel.ERROR,
+        description="Console floor on ranks other than 0 when `console_ranks` is `rank0`.",
+    )
+    file_ranks: RankScope = Field(
+        default=RankScope.RANK0,
+        description=(
+            "`rank0`: only rank 0 writes the text log. `all`: every rank writes its own "
+            "`<name>.rank<N>.log` beside it, so ranks never interleave in one file."
+        ),
+    )
+
+
+class LoggingProgressConfigSchema(BaseModel):
+    """How progress is shown.
+
+    A live tqdm bar is right on a terminal and wrong in a SLURM file, where every
+    refresh becomes a line. `auto` therefore shows a bar on a TTY only, and the log
+    gets one generic tracking line every `log_every_n_iterations` iterations. The bar and the lines are rank 0 only unless
+    `logging.distributed.console_ranks` is `all`.
+    """
+
+    model_config = _LOG_SUBBLOCK
+
+    mode: ProgressMode = Field(
+        default=ProgressMode.AUTO,
+        description="`auto` (bar on a TTY, lines otherwise), `bar`, `lines` or `off`.",
+    )
+    log_every_n_iterations: int = Field(
+        default=1500,
+        ge=1,
+        description="Iterations between tracking lines in the log (tracking only; the bar is console-only).",
+    )
 
 
 class LoggingIntervalsConfigSchema(BaseModel):
@@ -189,7 +249,7 @@ class LoggingSnapshotsConfigSchema(BaseModel):
     )
     save_images: bool = Field(default=True, description="Include images.")
     save_json: bool = Field(default=True, description="Include a JSON dump.")
-    log_steps: list = Field(
+    log_steps: list[Any] = Field(
         default_factory=lambda: [0, 1, 2, 10],
         description=(
             "Step numbers that force the diffusion anomaly-check log "
@@ -245,6 +305,10 @@ class LoggingConfigSchema(BaseModel):
     report_cases: LoggingReportCasesConfigSchema = Field(
         default_factory=LoggingReportCasesConfigSchema
     )
+    distributed: LoggingDistributedConfigSchema = Field(
+        default_factory=LoggingDistributedConfigSchema
+    )
+    progress: LoggingProgressConfigSchema = Field(default_factory=LoggingProgressConfigSchema)
 
     __folded_input_keys__ = folded_input_keys("logging")
     __folded_input_paths__ = folded_input_paths("logging")
@@ -259,8 +323,12 @@ class LoggingConfigSchema(BaseModel):
     # place: the key stops working AND stops being visible. Promoting a
     # drained record in a block without this validator converts a working
     # fold into exactly that.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("logging")))
-    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("logging")))
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("logging"))  # type: ignore[arg-type]
+    )
+    _fold_renamed = model_validator(mode="before")(
+        classmethod(fold_renamed_keys("logging"))  # type: ignore[arg-type]
+    )
 
     # ---- ungrouped: inert, and flatness is the tell ----------------------
     # All nine below are carried by KNOWN_UNCONSUMED in
@@ -333,7 +401,7 @@ class LoggingConfigSchema(BaseModel):
     )
     progress_bar_on_warning: bool = Field(
         default=True,
-        description="Show progress bars when logging level is WARNING or above",
+        description="Show progress bars when the logging level is WARNING or above; `false` turns them off there.",
     )
     progress_bar_no_progress: bool = Field(
         default=False,

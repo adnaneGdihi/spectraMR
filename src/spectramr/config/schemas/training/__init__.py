@@ -45,8 +45,6 @@ import logging
 from typing import Any
 
 from .base import BaseTrainingConfigSchema
-
-logger = logging.getLogger(__name__)
 from .acq_hypernetwork import AcqHypernetworkConfig, TrainingConfigAcqHypernetwork
 from .bloch_manifold_dps import TrainingConfigBlochManifoldDPS
 from .diffusion import TrainingConfigDiffusion
@@ -58,6 +56,7 @@ from .equivariance_conformal import TrainingConfigEquivarianceConformal
 from .federated import TrainingConfigFederated
 from .flow import TrainingConfigFlow
 from .gan import TrainingConfigGAN
+from .hardware_warp import TrainingConfigHardwareWarpCalibration
 from .mcgi import MCGIConfig
 from .meta_learning import TrainingConfigMetaLearning
 from .motion import TrainingConfigMotion
@@ -76,6 +75,8 @@ from .ssl import TrainingConfigSSL
 from .tto import TrainingConfigTTO
 from .vae import TrainingConfigVAE
 from .vf_advanced import TrainingConfigIBVF, TrainingConfigTwinDPS
+
+logger = logging.getLogger(__name__)
 
 # Alias preserved for callers using the older name.
 TrainingConfigSchema = BaseTrainingConfigSchema
@@ -146,6 +147,9 @@ _MODE_DISPATCH: dict[str, str] = {
     # supervised paradigm and needs no wrapper.
     "acq_hypernetwork": "TrainingConfigAcqHypernetwork",
     "dispersion_bloch_ae": "TrainingConfigDispersionBlochAE",
+    # ULF paired batch-1 Proposal 2 -- hardware warp identified from repeat-session
+    # commutators; frozen-parameter, no model or loss registration.
+    "hardware_warp_calibration": "TrainingConfigHardwareWarpCalibration",
 }
 
 # The documented default mode when ``training_mode`` is missing or
@@ -230,6 +234,7 @@ __all__ = [
     "TrainingConfigFederated",
     "TrainingConfigFlow",
     "TrainingConfigGAN",
+    "TrainingConfigHardwareWarpCalibration",
     "TrainingConfigIBVF",
     "TrainingConfigLowRankSparse",
     "TrainingConfigMetaLearning",

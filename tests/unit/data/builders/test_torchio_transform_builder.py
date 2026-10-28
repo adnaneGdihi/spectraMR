@@ -179,6 +179,35 @@ class TestTorchIOTransformBuilder:
         transforms = TorchIOTransformBuilder.build_val_transforms(config)
         assert isinstance(transforms, tio.Compose)
 
+    @pytest.mark.parametrize("build", ["build_train_transforms", "build_val_transforms"])
+    def test_chain_deep_copies_the_subject_once(self, build, monkeypatch):
+        """Each member's default copy=True made an N-member chain copy a sample N+1 times."""
+        import copy
+
+        import torch
+
+        copies = []
+        real = copy.deepcopy
+
+        def counting(obj, memo=None):
+            if isinstance(obj, tio.Subject):
+                copies.append(obj)
+            return real(obj, memo)
+
+        monkeypatch.setattr("torchio.transforms.transform.copy.deepcopy", counting)
+        chain = getattr(TorchIOTransformBuilder, build)(TorchIOTransformConfig())
+        assert len(chain.transforms) > 1
+        chain(tio.Subject(input=tio.ScalarImage(tensor=torch.rand(1, 8, 8, 1))))
+        assert len(copies) == 1
+
+    def test_members_of_a_one_of_stop_copying_too(self):
+        """OneOf keeps its members in transforms_dict, so a `.transforms` walk missed them."""
+        from spectramr.data.builders.torchio_transform_builder import _compose_copying_once
+
+        flip, noise = tio.RandomFlip(), tio.RandomNoise()
+        _compose_copying_once([tio.OneOf({flip: 0.5, noise: 0.5}), tio.Compose([tio.RandomBlur()])])
+        assert flip.copy is False and noise.copy is False
+
     def test_build_train_transforms_count_minimal(self):
         """Test that minimal config produces expected number of transforms."""
         config = TorchIOTransformConfig(
@@ -545,6 +574,36 @@ class TestKSpaceScaleDomainWiring:
         found = self._kspace_norm(build(cfg))
         assert len(found) == 1, f"expected exactly one normalizer, got {len(found)}"
         assert found[0].scale_domain == domain
+
+    @pytest.mark.parametrize("reference", ["target", "input"])
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_scale_reference_forwarded_to_both_pipelines(self, reference, which):
+        cfg = self._cfg(kspace_scale_reference=reference)
+        found = self._kspace_norm(_builder(which)(cfg))
+        assert len(found) == 1
+        assert found[0].spec.scale_reference == reference
+
+    def test_from_training_config_reads_the_reference_knob(self):
+        """Non-vacuous: the default is "target", so "input" proves the read."""
+        from spectramr.config.schemas.data import DataConfigSchema
+        from spectramr.data.builders.torchio_transform_builder import (
+            TorchIOTransformConfig,
+        )
+
+        data = DataConfigSchema(
+            processing={"enable_kspace_normalization": True, "kspace_scale_reference": "input"}
+        )
+
+        class _Proxy:
+            def __init__(self, d):
+                self._d = d
+                self.undersampling = None
+
+            def __getattr__(self, name):
+                return getattr(self._d, name)
+
+        resolved = TorchIOTransformConfig.from_training_config(_Proxy(data))
+        assert resolved.kspace_scale_reference == "input"
 
     def test_from_training_config_reads_the_data_knob(self):
         from spectramr.config.schemas.data import DataConfigSchema
@@ -1126,3 +1185,152 @@ def _fold_copies(source: str) -> list[int]:
         if pattern.search(code):
             hits.append(lineno)
     return hits
+
+
+# ── #2093: the coil mode the three prior-method arms need ─────────────────────
+
+
+class TestCoilModeDispatchForPriorMethodArms:
+    """``rss_per_channel`` mounts a combine; ``rss`` deliberately still does not.
+
+    CDiffMR, FDB and Shen 2024 are all single-coil methods whose networks take
+    two channels, so 4-coil M4Raw has to be reduced before the model sees it.
+    ``rss`` cannot do that job: it has always declared "the source is already
+    combined" and mounted nothing, and seven arms rely on that reading. The
+    second test is what stops this change from quietly altering them.
+    """
+
+    @staticmethod
+    def _cfg(mode: str):
+        return TorchIOTransformConfig(patch_size=(16, 16, 1), coil_processing_mode=mode)
+
+    @staticmethod
+    def _combine_transforms(pipeline):
+        from spectramr.data.transforms.kspace_coil_transforms import CoilCombineTransform
+
+        return [t for t in pipeline.transforms if isinstance(t, CoilCombineTransform)]
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_rss_per_channel_mounts_the_combine(self, which):
+        mounted = self._combine_transforms(_builder(which)(self._cfg("rss_per_channel")))
+
+        assert len(mounted) == 1
+        assert mounted[0].method == "rss_per_channel"
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_rss_still_mounts_nothing(self, which):
+        """The planted red. Giving ``rss`` a transform would change 7 arms in place."""
+        assert self._combine_transforms(_builder(which)(self._cfg("rss"))) == []
+
+    def test_an_unknown_mode_still_raises(self):
+        """Widening the dispatch must not widen it to everything (pitfall #9)."""
+        with pytest.raises(ValueError, match="Unknown coil_processing_mode"):
+            TorchIOTransformBuilder.build_train_transforms(self._cfg("rss_per_coil"))
+
+
+def test_mask_direction_reaches_the_cartesian_masking_transform():
+    """`undersampling.mask_direction` is read by the builder and lands on the transform."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    cfg = TorchIOTransformConfig(
+        trajectory_type="cartesian", acceleration=4, center_fraction=0.08, mask_direction="x"
+    )
+    transform = TorchIOTransformBuilder._build_physics_transform(cfg)
+    assert isinstance(transform, PhysicsInformedMasking) and transform.line_axis == "x"
+    default = TorchIOTransformBuilder._build_physics_transform(
+        TorchIOTransformConfig(trajectory_type="cartesian", acceleration=4, center_fraction=0.08)
+    )
+    assert default.line_axis == "y"
+
+
+def test_the_injection_log_names_the_declared_factor_as_outer_line_only(caplog):
+    """#2382: an ``acc=4x`` line read as R4 while the mask realised R 3.24."""
+    cfg = TorchIOTransformConfig(trajectory_type="cartesian", acceleration=4, center_fraction=0.08)
+    with caplog.at_level("INFO", logger="spectramr.data.builders.torchio_transform_builder"):
+        TorchIOTransformBuilder._build_physics_transform(cfg)
+    assert "declared acc=4x over the non-ACS lines" in caplog.text
+    assert "realised" in caplog.text
+
+
+def test_phase_encode_axis_is_read_from_the_data_block_not_the_design_block():
+    """`data.acquisition` carries the axis; a TrainingSettings' top-level
+    `acquisition:` is the acquisition-design block and must not be read (#2160)."""
+    from types import SimpleNamespace
+
+    from spectramr.data.builders.torchio_transform_builder import _phase_encode_axis_of
+
+    data = SimpleNamespace(acquisition=SimpleNamespace(phase_encode_axis=-1))
+    assert _phase_encode_axis_of(data) == -1
+    settings = SimpleNamespace(data=data, acquisition=SimpleNamespace(codesign=None))
+    assert _phase_encode_axis_of(settings) == -1
+    assert _phase_encode_axis_of(SimpleNamespace(acquisition=None)) is None
+    cfg = TorchIOTransformConfig(
+        trajectory_type="cartesian",
+        acceleration=4,
+        center_fraction=0.08,
+        mask_direction="phase",
+        phase_encode_axis=-1,
+    )
+    assert TorchIOTransformBuilder._build_physics_transform(cfg).line_axis == "x"
+
+
+def test_at_base_one_the_loader_masks_nothing_and_reads_no_direction():
+    """#1082: the audit calls a base-1 bin-wise arm's mask_direction unread on this branch."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    cfg = TorchIOTransformConfig(
+        trajectory_type="cartesian", acceleration=1, center_fraction=0.08, mask_direction="x"
+    )
+    transform = TorchIOTransformBuilder._build_physics_transform(cfg)
+    assert not isinstance(transform, PhysicsInformedMasking)
+
+
+class TestTheTwinIsReachableFromTheRunConfig:
+    """``physics`` is a run-level block. The data builders used to hand the builder a
+    data-only proxy, so ``physics.digital_twin.apply_as_transform`` was never read."""
+
+    @staticmethod
+    def _settings(apply: bool):
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+        from spectramr.config.schemas.physics import PhysicsConfigSchema
+
+        twin = {
+            "apply_as_transform": apply,
+            "enable_b0": False,
+            "enable_b1": False,
+            "enable_motion": True,
+            "motion_severity": 3.0,
+        }
+        return SimpleNamespace(
+            data=DataConfigStub(patch_size=(32, 32, 1), coil_processing_mode="none"),
+            undersampling=AccelerationConfigSchema(base_acceleration=1.0),
+            physics=PhysicsConfigSchema(field_strength=0.3, digital_twin=twin),
+        )
+
+    @staticmethod
+    def _twins(pipeline):
+        from spectramr.data.transforms.tio_physics import DigitalTwinDegradation
+
+        return [t for t in pipeline.transforms if isinstance(t, DigitalTwinDegradation)]
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_the_flag_puts_a_firing_twin_in_both_chains(self, which):
+        import torch
+
+        cfg = TorchIOTransformConfig.from_settings(self._settings(True))
+        assert cfg.digital_twin_field_strength_t == 0.3
+        (twin,) = self._twins(_builder(which)(cfg))
+        torch.manual_seed(0)
+        out = twin(tio.Subject(kspace=tio.ScalarImage(tensor=torch.randn(2, 32, 32, 1))))
+        assert not torch.allclose(out["input"].data, out["target"].data, atol=1e-4)
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_no_twin_when_the_flag_is_off(self, which):
+        cfg = TorchIOTransformConfig.from_settings(self._settings(False))
+        assert self._twins(_builder(which)(cfg)) == []
+
+    def test_a_bare_data_config_builds_without_run_blocks(self):
+        cfg = TorchIOTransformConfig.from_settings(DataConfigStub(patch_size=(32, 32, 1)))
+        assert cfg.digital_twin_apply is False

@@ -15,6 +15,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -125,7 +126,7 @@ def test_mocked_env_with_no_owned_modules_is_empty() -> None:
     s.some_scalar = 0.5
     s.some_flag = True
     state = s.strategy_state_dict()
-    assert state == {"modules": {}, "params": {}}
+    assert state == {"modules": {}, "params": {}, "generators": {}, "counters": {}}
 
 
 def test_owned_module_alongside_env_aliases() -> None:
@@ -138,3 +139,146 @@ def test_owned_module_alongside_env_aliases() -> None:
     state = s.strategy_state_dict()
     assert "critic" in state["modules"]
     assert "generator_alias" not in state["modules"]
+
+
+# ---------------------------------------------------------------------------
+# #2786: declared random streams round-trip through the base seam
+# ---------------------------------------------------------------------------
+
+
+class _Streamed(_Strat):
+    checkpointed_streams = ("_rng",)
+
+
+def _streamed() -> _Streamed:
+    s = object.__new__(_Streamed)
+    s.env = _env()
+    s._rng = torch.Generator().manual_seed(4)
+    return s
+
+
+def test_a_declared_stream_resumes_where_it_was_saved() -> None:
+    saved = _streamed()
+    torch.rand(8, generator=saved._rng)  # advance past the seed
+    state = saved.strategy_state_dict()
+    expected = torch.rand(8, generator=saved._rng)
+
+    resumed = _streamed()
+    resumed.load_strategy_state_dict(state)
+    assert torch.equal(torch.rand(8, generator=resumed._rng), expected)
+
+
+def test_an_undeclared_generator_is_not_saved() -> None:
+    # A stream reseeded on every call, or built lazily after the first
+    # validation (se3 navigator's), would make a resume of a fresh strategy
+    # refuse a stream it does not yet own.
+    s = _bare(_env())
+    s._val_motion_generator = torch.Generator()
+    assert s.strategy_state_dict()["generators"] == {}
+
+
+# ---------------------------------------------------------------------------
+# #2820: a saved entry with no live target of its kind raises
+# ---------------------------------------------------------------------------
+
+
+def _saved_with_sfc_and_scale() -> dict:
+    s = _bare(_env(generator=nn.Linear(4, 4)))
+    s.sfc = nn.Linear(3, 3)
+    s.scale = nn.Parameter(torch.tensor(2.0))
+    return s.strategy_state_dict()
+
+
+def test_a_saved_module_with_no_attribute_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.scale = nn.Parameter(torch.tensor(0.0))
+    with pytest.raises(RuntimeError, match=r"modules\.sfc"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_saved_module_whose_lazy_slot_is_still_none_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.sfc = None
+    fresh.scale = nn.Parameter(torch.tensor(0.0))
+    with pytest.raises(RuntimeError, match=r"modules\.sfc"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_saved_parameter_with_no_attribute_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.sfc = nn.Linear(3, 3)
+    with pytest.raises(RuntimeError, match=r"params\.scale"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_target_of_the_wrong_kind_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.sfc = nn.Linear(3, 3)
+    fresh.scale = torch.tensor(0.0)  # a plain tensor, not an nn.Parameter
+    with pytest.raises(RuntimeError, match=r"params\.scale"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_parameter_whose_lazy_slot_is_still_none_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.sfc = nn.Linear(3, 3)
+    fresh.scale = None
+    with pytest.raises(RuntimeError, match=r"params\.scale"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_module_target_of_the_wrong_kind_raises() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.sfc = torch.zeros(3, 3)  # a tensor where a module was saved
+    fresh.scale = nn.Parameter(torch.tensor(0.0))
+    with pytest.raises(RuntimeError, match=r"modules\.sfc"):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+
+
+def test_a_refused_restore_leaves_every_target_untouched() -> None:
+    fresh = _bare(_env(generator=nn.Linear(4, 4)))
+    fresh.scale = nn.Parameter(torch.tensor(0.0))
+    with pytest.raises(RuntimeError):
+        fresh.load_strategy_state_dict(_saved_with_sfc_and_scale())
+    assert float(fresh.scale.detach()) == 0.0
+
+
+class _Lazy(_Strat):
+    def _materialize_owned_state(self, state: dict) -> None:
+        if "sfc" in state["modules"]:
+            self.sfc = nn.Linear(3, 3)
+
+
+def test_the_materialize_hook_rebuilds_a_lazy_module_before_the_check() -> None:
+    saved = _bare(_env(generator=nn.Linear(4, 4)))
+    saved.sfc = nn.Linear(3, 3)
+    state = saved.strategy_state_dict()
+
+    fresh = object.__new__(_Lazy)
+    fresh.env = _env(generator=nn.Linear(4, 4))
+    fresh.load_strategy_state_dict(state)
+    assert torch.equal(fresh.sfc.weight, saved.sfc.weight)
+
+
+class _Counted(_Strat):
+    checkpointed_counters = ("_steps_seen",)
+
+
+def test_declared_counters_round_trip_and_old_checkpoints_still_load() -> None:
+    # #2892: a schedule counter must survive resume, and a checkpoint written
+    # before counters existed has no "counters" key and must still load.
+    s = object.__new__(_Counted)
+    s.env = _env(generator=nn.Linear(2, 2))
+    s._steps_seen = 37
+    state = s.strategy_state_dict()
+    assert state["counters"] == {"_steps_seen": 37}
+
+    fresh = object.__new__(_Counted)
+    fresh.env = _env(generator=nn.Linear(2, 2))
+    fresh._steps_seen = 0
+    fresh.load_strategy_state_dict(state)
+    assert fresh._steps_seen == 37
+
+    legacy = {k: v for k, v in state.items() if k != "counters"}
+    fresh.load_strategy_state_dict(legacy)
+    assert fresh._steps_seen == 37

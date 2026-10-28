@@ -25,11 +25,16 @@ import logging
 from typing import Any
 
 import torch
-import torch.nn.functional as F  # noqa: N812  (repo-wide convention)
+import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.kspace import KspaceMixin
 from spectramr.infrastructure.training.strategies.mixins.utils import _callable_accepts_kwarg
+from spectramr.models.diffusion.bloch_manifold_dps_sampler import (
+    check_reverse_stride,
+    rescaled_linear_betas,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +55,10 @@ def _cfg_get(block: Any, key: str, default: Any = None) -> Any:
     return getattr(block, key, default)
 
 
-def _linear_beta_schedule(timesteps: int, device: torch.device) -> torch.Tensor:
-    scale = 1000.0 / max(timesteps, 1)
-    return torch.linspace(scale * 1e-4, scale * 2e-2, timesteps, device=device, dtype=torch.float32)
-
-
 class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
+    # parallel_compat: Runs the score network only through its wrapped forward and builds no parameters.
+    parallel_compat = frozenset({"replicated"})
+
     # Debug-snapshot contract (non-negotiable 14): the model is fed q_sample(x0),
     # not the prepared input; declared here and emitted under the tag.
     snapshot_prepared_is_model_input: bool = False
@@ -88,7 +91,8 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
             else self._sampling_steps
         )
         self.num_timesteps = int(diff_ts)
-        betas = _linear_beta_schedule(self.num_timesteps, self.device)
+        check_reverse_stride(self._sampling_steps, self.num_timesteps)
+        betas = rescaled_linear_betas(self.num_timesteps, self.device)
         self.register_diffusion_buffers(betas)
 
         self.prediction_type = str(_cfg_get(bm, "prediction_type", "epsilon"))
@@ -169,7 +173,7 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
         and caches per underlying function, so this costs one signature lookup
         per model, not one per step.
         """
-        if _callable_accepts_kwarg(getattr(model, "forward", model), "timesteps"):
+        if _callable_accepts_kwarg(getattr(unwrap_model(model), "forward", model), "timesteps"):
             return model(x_t, timesteps=t)
         return model(x_t)
 
@@ -191,7 +195,7 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
         noise = torch.randn_like(x0)
         x_t = self.q_sample(x0, t, noise)
 
-        self._declare_model_input({"x_t": x_t, "t": t})
+        self._declare_model_input({"x_t": x_t, "t": t}, extra={"model_input_key": "x_t"})
         pred = self._forward_score(self.generator_model, x_t, t)
         if isinstance(pred, (tuple, list)):
             pred = pred[0]
@@ -301,7 +305,8 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
             }
             self._sampler = BlochManifoldDPSSampler(
                 score_network=self.generator_model,
-                sampling_steps=int(_cfg_get(bm, "sampling_steps", 1000)),
+                sampling_steps=self._sampling_steps,
+                num_timesteps=self.num_timesteps,
                 sampler_type=str(_cfg_get(bm, "sampler_type", "ddim")),
                 likelihood_weight_zeta=float(_cfg_get(bm, "likelihood_weight_zeta", 1.0)),
                 prediction_type=str(_cfg_get(bm, "prediction_type", "epsilon")),

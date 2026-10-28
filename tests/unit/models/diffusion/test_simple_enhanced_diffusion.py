@@ -75,3 +75,25 @@ def test_registered_variants_still_construct(subclass):
         num_res_blocks=1,
     )
     assert model.noise_type in ("gaussian", "chi_square", "gaussian_kan")
+
+
+@pytest.mark.parametrize("horizon", [29, 1000])
+def test_the_kan_time_code_divides_by_its_horizon(horizon):
+    """PLANTED (#2442): the KAN code divided by 1000 whatever the chain length."""
+    embed = SimpleKANTimeEmbedding(16, horizon)
+    seen = []
+    embed.kan_layers.register_forward_pre_hook(lambda _m, args: seen.append(args[0]))
+    embed(torch.tensor([0, horizon - 1]))
+    assert torch.equal(seen[0].squeeze(-1), torch.tensor([0, horizon - 1]).float() / horizon)
+
+
+def test_the_kan_variant_names_its_horizon_for_the_builder():
+    """The builder injects only into constructors that name num_timesteps."""
+    from spectramr.infrastructure.builders.generator_kwargs import resolve_contract
+
+    contract = resolve_contract(model_cls=SimpleGaussianKANDiffusionUNet, model_type=None)
+    assert "num_timesteps" in contract.accepted
+    model = SimpleGaussianKANDiffusionUNet(
+        model_channels=8, channel_mult=(1,), num_res_blocks=1, num_timesteps=29
+    )
+    assert model.time_embed.num_timesteps == 29

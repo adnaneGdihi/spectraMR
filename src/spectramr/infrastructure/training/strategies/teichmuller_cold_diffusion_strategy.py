@@ -41,6 +41,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.conformal_geometry import (
     enforce_beltrami_constraint,
 )
@@ -72,6 +73,13 @@ class TeichmullerColdDiffusionStrategy(BaseTrainingStrategy):
     ``validate_teichmuller_cold_diffusion``.
     """
 
+    # parallel_compat: The schedule head is an owned module, DDP-wrapped and run via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: object) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("schedule_head", OWNED_MODULE),)
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         # Typed, frozen, nested sub-block — REQUIRED. A missing block is a
@@ -97,8 +105,9 @@ class TeichmullerColdDiffusionStrategy(BaseTrainingStrategy):
         self.schedule_head = TeichmullerScheduleHead(hidden=16, r_max=r_max)
         if self.device is not None:
             self.schedule_head = self.schedule_head.to(self.device)
-        # The schedule head is learnable; register it on opt_g (else it never
-        # trains). env.opt_g is a READ-ONLY property — never assign to it.
+        # The schedule head is learnable: register the module for DDP, then put its
+        # parameters on opt_g (else it never trains). env.opt_g is READ-ONLY.
+        self.register_owned_module("schedule_head", self.schedule_head)
         opt = getattr(self.env, "opt_g", None)
         if opt is not None and hasattr(opt, "param_groups"):
             existing = {p for g in opt.param_groups for p in g["params"]}
@@ -148,7 +157,7 @@ class TeichmullerColdDiffusionStrategy(BaseTrainingStrategy):
     def _sample_schedule(self, device: torch.device) -> torch.Tensor:
         """Return r(t) for t ∈ linspace(0, 1, n_steps)."""
         t = torch.linspace(0.0, 1.0, self.n_steps, device=device)
-        return self.schedule_head(t)  # [n_steps]
+        return self.call_owned("schedule_head", t)  # [n_steps]
 
     def _sfc_degrade(self, image: torch.Tensor, mu_t: torch.Tensor) -> torch.Tensor:
         """Apply a ``μ_t``-parameterised k-space attenuation to ``image``.

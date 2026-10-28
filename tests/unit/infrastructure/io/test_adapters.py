@@ -89,6 +89,18 @@ def test_load_nifti_16bit_volume_in_unit_range(tmp_path: Path) -> None:
     assert out.max() <= 1.0 + 1e-6
 
 
+def test_load_nifti_emits_no_numpy2_copy_deprecation(tmp_path: Path) -> None:
+    """np.array on nibabel's proxy passes ``copy=``, which its __array__ rejects."""
+    import warnings
+
+    path = tmp_path / "int16.nii.gz"
+    _write_nifti(path, np.arange(2 * 4 * 4, dtype=np.int16).reshape(2, 4, 4))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = load_nifti(path)
+    assert out.dtype == np.float32 and out.shape == (2, 4, 4)
+
+
 def test_load_nifti_no_slice_index_returns_all_slices(tmp_path: Path) -> None:
     """No slice_index must return the WHOLE volume, never a silent middle slice."""
     vol = np.arange(3 * 4 * 4, dtype=np.float32).reshape(3, 4, 4)

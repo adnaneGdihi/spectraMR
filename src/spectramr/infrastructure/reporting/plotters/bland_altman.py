@@ -48,7 +48,7 @@ def make(
     diff = meas - ref
     bias = diff.mean()
     sd = diff.std(ddof=1)
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), column_width("single") * 0.85))
     ax.scatter(mean, diff, s=6, color=colour_for("ours", 1), alpha=0.7)
     ax.axhline(bias, color="#333333", lw=0.8, label=f"bias {bias:.3g}")

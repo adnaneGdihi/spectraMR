@@ -25,6 +25,13 @@ from spectramr.infrastructure.reporting.metadata import (
     stamp_figure,
     write_sidecar,
 )
+from spectramr.infrastructure.reporting.plotters.qc._strip_series import (  # noqa: F401
+    _NON_METRIC,
+    _collect,
+    _one_pass,
+    _series_from_long,
+    _series_from_wide,
+)
 from spectramr.infrastructure.reporting.style import (
     column_width,
     panel_label,
@@ -37,69 +44,6 @@ logger = logging.getLogger(__name__)
 
 # Fewer observations than this and there are no quartiles to speak of.
 _MIN_BOX_N = 4
-
-# Columns that are identifiers/bookkeeping, never a metric to distribute.
-_NON_METRIC = {
-    "case_id",
-    "split",
-    "step",
-    "subject_id",
-    "method",
-    "run_id",
-    "metric",
-    "value",
-    "epoch",
-    "iteration",
-}
-
-
-def _series_from_wide(frame: pd.DataFrame) -> dict:
-    """``per_call_metrics.csv`` shape: numeric non-id columns are metrics."""
-    out: dict[str, tuple] = {}
-    labels = frame["case_id"].astype(str).to_numpy() if "case_id" in frame else None
-    for col in frame.columns:
-        if col in _NON_METRIC:
-            continue
-        vals = pd.to_numeric(frame[col], errors="coerce").to_numpy()
-        mask = np.isfinite(vals)
-        if mask.sum() >= 1:
-            out[str(col)] = (vals[mask], labels[mask] if labels is not None else None)
-    return out
-
-
-def _series_from_long(frame: pd.DataFrame) -> dict:
-    """Long frame (``metric``, ``value``[, ``subject_id``]) → per-metric arrays."""
-    out: dict[str, tuple] = {}
-    sub = frame
-    if "split" in sub.columns:
-        keep = sub["split"].isin(["test", "val"])
-        sub = sub[keep] if keep.any() else sub
-    for metric, grp in sub.groupby("metric"):
-        vals = pd.to_numeric(grp["value"], errors="coerce").to_numpy()
-        labs = grp["subject_id"].astype(str).to_numpy() if "subject_id" in grp else None
-        mask = np.isfinite(vals)
-        if mask.sum() >= 1:
-            out[str(metric)] = (vals[mask], labs[mask] if labs is not None else None)
-    return out
-
-
-def _collect(df, per_call_df, predictions_df) -> dict:
-    if per_call_df is not None and not per_call_df.empty:
-        s = _series_from_wide(per_call_df)
-        if s:
-            return s
-    if (
-        predictions_df is not None
-        and not predictions_df.empty
-        and "metric" in predictions_df.columns
-    ):
-        s = _series_from_long(predictions_df)
-        if s:
-            return s
-    if df is not None and not df.empty and "metric" in df.columns:
-        return _series_from_long(df)
-    return {}
-
 
 def _tukey_outliers(vals: np.ndarray) -> tuple[np.ndarray, float, float]:
     """Return (outlier_mask, whisker_lo, whisker_hi) via the 1.5·IQR rule."""
@@ -189,25 +133,48 @@ def make(
     formats=("pdf", "png"),
     dpi: int = 600,
     metadata: RunMetadata | None = None,
+    checkpoint_step: int | None = None,
+    view: str = "selected",
     **_ignored,
 ) -> Path | None:
-    series = _collect(df, per_call_df, predictions_df)
+    series = _collect(df, per_call_df, predictions_df, checkpoint_step, view)
     if metrics:
         series = {m: series[m] for m in metrics if m in series}
     series = _drop_degenerate(series)
     if not series:
         return None
     names = sorted(series)
-    use_default_style("nature")
+    use_default_style()
     n = len(names)
-    fig, axes = plt.subplots(n, 1, figsize=(column_width("double"), 0.55 * n + 0.6), squeeze=False)
+    # Accelerations are separate distributions: one sub-row per R, never pooled.
+    levels = [
+        np.unique(series[m][2]) if series[m][2] is not None else np.array([np.nan])
+        for m in names
+    ]
+    heights = [0.3 * len(lv) + 0.25 for lv in levels]
+    fig, axes = plt.subplots(
+        n,
+        1,
+        figsize=(column_width("double"), sum(heights) + 0.6),
+        squeeze=False,
+        gridspec_kw={"height_ratios": heights},
+    )
     for i, name in enumerate(names):
         ax = axes[i][0]
-        vals, labels = series[name]
-        out_mask = _draw_hbox(ax, vals)
+        vals, _, groups = series[name]
+        rows = np.ones(vals.size)
+        out_mask = np.zeros(vals.size, dtype=bool)
+        if groups is None:
+            out_mask = _draw_hbox(ax, vals)
+        else:
+            for k, level in enumerate(levels[i], start=1):
+                sel = groups == level
+                rows[sel] = k
+                if sel.sum():
+                    out_mask[sel] = _draw_hbox(ax, vals[sel], y=float(k))
         # seeded local RNG → reproducible jitter, never touches the global RNG
         rng = np.random.default_rng(i)
-        yj = 1.0 + rng.uniform(-0.16, 0.16, vals.size)
+        yj = rows + rng.uniform(-0.16, 0.16, vals.size)
         ax.scatter(vals[~out_mask], yj[~out_mask], s=6, color="#0072B2", alpha=0.6, zorder=4)
         ax.scatter(
             vals[out_mask],
@@ -218,29 +185,13 @@ def make(
             linewidth=0.3,
             zorder=5,
         )
-        if labels is not None:
-            for xv, yv, lab in zip(vals[out_mask], yj[out_mask], labels[out_mask], strict=False):
-                ax.annotate(
-                    str(lab),
-                    (xv, yv),
-                    fontsize=4,
-                    ha="left",
-                    va="bottom",
-                    color="#D55E00",
-                )
-        ax.set_ylim(0.4, 1.6)
-        ax.set_yticks([])
+        ax.set_ylim(0.4, len(levels[i]) + 0.6)
+        if groups is None:
+            ax.set_yticks([])
+        else:
+            ax.set_yticks(range(1, len(levels[i]) + 1))
+            ax.set_yticklabels([f"{lv:g}\u00d7" for lv in levels[i]], fontsize=4.5)
         ax.set_ylabel(pretty_label(name), rotation=0, ha="right", va="center", fontsize=6)
-        ax.text(
-            0.995,
-            0.9,
-            f"n={vals.size}",
-            transform=ax.transAxes,
-            fontsize=4,
-            ha="right",
-            va="top",
-            color="#666666",
-        )
         panel_label(ax, chr(ord("a") + i)) if n > 1 else None
     fig.suptitle("Group IQM distribution", fontsize=8)
     fig.tight_layout(rect=(0, 0, 1, 0.97))

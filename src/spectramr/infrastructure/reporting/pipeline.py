@@ -15,7 +15,8 @@ import pandas as pd
 
 from . import plotters, tables
 from .aggregator import aggregate, aggregate_many
-from .metadata import RunMetadata, detect_metadata
+from .metadata import RunMetadata, detect_metadata, run_provenance
+from .run_status import log_status, read_run_status, status_notes
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,17 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
+            "fig_3_1_metric_violin",
+            "fig_3_2_subject_bars",
+            "fig_3_3_metric_scatter",
+            "fig_3_6_error_decomposition",
+            "fig_3_7_metric_embedding",
+            "fig_3_8_intensity_joint",
+            "fig_3_9_background_zoom",
+            "fig_4_1_weight_trajectory",
+            "fig_4_2_layer_drift",
+            "fig_4_3_progress_strip",
+            "fig_4_4_image_embedding",
             "mri_a7_kspace_recon",
             "mri_a11_cohort_table",
             "qc_group_strip",
@@ -81,6 +93,17 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
+            "fig_3_1_metric_violin",
+            "fig_3_2_subject_bars",
+            "fig_3_3_metric_scatter",
+            "fig_3_6_error_decomposition",
+            "fig_3_7_metric_embedding",
+            "fig_3_8_intensity_joint",
+            "fig_3_9_background_zoom",
+            "fig_4_1_weight_trajectory",
+            "fig_4_2_layer_drift",
+            "fig_4_3_progress_strip",
+            "fig_4_4_image_embedding",
             "mri_a2_synthesis_c2c",
             "mri_a11_cohort_table",
             "qc_group_strip",
@@ -107,6 +130,17 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
+            "fig_3_1_metric_violin",
+            "fig_3_2_subject_bars",
+            "fig_3_3_metric_scatter",
+            "fig_3_6_error_decomposition",
+            "fig_3_7_metric_embedding",
+            "fig_3_8_intensity_joint",
+            "fig_3_9_background_zoom",
+            "fig_4_1_weight_trajectory",
+            "fig_4_2_layer_drift",
+            "fig_4_3_progress_strip",
+            "fig_4_4_image_embedding",
             "mri_a11_cohort_table",
             "qc_group_strip",
             "qc_subject_mosaic",
@@ -301,6 +335,7 @@ def generate_report(
     qc_figures: bool = True,
     html_report: bool = True,
     interactive: bool = True,
+    view: str = "selected",
 ) -> dict[str, Any]:
     """Generate the canonical report for a single experiment run.
 
@@ -360,10 +395,20 @@ def generate_report(
     else:
         df = aggregate(experiment_dir, method_name=method)
 
+    # A crashed run is still reported, since its report is how the crash gets
+    # read; its status is stamped into the summary, the manifest and the table.
+    statuses = {method: read_run_status(experiment_dir)}
+    statuses.update({Path(r).name: read_run_status(r) for r in extra_runs or []})
+    for name, status in statuses.items():
+        log_status(name, status, action="reported with its status stamped")
+
+    # What the caller did not pass, the run directory recorded (#2502).
+    recorded = run_provenance(experiment_dir)
     metadata = detect_metadata(
         seed=seed,
-        dataset_version=dataset_version,
-        config_path=config_path,
+        dataset_version=dataset_version or recorded["dataset_version"],
+        config_path=config_path or recorded["config_path"],
+        config_hash=recorded["config_hash"],
     )
 
     # Per-plotter kwargs router
@@ -388,8 +433,16 @@ def generate_report(
     # qualitative plotters. Explicit caller kwargs (set above) always win — the
     # guards below only fill figures the caller did not already supply.
     from .cases.loader import load_report_cases
+    from .views import checkpoint_steps
 
-    disk_cases = load_report_cases(experiment_dir, task=str(getattr(task, "value", task)))
+    # The run this report is about; extra runs never choose its checkpoint.
+    selected = checkpoint_steps(df[df["method"] == method] if "method" in df else df, view)
+    checkpoint_step = next(iter(selected.values()), None)
+    disk_cases = load_report_cases(
+        experiment_dir,
+        task=str(getattr(task, "value", task)),
+        step=checkpoint_step,
+    )
     case_routing = {
         "cases_kspace": ("mri_a7_kspace_recon", "cases"),
         "cases_sr": ("mri_a1_sr_triptych", "cases"),
@@ -405,7 +458,26 @@ def generate_report(
         val = disk_cases.get(payload_key)
         if val and fid not in plot_kwargs:
             plot_kwargs.setdefault(fid, {})[kw] = val
+    from .comparison.slice_cases import slice_case_rows
+    from .plotters.distributions import CASE_FIGURES, SLICE_FIGURES
+
+    slice_df = slice_case_rows(
+        experiment_dir, step=checkpoint_step, run_id=str(method), method=str(method)
+    )
+    if not slice_df.empty:
+        for fid in SLICE_FIGURES:
+            plot_kwargs.setdefault(fid, {}).setdefault("slice_df", slice_df)
+    plot_kwargs.setdefault("fig_4_1_weight_trajectory", {}).setdefault(
+        "weight_runs", {str(method): experiment_dir}
+    )
+    plot_kwargs.setdefault("fig_4_2_layer_drift", {}).setdefault(
+        "weight_runs", {str(method): experiment_dir}
+    )
+    plot_kwargs.setdefault("fig_4_3_progress_strip", {}).setdefault("run_dir", experiment_dir)
     if img_cases:
+        plot_kwargs.setdefault("fig_4_4_image_embedding", {}).setdefault("cases", img_cases)
+        for fid in CASE_FIGURES:
+            plot_kwargs.setdefault(fid, {}).setdefault("cases", img_cases)
         plot_kwargs.setdefault("mri_recon_panel", {}).setdefault("cases", img_cases)
         plot_kwargs.setdefault("kspace_error_spectrum", {}).setdefault("cases", img_cases)
     if disk_cases.get("predictions_df") is not None:
@@ -434,6 +506,11 @@ def generate_report(
             per_call_df = None
     if per_call_df is not None and not per_call_df.empty:
         plot_kwargs.setdefault("qc_group_strip", {}).setdefault("per_call_df", per_call_df)
+        from .per_case import call_unit, validation_batch_size
+
+        sweep = plot_kwargs.setdefault("acceleration_sweep", {})
+        sweep.setdefault("per_call_df", per_call_df)
+        sweep.setdefault("call_unit", call_unit([validation_batch_size(experiment_dir)]))
     if disk_cases.get("predictions_df") is not None:
         plot_kwargs.setdefault("qc_group_strip", {}).setdefault(
             "predictions_df", disk_cases["predictions_df"]
@@ -457,8 +534,19 @@ def generate_report(
         table_kwargs["tab_2_4_dataset_descriptor"] = {"cohort": cohort}
     if hyperparameters is not None:
         table_kwargs["tab_2_3_hyperparameters"] = {"hyperparameters": hyperparameters}
+    table_kwargs.setdefault("tab_2_1_main_results", {}).update(
+        view=view, run_notes=status_notes(statuses)
+    )
     if metrics is not None:
-        table_kwargs["tab_2_1_main_results"] = {"metrics": metrics}
+        table_kwargs["tab_2_1_main_results"]["metrics"] = metrics
+    for fid in ("acceleration_sweep", "qc_group_strip", "fig_1_16_run_summary_card"):
+        plot_kwargs.setdefault(fid, {}).update(view=view, checkpoint_step=checkpoint_step)
+    if extra_runs and "method" in df.columns:
+        # one run's card and summary: the extra runs belong to the comparison figures
+        df_overrides.setdefault("fig_1_16_run_summary_card", df[df["method"] == method])
+        plot_kwargs["acceleration_sweep"]["expected_methods"] = [
+            str(m) for m in pd.unique(df["method"])
+        ]
 
     # Dispatch.
     #
@@ -506,7 +594,9 @@ def generate_report(
         method,
         task,
         tikz=tikz_results,
-        df=df,
+        df=df[df["method"] == method] if "method" in df.columns else df,
+        view=view,
+        status=statuses[method].label,
     )
     if emit_manifest:
         from .report_manifest import write_report_manifest, write_submission_bundle
@@ -519,6 +609,7 @@ def generate_report(
             tables=table_results,
             metadata=metadata,
             figure_reasons=fig_reasons,
+            runs=[{"arm": n, "included": True, **s.to_dict()} for n, s in statuses.items()],
         )
         if submission_bundle:
             write_submission_bundle(out_dir, fig_paths)
@@ -556,17 +647,28 @@ def generate_report(
     }
 
 
-def _headline_lines(df: pd.DataFrame | None) -> list[str]:
-    """Markdown table of the ``split='best'`` rows (final_metrics.json)."""
+def _headline_lines(df: pd.DataFrame | None, view: str = "selected") -> list[str]:
+    """Markdown table of the headline metrics at the ``view`` pass.
+
+    Read through :mod:`.views`, never from ``final_metrics.json``'s ``best`` block,
+    whose entries come from different checkpoints.
+    """
     if df is None or df.empty or "split" not in df.columns:
         return []
-    best = df[df["split"] == "best"].dropna(subset=["value"])
-    if best.empty:
+    from .views import snapshot
+
+    snap = snapshot(df, view)
+    if snap.empty or "headline" not in snap.columns:
+        return []
+    snap = snap[snap["headline"].astype(bool)]
+    if snap.empty:
         return []
     from .style import pretty_label
 
-    rows = best.groupby("metric")["value"].last().sort_index()
-    lines = ["", "## Headline numbers (best)", "", "| metric | value |", "|---|---|"]
+    step = int(snap["step"].iloc[0])
+    rows = snap.groupby("metric")["value"].last().sort_index()
+    lines = ["", f"## Headline numbers ({view} pass, step {step})", "", "| metric | value |",
+             "|---|---|"]
     lines += [f"| {pretty_label(str(m))} | {v:.4g} |" for m, v in rows.items()]
     return lines
 
@@ -581,17 +683,21 @@ def _write_summary(
     *,
     tikz: dict[str, Path] | None = None,
     df: pd.DataFrame | None = None,
+    view: str = "selected",
+    status: str = "not read",
 ) -> None:
     lines = [
         f"# Report — `{method}`",
         "",
+        f"- Run status: `{status}`",
         f"- Task preset: `{task}`",
+        f"- Checkpoint view: `{view}`",
         f"- Git: `{metadata.git_commit[:10]}`{' (dirty)' if metadata.git_dirty else ''}",
         f"- Seed: `{metadata.seed}`",
         f"- Dataset: `{metadata.dataset_version}`",
         f"- Generated (UTC): `{metadata.timestamp_utc}`",
     ]
-    lines += _headline_lines(df)
+    lines += _headline_lines(df, view)
     lines += ["", "## Figures"]
     for fid, p in figures.items():
         if p is None:

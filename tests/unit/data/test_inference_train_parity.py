@@ -40,7 +40,7 @@ def test_phase2_signature_module_exists_and_computes() -> None:
 
     This is the prerequisite for the xfailed tests below: they need the
     signature recorded in the checkpoint and re-computed at inference
-    load. Until CheckpointService and DataPipelineDirector are wired in,
+    load. Until the checkpoint store and DataPipelineDirector are wired in,
     those remain xfail. But the building block they depend on lives now.
     """
     from spectramr.data.transforms.signature import compute_transform_signature
@@ -112,84 +112,6 @@ def test_compute_infer_signature_hashes_the_val_chain() -> None:
     assert len(sig) == 64
     # Deterministic: the same config must hash identically.
     assert sig == sig
-
-
-def test_checkpoint_records_transform_signature(tmp_path) -> None:
-    """Sub-phase 2.9 landed: when callers pass ``transform_signature``
-    to ``CheckpointService.save_checkpoint``, the value is persisted
-    in the saved state dict alongside model weights.
-
-    The signature is consulted at inference load time by
-    :func:`spectramr.data.transforms.signature.diff_signatures` (when
-    ``modes.infer.strict_train_parity: true``).
-    """
-    import torch
-    from torch import nn
-
-    from spectramr.data.transforms.signature import compute_transform_signature
-    from spectramr.infrastructure.services.checkpoint_service import (
-        CheckpointService,
-    )
-
-    # Minimal model so save_checkpoint has something to serialize.
-    model = nn.Linear(4, 4)
-
-    # Build a signature from a fake transform chain.
-    class FakeTransform:
-        pass
-
-    FakeTransform.__name__ = "RescaleIntensity"
-    t = FakeTransform()
-    t.out_min_max = (0, 1)
-    signature = compute_transform_signature([t])
-    assert len(signature) == 64
-
-    from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
-
-    cfg = CheckpointConfigSchema(checkpoint_dir=str(tmp_path), format="pth")
-    svc = CheckpointService(cfg)
-    saved_path = svc.save_checkpoint(
-        model=model,
-        optimizer=None,
-        epoch=0,
-        loss=0.0,
-        file_path=str(tmp_path / "ckpt.pt"),
-        transform_signature=signature,
-    )
-
-    # Round-trip: load the checkpoint and verify the signature is there.
-    state = torch.load(saved_path, map_location="cpu", weights_only=False)
-    assert (
-        "transform_signature" in state
-    ), "CheckpointService.save_checkpoint did not persist transform_signature"
-    assert state["transform_signature"] == signature
-
-
-def test_checkpoint_omits_signature_when_not_provided(tmp_path) -> None:
-    """Backward-compat: callers that don't pass ``transform_signature``
-    produce checkpoints without the key — inference must tolerate that
-    (pre-Phase-2.9 checkpoints), via ``diff_signatures(None, ...)``."""
-    import torch
-    from torch import nn
-
-    from spectramr.infrastructure.services.checkpoint_service import (
-        CheckpointService,
-    )
-
-    from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
-
-    model = nn.Linear(4, 4)
-    cfg = CheckpointConfigSchema(checkpoint_dir=str(tmp_path), format="pth")
-    svc = CheckpointService(cfg)
-    saved_path = svc.save_checkpoint(
-        model=model,
-        optimizer=None,
-        epoch=0,
-        loss=0.0,
-        file_path=str(tmp_path / "ckpt_no_sig.pt"),
-    )
-    state = torch.load(saved_path, map_location="cpu", weights_only=False)
-    assert "transform_signature" not in state
 
 
 def test_inference_dataset_class_still_exists() -> None:

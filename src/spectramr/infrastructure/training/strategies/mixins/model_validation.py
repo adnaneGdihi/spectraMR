@@ -4,26 +4,45 @@ This module provides a reusable mixin for model validation, handling
 batch unpacking, prediction generation, and metric computation.
 """
 
+import functools
 import logging
 import traceback
 from abc import ABC, abstractmethod
+from types import MappingProxyType
 from typing import Any
 
 import torch
 
+from spectramr.core.metrics.data_range_contract import DataRangeContractError
+from spectramr.core.metrics.registry import MetricsRegistry
+from spectramr.core.metrics.sense_image_metrics import SenseMapsMissingError
+from spectramr.infrastructure.builders.leaf.adapter_builders import apply_pre_model
 from spectramr.infrastructure.training.utils.training_utils import clamp_to_range
 
+from ..validation_chunking import reconstruction_output
+from .recorrupted_inference import RecorruptedInference, resolve_recorrupted_inference
+from .test_slice_feed import feed_test_slice_writer
 from .utils import pick_present
+from .validation_context import (
+    SUPPLIED_FIELDS,
+    compute_context_metrics,
+    context_metric_names,
+    fold_depth,
+    project_prediction,
+    with_measurement,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class _FallbackRangeUnresolvedError(Exception):
-    """The fallback PSNR could not resolve a data_range, so it reports nothing.
+    """The fallback PSNR has no right-domain number to report, and has said why.
 
-    Internal control flow only. Distinct from a generic exception so the
-    fallback's own ``except`` cannot mistake "no contract holds for this data"
-    for "the fallback itself is broken" and log the wrong diagnosis.
+    Raised when no data_range can be resolved, or when the metric transform that
+    puts the output in the scored domain failed. Internal control flow only.
+    Distinct from a generic exception so the fallback's own ``except`` cannot
+    mistake either case for "the fallback itself is broken" and log the wrong
+    diagnosis.
     """
 
 
@@ -31,9 +50,60 @@ class ModelValidationMixin(ABC):
     #: Metrics the input-as-prediction baseline is graded on. Intersected with
     #: the arm's configured specs by ``ValidationMetricsComputer.compute(only=)``,
     #: never added to them (one owner of "which metrics does this arm grade on").
-    _ZF_BASELINE_METRICS: tuple[str, ...] = ("psnr", "hfen")
+    # ssim included: the one-virtual-coil EI pair selects on val_ssim and reads it
+    # against the zero-filled adjoint, which needs the same column on the baseline.
+    _ZF_BASELINE_METRICS: tuple[str, ...] = ("psnr", "ssim", "hfen")
+    #: The object-only pair, added by the strategies whose cohorts read it (EI, SSDU, n2n).
+    _ZF_OBJECT_METRICS: tuple[str, ...] = ("robust_mri_psnr", "clinical_ssim")
     #: Reported once per strategy instance when the baseline cannot be formed.
     _zf_baseline_not_applicable_reported: bool = False
+    #: The coil-manifold projection announces itself once (pitfall 15's provenance leg).
+    _coil_projection_logged: bool = False
+    #: ``validation.scoring.recorrupted_inference``, resolved on the first step:
+    #: ``False`` until then, ``None`` when the knob is off.
+    _recorrupted_inference: RecorruptedInference | bool | None = False
+
+    # Overwritten per instance by BaseTrainingStrategy; the empty default keeps bare stubs valid.
+    adapter_chains: Any = MappingProxyType({})
+
+    @classmethod
+    def routes_context_metric(cls, name: str) -> bool:
+        """Whether this path hands ``name`` the context it declared it needs.
+
+        Read by the ``context_metrics_routed`` audit check. A strategy with its own
+        ``validation_step`` does not inherit this, and a context metric configured on
+        one raises there for want of its maps instead of producing a column.
+        """
+        return set(MetricsRegistry.needs(name)) <= SUPPLIED_FIELDS
+
+    def _validation_loss(
+        self,
+        raw_prediction: torch.Tensor,
+        target_batch: torch.Tensor,
+        batch_context: dict[str, Any],
+        batch_data: Any,
+    ) -> torch.Tensor | None:
+        """The strategy's own ``val_loss``, or ``None`` for the generic magnitude L1.
+
+        A strategy whose training objective is not a prediction-vs-target distance
+        (EI, SSDU) overrides this so ``val_loss`` is on the training loss's scale.
+        """
+        return None
+
+    def _scoring_estimator(self, config: Any) -> RecorruptedInference | None:
+        """The Monte-Carlo estimator the arm declares, resolved and announced once."""
+        if self._recorrupted_inference is False:
+            # No validation block declares no knob, as for coil_manifold_projection.
+            declared = config is not None and config.validation is not None
+            spec = resolve_recorrupted_inference(config) if declared else None
+            self._recorrupted_inference = None if spec is None else RecorruptedInference(spec)
+            if spec is not None:
+                logger.info(
+                    "[validation] recorrupted_inference: ON (%s); every scored output, "
+                    "pred_alt included, is the mean over the recorruptions.",
+                    spec.describe(),
+                )
+        return self._recorrupted_inference or None
 
     def _zero_filled_baseline_metrics(
         self, input_batch, target_batch, computer, transform_fn, val_config
@@ -84,6 +154,32 @@ class ModelValidationMixin(ABC):
     4. Error handling
     """
 
+    #: True when ``_validation_forward`` reads the measurement from the batch
+    #: context instead of the tensor it is handed (EI, SSDU); the second-repetition
+    #: forward then gets a context that carries ``input_alt`` as its measurement.
+    validation_reads_context_measurement: bool = False
+
+    def _alternate_validation_context(
+        self, batch_context: dict[str, Any], alternate: torch.Tensor
+    ) -> dict[str, Any]:
+        """The context the forward on ``input_alt`` runs on (#2593)."""
+        if not self.validation_reads_context_measurement:
+            return batch_context
+        return with_measurement(batch_context, alternate)
+
+    def _context_metric_prediction(
+        self, raw: torch.Tensor, batch_context: dict[str, Any]
+    ) -> tuple[torch.Tensor, str]:
+        """``(tensor, domain)`` the context metrics grade, from the folded raw output.
+
+        The model's output as it stands, in ``model.output_type``. A strategy whose
+        output is not what those metrics read overrides this: the Rep-BV metrics
+        read coil k-space, and an image network's SENSE-combined ``x_hat``
+        has to be re-expanded to ``F S x_hat`` before they can grade it (#2509).
+        """
+        del batch_context
+        return raw, self.state.config.model.output_type
+
     @abstractmethod
     def _validation_forward(
         self,
@@ -107,22 +203,28 @@ class ModelValidationMixin(ABC):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Performs a single validation step with evaluation metrics.
 
         Args:
-            batch: Raw batch data
             input_batch: Optional pre-unpacked input
             target_batch: Optional pre-unpacked target
+            batch_data: The whole validation batch. Declared by name because the
+                loop forwards it only to a ``validation_step`` that asks for it
+                (``select_validation_extra_fields``); it is read only for the
+                fields metrics declare in ``needs`` and for the coil maps the
+                ``coil_manifold_projection`` knob projects onto.
             **kwargs: Additional context (e.g. batch_context)
 
         Returns:
             Dictionary of computed metrics
         """
         batch = (input_batch, target_batch)
-        # POP (not get): line 95 re-forwards **kwargs to _validation_forward and also
-        # passes batch_context positionally. With .get, a caller that supplies
+        # POP (not get): _forward below re-forwards **kwargs to _validation_forward
+        # and also passes batch_context positionally. With .get, a caller that supplies
         # batch_context= (the cross-field / field-flow / field-bridge validation_step
         # overrides do) would hit "multiple values for argument 'batch_context'".
         batch_context = kwargs.pop("batch_context", None)
@@ -146,24 +248,42 @@ class ModelValidationMixin(ABC):
             )
             return {}
 
+        # Same pre_model chain as train_step: validation grades the tensors the model trained on.
+        input_batch, target_batch = apply_pre_model(self.adapter_chains, input_batch, target_batch)
+
         self.generator_model.eval()
         # Prepare context if missing
         if batch_context is None:
             batch_context = {"use_dc": False, "measured_kspace": None}
 
-        # Generate predictions (Hook)
-        hr_fakes = self._validation_forward(input_batch, batch_context, **kwargs)
+        config = self.state and self.state.config
 
-        # Handle models that return tuples (e.g., DisentangledMRI, VAE)
-        if isinstance(hr_fakes, (tuple, list)):
-            hr_fakes = hr_fakes[0]
+        def _forward(x: torch.Tensor, ctx: dict[str, Any] | None = None) -> torch.Tensor:
+            out = self._validation_forward(x, batch_context if ctx is None else ctx, **kwargs)
+            # Tuple-returning models (DisentangledMRI, VAE) and dict-returning ones.
+            return reconstruction_output(out)
 
-        # Handle models that return dicts
-        if isinstance(hr_fakes, dict):
-            hr_fakes = hr_fakes.get(
-                "reconstruction",
-                hr_fakes.get("output", next(iter(hr_fakes.values()), None)),
+        # The arm's estimator: the model itself, or its mean over recorruptions.
+        estimator = self._scoring_estimator(config)
+        if estimator is not None and self.validation_reads_context_measurement:
+            # The estimator recorrupts the tensor it hands the forward; a strategy
+            # that reads y from the context would run J identical forwards.
+            raise ValueError(
+                f"{type(self).__name__} reads its measurement from the batch context, so "
+                "validation.scoring.recorrupted_inference would average J copies of one "
+                "output. Drop the knob for this arm."
             )
+
+        def _estimate(
+            x: torch.Tensor, batch_key: int | None = None, ctx: dict[str, Any] | None = None
+        ) -> torch.Tensor:
+            if estimator is None:
+                return _forward(x, ctx)
+            return estimator.predict(lambda z: _forward(z, ctx), x, batch_data, batch_key=batch_key)
+
+        # The batch index reseeds the draws, so every epoch scores this batch under
+        # the same recorruptions; the pred_alt call below continues the stream.
+        hr_fakes = _estimate(input_batch, kwargs.get("batch_idx"))
 
         if hr_fakes is None:
             logger.warning(
@@ -176,51 +296,114 @@ class ModelValidationMixin(ABC):
             hr_fakes = hr_fakes.to(target_batch.device)
 
         # Optional output range enforcement
-        config = self.state and self.state.config
         training_config = getattr(config, "training", None)
         if training_config and getattr(training_config, "enforce_output_range", False):
             hr_fakes = clamp_to_range(hr_fakes, enable=True, telemetry=False)
+
+        # Depth folds into the batch once, here, so the projection, the context
+        # metrics and the image metrics all see the (B, C, H, W) layout.
+        hr_fakes, _ = fold_depth(hr_fakes)
+        input_batch, _ = fold_depth(input_batch)
+        if target_batch is not None:
+            target_batch, _ = fold_depth(target_batch)
 
         # Compute Metrics
         metrics = {}
         val_config = config.validation if config else None
         compute_img_metrics = val_config.scoring.enable_image_metrics if val_config else True
 
+        # The network's own output, kept before any projection: the certificate
+        # metrics read THAT (a residual measured after projecting would be 0);
+        # every other metric, image or context, grades the projected output.
+        raw_prediction = hr_fakes
+        projector = None
+        if val_config is not None and val_config.scoring.coil_manifold_projection:
+            hr_fakes, maps_key = project_prediction(hr_fakes, batch_data, config.model.output_type)
+
+            def projector(x: torch.Tensor) -> torch.Tensor:
+                return project_prediction(x, batch_data, config.model.output_type)[0]
+
+            if not self._coil_projection_logged:
+                self._coil_projection_logged = True
+                logger.info(
+                    "[validation] coil_manifold_projection: ON, maps from batch key %r; "
+                    "every metric grades the projected output except the null-space "
+                    "certificate, which reads the raw one.",
+                    maps_key,
+                )
+
+        # Attached by the held-out test pass only: every test slice is rendered and guarded.
+        test_writer = getattr(self, "_test_slice_writer", None)
+        if test_writer is not None and target_batch is not None:
+            feed_test_slice_writer(
+                self,
+                test_writer,
+                input_batch=input_batch,
+                prediction=hr_fakes,
+                target=target_batch,
+                val_config=val_config,
+                batch_data=batch_data,
+                batch_index=kwargs.get("batch_idx"),
+            )
+
         if compute_img_metrics and target_batch is not None:
-            # Assume self.validation_metrics_computer exists
             computer = self.validation_metrics_computer
+            if computer and not computer.get_metric_names():
+                # Every requested name is strategy-emitted (#2839). Skipping here
+                # also keeps the fallback PSNR below from scoring what was not asked for.
+                computer = None
+            context_names: tuple[str, ...] = ()
+            if computer:
+                # Outside the `try` below on purpose: a context metric missing its
+                # maps is a wiring defect and must fail the batch, not degrade to
+                # the fallback PSNR. Run first, since `compute` clears
+                # `last_not_applicable` per call and the full pass should own it.
+                context_names = context_metric_names(computer)
+                if context_names:
+                    graded, domain = self._context_metric_prediction(raw_prediction, batch_context)
+
+                    def _graded_forward(x: torch.Tensor) -> torch.Tensor:
+                        alt_context = self._alternate_validation_context(batch_context, x)
+                        return self._context_metric_prediction(
+                            fold_depth(_estimate(x, ctx=alt_context))[0], alt_context
+                        )[0]
+
+                    metrics.update(
+                        compute_context_metrics(
+                            computer,
+                            context_names,
+                            graded,
+                            target_batch,
+                            input_batch,
+                            batch_data,
+                            config.model,
+                            _graded_forward,
+                            projected=projector,
+                            signal_domain=domain,
+                            image_prediction=(
+                                raw_prediction if config.model.output_type == "image" else None
+                            ),
+                        )
+                    )
             if computer:
                 try:
-                    # Globally flatten 5D tensors to 4D to prevent "too many values to unpack (expected 4)" in metrics
-                    if target_batch.ndim == 5:
-                        b_dim, c_dim, h_dim, w_dim, d_dim = target_batch.shape
-                        target_batch = target_batch.permute(0, 4, 1, 2, 3).reshape(
-                            b_dim * d_dim, c_dim, h_dim, w_dim
-                        )
-                    if hr_fakes.ndim == 5:
-                        b_dim, c_dim, h_dim, w_dim, d_dim = hr_fakes.shape
-                        hr_fakes = hr_fakes.permute(0, 4, 1, 2, 3).reshape(
-                            b_dim * d_dim, c_dim, h_dim, w_dim
-                        )
-
-                    # Apply transforms if available
-                    transform_fn = self._apply_metric_transforms
-                    if transform_fn:
-                        output_trans, target_trans = transform_fn(
-                            hr_fakes, target_batch, val_config
-                        )
-                    else:
-                        output_trans, target_trans = hr_fakes, target_batch
+                    views = self._metric_transform_views(
+                        hr_fakes, target_batch, val_config, batch_data=batch_data
+                    )
 
                     # Evidential UNets output 4 parameters (mean, var, alpha, beta)
                     # We only want to compute structural metrics on the predicted mean
                     if (
                         getattr(config.model, "model_type", "") == "evidential_unet"
-                        and output_trans.shape[1] > target_trans.shape[1]
+                        and views.pred.shape[1] > views.target.shape[1]
                     ):
-                        output_trans = output_trans[:, : target_trans.shape[1]]
+                        views = views._replace(pred=views.pred[:, : views.target.shape[1]])
 
-                    computed = computer.compute(output_trans, target_trans)
+                    if context_names:
+                        plain = [n for n in computer.get_metric_names() if n not in context_names]
+                        computed = views.compute(computer, only=plain)
+                    else:
+                        computed = views.compute(computer)
 
                     # Apply prefix 'val_'
                     for k, v in computed.items():
@@ -236,7 +419,13 @@ class ModelValidationMixin(ABC):
                     if not getattr(self, "_owns_zero_filled_baseline", False):
                         metrics.update(
                             self._zero_filled_baseline_metrics(
-                                input_batch, target_batch, computer, transform_fn, val_config
+                                input_batch,
+                                target_batch,
+                                computer,
+                                functools.partial(
+                                    self._apply_metric_transforms, batch_data=batch_data
+                                ),
+                                val_config,
                             )
                         )
                 except torch.cuda.OutOfMemoryError:
@@ -244,6 +433,12 @@ class ModelValidationMixin(ABC):
                     # allocator in a corrupt state and the fallback metric path
                     # below would OOM again. Propagate so the run fails loudly
                     # instead of silently reporting degraded validation metrics.
+                    raise
+                except (DataRangeContractError, SenseMapsMissingError):
+                    # Not a metric failure for the fallback to paper over: the
+                    # fallback scores the untransformed target and would read the
+                    # contradiction as "no range", leaving the run without val_psnr;
+                    # a SENSE transform without maps would be scored as RSS.
                     raise
                 except Exception as e:
                     logger_service = self.logging_service
@@ -264,8 +459,29 @@ class ModelValidationMixin(ABC):
 
                     # Fallback: compute basic PSNR and SSIM so we never return empty metrics
                     try:
-                        pred_for_fallback = hr_fakes.float()
-                        target_for_fallback = target_batch.float()
+                        # Scored in the domain the computer would have scored in:
+                        # the raw tensors of a k-space arm are interleaved k-space,
+                        # and an image PSNR on them is a finite number in the wrong
+                        # domain (#2603). If the transform itself is what failed,
+                        # there is no right-domain tensor to score, so NaN.
+                        try:
+                            fallback_views = self._metric_transform_views(
+                                hr_fakes, target_batch, val_config, batch_data=batch_data
+                            )
+                        except Exception as view_exc:
+                            logger.warning(
+                                "[ModelValidationMixin] Fallback val_psnr is NaN: the "
+                                "metric transform that maps this arm's output "
+                                "(model.output_type=%s) into the scored domain failed "
+                                "(%s), and the untransformed tensors are not scored "
+                                "in its place.",
+                                getattr(getattr(config, "model", None), "output_type", None),
+                                view_exc,
+                            )
+                            metrics["val_psnr"] = float("nan")
+                            raise _FallbackRangeUnresolvedError from None
+                        pred_for_fallback = fallback_views.pred.float()
+                        target_for_fallback = fallback_views.target.float()
 
                         # A 2-channel prediction is real/imag for MOST strategies, but a
                         # distribution head emits [mean, logvar]. RSS-ing THOSE computes
@@ -300,11 +516,11 @@ class ModelValidationMixin(ABC):
                             pred_for_fallback, target_for_fallback
                         ).item()
 
-                        # The SAME data_range policy the registered `psnr` uses, so
-                        # `val_psnr` means one thing whichever branch produced it.
-                        # This used to derive a PER-IMAGE `max - min` under the same
-                        # key. See docs/metric_outcome_contract.rst, "Range-sensitive
-                        # metrics".
+                        # The SAME data_range policy, declared range and scale
+                        # contract the registered `psnr` uses, read off the computer
+                        # that just failed, so `val_psnr` means one thing whichever
+                        # branch produced it. See docs/metrics_reference.rst, "How
+                        # the image range is resolved".
                         from spectramr.core.metrics.evaluation_metrics import (
                             resolve_image_data_range,
                         )
@@ -314,7 +530,10 @@ class ModelValidationMixin(ABC):
 
                         try:
                             data_range = resolve_image_data_range(
-                                target_for_fallback, None, metric_name="val_psnr"
+                                target_for_fallback,
+                                computer.data_range,
+                                metric_name="val_psnr",
+                                contract=computer.scale_contract,
                             )
                         except MetricNotApplicableError as dr_exc:
                             # No contract holds, so there is no PSNR to report.
@@ -340,6 +559,10 @@ class ModelValidationMixin(ABC):
                         )
                     except _FallbackRangeUnresolvedError:
                         pass
+                    except DataRangeContractError:
+                        # The data path contradicts its declared normalization;
+                        # logging it here would leave the run without val_psnr (#2241).
+                        raise
                     except Exception as fallback_e:
                         logger.warning(
                             "[ModelValidationMixin] Fallback metrics also failed: %s",
@@ -358,6 +581,10 @@ class ModelValidationMixin(ABC):
         # validation for it (the .item() sync is off the hot training loop).
         if compute_img_metrics and target_batch is not None and "val_loss" not in metrics:
             try:
+                own_loss = self._validation_loss(raw_prediction, target_batch, batch_context, batch_data)
+                if own_loss is not None:
+                    metrics["val_loss"] = own_loss.detach()
+                    return metrics
                 pred_l = hr_fakes.float()
                 tgt_l = target_batch.float()
                 if pred_l.shape[1] != tgt_l.shape[1]:
@@ -372,8 +599,18 @@ class ModelValidationMixin(ABC):
                     if tgt_l.shape[1] == 2:
                         tgt_l = torch.sqrt(tgt_l[:, 0:1] ** 2 + tgt_l[:, 1:2] ** 2)
                     if pred_l.shape[1] != tgt_l.shape[1]:
-                        pred_l, tgt_l = pred_l[:, :1], tgt_l[:, :1]
-                metrics["val_loss"] = torch.nn.functional.l1_loss(pred_l, tgt_l).item()
+                        # An image against coil k-space: grade both in the declared
+                        # scoring domain, not on channel 0 of each (|x| vs Re k_0).
+                        views = self._metric_transform_views(
+                            hr_fakes, target_batch, val_config, batch_data=batch_data
+                        )
+                        pred_l, tgt_l = views.pred.float(), views.target.float()
+                    if pred_l.shape != tgt_l.shape:
+                        raise ValueError(
+                            f"prediction {tuple(pred_l.shape)} and target {tuple(tgt_l.shape)} "
+                            "share no domain under validation.scoring.output_transform"
+                        )
+                metrics["val_loss"] = torch.nn.functional.l1_loss(pred_l, tgt_l).detach()
             except Exception as exc:  # monitoring scalar — never fatal to validation
                 logger.warning("[ModelValidationMixin] val_loss computation skipped: %s", exc)
 

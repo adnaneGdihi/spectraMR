@@ -1,10 +1,10 @@
-"""Adapters for prior-method baseline replications.
+"""The contract every prior-method baseline adapter satisfies.
 
-Each subclass under this package wraps an upstream baseline (vendored
-under ``external/baselines/<name>/``) so it plugs into this repo's
-Builder + Strategy + Registry chain without duplicating common
-infrastructure (mask generation, coil compression, ESPIRiT, FFT
-centering, metric computation).
+The adapters themselves -- each wrapping an upstream vendored under
+``external/baselines/<name>/`` -- live out of tree in the
+``spectramr_baselines`` plugin (``plugins/spectramr_baselines/``). This package
+keeps only what the framework reads back from them: the declarative
+attributes that ``ConfigHealthChecker`` and ``baseline_provenance`` inspect.
 
 See ``TODO/backlog_baseline_replication_experiment_11.md`` for the
 replication contract and ``BaselineAdapter`` for the declarative

@@ -15,15 +15,17 @@ Mounting (mirrors B-1 equivariance_conformal): the typed wrapper is registered i
     from .phys_residual_conformal import TrainingConfigPhysResidualConformal
     _MODE_DISPATCH["phys_residual_conformal"] = "TrainingConfigPhysResidualConformal"
 
-No base.py optional field is needed (the typed-wrapper route only).
+The sub-block is also typed as an optional field of ``TrainingStrategyConfigSchema`` so a
+retired key is refused when the config loads, not when the strategy is built.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..renames import reject_renamed_keys
 from .base import BaseTrainingConfigSchema
 
 
@@ -51,12 +53,13 @@ class PhysResidualConformalConfig(BaseModel):
         lt=1.0,
         description="Fraction of the val loader used as the calibration split (rest = test).",
     )
-    pretrained_reconstructor_checkpoint: str = Field(
-        ...,
-        description="Path to the frozen tissue-parameter estimator checkpoint.",
-    )
     output_artefact: str | None = Field(
         default=None, description="Optional JSON path for the certificate report."
+    )
+
+    # Retired prior-checkpoint field (#647); the refusal names the removal record.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.phys_residual_conformal"))  # type: ignore[arg-type]
     )
 
 

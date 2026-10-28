@@ -110,7 +110,7 @@ class ContrastConsistencyLoss(nn.Module):
         self,
         predicted_t1_ms: torch.Tensor,
         tissue_probabilities: torch.Tensor,
-        field_strength_T: float | torch.Tensor,
+        field_strength_T: float | torch.Tensor,  # noqa: N803 — unit suffix Tesla
         **_: object,
     ) -> torch.Tensor:
         r"""Compute the contrast-consistency loss.

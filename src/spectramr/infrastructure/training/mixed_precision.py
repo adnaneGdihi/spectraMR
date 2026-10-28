@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import ContextManager
 
@@ -5,6 +6,14 @@ import torch
 from torch.amp import GradScaler as NativeScaler
 
 from spectramr.core.compute_device import resolve_torch_device
+from spectramr.core.device_capabilities import (
+    MIN_NATIVE_BF16_CAPABILITY,
+    TARGET_CAPABILITY_ENV,
+    DeviceCapabilities,
+    probe_device_capabilities,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,6 +60,55 @@ def resolve_amp_precision(use_amp: bool, amp_dtype: str | None) -> tuple[bool, s
     return enabled, _AMP_DTYPE_TO_PRECISION[dtype]
 
 
+class AMPPrecisionUnsupportedError(RuntimeError):
+    """The resolved AMP dtype has no native support on the resolved device."""
+
+
+def assert_amp_dtype_supported(
+    precision: str,
+    *,
+    capabilities: DeviceCapabilities,
+) -> None:
+    """Raise when *precision* would run emulated on this device.
+
+    Only ``bf16`` is gated, and only on CUDA. Pre-Ampere cards (sm_70 V100,
+    sm_75 Turing) have no bf16 tensor cores; ``torch`` will still *run* bf16
+    there by emulating it, which is slow and numerically unlike what the arm
+    asked for.
+
+    **Raises rather than downgrading to fp16.** A downgrade would be a silent
+    fallback (pitfall #9), and it would also be wrong here: ``get_autocast_context``
+    turns fp16 into a ``nullcontext`` for complex arms, so an automatic
+    downgrade would quietly produce fp32 on exactly the arms this framework
+    cares most about.
+
+    An *unknown* capability does not raise. The audit legitimately runs on a
+    login node with a different GPU or none at all, so "cannot tell" is reported
+    and the run proceeds — the health check carries the same polarity.
+    """
+    if precision != "bf16" or capabilities.device_type != "cuda":
+        return
+    if "capability" in capabilities.incomplete:
+        logger.warning(
+            "AMP dtype bfloat16 requested but the compute capability could not be read "
+            "(source=%s). Native bf16 needs sm_80+; set %s to declare the target.",
+            capabilities.source,
+            TARGET_CAPABILITY_ENV,
+        )
+        return
+    if capabilities.native_bf16:
+        return
+    raise AMPPrecisionUnsupportedError(
+        f"optimization.precision.dtype='bfloat16' on a device with compute capability "
+        f"{capabilities.capability_str} (source={capabilities.source}). Native bf16 needs "
+        f"sm_{MIN_NATIVE_BF16_CAPABILITY[0]}{MIN_NATIVE_BF16_CAPABILITY[1]}+; below that "
+        f"torch emulates it, which is slower than fp16 and numerically different from what "
+        f"this arm declared. Supported here: {list(capabilities.amp_dtypes)}. Note that "
+        f"torch.cuda.is_bf16_supported() answers True on this device -- it admits emulation "
+        f"by default, which is why this check reads the capability instead."
+    )
+
+
 class MixedPrecisionIntegrationHelper:
     """Helper to integrate AMP into training strategies."""
 
@@ -58,6 +116,7 @@ class MixedPrecisionIntegrationHelper:
         self,
         config: MixedPrecisionConfig,
         device: torch.device | str | None = None,
+        capabilities: DeviceCapabilities | None = None,
     ):
         """Initialize the AMP integration helper.
 
@@ -71,6 +130,12 @@ class MixedPrecisionIntegrationHelper:
                 or the run was pinned to a device other than ``cuda:0``.
                 ``None`` falls back to the 9b resolver rather than to a raw
                 availability probe.
+            capabilities: Injected device capabilities, for tests and for callers
+                that already probed. ``None`` probes *device*.
+
+        Raises:
+            AMPPrecisionUnsupportedError: AMP is on and the resolved dtype has
+                no native support here -- today only bf16 below sm_80.
         """
         self.config = config
         self.scaler = None
@@ -82,6 +147,24 @@ class MixedPrecisionIntegrationHelper:
             ).device
         self.device_type = torch.device(device).type
         self.enabled = config.enabled
+        if self.enabled and config.precision == "fp16" and config.enable_complex_support:
+            # fp16 autocast cannot run on complex tensors, so this combination
+            # used to run in fp32 while reporting AMP on, and its GradScaler
+            # turned the non-finite-loss raise into a silently skipped step (#2302).
+            raise AMPPrecisionUnsupportedError(
+                "optimization.precision.dtype='float16' on a complex-valued arm "
+                "(model.target_domain: kspace or physics.kspace.enable_kspace_recon). "
+                "fp16 autocast cannot run on complex tensors. Declare "
+                "precision.dtype: bfloat16 (sm_80+) or float32."
+            )
+        if self.enabled:
+            # Probed here rather than threaded in: this runs once per helper, not
+            # per step, and the probe is a `get_device_capability` call plus a
+            # `find_spec`. Injectable so the gate is testable without a GPU.
+            assert_amp_dtype_supported(
+                config.precision,
+                capabilities=capabilities or probe_device_capabilities(device),
+            )
         if config.enabled and config.precision == "fp16":
             if config.enable_complex_support:
                 # Use our new ComplexGradScaler instead of native one
@@ -160,11 +243,8 @@ class MixedPrecisionIntegrationHelper:
     def get_autocast_context(self) -> ContextManager:
         """Returns the appropriate autocast context manager.
 
-        For complex-valued MRI pipelines, fp16 autocast is fundamentally
-        incompatible because complex64 tensors cannot interact with Half-precision
-        model weights (PyTorch has no complex16 type). When complex support is
-        enabled with fp16, we disable autocast entirely to prevent
-        'Input type (complex<float>) and bias type (Half)' crashes.
+        Complex-valued arms autocast only in bf16: fp16 has no complex type, so
+        ``__init__`` rejects fp16 there rather than returning a disabled context.
         """
         from contextlib import nullcontext
 
@@ -176,12 +256,6 @@ class MixedPrecisionIntegrationHelper:
         # If complex support is disabled, use standard autocast (allows TF32 if globally enabled)
         if not self.config.enable_complex_support:
             return torch.amp.autocast(device_type=self.device_type, dtype=dtype, enabled=True)
-
-        # [FIX] Complex + fp16 is fundamentally broken: complex64 cannot mix
-        # with Half weights. Disable autocast entirely for fp16 complex flows.
-        # bfloat16 CAN work with complex on some hardware but is still risky.
-        if dtype == torch.float16:
-            return nullcontext()
 
         # Use our SafeComplexAutocast with proper device_type and TF32 disabled
         return SafeComplexAutocast(

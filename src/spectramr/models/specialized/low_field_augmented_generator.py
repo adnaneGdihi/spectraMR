@@ -303,7 +303,7 @@ class LowFieldConditionEncoder(nn.Module):
 
 
 @register_model(name="low_field_augmented", training_mode="reconstruction")
-class LowFieldStyleAugmentedGenerator(IGenerator):
+class LowFieldStyleAugmentedGenerator(IGenerator, nn.Module):
     """Generator with low-field style augmentation.
 
     Augments a base generator with InstanceNorm statistics shift

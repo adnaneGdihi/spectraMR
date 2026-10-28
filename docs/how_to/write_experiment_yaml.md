@@ -1,14 +1,12 @@
 # Write an experiment YAML
 
-Every experiment in spectraMR is one YAML file. The schema is the canonical
-v6.0 layout — frozen Pydantic v2 models defined in
-`src/spectramr/config/schemas/`. The audit ladder catches mistakes before
+Every experiment in spectraMR is one YAML file. The schema is a set of frozen
+Pydantic v2 models defined in `src/spectramr/config/schemas/`, and every file
+declares `config_version: '1.0'`. The audit ladder catches mistakes before
 training starts.
 
 This page is the short, opinionated walkthrough. The dry exhaustive
-reference is at [YAML schema](../reference/yaml_schema.md). For
-multi-experiment campaigns see
-[campaigns_user_guide](https://github.com/adnaneGdihi/spectramr/blob/main/docs/campaigns_user_guide.rst).
+reference is at [configuration schema reference](../config_schema_reference.rst).
 
 ## Where the file lives
 
@@ -51,12 +49,8 @@ undersampling:
   base_acceleration: 4
   center_fraction: 0.08
 
-artifacts:
-  persistent_root: experiments/results/<arm_name>
-
 checkpoint:
   enabled: true
-  keep_best_n: 3
   keep_last_n: 5
   save_interval: 10000
 
@@ -208,10 +202,11 @@ only if the data pipeline mounts the relevant wrapper. Flip the flag:
 
 ```yaml
 data:
-  expose_conformal_jacobian: true
-  expose_cortex_flatten_grid: true
-  expose_glm_design_matrix: true
-  expose_scanner_id: true
+  expose:
+    conformal_jacobian: true
+    cortex_flatten_grid: true
+    glm_design_matrix: true
+    scanner_id: true
 ```
 
 Without the flag, the strategy gets a `KeyError` mid-training. The
@@ -220,10 +215,9 @@ epoch 1.
 
 ### 7. Strategy class + `training_mode` must agree
 
-`training_mode` is matched against `TRAINING_MODE_CONSTRAINTS` in
-`src/spectramr/config/validation_constants.py`. Adding a new strategy
-means adding **three** entries: `STRATEGY_CLASS_PATHS`,
-`VALID_TRAINING_MODES`, and `TRAINING_MODE_CONSTRAINTS`. See
+`training_mode` is matched against `VALID_TRAINING_MODES` in
+`src/spectramr/config/validation_constants.py` and dispatched through
+`STRATEGY_CLASS_PATHS`. Adding a new strategy means adding **both** entries. See
 [add_paradigm](add_paradigm.md#2-register-the-dispatch-key).
 
 ### 8. Use `${SPECTRAMR_DATA_ROOT}` for data paths
@@ -232,7 +226,7 @@ Never hardcode a cluster path. The audit's `hardcoded_cluster_paths`
 check rejects any data field starting with `/project/<user>/` or
 `/scratch/<user>/` *unless* that prefix matches your own
 `SPECTRAMR_DATA_ROOT` / `PROJECT_ROOT` env var (see
-[CLUSTER_DATA_LAYOUT.md](../CLUSTER_DATA_LAYOUT.md)).
+[environment variables](../environment_variables.rst)).
 
 ## Validate before launching
 
@@ -256,19 +250,17 @@ spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml --probe     # adds 
 
 ## Reference YAMLs to copy from
 
-| Strategy class | Reference YAML |
+| What you are building | Config to copy |
 |---|---|
-| `ReconstructionTrainingStrategy` | `experiments/active/experiment_42_bloch_cycles.yaml` |
-| `ScoreFieldTomographyStrategy` | `experiments/inprogress/novel_2026/idea_2_score_field_tomography.yaml` |
-| `BeltramiMotionCorrectionStrategy` | `experiments/inprogress/sfc_conformal_2026/idea_4_beltrami_motion_correction.yaml` |
-| `RiemannianMRFDiffusionStrategy` | `experiments/inprogress/mrf_2026/idea_2_riemannian_mrf_diffusion.yaml` |
-| Cold diffusion (Teichmüller) | `experiments/inprogress/sfc_conformal_2026/idea_6_teichmuller_cold_diffusion.yaml` |
-| Generic GAN | `experiments/active/dummy_gan.yaml` (minimal GAN reference) |
+| Anything, from scratch | `experiments/templates/comprehensive_config_template.yaml` (`model_type: unet`, `training_mode: reconstruction`) |
+| Self-supervised reconstruction | `experiments/inprogress/reconstruction/ssdu_selfsup_m4raw.yaml` (`model_type: unrolled_reconstruction`) |
+| Score-based diffusion | `experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml` (`model_type: score_based_diffusion`) |
+| Complex-valued reconstruction | `experiments/inprogress/workflow_baselines/b1_structural_recon_m4raw.yaml` (`model_type: complex_unet`) |
 
 Copy-and-modify is cheaper than writing from scratch.
 
 ## Next steps
 
-- [YAML schema reference](../reference/yaml_schema.md) — every field, every type.
-- [Audit ladder](../explanation/audit_ladder.md) — what each tier checks.
+- [Configuration schema reference](../config_schema_reference.rst) — every field, every type.
+- [Audit ladder](../audit_ladder_user_guide.rst) — what each tier checks.
 - [Add a paradigm](add_paradigm.md) — when a new training mode is needed.

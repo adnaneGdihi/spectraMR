@@ -63,6 +63,7 @@ class Noise2NoiseLoss(nn.Module):
             raise ValueError(f"norm must be l1 or l2, got {norm!r}")
         self.norm = norm
         self.require_independent = require_independent
+        self._checked_independence = False
 
     def forward(
         self,
@@ -70,8 +71,11 @@ class Noise2NoiseLoss(nn.Module):
         target: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
+        # torch.equal syncs the host, so look once, not every step.
+        check = self.require_independent and not self._checked_independence
+        self._checked_independence = True
         if (
-            self.require_independent
+            check
             and prediction.shape == target.shape
             and torch.equal(prediction.detach(), target.detach())
         ):

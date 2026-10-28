@@ -37,6 +37,8 @@ underlying primitives.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from torch.nn.functional import grid_sample
@@ -110,7 +112,9 @@ class HJBResidualLoss(nn.Module):
             f"field; got {x.ndim} dims with shape {tuple(x.shape)}."
         )
 
-    def _make_value_fn(self, field: torch.Tensor):
+    def _make_value_fn(
+        self, field: torch.Tensor
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
         r"""Build a differentiable ``value_fn(states, times) -> (N,)``.
 
         ``field`` is a single ``[T, H, W]`` value-function volume. The
@@ -185,7 +189,7 @@ class HJBResidualLoss(nn.Module):
             def _target_residual_cost(
                 s: torch.Tensor,
                 t: torch.Tensor,
-                _fn=tgt_value_fn,
+                _fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tgt_value_fn,
             ) -> torch.Tensor:
                 s = s.detach().requires_grad_(True)
                 t = t.detach().requires_grad_(True)
@@ -197,7 +201,8 @@ class HJBResidualLoss(nn.Module):
                 # The primitive computes residual = d_t V + (-g_max||grad V||)
                 # + L. Choosing L = -(d_t V_tgt - g_max||grad V_tgt||) makes
                 # residual = R[V_pred] - R[V_tgt].
-                return -(dvdt - self.g_max * norm)
+                cost: torch.Tensor = -(dvdt - self.g_max * norm)
+                return cost
 
             residual = hjb_residual_loss(
                 value_fn=pred_value_fn,

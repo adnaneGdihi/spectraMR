@@ -33,11 +33,6 @@ Registered as ``joint_rotation`` and declarable from YAML::
           - name: joint_rotation
             kwargs: {group: SE2, seed: 0}
 
-This note previously read "there is no ``@register_transform`` decorator in the
-codebase", which was true when written and is the reason this module sat with
-zero importers: it documented its own unreachability as though it were the
-design. The decorator exists now, so the module is attached to it.
-
 The rotation is applied jointly to every key in ``include_keys`` (``input``,
 ``target``, ``mri``) from ONE drawn group element. That is the property that
 makes it safe to wire where a torchvision-style pipeline is not: independent
@@ -139,7 +134,7 @@ def rotate_kspace(
     return fft2c(rotated_image)
 
 
-@register_transform("joint_rotation")
+@register_transform("joint_rotation", modifies=("input", "target", "mri"))
 class JointKSpaceImageRotation(tio.Transform):
     r"""TorchIO transform applying a consistent rotation to image and k-space.
 

@@ -12,15 +12,18 @@ import ast
 import inspect
 import math
 import textwrap
+from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
 
 from spectramr.config.schemas.enums import PredictionType
+from spectramr.data.batch_types import TrainingBatch
 from spectramr.data.transforms.normalization import (
     DECOMPRESS_MAGNITUDE_CEILING,
+    compress_kspace_log,
     decompress_kspace_log,
 )
 from spectramr.domain.exceptions import ConfigurationError
@@ -30,8 +33,10 @@ from spectramr.infrastructure.training.schedulers.diffusion_scheduler import (
 )
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
+    validation_loss_key,
 )
 from spectramr.infrastructure.training.utils.kspace_view import decompress_for_view
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 
 
 def _gen(conditional: bool):
@@ -73,6 +78,39 @@ def test_build_gen_kwargs_no_condition_image_when_unconditional() -> None:
         batch_data=None,
     )
     assert "condition_image" not in kw
+
+
+@pytest.mark.parametrize("geometry_channels", [6, 0])
+def test_build_gen_kwargs_forwards_the_acquired_plane_to_a_consumer(geometry_channels) -> None:
+    """The geometry planes read the scanner-written support; the reverse loops pass
+    it from ``measured_lines``, so training must pass the same plane or the two
+    paths condition on different definitions."""
+    mock = MagicMock()
+    mock.generator_model = SimpleNamespace(
+        config=SimpleNamespace(conditional_translation=False),
+        kspace_geometry_channels=geometry_channels,
+    )
+    mock._current_smaps = None
+    del mock.prior_model
+    mock.config = SimpleNamespace(undersampling=None)
+    inp = torch.randn(1, 2, 16, 16)
+    mask = torch.ones(1, 1, 16, 16)
+    acquired = torch.zeros(1, 1, 16, 16)
+    acquired[..., 2:14] = 1.0
+    kw = DiffusionTrainingStrategy._build_generator_kwargs(
+        mock,
+        is_cold_diffusion=True,
+        is_latent_diffusion=False,
+        input_batch=inp,
+        target_batch=inp,
+        batch_data=None,
+        mask=mask,
+        acquired=acquired,
+    )
+    if geometry_channels:
+        assert kw["acquired"] is acquired
+    else:
+        assert "acquired" not in kw, "a generator without geometry planes must not receive it"
 
 
 def test_validation_step_no_acceleration_runs_plain_pass_emits_val_psnr() -> None:
@@ -127,6 +165,129 @@ def test_forward_through_model_latent_forwards_condition_and_context() -> None:
     )
     assert torch.equal(received["condition_image"], cond)
     assert received["context"] == {"contrast_idx": cidx}
+
+
+# ---------------------------------------------------------------------------
+# Validation-path contrast conditioning (#1931).
+#
+# The train path was fixed in half 1: ``_contrast_idx_from_batch`` is the ONE
+# owner of the extraction (non-negotiable 17). ``_generate_validation_prediction``
+# kept a SECOND resolver behind ``isinstance(batch_data, dict)`` -- and what
+# ``select_validation_extra_fields`` (pipelines/train.py) forwards as
+# ``batch_data`` is a ``TrainingBatch``: a dataclass, not a mapping, whose
+# non-core fields live in ``.metadata``. So the guard never matched and every
+# multi-contrast arm trained CONDITIONED and validated UNCONDITIONED -- the
+# train/val mismatch of pitfall #18, silent, with the checkpoint selected on
+# metrics the model was never conditioned for.
+#
+# These drive the REAL method rather than the extraction in isolation, because
+# the whole body sits inside ``except Exception: return None`` -- an assertion
+# on a helper would not notice the swallow.
+# ---------------------------------------------------------------------------
+
+
+def _validation_strategy(chunk_size: int = 8):
+    """A strategy mock that reaches the plain ``_forward_through_model`` branch.
+
+    Two ``MagicMock`` hazards are deliberately avoided here:
+
+    * ``hasattr(mock, anything)`` is always True, so a ``MagicMock`` generator
+      would satisfy ``hasattr(gen, "sample")`` and route into the latent
+      sampler. ``generator_model`` is therefore a real bare object.
+    * ``mock._contrast_idx_from_batch(...)`` would return a ``Mock`` -- truthy,
+      forwarded, and the test would pass whether or not the extraction works.
+      The REAL staticmethod is bound instead, which is the whole subject.
+    """
+    mock = MagicMock()
+    mock.generator_model = SimpleNamespace()  # no .sample/.generate/.module
+    mock._is_cold_diffusion.return_value = False
+    mock._is_latent_diffusion.return_value = False
+    mock._contrast_idx_from_batch = DiffusionTrainingStrategy._contrast_idx_from_batch
+    mock.config = SimpleNamespace(
+        model=SimpleNamespace(model_type="diffusion_unet"),  # skips the smaps block
+        validation=SimpleNamespace(loader=SimpleNamespace(chunk_size=chunk_size)),
+        training=None,  # the legacy-forward branch reads config.training.diffusion
+    )
+    mock.q_sample.side_effect = lambda x, t, noise: x
+    mock._forward_through_model.return_value = torch.zeros(1, 1, 8, 8)
+    return mock
+
+
+def _drive_validation(mock, batch_data, *, target: torch.Tensor | None = None):
+    """Run the real method and fail loudly if its blanket except swallowed."""
+    inp = torch.randn(1, 1, 8, 8)
+    tgt = target if target is not None else torch.zeros(1, 1, 8, 8)
+    mock._forward_through_model.return_value = torch.zeros_like(tgt)
+    DiffusionTrainingStrategy._generate_validation_prediction(
+        mock,
+        input_batch=inp,
+        target_batch=tgt,
+        timestep=torch.tensor([1]),
+        batch_data=batch_data,
+        kwargs={},
+    )
+    swallowed = [
+        c.args[0]
+        for c in mock.logging_service.log_warning.call_args_list
+        if c.args and "Validation generation failed" in str(c.args[0])
+    ]
+    assert not swallowed, f"the method's blanket except fired: {swallowed}"
+    assert mock._forward_through_model.called, "never reached the generator forward"
+    return mock._forward_through_model.call_args.kwargs["gen_kwargs"]
+
+
+def test_validation_conditions_on_a_training_batch_not_only_a_dict() -> None:
+    """The load-bearing test: a ``TrainingBatch`` is what production delivers."""
+    c_idx = torch.tensor([2])
+    batch = TrainingBatch(
+        input=torch.randn(1, 1, 8, 8),
+        target=torch.zeros(1, 1, 8, 8),
+        metadata={"contrast_idx": c_idx},
+    )
+    assert not isinstance(batch, dict)  # the guard that used to stand here
+
+    gen_kwargs = _drive_validation(_validation_strategy(), batch)
+
+    assert "contrast_idx" in gen_kwargs, (
+        "validation reached the generator with no contrast_idx while the train "
+        "path sends one — the arm validates unconditioned (pitfall #18)"
+    )
+    assert torch.equal(gen_kwargs["contrast_idx"], c_idx)
+
+
+def test_validation_still_conditions_on_a_plain_dict_batch() -> None:
+    """Routing through the owner must not drop the shape that DID work."""
+    c_idx = torch.tensor([1])
+    gen_kwargs = _drive_validation(
+        _validation_strategy(),
+        {"input": torch.randn(1, 1, 8, 8), "contrast_idx": c_idx},
+    )
+    assert torch.equal(gen_kwargs["contrast_idx"], c_idx)
+
+
+def test_validation_realigns_contrast_ids_when_5d_targets_are_flattened() -> None:
+    """This site's own concern, kept out of the owner: only validation flattens.
+
+    Two volumes of three slices arrive as one batch of six, so a per-volume
+    contrast id must be repeated per slice. Getting this wrong is the silent
+    shape: ``repeat`` instead of ``repeat_interleave`` labels slice 0 of volume
+    1 with volume 0's contrast and still trains without error.
+    """
+    c_idx = torch.tensor([0, 2])
+    batch = TrainingBatch(
+        input=torch.randn(2, 1, 3, 8, 8),
+        target=torch.zeros(2, 1, 3, 8, 8),
+        metadata={"contrast_idx": c_idx},
+    )
+    gen_kwargs = _drive_validation(_validation_strategy(), batch, target=torch.zeros(6, 1, 8, 8))
+    assert torch.equal(gen_kwargs["contrast_idx"], torch.tensor([0, 0, 0, 2, 2, 2]))
+
+
+def test_validation_sends_no_contrast_idx_when_the_batch_carries_none() -> None:
+    """A single-contrast arm must not gain a fabricated id (#9)."""
+    batch = TrainingBatch(input=torch.randn(1, 1, 8, 8), target=torch.zeros(1, 1, 8, 8))
+    gen_kwargs = _drive_validation(_validation_strategy(), batch)
+    assert "contrast_idx" not in gen_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +449,70 @@ class TestSamplerStepParamNames:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Consistency-model validation steps: the declared count reaches multistep_inference.
+# ---------------------------------------------------------------------------
+
+
+class _StepsDiffusion:
+    """``training.diffusion`` stand-in with pydantic's ``model_fields_set``."""
+
+    def __init__(self, declared: dict) -> None:
+        self.sampling_steps = declared.get("sampling_steps", 100)
+        self.model_fields_set = set(declared)
+
+
+def _steps_strategy(val_steps=None, diffusion=None):
+    st = object.__new__(DiffusionTrainingStrategy)
+    st.num_timesteps = 1000
+    st.config = SimpleNamespace(
+        validation=SimpleNamespace(sampling=SimpleNamespace(steps=val_steps)),
+        training=SimpleNamespace(diffusion=_StepsDiffusion(diffusion or {})),
+    )
+    return st
+
+
+@pytest.mark.parametrize(
+    ("val_steps", "diffusion", "expected"),
+    [
+        (None, {}, 2),  # undeclared: the historical 2, not the schema's 100
+        (8, {}, 8),
+        (None, {"sampling_steps": 1}, 1),
+        (4, {"sampling_steps": 1}, 4),  # validation.sampling.steps wins
+    ],
+)
+def test_consistency_validation_steps_follow_the_declaration(val_steps, diffusion, expected) -> None:
+    assert _steps_strategy(val_steps, diffusion)._consistency_validation_steps() == expected
+
+
+def test_the_declared_steps_reach_the_consistency_sampler() -> None:
+    from spectramr.models.generators.consistency_model_generator import ConsistencyModelGenerator
+
+    torch.manual_seed(0)
+    gen = ConsistencyModelGenerator(in_channels=1, out_channels=1, features=[8, 16], time_dim=16).eval()
+    calls: list[int] = []
+    real = gen.multistep_inference
+
+    def _spy(x, steps=2, **kw):
+        calls.append(steps)
+        return real(x, steps=steps, **kw)
+
+    gen.multistep_inference = _spy  # type: ignore[method-assign]
+    mock = _validation_strategy()
+    mock.generator_model = gen
+    mock._consistency_validation_steps.return_value = 5
+    mock.config.training = SimpleNamespace(diffusion=SimpleNamespace(inference_sampler=None))
+    inp = torch.randn(1, 1, 8, 8)
+    out = DiffusionTrainingStrategy._generate_validation_prediction(
+        mock, input_batch=inp, target_batch=torch.zeros(1, 1, 8, 8),
+        timestep=torch.tensor([1]), batch_data=None, kwargs={},
+    )
+    assert calls == [5]
+    torch.manual_seed(0)
+    two = real(inp, steps=2)
+    assert not torch.allclose(out, two)
+
+
 def _timestep_strategy(
     sampling_strategy: str,
     floor: int,
@@ -299,17 +524,17 @@ def _timestep_strategy(
 ):
     """Unbound-call harness for ``sample_timesteps``.
 
-    The method only needs ``generator_model.training``, the resolved curriculum
-    state, the sampling-strategy name, ``num_timesteps``, ``device`` and the
-    operator floor — so a MagicMock strategy exercises it without building a
-    model.
+        The method only needs ``generator_model.training``, the resolved curriculum
+        state, the sampling-strategy name, ``num_timesteps``, ``device`` and the
+        operator floor — so a MagicMock strategy exercises it without building a
+        model.
 
-The curriculum is not hand-set (#1296): the fixture binds the REAL
-    ``_resolve_curriculum_once`` so the state is derived from the same config
-    declared two lines below it. A fixture that stated the answer independently
-    could disagree with the config beside it, which is the shape that lets a
-    mock-fed test pass while production does something else -- and here it would
-    also stub out the very resolver these cases exist to exercise.
+    The curriculum is not hand-set (#1296): the fixture binds the REAL
+        ``_resolve_curriculum_once`` so the state is derived from the same config
+        declared two lines below it. A fixture that stated the answer independently
+        could disagree with the config beside it, which is the shape that lets a
+        mock-fed test pass while production does something else -- and here it would
+        also stub out the very resolver these cases exist to exercise.
     """
     strategy = MagicMock(spec=DiffusionTrainingStrategy)
     strategy.generator_model = SimpleNamespace(training=True)
@@ -353,9 +578,7 @@ def test_the_short_run_bypass_uses_the_full_range_despite_a_declared_ramp() -> N
     assert not state.effective
     assert state.declared
     strategy.logging_service.log_warning.assert_called_once()
-    drawn = DiffusionTrainingStrategy.sample_timesteps(
-        strategy, batch_size=4096, iteration=200
-    )
+    drawn = DiffusionTrainingStrategy.sample_timesteps(strategy, batch_size=4096, iteration=200)
     assert drawn.max().item() == 27
     # Resolved ONCE: the sampler above must reuse the cached state rather than
     # re-reading the config every step (non-negotiable 9), and the latched
@@ -616,62 +839,6 @@ def test_reverse_schedule_binding_hands_over_betas_not_just_the_name() -> None:
     torch.testing.assert_close(kwargs["betas"], mock.scheduler.betas)
 
 
-def test_mask_coverage_check_reads_the_real_acceleration_field() -> None:
-    """The DEBUG mask-coverage check was gated on
-    `hasattr(self.config.data, "acceleration")` — permanently False, since the
-    acceleration factor lives on its own block. It now reads
-    `acceleration.base_acceleration`, so the check can actually run."""
-    import inspect
-
-    from spectramr.config.schemas.acceleration import AccelerationConfigSchema
-    from spectramr.config.schemas.data import DataConfigSchema
-    from spectramr.infrastructure.training.strategies import diffusion
-
-    assert "acceleration" not in DataConfigSchema.model_fields
-    assert "base_acceleration" in AccelerationConfigSchema.model_fields
-    # Positive assertion only: the removal left a comment quoting the old
-    # `hasattr(self.config.data, "acceleration")` probe, so a negative grep
-    # would match its own documentation.
-    assert "accel_cfg.base_acceleration" in inspect.getsource(diffusion)
-
-
-def test_validation_mask_fallback_reads_the_real_seed_field() -> None:
-    """The deterministic-mask fallback read `self.config.training.seed`.
-
-    Phase 4b moved the key to `run.seed`, and `training.seed` is a RAISE-posture
-    rename — so `reject_renamed_keys("training")` blocks it in YAML *and* the
-    attribute is absent on `TrainingStrategyConfigSchema`. There was no
-    execution path on which the old spelling resolved. It only fires when a
-    validation batch carries no pre-computed mask, i.e. the degraded path, so a
-    happy-path smoke run never reached it.
-    """
-    import inspect
-
-    from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
-    from spectramr.config.schemas.renames import RENAMES
-    from spectramr.config.schemas.training.base import TrainingStrategyConfigSchema
-    from spectramr.config.settings import TrainingSettings
-    from spectramr.infrastructure.training.strategies import diffusion
-
-    assert "seed" not in TrainingStrategyConfigSchema.model_fields
-    assert RENAMES["training.seed"].canonical == "run.seed"
-
-    settings = TrainingSettings.settings_from_dict(
-        {
-            "config_version": CANONICAL_CONFIG_VERSION,
-            "data": {"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 2},
-            "optimization": {"learning_rate": 1e-4},
-            "logging": {},
-            "model": {"model_type": "unet"},
-            "run": {"seed": 1234},
-        }
-    )
-    assert settings.run.seed == 1234
-    # Positive assertion: the fix leaves a comment naming the old spelling, so a
-    # negative grep would match the documentation of its own removal.
-    assert "self.config.run.seed" in inspect.getsource(diffusion)
-
-
 # ---------------------------------------------------------------------------
 # #927 -- validation image logging must not be told a domain that is not true
 # ---------------------------------------------------------------------------
@@ -700,8 +867,6 @@ def _image_logger_mock():
     # Real passthroughs: a MagicMock return from either of these reaches
     # torch.is_complex, and the method's own error path swallows the TypeError
     # before the guard under test is ever consulted.
-    mock._slice_to_target_contrast = lambda pred, target: (pred, target)
-    mock._slice_to_target_contrast_single = lambda ksp: ksp
     mock._resolve_federated_target_start = lambda *a, **k: None
     return mock
 
@@ -1029,6 +1194,58 @@ def test_a_well_scaled_prediction_measures_quiet() -> None:
 
 
 @pytest.mark.unit
+def test_a_uniformly_attenuated_prediction_is_invisible_to_the_peak_statistics() -> None:
+    """PLANTED: the experiment_11_attention_none failure shape, R=32.
+
+    Both incumbent numbers are driven by the PEAK, so neither can see a deficit
+    spread over the whole image. Measured on that arm's own saved validation case
+    (``report_cases/case_2.npz``, 2026-09-16): a reconstruction carrying 0.295 of
+    the target's energy reported ``pred_target_scale_ratio`` 1.075 and
+    ``pred_above_target_fraction`` ~0 -- both squarely in band, on a 70000-iteration
+    run whose images are visibly zero-filled.
+
+    This test pins the MISS as well as the catch. Without the first two asserts a
+    later simplification could drop the energy statistics and leave the gate blind
+    again with nothing turning red.
+    """
+    torch.manual_seed(0)
+    target = torch.rand(2, 1, 32, 32) * _EXPERIMENT_11_TARGET_PEAK
+    # A low-passed copy at ~55% amplitude, with one hot pixel so the peak agrees:
+    # exactly the shape hard DC produces when the null band is under-filled.
+    pred = target * 0.55
+    pred[0, 0, 0, 0] = target.max() * 1.05
+
+    scale = DiffusionTrainingStrategy._measure_prediction_scale(pred, target)
+
+    # The miss: the incumbents read healthy.
+    assert scale["pred_target_scale_ratio"] == pytest.approx(1.05, abs=1e-3)
+    assert scale["pred_above_target_fraction"] < DiffusionTrainingStrategy._PRED_SCALE_WARN_FRACTION
+
+    # The catch: energy and the least-squares gain both name the deficit, and
+    # the gain names its SIZE -- the factor a single scalar would recover.
+    assert scale["pred_target_energy_ratio"] < 0.35
+    assert scale["pred_target_optimal_gain"] > 1.7
+
+
+@pytest.mark.unit
+def test_an_honestly_scaled_prediction_reads_one_on_both_energy_statistics() -> None:
+    """The anchor: identical tensors give ratio 1.0 and gain 1.0."""
+    target = torch.linspace(0.5, 4.0, 64).reshape(1, 1, 8, 8)
+
+    scale = DiffusionTrainingStrategy._measure_prediction_scale(target.clone(), target)
+
+    assert scale["pred_target_energy_ratio"] == pytest.approx(1.0, abs=1e-5)
+    assert scale["pred_target_optimal_gain"] == pytest.approx(1.0, abs=1e-5)
+
+    # A globally scaled prediction: energy goes as the square, the gain is the
+    # exact factor that undoes it. This is what makes the gain readable as
+    # "the reconstruction is under-scaled by 2x" rather than as an index.
+    half = DiffusionTrainingStrategy._measure_prediction_scale(target * 0.5, target)
+    assert half["pred_target_energy_ratio"] == pytest.approx(0.25, abs=1e-5)
+    assert half["pred_target_optimal_gain"] == pytest.approx(2.0, abs=1e-5)
+
+
+@pytest.mark.unit
 def test_prediction_scale_is_measured_on_magnitude_for_complex_tensors() -> None:
     """Complex predictions are compared in the domain the render path sees.
 
@@ -1225,7 +1442,27 @@ def test_validation_metrics_routes_decompression_through_the_verifying_helper() 
     }
 
     assert "decompress_kspace_log" not in called
-    assert "decompress_for_view" in called
+    # The verifying entry for tensors scored against the target: it runs
+    # decompress_for_view's check once, on the target, for all of them.
+    assert "decompress_scored_against" in called
+
+
+def _scored_against_the_target(tree: ast.AST) -> set[str]:
+    """Names passed into ``decompress_scored_against`` (the reference and each ``others`` value)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "decompress_scored_against"
+        ):
+            continue
+        if node.args and isinstance(node.args[0], ast.Name):
+            names.add(node.args[0].id)
+        for arg in node.args[1:2]:
+            if isinstance(arg, ast.Dict):
+                names.update(v.id for v in arg.values if isinstance(v, ast.Name))
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -1251,12 +1488,13 @@ def test_validation_metrics_routes_decompression_through_the_verifying_helper() 
 
 def _cold_diffusion_mock() -> MagicMock:
     """A ``self`` exposing only what the scale block ahead of :4758 reads."""
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
+
     mock = MagicMock()
     mock.config = SimpleNamespace(
         data=SimpleNamespace(
-            processing=SimpleNamespace(
-                enable_kspace_normalization=True,
-                enable_log_scaling=False,
+            processing=DataProcessingConfigSchema(
+                enable_kspace_normalization=True, enable_log_scaling=False
             )
         ),
     )
@@ -1319,9 +1557,7 @@ def test_denom_scale_is_sized_from_the_prediction_not_the_published_field(
     producer's is what reached the multiply.
     """
     calls = _spy_on_alignment(monkeypatch)
-    _call_with_flattened_batch(
-        _cold_diffusion_mock(), torch.tensor([224.36, 198.15]), batch=36
-    )
+    _call_with_flattened_batch(_cold_diffusion_mock(), torch.tensor([224.36, 198.15]), batch=36)
 
     assert calls, "the scale-alignment seam was never reached"
     assert calls[0]["batch_size"] == 36
@@ -1338,9 +1574,7 @@ def test_the_multiply_that_crashed_the_cluster_no_longer_collides(
     )
 
     assert calls, "the scale-alignment seam was never reached"
-    assert "must match the size" not in str(error or ""), (
-        f"the 36-vs-2 collision is back: {error}"
-    )
+    assert "must match the size" not in str(error or ""), f"the 36-vs-2 collision is back: {error}"
 
 
 def test_the_aligned_scale_is_subject_major_at_this_site_too(monkeypatch) -> None:
@@ -1352,9 +1586,7 @@ def test_the_aligned_scale_is_subject_major_at_this_site_too(monkeypatch) -> Non
     error raised.
     """
     calls = _spy_on_alignment(monkeypatch)
-    _call_with_flattened_batch(
-        _cold_diffusion_mock(), torch.tensor([10.0, 20.0]), batch=6
-    )
+    _call_with_flattened_batch(_cold_diffusion_mock(), torch.tensor([10.0, 20.0]), batch=6)
 
     assert calls, "the scale-alignment seam was never reached"
     assert calls[0]["aligned"].flatten().tolist() == [
@@ -1395,10 +1627,7 @@ def test_the_model_input_key_follows_whether_smaps_were_concatenated() -> None:
     )
 
     assert cold_model_input_key({"noisy_kspace": 1, "target": 2}) == "noisy_kspace"
-    assert (
-        cold_model_input_key({"noisy_kspace": 1, "model_input": 2, "smaps": 3})
-        == "model_input"
-    )
+    assert cold_model_input_key({"noisy_kspace": 1, "model_input": 2, "smaps": 3}) == "model_input"
 
 
 def test_both_cold_emitters_answer_through_the_same_rule() -> None:
@@ -1426,6 +1655,7 @@ def test_both_cold_emitters_answer_through_the_same_rule() -> None:
         assert '"model_input" if "model_input" in' not in src, (
             f"{method.__name__} still carries a hand-written copy of the rule"
         )
+
 
 # ---------------------------------------------------------------------------
 # S-maps are FFT'd before they are concatenated onto a k-space input (#1297)
@@ -1457,9 +1687,7 @@ def _concat_arg_names(func) -> list[list[str]]:
             continue
         if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
             continue
-        out.append(
-            [e.id for e in node.args[0].elts if isinstance(e, ast.Name)]
-        )
+        out.append([e.id for e in node.args[0].elts if isinstance(e, ast.Name)])
     return out
 
 
@@ -1468,9 +1696,7 @@ def _calls_named(func, name: str) -> int:
     return sum(
         1
         for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == name
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
     )
 
 
@@ -1490,9 +1716,7 @@ def test_smaps_are_prepared_before_the_kspace_concat(method_name: str) -> None:
     concats = [names for names in _concat_arg_names(method) if "smaps_k" in names]
     assert concats, f"{method_name} does not concatenate the prepared maps"
     for names in concats:
-        assert "smaps" not in names, (
-            f"{method_name} still concatenates the raw image-domain maps"
-        )
+        assert "smaps" not in names, f"{method_name} still concatenates the raw image-domain maps"
 
 
 @pytest.mark.unit
@@ -1509,9 +1733,7 @@ def test_current_smaps_is_never_rebound_to_the_kspace_form() -> None:
         "_prepare_diffusion_inputs",
         "_generate_validation_prediction",
     ):
-        src = textwrap.dedent(
-            inspect.getsource(getattr(DiffusionTrainingStrategy, method_name))
-        )
+        src = textwrap.dedent(inspect.getsource(getattr(DiffusionTrainingStrategy, method_name)))
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
@@ -1543,9 +1765,7 @@ def test_snapshot_declares_the_concatenated_smaps_as_kspace() -> None:
     the previewer has to IFFT it -- and the comment that justified excluding it
     has to go with it, or the next reader trusts a stale claim.
     """
-    src = textwrap.dedent(
-        inspect.getsource(DiffusionTrainingStrategy._prepare_diffusion_inputs)
-    )
+    src = textwrap.dedent(inspect.getsource(DiffusionTrainingStrategy._prepare_diffusion_inputs))
     assert '"noisy_kspace", "target", "smaps"' in src
     assert "smaps are image-domain despite their real-stacked" not in src
     assert "smaps_conditioning" in src
@@ -1577,6 +1797,8 @@ class _RecordingGen:
                 "mask": mask,
                 "steps": inference_timesteps,
                 "smaps": kwargs.get("smaps"),
+                "reference": kwargs.get("reference"),
+                "contrast_idx": kwargs.get("contrast_idx"),
             }
         )
         return torch.zeros_like(measurement)
@@ -1624,6 +1846,34 @@ def test_multistep_chunking_splits_the_smaps_with_the_measurement() -> None:
         assert call["smaps"].shape[0] == call["measurement"].shape[0] == 2
         assert torch.equal(call["smaps"], smaps[2 * i : 2 * i + 2])
         assert torch.equal(call["measurement"], meas[2 * i : 2 * i + 2])
+
+
+@pytest.mark.unit
+def test_multistep_chunking_splits_the_reference_with_the_measurement() -> None:
+    """The T1 reference is per row: a misaligned chunk would condition one
+    subject's target on another subject's T1 (#2452)."""
+    gen = _RecordingGen()
+    meas = torch.randn(5, 8, 8, 8)
+    ref = torch.randn(5, 8, 8, 8)
+    contrast = torch.arange(5)
+    DiffusionTrainingStrategy._sample_multistep_chunked(
+        _chunking_strategy(2), gen, meas, None, 3, contrast_idx=contrast, reference=ref
+    )
+    assert [c["measurement"].shape[0] for c in gen.calls] == [2, 2, 1]
+    for i, call in enumerate(gen.calls):
+        rows = slice(2 * i, 2 * i + call["measurement"].shape[0])
+        assert torch.equal(call["reference"], ref[rows])
+        assert torch.equal(call["contrast_idx"], contrast[rows])
+
+
+@pytest.mark.unit
+def test_multistep_sampling_passes_the_reference_unchunked() -> None:
+    gen = _RecordingGen()
+    ref = torch.randn(2, 8, 8, 8)
+    DiffusionTrainingStrategy._sample_multistep_chunked(
+        _chunking_strategy(8), gen, torch.randn(2, 8, 8, 8), None, 3, reference=ref
+    )
+    assert gen.calls[0]["reference"] is ref
 
 
 @pytest.mark.unit
@@ -1687,9 +1937,7 @@ class TestMultistepStartTimestepPassthrough:
             self.calls: list[dict] = []
 
         def sample(self, measurement, mask, inference_timesteps, smaps, start_timestep):
-            self.calls.append(
-                {"n": measurement.shape[0], "start_timestep": start_timestep}
-            )
+            self.calls.append({"n": measurement.shape[0], "start_timestep": start_timestep})
             return measurement
 
     @staticmethod
@@ -1801,8 +2049,7 @@ class TestFiveDimensionalCapabilityProbe:
             and n.args[1].value == "rep_fusion"
         ]
         assert not offenders, (
-            "a 5D-capability decision is again being made from a rep_fusion "
-            f"hasattr: {offenders}"
+            f"a 5D-capability decision is again being made from a rep_fusion hasattr: {offenders}"
         )
 
     def test_both_sites_ask_the_generator_for_5d_support(self) -> None:
@@ -1853,9 +2100,9 @@ def test_unsampled_weight_returns_none_when_fully_sampled() -> None:
     """
     ref = torch.randn(2, 8, 16, 16)
     mask = torch.ones(2, 1, 16, 16)
-    assert (
-        DiffusionTrainingStrategy._unsampled_weight(mask, ref) is None
-    ), "an all-ones mask must yield None, not a zeroed weight"
+    assert DiffusionTrainingStrategy._unsampled_weight(mask, ref) is None, (
+        "an all-ones mask must yield None, not a zeroed weight"
+    )
 
 
 def test_unsampled_weight_is_not_none_when_bins_are_missing() -> None:
@@ -2250,20 +2497,11 @@ class TestValidationCallSitePassesTheScaledInputs:
 
     @pytest.mark.unit
     def test_input_batch_is_decompressed_for_view(self) -> None:
-        """The other half of the seam: undo ``log1p`` before scaling."""
-        tree = self._tree()
-        found = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Assign)
-            and len(n.targets) == 1
-            and isinstance(n.targets[0], ast.Name)
-            and n.targets[0].id == "input_batch"
-            and isinstance(n.value, ast.Call)
-            and isinstance(n.value.func, ast.Name)
-            and n.value.func.id == "decompress_for_view"
-        ]
-        assert found, "``input_batch`` never passes through ``decompress_for_view``"
+        """The other half of the seam: undo ``log1p`` before scaling, like the target."""
+        scored = _scored_against_the_target(self._tree())
+        assert {"target_batch", "input_batch"} <= scored, (
+            "``input_batch`` never passes through the target's decompression decision"
+        )
 
 
 class TestNonNegotiableThreeAndSeventeenInValidation:
@@ -2370,15 +2608,18 @@ def _zf_mock(
     decompress / denormalise / data-range legs) from the transform's own
     behaviour, and it is a real configuration the corpus uses.
     """
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
     from spectramr.core.metrics.computer import ValidationMetricsComputer
     from spectramr.core.metrics.types import MetricSpec, ValidationMetricsConfig
 
+    # Log compression runs inside the k-space normalization (#2353), so a
+    # log-scaled arm has both on; the unit scale passed by the caller keeps the
+    # denormalisation leg an exact identity.
     mock = MagicMock()
     mock.config = SimpleNamespace(
         data=SimpleNamespace(
-            processing=SimpleNamespace(
-                enable_kspace_normalization=False,
-                enable_log_scaling=log_scaled,
+            processing=DataProcessingConfigSchema(
+                enable_kspace_normalization=log_scaled, enable_log_scaling=log_scaled
             )
         ),
         model=SimpleNamespace(input_type="image", model_type="kspace_cold_diffusion"),
@@ -2390,6 +2631,11 @@ def _zf_mock(
     )
     mock._is_cold_diffusion = MagicMock(return_value=True)
     mock._apply_metric_transforms = lambda pred, target, cfg: (pred, target)
+    # Read late so a test that swaps ``_apply_metric_transforms`` still sees
+    # the call the validation path makes through the views hook.
+    mock._metric_transform_views = lambda pred, target, cfg: MetricViews(
+        *mock._apply_metric_transforms(pred, target, cfg)
+    )
     mock._measure_prediction_scale = lambda pred, target: {
         "pred_above_target_fraction": 0.0,
         "target_abs_max": 1.0,
@@ -2432,6 +2678,194 @@ def _reference_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     metric = MetricsRegistry.get("psnr", device="cpu")
     data_range = target.abs().max().item()
     return float(metric(pred, target, data_range=data_range))
+
+
+class TestMeasurementAwareMetricsReachTheProductionPath:
+    """Observed firing end to end, not inferred from the wiring (non-negotiable 16).
+
+    Three separate defects kept these columns out of every run (2026-09-16): the
+    declared tuple named two of five, ``only=`` intersected against
+    ``validation.scoring.compute`` rather than the ``metrics.compute`` the seam's
+    comment named, and the context-free write-back overwrote the result with its
+    own NaN. The unit tests in ``test_diffusion_measurement_metrics.py`` pin each
+    mechanism; this one drives ``_compute_validation_metrics`` itself, because
+    that is where all three met.
+    """
+
+    @staticmethod
+    def _mock(names: list[str], mask: torch.Tensor | None):
+        measurement = torch.rand(2, 2, 8, 8)
+        mock = _zf_mock(measurement=measurement, metrics=names)
+        # The real seam, bound to the mock host: a MagicMock would stub it out
+        # and the test would observe nothing while claiming to observe firing.
+        mock._measurement_aware_metrics = (
+            lambda p, t_, m_, c, mk=None: DiffusionTrainingStrategy._measurement_aware_metrics(
+                mock, p, t_, m_, c, mk
+            )
+        )
+        mock._MEASUREMENT_AWARE_METRICS = DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS
+        mock._select_batch_compatible_smaps = lambda batch: None  # single-coil surrogate
+        mock._rung_mask = mask
+        return mock
+
+    def test_the_columns_are_finite_when_the_arm_asks_for_them(self) -> None:
+        torch.manual_seed(0)
+        wanted = list(DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", *wanted], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        for name in wanted:
+            assert f"val_{name}" in out, f"val_{name} never reached the metrics dict"
+            assert math.isfinite(out[f"val_{name}"]), (
+                f"val_{name} is NaN -- the context-free pass won the write-back, "
+                f"which is the defect merge_metric_passes exists to stop"
+            )
+
+    def test_the_baseline_crosses_the_same_seam_and_mints_a_delta(self) -> None:
+        """``val_zf_delta_fabrication_excess`` is the number the cohort reports.
+
+        The raw value carries a coil-subspace bias the delta cancels, so the seam
+        has to score the zero-filled baseline too -- not only the prediction.
+        """
+        torch.manual_seed(0)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", "fabrication_excess"], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        assert math.isfinite(out["val_fabrication_excess"])
+        assert math.isfinite(out["val_zf_fabrication_excess"])
+        assert out["val_zf_delta_fabrication_excess"] == pytest.approx(
+            out["val_fabrication_excess"] - out["val_zf_fabrication_excess"], rel=1e-6
+        )
+
+    def test_an_arm_that_does_not_ask_gets_no_columns_at_all(self) -> None:
+        """PLANTED: the shipped cohort config. Silence, not NaN -- which is why
+        a cohort review that read the code did not catch it."""
+        torch.manual_seed(0)
+        mask = torch.zeros(2, 1, 8, 8)
+        mask[..., 2:6, :] = 1.0
+        mock = self._mock(["psnr", "mse"], mask)
+
+        out = _run_validation_metrics(
+            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+        )
+
+        assert "val_psnr" in out
+        for name in DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS:
+            assert f"val_{name}" not in out
+
+    def test_ndcr_scores_multicoil_kspace_per_coil(self) -> None:
+        """#2316, observed through ``_compute_validation_metrics``.
+
+        Four coils whose noise is i.i.d. per coil, so part of it lies off the
+        sensitivity subspace. The zero-filled baseline and a prediction equal to
+        the fully-sampled target both agree with the measurement on every
+        acquired sample, so ``ndcr`` is 0 for both. Before the seam handed over
+        ``pred_kspace`` the coil-combined images were re-projected through the
+        maps and both read the off-subspace noise instead (0.29 for the model here).
+        """
+        g = torch.Generator().manual_seed(0)
+        b, c, h, w = 2, 4, 8, 8
+        yy, xx = torch.meshgrid(torch.linspace(-1, 1, h), torch.linspace(-1, 1, w), indexing="ij")
+        maps = torch.stack(
+            [(0.6 + 0.4 * torch.cos(0.5 * (i + 1) * xx)) * torch.exp(1j * 0.5 * (i + 1) * (xx + yy))
+             for i in range(c)]
+        ).to(torch.complex64)
+        maps = (maps / maps.abs().pow(2).sum(0, keepdim=True).sqrt()).expand(b, c, h, w)
+        img = torch.exp(-(xx**2 + yy**2) / 0.3).to(torch.complex64).expand(b, 1, h, w)
+        clean = fft2c(img * maps)
+        noise = 0.05 * float(clean.abs().max()) * torch.complex(
+            torch.randn(clean.shape, generator=g), torch.randn(clean.shape, generator=g)
+        )
+        full = clean + noise
+        mask = torch.zeros(b, 1, h, w)
+        mask[..., ::2] = 1.0
+        mask[..., 3:5] = 1.0
+
+        def layout(k: torch.Tensor) -> torch.Tensor:
+            return torch.stack([k.real, k.imag], dim=2).flatten(1, 2)  # [r0, i0, r1, i1, ...]
+
+        measured = layout(full * mask)
+        mock = self._mock(["psnr", "ndcr"], mask)
+        mock._zf_measurement = measured
+        mock._select_batch_compatible_smaps = lambda batch: maps
+
+        out = _run_validation_metrics(mock, layout(full), layout(full), measured)
+
+        assert out["val_ndcr"] == pytest.approx(0.0, abs=1e-5)
+        assert out["val_zf_ndcr"] == pytest.approx(0.0, abs=1e-5)
+
+
+class TestPredictionAndTargetShareOneLevel:
+    """The prediction is graded on the target's level, whatever its own magnitude.
+
+    Per-tensor decompression left a prediction whose compressed |k|max passes
+    ``DECOMPRESS_MAGNITUDE_CEILING`` in compressed units while its target was
+    decompressed, so the metric compared two different scales.
+    """
+
+    @staticmethod
+    def _pair() -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(11)
+        target = torch.log1p(torch.rand(2, 2, 8, 8) * 50.0)
+        pred = target.clone()
+        pred[:, :, 0, 0] = DECOMPRESS_MAGNITUDE_CEILING + 5.0  # one diverged bin
+        return pred, target
+
+    def test_a_prediction_past_the_ceiling_is_decompressed_with_its_target(self) -> None:
+        pred, target = self._pair()
+        mock = _zf_mock(log_scaled=True)
+        seen = {}
+        mock._apply_metric_transforms = lambda p, t, cfg: (seen.update(p=p, t=t) or (p, t))
+        _run_validation_metrics(mock, pred, target, target.clone())
+        expected_pred = decompress_kspace_log(pred, channel_dim=1)
+        expected_target = decompress_kspace_log(target, channel_dim=1)
+        torch.testing.assert_close(seen["t"], expected_target)
+        torch.testing.assert_close(seen["p"], expected_pred)
+
+    def test_per_tensor_decisions_would_have_split_the_pair(self) -> None:
+        """Planted: the old rule leaves this prediction compressed, its target not."""
+        pred, target = self._pair()
+        assert decompress_for_view(pred, log_scaled=True, channel_dim=1) is pred
+        assert decompress_for_view(target, log_scaled=True, channel_dim=1) is not target
+
+    def test_log_scaling_without_normalization_is_scored_uncompressed(self) -> None:
+        """#2353: ``enable_log_scaling`` alone compresses nothing, so validation
+        must not ``expm1`` the pair on the bare declaration."""
+        from spectramr.config.schemas.data import DataProcessingConfigSchema
+
+        pred, target = self._pair()
+        mock = _zf_mock()
+        mock.config.data.processing = DataProcessingConfigSchema(
+            enable_kspace_normalization=False, enable_log_scaling=True
+        )
+        seen = {}
+        mock._apply_metric_transforms = lambda p, t, cfg: (seen.update(p=p, t=t) or (p, t))
+        _run_validation_metrics(mock, pred, target, target.clone())
+        torch.testing.assert_close(seen["t"], target)
+        torch.testing.assert_close(seen["p"], pred)
+
+    def test_a_perfect_prediction_scores_as_perfect(self) -> None:
+        _, target = self._pair()
+        out = _run_validation_metrics(
+            _zf_mock(log_scaled=True), target.clone(), target, target.clone()
+        )
+        assert out["val_psnr"] == pytest.approx(
+            _reference_psnr(
+                decompress_kspace_log(target, channel_dim=1),
+                decompress_kspace_log(target, channel_dim=1),
+            ),
+            rel=1e-6,
+        )
 
 
 class TestZeroFilledBaselineIsEmittedAndComparable:
@@ -2502,7 +2936,10 @@ class TestZeroFilledBaselineIsEmittedAndComparable:
         """
         torch.manual_seed(3)
         compressed = torch.log1p(torch.rand(2, 2, 8, 8) * 50.0)
-        target = torch.rand(2, 2, 8, 8) * 50.0
+        # The target is compressed by the same transform as the measurement, as
+        # on the data path; it is graded decompressed.
+        target_linear = torch.rand(2, 2, 8, 8) * 50.0
+        target = compress_kspace_log(target_linear, channel_dim=1)
         decompressed = decompress_for_view(compressed, log_scaled=True, channel_dim=1)
         assert not torch.allclose(decompressed, compressed), (
             "decompression was a no-op on this fixture, so the assertion below "
@@ -2511,9 +2948,15 @@ class TestZeroFilledBaselineIsEmittedAndComparable:
 
         mock = _zf_mock(log_scaled=True, measurement=compressed)
         out = _run_validation_metrics(
-            mock, torch.rand(2, 2, 8, 8) * 50.0, target, torch.rand(2, 2, 8, 8) * 50.0
+            mock,
+            torch.log1p(torch.rand(2, 2, 8, 8) * 50.0),
+            target,
+            torch.log1p(torch.rand(2, 2, 8, 8) * 50.0),
         )
-        assert out["val_zf_psnr"] == pytest.approx(_reference_psnr(decompressed, target), abs=1e-3)
+        graded_target = decompress_for_view(target, log_scaled=True, channel_dim=1)
+        assert out["val_zf_psnr"] == pytest.approx(
+            _reference_psnr(decompressed, graded_target), abs=1e-3
+        )
 
     def test_no_baseline_keys_when_no_measurement_was_recorded(self) -> None:
         """A non-cold arm never records one, so it emits none -- on EVERY batch
@@ -2594,8 +3037,7 @@ class TestZeroFilledBaselineWiring:
             if isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Name)
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert sources == ["masked_input"], (
@@ -2616,8 +3058,7 @@ class TestZeroFilledBaselineWiring:
             and isinstance(node.value, ast.Constant)
             and node.value.value is None
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert len(top_level_clears) == 1
@@ -2631,23 +3072,14 @@ class TestZeroFilledBaselineWiring:
             and isinstance(node.value, ast.Constant)
             and node.value.value is None
             and any(
-                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement"
-                for t in node.targets
+                isinstance(t, ast.Attribute) and t.attr == "_zf_measurement" for t in node.targets
             )
         ]
         assert len(clears) == 1, "the consumer must clear what it read"
 
     def test_the_baseline_is_decompressed_before_it_is_graded(self) -> None:
         tree = _method_tree(DiffusionTrainingStrategy._compute_validation_metrics)
-        decompressed = [
-            node.args[0].id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "decompress_for_view"
-            and node.args
-            and isinstance(node.args[0], ast.Name)
-        ]
+        decompressed = _scored_against_the_target(tree)
         assert "_zf_measurement" in decompressed, (
             "the baseline skipped the log-decompression seam; an inverse FFT of "
             "compressed k-space reconstructs a different signal (#1684)"
@@ -2693,8 +3125,11 @@ class TestZeroFilledBaselineWiring:
         zf = next(c for c in calls if _kw(c, "only") is not None)
         primary = next(c for c in calls if _kw(c, "only") is None)
 
+        # The primary pass scores the transform's views, whose magnitude target
+        # is the one bound to ``target_transformed`` (#867); the ZF subset names it.
+        assert isinstance(zf.args[1], ast.Name) and zf.args[1].id == "target_transformed"
+        assert isinstance(primary.func.value, ast.Name) and primary.func.value.id == "metric_views"
         for call in (zf, primary):
-            assert isinstance(call.args[1], ast.Name) and call.args[1].id == "target_transformed"
             data_range = _kw(call, "data_range")
             assert isinstance(data_range, ast.Name) and data_range.id == "dynamic_data_range"
 
@@ -2810,6 +3245,8 @@ class TestEveryProducerCallSiteHasAConsumerOrADiscard:
         assert any(any(_clears_the_stash(stmt) for stmt in t.finalbody) for t in tries), (
             "the discard is not in a finally: block"
         )
+
+
 class TestDiffusionDeclaredMetricKeys:
     """#1682 -- ``pre_dc_kspace_l1`` gets a column exactly when it is stamped.
 
@@ -2827,7 +3264,8 @@ class TestDiffusionDeclaredMetricKeys:
 
         return SimpleNamespace(
             config=SimpleNamespace(
-                losses=SimpleNamespace(reconstruction=SimpleNamespace(lambda_pre_dc_kspace=lam))
+                losses=SimpleNamespace(reconstruction=SimpleNamespace(lambda_pre_dc_kspace=lam)),
+                model=SimpleNamespace(model_kwargs={}),
             )
         )
 
@@ -2861,6 +3299,45 @@ class TestDiffusionDeclaredMetricKeys:
         bare = SimpleNamespace(config=SimpleNamespace(losses=None))
         with pytest.raises(AttributeError):
             DiffusionTrainingStrategy.declared_metric_keys(bare)
+
+    def test_the_clamp_columns_are_declared_exactly_when_the_clamp_is_on(self):
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+        def stub(model_kwargs):
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    losses=SimpleNamespace(reconstruction=None),
+                    model=SimpleNamespace(model_kwargs=model_kwargs),
+                )
+            )
+
+        on = DiffusionTrainingStrategy.declared_metric_keys(stub({"output_kspace_clip_ratio": 1.3}))
+        assert on == {"clip_bind_frac", "clip_overshoot_mean"}
+        assert DiffusionTrainingStrategy.declared_metric_keys(stub({})) == frozenset()
+
+    def test_dc_telemetry_columns_are_declared_from_the_generator(self):
+        """The Wiener-gain DC arm discarded its trust/gain telemetry: no column."""
+        from types import SimpleNamespace
+
+        import torch
+
+        from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+        emitted = {
+            "noise_adaptive_trust/mean": torch.tensor(0.5),
+            "wiener_gain/alpha": torch.tensor(1.0),
+        }
+        gen = SimpleNamespace(get_kan_trust_map_telemetry=lambda: emitted)
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                losses=SimpleNamespace(reconstruction=None),
+                model=SimpleNamespace(model_kwargs={}),
+            ),
+            generator_model=gen,
+        )
+        assert DiffusionTrainingStrategy.declared_metric_keys(stub) == set(emitted)
 
     def test_declaration_gate_matches_the_producer_gate(self):
         """Pin the two ends of one condition together.
@@ -3067,7 +3544,7 @@ class TestValidationEnsemble:
         target = torch.rand(2, 2, 8, 8) * 50.0
 
         std = mock._ensemble_std_in_metric_domain(
-            members, torch.ones(2, 1, 1, 1), True, target, mock.config.validation, True
+            members, torch.ones(2, 1, 1, 1), True, target, mock.config.validation
         )
 
         decompressed = torch.stack(
@@ -3092,6 +3569,119 @@ class TestValidationEnsemble:
         src = inspect.getsource(DiffusionTrainingStrategy.validation_step)
         assert "*self._ENSEMBLE_METRICS" in src
 
+    def test_the_zero_filled_normalised_mean_puts_the_rungs_on_one_axis(self) -> None:
+        all_metrics = {
+            "val_hfen_2x": 0.2,
+            "val_zf_hfen_2x": 0.4,
+            "val_hfen_8x": 0.6,
+            "val_zf_hfen_8x": 1.2,
+            "val_hfen_32x": 1.5,
+            "val_zf_hfen_32x": 1.0,
+        }
+        DiffusionTrainingStrategy._stamp_zf_normalised_mean(all_metrics, [2, 8, 32])
+        assert all_metrics["val_hfen_vs_zf_mean"] == pytest.approx((0.5 + 0.5 + 1.5) / 3)
+        assert "val_hfen_vs_zf_mean_partial" not in all_metrics
+
+    @pytest.mark.parametrize(
+        "drop",
+        [
+            {"val_zf_hfen_32x": None},  # baseline never computed on a rung
+            {"val_zf_hfen_32x": 0.0},  # baseline not positive: the ratio is undefined
+        ],
+    )
+    def test_a_rung_that_cannot_be_normalised_makes_the_mean_partial(self, drop) -> None:
+        """A silently shortened mean would outscore the full one (#1303), so it changes name."""
+        all_metrics = {
+            "val_hfen_2x": 0.2,
+            "val_zf_hfen_2x": 0.4,
+            "val_hfen_32x": 1.5,
+            "val_zf_hfen_32x": 1.0,
+        }
+        for key, value in drop.items():
+            if value is None:
+                all_metrics.pop(key)
+            else:
+                all_metrics[key] = value
+        DiffusionTrainingStrategy._stamp_zf_normalised_mean(all_metrics, [2, 32])
+        assert "val_hfen_vs_zf_mean" not in all_metrics
+        assert all_metrics["val_hfen_vs_zf_mean_partial"] == pytest.approx(0.5)
+
+    def test_the_band_metrics_are_normalised_by_their_zero_filled_baseline(self) -> None:
+        all_metrics = {
+            "val_unacquired_bin_nrmse_2x": 0.5,
+            "val_zf_unacquired_bin_nrmse_2x": 1.0,
+            "val_unacquired_bin_nrmse_8x": 0.9,
+            "val_zf_unacquired_bin_nrmse_8x": 1.0,
+        }
+        DiffusionTrainingStrategy._stamp_zf_normalised_mean(
+            all_metrics, [2, 8], metric="unacquired_bin_nrmse"
+        )
+        assert all_metrics["val_unacquired_bin_nrmse_vs_zf_mean"] == pytest.approx(0.7)
+        emitted = DiffusionTrainingStrategy.capabilities.emitted_metrics
+        assert "val_null_band_nrmse_outer_vs_zf_mean" in emitted
+
+    def test_the_zero_filled_baseline_is_graded_on_the_robust_psnr_too(self) -> None:
+        assert "robust_mri_psnr" in DiffusionTrainingStrategy._ZF_BASELINE_METRICS
+
+    def test_an_incomplete_cascade_stamps_the_partial_name(self) -> None:
+        all_metrics = {"val_hfen_2x": 0.2, "val_zf_hfen_2x": 0.4}
+        DiffusionTrainingStrategy._stamp_zf_normalised_mean(all_metrics, [2], complete=False)
+        assert "val_hfen_vs_zf_mean" not in all_metrics
+        assert "val_hfen_vs_zf_mean_partial" in all_metrics
+
+    def test_the_normalised_key_is_declared_ranked_lower_is_better_and_stamped_in_production(
+        self,
+    ) -> None:
+        import spectramr.core.metrics  # noqa: F401  -- populate the registry
+        from spectramr.core.metrics.metric_directions import metric_higher_is_better
+        from spectramr.core.metrics.registry import MetricsRegistry
+        from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import (
+            universal_validation_keys,
+        )
+        from spectramr.infrastructure.validation.witness.checks.validation_metric_checks import (
+            unresolved_metric_names,
+        )
+
+        emitted = DiffusionTrainingStrategy.capabilities.emitted_metrics
+        universal = universal_validation_keys(DiffusionTrainingStrategy)
+        assert (
+            unresolved_metric_names(
+                ["val_hfen_vs_zf_mean"], MetricsRegistry.is_registered, emitted, universal=universal
+            )
+            == []
+        )
+        assert metric_higher_is_better("val_hfen_vs_zf_mean") is False
+        src = inspect.getsource(DiffusionTrainingStrategy.validation_step)
+        assert "self._stamp_zf_normalised_mean(" in src
+
+    def test_the_acquired_bin_keys_resolve_per_rung_and_as_the_cascade_mean(self) -> None:
+        import spectramr.core.metrics  # noqa: F401  -- populate the registry
+        from spectramr.core.metrics.metric_directions import metric_higher_is_better
+        from spectramr.core.metrics.registry import MetricsRegistry
+        from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import (
+            universal_validation_keys,
+        )
+        from spectramr.infrastructure.validation.witness.checks.validation_metric_checks import (
+            unresolved_metric_names,
+        )
+
+        emitted = DiffusionTrainingStrategy.capabilities.emitted_metrics
+        universal = universal_validation_keys(DiffusionTrainingStrategy)
+        names = [
+            f"val_{base}{suffix}"
+            for base in ("acquired_bin_nrmse", "unacquired_bin_nrmse")
+            for suffix in ("", "_2x", "_8x", "_32x", "_mean")
+        ]
+        assert (
+            unresolved_metric_names(
+                names, MetricsRegistry.is_registered, emitted, universal=universal
+            )
+            == []
+        )
+        assert metric_higher_is_better("val_acquired_bin_nrmse_8x") is False
+        assert DiffusionTrainingStrategy.routes_context_metric("acquired_bin_nrmse")
+        assert DiffusionTrainingStrategy.routes_context_metric("unacquired_bin_nrmse")
+
     def test_the_multistep_branch_is_wired_to_the_ensemble(self) -> None:
         """Wiring pin (the behaviour is above): the cold branch resolves N, samples the
         stack, and the producer clears the stash before every prediction."""
@@ -3107,11 +3697,15 @@ class TestValidationEnsemble:
     def test_the_emitted_keys_resolve_through_the_witness_and_the_mixin(self) -> None:
         import spectramr.core.metrics  # noqa: F401  -- populate the registry
         from spectramr.core.metrics.registry import MetricsRegistry
+        from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import (
+            universal_validation_keys,
+        )
         from spectramr.infrastructure.validation.witness.checks.validation_metric_checks import (
             unresolved_metric_names,
         )
 
         emitted = DiffusionTrainingStrategy.capabilities.emitted_metrics
+        universal = universal_validation_keys(DiffusionTrainingStrategy)
         names = [
             "empirical_coverage",
             "ensemble_std_mean",
@@ -3120,7 +3714,12 @@ class TestValidationEnsemble:
             "val_ensemble_std_mean_32x",
             "val_ensemble_std_mean_mean",
         ]
-        assert unresolved_metric_names(names, MetricsRegistry.is_registered, emitted) == []
+        assert (
+            unresolved_metric_names(
+                names, MetricsRegistry.is_registered, emitted, universal=universal
+            )
+            == []
+        )
         # The mixin's exact-match rule, which the declaration flipped to strict.
         host = DiffusionTrainingStrategy.__new__(DiffusionTrainingStrategy)
         assert host._registry_backed_validation_metrics(
@@ -3128,3 +3727,1068 @@ class TestValidationEnsemble:
         ) == ["psnr"]
         with pytest.raises(ValueError, match="neither registered nor emitted"):
             host._registry_backed_validation_metrics(["val_nmse"])
+
+
+# ===========================================================================
+# The strategy may not keep its own list of what the arm optimizes
+# (#1918, #1919)
+# ===========================================================================
+
+_LOSS_OWNING_METHODS = ("_setup_strategy_specific_components", "_compute_losses_impl")
+# `diffusion.py` defines TWO strategy classes and both override both methods
+# (`XDiffusionTrainingStrategy` at :7658 -- setup :7867, step :8014). The claim
+# below is about the FILE, so the detector ranges over both; scoped to
+# `DiffusionTrainingStrategy` alone it could not see a hand-written list appear
+# in the sibling, which is the blindness shape non-negotiable 15 exists to catch.
+_LOSS_OWNING_CLASSES = ("DiffusionTrainingStrategy", "XDiffusionTrainingStrategy")
+_LOSS_OWNING_SITES = [(c, m) for c in _LOSS_OWNING_CLASSES for m in _LOSS_OWNING_METHODS]
+
+
+def _loss_site_tree(name: str, cls_name: str = "DiffusionTrainingStrategy"):
+    """Parse one loss-owning method.
+
+    NOT named ``_method_tree``: this module already defines that at module scope
+    for the validation-metric tests, with a different parameter (a method object,
+    not a name) and a different return type (``FunctionDef``, not ``Module``). A
+    second ``def`` of the same name is a silent rebinding -- the later one wins
+    for every caller in the file, including the eight that came first.
+    """
+    from spectramr.infrastructure.training.strategies import diffusion
+
+    cls = getattr(diffusion, cls_name)
+    # An inherited method would hand back `base.py`'s source under the subclass's
+    # name -- auditing the same bytes twice and counting it as coverage.
+    assert name in vars(cls), f"{cls_name} does not define {name}; the site moved"
+    return ast.parse(textwrap.dedent(inspect.getsource(getattr(cls, name))))
+
+
+def _named_losses(tree) -> set[str]:
+    """Registered canonical loss names appearing as string constants.
+
+    Keyed on the registry rather than "any string", so the surviving
+    `["g_total_loss", "loss", "diffusion"]` metric filter — none of which is a
+    registered loss — does not read as a violation.
+    """
+    from spectramr.models.losses.registry import LossRegistry
+
+    known = set(LossRegistry.list_available())
+    return {
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in known
+    }
+
+
+@pytest.mark.unit
+class TestNoSecondDeclarationSurface:
+    """Three hand-written lists claimed to know the objective and each read one
+    schema block, so all three were empty for the 58 `kspace_filling` arms that
+    declare theirs in the domain lists. The weight table is the owner now
+    (non-negotiable 17); a list here is a fourth owner reappearing."""
+
+    @pytest.mark.parametrize(("cls_name", "method"), _LOSS_OWNING_SITES)
+    def test_the_method_names_no_loss(self, cls_name: str, method: str) -> None:
+        named = _named_losses(_loss_site_tree(method, cls_name))
+        assert named == set(), (
+            f"{cls_name}.{method} names losses directly: {sorted(named)}. Read "
+            "`self._declared_loss_keys` / `self._weight_table` instead — a list "
+            "here mirrors one schema block and silently misses the rest."
+        )
+
+    @pytest.mark.parametrize(("cls_name", "method"), _LOSS_OWNING_SITES)
+    def test_the_method_holds_no_enable_weight_triples(self, cls_name: str, method: str) -> None:
+        """The second shape the same defect took: `[(name, enabled, weight), ...]`.
+
+        Caught separately because a triple list can be built from `getattr`
+        lookups with no loss name spelled as a constant at all.
+        """
+        tree = _loss_site_tree(method, cls_name)
+        triples = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.List)
+            and sum(isinstance(e, ast.Tuple) and len(e.elts) == 3 for e in node.elts) >= 2
+        ]
+        assert not triples, (
+            f"{cls_name}.{method} rebuilds an (name, enabled, weight) table; "
+            "`build_loss_weight_table` already resolved exactly that."
+        )
+
+    def test_this_module_binds_no_helper_name_twice(self) -> None:
+        """A second module-level ``def`` of a live name is a silent rebinding.
+
+        This file already had ``_method_tree`` (a method object -> FunctionDef)
+        when these tests were written; adding a same-named helper taking a
+        string re-pointed all eight earlier call sites at the new one. Nothing
+        raised at import, ruff saw nothing, and the tests added here still
+        passed -- only the tests that were NOT re-run went red. Checked here
+        because this module is where the collision happened.
+        """
+        import collections
+
+        tree = ast.parse(Path(__file__).read_text())
+        names = [
+            n.name
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        dupes = {n: c for n, c in collections.Counter(names).items() if c > 1}
+        assert not dupes, (
+            f"module-level names bound more than once: {dupes}. The last "
+            "definition wins for every caller in the file, including earlier ones."
+        )
+
+    def test_the_registry_oracle_is_not_vacuous(self) -> None:
+        """If the loss registry were empty the two tests above would pass on any
+        code at all."""
+        from spectramr.models.losses.registry import LossRegistry
+
+        known = set(LossRegistry.list_available())
+        assert len(known) > 100
+        assert {"complex_l1", "log_spectral", "hfen", "l1", "l2"} <= known
+
+
+@pytest.mark.unit
+class TestTheProductionPathCallsTheSSOT:
+    """Non-negotiable 16: registering the helper is the easy half."""
+
+    def test_setup_emits_the_banner(self) -> None:
+        tree = _loss_site_tree("_setup_strategy_specific_components")
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_log_loss_objective" in calls
+
+    def test_the_step_fills_from_the_declared_set(self) -> None:
+        tree = _loss_site_tree("_compute_losses_impl")
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_ensure_declared_losses_present" in calls
+
+    def test_the_banner_actually_reaches_the_logger(self) -> None:
+        """Observed, not inferred: drive the real method and read the spy."""
+        from types import SimpleNamespace
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+
+        arm = _KSPACE_ARM_DIR / "experiment_11_sense_bridge_critic.yaml"
+        assert arm.exists(), f"missing experiment config: {arm}"
+
+        strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
+        strategy.config = TrainingSettings.from_yaml(str(arm))
+        lines: list[str] = []
+        strategy.logging_service = SimpleNamespace(log_info=lines.append, log_warning=lines.append)
+
+        strategy._log_loss_objective("[DiffusionStrategy]")
+
+        assert lines, "the banner printed nothing — the state this work removed"
+        assert lines[0].startswith("[DiffusionStrategy] Configured Losses (")
+        assert not lines[0].startswith("[DiffusionStrategy] Configured Losses (0)"), (
+            "this arm trains seven losses; a zero count is the original bug"
+        )
+        assert any("adversarial" in ln and "0.0100" in ln for ln in lines)
+
+
+_KSPACE_ARM_DIR = (
+    Path(__file__).resolve().parents[5] / "experiments" / "inprogress" / "kspace_filling"
+)
+_KSPACE_ARMS = sorted(p.relative_to(_KSPACE_ARM_DIR) for p in _KSPACE_ARM_DIR.rglob("*.yaml"))
+
+
+@pytest.mark.unit
+class TestFillSetMatchesTheCsvHeader:
+    """The zero-fill exists so a declared loss gets a CSV column. If the two
+    sets disagree the fix is worse than the bug: a key the header lacks is
+    dropped by the writer (`extrasaction="ignore"`) and reported missing on
+    every single step."""
+
+    def test_the_cohort_is_not_empty(self) -> None:
+        assert len(_KSPACE_ARMS) > 50, f"corpus not found under {_KSPACE_ARM_DIR}"
+
+    @pytest.mark.parametrize("arm", [str(a) for a in _KSPACE_ARMS])
+    def test_declared_keys_equal_the_header_keys(self, arm: str) -> None:
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.training.builders.loss_builder import (
+            STRATEGY_MANAGED_LOSSES,
+        )
+        from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+        from spectramr.models.losses.weights import canonical_loss_name
+
+        strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
+        strategy.config = TrainingSettings.from_yaml(str(_KSPACE_ARM_DIR / arm))
+
+        # The CSV header's own owner: `training_loop` builds it from this call.
+        header = {
+            canonical_loss_name(name)
+            for name, weight in strategy.config.losses.get_enabled_losses().items()
+            if weight > 0
+        } - STRATEGY_MANAGED_LOSSES
+
+        declared = strategy._declared_loss_keys
+        assert not (header - declared), (
+            f"header promises columns the fill set misses: {sorted(header - declared)}"
+        )
+        assert not (declared - header), (
+            f"fill set writes keys the header lacks (dropped, then reported "
+            f"missing every step): {sorted(declared - header)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Non-Cartesian sample-domain fidelity: the measurement's route to the losses
+# ---------------------------------------------------------------------------
+# ``q_sample`` grids the off-grid samples away, so the fidelity term cannot
+# recover them from ``pred``/``target``. These pin the out-of-band route --
+# ``SimpleNamespace`` rather than ``MagicMock`` throughout, because a mock
+# auto-creates ``kspace_process.last_sample_measurement`` as a truthy child and
+# every assertion below would pass against a generator that publishes nothing.
+
+
+def test_sample_measurement_is_none_on_a_cartesian_arm() -> None:
+    """The grid process has no sample axis, and absent is the correct answer."""
+    strategy = SimpleNamespace(generator_model=SimpleNamespace(kspace_process=None))
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is None
+
+
+def test_sample_measurement_reads_the_process_stash() -> None:
+    """The strategy reads the measurement the forward process published."""
+    measurement = object()
+    strategy = SimpleNamespace(
+        generator_model=SimpleNamespace(
+            kspace_process=SimpleNamespace(last_sample_measurement=measurement)
+        )
+    )
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is measurement
+
+
+def test_sample_measurement_unwraps_the_ddp_wrapper() -> None:
+    """A DDP-wrapped generator hides the process one attribute deeper."""
+    measurement = object()
+    inner = SimpleNamespace(
+        kspace_process=SimpleNamespace(last_sample_measurement=measurement)
+    )
+    strategy = SimpleNamespace(generator_model=SimpleNamespace(module=inner))
+    assert DiffusionTrainingStrategy._sample_measurement_for_loss(strategy) is measurement
+
+
+def test_the_loss_computer_call_forwards_the_measurement() -> None:
+    """PLANTED VIOLATION: a stash nothing forwards is the facade shape.
+
+    The helper above can be correct while the measurement never reaches a loss.
+    Read the real call site rather than trusting that it was edited.
+    """
+    source = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
+    call = next(
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compute"
+    )
+    assert "sample_measurement" in {kw.arg for kw in call.keywords}, (
+        "the loss computer call must forward the rung measurement"
+    )
+
+
+def test_a_late_top_rung_is_warned_about_once_and_draws_match_it() -> None:
+    """#2066: the kspace_filling curriculum opens t=28 at iteration 56000 of 70000.
+
+    The warning is the observable half; the draw at iteration 55999 is the proof
+    that the number it states is the sampler's own cap.
+    """
+    strategy = _timestep_strategy(
+        "uniform", floor=0, max_iterations=70_000, num_timesteps=29,
+        curriculum_start=1, curriculum_rate=0.0005,
+    )
+    strategy.config.training.diffusion = SimpleNamespace(timesteps=29)
+    state = strategy._resolve_curriculum_once()
+    assert state.top_opens_at == 56_000
+    warnings = [c.args[0] for c in strategy.logging_service.log_warning.call_args_list]
+    assert len(warnings) == 1 and "iteration 56000 of 70000" in warnings[0]
+    before = DiffusionTrainingStrategy.sample_timesteps(strategy, batch_size=4096, iteration=55_999)
+    after = DiffusionTrainingStrategy.sample_timesteps(strategy, batch_size=4096, iteration=56_000)
+    assert before.max().item() < 28 == after.max().item()
+
+
+# ---------------------------------------------------------------------------
+# Cold-diffusion validation S-maps and chunking (#1914).
+# ---------------------------------------------------------------------------
+
+
+def test_cold_validation_hands_each_chunk_its_own_slice_of_this_batchs_smaps(
+    monkeypatch,
+) -> None:
+    """Single-step cold validation estimated the batch's maps, stored them on the
+    strategy and concatenated them into the input, but never passed them to the
+    generator, whose SENSE projection then used the maps cached on the last
+    training forward. And ``_forward_chunked`` sliced only the input and the
+    timesteps, so chunk 2 of a split batch met full-batch masks and measurements.
+    """
+    from spectramr.infrastructure.training.strategies import diffusion as diffusion_mod
+
+    batch, chunk = 4, 2
+    maps = torch.randn(batch, 1, 8, 8, dtype=torch.complex64)
+    monkeypatch.setattr(diffusion_mod, "estimate_smaps_calibrated", lambda *a, **k: maps)
+
+    mock = _validation_strategy(chunk_size=chunk)
+    mock._is_cold_diffusion.return_value = True
+    mock.config.model = SimpleNamespace(model_type="kspace_cold_diffusion")
+    mock.config.validation = SimpleNamespace(
+        loader=SimpleNamespace(chunk_size=chunk),
+        sampling=SimpleNamespace(enable_multistep_cold=False),
+    )
+    mask = torch.ones(batch, 1, 8, 8)
+    mock.generate_and_process_mask.return_value = mask
+    mock._apply_masking_and_verify.side_effect = lambda x, m, **_: x * m
+
+    seen: list[dict] = []
+
+    def _record(model_input, timesteps=None, is_latent_diffusion=False, gen_kwargs=None):
+        seen.append({"n": model_input.shape[0], **gen_kwargs})
+        return torch.zeros(model_input.shape[0], 2, 8, 8)
+
+    mock._forward_through_model.side_effect = _record
+    inp = torch.randn(batch, 2, 8, 8)
+    DiffusionTrainingStrategy._generate_validation_prediction(
+        mock,
+        input_batch=inp,
+        target_batch=inp.clone(),
+        timestep=torch.ones(batch, dtype=torch.long),
+        batch_data={},
+        kwargs={},
+    )
+    swallowed = [
+        c.args[0]
+        for c in mock.logging_service.log_warning.call_args_list
+        if c.args and "Validation generation failed" in str(c.args[0])
+    ]
+    assert not swallowed, swallowed
+    assert [c["n"] for c in seen] == [chunk, chunk]
+    for i, call in enumerate(seen):
+        rows = slice(i * chunk, (i + 1) * chunk)
+        assert torch.equal(call["smaps"], maps[rows])
+        assert call["mask"].shape[0] == chunk
+        assert call["kspace_measured"].shape[0] == chunk
+
+
+def test_x_diffusion_without_a_horizon_raises_rather_than_sampling_1000_steps():
+    """PLANTED (#2443): a missing training.diffusion fell through ``... or 1000``."""
+    from spectramr.infrastructure.training.strategies.diffusion import XDiffusionTrainingStrategy
+
+    strategy = object.__new__(XDiffusionTrainingStrategy)
+    strategy.env = SimpleNamespace(generator=torch.nn.Identity(), losses={})
+    strategy.config = SimpleNamespace(
+        training=SimpleNamespace(diffusion=None),
+        model=SimpleNamespace(model_type="x_diffusion"),
+    )
+    strategy.logging_service = SimpleNamespace(log_info=lambda *a, **k: None)
+    strategy._loss_dict_reuse = {}
+    x = torch.randn(1, 1, 8, 8)
+    with pytest.raises(ValueError, match=r"training\.diffusion\.timesteps"):
+        strategy._compute_losses_impl(input_batch=x, target_batch=x, epoch=0)
+
+
+def test_the_clamp_statistics_reach_the_training_metrics_as_device_tensors():
+    """Wiring: the generator's last clip stats land in the loss dict without a host sync."""
+    import inspect
+
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    src = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
+    assert '"clip_bind_frac"] = clip_stats[0]' in src
+    assert '"clip_overshoot_mean"] = clip_stats[1]' in src
+    assert "float(clip_stats" not in src and ".item()" not in src.split("clip_stats = ")[1][:400]
+
+
+def test_the_output_snapshot_also_fires_at_each_validation_step():
+    """The early cadence spends its budget mid-curriculum; a second tag covers validation."""
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = object.__new__(DiffusionTrainingStrategy)
+    s._cached_log_interval = 5000
+    s._cached_val_interval = 10000
+    due = DiffusionTrainingStrategy._output_snapshot_tags_due
+    assert due(s, 500) == ("model_output_dc",)
+    assert due(s, 10000) == ("model_output_dc", "model_output_dc_validation")
+    assert due(s, 10250) == ()
+    assert due(s, 0) == ("model_output_dc",)
+
+
+def test_no_validation_tag_when_validation_is_off():
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = object.__new__(DiffusionTrainingStrategy)
+    s._cached_log_interval = 5000
+    s._cached_val_interval = 0
+    assert DiffusionTrainingStrategy._output_snapshot_tags_due(s, 10000) == ("model_output_dc",)
+
+
+def test_the_t0_probe_drops_the_metrics_a_fully_sampled_mask_leaves_undefined():
+    """At t=0 there is no unmeasured band: those columns were nan in every row of 59 runs."""
+    from spectramr.infrastructure.training.strategies.diffusion import (
+        DiffusionTrainingStrategy,
+        drop_unmeasured_band_metrics,
+    )
+
+    names = DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS
+    metrics = {
+        "val_psnr": 30.0,
+        "val_hfen": 0.4,
+        "val_zf_psnr": 25.0,
+        "val_eta_null": float("nan"),
+        "val_null_band_energy_deficit": float("nan"),
+        "val_zf_fabrication_excess": float("nan"),
+        "val_zf_delta_null_band_nrmse_outer": float("nan"),
+    }
+    kept = drop_unmeasured_band_metrics(metrics, names)
+    assert kept == {"val_psnr": 30.0, "val_hfen": 0.4, "val_zf_psnr": 25.0}
+
+
+def test_the_t0_probe_keeps_the_acquired_bin_error_and_drops_the_rest():
+    """The acquired-bin error is defined under the probe's all-ones mask; the unmeasured-band
+    metrics, unacquired_bin_nrmse included, are not and stay dropped."""
+    import inspect
+
+    from spectramr.infrastructure.training.strategies.diffusion import (
+        DiffusionTrainingStrategy,
+        drop_unmeasured_band_metrics,
+    )
+
+    dropped = DiffusionTrainingStrategy._t0_probe_dropped_metrics()
+    metrics = {
+        "val_acquired_bin_nrmse": 0.12,
+        "val_zf_acquired_bin_nrmse": 0.30,
+        "val_unacquired_bin_nrmse": 0.0,
+        "val_eta_null": float("nan"),
+    }
+    kept = drop_unmeasured_band_metrics(metrics, dropped)
+    assert kept == {"val_acquired_bin_nrmse": 0.12, "val_zf_acquired_bin_nrmse": 0.30}
+    # Planted: the full measurement-aware set (the old call) drops it.
+    assert "val_acquired_bin_nrmse" not in drop_unmeasured_band_metrics(
+        metrics, DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS
+    )
+    assert "self._t0_probe_dropped_metrics()" in inspect.getsource(
+        DiffusionTrainingStrategy._t0_pre_dc_probe_metrics
+    )
+
+
+def _with_generator(gen):
+    """A strategy class whose ``generator_model`` property returns ``gen``."""
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    return type("_Strategy", (DiffusionTrainingStrategy,), {"generator_model": property(lambda self: gen)})
+
+
+def test_the_output_snapshot_carries_the_backbone_tap_and_the_image_domain_maps():
+    """#2488: the pre-DC tensor already includes the coil projection, so the
+    backbone's own output is snapshotted beside it, and the maps go under
+    ``coil_maps`` where the per-coil grid renders them."""
+    from types import SimpleNamespace
+
+    backbone = torch.rand(1, 8, 16, 16)
+    s = object.__new__(_with_generator(SimpleNamespace(last_backbone_output=backbone)))
+    s._current_smaps = torch.ones(1, 4, 16, 16, dtype=torch.complex64) / 2
+    snap = s._build_output_snapshot(
+        torch.rand(1, 8, 16, 16),
+        (torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16)),
+        torch.rand(1, 8, 16, 16),
+        torch.rand(1, 8, 16, 16),
+        None,
+    )
+    assert snap["model_output_backbone"] is backbone
+    assert "model_output_pre_dc" in snap and "model_output_post_dc" in snap
+    assert torch.equal(snap["coil_maps"], s._current_smaps)
+    assert "smaps" not in snap
+
+
+def test_the_output_snapshot_carries_the_projected_backbone_beside_the_raw_one():
+    from types import SimpleNamespace
+
+    raw, projected = torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16)
+    gen = SimpleNamespace(last_backbone_output=raw, last_backbone_projected=projected)
+    s = object.__new__(_with_generator(gen))
+    snap = s._build_output_snapshot(
+        torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16),
+        torch.rand(1, 8, 16, 16), None,
+    )
+    assert snap["model_output_backbone_projected"] is projected
+
+
+def test_the_backbone_tap_is_left_out_when_its_shape_does_not_match():
+    from types import SimpleNamespace
+
+    s = object.__new__(_with_generator(SimpleNamespace(last_backbone_output=torch.rand(1, 8, 8, 8))))
+    snap = s._build_output_snapshot(
+        torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16), torch.rand(1, 8, 16, 16),
+        torch.rand(1, 8, 16, 16), None,
+    )
+    assert "model_output_backbone" not in snap
+
+
+def test_chunked_validation_sums_the_unfitted_envelope_count_across_chunks():
+    """Each chunk's sampler record replaces the last; the per-sample count must not."""
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+    from tests.utils.config_block_stub import block_stub
+
+    gen = SimpleNamespace(last_reverse_stats=None)
+
+    def sample(measurement, mask, inference_timesteps, smaps=None, start_timestep=None):
+        # A fresh record per call, like the generator's per-call sampler.
+        gen.last_reverse_stats = {"decay_unfitted": int(measurement.flatten()[0] < 0)}
+        return measurement
+
+    gen.sample = sample
+    strat = SimpleNamespace(
+        config=SimpleNamespace(validation=block_stub("validation", val_chunk_size=1))
+    )
+    meas = torch.tensor([-1.0, 1.0, -1.0]).view(3, 1, 1, 1).expand(3, 2, 4, 4).contiguous()
+    DiffusionTrainingStrategy._sample_multistep_chunked(
+        strat, gen, meas, torch.ones(3, 1, 4, 4), steps=4
+    )
+    assert gen.last_reverse_stats["decay_unfitted"] == 2
+
+
+def test_a_generation_error_propagates_instead_of_returning_none() -> None:
+    """#1152/#181: the blanket except turned a wiring error into ``None``, every
+    batch then "succeeded", and the run reported success with no validation
+    number. The error must now reach ``_run_validation``'s per-batch accounting.
+    """
+    mock = _validation_strategy()
+
+    def _planted(*_a, **_k):
+        raise TypeError("planted: kwargs no registered accelerator reads")
+
+    mock._contrast_idx_from_batch = _planted
+    with pytest.raises(TypeError, match="planted") as info:
+        DiffusionTrainingStrategy._generate_validation_prediction(
+            mock,
+            input_batch=torch.randn(1, 1, 8, 8),
+            target_batch=torch.zeros(1, 1, 8, 8),
+            timestep=torch.tensor([1]),
+            batch_data={},
+            kwargs={},
+        )
+    assert any("Validation generation failed" in note for note in info.value.__notes__)
+
+
+def test_a_missing_prediction_is_not_scored_as_the_failure_sentinel() -> None:
+    """#181(a): ``hr_fakes is None`` returned ``{"validation_error": 1.0}``, a
+    finite value that let a run with no prediction report success."""
+    src = inspect.getsource(DiffusionTrainingStrategy.validation_step)
+    branch = src[src.index("if self.config.undersampling is None:") :]
+    branch = branch[: branch.index("single_metrics = self._compute_validation_metrics")]
+    assert "raise RuntimeError(" in branch
+    assert '"validation_error"' not in branch
+
+
+def _hfen_loss_and_metric_mock(loss_value: float) -> MagicMock:
+    """A host that scores ``hfen`` both as a loss term and as a metric (#2119)."""
+    mock = _zf_mock(metrics=("hfen",))
+    mock.context = SimpleNamespace(loss_fn=object())
+    mock.env.losses = {"hfen": lambda pred, target: torch.tensor(loss_value)}
+    mock._get_loss_weight = lambda name, iteration: 1.0
+    return mock
+
+
+def test_a_loss_and_a_metric_of_one_name_keep_separate_columns():
+    """The loss stamp no longer shares ``val_hfen`` with the metric that overwrote it."""
+    torch.manual_seed(0)
+    target = torch.rand(2, 1, 16, 16)
+    pred = target + 0.1 * torch.randn_like(target)
+    out = _run_validation_metrics(_hfen_loss_and_metric_mock(0.25), pred, target, pred)
+
+    assert float(out[validation_loss_key("hfen")]) == pytest.approx(0.25)
+    assert "val_hfen" in out and float(out["val_hfen"]) != pytest.approx(0.25)
+    # ``val_loss`` decomposes into the loss columns published beside it.
+    assert float(out["val_loss"]) == pytest.approx(float(out[validation_loss_key("hfen")]))
+
+
+def test_loss_columns_cannot_collide_with_a_registered_metric():
+    """Planted: the pre-fix ``val_{loss}`` spelling collides on ``hfen``; the namespace never does."""
+    from spectramr.core.metrics.registry import MetricsRegistry
+    from spectramr.models.losses.registry import LossRegistry
+
+    metric_columns = {f"val_{name}" for name in MetricsRegistry._metrics}
+    losses = LossRegistry.list_available()
+    assert "val_hfen" in {f"val_{name}" for name in losses} & metric_columns
+    assert not {validation_loss_key(name) for name in losses} & metric_columns
+
+
+def _cold_mock():
+    mock = MagicMock()
+    mock.generator_model = _gen(conditional=False)
+    mock._current_smaps = None
+    del mock.prior_model
+    mock.config = SimpleNamespace(undersampling=None)
+    return mock
+
+
+def test_training_hands_the_generator_the_masked_measurement() -> None:
+    """The output ceiling is read off ``kspace_measured``; training must not see bins validation hides."""
+    from spectramr.models.diffusion.kspace_process import band_local_magnitude_ceiling
+
+    # Magnitude falls with radius from the centre, as k-space does; only the central columns are
+    # acquired, so the outer bands are populated in the full tensor and empty in the measurement.
+    ky, kx = torch.meshgrid(torch.arange(32) - 16, torch.arange(32) - 16, indexing="ij")
+    full = (1.0 / (1.0 + (ky**2 + kx**2).float().sqrt())).expand(2, 8, 32, 32).clone()
+    mask = torch.zeros(2, 1, 32, 32)
+    mask[..., 12:20] = 1.0
+    kw = DiffusionTrainingStrategy._build_generator_kwargs(
+        _cold_mock(),
+        is_cold_diffusion=True,
+        is_latent_diffusion=False,
+        input_batch=full,
+        target_batch=full,
+        batch_data=None,
+        mask=mask,
+    )
+    measured = kw["kspace_measured"]
+    assert torch.equal(measured, full * mask)
+    # The validation path's measurement gives the same ceiling; the unmasked one does not.
+    val_ceiling = band_local_magnitude_ceiling(full * mask, 1.3, log_scaled=False)
+    assert torch.equal(band_local_magnitude_ceiling(measured, 1.3, log_scaled=False), val_ceiling)
+    assert not torch.equal(band_local_magnitude_ceiling(full, 1.3, log_scaled=False), val_ceiling)
+
+
+# --- Padded lines are not "unsampled" (#2160) --------------------------------
+# M4Raw writes 195 (T1/T2) or 198 (FLAIR) of 256 phase-encode lines; the rest
+# are exact zeros in input and target, and the rung mask is built over ACQUIRED
+# lines only, so they always read mask == 0. Counting them as unsampled bins
+# dilutes the mean of the pre-DC null-band term.
+
+
+def _padded_pre_dc_case(n_pad: int):
+    """A 16-line plane plus ``n_pad`` zero columns; kept lines are every 2nd of the 16."""
+    from spectramr.models.diffusion.acquired_line_budget import lines_to_plane
+
+    torch.manual_seed(0)
+    n = 16 + n_pad
+    pre = torch.zeros(1, 2, 8, n)
+    tgt = torch.zeros(1, 2, 8, n)
+    pre[..., :16] = torch.randn(1, 2, 8, 16)
+    tgt[..., :16] = torch.randn(1, 2, 8, 16)
+    kept = torch.zeros(1, n, dtype=torch.bool)
+    kept[:, 0:16:2] = True
+    acquired = torch.zeros(1, n, dtype=torch.bool)
+    acquired[:, :16] = True
+    return (
+        pre,
+        tgt,
+        lines_to_plane(kept, (8, n), -1),
+        lines_to_plane(acquired, (8, n), -1),
+    )
+
+
+def _pre_dc_term(pre, tgt, mask, acquired) -> torch.Tensor:
+    strategy = MagicMock(spec=DiffusionTrainingStrategy)
+    strategy._loss_dict_reuse = {}
+    strategy.config = SimpleNamespace(
+        losses=SimpleNamespace(reconstruction=SimpleNamespace(lambda_pre_dc_kspace=1.0))
+    )
+    strategy._unsampled_weight = DiffusionTrainingStrategy._unsampled_weight
+    return DiffusionTrainingStrategy._add_pre_dc_fidelity(
+        strategy, torch.zeros(()), (pre, pre), tgt, mask, acquired
+    )
+
+
+def test_pre_dc_term_ignores_padded_lines_when_acquired_is_given() -> None:
+    base = _pre_dc_term(*_padded_pre_dc_case(0)[:3], None)
+    for n_pad in (4, 12):
+        pre, tgt, mask, acq = _padded_pre_dc_case(n_pad)
+        assert torch.allclose(_pre_dc_term(pre, tgt, mask, acq), base)
+        # Planted violation: the legacy weight DOES move with the padding.
+        assert not torch.allclose(_pre_dc_term(pre, tgt, mask, None), base)
+
+
+def test_pre_dc_term_without_acquired_is_the_legacy_value() -> None:
+    pre, tgt, mask, _ = _padded_pre_dc_case(6)
+    w = (1.0 - mask).expand_as(pre)
+    expected = (w * (pre - tgt).abs()).sum() / w.sum()
+    assert torch.allclose(_pre_dc_term(pre, tgt, mask, None), expected)
+
+
+def test_unsampled_weight_counts_only_acquired_and_unkept_bins() -> None:
+    pre, _, mask, acq = _padded_pre_dc_case(5)
+    w =DiffusionTrainingStrategy._unsampled_weight(mask, pre, acq)
+    assert w is not None
+    # 8 unkept acquired lines x 8 rows; the 5 padded columns carry no weight.
+    assert float(w.sum()) == 8 * 8
+    assert float(w[..., 16:].sum()) == 0.0
+
+
+def test_unsampled_weight_returns_none_when_acquired_lines_are_all_kept() -> None:
+    """Identity rung on padded data: the helper reports no unmeasured bins (the caller decides)."""
+    pre, _, _, acq = _padded_pre_dc_case(5)
+    full = acq.clone()
+    assert DiffusionTrainingStrategy._unsampled_weight(full, pre, acq) is None
+
+
+def _pre_dc_terms_at_identity(lam_acquired: float) -> dict:
+    """Both pre-DC terms on a padded plane whose every acquirable line is kept (t=0)."""
+    pre, tgt, _, acq = _padded_pre_dc_case(5)
+    strategy = MagicMock(spec=DiffusionTrainingStrategy)
+    strategy._loss_dict_reuse = {}
+    strategy.config = SimpleNamespace(
+        losses=SimpleNamespace(
+            reconstruction=SimpleNamespace(
+                lambda_pre_dc_kspace=1.0, lambda_pre_dc_acquired=lam_acquired
+            )
+        )
+    )
+    strategy._unsampled_weight = DiffusionTrainingStrategy._unsampled_weight
+    strategy._acquired_weight = DiffusionTrainingStrategy._acquired_weight
+    DiffusionTrainingStrategy._add_pre_dc_fidelity(
+        strategy, torch.zeros(()), (pre + 1.0, pre + 1.0), tgt, acq.clone(), acq
+    )
+    return strategy._loss_dict_reuse
+
+
+def test_identity_rung_does_not_score_acquired_bins_twice_when_the_acquired_term_is_on() -> None:
+    """The acquired-band term scores every bin at t=0; the null-band fallback must not repeat it."""
+    terms = _pre_dc_terms_at_identity(0.5)
+    assert float(terms["pre_dc_kspace_l1"]) == 0.0
+    assert float(terms["pre_dc_acquired_l1"]) > 0.0
+
+
+def test_identity_rung_keeps_the_uniform_fallback_when_the_acquired_term_is_off() -> None:
+    """Without the acquired-band term the fallback is the only t=0 gradient (planted contrast)."""
+    terms = _pre_dc_terms_at_identity(0.0)
+    assert float(terms["pre_dc_kspace_l1"]) > 0.0
+
+
+def test_acquired_plane_of_lifts_the_process_lines_and_is_none_without_a_line_axis() -> None:
+    kspace = torch.zeros(2, 2, 4, 6)
+    kspace[..., :4] = 1.0  # columns 4-5 are padding
+    process = SimpleNamespace(
+        line_dim=-1, acquired_lines=lambda k: (k.abs().sum((1, 2)) > 0)  # [B, W]
+    )
+    strategy = MagicMock(spec=DiffusionTrainingStrategy)
+    strategy.generator_model = SimpleNamespace(kspace_process=process)
+    plane = DiffusionTrainingStrategy._acquired_plane_of(strategy, kspace)
+    assert plane is not None and plane.shape == (2, 1, 4, 6)
+    assert float(plane[..., :4].min()) == 1.0 and float(plane[..., 4:].max()) == 0.0
+
+    process.acquired_lines = lambda k: None
+    assert DiffusionTrainingStrategy._acquired_plane_of(strategy, kspace) is None
+
+
+@pytest.mark.parametrize("container", ["training_batch", "dict"])
+def test_cold_validation_calibrates_coil_maps_from_the_target(monkeypatch, container) -> None:
+    """Validation's maps come from ``target_batch`` whatever ``batch_data`` carries.
+
+    Production hands a ``TrainingBatch``, which the old ``isinstance(batch_data,
+    dict)`` read of a ``kspace`` alias never matched; the target was what every run
+    calibrated from. PLANTED: the deleted branch would calibrate the ``dict`` case
+    from the alias instead.
+    """
+    from spectramr.data.batch_types import TrainingBatch
+    from spectramr.infrastructure.training.strategies import diffusion as diffusion_mod
+
+    batch = 2
+    seen: list[torch.Tensor] = []
+
+    def _estimate(acs, **kwargs):
+        seen.append(acs)
+        return torch.ones(batch, 1, 8, 8, dtype=torch.complex64)
+
+    monkeypatch.setattr(diffusion_mod, "estimate_smaps_calibrated", _estimate)
+    mock = _validation_strategy(chunk_size=batch)
+    mock._is_cold_diffusion.return_value = True
+    mock.config.model = SimpleNamespace(model_type="kspace_cold_diffusion")
+    mock.config.validation = SimpleNamespace(
+        loader=SimpleNamespace(chunk_size=batch),
+        sampling=SimpleNamespace(enable_multistep_cold=False),
+    )
+    mock.generate_and_process_mask.return_value = torch.ones(batch, 1, 8, 8)
+    mock._apply_masking_and_verify.side_effect = lambda x, m, **_: x * m
+    mock._forward_through_model.side_effect = lambda model_input, **k: torch.zeros(
+        model_input.shape[0], 2, 8, 8
+    )
+    target = torch.randn(batch, 2, 8, 8)
+    alias = torch.randn(batch, 2, 8, 8)
+    if container == "dict":
+        batch_data = {"kspace": alias}
+    else:
+        batch_data = TrainingBatch(input=target, target=target, metadata={"kspace": alias})
+    DiffusionTrainingStrategy._generate_validation_prediction(
+        mock,
+        input_batch=target.clone(),
+        target_batch=target,
+        timestep=torch.ones(batch, dtype=torch.long),
+        batch_data=batch_data,
+        kwargs={},
+    )
+    (acs,) = seen
+    assert torch.equal(acs, torch.complex(target[:, :1], target[:, 1:]))
+
+
+class TestValidationLossesScoreTrainingUnits:
+    """``val_loss`` is scored on the normalised, log-compressed tensors.
+
+    The k-space losses are built with ``log_scaled=True`` and decompress inside
+    their own Fourier bridge. Handing them the physical-unit tensors that the
+    metrics consume applied ``expm1`` a second time, so magnitudes saturated at
+    ``expm1(DECOMPRESS_MAGNITUDE_CEILING)`` and ``coil_subspace_residual`` (an
+    energy) reported ~1e23 on every validation event.
+    """
+
+    @staticmethod
+    def _method_tree() -> ast.FunctionDef:
+        src = textwrap.dedent(
+            inspect.getsource(DiffusionTrainingStrategy._compute_validation_metrics)
+        )
+        return ast.parse(src).body[0]
+
+    def test_loss_operands_are_bound_before_decompression(self) -> None:
+        fn = self._method_tree()
+        bind_line = decompress_line = None
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Tuple) and [getattr(e, "id", None) for e in t.elts]
+                == ["loss_pred", "loss_target"]
+                for t in node.targets
+            ):
+                bind_line = node.lineno
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "decompress_scored_against"
+            ):
+                decompress_line = node.lineno
+        assert bind_line is not None, "loss operands are no longer bound"
+        assert decompress_line is not None
+        assert bind_line < decompress_line, "loss operands bound after decompression"
+
+    def test_every_loss_call_uses_the_training_unit_operands(self) -> None:
+        fn = self._method_tree()
+        calls = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_call_safe_loss"
+        ]
+        assert calls, "validation no longer scores the declared losses"
+        for call in calls:
+            names = [getattr(a, "id", None) for a in call.args[1:3]]
+            assert names == ["loss_pred", "loss_target"], names
+
+    def test_double_decompression_is_what_the_binding_prevents(self) -> None:
+        """Planted shape: the bridge applied to an already-decompressed tensor."""
+        from spectramr.models.losses.physics_losses import kspace_to_image
+
+        torch.manual_seed(0)
+        raw = torch.randn(1, 2, 16, 16, dtype=torch.complex64) * 50.0
+        compressed = compress_kspace_log(raw)
+        once = kspace_to_image(compressed, log_scaled=True)
+        twice = kspace_to_image(decompress_kspace_log(compressed), log_scaled=True)
+        assert torch.allclose(once, kspace_to_image(raw), rtol=1e-3, atol=1e-3)
+        assert twice.max() > 1e6 * once.max()
+
+
+# ── Pattern-C acquisition table binding (LM-20) ──────────────────────────────
+
+
+def _acq_strategy_mock(gen, *, enabled=True, params=None):
+    from spectramr.config.schemas.data import AcquisitionParamsSchema
+
+    rows = params if params is not None else [
+        AcquisitionParamsSchema(name="T1w", TE=12.0, TR=600.0, FA=70.0),
+        AcquisitionParamsSchema(name="T2w", TE=80.0, TR=4000.0),
+        AcquisitionParamsSchema(name="FLAIR", TE=120.0, TR=8000.0, TI=2200.0),
+    ]
+    mock = MagicMock()
+    mock.generator_model = gen
+    mock.config.data.multi_contrast = SimpleNamespace(
+        enabled=enabled, acquisition_params=rows, contrast_map={"T1w": 0, "T2w": 1, "FLAIR": 2}
+    )
+    return mock
+
+
+def _film_ldm(film: bool):
+    return _real_ldm(
+        conditional_translation=True,
+        use_contrast_guidance=True,
+        num_contrasts=3,
+        acquisition_film=film,
+    )
+
+
+def test_bind_acquisition_table_reaches_the_generator() -> None:
+    gen = _film_ldm(True)
+    DiffusionTrainingStrategy._bind_acquisition_table(_acq_strategy_mock(gen))
+    assert bool(gen.acquisition_film.table_bound)
+    assert gen.acquisition_film.table[2].tolist() == [120.0, 8000.0, 2200.0, 90.0]
+
+
+def test_bind_acquisition_table_without_params_raises() -> None:
+    with pytest.raises(ValueError, match="acquisition_params is empty"):
+        DiffusionTrainingStrategy._bind_acquisition_table(_acq_strategy_mock(_film_ldm(True), params=[]))
+
+
+def test_bind_acquisition_table_is_a_noop_when_film_is_off() -> None:
+    mock = _acq_strategy_mock(_film_ldm(False))
+    DiffusionTrainingStrategy._bind_acquisition_table(mock)
+    mock.logging_service.log_info.assert_not_called()
+
+
+def test_training_metrics_score_decompressed_denormalised_kspace(monkeypatch) -> None:
+    """train_* graded the SENSE image of log-compressed k-space; it must match val_* units."""
+    from types import SimpleNamespace
+
+    import torch
+
+    import spectramr.infrastructure.training.utils.kspace_view as kv
+    from spectramr.data.transforms.normalization import compress_kspace_log
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    monkeypatch.setattr(kv, "log_scaling_enabled", lambda _cfg: True)
+    torch.manual_seed(0)
+    target = torch.randn(2, 8, 16, 16) * 3
+    pred = target + 0.1 * torch.randn_like(target)
+    scale = torch.tensor([2.0, 5.0])
+    stub = SimpleNamespace(
+        _is_cold_diffusion=lambda: True,
+        _train_metric_scale=scale,
+        config=SimpleNamespace(
+            data=SimpleNamespace(processing=SimpleNamespace(enable_kspace_normalization=True))
+        ),
+    )
+    got_pred, got_target = DiffusionTrainingStrategy._training_metric_inputs(
+        stub, compress_kspace_log(pred, channel_dim=1), compress_kspace_log(target, channel_dim=1)
+    )
+    s = scale.view(-1, 1, 1, 1)
+    torch.testing.assert_close(got_target, target * s, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(got_pred, pred * s, rtol=1e-4, atol=1e-4)
+
+
+# ── PR4: rung and timestep provenance on the output snapshots ─────────────────
+
+
+def _bare_diffusion_for_snapshots(tmp_path=None, *, enabled: bool = True):
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = object.__new__(DiffusionTrainingStrategy)
+    s.env = SimpleNamespace(run_output_dir=str(tmp_path) if tmp_path else "/nonexistent", ema=object())
+    s.config = SimpleNamespace(
+        logging=SimpleNamespace(
+            snapshots=SimpleNamespace(
+                enabled=enabled, max_calls=8, save_images=False, save_json=True, interval_steps=0
+            )
+        ),
+        training=SimpleNamespace(output_dir=str(tmp_path) if tmp_path else "/nonexistent"),
+        validation=SimpleNamespace(sampling=SimpleNamespace(enable_multistep_cold=True)),
+    )
+    s._zf_measurement = torch.full((1, 1, 4, 8), 0.5)
+    s._rung_mask = torch.ones(1, 1, 4, 8)
+    return s
+
+
+def test_realised_acceleration_is_per_sample_over_sampled_pe_lines():
+    """N / sampled PE lines per sample; the acquired plane narrows the numerator."""
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = object.__new__(DiffusionTrainingStrategy)
+    gen = SimpleNamespace(kspace_process=SimpleNamespace(line_dim=-1))
+    mask = torch.zeros(2, 1, 4, 8)
+    mask[0, :, :, [0, 2, 4, 6]] = 1.0  # 4 of 8 PE columns sampled
+    mask[1, :, :, [0, 1]] = 1.0  # 2 of 8 sampled
+    with patch.object(DiffusionTrainingStrategy, "generator_model", new_callable=PropertyMock, return_value=gen):
+        assert DiffusionTrainingStrategy._snapshot_realised_acceleration(s, mask, None) == [2.0, 4.0]
+
+    plane = torch.zeros(2, 1, 4, 8)
+    plane[0, :, :, :6] = 1.0  # sample 0 acquired 6 columns: 6 / 4
+    plane[1, :, :, :] = 0.0  # sample 1 acquired nothing: sampled lines are unacquired
+    with patch.object(DiffusionTrainingStrategy, "generator_model", new_callable=PropertyMock, return_value=gen):
+        got = DiffusionTrainingStrategy._snapshot_realised_acceleration(s, mask, plane)
+    assert got == [1.5, 0.0]
+
+
+def test_realised_acceleration_is_unknown_without_a_line_axis():
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = object.__new__(DiffusionTrainingStrategy)
+    gen = SimpleNamespace(kspace_process=SimpleNamespace(line_dim=None))
+    with patch.object(DiffusionTrainingStrategy, "generator_model", new_callable=PropertyMock, return_value=gen):
+        assert DiffusionTrainingStrategy._snapshot_realised_acceleration(s, torch.ones(1, 1, 4, 8), None) is None
+        assert DiffusionTrainingStrategy._snapshot_realised_acceleration(s, None, None) is None
+
+
+def test_the_output_snapshot_extras_are_deferred_and_name_their_rung_and_cadence():
+    """Wiring: the model_output_dc emitter passes callables, so no sync runs unless written."""
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    src = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
+    assert '"timesteps": lambda: timesteps.detach().flatten().tolist()' in src
+    assert "lambda: self._snapshot_realised_acceleration(" in src
+    assert '"train_step_at_val_cadence"' in src and '"train_step_at_log_cadence"' in src
+
+
+def test_cascade_val_8x_is_emitted_for_the_8x_rung_on_the_first_batch_under_val_source():
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    s = _bare_diffusion_for_snapshots()
+    s.save_debug_snapshot = MagicMock()
+    seen: dict = {}
+
+    def _record(*args, **kwargs):
+        seen["phase"] = s._snapshot_phase
+
+    s.save_debug_snapshot.side_effect = _record
+    hr_fakes = torch.rand(1, 1, 4, 8)
+    target = torch.rand(1, 1, 4, 8)
+    gen = SimpleNamespace(_reverse_mode="replace_freeze_dc")
+    with (
+        patch.object(
+            DiffusionTrainingStrategy, "generator_model", new_callable=PropertyMock, return_value=gen
+        ),
+        s.snapshot_source("val"),
+    ):
+        s._emit_cascade_val_snapshot(hr_fakes, target, accel=8, timestep=17)
+
+    assert seen["phase"] == "val"
+    (tensors,), kwargs = s.save_debug_snapshot.call_args
+    assert kwargs["tag"] == "cascade_val_8x"
+    assert set(tensors) == {"model_output_post_dc", "target", "input", "mask"}
+    # The cascade's own prediction is what is shown: no second sampler call.
+    assert tensors["model_output_post_dc"].data_ptr() == hr_fakes.data_ptr()
+    assert kwargs["extra"] == {
+        "acceleration": 8,
+        "timestep": 17,
+        "validation_sampling": "multistep_cold",
+        "reverse_sampling_mode": "replace_freeze_dc",
+        "ema": True,
+    }
+    assert kwargs["in_kspace_keys"] == {"input", "target", "model_output_post_dc"}
+
+
+def test_cascade_val_8x_is_gated_to_the_8x_first_batch_before_the_metrics_pop_the_rung():
+    """Gate and ordering are wiring: the rung state is read before _compute_validation_metrics pops it."""
+    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
+
+    src = inspect.getsource(DiffusionTrainingStrategy.validation_step)
+    assert "if accel == 8 and not _is_heldout and batch_idx == 0:" in src
+    assert 'with self.snapshot_source("val"):' in src
+    emit = src.index("self._emit_cascade_val_snapshot(")
+    assert emit < src.index("level_metrics = self._compute_validation_metrics(")
+
+
+def test_cascade_val_8x_writes_nothing_when_snapshots_are_disabled(tmp_path):
+    """Real writer, disabled config: no directory, and the control run with snapshots on writes one."""
+    s_off = _bare_diffusion_for_snapshots(tmp_path / "off", enabled=False)
+    from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+
+    s_off.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_off)
+    hr = torch.rand(1, 1, 4, 8)
+    s_off._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    assert not list((tmp_path / "off").rglob("cascade_val_8x*"))
+
+    s_on = _bare_diffusion_for_snapshots(tmp_path / "on", enabled=True)
+    s_on.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_on)
+    s_on._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    assert list((tmp_path / "on").rglob("cascade_val_8x*")), "control run wrote nothing"

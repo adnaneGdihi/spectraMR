@@ -39,6 +39,7 @@ So one row per (iteration, severity point), level and timestep as values.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from spectramr.core.cascade_levels import (
@@ -66,6 +67,7 @@ __all__ = [
     "aggregate_cascade_rows",
     "build_cascade_row",
     "check_round_trip",
+    "flatten_band_records",
     "legacy_linear_timestep",
     "normalize_cascade_levels",
     "reconcile_skipped_levels",
@@ -168,3 +170,64 @@ def aggregate_cascade_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 merged[key] = values[0] if values else None
         out.append(merged)
     return out
+
+
+def flatten_band_records(records: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Summarise per-reveal-band attribution into cascade-row columns.
+
+    The full per-band table is the artifact a reader inspects for STEP
+    DISCONTINUITIES — a gain that jumps at a reveal boundary is a band written
+    by a differently-biased model call, and a jump in |k| along the phase-encode
+    axis is what produces coherent ghosting there. A CSV row cannot hold that
+    curve, so it carries the summary and the caller logs the table.
+
+    Bands the reverse loop revealed nothing at (``n_bins == 0`` — the inert
+    steps) contribute nothing: their gain is ``nan`` by construction and
+    averaging it in would report an unmeasured step as a measured one.
+
+    The observed support arrives as the ``step == -1`` record and is reported
+    SEPARATELY rather than pooled: under ``dc_method='hard'`` it is pinned to the
+    measurement, so its gain is the irreducible floor the inferred bands are read
+    against, not another sample of the same quantity.
+
+    Args:
+        records: :func:`~spectramr.models.diffusion.reveal_attribution.attribute_reveal_bands`
+            output.
+
+    Returns:
+        Flat ``val_band_*`` columns. Values are ``None`` when no band was
+        measurable, which is distinct from a gain of zero.
+    """
+    inferred = [r for r in records if r["step"] >= 0 and int(r["n_bins"]) > 0]
+    observed = next((r for r in records if r["step"] == -1), None)
+    # `worst` is selected from the MEASURED records, and the reported minimum is
+    # then read off it. Selecting from `inferred` while filtering the moduli
+    # separately let the two columns name different bands: `min` seeds on
+    # element 0 and every `k < nan` is False, so a leading nan record survived
+    # as "worst" while `val_band_gain_modulus_min` came from a real one -- the
+    # column labelled worst pointing at the band that was never measured. A band
+    # with `n_bins > 0` and zero target energy produces exactly that
+    # (reveal_attribution.py returns `(nan, nan)` for it), which is reachable at
+    # high |k| on a cropped or zero-padded acquisition.
+    measured = [r for r in inferred if not math.isnan(r["gain_modulus"])]
+    moduli = [float(r["gain_modulus"]) for r in measured]
+    phases = [
+        float(r["gain_phase_rad"]) for r in inferred if not math.isnan(r["gain_phase_rad"])
+    ]
+    worst = min(measured, key=lambda r: float(r["gain_modulus"]), default=None)
+    return {
+        "val_band_count": float(len(inferred)),
+        "val_band_gain_modulus_min": float(worst["gain_modulus"]) if worst is not None else None,
+        "val_band_gain_modulus_mean": (sum(moduli) / len(moduli)) if moduli else None,
+        "val_band_phase_rad_absmax": max(abs(p) for p in phases) if phases else None,
+        "val_band_phase_rad_absmean": (sum(abs(p) for p in phases) / len(phases))
+        if phases
+        else None,
+        "val_band_worst_timestep": float(worst["timestep"]) if worst is not None else None,
+        "val_band_observed_gain_modulus": (
+            None if observed is None else float(observed["gain_modulus"])
+        ),
+        "val_band_observed_phase_rad": (
+            None if observed is None else float(observed["gain_phase_rad"])
+        ),
+    }

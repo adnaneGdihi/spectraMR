@@ -14,6 +14,7 @@ Stamps are added in two places:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -92,17 +93,49 @@ def detect_metadata(
     )
 
 
+def run_provenance(run_dir: str | os.PathLike) -> dict[str, str | None]:
+    """Dataset identity, config path and config hash recorded in a run directory.
+
+    Read from what the run wrote (``resolved_config.json``, ``provenance.json``),
+    so a report made later from a downloaded run carries the same facts as one made
+    at the end of training. A fact the run did not record stays ``None``.
+    """
+    run = Path(run_dir)
+    out: dict[str, str | None] = {
+        "dataset_version": None,
+        "config_path": None,
+        "config_hash": None,
+    }
+
+    def _read(path: Path) -> dict:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    resolved = run / "resolved_config.json"
+    config = _read(resolved) if resolved.exists() else {}
+    if config:
+        out["config_path"] = str(resolved)
+        data = config.get("data") if isinstance(config.get("data"), dict) else {}
+        source = data.get("source") if isinstance(data.get("source"), dict) else {}
+        parts = [str(data["dataset_type"])] if data.get("dataset_type") else []
+        for key, tag in (("index_path", "train"), ("validation_index_path", "val")):
+            if isinstance(source.get(key), str) and source[key]:
+                parts.append(f"{tag}={Path(source[key]).name}")
+        out["dataset_version"] = " ".join(parts) or None
+    digest = _read(run / "provenance.json").get("config_sha256")
+    out["config_hash"] = digest if isinstance(digest, str) else None
+    return out
+
+
 def stamp_figure(fig: mfig.Figure, meta: RunMetadata) -> None:
-    """Annotate a figure with the metadata footer."""
-    fig.text(
-        0.99,
-        0.005,
-        meta.short_label(),
-        ha="right",
-        va="bottom",
-        fontsize=5,
-        color="#888888",
-    )
+    """Keep provenance off the canvas: ``write_sidecar`` records it beside the figure.
+
+    A footer collided with the legend and has no place in a publication panel.
+    """
+    del fig, meta
 
 
 def write_sidecar(artifact_path: str | os.PathLike, meta: RunMetadata) -> Path:

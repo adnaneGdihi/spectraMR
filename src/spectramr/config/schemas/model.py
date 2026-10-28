@@ -169,9 +169,10 @@ class ModelConfigSchema(BaseModel):
     # ==================== PHASE 5 ARCHITECTURE ENHANCEMENTS ====================
     # Phase 5 parameters are now passed via model_kwargs:
     # - attention_type: 'dual_domain' enables PhaseSafeDualAttention
-    # - phase_safe_attention_num_heads / _reduction / _max_tokens: the three keys
-    #   kspace_cold_diffusion_generator.py actually reads for that block. Width is
-    #   controlled by _reduction (hidden_dim = in_channels * 2 // reduction).
+    # - phase_safe_attention_num_heads / _reduction: the two keys
+    #   kspace_cold_diffusion_generator.py reads for that block. Width is controlled
+    #   by _reduction (hidden_dim = in_channels * 2 // reduction); the attention is
+    #   linear at native resolution, so there is no token cap to configure.
     # - reflect_padding_bottleneck_layers: Number of reflect-padded layers (default: 2)
     # See model_kwargs for details.
     #

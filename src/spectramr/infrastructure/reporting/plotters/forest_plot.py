@@ -53,7 +53,7 @@ def make(
         rows.append((m, d.mean(), lo, hi))
     if not rows:
         return None
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), 0.4 * len(rows) + 0.8))
     for i, (m, eff, lo, hi) in enumerate(rows):
         ax.plot([lo, hi], [i, i], color=colour_for(m, i), lw=1.2)

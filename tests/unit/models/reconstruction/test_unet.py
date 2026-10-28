@@ -546,3 +546,163 @@ class TestUNetPreservesInputSpatialSize:
         out = model(x)
         out = out[0] if isinstance(out, tuple) else out
         assert out.shape[-2:] == x.shape[-2:]
+
+
+class TestUNetDiscardsEveryDataConsistencyKwarg:
+    """UNet has no DC layer, so it must drop the whole ``DC_SSOT_KEYS`` set.
+
+    ``generator_kwargs`` step 3c forwards every row of
+    :data:`~spectramr.infrastructure.physics.dc_settings.DC_SSOT_KEYS` into any
+    generator whose constructor takes ``**kwargs`` — unconditionally, without
+    consulting ``physics.data_consistency.enabled``. UNet accepts those kwargs
+    only to throw them away, so its discard set has to be the table itself
+    (non-negotiable 17: one owner), not a hand-copied subset of it.
+    """
+
+    @staticmethod
+    def _dc_kwargs_from_schema_defaults() -> dict:
+        """What step 3c forwards for a config that declares no ``physics:``."""
+        from spectramr.config.schemas.physics import DataConsistencyConfig
+        from spectramr.infrastructure.physics.dc_settings import ssot_pairs
+
+        return dict(ssot_pairs(DataConsistencyConfig()))
+
+    def test_default_physics_block_does_not_break_construction(self):
+        # REGRESSION: DC_SSOT_KEYS grew the three noise keys, and UNet's
+        # hand-written pop-list did not grow with it, so every ``standard_unet``
+        # arm raised "Unexpected keyword argument 'train_noise_level' for
+        # UNetConfig" at build time — including the 121 arms that declare no
+        # physics block at all and the 24 that declare enabled: false.
+        from spectramr.models.reconstruction.unet import UNet
+
+        model = UNet(in_channels=1, out_channels=1, **self._dc_kwargs_from_schema_defaults())
+        assert model.config.in_channels == 1
+
+    def test_every_ssot_row_is_discarded(self):
+        """Each row on its own, so a seventh row cannot land unhandled.
+
+        This pin cannot go red by *addition* any more, and that is the point:
+        UNet derives its discard set from ``DC_SSOT_KEYS`` rather than
+        restating it, so growing the table grows the discard set. It goes red
+        if someone reintroduces a hand-written list.
+        """
+        from spectramr.infrastructure.physics.dc_settings import DC_SSOT_KEYS
+        from spectramr.models.reconstruction.unet import UNet
+
+        forwarded = self._dc_kwargs_from_schema_defaults()
+        for kwarg, _field in DC_SSOT_KEYS:
+            UNet(in_channels=1, out_channels=1, **{kwarg: forwarded[kwarg]})
+
+    def test_an_unknown_kwarg_still_raises(self):
+        """The discard set widened; the strict check did not go away."""
+        import pytest
+
+        from spectramr.models.reconstruction.unet import UNet
+
+        with pytest.raises(TypeError, match="not_a_unet_field"):
+            UNet(in_channels=1, out_channels=1, not_a_unet_field=1)
+
+
+class TestUNetContrastEmbeddingRows:
+    """The decoder's contrast embedding needs one row per sample (#2055).
+
+    This forward used to add whatever arrived: a single row broadcast onto every
+    sample, and any other mismatch surfaced as an opaque add error.
+    """
+
+    @staticmethod
+    def _model():
+        from spectramr.models.reconstruction.unet import UNet
+
+        torch.manual_seed(0)
+        return UNet(
+            in_channels=1, out_channels=1, model_channels=8, channel_mult=(1, 2), time_dim=16
+        ).eval()
+
+    def test_a_broadcast_row_raises(self):
+        model, x = self._model(), torch.randn(2, 1, 16, 16)
+        with pytest.raises(ValueError, match="contrast_emb batch 1"), torch.no_grad():
+            model(x, time=torch.tensor([1.0, 2.0]), contrast_emb=torch.randn(1, 16))
+
+    def test_per_sample_rows_pass(self):
+        model, x = self._model(), torch.randn(2, 1, 16, 16)
+        with torch.no_grad():
+            out = model(x, time=torch.tensor([1.0, 2.0]), contrast_emb=torch.randn(2, 16))
+        out = out[0] if isinstance(out, tuple) else out
+        assert out.shape == x.shape
+
+
+class TestDiffusionDenoiserOptions:
+    """The former EnhancedDeepDiffusionUNet options, folded into the configurable UNet."""
+
+    @staticmethod
+    def _unet(**kw):
+        from spectramr.models.reconstruction.unet import UNet
+
+        torch.manual_seed(0)
+        kw.setdefault("model_channels", 16)
+        kw.setdefault("channel_mult", (1, 2))
+        return UNet(in_channels=1, out_channels=1, **kw).eval()
+
+    def test_channel_mult_sets_widths_depth_and_time_width(self):
+        model = self._unet()
+        assert model.features == (16, 32) and model.depth == 1 and model.time_dim == 64
+
+    def test_forward_takes_timesteps_positionally_with_dense_skip(self):
+        model = self._unet(use_dense_skip=True, time_embedding_type="kan", num_timesteps=50)
+        x = torch.randn(2, 1, 16, 16)
+        with torch.no_grad():
+            out = model(x, torch.tensor([3, 7]), None)
+        assert out.shape == x.shape
+
+    def test_learned_input_scale_adds_one_scalar(self):
+        model = self._unet(learned_input_scale=True)
+        assert model.noise_scale.item() == 0.5
+
+    @pytest.mark.parametrize(
+        ("kw", "match"),
+        [
+            ({"time_embedding_type": "fourier"}, "time_embedding_type"),
+            ({"model_channels": None}, "needs model_channels"),
+        ],
+    )
+    def test_unknown_options_raise(self, kw, match):
+        with pytest.raises(ValueError, match=match):
+            self._unet(**kw)
+
+    def test_dense_skip_without_a_time_dim_raises(self):
+        from spectramr.models.reconstruction.unet import UNet
+
+        with pytest.raises(ValueError, match="use_dense_skip needs a time_dim"):
+            UNet(in_channels=1, out_channels=1, use_dense_skip=True)
+
+
+class TestFeaturesAreNotSilentlyDiscarded:
+    @pytest.mark.parametrize("declared", [64, (64, 128, 256, 512, 1024)])
+    def test_a_value_equal_to_the_built_widths_is_accepted(self, declared):
+        from spectramr.models.reconstruction.unet import UNet
+
+        UNet(in_channels=1, out_channels=1, features=declared)
+
+    @pytest.mark.parametrize("declared", [32, (32, 64, 128, 256, 512), [8, 16]])
+    def test_a_different_value_raises(self, declared):
+        from spectramr.models.reconstruction.unet import UNet
+
+        with pytest.raises(ValueError, match="not honoured"):
+            UNet(in_channels=1, out_channels=1, features=declared)
+
+
+class TestDecoderReceivesTheTimeEmbedding:
+    """The decoder nests TimeAwareSequential; the embedding used to stop at the outer one."""
+
+    def test_every_decoder_residual_block_projects_the_embedding(self):
+        from spectramr.models.reconstruction.unet import ConfigurableResidualBlock, UNet
+
+        model = UNet(in_channels=1, out_channels=1, depth=2, time_dim=16).eval()
+        calls = []
+        for module in model.decoder.modules():
+            if isinstance(module, ConfigurableResidualBlock):
+                module.time_proj.register_forward_hook(lambda *_: calls.append(1))
+        with torch.no_grad():
+            model(torch.randn(1, 1, 16, 16), time=torch.tensor([3.0]))
+        assert len(calls) == len(model.decoder) == 2

@@ -189,6 +189,23 @@ def resolve_cache_root() -> Path:
 #: ``TRITON_CACHE_DIR`` is the one exception and keeps ``setdefault`` semantics:
 #: DeepSpeed's own startup warning asks operators to point it at a non-NFS path,
 #: so an explicit export is an informed choice about NFS behaviour that must win.
+#:
+#: ``TORCHINDUCTOR_CACHE_DIR`` is pinned rather than inherited. Inductor's
+#: ``default_cache_dir`` is ``tempfile.gettempdir() + "torchinductor_<user>"``, so
+#: it *appears* to follow ``TMPDIR`` above -- but ``gettempdir`` memoizes on first
+#: call, and anything that touches it before this function runs freezes the answer
+#: at ``/tmp``. Measured: with one ``tempfile.gettempdir()`` beforehand, the env
+#: var reads ``<cache_root>`` while Inductor still writes to
+#: ``/tmp/torchinductor_<user>``. A coupling that silently stops holding is not
+#: coverage, and compiled artifacts are exactly what must not land on a node-local
+#: ``/tmp`` that the next job cannot see.
+#:
+#: ``CUDA_CACHE_PATH`` is the PTX JIT cache and the NVIDIA-documented spelling.
+#: ``CUDA_CACHE_CONFIG`` below it is NOT one of NVIDIA's three
+#: (``CUDA_CACHE_DISABLE`` / ``CUDA_CACHE_PATH`` / ``CUDA_CACHE_MAXSIZE``) and is
+#: kept only because retiring it is a separate decision -- see #2178. Without
+#: ``CUDA_CACHE_PATH`` the cache stays at ``~/.nv/ComputeCache`` (measured: 17
+#: files there on a developer box that had this table applied).
 _CACHE_ENV_LAYOUT: tuple[tuple[str, str, bool], ...] = (
     # (env var, subdirectory of cache_root, overwrite an existing value)
     ("TMPDIR", "", True),
@@ -196,6 +213,8 @@ _CACHE_ENV_LAYOUT: tuple[tuple[str, str, bool], ...] = (
     ("TORCH_METRICS_CACHE", "torchmetrics_cache", True),
     ("XDG_CACHE_HOME", ".cache", True),
     ("CUDA_CACHE_CONFIG", "cuda_cache", True),
+    ("CUDA_CACHE_PATH", "cuda_cache", True),
+    ("TORCHINDUCTOR_CACHE_DIR", "inductor_cache", True),
     ("TRITON_CACHE_DIR", "triton_cache", False),
 )
 

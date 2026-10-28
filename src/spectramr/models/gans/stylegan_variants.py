@@ -308,7 +308,10 @@ class StyleGAN2Generator(IGenerator, nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-@register_model(name="stylegan_discriminator", training_mode="gan")
+# StyleGAN convolution stack over real-valued images; no internal transform.
+@register_model(
+    role="discriminator", name="stylegan_discriminator", training_mode="gan", input_domain="image"
+)
 class StyleGANDiscriminator(IDiscriminator, nn.Module):
     """StyleGAN Discriminator implementation following SOLID principles.
 

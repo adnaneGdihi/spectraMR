@@ -42,6 +42,7 @@ class _TinyStudent(nn.Module):
 
 def _strategy(delta: float = 0.1) -> PrivilegedLearningStrategy:
     s = object.__new__(PrivilegedLearningStrategy)
+    s._owned_modules, s._owned_wrappers = {}, {}
     s.device = torch.device("cpu")
     dummy = nn.Parameter(torch.zeros(1))
     s.env = types.SimpleNamespace(

@@ -21,11 +21,12 @@ loss weights come from ``config.losses.reconstruction`` (SSOT).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
 from spectramr.infrastructure.physics.vf_operators import MarkerPriorProjection
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.ood_acceleration_readout import (
     ood_acceleration_readout,
@@ -56,6 +57,8 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         noise_estimator: Marker-based noise variance estimator (monitoring).
     """
 
+    synthesises_model_input: ClassVar[bool] = True
+
     #: The twin undersamples at ``physics.digital_twin.acceleration`` when its
     #: ``enable_undersampling`` is true; the top-level ``undersampling:`` block
     #: reaches nothing here (the k-space mixin's generator is never called), so
@@ -71,7 +74,8 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize Digital Twin from config, operator chain, and losses."""
@@ -226,11 +230,15 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         if self.env and hasattr(self.env, "losses"):
             env_losses = self.env.losses or {}
 
+        # Live iteration (loop_state seam). Frozen at 0 the warm-up gate never
+        # opened, so ``l1`` — undeclared by these arms and resolved from the
+        # ``lambda_l1`` schema default of 10.0 — was absent from ``components``
+        # for the whole run (pitfall #16, #1937).
         loss_output = self.loss_computer.compute(
             pred=pred_anchored,
             target=clean_target,
             epoch=epoch,
-            iteration=getattr(self.env, "step", 0) if self.env else 0,
+            iteration=resolve_loop_iteration(self),
             losses_dict=env_losses,
         )
 

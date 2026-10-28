@@ -23,9 +23,10 @@ differentiable, so the loss back-props detail-matching gradients into the genera
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 from torch import nn
 
 from spectramr.models.losses.registry import register_loss
@@ -55,6 +56,11 @@ def _gabor_quadrature(
 @register_loss(name="scattering_besov", domain="image")
 class ScatteringBesovLoss(nn.Module):
     """Fixed-filterbank scattering + Besov detail prior (B-1.3)."""
+
+    cos_filters: torch.Tensor
+    sin_filters: torch.Tensor
+    scale_index: torch.Tensor
+    besov_scale_weights: torch.Tensor
 
     def __init__(
         self,
@@ -107,7 +113,7 @@ class ScatteringBesovLoss(nn.Module):
         modulus = torch.sqrt(cos_r**2 + sin_r**2 + 1e-8)
         return cos_r, modulus
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         out = self.compute(pred, target)
         return out["loss_total"]
 
@@ -120,11 +126,14 @@ class ScatteringBesovLoss(nn.Module):
         loss_scatter = F.l1_loss(s_p, s_t)
         # Besov B^s_{1,1} norm of the residual: 2^(level*s)-weighted per-scale linear detail,
         # with the weight up-weighting the finer (higher-frequency) bands (see __init__).
+        # The bank is built scale-major, so scale j owns a contiguous channel slice;
+        # slicing avoids the device sync a boolean-mask index costs on CUDA.
         loss_besov = pred.new_zeros(())
+        n_orient = self.n_orientations
         for j in range(self.n_scales):
-            mask = self.scale_index == j
+            band = slice(j * n_orient, (j + 1) * n_orient)
             w = self.besov_scale_weights[j]
-            loss_besov = loss_besov + w * (cos_p[:, mask] - cos_t[:, mask]).abs().mean()
+            loss_besov = loss_besov + w * (cos_p[:, band] - cos_t[:, band]).abs().mean()
         loss_besov = loss_besov / self.n_scales
         total = self.scatter_weight * loss_scatter + self.besov_weight * loss_besov
         return {"loss_total": total, "loss_scatter": loss_scatter, "loss_besov": loss_besov}

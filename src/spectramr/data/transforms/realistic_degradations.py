@@ -8,11 +8,14 @@ Includes Rician noise, motion blur, k-space undersampling, and
 other realistic artifacts commonly found in MRI data.
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchio as tio
 
+from spectramr.infrastructure.physics.degradations.blocks.volume_warp import warp_volume
 from spectramr.infrastructure.physics.fft_ops import (
     fft_volume_full3d_uncentered,
     ifft_volume_full3d_uncentered,
@@ -30,16 +33,18 @@ class B0GeometricDistortion(nn.Module):
     Formula: delta_y = gamma * Delta_B0(x,y,z) * T_readout
     """
 
-    def __init__(self, strength: float = 1.0, readout_dim: int = 2):
+    def __init__(self, strength: float, shift_dim: int):
         """__init__.
 
         Args:
-            strength (float): Description.
-            readout_dim (int): Description.
+            strength (float): Pixel shift per unit of the B0 map.
+            shift_dim (int): Axis of the [B, C, D, H, W] tensor that is shifted: 3 (H) or 4 (W).
         """
         super().__init__()
+        if shift_dim not in (3, 4):
+            raise ValueError(f"shift_dim must be 3 (H) or 4 (W) of [B, C, D, H, W]; got {shift_dim!r}")
         self.strength = strength
-        self.readout_dim = readout_dim  # 2 for height (y), 3 for width (x) usually [B, C, D, H, W]
+        self.shift_dim = shift_dim
 
     def forward(self, x: torch.Tensor, b0_map: torch.Tensor) -> torch.Tensor:
         """
@@ -49,156 +54,62 @@ class B0GeometricDistortion(nn.Module):
             x: [B, C, D, H, W]
             b0_map: [B, 1, H, W] or [B, 1, D, H, W] (Hz)
 
-        forward method for B0GeometricDistortion.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            b0_map (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
         Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+            torch.Tensor: Distorted tensor, same shape as ``x``.
+        """
         if self.strength == 0:
             return x
 
         B, C, D, H, W = x.shape
-        device = x.device
 
-        # Ensure b0_map matches 3D shape if provided as 2D
         if b0_map.dim() == 4:  # [B, 1, H, W]
             b0_map = b0_map.unsqueeze(2).expand(-1, -1, D, -1, -1)
 
-        # Create identity grid
-        vectors = [torch.linspace(-1, 1, steps=s, device=device) for s in (D, H, W)]
-        grid = torch.stack(torch.meshgrid(vectors, indexing="ij"), dim=-1)  # [D, H, W, 3]
-        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)  # [B, D, H, W, 3]
-
-        # Calculate displacement
-        # Normalize strength relative to FOV (simple approx: strength is pixel shift)
-        # Grid range is [-1, 1], so 2 units = full FOV.
-        # Shift in normalized units = (pixels / size) * 2
-
-        size_dim = [D, H, W][self.readout_dim - 2]  # readout_dim 2->D? No.
-        # input is [B, C, D, H, W] -> dims 2, 3, 4
-        # grid is [D, H, W, 3] -> 0, 1, 2 (corresponding to Z, Y, X)
-
-        # Map readout_dim (2,3,4) to grid index (0,1,2)
-        grid_dim = self.readout_dim - 2
-
-        # B0 map is in Hz. We treat 'strength' as scaling factor to pixels.
-        # displacement (pixels) = b0 * strength
-        # displacement (grid) = (b0 * strength / size) * 2
-
-        disp_pixels = b0_map * self.strength
-        disp_grid = (disp_pixels / size_dim) * 2.0
-
-        # Add to grid
-        # grid[..., grid_dim] += disp_grid.squeeze(1)
-        # Note: grid is [..., 3], disp_grid is [B, 1, D, H, W]
-
-        # We need to broadcast carefully.
-        # grid: [B, D, H, W, 3]
-        # disp: [B, D, H, W] (after squeeze)
-
-        disp_grid = (
-            disp_grid.squeeze(1).permute(0, 2, 3, 4, 1)
-            if disp_grid.shape[1] > 1
-            else disp_grid.squeeze(1)
-        )
-        # Actually disp_grid is [B, 1, D, H, W] -> squeeze -> [B, D, H, W]
-
-        # Create full flow field [B, D, H, W, 3] initialized to 0
-        flow = torch.zeros_like(grid)
-        flow[..., grid_dim] = disp_grid
-
-        # Apply
-        new_grid = torch.clamp(grid + flow, -1, 1)
-
-        return F.grid_sample(
-            x, new_grid, mode="bilinear", padding_mode="reflection", align_corners=False
-        )
+        # Displacement channels are (dz, dy, dx): H -> 1, W -> 2. Border padding is the
+        # coordinate clamp to [-1, 1] the grid used before.
+        disp = torch.zeros(B, 3, D, H, W, device=x.device, dtype=x.dtype)
+        disp[:, self.shift_dim - 2] = b0_map.squeeze(1).to(x.dtype) * self.strength
+        return warp_volume(x, disp, padding_mode="border")
 
 
 class RandomB0Distortion(tio.Transform):
-    """
-    TorchIO wrapper for B0 Geometric Distortion.
+    """B0 off-resonance geometric distortion along the readout axis, as a TorchIO transform.
+
+    One field and one strength are drawn per subject and applied to every selected
+    image, so the ``image``/``input`` copies of a scan stay registered. Pass
+    ``exclude=("target", ...)`` to keep the clean reference undistorted: the warp is an
+    acquisition artefact of the degraded scan, not of the ground truth.
     """
 
-    def __init__(self, max_displacement: float = 2.0, p: float = 0.5, field_strength: float = 3.0):
-        """__init__.
-
-        Args:
-            max_displacement (float): Description.
-            p (float): Description.
-            field_strength (float): Description.
-        """
-        super().__init__(p=p)
+    def __init__(
+        self,
+        max_displacement: float = 2.0,
+        p: float = 0.5,
+        field_strength: float = 3.0,
+        **kwargs: Any,
+    ):
+        super().__init__(p=p, **kwargs)
         self.max_displacement = max_displacement
         self.simulator = B0MapSimulator(field_strength=field_strength)
-        self.distortion = B0GeometricDistortion(
-            strength=1.0
-        )  # Strength scaling handled dynamically
+        # Strength is applied per draw; shift_dim=4 shifts W.
+        self.distortion = B0GeometricDistortion(strength=1.0, shift_dim=4)
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
-        # Generate random B0 map
-        # Assume first image shape
-        """apply_transform.
-
-        Args:
-            subject (tio.Subject): Description.
-        Returns:
-            tio.Subject: Description.
-        """
-        shape = subject.shape[1:]  # [H, W, D] usually for TorchIO?
-        # TorchIO stores as [C, W, H, D] or [C, H, W, D]?
-        # TIO is (C, W, H, D) usually but let's check input tensor
-
-        # We will work on tensor data directly from 'input'
-        for image_name in subject.get_images_names():
-            image = subject[image_name]
-            data = image.data  # [C, W, H, D]
-
-            # Map generation expects [H, W] (2D) or we need 3D?
-            # B0MapSimulator is 2D. We can extrude or generate 2D.
-            # Let's generate 2D map matching H, W (dims 2, 1 in TIO W, H, D)
-
-            spatial_shape = data.shape[1:]  # W, H, D
-            h, w = spatial_shape[1], spatial_shape[0]
-
-            # Generate 2D map
-            device = data.device
-            b0_map = self.simulator.generate_smooth_b0((h, w), device=device)  # [1, 1, H, W]
-
-            # Random strength for this sample
-            strength = (torch.rand(1, device=device).item() * 2 - 1) * self.max_displacement
-
-            # Apply distortion
-            # We need to bridge [C, W, H, D] to [B, C, D, H, W] expected by B0GeometricDistortion
-            # TIO: W, H, D -> D, H, W for module
-
-            # Permute [C, W, H, D] -> [1, C, D, H, W]
-            tensor_in = data.permute(3, 2, 0, 1).unsqueeze(0)  # [D, H, W, C] -> wait
-            # data: [C, W, H, D]
-            # target: [1, C, D, H, W]
-            tensor_in = data.permute(0, 3, 2, 1).unsqueeze(0)  # [1, C, D, H, W]
-
-            # Adjust map to [1, 1, D, H, W] (extrude D)
-            # b0_map is [1, 1, H, W].
-
-            # Multiply map by strength before passing (per-sample dynamic strength).
-            b0_weighted = b0_map * strength
-
-            distorted = self.distortion(tensor_in.contiguous(), b0_weighted)
-
-            # Permute back: [1, C, D, H, W] -> [C, W, H, D]
-            tensor_out = distorted.squeeze(0).permute(0, 3, 2, 1)
-
-            image.set_data(tensor_out)
-
+        images = subject.get_images_dict(
+            intensity_only=False, include=self.include, exclude=self.exclude
+        )
+        if not images:
+            return subject
+        # TorchIO tensors are [C, W, H, D]; the distortion module takes [B, C, D, H, W].
+        first = next(iter(images.values())).data
+        w, h = first.shape[1], first.shape[2]
+        b0_map = self.simulator.generate_smooth_b0((h, w), device=first.device)  # [1, 1, H, W]
+        strength = (torch.rand(1, device=first.device) * 2 - 1) * self.max_displacement
+        b0_weighted = b0_map * strength
+        for image in images.values():
+            tensor_in = image.data.permute(0, 3, 2, 1).unsqueeze(0).contiguous()
+            distorted = self.distortion(tensor_in, b0_weighted)
+            image.set_data(distorted.squeeze(0).permute(0, 3, 2, 1))
         return subject
 
 
@@ -579,12 +490,7 @@ class ElasticDeformation3D(nn.Module):
         B, C, D, H, W = x.shape
         device = x.device
 
-        # 1. Create identity grid [-1, 1]
-        vectors = [torch.linspace(-1, 1, steps=s, device=device) for s in (D, H, W)]
-        grid = torch.stack(torch.meshgrid(vectors, indexing="ij"), dim=-1)  # [D, H, W, 3]
-        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)  # [B, D, H, W, 3]
-
-        # 2. Generate Gaussian flow field on low-res then upsample (Simulates sigma)
+        # 1. Generate Gaussian flow field on low-res then upsample (Simulates sigma)
         # Generating noise at full res and smoothing is slow.
         # Generating at low res and interpolating is equivalent to smoothing.
         scale_factor = 8  # Approximation of sigma smoothing
@@ -597,20 +503,13 @@ class ElasticDeformation3D(nn.Module):
         noise = torch.randn(B, 3, *small_shape, device=device) * self.alpha
         # Upsample noise to valid flow field
         flow = F.interpolate(noise, size=(D, H, W), mode="trilinear", align_corners=False)
-        flow = flow.permute(0, 2, 3, 4, 1)  # [B, D, H, W, 3]
 
-        # 3. Apply deformation
-        # grid_sample expects [B, D, H, W, 3] coordinates in range [-1, 1]
-        deformed_grid = torch.clamp(grid + flow, -1, 1)
-
-        # Reshape x for grid_sample (it processes all channels together)
-        return F.grid_sample(
-            x,
-            deformed_grid,
-            mode="bilinear",
-            padding_mode="reflection",
-            align_corners=False,
-        )
+        # 2. Apply deformation. The flow is in grid units with channels (x, y, z); warp_volume
+        # takes (dz, dy, dx) voxels, and border padding is the old clamp of the grid to [-1, 1].
+        flow = flow.to(x.dtype)
+        disp_px = torch.stack([flow[:, i] * ((n - 1) / 2.0) for i, n in enumerate((W, H, D))], 1)
+        disp_px = disp_px.flip(1)
+        return warp_volume(x, disp_px, padding_mode="border")
 
 
 class MultiContrastProcessor(nn.Module):

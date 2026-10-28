@@ -170,19 +170,20 @@ def distributed_rank() -> int | None:
     point: the four startup lines that used to print once per rank are all
     emitted before the process group exists.
 
-    ``RANK`` and ``WORLD_SIZE`` must BOTH be present. torchrun always sets them
-    together, and requiring both avoids mistaking an unrelated environment that
-    happens to export ``RANK`` for a distributed launch. ``LOCAL_RANK`` is a
-    fallback for launchers that set it alone (the same order
-    ``setup_distributed`` uses).
+    ``WORLD_SIZE`` must be present: torchrun always sets it with ``RANK``, and requiring it
+    avoids mistaking an unrelated environment that happens to export ``RANK`` for a
+    distributed launch. The rank itself comes from :func:`spectramr.core.topology.resolve_rank`,
+    the one rule ``setup_distributed`` and the run topology also use, so the console gate cannot
+    disagree with the process group about which process is rank 0.
     """
     if WORLD_SIZE not in os.environ:
         return None
-    if RANK in os.environ:
-        return as_int(RANK, 0)
-    if LOCAL_RANK in os.environ:
-        return as_int(LOCAL_RANK, 0)
-    return None
+    # Imported here, not at the top: this module is loaded to build the CLI parser, and the
+    # topology module pulls in the resource probes.
+    from spectramr.core.topology import resolve_rank
+
+    rank, _source = resolve_rank(os.environ)
+    return rank
 
 
 def is_secondary_rank() -> bool:

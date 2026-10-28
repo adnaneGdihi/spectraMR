@@ -9,11 +9,13 @@ contrasts of the same subject and negatives are different subjects.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from spectramr.core.module_utils import unwrap_model
 
 from .base import BaseTrainingStrategy
 from .mixins.utils import pick_present
@@ -23,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
     """Contrastive SSL on co-registered multi-contrast cohorts."""
+
+    # parallel_compat: The momentum encoder is a frozen copy of the inner generator, updated on
+    # every rank from the synchronised weights, so it needs no reduction.
+    parallel_compat = frozenset({"replicated"})
+    #: The momentum warm-up schedule reads ``_step``; a resume must continue it.
+    checkpointed_counters: ClassVar[tuple[str, ...]] = ("_step",)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -142,9 +150,17 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
             return
         from copy import deepcopy
 
-        self._target_encoder = deepcopy(gen)
+        # The inner module: a copy of a DDP wrapper carries its process group and prefixes
+        # every checkpoint key with ``module.``.
+        self._target_encoder = deepcopy(unwrap_model(gen))
         for p in self._target_encoder.parameters():
             p.requires_grad = False
+
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Rebuild the momentum encoder so its saved EMA weights load over it."""
+        super()._materialize_owned_state(state)
+        if "_target_encoder" in state.get("modules", {}):
+            self._ensure_momentum_encoder()
 
     @torch.no_grad()
     def _ema_update(self) -> None:
@@ -152,7 +168,8 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
         if gen is None or self._target_encoder is None:
             return
         m = self._momentum * min(1.0, self._step / max(1, self._warmup_steps))
-        for tgt, src in zip(self._target_encoder.parameters(), gen.parameters(), strict=False):
+        src_params = unwrap_model(gen).parameters()
+        for tgt, src in zip(self._target_encoder.parameters(), src_params, strict=False):
             tgt.mul_(m).add_(src, alpha=1 - m)
 
     @staticmethod

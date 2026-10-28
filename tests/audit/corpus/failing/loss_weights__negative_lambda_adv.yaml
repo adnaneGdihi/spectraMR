@@ -8,10 +8,17 @@
 # 'losses.gan.lambda_adv' this fixture declares below.
 
 # expect: registry
-#   'loss_weights' also names a DIFFERENT ConfigHealthChecker method
-#   (check_loss_weights, "all major reconstruction weights are 0.0") that
-#   would not fire on this violation, so this fixture stays registry-only to
-#   avoid colliding with that check's health-checker parametrisation.
+#   'loss_weights' used to name a SECOND owner as well: a ConfigHealthChecker
+#   method (check_loss_weights, "all major reconstruction weights are 0.0").
+#   That method was deleted in #1927 -- it read only the legacy
+#   losses.reconstruction.lambda_* surface, fired on 0 of 660 corpus arms, and
+#   false-positived on any arm that declared its objective through the domain
+#   lists while hand-zeroing that legacy surface. (The migration itself
+#   REMOVES those lines rather than zeroing them, and a removed key defaults
+#   to 10.0 -- so the check was silent on migrated arms, not wrong about
+#   them.) The name now has ONE owner: the
+#   ValidatorRegistry rule this fixture trips. The fixture stays registry-only
+#   because no health check enforces a lambda_adv range.
 
 config_version: '1.0'
 

@@ -40,7 +40,9 @@ from dataclasses import dataclass
 import torch
 import torchio as tio
 
+from spectramr.config.schemas.data import SUBJECT_PREFETCH_AUTO, validate_subject_prefetch
 from spectramr.core.worker_seeding import seed_worker
+from spectramr.data.builders.prefetching_queue import PrefetchingQueue, resolve_subject_prefetch
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +100,16 @@ class TorchIOQueueConfig:
         shuffle_patches_train: Whether to shuffle patches within queue
         shuffle_subjects_val: Whether to shuffle validation subjects
         shuffle_patches_val: Whether to shuffle validation patches
+
+        subject_prefetch: ``"auto"`` or an int >= 1 -- the train queue's subject
+            loader prefetch depth, resolved at build time against the clamped
+            worker count (``data.sampling.subject_prefetch``, #2673)
     """
 
     # Queue parameters
     queue_length: int = 256
     samples_per_volume: int = 16
+    subject_prefetch: int | str = SUBJECT_PREFETCH_AUTO
     dataset_type: str = "fastmri_kspace"
 
     # Sampling parameters
@@ -147,6 +154,8 @@ class TorchIOQueueConfig:
         if self.samples_per_volume <= 0:
             raise ValueError(f"samples_per_volume must be positive, got {self.samples_per_volume}")
 
+        validate_subject_prefetch(self.subject_prefetch)
+
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
 
@@ -186,6 +195,7 @@ class TorchIOQueueConfig:
             queue_length = config.sampling.queue_length
 
         patch_size = config.sampling.patch_size
+        subject_prefetch = config.sampling.subject_prefetch
         batch_size = config.loader.batch_size
         num_workers = config.loader.num_workers
 
@@ -242,6 +252,7 @@ class TorchIOQueueConfig:
             dataset_type=dataset_type,
             queue_length=queue_length,
             samples_per_volume=samples_per_volume,
+            subject_prefetch=subject_prefetch,
             patch_size=patch_size,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -281,6 +292,44 @@ def config_to_sampler_view(config):
         label_name=config.sampler_label_name,
         label_probabilities=config.sampler_label_probabilities,
         probability_map=config.sampler_probability_map,
+    )
+
+
+
+def _record_hwd(record: dict) -> tuple[int, int, int]:
+    """(H, W, depth) of an index record, whose ``shape`` layout depends on the file kind.
+
+    NIfTI manifests store ``[C, H, W, D]``; raw k-space indexes store ``[S, C, H, W]``
+    (slice-leading), where depth is the leading axis.
+    """
+    shape = record["shape"]
+    path = str(record.get("primary_path", ""))
+    if len(shape) == 4 and path.endswith((".nii", ".nii.gz")):
+        return shape[1], shape[2], shape[3]
+    return shape[-2], shape[-1], shape[0]
+
+
+def _subject_count(dataset) -> int | None:
+    """``len(dataset)``, or None for a streaming dataset whose length is not knowable."""
+    try:
+        return len(dataset)
+    except TypeError:
+        return None
+
+
+def _require_a_subject_fits(role: str, before: int | None, dataset, patch_size) -> None:
+    """Raise when the patch filter left ``role`` with no subject, naming the patch and the extents.
+
+    Without it the empty dataset reaches the sampler as ``num_samples=0``, which names neither
+    the patch nor the volumes that were too small for it.
+    """
+    if not before or _subject_count(dataset) != 0:
+        return
+    raise ValueError(
+        f"All {before} {role} subject(s) are smaller than patch_size={tuple(patch_size)} on at "
+        "least one axis, so none can be sampled. Declare a patch_size every volume covers "
+        "(see the [QUEUE] drop warning above for the per-run count), or drop the axis that "
+        "exceeds the data (a 1 on the depth axis makes the patch 2-D)."
     )
 
 
@@ -343,12 +392,11 @@ class TorchIOQueueBuilder:
             and len(index) == len(dataset)
             and all(isinstance(r, dict) and r.get("shape") and len(r["shape"]) >= 2 for r in index)
         ):
+            extents = [_record_hwd(r) for r in index]
             keep_idx = [
                 i
-                for i, r in enumerate(index)
-                if r["shape"][-2] >= ph
-                and r["shape"][-1] >= pw
-                and (pd <= 1 or r["shape"][0] >= pd)
+                for i, (h, w, d) in enumerate(extents)
+                if h >= ph and w >= pw and (pd <= 1 or d >= pd)
             ]
             dropped = len(index) - len(keep_idx)
             if dropped:
@@ -424,10 +472,12 @@ class TorchIOQueueBuilder:
         # F10/E35: pre-filter subjects whose spatial extent is too small
         # for the configured patch_size. Prevents the downstream
         # zero-depth ``5D target_batch has a zero-sized dim`` crash.
+        n_train = _subject_count(train_dataset)
         train_dataset = TorchIOQueueBuilder._filter_patch_compatible_subjects(
             train_dataset,
             config.patch_size,
         )
+        _require_a_subject_fits("train", n_train, train_dataset, config.patch_size)
 
         # =====================================================================
         # 1. Create Queue with patch sampling
@@ -481,7 +531,21 @@ class TorchIOQueueBuilder:
             )
 
         _require_dry_iter(train_dataset, "train")
-        train_queue = tio.Queue(
+        # Resolved here, not in from_training_config: the director overwrites
+        # num_workers with the topology-clamped count after that call.
+        subject_prefetch = resolve_subject_prefetch(
+            config.subject_prefetch,
+            queue_length=config.queue_length,
+            samples_per_volume=config.samples_per_volume,
+            num_workers=effective_workers,
+        )
+        logger.info(
+            f"[QUEUE] Train queue subject prefetch: declared={config.subject_prefetch!r}, "
+            f"resolved={subject_prefetch} per worker x {effective_workers} worker(s) "
+            f"(queue_length={config.queue_length}, "
+            f"samples_per_volume={config.samples_per_volume}; None = main-process loading)"
+        )
+        train_queue = PrefetchingQueue(
             subjects_dataset=train_dataset,
             max_length=config.queue_length,
             samples_per_volume=config.samples_per_volume,
@@ -489,6 +553,7 @@ class TorchIOQueueBuilder:
             num_workers=effective_workers,
             shuffle_subjects=config.shuffle_subjects_train,
             shuffle_patches=config.shuffle_patches_train,
+            subject_prefetch=subject_prefetch,
         )
 
         logger.debug(f"[QUEUE] Created training queue with {config.queue_length} max patches")
@@ -589,10 +654,12 @@ class TorchIOQueueBuilder:
             # subjects are valid there; filtering them dropped legitimate
             # validation volumes (and crashed with 'Subjects list is empty'
             # when every val volume was smaller than the train patch_size).
+            n_val = _subject_count(val_dataset)
             val_dataset = TorchIOQueueBuilder._filter_patch_compatible_subjects(
                 val_dataset,
                 config.patch_size,
             )
+            _require_a_subject_fits("validation", n_val, val_dataset, config.patch_size)
 
             logger.debug(
                 f"[QUEUE] Building validation queue (queue-based strategy): "

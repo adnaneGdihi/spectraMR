@@ -94,7 +94,7 @@ def test_noise_std_non_negative() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Frozen + extra='ignore'
+# Frozen + extra='forbid'
 # ---------------------------------------------------------------------------
 
 
@@ -105,10 +105,17 @@ def test_schema_is_frozen() -> None:
         cfg.enabled = True
 
 
-def test_extra_fields_silently_ignored() -> None:
-    """Unknown fields don't raise (``extra='ignore'``)."""
-    cfg = AugmentationConfigSchema(legacy_alias=42)
-    assert cfg.enabled is False
+@pytest.mark.parametrize("typo", ["enable_flipp", "random_rotation_degrees", "p"])
+def test_unknown_keys_raise(typo: str) -> None:
+    """A misspelled or legacy flag raises instead of training without that augmentation."""
+    with pytest.raises(ValidationError, match=typo):
+        AugmentationConfigSchema(enabled=True, **{typo: True})
+
+
+def test_renamed_custom_transforms_keeps_its_own_message() -> None:
+    """The RENAMES record still answers first, naming the canonical home."""
+    with pytest.raises(ValueError, match=r"processing\.transforms"):
+        AugmentationConfigSchema(custom_transforms=[{"name": "x"}])
 
 
 # ---------------------------------------------------------------------------

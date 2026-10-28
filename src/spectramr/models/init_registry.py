@@ -176,12 +176,6 @@ def populate_model_registry(*, force: bool = False) -> None:
         # and was deleted as part of the same triage — the
         # `physics_informed_unet` name had no consumers in experiments/.
         "spectramr.models.gans",
-        # Added 2026-05-22: prior-method baseline adapters
-        # (baselines/{cdiffmr,shen2024,fdb}.py register cdiffmr_baseline /
-        # shen2024_baseline / fdb_baseline). Without this entry the real
-        # BaselineAdapter impls never registered and stale _BackboneAlias
-        # stubs in _v6_1_registrations.py shadowed the names.
-        "spectramr.models.baselines",
         # Added 2026-05-22: packages whose @register_model decorators never
         # fired during population, so the names were advertised (schemas /
         # validation_constants) but un-resolvable at build time. The framework

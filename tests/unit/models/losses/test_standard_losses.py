@@ -188,3 +188,60 @@ def test_standard_losses_registered() -> None:
     names = list_available()
     for canonical in ["l1", "l2", "smooth_l1", "bce", "bce_with_logits", "cross_entropy", "tv"]:
         assert canonical in names, f"{canonical} missing"
+
+
+def _reference_tv_4d(x: torch.Tensor) -> torch.Tensor:
+    """The two-axis formula this loss has always computed on ``[B, C, H, W]``."""
+    count_h = x.size(1) * (x.size(2) - 1) * x.size(3)
+    count_w = x.size(1) * x.size(2) * (x.size(3) - 1)
+    h_tv = (x[:, :, 1:, :] - x[:, :, :-1, :]).pow(2).sum()
+    w_tv = (x[:, :, :, 1:] - x[:, :, :, :-1]).pow(2).sum()
+    return 2 * (h_tv / count_h + w_tv / count_w) / x.size(0)
+
+
+def test_total_variation_4d_matches_the_two_axis_formula_exactly() -> None:
+    torch.manual_seed(1)
+    x = torch.randn(3, 2, 7, 9)
+    assert torch.equal(TotalVariationLoss()(x), _reference_tv_4d(x))
+
+
+def test_total_variation_5d_sees_variation_along_the_last_axis() -> None:
+    """On ``[B, C, D, H, W]`` the old code differenced D and H only and never W."""
+    x = torch.zeros(1, 1, 4, 4, 4)
+    x[..., ::2] = 1.0
+    assert TotalVariationLoss()(x).item() == pytest.approx(2.0)
+
+
+def test_total_variation_5d_treats_every_spatial_axis_alike() -> None:
+    torch.manual_seed(2)
+    x = torch.randn(2, 1, 5, 6, 7)
+    permuted = x.permute(0, 1, 4, 3, 2).contiguous()
+    torch.testing.assert_close(TotalVariationLoss()(x), TotalVariationLoss()(permuted))
+
+
+def test_total_variation_skips_a_unit_axis_instead_of_dividing_by_zero() -> None:
+    x = torch.randn(2, 1, 8, 1, requires_grad=True)
+    out = TotalVariationLoss()(x)
+    assert torch.isfinite(out)
+    (grad,) = torch.autograd.grad(out, x)
+    assert torch.isfinite(grad).all()
+
+
+def test_total_variation_refuses_a_tensor_with_no_spatial_axis() -> None:
+    with pytest.raises(ValueError, match="spatial"):
+        TotalVariationLoss()(torch.randn(2, 3))
+
+
+@pytest.mark.parametrize("cls", [L1Loss, MSELoss])
+def test_an_unknown_reduction_is_refused_at_construction(cls: type) -> None:
+    """The complex branch used to return the unreduced tensor for any unknown string."""
+    with pytest.raises(ValueError, match="reduction"):
+        cls(reduction="batchmean")
+
+
+@pytest.mark.parametrize("cls", [L1Loss, MSELoss])
+@pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
+def test_the_supported_reductions_still_construct(cls: type, reduction: str) -> None:
+    a = torch.randn(2, 3, dtype=torch.complex64)
+    out = cls(reduction=reduction)(a, a.conj())
+    assert out.shape == (() if reduction != "none" else (2, 3))

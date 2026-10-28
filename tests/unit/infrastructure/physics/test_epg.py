@@ -29,6 +29,25 @@ from spectramr.infrastructure.physics.epg import (
 # ---------------------------------------------------------------------------
 
 
+def test_a_per_row_echo_spacing_equals_each_rows_scalar_spacing() -> None:
+    """The protocol render and the surrogate fit pass one spacing per row as a tensor."""
+    rho = torch.full((2, 1, 2, 2), 0.8)
+    t1, t2 = torch.full_like(rho, 900.0), torch.full_like(rho, 70.0)
+    fa = {"excitation_fa": torch.full_like(rho, 90.0), "refocusing_fa": torch.full_like(rho, 180.0)}
+    spacing = torch.tensor([2.3, 16.0]).view(2, 1, 1, 1)
+    both = simulate_differentiable_epg_fse(rho, t1, t2, **fa, te_spacing=spacing)
+    for row, s in enumerate((2.3, 16.0)):
+        one = simulate_differentiable_epg_fse(
+            rho[row : row + 1],
+            t1[row : row + 1],
+            t2[row : row + 1],
+            excitation_fa=fa["excitation_fa"][row : row + 1],
+            refocusing_fa=fa["refocusing_fa"][row : row + 1],
+            te_spacing=s,
+        )
+        assert torch.allclose(both[row : row + 1], one)
+
+
 def test_diff_epg_zero_pd_yields_zero_signal() -> None:
     """PD = 0 → output is zero."""
     rho = torch.zeros(1, 1, 4, 4)

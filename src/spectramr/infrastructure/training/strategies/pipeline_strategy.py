@@ -35,9 +35,11 @@ from spectramr.config.schemas.training.pipeline import (
     TrainingStateSchema,
 )
 from spectramr.config.settings import TrainingSettings
+from spectramr.infrastructure.checkpointing.restore import CheckpointPartMissingError, weights
 from spectramr.infrastructure.services.metric_keys import resolve_metric_key
 from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
 from spectramr.infrastructure.training.optimizer_registry import create_optimizer
+from spectramr.infrastructure.training.strategies import pipeline_stage_state
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.lora import inject_lora_adapters
 
@@ -59,6 +61,10 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
         _finetune_epoch: Epoch at which all stages are unfrozen.
     """
 
+    # parallel_compat: Holds the stage models outside env.models, freezes them mid-run and builds
+    # its own per-stage optimizers.
+    parallel_compat = frozenset()
+
     def __init__(
         self,
         env: Any,
@@ -66,7 +72,8 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     # ------------------------------------------------------------------
     # Setup
@@ -83,7 +90,7 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
             model = self._create_stage_model(stage_cfg)
 
             if stage_cfg.checkpoint_path:
-                self._load_stage_weights(model, stage_cfg.checkpoint_path)
+                self._load_stage_weights(model, stage_cfg.checkpoint_path, stage_cfg.name)
 
             self._apply_training_state(model, stage_cfg.training_state, stage_cfg.name)
 
@@ -143,6 +150,14 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
 
     def _create_stage_model(self, stage_cfg: MultiStageSchema) -> nn.Module:
         """Create a model via GeneratorBuilder with per-stage overrides."""
+        # Only the training ModelBuilder loads a stage-1 VAE; a stage would silently
+        # train in a random latent space (NN3/NN8).
+        if "vae_checkpoint_path" in (stage_cfg.model_kwargs or {}):
+            raise ValueError(
+                f"stage '{stage_cfg.name}' sets model_kwargs.vae_checkpoint_path, but "
+                "multi-stage stages do not load a stage-1 VAE. Use a single-stage LDM "
+                "arm, or load the trained stage through the stage's checkpoint_path."
+            )
         from spectramr.infrastructure.builders.leaf.model_builders import GeneratorBuilder
 
         in_ch = stage_cfg.in_channels or self.config.model.in_channels
@@ -161,25 +176,13 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
 
         return builder.validate().build()
 
-    def _load_stage_weights(self, model: nn.Module, checkpoint_path: str) -> None:
-        """Load pre-trained weights (.safetensors or .pt)."""
+    def _load_stage_weights(self, model: nn.Module, checkpoint_path: str, stage_name: str) -> None:
+        """A stage's own ``stage:<name>`` part when the file has one, else its generator."""
         try:
-            if checkpoint_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
-
-                state_dict = load_file(checkpoint_path, device=str(self.device))
-            else:
-                state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-                if isinstance(state, dict):
-                    state_dict = (
-                        state.get("model_state_dict")
-                        or state.get("generator")
-                        or state.get("state_dict")
-                        or state
-                    )
-                else:
-                    state_dict = state
-            model.load_state_dict(state_dict, strict=False)
+            try:
+                weights(checkpoint_path, f"stage:{stage_name}", model, policy="overlap")
+            except CheckpointPartMissingError:
+                weights(checkpoint_path, "generator", model, policy="overlap")
             logger.info("[Multi] Loaded weights from '%s'", checkpoint_path)
         except Exception as e:
             raise RuntimeError(f"Failed to load checkpoint '{checkpoint_path}': {e}") from e
@@ -686,6 +689,8 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
             # dedups against existing groups, so this only adds the new ones.
             self._register_global_params()
             self._all_unfrozen = True
+            # The unfreeze released every stage, early-stopped ones included.
+            self._es_frozen: set[str] = set()
 
     def on_epoch_end(self, epoch: int, metrics: dict[str, float]) -> None:
         """Check per-stage early stopping conditions.
@@ -770,6 +775,7 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
                 model = self.multi_stages[stage_name]
                 for param in model.parameters():
                     param.requires_grad = False
+                self._es_frozen = {*getattr(self, "_es_frozen", ()), stage_name}
                 self._trainable_params = self._collect_trainable_params()
             elif wait > 0:
                 logger.info(
@@ -791,6 +797,31 @@ class MultiTrainingStrategy(BaseTrainingStrategy):
     @_all_unfrozen.setter
     def _all_unfrozen(self, value: bool) -> None:
         self._has_unfrozen_all = value
+
+    # ------------------------------------------------------------------
+    # Checkpoint state (#2962): the stages are models, the rest a strategy entry
+    # ------------------------------------------------------------------
+
+    def checkpoint_models(self) -> dict[str, nn.Module]:
+        return pipeline_stage_state.stage_models(self)
+
+    def strategy_state_dict(self) -> dict[str, Any]:
+        state = super().strategy_state_dict()
+        state[pipeline_stage_state.PIPELINE_KEY] = pipeline_stage_state.capture_pipeline_state(self)
+        return state
+
+    def check_strategy_state(self, state: dict[str, Any] | None) -> None:
+        entry = (state or {}).get(pipeline_stage_state.PIPELINE_KEY)
+        pipeline_stage_state.check_pipeline_state(self, entry)
+
+    def load_strategy_state_dict(
+        self, state: dict[str, Any] | None, *, load_optimizer: bool = True
+    ) -> None:
+        self.check_strategy_state(state)
+        super().load_strategy_state_dict(state, load_optimizer=load_optimizer)
+        # check_strategy_state refused a None state above.
+        entry = cast("dict[str, Any]", state)[pipeline_stage_state.PIPELINE_KEY]
+        pipeline_stage_state.restore_pipeline_state(self, entry, load_optimizer=load_optimizer)
 
     # ------------------------------------------------------------------
     # Per-stage framework integration (LossBuilder, Optimizers)

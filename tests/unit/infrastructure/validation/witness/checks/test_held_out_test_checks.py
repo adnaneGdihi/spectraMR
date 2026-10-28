@@ -13,6 +13,7 @@ from spectramr.infrastructure.validation.witness.checks.held_out_test_checks imp
     declares_held_out_test,
     held_out_test_declared,
     held_out_test_split_disjoint,
+    paired_route_holdout_site,
 )
 from spectramr.infrastructure.validation.witness.registry import Severity, get_witness_registry
 from spectramr.infrastructure.validation.witness.subject import WitnessSubject
@@ -36,7 +37,11 @@ def test_baseline_without_a_test_set_is_flagged_as_advisory() -> None:
 
 @pytest.mark.parametrize(
     "data",
-    [{"source": {"test_index_path": "test.json"}}, {"enable_test_split": True}],
+    [
+        {"source": {"test_index_path": "test.json"}},
+        {"source": {"paired_manifest_path": "m.json"}, "enable_test_split": True},
+        {"source": {"paired_manifest_path": "m.json"}, "split": {"test_subjects": ["07"]}},
+    ],
 )
 def test_baseline_with_a_test_set_passes(data) -> None:
     assert held_out_test_declared(_raw("baseline", data)).passed is True
@@ -58,9 +63,38 @@ def test_role_is_read_from_metadata_top_level_too() -> None:
 
 def test_declares_held_out_test_predicate() -> None:
     assert declares_held_out_test({"source": {"test_index_path": "t.json"}})
-    assert declares_held_out_test({"enable_test_split": True})
+    # enable_test_split with no route has no test loader (the schema refuses it at load).
+    assert not declares_held_out_test({"enable_test_split": True})
     assert not declares_held_out_test({"source": {"index_path": "a.json"}})
     assert not declares_held_out_test("not a dict")
+
+
+def _typed(data: dict) -> SimpleNamespace:
+    source = SimpleNamespace(**{"test_index_path": None, "paired_manifest_path": None, **data.get("source", {})})
+    split = SimpleNamespace(**{"test_subjects": [], **data.get("split", {})})
+    return SimpleNamespace(
+        data=SimpleNamespace(
+            source=source, split=split, enable_test_split=data.get("enable_test_split", False)
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"enable_test_split": True},
+        {"source": {"test_index_path": "t.json"}},
+        {"source": {"paired_manifest_path": "m.json"}},
+        {"source": {"paired_manifest_path": "m.json"}, "enable_test_split": True},
+        {"source": {"paired_manifest_path": "m.json"}, "split": {"test_subjects": ["07"]}},
+    ],
+)
+def test_witness_and_loader_agree_on_what_declares_a_test_set(data) -> None:
+    """One predicate: the audit's raw-dict view and the loaders' typed view never disagree."""
+    from spectramr.infrastructure.builders.directors.test_split import declares_test_set
+
+    assert declares_held_out_test(data) is declares_test_set(_typed(data))
 
 
 # --- held_out_test_split_disjoint (error) ----------------------------------------
@@ -124,3 +158,46 @@ def test_both_witnesses_are_registered_after_discovery() -> None:
     registry = get_witness_registry()
     assert registry.get("held_out_test_declared") is not None
     assert registry.get("held_out_test_split_disjoint") is not None
+
+
+# --- paired_route_holdout_site (error) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "split",
+    [
+        {"type": "loso", "holdout_site": ["sub-0001", "sub-0002"]},  # the 46-arm corpus shape
+        {"type": "loso", "holdout_site": ["0046", "0048"]},  # bare manifest-form ids
+        {"type": "loso", "holdout_site": "sub-0046"},  # scalar string
+        {"type": "random", "validation_fraction": 0.2, "holdout_site": ["0001"]},
+        {"type": "auto", "holdout_site": "siteA"},  # a real site id raises on this route too
+    ],
+)
+def test_holdout_site_on_a_paired_manifest_is_an_error(split) -> None:
+    data = {"source": {"paired_manifest_path": "m.json"}, "split": split}
+    verdict = paired_route_holdout_site(_raw(None, data))
+    assert verdict.passed is False
+    assert verdict.severity is Severity.ERROR
+    assert "holdout_site" in verdict.message
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "source": {"index_path": "i.json"},
+            "split": {"type": "loso", "holdout_site": "site_1.5T"},
+        },
+        {"source": {"paired_manifest_path": "m.json"}, "split": {"type": "random"}},
+        {"source": {"paired_manifest_path": "m.json"}, "split": {"holdout_site": None}},
+        {},
+    ],
+)
+def test_site_route_and_config_owned_paired_splits_pass(data) -> None:
+    assert paired_route_holdout_site(_raw(None, data)).passed is True
+
+
+def test_paired_route_holdout_site_is_registered_as_an_error() -> None:
+    spec = get_witness_registry().get("paired_route_holdout_site")
+    assert spec is not None
+    assert spec.severity is Severity.ERROR

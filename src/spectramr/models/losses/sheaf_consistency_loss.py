@@ -99,6 +99,15 @@ class SheafConsistencyLoss(nn.Module):
         v = u + 1
         return torch.stack([u, v], dim=1)
 
+    @staticmethod
+    def _pixelwise_edges(
+        batch: int, num_cells: int, stalk: int, device: torch.device
+    ) -> torch.Tensor:
+        """Path edges ``(b, c, p) -- (b, c + 1, p)`` over flattened ``(B*C*n)`` vertices."""
+        idx = torch.arange(batch * num_cells * stalk, device=device).view(batch, num_cells, stalk)
+        u = idx[:, :-1, :].reshape(-1)
+        return torch.stack([u, u + stalk], dim=1)
+
     def forward(
         self,
         prediction: torch.Tensor,
@@ -119,35 +128,32 @@ class SheafConsistencyLoss(nn.Module):
         pred_flat = prediction.reshape(batch, num_cells, -1)
         tgt_flat = target.reshape(batch, num_cells, -1)
         stalk = pred_flat.shape[-1]
+        num_edges = self._path_edges(num_cells, prediction.device).shape[0]
 
-        edges = self._path_edges(num_cells, prediction.device)
-        num_edges = edges.shape[0]
-        # Identity restriction maps F_{u<=e} = F_{v<=e} = I_n: the agreement
-        # sheaf. (E, n, n) per edge.
-        eye = torch.eye(stalk, dtype=prediction.dtype, device=prediction.device)
-        restriction = eye.unsqueeze(0).expand(num_edges, stalk, stalk)
+        # Every per-sample term enters the reduction linearly, so the batch sum of
+        # each term is what is needed.
+        total = prediction.new_zeros(())
+        if self.laplacian_weight > 0 and num_edges > 0:
+            # The identity-restriction sheaf on stalk R^n is the direct sum of n
+            # stalk-1 sheaves on the same path graph, so one stalk-1 call carries
+            # the quadratic form without the (E, n, n) identity maps (17 GB at 256^2).
+            edges = self._pixelwise_edges(batch, num_cells, stalk, prediction.device)
+            unit = prediction.new_ones(1, 1, 1).expand(edges.shape[0], 1, 1)
+            lap = sheaf_laplacian_quadratic_form(pred_flat.reshape(-1, 1), edges, unit, unit)
+            total = total + self.laplacian_weight * (lap / (num_edges * stalk))
 
-        per_sample = prediction.new_zeros(batch)
-        for b in range(batch):
-            # --- Sheaf-Laplacian energy of the prediction (= 0 iff global
-            #     section, i.e. all cover cells agree). ---
-            if self.laplacian_weight > 0 and num_edges > 0:
-                lap = sheaf_laplacian_quadratic_form(pred_flat[b], edges, restriction, restriction)
-                # Normalise by edges*stalk so the energy is a mean disagreement.
-                per_sample[b] = per_sample[b] + self.laplacian_weight * (lap / (num_edges * stalk))
-
-            # --- Mayer-Vietoris obstruction between prediction and target on a
-            #     two-patch cover (whole-section overlap). Zero iff they agree. ---
-            if self.obstruction_weight > 0:
+        # Mayer-Vietoris obstruction between prediction and target on a two-patch
+        # cover (whole-section overlap). Zero iff they agree.
+        if self.obstruction_weight > 0:
+            section_len = num_cells * stalk
+            for b in range(batch):
                 pred_section = pred_flat[b].reshape(-1)
                 tgt_section = tgt_flat[b].reshape(-1)
                 obstruction = mayer_vietoris_obstruction_norm(
                     pred_section, tgt_section, pred_section, tgt_section
                 )
-                per_sample[b] = per_sample[b] + self.obstruction_weight * (
-                    obstruction / pred_section.shape[0]
-                )
+                total = total + self.obstruction_weight * (obstruction / section_len)
 
         if self.reduction == "mean":
-            return per_sample.mean()
-        return per_sample.sum()
+            return total / batch
+        return total

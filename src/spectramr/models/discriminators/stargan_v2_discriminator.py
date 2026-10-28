@@ -107,6 +107,7 @@ class _DownBlock(nn.Module):
 
 
 @register_model(
+    role="discriminator",
     name="stargan_v2_discriminator",
     training_mode="stargan_v2",
     spatial_dims=(2,),

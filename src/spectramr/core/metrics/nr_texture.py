@@ -39,7 +39,7 @@ from itertools import pairwise
 from typing import Any
 
 import torch
-import torch.nn.functional as F  # noqa: N812 - universal PyTorch idiom
+import torch.nn.functional as F
 
 from spectramr.core.metrics.context import MetricContext, resolve_context
 from spectramr.core.metrics.hallucination_metrics import _to_magnitude

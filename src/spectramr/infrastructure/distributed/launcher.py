@@ -30,6 +30,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _free_port() -> int:
+    """A currently unused TCP port, so two jobs on one node do not share a rendezvous."""
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _init_process_group(rank: int, world_size: int, backend: str) -> None:
     if torch.distributed.is_initialized():
         return
@@ -54,9 +63,11 @@ def _spawn_worker(
     settings: Any,
 ) -> None:
     try:
-        _init_process_group(rank, world_size, backend)
+        # Select the device BEFORE creating the group, so NCCL binds this rank's GPU
+        # rather than whatever the current context happens to be.
         if torch.cuda.is_available():
             torch.cuda.set_device(rank % torch.cuda.device_count())
+        _init_process_group(rank, world_size, backend)
         run_fn(rank=rank, world_size=world_size, settings=settings)
     finally:
         _destroy_process_group()
@@ -89,6 +100,9 @@ def launch_distributed(
         # Single-node, multi-GPU — spawn workers locally.
         import torch.multiprocessing as mp
 
+        # Workers inherit the environment under spawn. A fixed default port made
+        # two concurrent jobs on one node fight over the same rendezvous.
+        os.environ.setdefault("MASTER_PORT", str(_free_port()))
         mp.spawn(
             _spawn_worker,
             args=(world_size, backend, run_fn, settings),
@@ -113,7 +127,8 @@ def launch_distributed(
     nnodes = num_nodes
     return (
         f"torchrun --nproc_per_node={nproc} --nnodes={nnodes} "
-        f"--rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 "
+        f"--rdzv_id=${{SLURM_JOB_ID:-spectramr}} "
+        f"--rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:${{MASTER_PORT:-29500}} "
         f"-m spectramr.cli train-distributed --config $CONFIG_PATH"
     )
 

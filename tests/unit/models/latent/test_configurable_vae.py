@@ -80,3 +80,26 @@ def test_usage_md_documented_symbols_import_cleanly() -> None:
     from spectramr.models.latent.configurable_vae import (  # noqa: F401
         create_configurable_vae as _ccv,
     )
+
+
+# --- #801: the VAE is an nn.Module and its encoder/decoder register ----------
+
+
+def test_the_vae_is_an_nn_module() -> None:
+    """It implemented ``IGenerator`` only, which carries no ``nn.Module``."""
+    from torch import nn
+
+    assert issubclass(ConfigurableVAE, nn.Module)
+    assert ConfigurableVAE.__call__ is nn.Module.__call__
+
+
+def test_encoder_and_decoder_register_so_the_vae_can_be_trained() -> None:
+    """Both halves were plain attributes, so ``parameters()`` was empty."""
+    vae = ConfigurableVAE.from_presets("simple")
+    children = dict(vae.named_children())
+    assert "encoder" in children
+    assert "decoder" in children
+    assert sum(1 for _ in vae.parameters()) > 0
+    keys = vae.state_dict()
+    assert any(k.startswith("encoder.") for k in keys)
+    assert any(k.startswith("decoder.") for k in keys)

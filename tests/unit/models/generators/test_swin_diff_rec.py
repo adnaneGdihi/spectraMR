@@ -181,3 +181,48 @@ def test_accepts_input_smaller_than_the_constructed_image_size(fed):
     with torch.no_grad():
         out = model(x, t)
     assert out.shape[-2:] == (fed, fed)
+
+
+@pytest.mark.parametrize("scale", ["unit_interval", "integer"])
+def test_forward_passes_the_timestep_scale_to_the_sinusoid(scale):
+    """A dropped ``timestep_scale`` would keep the dividing form on every arm (#2315)."""
+    from unittest import mock
+
+    import spectramr.models.generators.swin_diff_rec as mod
+
+    seen = []
+    real = mod.sinusoidal_timestep_embedding
+
+    def spy(t, dim, *, max_timesteps=None, scale="unit_interval"):
+        seen.append(scale)
+        return real(t, dim, max_timesteps=max_timesteps, scale=scale)
+
+    net = _tiny().eval()
+    with mock.patch.object(mod, "sinusoidal_timestep_embedding", spy), torch.no_grad():
+        net(torch.randn(1, 2, 32, 32), torch.tensor([3]), max_timesteps=29.0, timestep_scale=scale)
+    assert seen == [scale]
+
+
+class TestContrastEmbeddingBatch:
+    """Exactly one contrast row per sample; a truncated batch or a broadcast row raises."""
+
+    def test_contrast_batch_larger_than_the_timestep_batch_raises(self) -> None:
+        net = _tiny().eval()
+        with pytest.raises(ValueError, match="contrast_emb batch 3"), torch.no_grad():
+            net(torch.randn(2, 2, 32, 32), torch.tensor([1, 2]), contrast_emb=torch.randn(3, 32))
+
+    @pytest.mark.parametrize(("rows", "t_rows"), [(1, 2), (2, 3)])
+    def test_a_broadcast_row_or_a_larger_timestep_batch_raises(self, rows, t_rows) -> None:
+        """A single row used to broadcast onto every sample (#2055)."""
+        net = _tiny().eval()
+        x = torch.randn(t_rows, 2, 32, 32)
+        with pytest.raises(ValueError, match=f"contrast_emb batch {rows}"), torch.no_grad():
+            net(x, torch.arange(1, t_rows + 1), contrast_emb=torch.randn(rows, 32))
+
+    @pytest.mark.parametrize("rows", [2])
+    def test_per_sample_rows_pass(self, rows) -> None:
+        net = _tiny().eval()
+        x = torch.randn(2, 2, 32, 32)
+        with torch.no_grad():
+            out = net(x, torch.tensor([1, 2]), contrast_emb=torch.randn(rows, 32))
+        assert out.shape == x.shape

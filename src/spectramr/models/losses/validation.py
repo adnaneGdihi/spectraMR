@@ -11,14 +11,12 @@ silent dimension mismatches and gradient instability.
 import functools
 import logging
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any
 
 import torch
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
-
-F = TypeVar("F", bound=Callable)
 
 
 def _strip_trailing_singletons(t: Tensor, min_ndim: int = 3) -> Tensor:
@@ -37,7 +35,7 @@ def _strip_trailing_singletons(t: Tensor, min_ndim: int = 3) -> Tensor:
     return t
 
 
-def validate_loss_inputs(forward_method: F) -> F:
+def validate_loss_inputs[F: Callable[..., Any]](forward_method: F) -> F:
     """Decorator to validate loss function inputs.
 
     Wraps a loss forward method with automatic shape and device validation.
@@ -57,27 +55,11 @@ def validate_loss_inputs(forward_method: F) -> F:
     """
 
     @functools.wraps(forward_method)
-    def wrapper(self, pred: Tensor, target: Tensor, *args, **kwargs) -> Tensor:
-        # Shape validation
-        """wrapper.
-
-        Args:
-            pred (Tensor): Description.
-            target (Tensor): Description.
-        Returns:
-            Tensor: Description.
-        """
-        # F34 / 2026-05-22 — TorchIO wraps 1-D/2-D data with trailing
-        # singleton axes (``[B, C, L, 1, 1]`` for 1-D PDE benchmarks,
-        # ``[B, C, H, W, 1]`` for 2-D). Shape-rigid operators (cs_mno_*)
-        # squeeze those trailing size-1 axes from their INPUT, so the model
-        # output is ``[B, C, L]`` while the raw target keeps ``[B, C, L, 1, 1]``.
-        # The loss then shape-checked them as a mismatch and raised — crashing
-        # cs_mno_burgers / cs_mno_darcy at train step 1. Stripping trailing
-        # size-1 axes is numel-preserving normalisation (NOT coercion of a real
-        # mismatch — every elementwise loss is invariant to trailing unit
-        # dims), and mirrors the model's own input canonicalisation. A genuine
-        # extent mismatch still fails loudly below.
+    def wrapper(self: Any, pred: Tensor, target: Tensor, *args: Any, **kwargs: Any) -> Any:
+        """Shape/device-check ``pred`` and ``target``, then call the wrapped forward."""
+        # TorchIO pads 1-D/2-D data with trailing unit axes that shape-rigid models
+        # squeeze from their input; stripping them is numel-preserving, and a real
+        # extent mismatch still raises below.
         pred = _strip_trailing_singletons(pred)
         target = _strip_trailing_singletons(target)
         if pred.shape != target.shape:
@@ -130,7 +112,7 @@ def validate_loss_inputs(forward_method: F) -> F:
 
         return result
 
-    return wrapper  # type: ignore
+    return wrapper  # type: ignore[return-value]
 
 
 def assert_same_shape(

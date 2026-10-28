@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from spectramr.config.schemas.data import DataPairingConfigSchema
 from tests.utils.data_config_stub import DataConfigStub
 from unittest.mock import patch
 
@@ -260,9 +261,10 @@ class TestLoadPairedBidsManifest:
         p = _make_manifest_file(tmp_path, records)
         cfg = DataConfigStub(
             split=_split(),
-            allow_unpaired=True, bidirectional_mode="ulf_to_hf", contrasts=None,
+            allow_unpaired=False, bidirectional_mode="ulf_to_hf", contrasts=None,
             hf_resolution="highres",
         )
+        cfg.pairing = DataPairingConfigSchema(unpaired_training=True, hf_resolution="highres")
         result = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
         # sub-0002 (lowres) should be dropped; sub-0001 (highres) + sub-0003 (None) survive
         assert len(result) == 2
@@ -284,3 +286,107 @@ class TestLoadPairedBidsManifest:
         )
         result = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
         assert len(result) == 3
+
+
+@patch("spectramr.data.metadata.index_builder.PathResolver.resolve", side_effect=_no_op_resolve)
+class TestUnpairedTrainingKeepsOnlyTrainUnpaired:
+    def test_train_keeps_unpaired_val_stays_paired(self, mock_resolve, tmp_path):
+        records = [
+            _fake_record(sub="sub-0001", split_hint="train"),
+            _fake_record(sub="sub-0002", split_hint="train", target=None, pairing_status="unpaired_ulf"),
+            _fake_record(sub="sub-0003", split_hint="val"),
+            _fake_record(sub="sub-0004", split_hint="val", target=None, pairing_status="unpaired_ulf"),
+        ]
+        p = _make_manifest_file(tmp_path, records)
+        cfg = DataConfigStub(
+            split=_split(),
+            allow_unpaired=False,
+            bidirectional_mode="ulf_to_hf",
+            contrasts=None,
+            hf_resolution=None,
+        )
+        cfg.pairing = DataPairingConfigSchema(unpaired_training=True)
+        train = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
+        val = IndexBuilder.load_paired_bids_manifest(p, "val", cfg)
+        assert sorted(r["subject_id"] for r in train) == ["sub-0001", "sub-0002"]
+        assert [r["subject_id"] for r in val] == ["sub-0003"]
+
+    def test_default_drops_unpaired_from_train(self, mock_resolve, tmp_path):
+        records = [
+            _fake_record(sub="sub-0001", split_hint="train"),
+            _fake_record(sub="sub-0002", split_hint="train", target=None, pairing_status="unpaired_ulf"),
+        ]
+        p = _make_manifest_file(tmp_path, records)
+        cfg = DataConfigStub(
+            split=_split(),
+            allow_unpaired=False,
+            bidirectional_mode="ulf_to_hf",
+            contrasts=None,
+            hf_resolution=None,
+        )
+        train = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
+        assert [r["subject_id"] for r in train] == ["sub-0001"]
+
+
+@patch("spectramr.data.metadata.index_builder.PathResolver.resolve", side_effect=_no_op_resolve)
+class TestUnpairedAdmissionPerSplit:
+    """allow_unpaired never admits target-less records into train (identity-pair defect)."""
+
+    def _records(self):
+        return [
+            _fake_record(sub="sub-0001", split_hint="train"),
+            _fake_record(sub="sub-0002", split_hint="train", target=None, pairing_status="unpaired_ulf"),
+        ]
+
+    def test_allow_unpaired_alone_drops_unpaired_from_train(self, mock_resolve, tmp_path):
+        p = _make_manifest_file(tmp_path, self._records())
+        cfg = DataConfigStub(
+            split=_split(), allow_unpaired=True, bidirectional_mode="ulf_to_hf",
+            contrasts=None, hf_resolution=None,
+        )
+        train = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
+        assert [r["subject_id"] for r in train] == ["sub-0001"]
+
+    def test_unpaired_training_admits_unpaired_to_train_only(self, mock_resolve, tmp_path):
+        records = [
+            *self._records(),
+            _fake_record(sub="sub-0003", split_hint="val", target=None, pairing_status="unpaired_ulf"),
+        ]
+        p = _make_manifest_file(tmp_path, records)
+        cfg = DataConfigStub(
+            split=_split(), allow_unpaired=False, bidirectional_mode="ulf_to_hf",
+            contrasts=None, hf_resolution=None,
+        )
+        cfg.pairing = DataPairingConfigSchema(unpaired_training=True)
+        train = IndexBuilder.load_paired_bids_manifest(p, "train", cfg)
+        assert sorted(r["subject_id"] for r in train) == ["sub-0001", "sub-0002"]
+        val = IndexBuilder.load_paired_bids_manifest(p, "val", cfg)
+        assert val == []
+
+
+@patch("spectramr.data.metadata.index_builder.PathResolver.resolve", side_effect=_no_op_resolve)
+@patch("spectramr.data.builders.manifest_loader.PathResolver.resolve", side_effect=_no_op_resolve)
+def test_contrast_aware_route_admits_no_targetless_record(_m1, _m2, tmp_path):
+    """The contrast-aware route (`load_paired_nifti_splits`) filters target-less records
+    out of train and val, so the dataset's TargetlessSampleError never fires on a correct index."""
+    from spectramr.data.builders.manifest_loader import ManifestLoader
+
+    records = [
+        _fake_record(sub="sub-0001", split_hint="train"),
+        _fake_record(sub="sub-0002", split_hint="train", target=None, pairing_status="unpaired_ulf"),
+        _fake_record(sub="sub-0003", split_hint="val"),
+        _fake_record(sub="sub-0004", split_hint="val", target=None, pairing_status="unpaired_ulf"),
+    ]
+    p = _make_manifest_file(tmp_path, records)
+    from spectramr.config.schemas.data import DataSplitConfigSchema
+
+    cfg = DataConfigStub(
+        split=DataSplitConfigSchema(), allow_unpaired=False,
+        bidirectional_mode="ulf_to_hf", contrasts=None, hf_resolution=None,
+        enable_test_split=False,
+    )
+    cfg.source = cfg.source.model_copy(update={"paired_manifest_path": str(p)})
+    train, val = ManifestLoader.load_paired_nifti_splits(cfg)
+    assert [r["subject_id"] for r in train] == ["sub-0001"]
+    assert [r["subject_id"] for r in val] == ["sub-0003"]
+    assert all(r.get("target_path") for r in train + val)

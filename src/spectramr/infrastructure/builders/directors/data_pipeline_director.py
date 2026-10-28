@@ -7,6 +7,7 @@ Replaces the deprecated ConsolidatedDatasetFactory.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from torch.utils.data import DataLoader
@@ -53,11 +54,9 @@ def _self_indexed_dataset_types() -> frozenset[str]:
     ``build_dataloaders``, so a module-level comprehension would evaluate
     against an empty dict and silently restore the drift it exists to remove.
     """
-    from spectramr.data.builders.dataset_instantiator import DatasetInstantiator
-    from spectramr.data.datasets.registry import DATASET_REGISTRY
+    from spectramr.data.builders.dataset_instantiator import self_indexed_dataset_types
 
-    DatasetInstantiator._ensure_registered()
-    return frozenset(name for name, entry in DATASET_REGISTRY.items() if not entry.indexed)
+    return self_indexed_dataset_types()
 
 
 #: fMRI/SFC ``data.expose_*`` keys that activate SFCConformalFMRIKeysWrapper.
@@ -394,6 +393,47 @@ def _apply_domain_overrides(config, domain):
     return config.model_copy(update={"data": data_cfg})
 
 
+
+def _slice_records_fill_patch(data_config, train_ds, queue_config) -> bool:
+    """Whether a ``tio.Queue`` over slice-level M4Raw records would only re-serve each record.
+
+    One uniform patch per depth-1 record, as large as the slice, is the record itself, so the
+    queue adds nothing but a synchronous refill every ``queue_length`` samples that leaves
+    the GPU idle for the whole decode (measured 130-270 s per 100 slices on sabine).
+    """
+    if (
+        getattr(data_config, "dataset_type", None) != "m4raw"
+        or not getattr(data_config, "slice_level_records", False)
+        or queue_config.sampler_type != "uniform"
+        or queue_config.samples_per_volume != 1
+    ):
+        return False
+    index = getattr(train_ds, "index", None)
+    patch = tuple(queue_config.patch_size[:2])
+    return (
+        isinstance(index, list)
+        and bool(index)
+        and all(
+            isinstance(r, dict) and r.get("shape") and tuple(r["shape"][-2:]) == patch
+            for r in index
+        )
+    )
+
+
+def _slice_records_val_inherits_workers(data_config, val_cfg) -> bool:
+    """Whether validation loads slice-level M4Raw records with the training worker count.
+
+    Only when the arm leaves ``validation.loader.num_workers`` undeclared: a declared
+    value, including 0, is the user's.
+    """
+    return (
+        val_cfg is not None
+        and getattr(data_config, "dataset_type", None) == "m4raw"
+        and bool(getattr(data_config, "slice_level_records", False))
+        and "num_workers" not in val_cfg.loader.model_fields_set
+    )
+
+
 class DataPipelineDirector:
     """Orchestrates data builders (DatasetInstantiator, DataLoaderBuilder, TransformBuilder)
     to create training and validation data loaders.
@@ -403,6 +443,8 @@ class DataPipelineDirector:
     def __init__(self, ctx: BuilderContext) -> None:
         config = ctx.config
         self._config = config
+        #: The applied train/val/test split of the last paired build (for provenance).
+        self.split_provenance: dict = {}
 
     def coil_process(self, kspace: torch.Tensor) -> dict[str, torch.Tensor | None]:
         """Apply the configured ``physics.coil_processing`` pipeline to k-space.
@@ -420,11 +462,16 @@ class DataPipelineDirector:
         device=None,
         val_shuffle: bool = False,
         val_batch_size: int | None = None,
+        persistent_workers: bool | None = None,
     ) -> tuple[DataLoader, DataLoader]:
-        """Create training and validation data loaders."""
+        """Create training and validation data loaders.
+
+        ``persistent_workers=None`` reads ``data.loader.persistent_workers``; a
+        caller that walks the loaders once (export, dataset dumps) passes
+        ``False`` so no worker pool outlives the walk.
+        """
         config = self._config
         data_config = config.data if hasattr(config, "data") else config
-        accel_config = getattr(config, "undersampling", None)
 
         # Resolve worker count from config when the caller doesn't override it.
         # The old ``num_workers=0`` default was a latent single-process trap:
@@ -444,7 +491,10 @@ class DataPipelineDirector:
         # unconditionally overwrites ``queue_config.num_workers`` with this value,
         # so a clamp applied downstream in ``torchio_queue_builder`` is dead code.
         _topology = resolve_run_topology()
-        _train_workers = clamp_worker_count(num_workers, _topology, role="train")
+        _reserved = int(data_config.loader.reserved_cores)
+        _train_workers = clamp_worker_count(
+            num_workers, _topology, role="train", reserved_cores=_reserved
+        )
         num_workers = _train_workers.workers
 
         # Same treatment for pin_memory: ``None`` → read ``data.pin_memory``
@@ -459,7 +509,11 @@ class DataPipelineDirector:
         # ``persistent_workers`` avoids respawning workers every epoch; wiring
         # it here fixes the val + npy_slice/mrixfields/full-sampler paths that
         # previously ignored the knob (pitfall #15).
-        _persistent = getattr(data_config.loader, "persistent_workers", False)
+        _persistent = (
+            bool(data_config.loader.persistent_workers)
+            if persistent_workers is None
+            else bool(persistent_workers)
+        )
         _prefetch = getattr(data_config.loader, "prefetch_factor", 2)
 
         # Validation loader worker policy (fixes the cohort-wide cgroup host-RAM
@@ -487,16 +541,26 @@ class DataPipelineDirector:
         _val_num_workers = (
             int(getattr(_val_cfg.loader, "num_workers", 0)) if _val_cfg is not None else 0
         )
+        if _slice_records_val_inherits_workers(data_config, _val_cfg):
+            # Independent one-slice reads, so no whole-volume decode fans out; the
+            # main-process default read ~2 s per slice with the GPU idle (sabine).
+            _val_num_workers = int(data_config.loader.num_workers)
         # Same ceiling for validation. A declared 0 -- the default, and what the
         # guard below insists on for volume-backed sets -- passes through
         # untouched, so this cannot resurrect a nonzero count where 0 was chosen.
-        _val_workers = clamp_worker_count(_val_num_workers, _topology, role="val")
+        _val_workers = clamp_worker_count(
+            _val_num_workers, _topology, role="val", reserved_cores=_reserved
+        )
         _val_num_workers = _val_workers.workers
 
         # Kept for provenance and tests: what was asked for vs what will run.
+        # torch raises on persistent_workers with 0 workers, and the val loader
+        # defaults to 0, so the flag is decided per loader from its clamped count.
+        _persistent_train = _persistent and num_workers > 0
+        _persistent_val = _persistent and _val_num_workers > 0
         self.worker_decisions = {
-            "train": _train_workers.to_dict(),
-            "val": _val_workers.to_dict(),
+            "train": replace(_train_workers, persistent=_persistent_train).to_dict(),
+            "val": replace(_val_workers, persistent=_persistent_val).to_dict(),
         }
 
         from spectramr.data.builders.dataset_instantiator import DatasetInstantiator
@@ -512,20 +576,7 @@ class DataPipelineDirector:
         from spectramr.infrastructure.builders.leaf.data_builders import DataLoaderBuilder
 
         # --- 1. Transforms ---
-        class ConfigProxy:
-            def __init__(self, d_conf, a_conf):
-                self._data = d_conf
-                # Phase 11: the block is `undersampling:`. This attribute name IS
-                # the proxy's contract with `from_training_config`, which reads
-                # `config.undersampling`; `__getattr__` would delegate it to the
-                # DATA config and raise.
-                self.undersampling = a_conf
-
-            def __getattr__(self, name):
-                return getattr(self._data, name)
-
-        proxy_config = ConfigProxy(data_config, accel_config)
-        torchio_config = TorchIOTransformConfig.from_training_config(proxy_config)
+        torchio_config = TorchIOTransformConfig.from_settings(config)
         train_transforms = TorchIOTransformBuilder.build_train_transforms(torchio_config)
         val_transforms = TorchIOTransformBuilder.build_val_transforms(torchio_config)
 
@@ -555,11 +606,13 @@ class DataPipelineDirector:
                 "paired_nifti",
                 "paired_mri",
             ):
-                train_index, val_index = ManifestLoader.load_paired_nifti_splits(proxy_config)
+                train_index, val_index = ManifestLoader.load_paired_nifti_splits(
+                    data_config, partition_stamp=self.split_provenance
+                )
             elif data_config.dataset_type in ("nifti", "dicom"):
-                train_index, val_index = ManifestLoader.load_nifti_splits(proxy_config)
+                train_index, val_index = ManifestLoader.load_nifti_splits(data_config)
             else:
-                train_index, val_index = ManifestLoader.load_fastmri_splits(proxy_config)
+                train_index, val_index = ManifestLoader.load_fastmri_splits(data_config)
 
         # --- 3. Datasets ---
         train_ds, val_ds = DatasetInstantiator.create_datasets(
@@ -648,7 +701,7 @@ class DataPipelineDirector:
                 .with_batch_size(data_config.loader.batch_size)
                 .with_num_workers(num_workers)
                 .with_pin_memory(pin_memory)
-                .with_persistent_workers(_persistent)
+                .with_persistent_workers(_persistent_train)
                 .with_prefetch_factor(_prefetch)
             )
             train_loader = (
@@ -662,7 +715,7 @@ class DataPipelineDirector:
                 .with_batch_size(_val_batch_size)
                 .with_num_workers(_val_num_workers)
                 .with_pin_memory(pin_memory)
-                .with_persistent_workers(_persistent)
+                .with_persistent_workers(_persistent_val)
                 .with_prefetch_factor(_prefetch)
                 .with_shuffle(val_shuffle)
                 .build()
@@ -670,9 +723,11 @@ class DataPipelineDirector:
             return train_loader, val_loader
 
         # 3D Queue Builder handling patch-based volumetric datasets
-        queue_config = TorchIOQueueConfig.from_training_config(proxy_config)
+        queue_config = TorchIOQueueConfig.from_training_config(data_config)
 
-        if queue_config.sampler_type == "full":
+        if queue_config.sampler_type == "full" or _slice_records_fill_patch(
+            data_config, train_ds, queue_config
+        ):
             # Full-slice training (whole-volume sampler, no patching): route TRAINING
             # through the same no-Queue DataLoaderBuilder path validation uses, so every
             # sample is a whole slice (not a random patch) and the queue's patch-compat
@@ -685,7 +740,7 @@ class DataPipelineDirector:
                 .with_batch_size(data_config.loader.batch_size)
                 .with_num_workers(num_workers)
                 .with_pin_memory(pin_memory)
-                .with_persistent_workers(_persistent)
+                .with_persistent_workers(_persistent_train)
                 .with_prefetch_factor(_prefetch)
                 .with_shuffle(True)
                 .build()
@@ -709,7 +764,7 @@ class DataPipelineDirector:
             .with_batch_size(_val_batch_size)
             .with_num_workers(_val_num_workers)
             .with_pin_memory(pin_memory)
-            .with_persistent_workers(_persistent)
+            .with_persistent_workers(_persistent_val)
             .with_prefetch_factor(_prefetch)
             .with_shuffle(val_shuffle)
             .build()

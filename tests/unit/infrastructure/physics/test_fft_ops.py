@@ -6,9 +6,11 @@ import torch
 from spectramr.infrastructure.physics.fft_ops import (
     _to_complex,
     _to_ri,
+    coil_combine,
     fft2c,
     fft2c_masked,
     ifft2c,
+    sense_adjoint,
 )
 
 
@@ -283,7 +285,15 @@ class TestFFTNumericalAccuracy:
     """Test numerical accuracy of FFT operations."""
 
     def test_fft_linearity(self):
-        """Test FFT linearity: FFT(a*x + b*y) = a*FFT(x) + b*FFT(y)."""
+        """Test FFT linearity: FFT(a*x + b*y) = a*FFT(x) + b*FFT(y).
+
+        Seeded: the inputs were unseeded and `rtol=1e-5` is checked against a
+        default `atol=1e-8`, so a draw where `a*x + b*y` nearly cancels in a bin
+        fails on complex64 rounding alone. Observed failing once in eight runs
+        when an unrelated test changed the global RNG stream. Pinning the draw
+        keeps the tolerance honest; widening it would hide a real regression.
+        """
+        torch.manual_seed(20260921)
         x = torch.randn(2, 8, 8, dtype=torch.complex64)
         y = torch.randn(2, 8, 8, dtype=torch.complex64)
         a = 2.5
@@ -528,3 +538,153 @@ class TestOneDimensionalHelpers:
             "ifft2_uncentered_last2",
         }
         assert names <= set(get_fft_ops())
+
+
+class TestTheDynamoFence:
+    """`fft2c`/`ifft2c` are fenced out of every compiled graph.
+
+    Inductor cannot generate code for complex operators: it routes each one to
+    an eager fallback and warns **once per process**, which on a cluster is
+    indistinguishable from silence. Fencing the SSOT is what lets an arm declare
+    `compile.allow_complex` honestly -- the compiled regions provably hold no
+    complex tensors rather than hopefully so.
+
+    The fence is applied at import and unconditionally, so it is paid by every
+    arm including the ones that never compile. Measured on this machine's GPU at
+    8x1x320x320: +1.4 us/call, +0.1%.
+    """
+
+    @pytest.mark.parametrize("fn", [fft2c, ifft2c], ids=["fft2c", "ifft2c"])
+    def test_the_fence_is_applied(self, fn):
+        """`torch._dynamo.disable` wraps with functools.wraps, so a fenced
+        function carries `__wrapped__` and an unfenced one does not."""
+        assert hasattr(fn, "__wrapped__"), f"{fn.__name__} is not fenced"
+
+    @pytest.mark.parametrize("fn", [fft2c, ifft2c], ids=["fft2c", "ifft2c"])
+    def test_the_fence_preserves_the_identity(self, fn):
+        """A fence that swapped the function out would be a correctness bug, not
+        a performance one -- which is why `dynamo_disable` checks `__name__`
+        rather than `callable()` before returning the wrapper."""
+        assert fn.__name__ == fn.__wrapped__.__name__
+
+    def test_the_fence_does_not_change_the_numbers(self):
+        """The centering and `norm="ortho"` contract is what this module is for
+        (non-negotiable 2); a decorator must not perturb it."""
+        x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+        assert torch.allclose(fft2c(x), fft2c.__wrapped__(x))
+        assert torch.allclose(ifft2c(x), ifft2c.__wrapped__(x))
+
+    def test_round_trip_survives_the_fence(self):
+        x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+        assert torch.allclose(ifft2c(fft2c(x)), x, atol=1e-5)
+
+
+class TestSenseAdjointNormalize:
+    """``sense_adjoint(normalize=...)``: matched filter vs Roemer estimate.
+
+    The flag exists because ``A^H`` returns ``(sum_c |S_c|^2) * m``, not ``m``.
+    That shading is correct inside a physics expression and wrong in a readout or
+    a fidelity term, where it silently weights the image by the coil intensity
+    profile.
+    """
+
+    @staticmethod
+    def _phantom(shaded: bool, seed: int = 0):
+        """``(kspace, smaps, m)`` for coil images that are exactly ``S_c * m``."""
+        torch.manual_seed(seed)
+        b, c, h, w = 2, 4, 16, 16
+        m = torch.randn(b, 1, h, w, dtype=torch.complex64)
+        s = torch.randn(b, c, h, w, dtype=torch.complex64)
+        s = s / s.abs().pow(2).sum(1, keepdim=True).sqrt()  # unit RSS
+        if shaded:
+            s = s * (0.3 + 0.7 * torch.rand(b, 1, h, w))
+        return fft2c(s * m), s, m
+
+    def test_roemer_recovers_the_magnetization_through_shaded_maps(self):
+        """The property the matched filter does NOT have."""
+        k, s, m = self._phantom(shaded=True)
+        assert torch.allclose(sense_adjoint(k, s, normalize=True), m, atol=1e-4)
+
+    def test_the_adjoint_is_shaded_by_the_same_maps(self):
+        """The planted counterpart: without the divide the answer is not ``m``."""
+        k, s, m = self._phantom(shaded=True)
+        assert not torch.allclose(sense_adjoint(k, s), m, atol=1e-2)
+
+    def test_the_default_is_the_adjoint_unchanged(self):
+        """68 arms declare a term that routes through here; the default must not
+        move them. Bit-identical to the explicit sum, not merely close."""
+        k, s, _ = self._phantom(shaded=True)
+        expected = (ifft2c(k) * torch.conj(s)).sum(dim=1, keepdim=True)
+        assert torch.equal(sense_adjoint(k, s), expected)
+
+    def test_the_support_floor_bounds_the_out_of_support_amplification(self):
+        """Planted violation: a dead strip in the maps is where a normalized
+        combine divides noise by nothing. ``coil_combine_sense`` owns the floor;
+        ``min_support_frac=0.0`` restores the unprotected divide and must blow up.
+        """
+        k, s, _ = self._phantom(shaded=True)
+        s = s.clone()
+        s[..., :4, :] *= 1e-4
+        noisy = fft2c(ifft2c(k) + 0.01 * torch.randn_like(k))
+        floored = sense_adjoint(noisy, s, normalize=True).abs().max()
+        unprotected = sense_adjoint(noisy, s, normalize=True, min_support_frac=0.0).abs().max()
+        assert unprotected > 20 * floored
+
+    def test_coil_combine_sense_is_the_magnitude_of_the_normalized_adjoint(self):
+        """One owner: the two entry points differ only in domain and in ``abs``."""
+        k, s, _ = self._phantom(shaded=True)
+        combined = coil_combine(ifft2c(k), method="sense", smaps=s)
+        assert torch.allclose(combined, sense_adjoint(k, s, normalize=True).abs(), atol=1e-6)
+
+
+class TestCentredFreqs:
+    @pytest.mark.parametrize("n", [8, 9, 64, 65])
+    def test_zero_on_the_dc_sample_and_spacing_one_over_n(self, n):
+        from spectramr.infrastructure.physics.fft_ops import centred_freqs
+
+        f = centred_freqs(n)
+        assert f[n // 2] == 0.0
+        assert torch.allclose(f[1:] - f[:-1], torch.full((n - 1,), 1.0 / n))
+
+    @pytest.mark.parametrize("n", [64, 65])
+    def test_phase_ramp_is_an_exact_integer_shift(self, n):
+        from spectramr.infrastructure.physics.fft_ops import centred_freqs, fft2c, ifft2c
+
+        x = torch.randn(1, 1, n, n, dtype=torch.complex64)
+        ramp = torch.exp(-2j * torch.pi * centred_freqs(n).view(1, 1, 1, -1) * 7)
+        assert torch.allclose(ifft2c(fft2c(x) * ramp), torch.roll(x, 7, dims=-1), atol=1e-5)
+
+
+class TestSpatialDimsAndAmp:
+    def test_spatial_dims_is_layout_agnostic(self):
+        from spectramr.infrastructure.physics.fft_ops import spatial_dims
+
+        assert spatial_dims(torch.zeros(2, 1, 4, 5)) == (2, 3)
+        assert spatial_dims(torch.zeros(2, 1, 3, 4, 5)) == (2, 3, 4)
+        for shape in [(4,), (2, 4), (2, 1, 3, 4, 5, 6)]:
+            with pytest.raises(ValueError):
+                spatial_dims(torch.zeros(*shape))
+
+    def test_fftnc_under_autocast_is_complex64(self, monkeypatch):
+        from spectramr.infrastructure.physics import fft_ops
+
+        seen: list[bool] = []
+
+        def spy(fn):
+            def wrapper(*a, **kw):
+                seen.append(torch.is_autocast_enabled("cuda"))
+                return fn(*a, **kw)
+
+            return wrapper
+
+        monkeypatch.setattr(fft_ops.torch.fft, "fftn", spy(torch.fft.fftn))
+        monkeypatch.setattr(fft_ops.torch.fft, "ifftn", spy(torch.fft.ifftn))
+        x = torch.randn(1, 2, 4, 6, 8)
+        ref = fft_ops.fftnc(x)
+        seen.clear()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            k = fft_ops.fftnc(x)
+            back = fft_ops.ifftnc(k)
+        assert seen == [False, False]
+        assert k.dtype == back.dtype == torch.complex64
+        assert torch.equal(k, ref)

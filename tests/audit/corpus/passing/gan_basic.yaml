@@ -52,6 +52,12 @@ model:
       - 2
     num_res_blocks: 1
     dropout: 0.0
+  # A GAN needs its critic: without this block the optimizer builder raises for
+  # training_mode gan, and discriminator_gan_losses refuses the config.
+  discriminator_component:
+    name: patch_gan
+    kwargs:
+      in_channels: 1
 
 optimization:
   learning_rate: 0.0002

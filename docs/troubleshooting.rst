@@ -55,8 +55,8 @@ Run dry-run to validate before training:
 ``out_channels`` than the current config.
 
 **Fix**: Either match config to checkpoint architecture or use
-``load_optimizer_state: false`` + ``resume_training: false`` and
-fine-tune from scratch with the new channel count.
+``load_optimizer_state: false`` and warm-start the compatible weights with
+``model.checkpoint_path`` (do not pass ``--resume``).
 
 
 Config / Schema Errors
@@ -74,29 +74,22 @@ Add to your YAML:
 ``AttributeError: 'TrainingSettings' object has no attribute 'lr'``
 --------------------------------------------------------------------
 
-Flat aliases were removed. Use the nested path — and note that
-``optimization.learning_rate`` is **also** retired: the optimizer block was
-decomposed and the field moved one level deeper, so the obvious first guess
-raises the same ``AttributeError`` you are trying to fix.
+The configuration is nested. Read the full path — a shorter guess raises the
+same ``AttributeError`` you are trying to fix.
 
 .. code-block:: python
 
-   # ❌ flat alias — never existed on the schema
+   # ❌ not on the schema
    config.lr
    config.lambda_l1
-
-   # ❌ one-level spelling — retired when the optimizer block was decomposed
-   config.optimization.learning_rate
-   # AttributeError: 'OptimizationConfigSchema' object has no attribute 'learning_rate'
 
    # ✅
    config.optimization.optimizer.learning_rate
    config.losses.image_losses[0].weight
 
-When you are unsure where a field lives now, resolve it through
-``spectramr/config/schemas/renames.py`` rather than guessing: it names the
-canonical location for every retired spelling, and says whether the old one
-still folds silently or raises.
+When you are unsure where a field lives, look it up in
+:doc:`config_schema_reference` rather than guessing — it lists every key the
+schema declares, with its full path.
 
 ``extra fields not permitted``
 -------------------------------
@@ -130,6 +123,101 @@ The ``ConfigHealthChecker`` validates before GPU allocation. Common fixes:
      - Verify ``train_manifest`` path exists on current machine
    * - ``DC disabled in reconstruction mode``
      - Set ``physics.data_consistency.enabled: true``
+   * - ``Model outputs N channels but the target provides 1``
+     - A head that emits distribution parameters (e.g. ``[mean, logvar]``) must
+       set ``predicts_distribution_params = True`` on its strategy class, so the
+       channel check and the metric reducer read only the mean channel
+
+
+The reconstruction is a bright lobe over a fine grid texture
+-------------------------------------------------------------
+
+Two separable things are on that picture, and neither is a plot of k-space.
+
+The **grid** is decoder checkerboard — the signature of transposed-convolution
+upsampling in an untrained or barely-trained U-Net. The **lobe** is the network's
+response to an input whose energy is concentrated in one pixel: undersampled
+k-space has a DC value tens of times its own standard deviation, and a
+convolutional stack smears that spike into a blob rather than transforming it.
+
+So the picture says the network was handed **raw k-space where it expected an
+image**, i.e. the adjoint :math:`A^H` never ran. Measured on an untrained
+``standard_unet`` over an R4 phantom:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 22 44
+
+   * - Model input
+     - Output ``|max|``
+     - Energy in the central 32x32
+   * - raw k-space
+     - 32.7
+     - **22.6%**
+   * - :math:`A^H y` (the adjoint image)
+     - 5.0
+     - 8.6%
+   * - *(the phantom itself, for reference)*
+     -
+     - 11.6%
+
+Confirm it from the arm's first ``debug_snapshots/first_steps_*`` entry: if
+``input_raw`` and ``input_prepared`` are identical **and** span a k-space dynamic
+range (``|max|`` in the tens against a ``std`` near 0.2), the adjoint is missing.
+
+Who is supposed to apply it depends on what the model registered:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Registered ``input_domain``
+     - Who applies ``ifft2c``
+   * - ``kspace`` (``complex_unet``, ``unrolled_reconstruction``, ...)
+     - Nobody. The network consumes k-space and the loss should be native to it.
+   * - ``image`` (``standard_unet``, ...)
+     - The strategy, through ``needs_kspace_to_image_bridge``, before ``forward``.
+   * - unannotated
+     - Nobody, deliberately - the bridge is never applied on a guess. Annotate
+       the model's ``@register_model`` capabilities if it needs one.
+
+``physics.data_consistency.enabled`` does **not** control this. It used to, as a
+side effect, which is what produced the picture on the ``self_supervised`` cohort
+(issue #2238); the two decisions are separate owners now.
+
+A related but distinct picture - a black frame with a single saturated pixel at
+the exact centre and nothing else - really *is* k-space drawn as an image, and
+means a previewer or metric IFFT'd one tensor of a pair and not the other.
+
+Every declared loss is weighted to zero and the model never learns
+-------------------------------------------------------------------
+
+Symptom: ``g_total_loss``, ``loss`` and ``final_loss`` are exactly ``0.0`` in
+``run_summary.json`` while the individual component (``l1``, say) is reported
+and non-zero. Two arms differing only in their training target write
+byte-identical validation PNGs, because both are still the initialisation.
+
+Cause: the warm-up gate. ``losses.reconstruction.warmup_losses`` defaults to
+``LEGACY_WARMUP_LOSSES`` — ``l1``, ``perceptual``, ``adversarial``,
+``complex_spatial_gradient``, ``rician_consistency``,
+``background_suppression`` — and ``warmup_iterations`` defaults to **1000**. An
+arm whose only declared loss is one of those, running fewer than 1000
+iterations, trains on a zero-gradient leaf for its entire life.
+
+Declare the gate rather than inheriting it::
+
+    losses:
+      reconstruction:
+        warmup_losses: []
+
+``BaseLossComputer._stack_components`` does detect this and logs
+``[LossComputer] DEAD LOSS: ...`` at ``ERROR`` — but on the module logger, which
+the run's log file does not capture (issue #2239). Check the loss weight the
+arm actually resolves rather than the one it declares::
+
+    from spectramr.models.losses.weights import build_loss_weight_table, resolve_loss_weight
+    table = build_loss_weight_table(config.losses)
+    resolve_loss_weight(table, "l1", scheduled=None, iteration=1)   # 0.0 means gated
 
 
 AMP / NaN Gradient Errors
@@ -150,11 +238,13 @@ AMP / NaN Gradient Errors
 
    # Fix 1: switch to bfloat16
    optimization:
-     amp_dtype: bfloat16
+     precision:
+       dtype: bfloat16
 
    # Fix 2: disable AMP entirely
    optimization:
-     use_amp: false
+     precision:
+       enabled: false
 
    # Fix 3: use gradient clipping
    optimization:
@@ -193,8 +283,9 @@ Out-of-Memory (OOM) Errors
 
    # 3. Enable AMP (halves memory for activations)
    optimization:
-     use_amp: true
-     amp_dtype: bfloat16
+     precision:
+       enabled: true
+       dtype: bfloat16
 
    # 4. Patch-based inference for large volumes
    inference:
@@ -218,62 +309,38 @@ Reduce validation batch size:
 ------------------------------------------------------
 
 The phase-aware complex self-attention in
-:class:`spectramr.models.blocks.dual_domain_attention_kan.ComplexMHA` formed a
-dense ``[B, h, N, N]`` score matrix over the full feature-map sequence
-(``N = H*W``). On a 256² map this is tens of GiB and OOM'd every
-``experiment_11`` KAN dual-domain arm on the 44 GiB cluster GPUs (2026-06
-rerun, traceback ending in ``ComplexMHA.forward`` ``attn @ Vh``).
+:class:`spectramr.models.blocks.dual_domain_attention_kan.ComplexMHA` would
+otherwise form a dense ``[B, h, N, N]`` score matrix over the full feature-map
+sequence (``N = H*W``). On a 256² map that is tens of GiB.
 
-``forward`` now **chunks over the query dimension** above
+``forward`` **chunks over the query dimension** above
 ``_COMPLEX_MHA_QUERY_CHUNK`` (default 2048): softmax / top-k act per query on
 the key dimension, so the chunked result is *numerically identical* to the
-dense one (pinned by
-``tests/unit/models/blocks/test_dual_domain_attention_oom_caps.py::test_complex_mha_query_chunking_is_numerically_exact``)
-while peak attention memory drops from ``O(N²)`` to ``O(chunk·N)``. This
-mirrors the ``max_band_tokens`` cap already on ``RadialBandAttention`` and
-``MultiScaleFreqBandAttention``. No YAML knob — the chunk size is an internal
-memory optimisation; override per-instance via ``self._query_chunk`` if needed.
+dense one, while peak attention memory drops from ``O(N²)`` to ``O(chunk·N)``.
+Above ``max_band_tokens`` a radial band attends a fixed, seeded subsample that
+covers every row of the band and keeps conjugate pairs together, and its other
+bins receive the band mean of the attended outputs; above ``max_tokens`` a
+``MultiScaleFreqBandAttention`` band switches to the O(N) linear form
+(``ComplexMHA.forward_linear``) instead of pooling. There is no YAML knob for
+the chunk size -- it is an internal memory optimisation.
 
-**Real-matmul scoring (follow-up to the chunking).** Chunking bounds the score
-tensor to ``chunk·N`` but the 2026-06-22 cluster reruns still OOM'd at the
-score line (``Tried to allocate 256.00 MiB`` at
-``dual_domain_attention_kan.py:158``): the chunked score was still built in
-**complex** before ``.real`` was taken, doubling its bytes. Because
-``Re(q kᴴ) = qr·krᵀ + qi·kiᵀ``, the score is now computed from two **real**
-matmuls via :func:`spectramr.models.blocks.dual_domain_attention_kan._phase_aware_real_scores`,
-and the value aggregation keeps the weight tensor real via
-:func:`spectramr.models.blocks.dual_domain_attention_kan._complex_weighted_sum`
-(``ComplexMHA`` and ``CrossDomainAttention`` both use them). The result is
-numerically identical (max abs diff ``~4e-7``, pinned by
-``test_phase_aware_real_scores_matches_complex_reference``,
-``test_complex_weighted_sum_matches_upcast_reference`` and
-``test_complex_mha_forward_matches_complex_matmul_reference``); measured peak
-at the failing ``[1, 4, 2048, 4096]`` frame drops **512 → 384 MiB (≈25 %,
-128 MiB freed)**, which is the headroom the 32 GiB-card arms died for. The
-44 GiB-card arms get the same 128 MiB relief but may still need a config lever
-(``optimization.use_gradient_checkpointing: true``, a lower
-``max_dense_attn_tokens``, or an 80 GiB GPU) since their peak is the aggregate
-U-Net forward, not this single op.
+``max_dense_attn_tokens`` is the supported config lever for the score-tensor
+peak, and since the image branch became full-resolution linear attention it
+bounds only the cross branch: when ``N = H*W`` exceeds it, the cross branch
+attends the centre ``round(sqrt(budget))^2`` crop of k-space (queries keep
+their frequency location) against image-domain keys/values average-pooled to
+the same grid, and writes its update into the cropped bins only. The budget
+therefore sets which frequencies the cross branch can reach, so keep it
+uniform across any set of arms you intend to compare.
 
-**Cohort-wide token-budget reduction (2026-06-26).** ``max_dense_attn_tokens``
-is the supported config lever for the score-tensor peak. When the feature-map
-sequence ``N = H*W`` exceeds it, the dense image/cross branches adaptive-pool to
-a ``round(sqrt(budget))²`` grid before attending, attend there, then interpolate
-back (``dual_domain_attention_kan.py:891``); the **output k-space stays full
-256²** regardless, so this only coarsens the *global attention mixing*, not the
-data or the reconstruction target. The whole KAN dual-domain family (the
-``attention_shootout`` arms, the ``attention_enhancements`` 5×2 matrix, and the
-standalone ``experiment_11_kan_dual_domain``) was lowered from ``4096`` (64²) to
-``2304`` (48²) to fit the 32 GiB cards. Because the budget sets the pooled
-attention resolution, it must stay **uniform across the family**, or a
-memory-vs-quality difference confounds the head-to-head deltas; that invariant
-is pinned by
-``tests/audit/test_kspace_filling_cohort_invariants.py::test_j_dense_attn_token_budget_uniform``.
+If that is not enough headroom, gradient checkpointing
+(``optimization.gradient.enable_checkpointing: true``) and a larger GPU are the
+remaining levers.
 
 This is the right knob precisely because ``data.patch_size`` is **not** safe to
 shrink on these k-space arms. For ``dataset_type: m4raw`` the Subject's
-``input`` / ``target`` keys hold *k-space* (``m4raw_dataset.py:797``), and
-``patch_size`` equals M4Raw's native 256² acquisition matrix, so at ``256`` it
+``input`` / ``target`` keys hold *k-space*, and ``patch_size`` equals M4Raw's
+native 256² acquisition matrix, so at ``256`` it
 crops nothing (the ``UniformSampler`` returns the whole matrix). Reducing it
 makes the sampler crop a window of **k-space**, which truncates high spatial
 frequencies and permanently lowers the reconstruction resolution, i.e. it
@@ -282,22 +349,88 @@ token budget (a benign attention approximation) over the patch size (a data
 crop) for k-space memory relief.
 
 
+CUDA Device Faults
+==================
+
+``CUDA error: misaligned address`` (and its siblings)
+------------------------------------------------------
+
+**The traceback names the wrong line.** CUDA reports a misaligned address, an
+illegal memory access, an unspecified launch failure and a device-side assert
+*asynchronously*: the driver surfaces the fault at whichever later operation
+happens to synchronise, so the frame Python shows you is the op that waited, not
+the kernel that faulted. Three ``kspace_cold_diffusion`` arms died this way on
+the 2026-09-17 dispatch, all three blaming the same ``ChannelAttention`` line.
+
+``run_training_pipeline`` now says so at the point of failure
+(``_async_cuda_fault_hint``). The remedy it names is the only one that works:
+
+.. code-block:: bash
+
+   CUDA_LAUNCH_BLOCKING=1 spectramr train --config <arm>.yaml
+
+That serialises every launch, so the next traceback names the real kernel — at a
+large throughput cost, which is why it is a debugging flag and not a default.
+
+**If the blamed frame moves between runs, suspect the selection, not the code.**
+``cudnn.benchmark`` re-autotunes on every process start, so the convolution
+algorithm — and any alignment requirement it carries — is chosen fresh each run.
+An arm with a byte-identical config can therefore fault on one node and pass on
+the next, which is what distinguishes this from a shape bug. Pin the selection
+with ``determinism: true`` on the arm to make the outcome repeatable before
+concluding anything about the model.
+
+
 Distributed (DDP) validation metrics are summed across ranks
 =============================================================
 
 Under DDP the validation loader is wrapped in a ``DistributedSampler``
 (:func:`spectramr.pipelines.parallel._apply_distributed_samplers`) which *shards
 and pads* the val set, so each rank validates only ``~1/world_size`` of it.
-``_run_validation`` previously finalised ``v_sum / val_count`` on the **local**
-shard and never reduced across ranks, so rank-0 reported (and early-stopped on)
-a single padded shard's metric rather than the true full-set value.
-:func:`spectramr.pipelines.train._all_reduce_val_metrics` now all-reduce-SUMs
-both the per-metric running-sums and the sample count before dividing, giving
-the correct sample-weighted global mean. It is a **no-op** when
-``torch.distributed`` is not initialised (the default single-process
-``spectramr train`` path), so single-GPU runs are unaffected. Pinned by
-``tests/unit/pipelines/test_train.py::test_all_reduce_val_metrics_noop_without_process_group``
-and ``::test_all_reduce_val_metrics_single_rank_identity``.
+:func:`spectramr.pipelines.train._all_reduce_val_metrics` all-reduce-sums the
+per-metric running-sums, the per-metric finite-sample counts and the sample
+count as one vector before dividing, giving the correct sample-weighted global
+mean rather than one padded shard's value. The ranks first agree on the union of
+their metric keys, so a rank whose batches all raised, or one that emitted a
+different key set, still joins the same collective instead of hanging it. It is
+a **no-op** when ``torch.distributed`` is not initialised (the default
+single-process ``spectramr train`` path), so single-GPU runs are unaffected.
+
+
+A validation column is averaged over its finite values only
+===========================================================
+
+Each validation metric is divided by its own count of finite samples. A NaN or
+Inf slice is left out of that column's mean instead of turning the column NaN
+for the whole pass, and a key that only some batches emit is averaged over those
+batches. The raw per-slice value, NaN included, stays in the per-batch rows
+(``validation.per_batch_rows``). Each pass logs the per-metric skip counts once,
+and the validation CSV carries two coverage columns:
+
+- ``val_samples_skipped_max``: the largest number of samples any metric left out.
+- ``val_monitor_samples_skipped``: the samples the ``early_stopping.metric``
+  column left out, present when early stopping is enabled and its metric resolves.
+
+When the early-stopping metric has no finite value in a pass, the pass logs a
+warning naming it, even if other columns such as ``psnr`` are finite. The
+training loop raises once the monitor stays non-finite for ``patience``
+validation events.
+
+
+Volumes of unequal depth are validated one at a time
+====================================================
+
+A whole-volume validation loader batches volumes that need not share a slice
+count (fastMRI knee volumes do not). The image collate zero-pads them to the
+longest and records the padding under ``<key>_padding``. Folding depth into rows
+would then score the padding as slices of exact zeros; the cold-diffusion
+reverse sampler refuses such a row with ``NoiseAdaptiveDataConsistency:
+sample(s) [0] have no measured k-space bin``. ``_run_validation`` therefore
+splits a padded batch into one batch per volume, each cut back to its own extent
+(:func:`spectramr.data.collation.unpad.split_padded_batches`), before the depth
+flatten and before ``validation.per_batch_rows`` cuts slices. The
+``validation.loader.num_batches`` cap still counts loader batches. Batches the
+collate did not pad, such as M4Raw's equal-depth volumes, pass through unchanged.
 
 
 Mixed precision: ``precision.dtype`` selects the autocast dtype
@@ -306,22 +439,6 @@ Mixed precision: ``precision.dtype`` selects the autocast dtype
 ``optimization.precision.dtype`` chooses the autocast precision when
 ``optimization.precision.enabled: true``. It maps to the AMP policy in
 :func:`spectramr.infrastructure.training.mixed_precision.resolve_amp_precision`:
-
-.. note::
-
-   The two older flat spellings differ, and the difference matters.
-   ``optimization.use_amp`` is a ``RENAMES`` entry with posture ``fold``: it
-   still loads and still lands on ``precision.enabled``. ``optimization.amp_dtype``
-   has posture ``raise`` — declaring it is now a hard load error naming
-   ``precision.dtype``. So a ``use_amp`` declaration is live, which has
-   a practical consequence worth spelling out: **grepping for the canonical key
-   under-reports AMP usage.** A sweep for
-   ``optimization.precision.enabled: true`` across
-   ``experiments/inprogress/`` returned zero while 46 arms were in fact running
-   AMP through the legacy key. Ask ``resolve_amp_precision`` on the loaded
-   settings, never the text. Declaring both spellings at disagreeing values
-   raises (*"AMP is one decision"*), so migrate by **replacing** the legacy key,
-   not by adding the block beside it.
 
 .. list-table::
    :header-rows: 1
@@ -332,7 +449,7 @@ Mixed precision: ``precision.dtype`` selects the autocast dtype
      - Notes
    * - *(unset)* / ``float16``
      - fp16
-     - Historical default. Needs a ``GradScaler``; narrow dynamic range
+     - Needs a ``GradScaler``; narrow dynamic range
        (max ≈ 65504) can overflow to ``inf`` on unstable models. **Disabled
        automatically for complex/k-space flows** (complex64 cannot mix with
        Half weights).
@@ -341,15 +458,14 @@ Mixed precision: ``precision.dtype`` selects the autocast dtype
      - **Preferred.** Same exponent range as fp32 → no loss scaling, no
        overflow, no GradScaler scale-collapse. Halves the *autocast'd*
        activations (convs/projections). Works under complex autocast. Full
-       Tensor-Core throughput on the cluster's Ada GPUs (and Ampere+).
+       Tensor-Core throughput on Ampere-class and newer GPUs.
    * - ``float32``
      - *(off)*
-     - Full precision — AMP is disabled even if ``use_amp: true`` (the knob
+     - Full precision — AMP is disabled even if ``precision.enabled: true`` (the knob
        cannot silently no-op into fp16).
 
-This knob was **inert before 2026-06-24** (the policy hardcoded fp16); it is
-now threaded through ``BaseTrainingStrategy`` (pitfall #15) and the resolved
-value is logged at startup (``[Mixed Precision] enabled=… precision=…``).
+The resolved value is logged at startup
+(``[Mixed Precision] enabled=… precision=…``).
 
 .. _diffusion-fp32-policy:
 
@@ -368,9 +484,6 @@ state the table above documents: the choice is then validated at load time and
 stamped into provenance instead of inherited from a default.
 
 ``check_diffusion_precision_policy`` (Tier-1, severity ``error``) enforces it.
-When it landed it fired on **12 arms** under ``experiments/inprogress/`` that
-were training a noise/score-prediction objective under autocast — 11 fp16, 1
-bf16 — none of which a grep could see, for the reason in the note above.
 
 bf16 is refused alongside fp16 even though it is the *safer* half-precision and
 is the recommended fix elsewhere on this page. The policy is fp32 for diffusion;
@@ -391,17 +504,14 @@ It resolves the strategy class through
   ``twin_dps``, ``bloch_schrodinger_bridge`` and friends, whose class and module
   names say nothing.
 
-A third candidate, ``training.diffusion is not None``, was tried and rejected:
-it adds 14 arms, **all false positives** (PINN, FNO, Vision-Mamba and VAE
-reconstruction arms that merely carry the sub-block) and zero true ones. In a
-check that hard-errors, over-capture blocks AMP on arms legitimately entitled to
-it, which is worse than under-capture.
+A third candidate, ``training.diffusion is not None``, is deliberately not used:
+it captures PINN, FNO, Vision-Mamba and VAE reconstruction arms that merely
+carry the sub-block, and no true ones the two signals above miss. In a check
+that hard-errors, over-capture blocks AMP on arms legitimately entitled to it,
+which is worse than under-capture.
 
-Matching on ``model_type`` is *not* how this works, deliberately: that was a
-second AMP resolver inside ``AMPPolicy.should_use_amp`` and was removed in #806.
-The durable fix is a declaration rather than this inference —
-``StrategyCapabilities.supported_paradigms`` is the seam and is currently
-populated on 0 of 204 strategies (issue #810).
+Matching on ``model_type`` is *not* how this works, deliberately: that would be
+a second resolver for one decision, and AMP has a single owner.
 
 .. _complex-no-compile-policy:
 
@@ -449,7 +559,7 @@ cannot codegen. Keying on the layer would have blocked compilation on arms that
 compile perfectly well.
 
 Note ``capabilities.accepts_complex`` is the *declarative* signal and would be
-the whole answer if it were populated; it is ``None`` on 484 of 589 registered
+the whole answer if it were populated; it is unpopulated on most registered
 models, which is why four signals are needed instead of one lookup.
 
 .. rubric:: Getting throughput on a complex arm instead
@@ -459,19 +569,17 @@ models, which is why four signals are needed instead of one lookup.
 :doc:`training_throughput`.
 
 For OOM relief prefer ``bfloat16``: it does **not** need loss scaling and does
-**not** aggravate the gradient-explosion → NaN instability (the hyper-mamba
-``exp_hm_06``/``exp_hm_10`` failure mode), whereas fp16 can collapse the
-``GradScaler`` scale and silently skip steps. The ``hilbert_mamba`` cohort sets
-``use_amp: true`` + ``amp_dtype: bfloat16``.
+**not** aggravate the gradient-explosion → NaN instability, whereas fp16 can
+collapse the ``GradScaler`` scale and silently skip steps.
 
-**Mamba arms and fp16.** ``amp_dtype: float16`` *is* viable for the
-``hilbert_mamba`` arms — they are ``domain=image`` (real fp16 autocast, the
-``GradScaler`` is wired in ``steppers.py``), and
+**Mamba arms and fp16.** ``precision.dtype: float16`` *is* viable for
+image-domain Mamba arms — real fp16 autocast, with the ``GradScaler`` wired in
+``steppers.py`` — and
 :class:`spectramr.models.blocks.mamba_block.MambaBlock` force-runs the SSM/GRU
 recurrence in fp32 (``autocast(enabled=False)`` + ``.float()``) regardless of
-``amp_dtype``, so the precision-fragile long recurrence (L = H·W) and the
+``precision.dtype``, so the precision-fragile long recurrence (L = H·W) and the
 cuDNN-GRU-under-fp16 crash are both avoided. bf16 is still preferred (no
-scale-collapse failure mode; identical Tensor-Core throughput on Ada), and
+scale-collapse failure mode; identical Tensor-Core throughput), and
 because the recurrence is fp32-pinned either way, fp16's extra mantissa bits
 buy nothing on the part that matters.
 
@@ -479,7 +587,7 @@ buy nothing on the part that matters.
 requires ``torchao.float8`` or NVIDIA Transformer-Engine, explicit per-layer
 conversion of ``nn.Linear`` (and per-tensor scaling), and Hopper/Ada hardware.
 The Mamba selective-scan and ``Conv2d`` stems here are not standard fp8 targets,
-so ``amp_dtype`` deliberately rejects ``float8`` rather than advertise an
+so ``precision.dtype`` deliberately rejects ``float8`` rather than advertise an
 unwired knob. Adding fp8 would be a separate feature (a ``Float8Linear`` swap
 pass behind a new ``parallel``/``optimization`` flag), not a precision toggle.
 
@@ -494,37 +602,14 @@ is detected (:func:`spectramr.pipelines.distributed.run_distributed_training`).
 Data is sharded with a ``DistributedSampler``; very large models can shard
 parameters with FSDP (``parallel.fsdp.enabled: true``, ``mixed_precision: bf16``).
 
-**Single node, N GPUs:**
+:doc:`distributed_training` carries the launch commands for single-node and
+multi-node runs, the rendezvous settings, and the failure modes specific to
+each.
 
-.. code-block:: bash
-
-   torchrun --nproc_per_node=4 -m spectramr.cli train-distributed \
-       --config experiments/inprogress/hilbert_mamba/exp_hm_05_mm_mamba.yaml
-
-**Multiple nodes** (rendezvous on the first node):
-
-.. code-block:: bash
-
-   torchrun --nnodes=2 --node_rank=$NODE_RANK --nproc_per_node=4 \
-       --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-       -m spectramr.cli train-distributed --config <yaml>
-
-On SLURM use the committed launcher
-``scripts/training/train_distributed.sbatch`` (matches the cluster's
-``--account=<your-slurm-account>`` / ``--gres=gpu:ada:N`` conventions; one ``torchrun`` per
-node via ``srun``, c10d rendezvous keyed on the job id):
-
-.. code-block:: bash
-
-   # single node × 4 GPUs
-   sbatch --nodes=1 --gres=gpu:ada:4 \
-          --export=ALL,CONFIG=<yaml> scripts/training/train_distributed.sbatch
-   # 2 nodes × 4 GPUs (world_size 8)
-   sbatch --nodes=2 --gres=gpu:ada:4 \
-          --export=ALL,CONFIG=<yaml> scripts/training/train_distributed.sbatch
-
-Use ``DistributedDataParallel`` (the path above), never ``nn.DataParallel``.
-Combine with ``amp_dtype: bfloat16`` for the largest effective batch per GPU.
+Use ``DistributedDataParallel`` (the config-driven path above), never
+``nn.DataParallel``.
+Combine with ``precision.dtype: bfloat16`` for the largest effective batch per
+GPU.
 
 
 Validation Errors
@@ -534,19 +619,14 @@ Validation Errors
 ------------------------------------------------
 
 Every validation batch raised the same exception (a shape / channel mismatch in
-the strategy's validation forward, or an OOM), so the run is failed loud rather
-than shipped image-less and green (F36, CLAUDE.md #10). The **root-cause
-traceback of the first failing batch is embedded in the raised error itself**
-(``--- first validation-batch failure (root cause) ---`` block) — earlier it
-only said "logged above", and that ``logger.warning`` line was routed to a
-handler the per-arm log didn't persist, so cluster triage saw the symptom with
-no cause (2026-06-21: the ``exp_vf_ib_infonce_v2`` / ``b17_dice_risk_calibration``
-validation crashes). Read that embedded block: it names the exact tensor op and
-shapes. Common causes: the model emits 2-channel real-stacked complex while the
+the strategy's validation forward, or an OOM), so the run fails loud rather than
+shipping image-less and green. The **root-cause traceback of the first failing
+batch is embedded in the raised error itself**
+(``--- first validation-batch failure (root cause) ---`` block). Read that
+block: it names the exact tensor op and shapes. Common causes: the model emits 2-channel real-stacked complex while the
 validation metric compares against a 1-channel magnitude target; a strategy
 ``_validation_forward`` that returns ``None``; or a ``val_batch`` whose keys
-``_unpack_batch`` doesn't recognise. Pinned by
-``tests/unit/pipelines/test_validation_fail_loud.py``.
+``_unpack_batch`` doesn't recognise.
 
 ``RuntimeError: quantile() input tensor is too large``
 -------------------------------------------------------
@@ -557,38 +637,13 @@ embedder (``infrastructure/physics/digital_twin_simulator.py``) derives the
 tissue-intensity scale from a 0.75 quantile of the anatomy magnitude; on the
 **single-coil** path it flattens the *whole* tensor, so a larger **validation**
 batch tips over the cap and every validation batch raises → *"Validation
-produced zero successful batches"* (the ``exp_vf_ib_infonce_v2`` crash,
-2026-06-22 forensics).
+produced zero successful batches"*.
 
-**Fix**: the quantile sites now go through ``_robust_quantile`` (same module),
+**Fix**: the quantile sites go through ``_robust_quantile`` (same module),
 which decimates the reduced dimension with an even stride down to ~16.7M samples
 before the quantile when it would overflow — deterministic (no ``randperm``, so
 seeding/determinism is preserved) and statistically unbiased for the smooth
-0.75/0.99 quantiles the embedder uses. No config change needed. Pinned by
-``tests/unit/infrastructure/physics/test_digital_twin_simulator.py::TestRobustQuantile``
-(including a real ``>2**24`` tensor where bare ``torch.quantile`` raises).
-
-**Also in that helper (not an error, but it is what runs)**: below the cap
-``robust_quantile`` takes an exact selection fast path — two ``torch.kthvalue``
-calls interpolated, instead of the full sort ``torch.quantile`` performs to read
-at most two order statistics. It is **bit-identical**, not approximate, and
-declines to ``torch.quantile`` for any input it cannot reproduce exactly (NaN,
-±inf, a negative zero, non-CPU tensors, dtypes outside float32/float64, fewer
-than 4096 elements, or a ``q`` outside ``[0, 1]``) -- **and above the cap this
-page is about**: ``kthvalue`` carries no size limit of its own, so past
-``2**24`` it would answer where ``torch.quantile`` raises the error above.
-Declining there is what keeps this error reachable through ``max_elems``, rather
-than silently replaced by a number no reference value was ever compared against.
-So a number never changes because of it, and profiles taken before 2026-08 will
-show a ``sort`` where current ones show ``kthvalue``.
-
-The exactness rests on evaluating the rank ``q * (n - 1)`` in the *tensor's*
-dtype rather than in Python ``float``. Issue #1537 measured a divergence, read
-it as ``kthvalue`` being inexact on large tensors, and concluded the route was
-unusable above ~2**18 elements; that attribution is wrong — a full ``sort``
-under the same float64 rank arithmetic diverges identically, and with the rank
-in the tensor dtype the route is exact at 262,144 and 1,048,576 both.
-
+0.75/0.99 quantiles the embedder uses. No config change needed.
 
 Checkpoint Errors
 ==================
@@ -596,7 +651,8 @@ Checkpoint Errors
 ``KeyError: 'state_dict'`` when loading checkpoint
 ----------------------------------------------------
 
-The checkpoint uses the old ``pth`` format from before v5.0. Convert:
+The checkpoint is in an older format that stores the weights under a different
+key. Convert:
 
 .. code-block:: python
 
@@ -610,100 +666,14 @@ The checkpoint uses the old ``pth`` format from before v5.0. Convert:
 ------------------------------------------
 
 If resuming after changing ``max_iterations``, the step counter may
-be ahead of the new value. Fix:
+be ahead of the new value. Fix: do not resume (``--resume`` restores the step counter); warm-start instead:
 
 .. code-block:: yaml
 
+   model:
+     checkpoint_path: checkpoints/last.safetensors   # warm-start: weights only, step counter restarts
    checkpoint:
-     resume_training: false    # Don't restore step counter
-     pretrained_path: checkpoints/last.safetensors
      load_optimizer_state: true
-
-
-Hyper-Mamba Cohort (``hilbert_mamba``) — 2026-06-24 crash triage
-================================================================
-
-The ten ``experiments/inprogress/hilbert_mamba/exp_hm_*`` arms crashed in four
-distinct families. Two are fixed; two are cluster-data / cluster-runtime
-dependent and are documented here with their reproduction state.
-
-``RuntimeError: weight of size [1, 64, 1, 1], expected input … to have 64 channels, but got 1`` (FIXED)
-------------------------------------------------------------------------------------------------------
-
-**Symptom**: a Hilbert-Mamba arm with ``optimization.use_gradient_checkpointing:
-true`` (``exp_hm_01_ct``/``03_crm``/``04_hw``/``05_mm``) crashes at iteration 1
-inside ``self.stem`` — but the reported weight is the model's *last* conv (the
-``Conv2d(d_model, out_channels, 1)`` head), not the stem's.
-
-**Root cause**: ``GradientCheckpointing.apply_checkpointing``
-(``models/profiling/advanced_profiling.py``) patched every ``Conv2d``/``Linear``
-with ``module.forward = lambda x: checkpointed_forward(module, x)`` *inside the
-loop*. The lambda captured the loop variables ``module`` and
-``checkpointed_forward`` by reference (Python closure late-binding), so after the
-loop **every** patched layer's forward resolved to the **last** module's — the
-stem ended up running the head's conv on its 1-channel input.
-
-**Fix**: bind each layer's forward once, by value, via a module-scope factory
-``_make_checkpointed_forward(orig_forward)``, and use ``use_reentrant=False`` so
-gradients still flow when a layer's input does not itself require grad (the old
-reentrant default silently produced ``None`` grads for the stem). Regression:
-``tests/unit/models/profiling/test_advanced_profiling.py``. This bug affected
-*any* model routed through the generic checkpointing path, not just Hyper-Mamba.
-
-``CUDA out of memory. Tried to allocate 19.50 GiB`` in validation (FIXED)
--------------------------------------------------------------------------
-
-**Symptom**: ``exp_hm_02_fe`` trains at ``batch_size: 1`` but OOMs the moment
-validation starts.
-
-**Root cause**: a full-resolution 256×256 patch linearizes to a 65,536-token
-sequence; the SSM selective-scan tensor for a single forward is ~9.75 GiB, so
-``validation.loader.batch_size: 2`` tries to allocate ~19.5 GiB (= 2×) on top of the
-model. Validation, not training, is the trigger because training already fit at
-batch 1.
-
-**Fix**: ``validation.loader.batch_size: 1`` across all ten arms is the guaranteed lever (a
-single forward fits, as the training step proved); the val OOM was a latent
-failure for every full-resolution arm once the checkpointing crash above is
-cleared. ``optimization.use_amp: true`` + ``amp_dtype: bfloat16`` is also
-enabled, but note its OOM relief here is **partial**: ``MambaBlock`` force-runs
-the SSM/GRU recurrence in fp32 (``autocast(enabled=False)`` + ``.float()``), so
-AMP only shrinks the conv / projection / stem-head / sequence-embedding
-activations, not the recurrence — it is not a clean 2× on these models. For
-further scaling, reduce ``patch_size`` or run multi-GPU DDP (see the
-distributed-training section below).
-
-``num_samples should be a positive integer value, but got num_samples=0`` (cluster-data dependent)
----------------------------------------------------------------------------------------------------
-
-**Symptom**: ``exp_hm_07_25d`` and ``exp_hm_08_sdtw`` — the only two arms with a
-3-D ``patch_size`` (depth 16) and 3-D/2.5-D models — die at dataloader build with
-an empty training split.
-
-**Status**: NOT reproducible locally. ``data.data_root``
-(``databases/ulf_paired/preprocessed``) is cluster-only, and the local proxy
-manifest (32 paired records, depths 27/150/156) yields ≥1 depth-16 slab per
-volume — so the empty split is specific to the cluster manifest. **Diagnose on
-the cluster**: dump the train/val record counts the 3-D slab path
-(:class:`~spectramr.data.datasets.slice_dataset.SliceVolumeDataset`) produces for
-these two arms; the suspect is the interaction of ``allow_unpaired: true`` with
-the slab windowing leaving the train split empty.
-
-Model emits all-NaN → ``Metric 'lpips' … values in range [nan, nan]`` (cluster-runtime dependent)
---------------------------------------------------------------------------------------------------
-
-**Symptom**: ``exp_hm_06_mdi`` (NaN by iter ~10, preceded by
-``GRADIENT EXPLOSION DETECTED total_norm=2676``) and ``exp_hm_10_inr`` (NaN by
-iter ~40). LPIPS correctly hard-raises on the non-finite prediction (CLAUDE.md
-pitfall #9) — the metric is the messenger, not the cause.
-
-**Status**: training instability, not a forward bug — at initialisation both
-models produce finite output. Must be reproduced on a box with the real
-``mamba_ssm`` kernel (see the next section — the run now *fails loud* without
-it). Gradient clipping is already enabled (``gradient_clip_value: 1.0``) yet NaN
-still appears, which points at an exploding *forward* activation rather than the
-optimiser step. **Recommended cluster-side iteration**: lower ``learning_rate``
-(e.g. 5e-5), add LR warmup, and/or bound the output.
 
 
 ``MambaBlock requires the official mamba_ssm selective-scan kernel`` (by design)
@@ -715,7 +685,7 @@ Mamba/SSM models (``hilbert_mamba``, ``geomamba``, ``d2_mamba``, ``bloch_mamba``
 construction when it is missing or its kernel failed to build, rather than
 silently substituting a Gated-Conv+GRU block — that fallback is **not an SSM**,
 so a silent substitution would train a GRU under the "Mamba" label and make
-every result scientifically mislabelled (pitfall #9 / #16).
+every result scientifically mislabelled.
 
 This is also caught **at audit time** (before any GPU work) by the
 ``mamba_models_require_mamba_ssm`` health check: a ``model_type`` containing
@@ -726,11 +696,22 @@ if ``SPECTRAMR_ALLOW_MAMBA_FALLBACK`` is set (the run would be a non-SSM GRU).
 
 .. code-block:: bash
 
-   pip install -e '.[mamba]' --no-build-isolation   # mamba-ssm + causal-conv1d
-   python -c "import mamba_ssm"                       # verify the kernel imports
+   make install-mamba                                   # mamba-ssm + causal-conv1d
+   python -c "import mamba_ssm"                          # the kernel imports
+   python scripts/install_mamba_extra.py --verify-only   # ...and carries this GPU's arch
 
 The error message distinguishes *not installed* from *installed-but-kernel-broken*
-(CUDA/PyTorch version mismatch — rebuild with ``--no-build-isolation``).
+(CUDA/PyTorch version mismatch — rebuild through the script).
+
+.. warning::
+
+   ``import mamba_ssm`` succeeding does **not** mean the kernel can run here. A
+   wheel built for the wrong architectures imports cleanly and then raises
+   ``cudaErrorNoKernelImageForDevice`` at the first selective-scan launch — and
+   upstream's prebuilt wheels carry no ``sm_70``, so that is the default outcome
+   on a V100. ``--verify-only`` reads the arch list off the installed ``.so``,
+   which is the only check that distinguishes the two; see
+   :ref:`mamba-arch-list` for why the bare pip line produces this.
 
 **Opt-in GRU fallback (CPU/CI wiring only).** ``SPECTRAMR_ALLOW_MAMBA_FALLBACK=1``
 re-enables the GRU approximation with a loud warning, for shape/wiring tests on
@@ -742,9 +723,8 @@ experiment — the GRU is not an SSM and the numbers are not "Mamba".
 mixer from :class:`MambaBlock` runs the real ``mamba_ssm`` selective scan:
 ``hilbert_mamba`` (``_MambaEncoder``), ``mamba_unet`` (``MambaLayer2D``),
 ``geo_mamba_unet`` / ``FiLMMambaBlock``, ``d2_mamba``, ``hdsf``, ``mamba_4d``,
-``se3_lie_algebra_mamba``, and (since 2026-06-24) ``swin_mamba_kan``
-(``MambaLayer`` was a slow pure-Python ``for t in range(L)`` reimplementation;
-it now delegates to ``MambaBlock``). A handful of models keep a **bespoke**
+``se3_lie_algebra_mamba`` and ``swin_mamba_kan``. A handful of models keep a
+**bespoke**
 recurrence on purpose — that custom SSM *is* their contribution and must NOT be
 swapped for vanilla ``mamba_ssm``: ``bloch_mamba`` / ``bloch_mamba_v2`` (Bloch
 T1/T2 physics in the A-matrix), ``diff_mamba`` (Neural-ODE), ``neuro_mamba``
@@ -796,9 +776,9 @@ transitive-dependency conflict. The live example is ``torchmetrics``:
 ``torchmetrics>=1.0,<2.0`` is satisfied by e.g. ``1.9.0``, but the import raises
 when the environment has ``huggingface-hub>=1.0`` (torchmetrics needs ``<1.0``).
 Every torchmetrics-backed metric (``ms_ssim``, ``lpips``, ``fid``, ``kid``,
-``uqi``) then raises at runtime rather than fabricating a ``0.0`` (the
-2026-07-01 M1 fix), so any arm listing one
-of them in ``validation.metrics`` crashes at the first validation step.
+``uqi``) then raises at runtime rather than fabricating a ``0.0``, so any arm
+listing one of them in ``validation.metrics`` crashes at the first validation
+step.
 
 ``--import-check`` is what surfaces this — plain metadata reports ``OK`` while
 the import probe reports ``IMP`` with the exact root cause:
@@ -824,30 +804,27 @@ Data Loading Errors
 The BART ``.cfl`` payload is **truncated** — its byte size is smaller than its
 ``.hdr`` dimension vector implies (a complete payload is ``prod(dims)`` ×
 ``complex64`` = ``× 8`` bytes). Root cause: a dropped connection during download
-ended the stream early and the partial file was renamed as "complete" — the
-``size > 0`` completeness test never noticed (``multiecho_radial_b0_r2star``
-``v05.cfl``: 790 MB of a ~9 GB payload, which took out the 7 B0-field VF arms
-vf_21/25/26/29_real/30 at the first batch).
+ends the stream early and the partial file is renamed as "complete" — a
+``size > 0`` completeness test does not notice.
 
-``download_external_datasets.py`` now (a) **never promotes a short stream** —
-it verifies bytes-downloaded == ``Content-Length`` before the atomic rename and
-otherwise leaves the ``.part`` for the next Range-resume; (b) treats a
-``.cfl`` whose size ≠ ``prod(hdr dims) × 8`` as **not present** (``_present`` /
-``--verify``) so the dataset re-fetches; and (c) **unlinks** a previously-truncated
-``.cfl`` before re-streaming it. Pinned by
-``tests/unit/scripts/test_download_external_datasets.py``.
+.. note::
+
+   The mirroring and manifest tooling referenced throughout this section fetches
+   from the maintainers' cluster mirror into their manifest layout, and is not
+   part of this distribution. The diagnosis here is portable; the fetch commands
+   are not, so they are described rather than quoted.
 
 **Repair**: re-fetch the truncated payload from wherever you obtained it. A
 partially-written ``.cfl`` is indistinguishable from a complete one by anything
 except its length, so any integrity check you build has to compare the byte count
 against the ``.hdr`` dimensions rather than trust a ``status: downloaded`` marker.
 
-.. note::
-
-   The mirroring and manifest tooling referenced throughout this section fetches
-   from the maintainers' cluster mirror into their manifest layout, and is not
-   part of this distribution. The diagnosis below is portable; the fetch commands
-   were not, so they are described rather than quoted.
+``download_external_datasets.py`` (a) **never promotes a short stream** —
+it verifies bytes-downloaded == ``Content-Length`` before the atomic rename and
+otherwise leaves the ``.part`` for the next Range-resume; (b) treats a
+``.cfl`` whose size ≠ ``prod(hdr dims) × 8`` as **not present** (``_present`` /
+``--verify``) so the dataset re-fetches; and (c) **unlinks** a previously-truncated
+``.cfl`` before re-streaming it.
 
 No manifest regeneration is needed for this fix: the manifest already lists
 ``v05`` (its ``shape`` comes from the intact ``.hdr``; only the ``.cfl`` payload
@@ -859,15 +836,14 @@ The ``.cfl`` files are streamed **directly** into ``<id>/raw`` (no archive), so
 bundles and already fails loud on a truncated ``.zip`` (``BadZipFile``).
 
 **"A byte-level check says OK but the loader still raises"** — these disagree only
-when they read **different files**. ``inspect_bart.py`` historically globbed a
-hard-coded ``--root`` directory, but the loader resolves each ``.cfl`` from the
-**index manifest** (``data.index_path`` → ``data_root / relative_path``). A
-re-fetched ``raw/v05.cfl`` can pass the directory glob while the manifest still
-points the loader at a stale copy (or a missing/renamed file). Use the
-paths the ``BartDataset`` index actually reads, rather than globbing the
-directory. Per record the useful verdicts are ``OK`` / ``MISMATCH`` (the loader
-will raise ``ValueError``) / ``MISSING-CFL`` (``FileNotFoundError``) /
-``TRAILING-BYTES``.
+when they read **different files**. A check that globs a directory sees whatever
+is on disk, but the loader resolves each ``.cfl`` from the **index manifest**
+(``data.index_path`` → ``data_root / relative_path``). A re-fetched
+``raw/v05.cfl`` can pass the directory glob while the manifest still points the
+loader at a stale copy (or a missing/renamed file). Use the paths the
+``BartDataset`` index actually reads, rather than globbing the directory. Per
+record the useful verdicts are ``OK`` / ``MISMATCH`` (the loader will raise
+``ValueError``) / ``MISSING-CFL`` (``FileNotFoundError``) / ``TRAILING-BYTES``.
 
 The verdict mirrors ``io_strategies.BartCflStrategy`` exactly: ``np.fromfile``
 *floors* trailing bytes, so the loader raises iff ``(st_size // 8) !=
@@ -877,12 +853,10 @@ stricter byte-perfect ``ok``. Path resolution also mirrors the loader's
 reads ``<base>.cfl``): a manifest record may carry either the BART bare basename
 ``relative_path: "v05"`` or the explicit ``"v05.cfl"`` — both resolve to the same
 ``<data_root>/v05.cfl`` the loader reads, so a bare-basename manifest is **not**
-falsely flagged ``MISSING-CFL`` (the 2026-06-22 cluster false-positive: the real
-``v05.cfl`` was present and the loader loaded fine, but the inspector had
-literal-matched ``<data_root>/v05``). If manifest mode reports ``MISMATCH`` /
+falsely flagged ``MISSING-CFL``. If manifest mode reports ``MISMATCH`` /
 ``MISSING-CFL`` while a bare glob is clean, the manifest genuinely points at a
 **stale/truncated/missing** payload — re-fetch it or regenerate the manifest
-(above). Pinned by ``tests/unit/data/test_inspect_bart.py``.
+(above).
 
 On a non-clean verdict the dataset id is recoverable from the manifest's own
 ``data_root`` (``.../external/<id>/raw``) or an explicit ``dataset_name`` key,
@@ -899,7 +873,7 @@ crashing. Re-fetch restores the file; regenerate drops it — pick by whether th
 record is recoverable.
 
 ``pairing_policy='ulf_source' produced 0 pairs … fields present = [5.0, 7.0]``
------------------------------------------------------------------------------
+------------------------------------------------------------------------------
 
 **Symptom**: an mrixfields ``ulf_source`` arm crashes at data-loader build with
 *"produced 0 pairs: no group matches the pinned field 0.1 T; fields present =
@@ -910,20 +884,21 @@ strengths (9 complete groups, each 0.1/1.5/3/5/7 T).
 last). The upstream train/val split is a flat contiguous record slice, so a
 90/10 cut put *every* 0.1 T source in train and left validation with only the
 top fields. ``ulf_source`` pins the 0.1 T source, so the val dataset matched
-nothing and fail-fasted. It is **not** a missing-data problem — the misleading
-"build/point at the full corpus" hint in older builds pointed the wrong way.
+nothing and fail-fasted. It is **not** a missing-data problem, so pointing the
+arm at a larger corpus will not help.
 
-**Fix** (``DatasetInstantiator._create_mrixfields``): re-split **group-aware**
-(on whole ``pairing_group`` groups) for *every* field-pinned policy —
-``multi_source``, ``ulf_source``, ``prior``, ``fixed_target`` — so each split
-keeps complete field groups and the pinned field is present in both. See
-``tests/unit/data/builders/test_dataset_instantiator.py``.
+**Resolution**: ``DatasetInstantiator._create_mrixfields`` splits
+**group-aware** (on whole ``pairing_group`` groups) for *every* field-pinned
+policy — ``multi_source``, ``ulf_source``, ``prior``, ``fixed_target`` — so each
+split keeps complete field groups and the pinned field is present in both.
 
-``No losses were built by LossBuilder. Training cannot proceed`` (ablation arms)
--------------------------------------------------------------------------------
+``No losses were built by LossBuilder`` (ablation arms)
+-------------------------------------------------------
 
 **Symptom**: an ablation arm (e.g. ``mrixfields_b*_ablate_*``) crashes at build
-with *"No losses were built by LossBuilder"*.
+with *"No losses were built by LossBuilder"*. The raise names the strategy it
+judged and both remedies; match on that leading phrase, not on the whole
+sentence.
 
 **Cause**: these strategies compute their objective **directly** (e.g.
 ``ScatteringBesovStrategy``); the declarative ``losses.image_losses`` list is only
@@ -938,37 +913,36 @@ ablation (the strategy still computes the real, ablated objective — the
 placeholder only satisfies the build gate). Mirror the ``metadata.baseline``
 parent's ``losses`` block exactly.
 
+**The placeholder is not the only route, but it is the one this family needs.**
+``LossBuilder.validate()`` accepts an empty stack from a strategy that declares it
+owns its *whole* objective — ``inline_losses`` set **and** ``folds_image_losses =
+False``. ``ScatteringBesovStrategy`` declares ``folds_image_losses = True``: it does
+consume the builder's image list, so it is not exempt and the placeholder stands.
+A strategy that declares neither is never exempt — silence is not a claim of
+ownership (#1918).
+
 ``Paired-NIfTI VAE trains HF→ULF (degradation) instead of autoencoding HF``
 ---------------------------------------------------------------------------
 
-**Symptom**: a ``dataset_type: nifti_paired`` stage-1 VAE (the two-stage LDM
-``stage1_vae_*`` arms) shows a **sharp HF** ``input`` and a **noisy ULF**
+**Symptom**: a ``dataset_type: nifti_paired`` stage-1 VAE in a two-stage LDM
+shows a **sharp HF** ``input`` and a **noisy ULF**
 ``target`` with the SAME shape but different statistics in its first-steps
 snapshot — the model is minimizing ``||Dec(Enc(HF)) − ULF||``, a degradation
 network, and its frozen decoder later emits low-field appearance that corrupts
 stage 2.
 
-**Root cause** (2026-07, pitfall #9): the mode name is ``<input>_to_<target>``,
-so ``hf_to_ulf`` is a genuine HF→ULF *translation* (input HF, target ULF), NOT an
-autoencoder. Earlier it *looked* like an autoencoder only because a depth-0 patch
-bug made the ULF target shape-mismatch, tripping a silent ``vae.py`` fallback that
-substituted ``target = input``. When ``slice_2d`` + ``sampler.type: full`` fixed
-the patch bug, input and target became the same shape, the fallback stopped
-firing, and the arm silently trained the wrong direction.
+**Root cause**: the mode name is ``<input>_to_<target>``, so ``hf_to_ulf`` is a
+genuine HF→ULF *translation* (input HF, target ULF), NOT an autoencoder.
 
-**Fix**: two new single-field autoencode modes, ``hf_to_hf`` and ``ulf_to_ulf``,
-which DROP the opposite arm (``target_path`` → ``None`` so the self-supervised
-branch aliases ``target = input``) — ``input ≡ target`` by construction. The
-silent ``vae.py`` shape-mismatch fallback is REMOVED; a missing/mismatched target
-now **raises**. A ``ConfigHealthChecker`` rule
+**Fix**: use one of the single-field autoencode modes, ``hf_to_hf`` or
+``ulf_to_ulf``, which DROP the opposite arm (``target_path`` → ``None`` so the
+self-supervised branch aliases ``target = input``) — ``input ≡ target`` by
+construction. A missing or mismatched target **raises** rather than silently
+substituting the input. A ``ConfigHealthChecker`` rule
 (``check_vae_pretrain_autoencodes_single_field``) rejects a ``vae_pretrain`` arm
-on paired data that declares a translation direction. Set the stage-1 arms to
-``data.bidirectional_mode: hf_to_hf``. ``hf_to_ulf`` remains valid as a real
-bidirectional-translation direction. Pinned by
-``tests/unit/data/builders/test_dataset_instantiator.py`` (``_autoencode_field`` +
-the ``_create_nifti_universal`` hf_to_hf / ulf_to_ulf / missing-target cases),
-``tests/unit/data/test_hf_to_hf_autoencode.py`` (end-to-end input≡target), and
-``tests/unit/infrastructure/training/strategies/test_vae.py`` (the raise).
+on paired data that declares a translation direction. Set a stage-1 VAE to
+``data.bidirectional_mode: hf_to_hf``; ``hf_to_ulf`` remains valid as a real
+bidirectional-translation direction.
 
 
 ``Manifest not found: data/manifests/train.pkl``
@@ -1079,11 +1053,37 @@ come from applying non-symmetric augmentations in k-space. Use:
 
    kspace = kspace + torch.conj(torch.flip(kspace, dims=[-2, -1])) * 0.5
 
+Metrics are logged but no validation image is ever saved
+--------------------------------------------------------
+
+Symptom: ``val_psnr`` and ``val_ssim`` appear every pass, while the log carries
+``[ImageLogging] visual_samples was never captured`` and, after three passes,
+``consecutive validation passes saved NO image`` with a ``Last capture error``.
+
+Root cause: the image is rendered by a second forward in ``_run_validation``,
+separate from ``validation_step``, and that forward runs on the context
+:func:`spectramr.pipelines.train.visual_capture_inputs` builds. Unless the
+strategy supplies one, that context is bare (``use_dc``, ``measured_kspace=None``,
+the field conditioning) and the tensors pass through ``_prepare_validation_data``.
+A strategy whose ``_validation_forward`` needs the batch's mask, measurement or
+coil maps raises there, and the capture drops the image. The multi-coil EI
+operator and SSDU did this (#2431). Preparing the tensors is not safe for such a
+strategy either: with ``model.in_channels: 2``, a ``(2, 8, H, W)`` four-coil input
+is read as a ``(C, H, W, D)`` volume and permuted to ``(256, 2, 8, 256)``.
+
+Fix: have the strategy's ``validation_batch_context(input, target, batch)``
+return the context its ``validation_step`` grades on. A
+``ReconstructionTrainingStrategy`` subclass only sets
+``validates_on_batch_context = True``, which builds the context with
+``_prepare_batch_context(..., batch=batch)`` aligned to the input layout.
+``validation_step`` must read the same hook. When the hook answers, the capture
+renders on the unprepared tensors ``validation_step`` graded, so the saved image
+is the prediction the metrics scored.
+
 Validation REAL image is a centre-bright blob; FAKE is black; ``val_psnr`` NaN
 ------------------------------------------------------------------------------
 
-Symptom (smoke audit 2026-06-13, VF cohort exp_p3 / hyper_mamba_meta /
-method_c): the saved ``metrics/real_images`` panel renders as a centre-bright
+Symptom: the saved ``metrics/real_images`` panel renders as a centre-bright
 **k-space** blob instead of a brain, the ``fake_images`` panel is black, and
 ``val_psnr`` is ``NaN``.
 
@@ -1108,10 +1108,9 @@ The seam's domain decision is delegated to
 **not** a raw ``dataset_type == "kspace"`` check — because
 ``coil_processing_mode: rss_image`` / ``magnitude`` already IFFT inside the
 dataset's TorchIO pipeline, so those arms read ``dataset_type: kspace`` yet
-deliver an *image*. A naive guard would re-FFT that image into k-space (the
-mirror-image regression). The seam is therefore a no-op for ``rss_image`` arms
-(exp_p2, eval_c2/c3/c7, exp_c4) and only IFFTs the genuinely k-space-delivering
-``svd`` arms.
+deliver an *image*. A naive guard would re-FFT that image into k-space. The seam
+is therefore a no-op for ``rss_image`` arms and only IFFTs the genuinely
+k-space-delivering ``svd`` arms.
 
 Config half of the fix: an ``svd`` arm must keep the complex pair so the seam
 has an imaginary half to invert — set ``data.target_channels: 2`` (not ``1``,
@@ -1119,7 +1118,7 @@ which strips phase and leaves a single real channel the IFFT cannot use).
 
 ``ConcreteVirtualFiducialStrategy`` and ``IBVFStrategy`` carry an equivalent
 inline guard; the SE3-navigator, motion-meta, distillation and Bloch-manifold
-strategies now route through the shared base seam.
+strategies route through the shared base seam.
 
 
 Strategy-Specific Issues
@@ -1135,7 +1134,7 @@ Invoke with ``--resume`` on a pre-trained checkpoint:
 
    python -m spectramr.cli predict \
        --model checkpoints/hypermamba_best.safetensors \
-       --config experiments/training/exp_tto.yaml
+       --config experiments/<paradigm>/<your-arm>.yaml
 
 Diffusion: ``prediction quality degrades after 500 steps``
 ------------------------------------------------------------
@@ -1156,12 +1155,12 @@ Diffusion denoiser ignores the measurement (measurement-independent output)
 Standard image-domain diffusion noises the **target** and trains the denoiser
 to invert that noise — the low-res / ULF **input is never fed to the model**, so
 the network must hallucinate a specific subject from pure noise. The result is a
-measurement-independent solution (pitfall #20): the reconstruction does not
+measurement-independent solution: the reconstruction does not
 depend on the actual acquisition, and PSNR/SSIM against a fixed validation set
 can look plausible while the model has learned a prior, not a reconstruction.
 
-This bit ``exp_hm_09_hld_mamba`` (``in_channels: 1``, no conditioning path). To
-condition the denoiser on the measurement, set ``condition_on_input`` and give
+This affects any diffusion arm with ``in_channels: 1`` and no conditioning
+path. To condition the denoiser on the measurement, set ``condition_on_input`` and give
 the model an extra input channel — the strategy concatenates the (resized) input
 onto the noised target along the channel axis:
 
@@ -1173,7 +1172,7 @@ onto the noised target along the channel axis:
      diffusion:
        condition_on_input: true
 
-The flag defaults to ``false`` (historical unconditional behaviour) and is a
+The flag defaults to ``false`` (unconditional) and is a
 no-op for cold/latent diffusion and when smaps were already concatenated. It is
 declared on ``DiffusionTrainingConfigSchema`` (``training.diffusion``) and read
 by ``DiffusionTrainingStrategy._maybe_condition_on_input``.
@@ -1191,73 +1190,6 @@ N2N requires at least 2 repetitions in the dataset. Verify:
      num_repetitions: 3
 
 
-Diagnostics round (2026-06-25): four genuine crash fixes
-========================================================
-
-Four arms in the ``tests_experiments`` diagnostics sweep crashed on genuine,
-locally-reproducible code paths (the rest were stale, data-absent, or
-GPU-repro-bound). Each fix lands with a regression test.
-
-``field_strength`` missing in validation (calibration / field-renderer arms)
-----------------------------------------------------------------------------
-
-Symptom (``mrixfields_b17_dice_risk_calibration``): trains fine, then every
-validation batch raises ``AnatomyFieldRenderer.forward() missing 1 required
-keyword-only argument: 'field_strength'`` → *zero successful validation batches*
-(CLAUDE.md #10).
-
-Root cause — the field-strength injection had been added to
-``ReconstructionMixin._prepare_generator_inputs_reconstruction``, but that method
-**has no callers**. The live forward seam used by both training and validation is
-``ReconstructionTrainingStrategy._prepare_generator_inputs``; ``_validation_forward``
-calls it, and it did not inject ``field_strength``. Training survived because the
-*loss* path injects it; validation did not. Fix: inject ``field_strength`` /
-``contrast_id`` (signature-gated via ``_callable_accepts_kwarg``, target field
-preferred, never defaulted) into the **live** method. ``xfield_fm_strategy`` is
-unaffected — its override re-sets the field after ``super()``.
-
-``[DomainMismatch] Model outputs N channels, but target provided 1``
---------------------------------------------------------------------
-
-Symptom (``mrixfields_b29_heteroscedastic_ulf``): crash at iter 1 — the model
-emits 2 channels (``[mean, logvar]``) for a 1-channel target and the base
-``train_step`` width guard rejects it.
-
-Root cause — distributional / parametric heads emit more channels than the target
-**by design** and self-compute the likelihood, but the guard only excepted the
-hard-coded ``model_type == "evidential_unet"``. Fix: an Open-Closed
-``predicts_distribution_params`` class flag on ``BaseTrainingStrategy`` (set
-``True`` on ``HeteroscedasticULFStrategy``); the guard defers when it is set. Also
-covers ``b29_ablate_var_prior`` (same strategy + ``out_channels: 2``).
-
-``quantile() input tensor is too large`` (digital twin, multi-coil)
--------------------------------------------------------------------
-
-Symptom (``exp_vf_ib_infonce_v2``): ``RuntimeError: quantile() input tensor is too
-large`` in ``CornerFiducialEmbedder.forward`` — ``torch.quantile`` refuses a
-reduced dim above ``2**24``.
-
-Root cause — the single-coil and per-channel branches already used the
-``_robust_quantile`` guard (strided decimation below the cap), but the
-**multi-coil RSS branch** still called raw ``torch.quantile(rss.float(), 0.75)``.
-A 3-D/5-D coil volume tips it over the cap. Fix: route that branch through
-``_robust_quantile`` too.
-
-UNet output 4 px short of target (non-divisible input)
-------------------------------------------------------
-
-Symptom (``mrixfields_b25_cartoon_texture``): ``The size of tensor a (432) must
-match b (436)`` in the L1 loss — model output is 432 wide, target 436.
-
-Root cause — a ``W=436`` input floors through the strided encoder
-(``436 → 27 → ... → 432``). The UNet **deep-supervision** branch interpolates the
-output back to ``(input_height, input_width)``, but the standard (non-deep)
-branch did not — violating the documented "output preserves input H, W" contract.
-Fix: the ``else`` branch now interpolates back to the input size (guarded, so the
-common divisible case is an exact no-op). Benefits every ``configurable_unet`` arm
-on a non-divisible input, not just the cartoon-texture one.
-
-
 Useful Debug Commands
 ======================
 
@@ -1269,16 +1201,13 @@ Useful Debug Commands
    # Smoke tests (quick sanity check)
    pytest tests/smoke/ -v --tb=short
 
-   # Complexity audit
-   radon cc src/ -s -a --min B
-
-   # Dead code detection
-   vulture src/ --min-confidence 80
+   # Pre-flight a config (schema + health checks, no GPU work)
+   spectramr audit my.yaml
 
    # Check manifest integrity
    python -c "
    import pickle
-   m = pickle.load(open('data/manifests/train.pkl','rb'))
+   m = pickle.load(open('<your-train-manifest>.pkl','rb'))
    print(f'{len(m)} samples, keys: {list(m[0].keys()) if m else []}')
    "
 

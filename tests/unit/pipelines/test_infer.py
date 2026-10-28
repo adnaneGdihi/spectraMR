@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import yaml as _yaml
 
+from spectramr.config.schemas.logging import LoggingConfigSchema
 from spectramr.domain.exceptions import (
     ConfigurationError,
     DataCorruptionError,
@@ -436,7 +437,7 @@ class TestInferBuildsThroughTheCanonicalBuilder:
 
     ``ModelBuilder`` is imported function-locally in ``infer.py`` (torch import
     cost), so the module-level binding these tests can see is
-    ``resolve_state_dict``; the builder itself is pinned by source guard, the
+    ``weights``; the builder itself is pinned by source guard, the
     idiom this module already uses for ``_load_input`` and the device contract.
     """
 
@@ -480,14 +481,27 @@ class TestInferBuildsThroughTheCanonicalBuilder:
     def test_pipeline_builds_through_model_builder(self) -> None:
         assert "ModelBuilder(config, device_obj)" in self._infer_src()
 
-    def test_pipeline_binds_the_shared_checkpoint_reader(self) -> None:
-        """Behavioural: the one reader is bound at module scope."""
+    def test_pipeline_binds_the_one_weight_reader(self) -> None:
         import spectramr.pipelines.infer as infer_mod
 
-        assert hasattr(infer_mod, "resolve_state_dict"), (
-            "infer.py still carries its own envelope vocabulary; it knew only "
-            "`model_state_dict` and otherwise loaded the whole envelope (#1310)"
-        )
+        assert infer_mod.weights.__module__ == "spectramr.infrastructure.checkpointing.restore"
+
+    @staticmethod
+    def _weights_calls(src: str) -> list[tuple[object, object]]:
+        """``(part, policy)`` of every ``weights(...)`` call, read off the AST."""
+        import ast
+
+        calls = []
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "weights":
+                part = node.args[1].value if len(node.args) > 1 else None
+                policy = next((k.value.value for k in node.keywords if k.arg == "policy"), None)
+                calls.append((part, policy))
+        return calls
+
+    def test_pipeline_loads_the_generator_part_exactly(self) -> None:
+        """Predict scores the trained generator, all of it: neither the EMA shadow nor a partial load."""
+        assert self._weights_calls(self._infer_src()) == [("generator", "exact")]
 
 
 class TestAccelerationConfigReachesTheModel:
@@ -572,8 +586,11 @@ class TestAccelerationConfigReachesTheModel:
         assert generator._output_kspace_clip_ratio is not None, (
             "arm no longer sets output_kspace_clip_ratio; #1306 needs it"
         )
-        assert generator._kspace_log_scaled is config.data.processing.enable_log_scaling, (
-            "kspace_log_scaled must mirror data.processing.enable_log_scaling"
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        compressed = KSpaceNormalizationSpec.from_data_config(config.data).log_compressed
+        assert generator._kspace_log_scaled is compressed, (
+            "kspace_log_scaled must mirror KSpaceNormalizationSpec.log_compressed"
         )
 
 
@@ -969,7 +986,8 @@ class TestFailuresAreClassifiedByBlastRadius:
 
         monkeypatch.setattr(infer_mod, "_process_single_file", _stub)
         files = [Path(f"case_{i}.h5") for i in range(n_files)]
-        infer_mod._process_all_files(files, Path("/out"), None, None, None, None, 1, results)
+        config = SimpleNamespace(logging=LoggingConfigSchema())
+        infer_mod._process_all_files(files, Path("/out"), None, None, None, config, 1, results)
         return seen
 
     def test_a_run_invariant_fault_aborts_on_the_first_file(self, monkeypatch) -> None:
@@ -1022,7 +1040,7 @@ class TestFailuresAreClassifiedByBlastRadius:
                 None,
                 None,
                 None,
-                None,
+                SimpleNamespace(logging=LoggingConfigSchema()),
                 1,
                 self._results(),
             )
@@ -1151,7 +1169,7 @@ class TestInferEmitsTheReportArtifactContract:
                 MockModel(),
                 _Strategy(),
                 torch.device("cpu"),
-                SimpleNamespace(),
+                SimpleNamespace(model=SimpleNamespace(model_type="unet", model_kwargs={})),
                 batch_size=2,
                 results={"outputs": [], "num_processed": 0},
                 evaluator=_Spy(),
@@ -1197,111 +1215,6 @@ class TestInferEmitsTheReportArtifactContract:
         assert 'results["metrics_skipped"]' in src
 
 
-# ---- resolve_inference_settings: the artifact beside the checkpoint wins (2026-09-03, #1379) ----
-
-
-class TestResolveInferenceSettings:
-    @staticmethod
-    def _reference_yaml():
-        import pathlib
-
-        import spectramr.config.schemas as _schemas
-
-        return pathlib.Path(_schemas.__file__).parent / "templates" / "v1.0_reference.yaml"
-
-    @staticmethod
-    def _run_dir_with_artifact(tmp_path, yaml_path):
-        from spectramr.config.settings import TrainingSettings
-        from spectramr.infrastructure.validation.resolved_config_artifact import (
-            write_resolved_config,
-        )
-
-        run = tmp_path / "run"
-        run.mkdir()
-        write_resolved_config(run, TrainingSettings.from_yaml(str(yaml_path)), run_id="t")
-        ckpt = run / "best.pt"
-        ckpt.write_bytes(b"")
-        return ckpt
-
-    def test_artifact_beside_the_checkpoint_wins_over_the_yaml(self, tmp_path):
-        from spectramr.pipelines.infer import resolve_inference_settings
-
-        yaml_path = self._reference_yaml()
-        ckpt = self._run_dir_with_artifact(tmp_path, yaml_path)
-        settings, source = resolve_inference_settings(yaml_path, ckpt)
-        assert source["kind"] == "resolved_config" and source["path"].endswith(
-            "resolved_config.json"
-        )
-        assert "diverging_blocks" not in source
-        assert settings.model.model_type
-
-    def test_from_yaml_forces_the_yaml(self, tmp_path):
-        from spectramr.pipelines.infer import resolve_inference_settings
-
-        yaml_path = self._reference_yaml()
-        ckpt = self._run_dir_with_artifact(tmp_path, yaml_path)
-        _, source = resolve_inference_settings(yaml_path, ckpt, from_yaml=True)
-        assert source["kind"] == "yaml" and source["resolved_config"] is not None
-
-    def test_neither_source_raises_with_guidance(self, tmp_path):
-        from spectramr.pipelines.infer import resolve_inference_settings
-
-        ckpt = tmp_path / "best.pt"
-        ckpt.write_bytes(b"")
-        with pytest.raises(FileNotFoundError, match="resolved_config.json"):
-            resolve_inference_settings(None, ckpt)
-        with pytest.raises(FileNotFoundError, match="--from-yaml was set"):
-            resolve_inference_settings(None, ckpt, from_yaml=True)
-
-    def test_a_disagreeing_yaml_is_reported_not_used(self, tmp_path, caplog):
-        import logging
-
-        import yaml as _yaml
-
-        from spectramr.pipelines.infer import resolve_inference_settings
-
-        yaml_path = self._reference_yaml()
-        ckpt = self._run_dir_with_artifact(tmp_path, yaml_path)
-        doc = _yaml.safe_load(yaml_path.read_text())
-        doc["optimization"]["optimizer"]["learning_rate"] = 0.31337
-        other = tmp_path / "other.yaml"
-        other.write_text(_yaml.safe_dump(doc, sort_keys=False))
-        with caplog.at_level(logging.WARNING):
-            settings, source = resolve_inference_settings(other, ckpt)
-        assert source["kind"] == "resolved_config"
-        assert "optimization" in source["diverging_blocks"]
-        assert settings.optimization.optimizer.learning_rate != 0.31337
-        assert any("disagree" in r.message for r in caplog.records)
-
-    def test_an_artifact_without_the_declared_block_yields_to_the_yaml(self, tmp_path, caplog):
-        """Every run directory written before the block: the documented
-        ``infer --config`` command keeps working, and the source says why."""
-        import json
-        import logging
-
-        from spectramr.pipelines.infer import _describe_inference_source, resolve_inference_settings
-
-        run = tmp_path / "run"
-        run.mkdir()
-        (run / "resolved_config.json").write_text(
-            json.dumps({"model": {"model_type": "unet"}, "_ledger": {}})
-        )
-        ckpt = run / "best.pt"
-        ckpt.write_bytes(b"")
-        yaml_path = self._reference_yaml()
-        with caplog.at_level(logging.WARNING):
-            settings, source = resolve_inference_settings(yaml_path, ckpt)
-        assert source["kind"] == "yaml" and source["resolved_config_predates_declared"] is True
-        assert settings.model.model_type
-        assert any("predates" in r.message for r in caplog.records)
-        assert (
-            _describe_inference_source(yaml_path, ckpt, False)["resolved_config_predates_declared"]
-            is True
-        )
-        with pytest.raises(FileNotFoundError, match="predates"):
-            resolve_inference_settings(None, ckpt)
-
-
 # ---------------------------------------------------------------------------
 # physics.data_consistency.apply_at_predict: what the pipeline attaches
 # ---------------------------------------------------------------------------
@@ -1318,7 +1231,10 @@ class TestPredictDataConsistencyInputs:
 
     @staticmethod
     def _config(dataset_type="kspace"):
-        return SimpleNamespace(data=SimpleNamespace(dataset_type=dataset_type))
+        return SimpleNamespace(
+            data=SimpleNamespace(dataset_type=dataset_type),
+            model=SimpleNamespace(model_type="unet", model_kwargs={}),
+        )
 
     @staticmethod
     def _h5(tmp_path, with_mask: bool, n_slices: int = 2):
@@ -1464,3 +1380,343 @@ class TestPredictDataConsistencyInputs:
         assert (
             '"data_consistency_at_predict": results["data_consistency_at_predict"]' in summary_call
         )
+
+
+class TestPredictAcquiredLines:
+    """A line-axis arm gets its acquired support from the file's ISMRMRD limits (#2572)."""
+
+    HEADER = (
+        '<ismrmrdHeader xmlns="http://www.ismrm.org/ISMRMRD"><encoding><encodingLimits>'
+        "<kspace_encoding_step_1><minimum>1</minimum><maximum>6</maximum>"
+        "</kspace_encoding_step_1></encodingLimits></encoding></ismrmrdHeader>"
+    )
+
+    @classmethod
+    def _h5(cls, tmp_path, header: str | None):
+        h5py = pytest.importorskip("h5py")
+
+        p = tmp_path / "scan.h5"
+        with h5py.File(p, "w") as f:
+            f["kspace"] = [0.0]
+            if header is not None:
+                f["ismrmrd_header"] = header
+        return p
+
+    def test_an_arm_without_a_line_axis_is_untouched_and_never_opens_the_file(self, tmp_path):
+        from spectramr.pipelines import infer as infer_mod
+
+        for strategy in (SimpleNamespace(), SimpleNamespace(acquisition_line_dim=None)):
+            assert (
+                infer_mod._predict_acquired_lines(
+                    strategy, tmp_path / "never_read.h5", torch.zeros(2, 2, 8, 8)
+                )
+                is None
+            )
+
+    @pytest.mark.parametrize(("dim", "rows"), [(-2, 8), (-1, 8)])
+    def test_the_support_is_the_header_range_for_every_row(self, tmp_path, dim, rows):
+        from spectramr.pipelines import infer as infer_mod
+
+        p = self._h5(tmp_path, self.HEADER)
+        lines = infer_mod._predict_acquired_lines(
+            SimpleNamespace(acquisition_line_dim=dim), p, torch.zeros(3, 2, 8, 8)
+        )
+        assert tuple(lines.shape) == (3, rows)
+        assert lines[0].nonzero().flatten().tolist() == [1, 2, 3, 4, 5, 6]
+
+    def test_an_m4raw_count_header_resolves_through_the_data_lines(self, tmp_path):
+        """maximum is the COUNT (4); the file's data occupies columns 2..5, which is the support."""
+        from spectramr.pipelines import infer as infer_mod
+
+        header = self.HEADER.replace("<minimum>1</minimum>", "<minimum>0</minimum>").replace(
+            "<maximum>6</maximum>", "<maximum>4</maximum>"
+        )
+        p = self._h5(tmp_path, header)
+        tensor = torch.zeros(3, 2, 8, 8)
+        tensor[..., 2:6] = 1.0
+        lines = infer_mod._predict_acquired_lines(
+            SimpleNamespace(acquisition_line_dim=-1), p, tensor
+        )
+        assert tuple(lines.shape) == (3, 8)
+        assert lines[0].nonzero().flatten().tolist() == [2, 3, 4, 5]
+
+    def test_missing_limits_raise_naming_file_and_key(self, tmp_path):
+        from spectramr.data.ismrmrd_limits import EncodingLimitsUnavailableError
+        from spectramr.pipelines import infer as infer_mod
+
+        p = self._h5(tmp_path, None)
+        with pytest.raises(EncodingLimitsUnavailableError, match=r"scan\.h5.*ismrmrd_header"):
+            infer_mod._predict_acquired_lines(
+                SimpleNamespace(acquisition_line_dim=-2), p, torch.zeros(1, 2, 8, 8)
+            )
+
+    def test_process_single_file_hands_each_batch_its_slice_of_the_support(
+        self, tmp_path, monkeypatch
+    ):
+        from spectramr.pipelines import infer as infer_mod
+
+        seen: list[dict] = []
+
+        class _Strategy:
+            predict_dc = None
+            acquisition_line_dim = -2
+
+            def infer_single(self, batch, **kwargs):
+                seen.append({"batch": batch, **kwargs})
+                return batch
+
+        p = self._h5(tmp_path, self.HEADER)
+        # Data only on lines 1..6, the header's range: dense data outside it contradicts the header.
+        data = torch.zeros(3, 2, 8, 8)
+        data[:, :, 1:7, :] = torch.rand(3, 2, 6, 8)
+        monkeypatch.setattr(infer_mod, "_load_input", lambda f, d: data)
+        monkeypatch.setattr(infer_mod, "_preprocess_tensor", lambda t, c, d, m: t)
+        monkeypatch.setattr(infer_mod, "_save_output", lambda *a, **k: None)
+        infer_mod._process_single_file(
+            p,
+            tmp_path,
+            MockModel(),
+            _Strategy(),
+            torch.device("cpu"),
+            SimpleNamespace(
+                data=SimpleNamespace(dataset_type="kspace"),
+                model=SimpleNamespace(model_type="unet", model_kwargs={}),
+            ),
+            batch_size=2,
+            results={"outputs": [], "num_processed": 0},
+        )
+        assert [tuple(s["measured_lines"].shape) for s in seen] == [(2, 8), (1, 8)]
+
+
+def test_the_run_stamps_what_predict_did_to_kspace() -> None:
+    """Result dict (before and after the loop) and run summary carry the k-space stamp (#2581)."""
+    import inspect
+
+    from spectramr.pipelines import infer as infer_mod
+
+    src = inspect.getsource(infer_mod.run_inference_pipeline)
+    assert src.count('results["kspace_at_predict"] = kspace.provenance()') == 2
+    summary_call = src[src.index("write_inference_run_summary(") :]
+    assert '"kspace_at_predict": results["kspace_at_predict"]' in summary_call
+    loop_call = src[src.index("_process_all_files(") :]
+    assert "kspace," in loop_call[: loop_call.index(")")]
+
+
+def test_a_strategy_that_owns_normalisation_gets_the_volume_scale() -> None:
+    """``_process_single_file`` hands each batch its slice of one per-volume scale."""
+    from types import SimpleNamespace
+
+    from spectramr.pipelines.infer import _volume_kspace_scale
+
+    calls = {}
+
+    class _Owner:
+        owns_kspace_normalization = True
+
+        def volume_kspace_scale(self, volume, *, per_slice):
+            calls["per_slice"] = per_slice
+            return torch.arange(len(volume), dtype=torch.float32)
+
+    config = SimpleNamespace(data=SimpleNamespace(slice_level_records=True))
+    scale = _volume_kspace_scale(_Owner(), torch.zeros(3, 2, 4, 4), config)
+    assert scale.tolist() == [0.0, 1.0, 2.0] and calls["per_slice"] is True
+    # Planted: a strategy the pipeline normalises for gets nothing here.
+    assert _volume_kspace_scale(SimpleNamespace(), torch.zeros(3, 2, 4, 4), config) is None
+
+
+def test_the_volume_scale_is_consumed_before_the_cold_reverse_path() -> None:
+    """#2878's per-batch ``kspace_scale`` stops in ``infer``; ``run_inference`` refuses it.
+
+    Driven through ``_process_single_file`` with the real cold-diffusion strategy and
+    ``PredictKSpace``, as the pipeline runs them. The planted half shows the guard the
+    pop protects: the reverse path raises on a kwarg it does not read.
+    """
+    from spectramr.infrastructure.inference.cold_diffusion_inference_strategy import (
+        ColdDiffusionInferenceStrategy,
+    )
+    from spectramr.infrastructure.inference.predict_kspace import PredictKSpace
+    from spectramr.pipelines import infer as infer_mod
+
+    class _Generator(nn.Module):
+        num_timesteps = 8
+        _dc_method = "hard"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer = nn.Linear(1, 1)
+            self.calls: list[dict] = []
+
+        def sample(self, measurement, mask=None, inference_timesteps=None, **kwargs):
+            self.calls.append(kwargs)
+            return measurement
+
+    data = {"normalize_kspace": True, "kspace_percentile": 0.99, "dataset_type": "kspace"}
+    strategy = ColdDiffusionInferenceStrategy(
+        _Generator(), torch.device("cpu"), {"training": {"diffusion": {"timesteps": 8}}, "data": data}
+    )
+    assert strategy.kspace_norm.enabled
+    config = SimpleNamespace(
+        data=SimpleNamespace(slice_level_records=False, **data),
+        validation=SimpleNamespace(scoring=SimpleNamespace(recorrupted_inference=None)),
+        model=SimpleNamespace(model_type="unet", model_kwargs={}),
+    )
+    seen: list[dict] = []
+    original = strategy.infer_single
+
+    def _spy(batch, **kwargs):
+        seen.append(kwargs)
+        return original(batch, **kwargs)
+
+    strategy.infer_single = _spy
+    tensor = torch.rand(3, 2, 8, 8)
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(infer_mod, "_load_input", lambda f, d: tensor)
+        mp.setattr(infer_mod, "_preprocess_tensor", lambda t, c, d, m: t)
+        mp.setattr(infer_mod, "_save_output", lambda *a, **k: None)
+        results = {"outputs": [], "num_processed": 0}
+        infer_mod._process_single_file(
+            Path("scan.npy"),
+            Path("."),
+            strategy.model,
+            strategy,
+            torch.device("cpu"),
+            config,
+            2,
+            results,
+            None,
+            PredictKSpace(config, strategy),
+        )
+    finally:
+        mp.undo()
+    assert results["num_processed"] == 1
+    assert [tuple(kw["kspace_scale"].shape) for kw in seen] == [(2,), (1,)]
+    assert len(strategy.model.calls) == 2
+    assert all("kspace_scale" not in call for call in strategy.model.calls)
+    with pytest.raises(TypeError, match="kspace_scale"):
+        strategy.run_inference(tensor[:1], kspace_scale=torch.ones(1))
+
+
+class TestSaveOutputFollowsTheDeclaredDomain:
+    """``_save_output`` inverse-transforms only a declared k-space output.
+
+    Planted shape: an image-domain model emitting ``[1, 2, H, W]`` real/imag (the
+    FDB baseline). The channel-parity rule treated it as k-space and saved
+    ``|IFFT(image)|``, a cross-hair with a dark centre.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, output, output_is_kspace, tier=1):
+        import spectramr.data.writers.output_writer as writer_mod
+        import spectramr.infrastructure.training.utils.domain_inference as dom
+        from spectramr.pipelines import infer as infer_mod
+
+        captured = {}
+
+        class _Writer:
+            def __init__(self, config, output_dir):
+                pass
+
+            def write(self, tensor, subject_id, file_id):
+                captured["tensor"] = tensor
+                return []
+
+        monkeypatch.setattr(writer_mod, "OutputWriter", _Writer)
+        domain = "kspace" if output_is_kspace else "image"
+        monkeypatch.setattr(
+            dom, "resolve_output_domain", lambda cfg: dom.OutputDomainDecision(domain, tier)
+        )
+        cfg = SimpleNamespace(
+            data=SimpleNamespace(resolve_mode=lambda m: None),
+            model=SimpleNamespace(model_type="unet"),
+        )
+        infer_mod._save_output(output, tmp_path / "x.h5", tmp_path, cfg, torch.device("cpu"))
+        return captured["tensor"]
+
+    def test_image_output_is_saved_untransformed(self, monkeypatch, tmp_path) -> None:
+        out = torch.randn(1, 2, 8, 8)
+        saved = self._run(monkeypatch, tmp_path, out, output_is_kspace=False)
+        assert torch.equal(saved, out[0])
+
+    def test_kspace_output_is_inverse_transformed(self, monkeypatch, tmp_path) -> None:
+        out = torch.randn(1, 2, 8, 8)
+        saved = self._run(monkeypatch, tmp_path, out, output_is_kspace=True)
+        assert saved.shape == (1, 8, 8)
+        assert float(saved.min()) >= 0.0 and float(saved.max()) <= 1.0 + 1e-6
+
+    def test_odd_channel_declared_kspace_output_raises(self, monkeypatch, tmp_path) -> None:
+        with pytest.raises(ValueError, match="even count"):
+            self._run(monkeypatch, tmp_path, torch.randn(1, 3, 8, 8), output_is_kspace=True)
+
+    def test_odd_channel_guessed_kspace_output_is_saved_as_image(
+        self, monkeypatch, tmp_path, caplog
+    ) -> None:
+        """Tier 6 (loader serves k-space) guessed for an undeclared 1-channel image model."""
+        out = torch.randn(1, 1, 8, 8)
+        with caplog.at_level("WARNING", logger="spectramr.pipelines.infer"):
+            saved = self._run(monkeypatch, tmp_path, out, output_is_kspace=True, tier=6)
+        assert torch.equal(saved, out[0])
+        assert "model.target_domain" in caplog.text and "'unet'" in caplog.text
+
+
+class TestInferRefusesArmsWhoseInputIsBuiltInTheTrainingStep:
+    """SSDU and EI feed the network ``A^H y``; ``infer`` has no builder for it (planted arms)."""
+
+    _SS = Path("experiments/inprogress/self_supervised")
+
+    @pytest.mark.parametrize(
+        "arm",
+        ["ssdu_m4raw_r4", "robust_ssdu_m4raw_r4", "ei_multicoil_m4raw_r4", "ei_unet_m4raw_r4"],
+    )
+    def test_the_arm_is_refused_with_a_named_reason(self, arm):
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.pipelines.infer import _refuse_unservable_strategy
+
+        config = TrainingSettings.from_yaml(str(self._SS / f"{arm}.yaml"))
+        with pytest.raises(ConfigurationError, match="infer cannot serve"):
+            _refuse_unservable_strategy(config)
+
+    def test_an_image_domain_n2n_arm_is_not_refused(self):
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.pipelines.infer import _refuse_unservable_strategy
+
+        config = TrainingSettings.from_yaml(
+            "experiments/inprogress/n2n/n2n_a_r2r_single_ex_m4raw.yaml"
+        )
+        _refuse_unservable_strategy(config)
+
+
+def _contrast_config(model_type: str, num_contrasts: int, dataset_type: str, contrast_map=None):
+    return SimpleNamespace(
+        model=SimpleNamespace(model_type=model_type, model_kwargs={"num_contrasts": num_contrasts}),
+        data=SimpleNamespace(
+            dataset_type=dataset_type,
+            multi_contrast=SimpleNamespace(contrast_map=contrast_map or {}),
+        ),
+    )
+
+
+def test_predict_reads_the_m4raw_contrast_from_the_file_name() -> None:
+    from spectramr.pipelines.infer import _predict_contrast
+
+    cfg = _contrast_config("kspace_cold_diffusion", 3, "m4raw")
+    out = _predict_contrast(cfg, Path("m4raw_FLAIR_rep1.h5"), None)
+    assert out is not None and out.tolist() == [2]
+
+
+def test_predict_refuses_a_contrast_model_it_cannot_condition() -> None:
+    from spectramr.pipelines.infer import _predict_contrast
+
+    cfg = _contrast_config("kspace_cold_diffusion", 2, "kspace", {"CORPD_FBK": 0, "CORPDFS_FBK": 1})
+    with pytest.raises(ConfigurationError, match="--contrast-idx"):
+        _predict_contrast(cfg, Path("file1000123.h5"), None)
+    assert _predict_contrast(cfg, Path("file1000123.h5"), 1).tolist() == [1]
+
+
+def test_predict_contrast_is_not_asked_of_other_model_types() -> None:
+    from spectramr.pipelines.infer import _predict_contrast
+
+    cfg = _contrast_config("some_gan", 3, "m4raw")
+    assert _predict_contrast(cfg, Path("a_T1.h5"), None) is None
+    with pytest.raises(ConfigurationError):
+        _predict_contrast(cfg, Path("a_T1.h5"), 1)

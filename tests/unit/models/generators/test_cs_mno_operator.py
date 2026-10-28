@@ -138,7 +138,7 @@ def test_forward_squeezes_torchio_trailing_singleton_2d() -> None:
         n_layers=1, modes=4, dim=8, d_state=4, scan_mode="hilbert_2d",
     )
     y = m(torch.randn(2, 1, 16, 16, 1))
-    assert y.shape == (2, 1, 16, 16)
+    assert y.shape == (2, 1, 16, 16, 1)
 
 
 def test_forward_squeezes_pde_trailing_singletons_1d() -> None:
@@ -152,7 +152,18 @@ def test_forward_squeezes_pde_trailing_singletons_1d() -> None:
         n_layers=1, modes=4, dim=8, d_state=4, scan_mode="raster_1d",
     )
     y = m(torch.randn(2, 1, 32, 1, 1))
-    assert y.shape == (2, 1, 32)
+    assert y.shape == (2, 1, 32, 1, 1)
+
+
+def test_output_keeps_the_input_rank_for_the_metric() -> None:
+    """cs_mno_burgers: collation hands ``[B, 1, X, 1]`` for input and target, and
+    PSNR refused a ``[B, 1, X]`` prediction against that target."""
+    m = CSMNOOperator(
+        in_channels=1, out_channels=1, spatial_shape=(32,),
+        n_layers=1, modes=4, dim=8, d_state=4, scan_mode="raster_1d",
+    )
+    x = torch.randn(2, 1, 32, 1)
+    assert m(x).shape == x.shape
 
 
 def test_forward_does_not_squeeze_non_singleton_trailing_dim() -> None:
@@ -165,3 +176,57 @@ def test_forward_does_not_squeeze_non_singleton_trailing_dim() -> None:
     )
     with pytest.raises(ValueError, match="rank-2 spatial input"):
         m(torch.randn(2, 1, 16, 16, 4))
+
+
+_TINY = {"in_channels": 1, "out_channels": 1, "n_layers": 1, "modes": 2, "dim": 8, "d_state": 4}
+
+
+def test_fixed_resolution_arc_step_is_one_scalar_at_n_to_minus_1_over_d() -> None:
+    m = CSMNOOperator(
+        spatial_shape=(8, 8), scan_mode="hilbert_2d", arc_step="fixed_resolution", **_TINY
+    )
+    delta = m.delta_phys
+    assert delta.shape == (64,)
+    assert torch.allclose(delta, torch.full((64,), 1.0 / 8.0))
+
+
+def test_physical_arc_step_is_default_and_keeps_zero_first_token() -> None:
+    m = CSMNOOperator(spatial_shape=(8, 8), scan_mode="hilbert_2d", **_TINY)
+    assert m.arc_step == "physical"
+    assert m.delta_phys[0].item() == 0.0
+
+
+def test_arc_step_rejects_unknown_mode_and_inert_combination() -> None:
+    with pytest.raises(ValueError, match="arc_step must be one of"):
+        CSMNOOperator(spatial_shape=(8, 8), scan_mode="hilbert_2d", arc_step="learned", **_TINY)
+    with pytest.raises(ValueError, match="only applies with use_physical_arc=True"):
+        CSMNOOperator(
+            spatial_shape=(8, 8),
+            scan_mode="hilbert_2d",
+            use_physical_arc=False,
+            arc_step="fixed_resolution",
+            **_TINY,
+        )
+
+def test_grad_checkpointing_matches_plain_forward_and_grads() -> None:
+    """Checkpointing recomputes layer interiors; outputs and grads must not change."""
+    m = CSMNOOperator(
+        in_channels=1, out_channels=1, spatial_shape=(16, 16),
+        n_layers=2, modes=4, dim=8, d_state=4,
+    )
+    m.train()
+    x = torch.randn(2, 1, 16, 16)
+
+    y_ref = m(x)
+    y_ref.sum().backward()
+    g_ref = [p.grad.clone() for p in m.parameters() if p.grad is not None]
+
+    m.zero_grad()
+    m.set_grad_checkpointing(True)
+    y = m(x)
+    y.sum().backward()
+    g = [p.grad.clone() for p in m.parameters() if p.grad is not None]
+
+    assert torch.allclose(y, y_ref, atol=1e-5)
+    assert len(g) == len(g_ref)
+    assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(g, g_ref, strict=True))

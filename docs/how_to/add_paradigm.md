@@ -103,31 +103,20 @@ STRATEGY_CLASS_PATHS = {
 
 Then open
 [`src/spectramr/config/validation_constants.py`](https://github.com/adnaneGdihi/spectramr/blob/main/src/spectramr/config/validation_constants.py)
-and add matching entries to **both**:
-
-- `VALID_TRAINING_MODES` (set of allowed `training.training_mode` values)
-- `TRAINING_MODE_CONSTRAINTS` (per-mode required fields)
+and add the mode to `VALID_TRAINING_MODES` (the set of allowed
+`training.training_mode` values):
 
 ```python
 VALID_TRAINING_MODES = frozenset({..., "my_paradigm"})
-
-TRAINING_MODE_CONSTRAINTS = {
-    ...,
-    "my_paradigm": {
-        # any field you require — e.g. paired data:
-        "data.dataset_type": {"nifti_paired"},
-    },
-}
 ```
 
-**Why three places?**
+**Why two places?**
 - `STRATEGY_CLASS_PATHS` does runtime import — Pydantic doesn't see it.
 - `VALID_TRAINING_MODES` lives in the Pydantic v2 schema and rejects
   unknown YAML values at load time.
-- `TRAINING_MODE_CONSTRAINTS` declares additional cross-field invariants
-  the audit ladder enforces.
 
-A regression test ensures these three lists never drift. See
+Fields the strategy needs are the strategy's to check: raise in its builder
+when one is missing. A regression test ensures the two lists never drift. See
 [`tests/unit/registration/test_breakthrough_components_registered.py`](https://github.com/adnaneGdihi/spectramr/blob/main/tests/unit/registration/test_breakthrough_components_registered.py)
 for the pattern.
 
@@ -204,14 +193,14 @@ spectramr audit experiments/inprogress/<paradigm>/<arm>.yaml
 ```
 
 Tier 0+1 takes ~100 ms; add `--probe` for the Tier 2 synthetic forward pass.
-See the [audit ladder](../explanation/audit_ladder.md) for what each tier checks.
+See the [audit ladder](../audit_ladder_user_guide.rst) for what each tier checks.
 
 ### 4. Land tests + docs
 
 Two files, both required by [CONTRIBUTING.md](https://github.com/adnaneGdihi/spectramr/blob/main/CONTRIBUTING.md):
 
 ```
-tests/unit/infrastructure/training/test_my_paradigm_strategy.py
+tests/unit/infrastructure/training/test_<your_paradigm>_strategy.py
 docs/how_to/<your_topic>.md  (or extend an existing page)
 ```
 
@@ -232,7 +221,6 @@ A worked-out example is
 |---|---|---|
 | `KeyError: 'my_paradigm'` at runtime | Forgot `STRATEGY_CLASS_PATHS` entry | Step 2 |
 | `ValidationError: training_mode='my_paradigm' is not one of VALID_TRAINING_MODES` | Forgot `validation_constants` entry | Step 2 |
-| Audit fires `paradigm_required_fields` even when the field is set | Forgot `TRAINING_MODE_CONSTRAINTS` entry | Step 2 |
 | Strategy never runs even though audit passes | Decorator-only registry; the package `__init__.py` doesn't import the strategy file | Add an explicit import in `src/spectramr/infrastructure/training/strategies/__init__.py` |
 | `loss_total` is `None` after `train_step` | Returned a plain dict without that key | Return `{"loss_total": loss, ...}` |
 | Throughput drops 10× after adding paradigm | `.item()` or `.cpu()` inside `train_step` | Move to `validate_step` or async logging |
@@ -241,4 +229,4 @@ A worked-out example is
 
 - [Add a model](add_model.md) — how to register a new architecture for use in this paradigm.
 - [Add a loss](add_loss.md) — how to register a new loss function.
-- [Write an experiment YAML](write_experiment_yaml.md) — the v6.0 schema reference.
+- [Write an experiment YAML](write_experiment_yaml.md) — the schema reference.

@@ -102,3 +102,43 @@ def test_get_attention_wrapper_with_custom_config() -> None:
     cfg = AttentionConfig(causal=True)
     wrapper = get_attention_wrapper(cfg)
     assert wrapper.config.causal is True
+
+
+# ---------------------------------------------------------------------------
+# _compute_pytorch_attention (SDPA) parity with the explicit softmax(QK^T)V
+# ---------------------------------------------------------------------------
+
+
+def _explicit_attention(q, k, v, mask, causal, scale):
+    import torch
+
+    scores = q @ k.transpose(-2, -1) * scale
+    if mask is not None:
+        scores = scores + mask
+    if causal:
+        tri = torch.triu(torch.ones_like(scores), diagonal=1).bool()
+        scores = scores.masked_fill(tri, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ v
+
+
+def test_pytorch_attention_matches_explicit_softmax() -> None:
+    import pytest
+    import torch
+
+    from spectramr.models.blocks.attention_utils import AttentionWrapper
+
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 3, 7, 8) for _ in range(3))
+    mask = torch.randn(2, 1, 7, 7)
+    for causal in (False, True):
+        for m in (None, mask):
+            w = AttentionWrapper(AttentionConfig(causal=causal))
+            got = w._compute_pytorch_attention(q, k, v, m)
+            exp = _explicit_attention(
+                q, k, v, None if m is None else m.expand(-1, 3, -1, -1), causal, 8**-0.5
+            )
+            torch.testing.assert_close(got, exp, rtol=1e-4, atol=1e-5)
+    with pytest.raises(ValueError):
+        AttentionWrapper(AttentionConfig())._compute_pytorch_attention(
+            q, k, v, torch.zeros(2, 2, 7, 7)
+        )

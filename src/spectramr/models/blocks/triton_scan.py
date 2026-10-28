@@ -58,16 +58,21 @@ _TRITON_AVAILABLE: bool | None = None
 
 
 def triton_available() -> bool:
-    """Whether the Triton backend is usable in this process."""
+    """Whether the Triton backend is usable in this process.
+
+    Delegates to :mod:`spectramr.core.compile_capability`, which owns the
+    question. This module held the original probe and the compile path needs the
+    same answer; two copies would disagree the moment one grew a condition
+    (non-negotiable 17). The memo stays here because this is the hot caller —
+    it is consulted once per ``ContinuousSFCMamba`` constructor.
+    """
     global _TRITON_AVAILABLE
     if _TRITON_AVAILABLE is None:
-        try:
-            import triton  # noqa: F401
-            import triton.language as tl  # noqa: F401
+        from spectramr.core.compile_capability import (
+            triton_available as _probe,
+        )
 
-            _TRITON_AVAILABLE = torch.cuda.is_available()
-        except Exception:
-            _TRITON_AVAILABLE = False
+        _TRITON_AVAILABLE = _probe()
     return _TRITON_AVAILABLE
 
 

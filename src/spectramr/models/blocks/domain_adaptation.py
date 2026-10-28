@@ -1,45 +1,68 @@
+"""Gradient reversal -- the canonical home (NN6).
+
+Identity in the forward pass, ``-alpha * grad`` in the backward pass, so that minimising
+a downstream domain loss *removes* domain information from the features upstream
+(Ganin & Lempitsky 2015; Ganin et al. 2016, JMLR 17(1):1-35).
+
+This module is the single owner of that invariant (NN17): anything needing reversal
+imports from here instead of defining its own ``autograd.Function``. The AST walk in
+``tests/unit/models/blocks/test_domain_adaptation.py`` fails on a second definition
+anywhere under ``src/spectramr``.
+
+A wrapper that only decides *how alpha is chosen* is an adapter, not a duplicate, and may
+live wherever its schedule does -- the DANN sigmoid ramp in
+``models/losses/domain_adaptation_loss.py`` and the ``lambda_`` spelling in
+``infrastructure/training/strategies/privileged_learning_strategy.py`` are both of that
+kind. What the detector forbids is a second implementation of the reversal itself.
+"""
+
 import torch
 from torch import nn
-from torch.autograd import Function
 
 
-class GradientReversalLayer(Function):
-    """Gradient Reversal Layer (GRL) for Domain-Adversarial Training.
-    This layer has no parameters and simply reverses the gradient
-    during backpropagation.
-    """
+class GradientReversalFunction(torch.autograd.Function):
+    """Identity forward, ``-alpha * grad_output`` backward."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
-        """forward.
-
-        Args:
-            ctx (Any): Description.
-            x (torch.Tensor): Description.
-            alpha (float): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
         ctx.alpha = alpha
         return x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        """backward.
-
-        Args:
-            ctx (Any): Description.
-            grad_output (torch.Tensor): Description.
-        Returns:
-            tuple[torch.Tensor, None]: Description.
-        """
-        output = grad_output.neg() * ctx.alpha
-        return output, None
+        return grad_output.neg() * ctx.alpha, None
 
 
 def grad_reverse(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-    """Applies the Gradient Reversal Layer."""
-    return GradientReversalLayer.apply(x, alpha)
+    """Functional form of :class:`GradientReversalFunction`.
+
+    ``alpha`` is forwarded uncoerced: a caller holding it as a tensor would pay a device
+    sync for ``float()``, which NN9 forbids on the training path.
+    """
+    return GradientReversalFunction.apply(x, alpha)
+
+
+class GradientReversalLayer(nn.Module):
+    """Module form, with ``alpha`` chosen by the caller.
+
+    Typically annealed 0 -> 1 during training via :meth:`set_alpha`. For the DANN sigmoid
+    schedule driven by an internal iteration counter, use ``GradientReversalLayerModule``
+    from ``models/losses/domain_adaptation_loss.py`` instead.
+    """
+
+    def __init__(self, alpha: float = 1.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return GradientReversalFunction.apply(x, self.alpha)
+
+    def set_alpha(self, alpha: float) -> None:
+        """Update reversal strength, for an externally-driven schedule."""
+        self.alpha = alpha
+
+    def extra_repr(self) -> str:
+        return f"alpha={self.alpha}"
 
 
 class DomainClassifier(nn.Module):

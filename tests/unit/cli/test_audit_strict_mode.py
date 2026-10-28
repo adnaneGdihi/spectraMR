@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from spectramr.cli import audit as audit_command
+from spectramr.config.schemas.logging import LoggingConfigSchema
 from spectramr.infrastructure.validation.config_health_checker import (
     HealthCheckReport,
     HealthCheckResult,
@@ -29,6 +30,8 @@ def _stub_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace YAML loading + health check so the test never touches disk."""
 
     class _StubSettings:
+        logging = LoggingConfigSchema()
+
         @classmethod
         def from_yaml(cls, _path: str) -> Any:
             return cls()
@@ -104,6 +107,8 @@ def test_audit_returns_0_when_clean(
     than the flag this file guards, and not this PR's scope.
     """
     class _StubSettings:
+        logging = LoggingConfigSchema()
+
         @classmethod
         def from_yaml(cls, _path: str) -> Any:
             return cls()

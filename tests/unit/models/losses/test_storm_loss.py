@@ -176,3 +176,22 @@ def test_the_trace_still_equals_the_sum_of_squared_frame_differences() -> None:
     loss = SToRMRegularizer(learn_laplacian=False, num_frames=t)
     expected = float(((x[:, 1:] - x[:, :-1]) ** 2).sum())
     assert float(loss(x)) == pytest.approx(expected, rel=1e-9)
+
+
+def test_registry_call_does_not_bind_the_target_to_navigators() -> None:
+    """``loss(prediction, target)`` used to hand the target image to the manifold
+    encoder as navigators, which died unpacking a 5-D tensor."""
+    loss = SToRMRegularizer(learn_laplacian=True, num_frames=4, nav_dim=8)
+    x = torch.randn(1, 4, 1, 6, 6)
+    with pytest.raises(ValueError, match="navigators"):
+        loss(x, torch.randn(1, 4, 1, 6, 6))
+    value = loss(x, torch.randn(1, 4, 1, 6, 6), navigators=torch.randn(1, 4, 8))
+    assert torch.isfinite(value)
+
+
+def test_uniform_laplacian_ignores_the_target_and_accepts_non_contiguous_input() -> None:
+    loss = SToRMRegularizer(learn_laplacian=False, num_frames=4)
+    x = torch.randn(1, 4, 1, 6, 6)
+    x_t = x.transpose(-1, -2)
+    assert not x_t.is_contiguous()
+    torch.testing.assert_close(loss(x_t, torch.randn(1, 4, 1, 6, 6)), loss(x_t.contiguous()))

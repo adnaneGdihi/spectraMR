@@ -38,7 +38,6 @@ def _config(model_type: str = "bloch_field_bottleneck"):
             ti_ms=0.0,
             contrast_type="spin_echo",
             stratify_by="none",
-            pretrained_reconstructor_checkpoint="dummy.pt",
         )
     )
     return SimpleNamespace(

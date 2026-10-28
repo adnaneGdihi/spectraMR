@@ -120,12 +120,7 @@ class DiffusionAttentionBlock(nn.Module):
         v = v.reshape(B, h, C // h, H * W).transpose(2, 3)
 
         # Attention
-        scale = (C // h) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention
-        out = torch.matmul(attn, v)
+        out = F.scaled_dot_product_attention(q, k, v)  # default scale (C // h) ** -0.5
         out = out.transpose(2, 3).reshape(B, C, H, W)
 
         # Output projection

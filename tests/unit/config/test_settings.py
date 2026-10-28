@@ -192,13 +192,12 @@ def test_top_level_diffusion_emits_deprecation_warning():
     assert settings.diffusion == {"num_timesteps": 1000}
 
 
-def test_top_level_artifacts_emits_deprecation_warning():
-    """Loading a config with top-level ``artifacts`` must warn (and is consumed)."""
+def test_top_level_artifacts_is_refused():
+    """``artifacts`` was removed (#698); the refusal names the live output path."""
     cfg = _minimal_config()
     cfg["artifacts"] = {"persistent_root": "/tmp/artifacts"}
-    with pytest.warns(DeprecationWarning, match="config.artifacts is unused"):
-        settings = TrainingSettings(**cfg)
-    assert settings.artifacts == {"persistent_root": "/tmp/artifacts"}
+    with pytest.raises(ValidationError, match=r"`artifacts` was removed.*training\.output_dir"):
+        TrainingSettings(**cfg)
 
 
 def test_clean_config_emits_no_deprecation_warning():
@@ -378,6 +377,14 @@ def test_settings_from_dict_minimal_without_config_version():
     """
     settings = TrainingSettings.settings_from_dict(_minimal_config())
     assert settings.model.model_type == "unet"
+
+
+def test_flat_data_reserved_cores_folds_into_the_loader_block():
+    """`data` is extra="ignore": an unfolded flat knob would be silently discarded."""
+    cfg = _minimal_config()
+    cfg.setdefault("data", {})["reserved_cores"] = 0
+    settings = TrainingSettings.settings_from_dict(cfg)
+    assert settings.data.loader.reserved_cores == 0
 
 
 def test_settings_from_dict_strips_config_version_if_present():
@@ -871,3 +878,117 @@ class TestValidationEnsembleNeedsAStochasticSampler:
     def test_a_single_sample_validation_never_reads_sigma(self) -> None:
         settings = TrainingSettings(**self._cfg(n=1))
         assert settings.validation.sampling.ensemble_samples == 1
+
+
+class TestRecorruptedInferenceNeedsAnR2RTarget:
+    """`validation.scoring.recorrupted_inference` is refused at load where nothing recorrupts."""
+
+    @staticmethod
+    def _settings(target_mode: str, **knob):
+        cfg = _minimal_config()
+        cfg["data"].update({"target_mode": target_mode, "coils": {"processing_mode": "none"}})
+        if target_mode in ("r2r", "nullspace_r2r"):
+            cfg["data"]["val_target_mode"] = "phase_aligned_mean"
+        cfg["validation"] = {"scoring": {"recorrupted_inference": {"samples": 3, **knob}}}
+        return TrainingSettings(**cfg)
+
+    def test_r2r_and_nullspace_r2r_load(self) -> None:
+        for mode in ("r2r", "nullspace_r2r"):
+            assert self._settings(mode).validation.scoring.recorrupted_inference.samples == 3
+
+    def test_an_averaging_target_is_refused_at_load(self) -> None:
+        with pytest.raises(ValueError, match="recorrupted_inference is read only under"):
+            self._settings("phase_aligned_mean")
+
+    def test_the_other_modes_strength_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="angle_deg is the strength of the other"):
+            self._settings("r2r", angle_deg=30.0)
+        with pytest.raises(ValueError, match="alpha is the strength of the other"):
+            self._settings("nullspace_r2r", alpha=0.5)
+
+
+class TestTALLLocalityNeedsATALLModel:
+    """``training.tall_sr.lambda_locality > 0`` is refused at load on any model but ``tall_sr``."""
+
+    @staticmethod
+    def _cfg(model_type: str, weight: float) -> dict:
+        cfg = _minimal_config()
+        cfg["model"] = {"model_type": model_type}
+        cfg["training"] = {"tall_sr": {"lambda_locality": weight}}
+        return cfg
+
+    def test_positive_weight_on_a_non_tall_model_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"requires model\.model_type 'tall_sr'"):
+            TrainingSettings(**self._cfg("unet", 0.01))
+
+    def test_zero_weight_on_a_non_tall_model_loads(self) -> None:
+        settings = TrainingSettings(**self._cfg("unet", 0.0))
+        assert settings.training.tall_sr.lambda_locality == 0.0
+
+    def test_positive_weight_on_tall_sr_loads(self) -> None:
+        settings = TrainingSettings(**self._cfg("tall_sr", 0.01))
+        assert settings.training.tall_sr.lambda_locality == 0.01
+
+
+class TestDomainGRLNeedsCycleGAN:
+    """``losses.gan.domain_grl.enabled`` is refused at load on any strategy but ``cyclegan``."""
+
+    @staticmethod
+    def _cfg(strategy: str, enabled: bool) -> dict:
+        cfg = _minimal_config()
+        cfg["training"] = {"strategy_class": strategy}
+        cfg["losses"] = {"gan": {"domain_grl": {"enabled": enabled}}}
+        return cfg
+
+    def test_enabled_on_cyclegan_loads(self) -> None:
+        settings = TrainingSettings(**self._cfg("cyclegan", True))
+        assert settings.losses.gan.domain_grl.enabled is True
+
+    def test_enabled_on_another_strategy_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"requires training\.strategy_class 'cyclegan'"):
+            TrainingSettings(**self._cfg("cut", True))
+
+    def test_disabled_on_another_strategy_loads(self) -> None:
+        TrainingSettings(**self._cfg("cut", False))
+
+
+class TestLevyDenoisingNeedsItsStrategy:
+    """``training.levy_denoising`` is refused at load on a strategy that never reads it."""
+
+    @staticmethod
+    def _cfg(**training: object) -> dict:
+        cfg = _minimal_config()
+        cfg["training"] = {"levy_denoising": {"alpha": 1.7}, **training}
+        return cfg
+
+    def test_on_the_reconstruction_strategy_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="read only by LevyDenoisingStrategy"):
+            TrainingSettings(**self._cfg(strategy_class="reconstruction"))
+
+    def test_on_the_levy_mode_loads(self) -> None:
+        settings = TrainingSettings(**self._cfg(strategy_class="levy_diffusion"))
+        assert settings.training.levy_denoising.alpha == 1.7
+
+    def test_on_the_dotted_strategy_path_loads(self) -> None:
+        path = "spectramr.infrastructure.training.strategies.levy_denoising_strategy.LevyDenoisingStrategy"
+        assert TrainingSettings(**self._cfg(strategy_class=path)).training.levy_denoising
+
+
+class TestForwardNoiseExcludesSamplerSigma:
+    """``model.model_kwargs.forward_noise_sigma`` and ``sampler_sigma`` are one owner of reverse noise."""
+
+    @staticmethod
+    def _cfg(**model_kwargs) -> dict:
+        cfg = _minimal_config()
+        cfg["model"]["model_kwargs"] = dict(model_kwargs)
+        return cfg
+
+    def test_forward_noise_alone_loads(self) -> None:
+        settings = TrainingSettings(**self._cfg(forward_noise_sigma=0.2))
+        assert settings.model.model_kwargs["forward_noise_sigma"] == 0.2
+
+    def test_forward_noise_beside_sampler_sigma_is_refused(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="declare one"):
+            TrainingSettings(**self._cfg(forward_noise_sigma=0.2, sampler_sigma=0.1))

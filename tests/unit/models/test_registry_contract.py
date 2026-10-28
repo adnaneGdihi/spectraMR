@@ -96,3 +96,89 @@ def test_unknown_model_error_lists_alternatives() -> None:
         )
     else:
         pytest.fail("Expected ValueError for unknown model name")
+
+
+# ── 6. One owner for capability flags (#1916) ──────────────────────
+#
+# The helper tests in ``test_registry_helpers.py`` register their own models
+# into a cleared registry, so they can only prove the readers agree about a
+# model the test itself just wrote. That is the easy shape (non-negotiable
+# 15). The invariant below is checked against the REAL registry, which is
+# where #1916 lived: two reader families each answered confidently and shared
+# **zero** models on every flag.
+
+# Everything a registry entry is allowed to carry at the top level.
+# ``class``/``mode`` are the dispatch shape asserted above; ``role`` (#1932)
+# is a routing key -- which factory bucket the model belongs in -- and
+# ``capabilities`` is the nested dataclass that owns every capability flag.
+_ALLOWED_ENTRY_KEYS = frozenset({"class", "mode", "role", "capabilities"})
+
+
+def test_no_entry_carries_a_top_level_capability_key() -> None:
+    """Capability flags live on the nested dataclass and nowhere else.
+
+    This is the invariant #1916 elected, and it is deliberately NOT phrased as
+    "the two readers agree". ``model_supports`` is *implemented as* a read of
+    ``get_model_capabilities``, so comparing them is a tautology today -- and
+    it would stay green if a future change re-pointed both readers at the same
+    wrong surface together. Asserting the loser surface is *absent* cannot be
+    satisfied that way.
+
+    What it caught: ``register_model`` used to fan
+    ``supports_contrast_conditioning`` / ``supports_vendor_conditioning`` out
+    to top-level keys *as well as* into ``ModelCapabilities``, so
+    ``model_supports`` read the top-level half and ``get_model_capabilities``
+    the nested half. Measured on ``dev`` over 588 models: ``accepts_complex``
+    20 nested vs 0 top-level, ``requires_paired_data`` 71 vs 0,
+    ``expects_real_imag_interleaved`` 11 vs 0,
+    ``supports_contrast_conditioning`` 0 vs 28 -- 130 disagreements, every
+    fixture-scoped test green throughout.
+    """
+    assert MODEL_REGISTRY, "registry is empty; this test would pass vacuously"
+    offenders = {
+        name: sorted(set(entry) - _ALLOWED_ENTRY_KEYS)
+        for name, entry in MODEL_REGISTRY.items()
+        if isinstance(entry, dict) and not set(entry) <= _ALLOWED_ENTRY_KEYS
+    }
+    assert not offenders, (
+        f"{len(offenders)} registry entries carry top-level keys outside "
+        f"{sorted(_ALLOWED_ENTRY_KEYS)}. A capability flag at the top level is "
+        f"a second owner: it is invisible to get_model_capabilities and to "
+        f"every audit check that reads it (#1916). Declare it on "
+        f"ModelCapabilities instead. Offenders: "
+        f"{dict(sorted(offenders.items())[:10])}"
+    )
+
+
+def test_the_nested_owner_actually_holds_declarers() -> None:
+    """Non-vacuity for the test above: the surviving owner is populated.
+
+    Moving a flag from a dict key to a dataclass field turns a loud
+    ``KeyError`` into a quiet ``None``, so a census can read **zero** and every
+    assertion over it passes trivially. That happened twice while #1916 was
+    being fixed -- once in production (``_contrast_aware_critics`` reported 0
+    aware critics) and once in the test policing it. A key-absence assertion
+    alone is satisfied by a registry that declares nothing at all.
+
+    Counts drift as models are added; this asserts only that each flag has
+    real declarers, and records the reading for the next person.
+    """
+    from spectramr.models.registry import _boolean_capability_fields, model_supports
+
+    declared = {
+        f: sum(model_supports(n, f) for n in MODEL_REGISTRY) for f in _boolean_capability_fields()
+    }
+    # Measured 2026-09-08 on 588 models: accepts_complex 20,
+    # requires_paired_data 71, expects_real_imag_interleaved 11,
+    # supports_contrast_conditioning 28, supports_vendor_conditioning 0.
+    # ``supports_vendor_conditioning`` is honestly 0 -- the capability is
+    # unbuilt (#1941) -- so it is excluded rather than asserted non-zero.
+    expected_nonzero = set(declared) - {"supports_vendor_conditioning"}
+    empty = sorted(f for f in expected_nonzero if declared[f] == 0)
+    assert not empty, (
+        f"{empty} have zero declarers on ModelCapabilities over "
+        f"{len(MODEL_REGISTRY)} models. Either register_model stopped "
+        f"forwarding them to the dataclass, or the flag moved again -- and "
+        f"every check reading it is now silently answering 'no' for "
+        f"everything (#1916). Full reading: {declared}"
+    )

@@ -30,20 +30,15 @@ from .reconstruction import ReconstructionTrainingStrategy
 logger = logging.getLogger(__name__)
 
 
-def _resolve_checkpoint(value: Any, field_name: str) -> Path:
-    """Resolve a checkpoint path, raising if unset / not on disk."""
+def _resolve_manifest(value: Any, field_name: str) -> Path:
+    """Resolve a manifest path, raising if unset / not on disk."""
     if value is None:
-        raise ValueError(
-            f"PMPS: {field_name} is unset. The strategy depends on a "
-            f"prior-phase checkpoint and cannot run without it."
-        )
+        raise ValueError(f"PMPS: {field_name} is unset; the strategy cannot run without it.")
     path = Path(value)
     if not path.exists():
         raise FileNotFoundError(
-            f"PMPS: {field_name} resolved to {path}, but that path does "
-            f"not exist on disk. Smoke-test runs may use a placeholder "
-            f"path under tests/fixtures/; production runs must point at "
-            f"the real Phase-1 (or Phase-2) artifact."
+            f"PMPS: {field_name} resolved to {path}, but that path does not exist on disk. "
+            f"Smoke-test runs may use a placeholder path under tests/fixtures/."
         )
     return path
 
@@ -54,24 +49,8 @@ class CorruptionCalibrationStrategy(ReconstructionTrainingStrategy):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         cfg = self.config.training
-        # The schema mandates tissue_prior_checkpoint via Pydantic; this
-        # ladder converts a missing / unresolvable path into a loud
-        # failure at strategy-construction time, before the dataloader
-        # has consumed any GPU memory.
-        ckpt = getattr(cfg, "tissue_prior_checkpoint", None)
-        # Allow smoke-test paths under tests/fixtures/ — they're created
-        # lazily by the smoke harness — without raising FileNotFoundError.
-        if ckpt is not None and "tests/fixtures" in str(ckpt).replace("\\", "/"):
-            logger.info(
-                "CorruptionCalibrationStrategy: smoke-fixture checkpoint %s "
-                "accepted without disk verification.",
-                ckpt,
-            )
-        else:
-            _resolve_checkpoint(ckpt, "training.tissue_prior_checkpoint")
         logger.info(
-            "CorruptionCalibrationStrategy: tissue prior %s, %d calibration iters.",
-            ckpt,
+            "CorruptionCalibrationStrategy: %d calibration iters.",
             getattr(cfg, "calibration_iters", -1),
         )
 
@@ -89,23 +68,11 @@ class PairedSynthesisStrategy(ReconstructionTrainingStrategy):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         cfg = self.config.training
-        tissue_ckpt = getattr(cfg, "tissue_prior_checkpoint", None)
-        calib_ckpt = getattr(cfg, "corruption_calibration_checkpoint", None)
-        for ckpt, field in (
-            (tissue_ckpt, "training.tissue_prior_checkpoint"),
-            (calib_ckpt, "training.corruption_calibration_checkpoint"),
-        ):
-            if ckpt is not None and "tests/fixtures" in str(ckpt).replace("\\", "/"):
-                continue
-            _resolve_checkpoint(ckpt, field)
         n_pairs = getattr(cfg, "n_synthetic_pairs", 0)
         if n_pairs <= 0:
             raise ValueError("PairedSynthesisStrategy: training.n_synthetic_pairs must be > 0.")
         logger.info(
-            "PairedSynthesisStrategy: prior=%s, calibration=%s, "
-            "n_synthetic_pairs=%d, output_root=%s.",
-            tissue_ckpt,
-            calib_ckpt,
+            "PairedSynthesisStrategy: n_synthetic_pairs=%d, output_root=%s.",
             n_pairs,
             getattr(cfg, "output_root", "?"),
         )
@@ -133,7 +100,7 @@ class DataEfficiencyHarnessStrategy(ReconstructionTrainingStrategy):
             val = getattr(cfg, field, None)
             if val is None or "tests/fixtures" in str(val).replace("\\", "/"):
                 continue
-            _resolve_checkpoint(val, f"training.{field}")
+            _resolve_manifest(val, f"training.{field}")
         logger.info(
             "DataEfficiencyHarnessStrategy: %d settings × %d folds × %d seeds = %d cells.",
             len(settings),

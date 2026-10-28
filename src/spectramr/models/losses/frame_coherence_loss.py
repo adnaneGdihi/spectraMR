@@ -59,7 +59,8 @@ def gram_offdiagonal_penalty(atoms: torch.Tensor, eps: float = 1e-12) -> torch.T
     gram = wn @ wn.t()
     m = gram.shape[0]
     off = gram - torch.eye(m, device=gram.device, dtype=gram.dtype)
-    return (off**2).sum()
+    penalty: torch.Tensor = (off**2).sum()
+    return penalty
 
 
 @register_loss(
@@ -79,6 +80,13 @@ class FrameCoherenceLoss(nn.Module):
     if neither is supplied (anti-facade #16).
     """
 
+    @staticmethod
+    def _module_penalty(frame: nn.Module) -> torch.Tensor:
+        # Attribute access would be typed ``Tensor | Module`` by ``nn.Module.__getattr__``.
+        penalty_fn = getattr(frame, "coherence_penalty")  # noqa: B009
+        penalty: torch.Tensor = penalty_fn()
+        return penalty
+
     def forward(
         self,
         prediction: Any = None,
@@ -89,12 +97,12 @@ class FrameCoherenceLoss(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         if isinstance(frame, nn.Module) and hasattr(frame, "coherence_penalty"):
-            return frame.coherence_penalty()
+            return self._module_penalty(frame)
         if isinstance(atoms, torch.Tensor):
             return gram_offdiagonal_penalty(atoms)
         # A positional module (a strategy may pass the frame first-positionally).
         if isinstance(prediction, nn.Module) and hasattr(prediction, "coherence_penalty"):
-            return prediction.coherence_penalty()
+            return self._module_penalty(prediction)
         raise ValueError(
             "FrameCoherenceLoss is a PARAMETER penalty on a learnable frame's atoms; "
             "it needs frame=<module with coherence_penalty()> or atoms=<[m,n] tensor>. "

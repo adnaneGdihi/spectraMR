@@ -746,7 +746,7 @@ class ContrastInvariantEdgeAcutance:
         context: object | None = None,
         **kwargs: object,
     ) -> float:
-        import torch.nn.functional as F  # noqa: N812
+        import torch.nn.functional as F
 
         from spectramr.models.losses.edge_detection import SobelOperator
 
