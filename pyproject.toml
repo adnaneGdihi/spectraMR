@@ -519,8 +519,8 @@ docs = [
 # platform_machine == 'arm64', not 'aarch64'), and it ships four compiled objects
 # -- libscalene.so, pywhere, _scalene_unwind, get_line_atomic. So pip on a Linux
 # arm64 host compiles a C++ toolchain's worth of work as a side effect of
-# `pip install -e '.[dev]'` -- which is how the maintainer's self-hosted runner
-# installs the *test* suite. A profiler is not what that suite verifies.
+# `pip install -e '.[dev]'`, which installs the *test* suite. A profiler is not
+# what that suite verifies.
 # The marker excludes scalene exactly where it cannot be fetched prebuilt and
 # nowhere else; macOS arm64 keeps its wheel.
 # `spectramr profile` still raises its actionable error there rather than

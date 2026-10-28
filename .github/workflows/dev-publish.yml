@@ -34,10 +34,7 @@ permissions:
 jobs:
   build:
     if: github.repository == 'adnaneGdihi/spectraMR'
-    # NOT on thor. `dev` moves whenever an export snapshot lands, so this lane
-    # must run without the maintainer being at the machine; thor listens via a
-    # foreground `./run.sh` and a job targeted there queues until it is started.
-    # ubuntu-latest also keeps the amd64-only pypi-publish image reachable.
+    # ubuntu-latest keeps the amd64-only pypi-publish image reachable.
     runs-on: ubuntu-latest
     outputs:
       publish: ${{ steps.gate.outputs.publish }}

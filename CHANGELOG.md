@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-10-28
+
+### Removed
+- **The self-hosted `thor` runner.** `release.yml` and `test-release.yml` run every job
+  on `ubuntu-latest`; their `runner` dispatch input and the `RELEASE_RUNNER` repository
+  variable are gone. The public repository's desired settings declare no self-hosted
+  runner, so any registered one reports as drift, and
+  `tests/unit/ci/test_no_self_hosted_runner.py` fails on any job that targets one.
+
 ## [1.3.0] - 2026-10-28
 
 ### Added
@@ -432,7 +441,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      return 404, so the 200s here mean something. The `[0.1.0]` heading date above
      and `date-released` in CITATION.cff are two further declarations of the same
      day, and nothing reconciles the three; change them together. -->
-[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.1
 [1.3.0]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.0
 [0.1.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.2
 [0.1.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.1
