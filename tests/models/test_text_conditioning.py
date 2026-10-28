@@ -1,3 +1,5 @@
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,16 +46,12 @@ class MockCLIPTokenizer:
 
 @pytest.fixture
 def mock_transformers():
-    with (
-        patch(
-            "spectramr.models.generators.latent_diffusion_generator.CLIPTextModel",
-            MockCLIPTextModel,
-        ),
-        patch(
-            "spectramr.models.generators.latent_diffusion_generator.CLIPTokenizer",
-            MockCLIPTokenizer,
-        ),
-    ):
+    # The generator imports transformers lazily at construction, so a stand-in
+    # module in sys.modules is what the `from transformers import ...` resolves.
+    fake = types.ModuleType("transformers")
+    fake.CLIPTextModel = MockCLIPTextModel
+    fake.CLIPTokenizer = MockCLIPTokenizer
+    with patch.dict(sys.modules, {"transformers": fake}):
         yield
 
 

@@ -85,9 +85,10 @@ def test_complex_kspace_models_declare_complex_contract(caps_for):
         assert caps.expects_real_imag_interleaved is True
 
 
-def test_vae_declares_latent_output(caps_for):
+def test_vae_declares_the_decoded_image_as_its_output(caps_for):
+    # forward returns (reconstruction, mu, log_var); the loss sees the decoded image.
     caps = caps_for("vae")
-    assert caps.output_domain == "latent"
+    assert caps.output_domain == "image"
 
 
 def test_agnostic_models_do_not_declare_a_domain(caps_for):

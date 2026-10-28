@@ -26,6 +26,9 @@ from spectramr.infrastructure.run_layout import drop_profiling_artifacts
 logger = logging.getLogger(__name__)
 
 _STEP_RE = re.compile(r"epoch(\d+)_step(\d+)")
+#: Cascade validation writes one PNG set per acceleration: ``validation_R8x_epoch…``.
+_ACCEL_RE = re.compile(r"(?:^|_)R(\d+(?:\.\d+)?)x_epoch")
+_SLICE_RE = re.compile(r"_real_(\d+)\.png$")
 
 _TASK_CASE_KEY = {
     "reconstruction": "cases_kspace",
@@ -40,16 +43,13 @@ _TASK_CASE_KEY = {
 # Aliases bridging the recorder's canonical array names (``input`` /
 # ``prediction`` / ``target``) onto the per-plotter key vocabulary. The MRI
 # qualitative plotters (e.g. ``mri_a7_kspace_recon``) read ``zero_filled`` /
-# ``baseline`` / ``pred`` / ``fs_ref`` rather than the canonical names, so we
+# ``pred`` / ``fs_ref`` rather than the canonical names, so we
 # add these as non-destructive aliases — the canonical keys are preserved too.
 _PLOTTER_ALIASES = {
     # kspace recon plotter (mri_a7_kspace_recon)
     "zero_filled": "input",
     "pred": "prediction",
     "fs_ref": "target",
-    # ``baseline`` has no recorded counterpart; fall back to zero-filled input
-    # so the comparison column renders rather than crashing on a missing key.
-    "baseline": "input",
     # super-resolution triptych plotter (mri_a1_sr_triptych) reads lr/pred/hr;
     # the synthesis plotter reads input/pred/target (input & target canonical).
     "lr": "input",
@@ -94,12 +94,15 @@ def _find_image_dirs(run_dir: Path) -> tuple[Path | None, Path | None]:
     return None, None
 
 
-def load_image_pair_cases(run_dir: str | Path, *, max_cases: int = 12) -> list[dict]:
+def load_image_pair_cases(
+    run_dir: str | Path, *, max_cases: int = 12, step: int | None = None
+) -> list[dict]:
     """Synthesize image cases from downloaded validation PNG pairs.
 
-    ``real`` PNGs are targets, ``fake`` PNGs predictions. Uses the latest
-    epoch/step group so the mosaics reflect the most-trained validation pass.
-    Returns [] when no pairs are found (metrics are empty — PNGs carry none).
+    ``real`` PNGs are targets, ``fake`` PNGs predictions; no input was saved, so
+    the cases carry none. ``step`` picks the pass at or before that iteration
+    (the checkpoint the report reads); ``None`` takes the last pass. Returns []
+    when no pairs are found (metrics are empty — PNGs carry none).
     """
     run_dir = Path(run_dir)
     real_dir, fake_dir = _find_image_dirs(run_dir)
@@ -113,26 +116,51 @@ def load_image_pair_cases(run_dir: str | Path, *, max_cases: int = 12) -> list[d
         m = _STEP_RE.search(p.name)
         return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
 
+    def _accel(p: Path) -> float | None:
+        m = _ACCEL_RE.search(p.name)
+        return float(m.group(1)) if m else None
+
+    def _slice(p: Path) -> int:
+        m = _SLICE_RE.search(p.name)
+        return int(m.group(1)) if m else -1
+
     groups: dict[tuple[int, int], list[Path]] = {}
     for p in reals:
         groups.setdefault(_grp(p), []).append(p)
-    latest = max(groups)
-    epoch, step = latest
+    eligible = [g for g in groups if step is None or g[1] <= step]
+    if not eligible:
+        logger.info("report cases: no validation PNG pass at or before step %s", step)
+        return []
+    epoch, step = max(eligible, key=lambda g: (g[1], g[0]))
+    # One pass holds a PNG set per acceleration; slices are indexed within a set,
+    # so a case is (R, slice) -- grouping by pass alone mixed R2x and R32x tiles.
+    # A pass replayed after a resume writes a second timestamped set; the later
+    # one wins per (R, slice), so a slice is never loaded twice.
+    latest: dict[tuple[float, int], Path] = {}
+    for p in sorted(groups[(epoch, step)]):
+        latest[(_accel(p) or 0.0, _slice(p))] = p
+    ordered = [latest[k] for k in sorted(latest)]
+    per_r: dict[float | None, int] = {}
     cases: list[dict] = []
-    for i, rp in enumerate(sorted(groups[latest])[:max_cases]):
+    for rp in ordered:
+        # the cap is per acceleration, or a cascade's highest R never loads
+        if per_r.setdefault(_accel(rp), 0) >= max_cases:
+            continue
+        per_r[_accel(rp)] += 1
         fp = fake_dir / rp.name.replace("_real_", "_fake_")
         if not fp.exists():
             continue
-        arrays = _apply_plotter_aliases(
-            {"target": _read_gray(rp), "prediction": _read_gray(fp), "input": _read_gray(rp)}
-        )
+        accel = _accel(rp)
+        arrays = _apply_plotter_aliases({"target": _read_gray(rp), "prediction": _read_gray(fp)})
+        r_tag = f"R{accel:g}x_" if accel is not None else ""
         cases.append(
             {
                 **arrays,
                 "metrics": {},
                 "domain": {},
                 "rank": "case",
-                "case_id": f"epoch{epoch:03d}_step{step:06d}_{i:03d}",
+                "acceleration": accel,
+                "case_id": f"{r_tag}epoch{epoch:03d}_step{step:06d}_{_slice(rp):03d}",
             }
         )
     if cases:
@@ -140,7 +168,33 @@ def load_image_pair_cases(run_dir: str | Path, *, max_cases: int = 12) -> list[d
     return cases
 
 
-def load_report_cases(run_dir: str | Path, *, task: str, subdir: str = "report_cases") -> dict:
+_CASE_STEP_RE = re.compile(r"step(\d+)")
+
+
+def _cases_at_pass(cases: list[dict], step: int) -> list[dict]:
+    """Recorded cases of the one pass at or before ``step`` (#2503).
+
+    The recorder keeps best/median/worst over every validation pass, so its cases
+    come from several checkpoints; a panel built from all of them shows several
+    models. Cases whose id names no step are kept, since nothing places them.
+    """
+    stepped = {}
+    for case in cases:
+        m = _CASE_STEP_RE.search(str(case.get("case_id", "")))
+        stepped[id(case)] = int(m.group(1)) if m else None
+    known = sorted({v for v in stepped.values() if v is not None and v <= step})
+    if not known:
+        if any(v is not None for v in stepped.values()):
+            logger.info("report cases: none recorded at or before step %d", step)
+            return [c for c in cases if stepped[id(c)] is None]
+        return cases
+    chosen = known[-1]
+    return [c for c in cases if stepped[id(c)] in (chosen, None)]
+
+
+def load_report_cases(
+    run_dir: str | Path, *, task: str, subdir: str = "report_cases", step: int | None = None
+) -> dict:
     """Load recorded cases and route them into plotter kwargs.
 
     Returns a dict possibly containing ``cases_kspace`` / ``cases_sr`` /
@@ -169,14 +223,18 @@ def load_report_cases(run_dir: str | Path, *, task: str, subdir: str = "report_c
                     "case_id": row["case_id"],
                 }
             )
+    if cases:
+        # no checkpoint known: the latest recorded pass, never every pass at once
+        cases = _cases_at_pass(cases, step if step is not None else 10**12)
     if not cases:
         # Fallback: recover cases from downloaded validation PNG pairs.
-        cases = load_image_pair_cases(run_dir)
+        cases = load_image_pair_cases(run_dir, step=step)
     if not cases:
         return {}
 
     image_key = _TASK_CASE_KEY.get(str(task).lower(), "cases_kspace")
-    failures = [c for c in cases if c["rank"] == "worst"] or cases[-1:]
+    # Only a ranked case is a failure; the last unranked PNG pair is just a slice.
+    failures = [c for c in cases if c["rank"] == "worst"]
 
     rows = []
     for c in cases:

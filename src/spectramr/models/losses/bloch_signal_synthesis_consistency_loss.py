@@ -35,7 +35,9 @@ host strategy uses this loss as one of the objectives).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -128,7 +130,7 @@ class BlochSignalSynthesisConsistencyLoss(nn.Module):
         t2_ms: torch.Tensor,
         pd: torch.Tensor,
         observed_contrasts: torch.Tensor,
-        acquisition_params: Sequence[dict],
+        acquisition_params: Sequence[Mapping[str, Any]],
         **_: object,
     ) -> torch.Tensor:
         if observed_contrasts.dim() != 4:
@@ -136,11 +138,11 @@ class BlochSignalSynthesisConsistencyLoss(nn.Module):
                 f"observed_contrasts must be 4-D [B, N_c, H, W]; "
                 f"got {tuple(observed_contrasts.shape)}"
             )
-        N_c = observed_contrasts.shape[1]
-        if len(acquisition_params) != N_c:
+        n_c = observed_contrasts.shape[1]
+        if len(acquisition_params) != n_c:
             raise ValueError(
                 f"acquisition_params has {len(acquisition_params)} entries "
-                f"but observed_contrasts has {N_c} channels — must match."
+                f"but observed_contrasts has {n_c} channels — must match."
             )
         for shape_name, t in (("t1_ms", t1_ms), ("t2_ms", t2_ms), ("pd", pd)):
             if t.dim() != 4 or t.shape[1] != 1:
@@ -160,9 +162,9 @@ class BlochSignalSynthesisConsistencyLoss(nn.Module):
                     f"acquisition_params entry missing key {exc.args[0]!r}; "
                     "expected TR_ms, TE_ms, FA_deg."
                 ) from exc
-            fa_rad = fa_deg * (3.141592653589793 / 180.0)
-            sin_a = float(torch.sin(torch.tensor(fa_rad)).item())
-            cos_a = float(torch.cos(torch.tensor(fa_rad)).item())
+            fa_rad = math.radians(fa_deg)
+            sin_a = math.sin(fa_rad)
+            cos_a = math.cos(fa_rad)
 
             e1 = torch.exp(-tr / t1_safe)
             spgr = (sin_a * (1.0 - e1)) / (1.0 - cos_a * e1).clamp_min(self.eps)

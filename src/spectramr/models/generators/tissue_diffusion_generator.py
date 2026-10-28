@@ -142,6 +142,8 @@ class TissueDenoisingUNet(nn.Module):
         base_dim: int = 64,
         time_dim: int = 128,
         n_res_blocks: int = 2,
+        *,
+        num_timesteps: int,
     ):
         """Initialize denoising U-Net.
 
@@ -150,8 +152,10 @@ class TissueDenoisingUNet(nn.Module):
             base_dim: Base feature dimension.
             time_dim: Timestep embedding dimension.
             n_res_blocks: Residual blocks per level.
+            num_timesteps: The generator's diffusion horizon; ``t`` is divided by it.
         """
         super().__init__()
+        self.num_timesteps = int(num_timesteps)
         self.time_embed = nn.Sequential(
             SinusoidalPositionEmbedding(time_dim),
             nn.Linear(time_dim, time_dim),
@@ -227,7 +231,7 @@ class TissueDenoisingUNet(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        t_norm = t.float() / 1000.0
+        t_norm = t.float() / self.num_timesteps
         t_emb = self.time_embed(t_norm)
 
         # Encoder
@@ -329,6 +333,7 @@ class TissueDiffusionGenerator(nn.Module, IGenerator):
         self.denoiser = TissueDenoisingUNet(
             tissue_channels=tissue_channels,
             base_dim=base_dim,
+            num_timesteps=n_diffusion_steps,
         )
 
         # Noise schedule (linear)

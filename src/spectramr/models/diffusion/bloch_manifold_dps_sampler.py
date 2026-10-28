@@ -52,12 +52,34 @@ logger = logging.getLogger(__name__)
 _EPS = 1e-8
 
 
-def _linear_beta_schedule(timesteps: int, device: torch.device | str = "cpu") -> torch.Tensor:
-    """Standard linear DDPM β schedule (Ho et al. 2020)."""
-    scale = 1000.0 / max(timesteps, 1)
-    beta_start = scale * 1e-4
-    beta_end = scale * 2e-2
-    return torch.linspace(beta_start, beta_end, timesteps, device=device, dtype=torch.float32)
+#: Ho et al. (2020) define the linear β range over a 1000-step chain; Nichol &
+#: Dhariwal rescale it by ``_REFERENCE_STEPS / T`` so a T-step chain reaches the same noise.
+_REFERENCE_STEPS = 1000
+_REFERENCE_BETA_RANGE = (1e-4, 2e-2)
+_BETA_BOUNDS = (1e-4, 0.999)
+
+
+def rescaled_linear_betas(timesteps: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """Linear β schedule over ``timesteps`` steps, rescaled from the 1000-step reference.
+
+    The clamp keeps ``1 - β`` positive: unclamped, ``β_end = 20 / T`` reaches 1 at
+    ``T <= 20`` and every ``1 / sqrt(ᾱ)`` becomes inf (#2441).
+    """
+    if timesteps < 1:
+        raise ValueError(f"timesteps must be >= 1, got {timesteps}.")
+    scale = _REFERENCE_STEPS / timesteps
+    start, end = (scale * beta for beta in _REFERENCE_BETA_RANGE)
+    betas = torch.linspace(start, end, timesteps, device=device, dtype=torch.float32)
+    return betas.clamp(*_BETA_BOUNDS)
+
+
+def check_reverse_stride(sampling_steps: int, num_timesteps: int) -> None:
+    """Raise unless the reverse loop's step count strides the trained schedule."""
+    if not 1 <= sampling_steps <= num_timesteps:
+        raise ValueError(
+            f"sampling_steps={sampling_steps} must lie in [1, num_timesteps="
+            f"{num_timesteps}]: the reverse loop strides the trained schedule."
+        )
 
 
 @register_model(
@@ -80,7 +102,10 @@ class BlochManifoldDPSSampler(nn.Module):
         projector: A :class:`BlochManifoldProjector` (or any module with the
             same ``forward`` / ``residual`` contract). If ``None``, one is
             built from ``projector_kwargs``.
-        sampling_steps: Number of reverse diffusion steps.
+        sampling_steps: Number of reverse diffusion steps, strided over the
+            ``num_timesteps`` schedule.
+        num_timesteps: Horizon the score network was trained on; the ᾱ schedule
+            and the step indices fed to it span this. Defaults to ``sampling_steps``.
         sampler_type: ``"ddim"`` (deterministic) or ``"ddpm"`` (stochastic).
         likelihood_weight_zeta: DPS guidance scale :math:`\zeta \ge 0`.
         prediction_type: ``"epsilon"`` or ``"x0"``.
@@ -105,6 +130,7 @@ class BlochManifoldDPSSampler(nn.Module):
         prediction_type: str = "epsilon",
         projection_every: int = 1,
         projector_kwargs: dict | None = None,
+        num_timesteps: int | None = None,
     ) -> None:
         super().__init__()
         if sampler_type not in ("ddim", "ddpm"):
@@ -117,12 +143,14 @@ class BlochManifoldDPSSampler(nn.Module):
         self.projector = projector or BlochManifoldProjector(**(projector_kwargs or {}))
         self.forward_operator = str(forward_operator).lower()
         self.sampling_steps = int(sampling_steps)
+        self.num_timesteps = int(sampling_steps if num_timesteps is None else num_timesteps)
+        check_reverse_stride(self.sampling_steps, self.num_timesteps)
         self.sampler_type = sampler_type
         self.zeta = float(likelihood_weight_zeta)
         self.prediction_type = prediction_type
         self.projection_every = max(int(projection_every), 1)
 
-        betas = _linear_beta_schedule(self.sampling_steps)
+        betas = rescaled_linear_betas(self.num_timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         self.register_buffer("betas", betas, persistent=False)
@@ -277,7 +305,7 @@ class BlochManifoldDPSSampler(nn.Module):
 
         n = self.sampling_steps if num_steps is None else min(num_steps, self.sampling_steps)
         # Evenly spaced timestep indices, descending.
-        step_idx = torch.linspace(self.sampling_steps - 1, 0, n, device=device).round().long()
+        step_idx = torch.linspace(self.num_timesteps - 1, 0, n, device=device).round().long()
 
         trace: list[float] = []
         for i, t_idx_t in enumerate(step_idx):

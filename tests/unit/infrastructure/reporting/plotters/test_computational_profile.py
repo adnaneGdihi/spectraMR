@@ -46,6 +46,17 @@ def test_profile_fires_on_run_facts_alone(tmp_path):
     assert res is not None and res.exists() and res.stat().st_size > 0
 
 
+def test_run_facts_are_panels_without_value_text(tmp_path, monkeypatch):
+    figs = []
+    real = computational_profile.save_figure
+    monkeypatch.setattr(computational_profile, "save_figure",
+                        lambda fig, *a, **k: (figs.append(fig), real(fig, *a, **k))[1])
+    computational_profile.make(_run_facts_frame(), tmp_path / "p.pdf", formats=("pdf",), dpi=72)
+    fig = figs[0]
+    assert len(fig.axes) == 3  # one panel per fact in the fixture
+    assert all(len(t.get_text()) == 1 for ax in fig.axes for t in ax.texts)  # panel letters only
+
+
 def test_profile_renders_all_three_panels(tmp_path):
     df = pd.concat([_timing_frame(), _run_facts_frame()], ignore_index=True)
     out = tmp_path / "profile.pdf"

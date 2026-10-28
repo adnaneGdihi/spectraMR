@@ -441,7 +441,7 @@ class TestIOStrategyIntegration:
         extensionless DICOM or a typo'd path was handed to nibabel instead of
         failing loud.
         """
-        with pytest.raises(ValueError, match=r"[Uu]nrecognised|[Uu]nknown"):
+        with pytest.raises(ValueError, match=r"(?i)unrecognised|unknown"):
             AutoDetectStrategy().load("/data/scan.weirdext")
 
 
@@ -639,7 +639,7 @@ def _write_mat_v73(path):
         f.create_dataset("kdata", data=comp)  # complex compound
         f.create_dataset("scale", data=np.array([[5.0]]))
         g = f.create_group("D")  # MATLAB struct → HDF5 group
-        g.create_dataset("TE", data=np.array([[3.0]]))
+        g.create_dataset("TE", data=np.array([[3.0]]))  # codespell:ignore TE
 
 
 class TestMatStrategy:
@@ -652,13 +652,13 @@ class TestMatStrategy:
         variables = out["variables"]
         assert torch.is_complex(variables["kdata"])
         assert variables["kdata"][0, 0] == 1 + 2j
-        assert "D" in variables and "TE" in variables["D"]  # nested struct recursed
+        assert "D" in variables and "TE" in variables["D"]  # nested struct recursed  # codespell:ignore TE
         assert out["metadata"]["format"] == "mat_v73"
 
     def test_mat_key_selects_nested_variable(self, tmp_path) -> None:
         p = tmp_path / "flow.mat"
         _write_mat_v73(p)
-        out = MatStrategy().load(str(p), metadata={"mat_key": "D.TE"})
+        out = MatStrategy().load(str(p), metadata={"mat_key": "D.TE"})  # codespell:ignore TE
         assert float(out["data"].reshape(-1)[0]) == 3.0
 
     def test_mat_key_unknown_raises(self, tmp_path) -> None:
@@ -1033,3 +1033,16 @@ class TestLoadH5DatasetIfPresent:
             f.create_dataset("mask", data=np.ones((4, 4), dtype=np.float64))
         out = load_h5_dataset_if_present(p, "mask")
         assert out is not None and out.dtype == torch.float32
+
+
+def test_save_nifti_round_trips_through_lazy_load_nifti(tmp_path):
+    import numpy as np
+
+    from spectramr.data.io_strategies import lazy_load_nifti, save_nifti
+
+    vol = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    save_nifti(tmp_path / "v.nii.gz", vol, affine)
+    img = lazy_load_nifti(tmp_path / "v.nii.gz")
+    assert np.array_equal(np.asarray(img.dataobj), vol)
+    assert np.array_equal(img.affine, affine)

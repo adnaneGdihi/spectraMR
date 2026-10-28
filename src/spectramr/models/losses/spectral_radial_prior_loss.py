@@ -51,13 +51,22 @@ Section 3 of ``docs/multi_contrast.md``.
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.models.losses.registry import register_loss
 
-__all__ = ["SpectralRadialPriorLoss", "compute_radial_spectrum"]
+__all__ = ["COMPARISONS", "SpectralRadialPriorLoss", "compute_radial_spectrum"]
+
+COMPARISONS: tuple[str, ...] = ("log1p_difference", "log_ratio")
+#: Bins whose centre is at or beyond this fraction of Nyquist hold the noise floor (as in PR1).
+NOISE_FROM = 0.85
+#: Keeps ``log`` finite when a target has no outer-band energy at all.
+_EPS_FLOOR = 1e-12
 
 
 def compute_radial_spectrum(
@@ -123,13 +132,35 @@ class SpectralRadialPriorLoss(nn.Module):
         self,
         n_bins: int = 32,
         reference_spectrum: torch.Tensor | None = None,
-        log_space: bool = True,
+        log_space: bool | None = None,
+        comparison: str = "log1p_difference",
+        eps_noise_mult: float = 1.0,
+        min_ring_snr: float = 4.0,
     ) -> None:
         super().__init__()
         if n_bins < 4:
             raise ValueError(f"n_bins must be >= 4, got {n_bins}")
+        if comparison not in COMPARISONS:
+            raise ValueError(f"Unknown comparison {comparison!r}. Valid: {list(COMPARISONS)}.")
+        if comparison == "log_ratio" and log_space:
+            raise ValueError(
+                "comparison='log_ratio' already takes the log of each ring; "
+                "log_space: true would apply log1p on top. Drop log_space."
+            )
+        if not (eps_noise_mult > 0 and math.isfinite(eps_noise_mult)):
+            raise ValueError(f"eps_noise_mult must be a finite number > 0, got {eps_noise_mult}")
+        if not min_ring_snr >= 0:
+            raise ValueError(f"min_ring_snr must be >= 0, got {min_ring_snr}")
         self.n_bins = n_bins
-        self.log_space = log_space
+        self.comparison = comparison
+        # None resolves to the comparison's own default; log_ratio is log-space already.
+        self.log_space = (comparison == "log1p_difference") if log_space is None else log_space
+        self.eps_noise_mult = float(eps_noise_mult)
+        self.min_ring_snr = float(min_ring_snr)
+        # First bin whose centre lies at or beyond NOISE_FROM of Nyquist: the bins are contiguous.
+        self._noise_start = next(i for i in range(n_bins) if (i + 0.5) / n_bins >= NOISE_FROM)
+        self._first_call = True
+        self._empty_batches: torch.Tensor | None = None
         if reference_spectrum is not None:
             ref = reference_spectrum.detach().clone().float()
             if ref.dim() == 1:
@@ -147,7 +178,7 @@ class SpectralRadialPriorLoss(nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor | None = None,
         contrast_id: torch.Tensor | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pred_spec = compute_radial_spectrum(prediction, self.n_bins)
         if self._reference is not None:
@@ -162,7 +193,40 @@ class SpectralRadialPriorLoss(nn.Module):
                     "or a `target` tensor at forward time."
                 )
             ref_spec = compute_radial_spectrum(target, self.n_bins)
+        if self.comparison == "log_ratio":
+            return self._log_ratio(pred_spec, ref_spec)
         if self.log_space:
             pred_spec = torch.log1p(pred_spec)
             ref_spec = torch.log1p(ref_spec)
         return (pred_spec - ref_spec).pow(2).mean()
+
+    @property
+    def empty_ring_batches(self) -> int:
+        """Batches on which no ring passed ``min_ring_snr`` (zero loss returned for them)."""
+        return 0 if self._empty_batches is None else int(self._empty_batches.item())
+
+    def _log_ratio(self, pred_spec: torch.Tensor, ref_spec: torch.Tensor) -> torch.Tensor:
+        """Mean squared log-ratio over the rings whose target SNR clears ``min_ring_snr``.
+
+        ``log(E + eps)`` per ring, with ``eps`` a multiple of the target's own outer-band
+        level, so the term is invariant to the image's absolute scale. The noise level and
+        the SNR mask come from the target, so they carry no gradient.
+        """
+        ref = ref_spec.detach()
+        noise = ref[:, self._noise_start :].median(dim=1).values
+        keep = (ref > 0) & (ref >= self.min_ring_snr * noise[:, None])
+        eps = (self.eps_noise_mult * noise).clamp_min(_EPS_FLOOR)[:, None]
+        diff = torch.log(pred_spec + eps) - torch.log(ref + eps)
+        kept = keep.to(diff.dtype)
+        if self._first_call:
+            # One host read, first call only: a threshold that empties every ring on the
+            # first batch is a config error, not a batch property.
+            self._first_call = False
+            if not bool(keep.any()):
+                raise ValueError(
+                    f"min_ring_snr={self.min_ring_snr} keeps no ring of the target spectrum "
+                    "on the first batch; lower min_ring_snr or check the target's scale."
+                )
+        empty = (kept.sum() == 0).long()
+        self._empty_batches = empty if self._empty_batches is None else self._empty_batches + empty
+        return (diff.pow(2) * kept).sum() / kept.sum().clamp_min(1.0)

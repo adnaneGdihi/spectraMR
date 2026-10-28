@@ -230,7 +230,7 @@ class BaselineAdapter(nn.Module, ABC, metaclass=_BaselineAdapterMeta):
         argument defaults to is not the paper's reconstruction procedure. This is the
         validation-side sibling of :meth:`training_loss`: an adapter that can run its
         reverse process overrides this to return an actual reconstruction, and
-        :class:`~spectramr.infrastructure.training.strategies.upstream_process_strategy.UpstreamProcessStrategy`
+        ``spectramr_baselines.strategy.UpstreamProcessStrategy``
         is the only caller (non-negotiable 6 -- resolved through the adapter, not a
         branch on baseline name).
 

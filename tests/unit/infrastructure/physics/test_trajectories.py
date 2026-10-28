@@ -110,6 +110,55 @@ class TestSpiralTrajectory:
 # ── EPI ────────────────────────────────────────────────────────────
 
 
+class TestGoldenAngleSpiral:
+    """Interleaves rotated by the full-circle golden angle nest across counts (#612)."""
+
+    def test_first_interleaves_do_not_depend_on_the_count(self) -> None:
+        few, _ = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=3, samples_per_arm=128, golden_angle=True
+        )
+        many, _ = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=7, samples_per_arm=128, golden_angle=True
+        )
+        assert torch.equal(few, many[:, : few.shape[1]])
+
+    def test_rotation_is_the_full_circle_golden_angle(self) -> None:
+        from spectramr.infrastructure.physics.trajectories import SPIRAL_GOLDEN_ANGLE
+
+        assert math.degrees(SPIRAL_GOLDEN_ANGLE) == pytest.approx(137.508, abs=1e-3)
+        traj, _ = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=2, samples_per_arm=128, golden_angle=True
+        )
+        end0 = torch.atan2(traj[1, 127], traj[0, 127])
+        end1 = torch.atan2(traj[1, 255], traj[0, 255])
+        turn = float(torch.remainder(end1 - end0, 2 * math.pi))
+        assert turn == pytest.approx(SPIRAL_GOLDEN_ANGLE, abs=1e-4)
+
+    def test_every_interleave_is_the_first_one_rotated(self) -> None:
+        from spectramr.infrastructure.physics.trajectories import SPIRAL_GOLDEN_ANGLE
+
+        traj, dcf = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=3, samples_per_arm=128, golden_angle=True
+        )
+        assert dcf.numel() == traj.shape[1] == 3 * 128
+        first = torch.complex(traj[0, :128], traj[1, :128])
+        for a in (1, 2):
+            arm = torch.complex(traj[0, 128 * a : 128 * (a + 1)], traj[1, 128 * a : 128 * (a + 1)])
+            rotation = torch.polar(torch.tensor(1.0), torch.tensor(a * SPIRAL_GOLDEN_ANGLE))
+            assert torch.allclose(arm, first * rotation, atol=1e-4)
+
+    def test_default_spacing_is_unchanged(self) -> None:
+        """NUFFT consumers keep the uniform interleave spacing unless they opt in."""
+        uniform, _ = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=4, samples_per_arm=128
+        )
+        golden, _ = TrajectoryFactory.get_spiral_trajectory(
+            im_size=(64, 64), num_arms=4, samples_per_arm=128, golden_angle=True
+        )
+        assert torch.equal(uniform[:, :128], golden[:, :128])
+        assert not torch.equal(uniform, golden)
+
+
 class TestEPITrajectory:
     def test_shape(self) -> None:
         traj, dcf = TrajectoryFactory.get_epi_trajectory(im_size=(32, 32))

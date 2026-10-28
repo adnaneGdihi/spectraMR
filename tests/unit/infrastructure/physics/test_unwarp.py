@@ -167,3 +167,32 @@ class TestBatchBroadcast:
         # Batch entries differ because vol entries are identical so
         # outputs should be identical too; pin behaviour.
         assert out.shape == vol.shape
+
+
+class TestReadoutShiftModel:
+    """shift_mode='readout': a df offset moves samples by df / pixel bandwidth."""
+
+    def test_readout_needs_pixel_bandwidth(self) -> None:
+        with pytest.raises(ValueError, match="pixel_bandwidth_hz > 0"):
+            PhysicalUnwarp(echo_spacing_s=None, shift_mode="readout")
+
+    def test_epi_needs_echo_spacing(self) -> None:
+        with pytest.raises(ValueError, match="echo_spacing_s must be > 0"):
+            PhysicalUnwarp(echo_spacing_s=None, shift_mode="epi")
+
+    def test_known_offset_gives_one_pixel_readout_shift(self) -> None:
+        """A 1 pixel shift is df = BW, so the volume slides by one sample along W."""
+        bw = 100.0
+        op = PhysicalUnwarp(echo_spacing_s=None, shift_mode="readout", pixel_bandwidth_hz=bw)
+        assert op.shift_axis == "W"
+        W = 16
+        vol = torch.arange(W, dtype=torch.float32).reshape(1, 1, 1, 1, W).expand(1, 1, 4, 8, W)
+        b0 = torch.full((4, 8, W), bw)
+        out = op(vol.contiguous(), b0_hz=b0)
+        # Interior voxels sample the neighbour one pixel to the right.
+        assert torch.allclose(out[0, 0, 0, 0, 1:-2], vol[0, 0, 0, 0, 2:-1], atol=1e-4)
+
+    def test_readout_axis_is_not_pe_axis(self) -> None:
+        op = PhysicalUnwarp(echo_spacing_s=None, shift_mode="readout", pixel_bandwidth_hz=50.0)
+        assert op.shift_axis == "W"
+        assert PhysicalUnwarp(echo_spacing_s=1e-3, pe_axis="W").shift_axis == "W"

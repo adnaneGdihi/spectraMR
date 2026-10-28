@@ -34,6 +34,7 @@ References
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 
 __all__ = ["MultiContrastKSpaceCrossAttention"]
@@ -136,10 +137,9 @@ class MultiContrastKSpaceCrossAttention(nn.Module):
 
         # Scaled dot-product attention along the contrast axis.
         # q, k, v: (Btok, n_heads, n_c, head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, v)  # (Btok, n_heads, n_c, head_dim)
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=getattr(self.dropout, "p", 0.0) if self.training else 0.0
+        )  # (Btok, n_heads, n_c, head_dim)
         out = out.transpose(1, 2).contiguous().view(Btok, n_c, self.attn_dim)
         out = self.proj(out)
         return self._untokenise(out + residual, info)

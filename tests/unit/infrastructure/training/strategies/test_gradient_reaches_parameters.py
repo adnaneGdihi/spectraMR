@@ -62,6 +62,8 @@ class TestTheEquivariantImagingObjectiveReachesTheUNet:
         s.state = SimpleNamespace(config=cfg)
         s.group_name, s.alpha, s.n_group_samples = "dihedral", 1.0, 1
         s.robust, s.multicoil_operator, s._gsure = False, False, None
+        # The anchor on y itself, an image network: what __init__ reads for standard_unet.
+        s.measurement_target, s._consumes_kspace, s._emits_kspace = "measured", False, False
         s._group = get_group_action("dihedral")
         s._rng = torch.Generator(device="cpu").manual_seed(0)
         s._owned_ei_loss = None
@@ -90,9 +92,8 @@ class TestTheEquivariantImagingObjectiveReachesTheUNet:
         from spectramr.models.registry import MODEL_REGISTRY
 
         torch.manual_seed(0)
-        gen = MODEL_REGISTRY["standard_unet"]["class"](
-            in_channels=2, out_channels=2, features=8
-        ).train()
+        # Default widths: features=8 was never honoured, so this is the net the test always ran.
+        gen = MODEL_REGISTRY["standard_unet"]["class"](in_channels=2, out_channels=2).train()
         s = self._strategy(gen, bridge=bridge)
         y, mask = self._batch()
 
@@ -114,19 +115,15 @@ class TestTheEquivariantImagingObjectiveReachesTheUNet:
         from spectramr.models.registry import MODEL_REGISTRY
 
         torch.manual_seed(0)
-        gen = MODEL_REGISTRY["standard_unet"]["class"](
-            in_channels=2, out_channels=2, features=8
-        ).train()
+        # Default widths: features=8 was never honoured, so this is the net the test always ran.
+        gen = MODEL_REGISTRY["standard_unet"]["class"](in_channels=2, out_channels=2).train()
         s = self._strategy(gen, bridge=True)
         y, mask = self._batch()
 
-        # alpha=0 leaves only the consistency anchor; the equivariance term is
-        # then the difference between the two runs.
+        # alpha=0 skips the equivariance branch (d33a4dfbf), leaving only the anchor.
         s.alpha = 0.0
         anchor_only = s._compute_losses_impl(y, y, epoch=0, measured_kspace=y, mask=mask)
-        assert float(anchor_only["loss_equivariance"]) > 0, (
-            "the equivariance term computed to exactly zero — it is being reported but not measured"
-        )
+        assert float(anchor_only["loss_equivariance"]) == 0.0
         anchor_only["g_total_loss"].backward()
         assert _grad_census(gen)[0] > 0
 
@@ -134,6 +131,9 @@ class TestTheEquivariantImagingObjectiveReachesTheUNet:
             p.grad = None
         s.alpha = 1.0
         both = s._compute_losses_impl(y, y, epoch=0, measured_kspace=y, mask=mask)
+        assert float(both["loss_equivariance"]) > 0, (
+            "the equivariance term computed to exactly zero — it is being reported but not measured"
+        )
         both["g_total_loss"].backward()
         assert _grad_census(gen)[0] > 0
         assert float(both["g_total_loss"]) != float(anchor_only["g_total_loss"]), (
@@ -160,7 +160,12 @@ class TestTheN2nObjectiveReachesTheBackbone:
         d = yaml.safe_load(arm.read_text())
         d["losses"]["kspace_losses"] = [{"name": loss_name, "weight": 1.0}]
         if declare_warmup:
-            d["losses"].setdefault("reconstruction", {})["warmup_losses"] = []
+            rec = d["losses"].setdefault("reconstruction", {})
+            rec["warmup_losses"] = []
+            if loss_name == "l1":
+                # The arm pins lambda_l1 to 0; one loss declared on both surfaces
+                # must agree, so this l1 objective carries weight 1 on both (#2449).
+                rec["lambda_l1"] = 1.0
         else:
             d["losses"].pop("reconstruction", None)
         p = Path(tempfile.mkdtemp()) / "arm.yaml"

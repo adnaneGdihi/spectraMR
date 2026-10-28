@@ -17,18 +17,34 @@ import torch.nn.functional as F
 from .reconstruction import ReconstructionTrainingStrategy
 
 
+def field_strength_for(
+    x: torch.Tensor, batch_field: Any, source_field: float | None
+) -> torch.Tensor:
+    """Per-sample source field: the batch's own value, else the declared source field.
+
+    Neither present raises, so the restorer is never run at an unstated field.
+    """
+    if batch_field is not None:
+        return torch.as_tensor(batch_field, device=x.device).reshape(-1).float()
+    if source_field is None:
+        raise ValueError(
+            "FieldWienerStrategy needs the source field: batch['field_strength'] is absent and "
+            "training.field_wiener.source_field is unset."
+        )
+    return torch.full((x.shape[0],), float(source_field), device=x.device)
+
+
 def compute_field_wiener_loss(
-    model: Any, batch: dict[str, Any], *, lambda_l1: float = 1.0
+    model: Any,
+    batch: dict[str, Any],
+    *,
+    lambda_l1: float = 1.0,
+    source_field: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """L1 restoration via the field-conditioned spectral Wiener restorer."""
     x = batch["input"]
     y = batch["target"]
-    if "field_strength" not in batch:
-        raise ValueError(
-            "FieldWienerStrategy requires batch['field_strength'] (source field, Tesla). Use "
-            f"data.dataset_type='mrixfields'. Got batch keys: {sorted(batch.keys())}."
-        )
-    b_s = batch["field_strength"].reshape(-1).float()
+    b_s = field_strength_for(x, batch.get("field_strength"), source_field)
     pred = model(x, field_strength=b_s)
     loss_l1 = F.l1_loss(pred, y)
     return {
@@ -51,6 +67,9 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
         self._verify_strategy_config(expected_modes=("field_wiener", "reconstruction"))
         cfg = getattr(self.config.training, "field_wiener", None)
         self._fw_lambda_l1 = self._declared_inline_l1_weight()
+        self._fw_source_field = (
+            float(cfg.source_field) if cfg is not None and cfg.source_field is not None else None
+        )
         if getattr(self, "logging_service", None):
             self._log_config_features(self.logging_service)
             gen = getattr(self.env, "generator", None)
@@ -74,7 +93,10 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
                 f"got {type(batch)!r}."
             )
         out = compute_field_wiener_loss(
-            self.env.generator, batch, lambda_l1=getattr(self, "_fw_lambda_l1", 1.0)
+            self.env.generator,
+            batch,
+            lambda_l1=getattr(self, "_fw_lambda_l1", 1.0),
+            source_field=getattr(self, "_fw_source_field", None),
         )
         # Loss-SSOT seam: fold declarative image losses (hfen/ms_ssim/sobel_edge) onto
         # the inline objective; the inline l1 is skipped by the seam (no double-count).
@@ -109,6 +131,9 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
         """
         x = batch_context.get("input", input_batch)
         b_s = batch_context.get("field_strength")
+        source = getattr(self, "_fw_source_field", None)
+        if b_s is None and source is not None and isinstance(x, torch.Tensor) and x.ndim >= 2:
+            b_s = field_strength_for(x, None, source)
         gen = self.env.generator
         if not isinstance(x, torch.Tensor) or x.numel() == 0 or x.ndim < 2 or b_s is None:
             return {}
@@ -126,8 +151,9 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
         self, input_batch: Any, batch_context: dict[str, Any], **kwargs: Any
     ) -> torch.Tensor:
         x0 = batch_context.get("input", input_batch)
-        b_s = batch_context.get("field_strength", kwargs.get("field_strength"))
-        if b_s is None:
-            raise ValueError("FieldWienerStrategy validation requires per-sample 'field_strength'.")
-        b_s = torch.as_tensor(b_s, device=x0.device).reshape(-1).float()
+        b_s = field_strength_for(
+            x0,
+            batch_context.get("field_strength", kwargs.get("field_strength")),
+            getattr(self, "_fw_source_field", None),
+        )
         return self.env.generator(x0, field_strength=b_s).clamp(0.0, 1.0)

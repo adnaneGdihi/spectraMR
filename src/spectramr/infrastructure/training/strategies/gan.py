@@ -151,6 +151,21 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
 
         return StrategyInitializationHelper.create_profiling_context(self, name, **metadata)
 
+    def _split_generator_output(self, output: Any) -> tuple[torch.Tensor, Any]:
+        """``(image, auxiliary)``: the image is what the critic, the losses and the metrics see.
+
+        The one place a distribution head is reduced to its point estimate, so the
+        discriminator, the generator objective and validation cannot disagree about
+        which channels are the image. The default head is the image itself.
+        """
+        return output, None
+
+    def _auxiliary_generator_loss(
+        self, image: torch.Tensor, auxiliary: Any, target: torch.Tensor
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """``(term added to the generator objective, components)``; none by default."""
+        return None, {}
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor,
@@ -189,7 +204,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             pass
 
         # Forward pass
-        hr_fakes = self.generator_model(input_batch)
+        hr_fakes, auxiliary = self._split_generator_output(self.generator_model(input_batch))
         if hr_fakes.device != target_batch.device:
             hr_fakes = hr_fakes.to(target_batch.device)
 
@@ -221,6 +236,10 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
 
         total_loss = loss_output.total
         components = loss_output.components
+        extra, extra_components = self._auxiliary_generator_loss(hr_fakes, auxiliary, target_batch)
+        if extra is not None:
+            total_loss = extra if total_loss is None else total_loss + extra
+            components = {**components, **extra_components}
 
         if total_loss is None:
             total_loss = torch.tensor(0.0, device=target_batch.device, requires_grad=True)
@@ -269,7 +288,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
                 discriminator.requires_grad_(True)
 
             with torch.no_grad():
-                hr_fakes = self.env.generator(input_batch)
+                hr_fakes, _ = self._split_generator_output(self.env.generator(input_batch))
 
             if hr_fakes.device != target_batch.device:
                 hr_fakes = hr_fakes.to(target_batch.device)
@@ -350,7 +369,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             if isinstance(discriminator, nn.Module):
                 discriminator.requires_grad_(False)
 
-            hr_fakes = self.env.generator(input_batch)
+            hr_fakes, auxiliary = self._split_generator_output(self.env.generator(input_batch))
 
             if hr_fakes.device != target_batch.device:
                 hr_fakes = hr_fakes.to(target_batch.device)
@@ -372,6 +391,11 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
                 iteration=iteration,
             )
             g_total = g_loss_output.total if hasattr(g_loss_output, "total") else g_loss_output
+            extra, extra_components = self._auxiliary_generator_loss(
+                hr_fakes, auxiliary, target_batch
+            )
+            if extra is not None:
+                g_total = extra if g_total is None else g_total + extra
 
             # Store detached metrics as TENSORS (no host transfer). float() here
             # fired a GPU sync per key every step; get_last_metrics() converts to
@@ -379,11 +403,11 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             with torch.no_grad():
                 if g_total is not None:
                     self._last_step_metrics["g_total_loss"] = g_total.detach()
-                if hasattr(g_loss_output, "components"):
-                    for k, v in g_loss_output.components.items():
-                        self._last_step_metrics[
-                            f"g_{k}" if not str(k).startswith("loss_") else k
-                        ] = v.detach()
+                components = dict(getattr(g_loss_output, "components", {}) or {})
+                for k, v in {**components, **extra_components}.items():
+                    self._last_step_metrics[
+                        f"g_{k}" if not str(k).startswith("loss_") else k
+                    ] = v.detach()
 
                 if hasattr(self, "_compute_training_metrics"):
                     # Live iteration (loop_state seam), not the frozen
@@ -469,7 +493,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         # the same seam already used for ``current_step`` below.
         iteration = resolve_loop_iteration(self)
         config = self.env.config if self.env else self.config
-        num_d_updates = _resolve_disc_updates(config)
+        num_d_updates = _resolve_disc_updates(config, iteration=iteration)
 
         # Validate discriminator availability
         discriminator = self.env.discriminator
@@ -564,19 +588,6 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         Returns:
             A dictionary of validation metrics (e.g., `val_psnr`, `val_real_score`).
         """
-        batch = (input_batch, target_batch)
-        if input_batch is None or target_batch is None:
-            input_batch, target_batch = self._unpack_batch(batch)
-            if input_batch is None or target_batch is None:
-                return {}
-
-        # Fail gracefully if unpacking failed
-        if input_batch is None or target_batch is None:
-            return {}
-
-        if input_batch is None or target_batch is None:
-            return {}
-
         # [FIX] Complex→Real guard for validation
         if torch.is_complex(input_batch):
             input_batch = torch.cat([input_batch.real, input_batch.imag], dim=1)
@@ -594,6 +605,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             # Handle models that return tuples (e.g., DisentangledMRI)
             if isinstance(hr_fakes, tuple):
                 hr_fakes = hr_fakes[0]
+            hr_fakes, _ = self._split_generator_output(hr_fakes)
 
             if getattr(self.config.training, "enforce_output_range", False):
                 hr_fakes = clamp_to_range(hr_fakes, enable=True, telemetry=False)
@@ -605,13 +617,8 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             metrics = {}
             if compute_img_metrics:
                 try:
-                    output_transformed, target_transformed = self._apply_metric_transforms(
-                        hr_fakes, target_batch, val_config
-                    )
-
-                    computed = self.validation_metrics_computer.compute(
-                        output_transformed, target_transformed
-                    )
+                    views = self._metric_transform_views(hr_fakes, target_batch, val_config)
+                    computed = views.compute(self.validation_metrics_computer)
                     metrics.update(computed)
                 except Exception as e:
                     if hasattr(self, "logging_service") and self.logging_service:
@@ -622,8 +629,11 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             if self.env.discriminator:
                 # Cast for callability
                 disc = cast(nn.Module, self.env.discriminator)
-                real_scores = disc(target_batch)
-                fake_scores = disc(hr_fakes)
+                # The same domain conversion the D and G steps apply (#1921), so
+                # validation scores what the critic was trained to score.
+                to_critic = self.loss_computer._to_critic
+                real_scores = disc(to_critic(target_batch))
+                fake_scores = disc(to_critic(hr_fakes))
                 disc_scores = {
                     "real_score": real_scores.mean().detach().item(),
                     "fake_score": fake_scores.mean().detach().item(),

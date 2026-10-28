@@ -13,9 +13,10 @@ import itertools
 import pytest
 import torch
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (
-    DEGRADATION_REGISTRY,
-    apply_degradation,
+from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY, apply_degradation
+from spectramr.infrastructure.physics.degradations.registry_queries import (
+    requirement_free_degradations,
+    slice_capable_degradations,
 )
 from spectramr.infrastructure.physics.severity import (
     PhysicalParam,
@@ -89,9 +90,7 @@ class TestEveryDegradationDeclaresItsRange:
     """The coverage gate: no degradation may exist without a declared severity."""
 
     def test_all_registry_entries_have_a_severity_spec(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         # No hard-coded size: the gate is that EVERY entry declares a range,
         # which must keep holding as axes are added (D28 resolution_snr,
@@ -104,21 +103,28 @@ class TestEveryDegradationDeclaresItsRange:
             assert spec.severity.primary.units, f"{name}: primary param has no units"
 
     def test_a_degradation_without_a_declared_severity_fails_at_import(self) -> None:
-        """`_reg` raises rather than defaulting -- you cannot add a degradation
+        """A family entry has no severity default -- you cannot add a degradation
         without writing down what its severity means physically."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import _reg
+        from spectramr.config.schemas.enums import ArtifactOrigin
+        from spectramr.infrastructure.physics.degradations.families import native_2d
 
-        with pytest.raises(KeyError, match="no declared SeveritySpec"):
-            _reg("D99", "not_a_real_degradation", "noise", lambda x: x, "bogus")
+        with pytest.raises(TypeError, match="severity"):
+            native_2d(  # type: ignore[call-arg]
+                code="D99",
+                name="not_a_real_degradation",
+                family="noise",
+                fn=lambda x, theta, seed=0: x,
+                description="bogus",
+                affects=frozenset({"magnitude"}),
+                origin=ArtifactOrigin.SCANNER,
+            )
 
     def test_the_known_decreasing_axes_are_labelled_as_such(self) -> None:
-        """Four degradations ramp their physical parameter DOWN with severity.
+        """These degradations ramp their physical parameter DOWN with severity.
 
         Mislabelling any of these silently inverts the reported range.
         """
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         decreasing = {
             name
@@ -131,6 +137,9 @@ class TestEveryDegradationDeclaresItsRange:
             "complex_gaussian",  # SNR 40 dB -> 2 dB
             "gibbs",  # keeps 100% -> 8.5% of k-space radius (#246)
             "partial_fourier",  # keeps 100% -> 62.5% of ky
+            "adc_clipping",  # clip level 100% -> 10% of the k-space peak
+            "adc_quantization",  # 16 bit -> 4 bit
+            "field_contrast",  # target field 3 T -> 0.05 T
         }
 
 
@@ -142,9 +151,7 @@ class TestDeclarationMatchesTheDegrader:
     """
 
     def test_complex_gaussian_snr_matches_the_degrader_formula(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         sev = DEGRADATION_REGISTRY["complex_gaussian"].severity
         # degrader: snr_db = snr_max_db + (snr_min_db - snr_max_db) * theta
@@ -154,9 +161,7 @@ class TestDeclarationMatchesTheDegrader:
             assert sev.physical_value(theta) == pytest.approx(expected)
 
     def test_cartesian_undersampling_r_matches_the_degrader_formula(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         sev = DEGRADATION_REGISTRY["cartesian_undersamp"].severity
         # degrader: R = 1.0 + (R_max - 1.0) * theta,  R_max = 8.0
@@ -164,9 +169,7 @@ class TestDeclarationMatchesTheDegrader:
             assert sev.physical_value(theta) == pytest.approx(1.0 + 7.0 * theta)
 
     def test_partial_fourier_fraction_matches_the_degrader_formula(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         sev = DEGRADATION_REGISTRY["partial_fourier"].severity
         # degrader: frac = 1.0 - (1.0 - min_fraction) * theta,  min_fraction = 0.625
@@ -176,9 +179,7 @@ class TestDeclarationMatchesTheDegrader:
             )
 
     def test_gibbs_truncation_matches_the_degrader_formula(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         sev = DEGRADATION_REGISTRY["gibbs"].severity
         # delegate: trunc = 1.0 - theta * 0.915  (theta=1 keeps 8.5% radius, #246)
@@ -215,7 +216,11 @@ class TestDeclarationMatchesTheDegrader:
 # nothing. These tests call the degraders.
 # ──────────────────────────────────────────────────────────────────────
 
-_ALL_DEGRADERS = sorted(DEGRADATION_REGISTRY)
+# These checks run on a single-coil 2-D slice; volume-only and multi-coil axes are covered by
+# their own mode-rejection and coil-stack tests under degradations/catalogue/.
+_ALL_DEGRADERS = sorted(
+    set(slice_capable_degradations()) & set(requirement_free_degradations())
+)
 
 #: Axes that do not move the magnitude at all. Not a waiver -- a standing bug report.
 #: See https://github.com/adnaneGdihi/spectramr/issues (inert severity axes).

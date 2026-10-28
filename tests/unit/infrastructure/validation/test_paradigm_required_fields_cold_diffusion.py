@@ -49,3 +49,40 @@ def test_genuine_diffusion_still_requires_training_diffusion() -> None:
     )
     # The real DiffusionTrainingStrategy must still be flagged when the block is absent.
     assert any(r.category == "paradigm_required_fields" for r in _errors(results))
+
+
+def test_levy_denoising_not_required_to_set_training_diffusion() -> None:
+    # LevyDenoisingStrategy owns training.levy_denoising and refuses training.diffusion.
+    checker = ConfigHealthChecker()
+    results = checker.check_paradigm_required_fields(
+        _cfg("levy_diffusion", has_diffusion_block=False)
+    )
+    assert _errors(results) == []
+
+
+def test_other_diffusion_named_mode_still_requires_training_diffusion() -> None:
+    # The exemption is an exact mode name, not the "diffusion" substring.
+    checker = ConfigHealthChecker()
+    results = checker.check_paradigm_required_fields(
+        _cfg("latent_diffusion", has_diffusion_block=False)
+    )
+    assert any(r.category == "paradigm_required_fields" for r in _errors(results))
+
+
+def test_resetting_denoiser_not_required_to_set_training_diffusion() -> None:
+    # resetting_diffusion routes to LevyDenoisingStrategy, which refuses training.diffusion.
+    checker = ConfigHealthChecker()
+    results = checker.check_paradigm_required_fields(
+        _cfg("resetting_diffusion", has_diffusion_block=False)
+    )
+    assert _errors(results) == []
+
+
+def test_qspace_diffusion_not_required_to_set_training_diffusion() -> None:
+    # QSpaceDiffusionStrategy reads training.qspace_diffusion; its reconstruction base
+    # refuses training.diffusion, so requiring it here made the arm unlaunchable.
+    checker = ConfigHealthChecker()
+    results = checker.check_paradigm_required_fields(
+        _cfg("qspace_diffusion", has_diffusion_block=False)
+    )
+    assert _errors(results) == []

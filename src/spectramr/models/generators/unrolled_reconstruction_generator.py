@@ -20,6 +20,9 @@ from spectramr.infrastructure.physics.forward_operator import (
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
+#: The output activations ``unrolled_reconstruction`` accepts; anything else raises.
+_OUTPUT_ACTIVATIONS: dict[str, type[nn.Module]] = {"tanh": nn.Tanh, "none": nn.Identity}
+
 
 class RegularizationBlock(nn.Module):
     """Learned regularization block for unrolled reconstruction.
@@ -140,6 +143,7 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         lambda_dc: float = 1.0,
         num_coils: int = 1,
         activation: str = "relu",
+        output_activation: str = "tanh",
     ):
         """__init__.
 
@@ -151,8 +155,10 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
             features (int): Description.
             kernel_size (int): Description.
             lambda_dc (float): Description.
-            num_coils (int): Description.
+            num_coils: coils the measured k-space and the maps carry (checked).
             activation (str): Description.
+            output_activation: ``"tanh"`` (default) or ``"none"``; a tanh after the
+                last DC step clips the image above 1 and undoes the DC (#2327).
         """
         super().__init__()
 
@@ -160,7 +166,9 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         self.out_channels = out_channels
         self.img_size = img_size
         self.num_unrolls = num_unrolls
-        self.num_coils = num_coils
+        self.num_coils = int(num_coils)
+        if output_activation not in _OUTPUT_ACTIVATIONS:
+            raise ValueError(f"Unknown output_activation {output_activation!r}")
 
         # Initial reconstruction (e.g., zero-filled reconstruction)
         self.initial_recon = nn.Conv2d(in_channels, out_channels, 1)
@@ -193,8 +201,7 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
             ],
         )
 
-        # Final output activation
-        self.output_activation = nn.Tanh()
+        self.output_activation = _OUTPUT_ACTIVATIONS[output_activation]()
 
     def forward(
         self,
@@ -229,6 +236,12 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        # A half-supplied pair would silently skip every DC step.
+        if (kspace_measured is None) != (mask is None):
+            raise ValueError(
+                "data consistency needs both kspace_measured and mask; got only "
+                f"{'kspace_measured' if mask is None else 'mask'}."
+            )
         # Initial reconstruction
         x = self.initial_recon(x)
 
@@ -238,13 +251,10 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
             x = reg_block(x)
 
             # Data consistency step (if k-space data available)
-            # Data consistency step (if k-space data available)
             if kspace_measured is not None and mask is not None:
-                # Update operator state dynamically
+                self._check_coils(kspace_measured, sensitivity_maps)
                 self.forward_operator.set_coil_sensitivities(sensitivity_maps)
                 self.forward_operator.set_mask(mask)
-
-                # Apply DC
                 x = dc_layer(x, kspace_measured)
 
         # Final activation
@@ -262,6 +272,21 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
             mask=mask,
             sensitivity_maps=sensitivity_maps,
         )
+
+    def _check_coils(self, kspace: torch.Tensor, maps: torch.Tensor | None) -> None:
+        """Refuse k-space whose coil count ``num_coils`` does not name (shape-only, no sync).
+
+        Without maps the operator is ``A = M F`` on one coil and has no combine.
+        """
+        coils = kspace.shape[1] if torch.is_complex(kspace) else kspace.shape[1] // 2
+        if coils != self.num_coils or (maps is not None and maps.shape[-3] != coils):
+            raise ValueError(
+                f"unrolled_reconstruction declares num_coils={self.num_coils}, but data "
+                f"consistency received {coils}-coil k-space and maps "
+                f"{None if maps is None else tuple(maps.shape)}."
+            )
+        if coils > 1 and maps is None:
+            raise ValueError(f"{coils}-coil data consistency needs sensitivity_maps to combine.")
 
     @property
     def name(self) -> str:
@@ -424,15 +449,11 @@ class VariationalNetworkGenerator(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Input validation and comprehensive normalization
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            return torch.zeros(
-                x.shape[0],
-                self.out_channels,
-                x.shape[2],
-                x.shape[3],
-                dtype=x.dtype,
-                device=x.device,
+        # A half-supplied pair would silently skip every DC step.
+        if (kspace_measured is None) != (mask is None):
+            raise ValueError(
+                "data consistency needs both kspace_measured and mask; got only "
+                f"{'kspace_measured' if mask is None else 'mask'}."
             )
 
         # Normalize input: k-space can have very large values
@@ -516,6 +537,7 @@ def create_unrolled_reconstruction_generator(
     lambda_dc: float = 1.0,
     num_coils: int = 1,
     activation: str = "relu",
+    output_activation: str = "tanh",
     **kwargs,
 ) -> UnrolledReconstructionGenerator:
     """Factory function for unrolled reconstruction generator.
@@ -546,6 +568,7 @@ def create_unrolled_reconstruction_generator(
         lambda_dc=lambda_dc,
         num_coils=num_coils,
         activation=activation,
+        output_activation=output_activation,
     )
 
 

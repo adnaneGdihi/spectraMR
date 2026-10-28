@@ -21,12 +21,21 @@ class SENSESubspaceProjector(nn.Module):
         """__init__."""
         super().__init__()
 
-    def forward(self, kspace_pred: torch.Tensor, smaps: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, kspace_pred: torch.Tensor, smaps: torch.Tensor, *, log_scaled: bool = False
+    ) -> torch.Tensor:
         """Project multi-coil k-space onto true SENSE subspace.
+
+        The projection is linear-domain physics: a true multi-coil image is
+        ``s_c * m`` at every pixel, and only on linear k-space does the inverse
+        FFT return those coil images. On ``log1p``-compressed k-space it changed an
+        exact prediction by NRMSE 0.46 (#2488), so ``log_scaled`` input is
+        decompressed, projected and compressed again.
 
         Args:
             kspace_pred: K-space output from network [B, C, H, W] (real-stacked or complex)
             smaps: Spatial coil sensitivity maps [B, C, H, W] (real-stacked or complex)
+            log_scaled: Whether ``kspace_pred`` is ``log1p``-compressed in magnitude.
 
         Returns:
             Projected k-space [B, C, H, W] mathematically consistent with coil geometries.
@@ -44,6 +53,15 @@ class SENSESubspaceProjector(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        if log_scaled:
+            from spectramr.data.transforms.normalization import (
+                compress_kspace_log,
+                decompress_kspace_log,
+            )
+
+            linear = decompress_kspace_log(kspace_pred, channel_dim=1)
+            return compress_kspace_log(self.forward(linear, smaps), channel_dim=1)
+
         # Ensure smaps and kspace are complex for FFT ops
         is_real_stacked = False
         k_pred_comp = kspace_pred

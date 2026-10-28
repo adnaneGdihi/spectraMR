@@ -44,8 +44,10 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.utils.domain_inference import (
     IMAGE_DOMAIN_COIL_MODES,
     infer_output_domain,
+    loader_serves_kspace,
     metric_transform_produced_image,
     needs_ifft_for_visualization,
+    resolve_output_domain,
 )
 from tests.utils.corpus import tracked_yamls
 from tests.utils.data_config_stub import DataConfigStub
@@ -217,6 +219,37 @@ def test_a_flat_only_config_still_resolves() -> None:
     )
 
     assert needs_ifft_for_visualization(config) == (False, False)
+
+
+@pytest.mark.unit
+def test_declared_kspace_output_is_kspace_without_normalisation() -> None:
+    """The dataset obeys ``domain.output``, so the predicate must too.
+
+    An m4raw arm with k-space normalisation off receives k-space; reading it as image
+    left ``_ensure_image_domain_target`` a no-op on the kspace_filling baselines.
+    """
+    config = _config(dataset_type="m4raw", output_domain="kspace", normalize_kspace=False)
+
+    assert loader_serves_kspace(config) is True
+    assert needs_ifft_for_visualization(config)[1] is True
+
+
+@pytest.mark.unit
+def test_declared_kspace_output_still_yields_to_an_image_coil_mode() -> None:
+    """``rss_image`` IFFTs inside the dataset, whatever ``domain.output`` says."""
+    config = _config(
+        dataset_type="m4raw", output_domain="kspace", coil_processing_mode="rss_image"
+    )
+
+    assert loader_serves_kspace(config) is False
+
+
+@pytest.mark.unit
+def test_defaulted_domain_output_does_not_count_as_kspace() -> None:
+    """``domain.output`` defaults to ``'image'``; only a declaration may flip the answer."""
+    config = _config(dataset_type="m4raw", normalize_kspace=False)
+
+    assert loader_serves_kspace(config) is False
 
 
 @pytest.mark.unit
@@ -456,3 +489,24 @@ class TestTheKspaceToImageBridgeHasAnOwner:
         for coil_mode in ("none", "rss_image"):
             cfg = self._cfg("standard_unet", coil_mode=coil_mode)
             assert needs_ifft_for_visualization(cfg)[1] is loader_serves_kspace(cfg)
+
+
+@pytest.mark.unit
+def test_a_loader_heuristic_is_not_reported_as_a_declaration() -> None:
+    """P6 (the loader serves k-space) guesses; ``_save_output`` must not raise on a guess."""
+    decision = resolve_output_domain(_config(dataset_type="kspace", coil_processing_mode="svd"))
+
+    assert (decision.domain, decision.tier, decision.declared) == ("kspace", 6, False)
+
+
+@pytest.mark.unit
+def test_a_target_domain_declaration_is_reported_as_one() -> None:
+    config = SimpleNamespace(
+        data=DataConfigStub(dataset_type="kspace"),
+        model=SimpleNamespace(target_domain="kspace"),
+        physics=None,
+    )
+    decision = resolve_output_domain(config)
+
+    assert (decision.domain, decision.tier, decision.declared) == ("kspace", 1, True)
+    assert infer_output_domain(config) == decision.domain

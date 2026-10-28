@@ -119,14 +119,24 @@ def test_distributed_rank_reads_torchrun_env(monkeypatch: pytest.MonkeyPatch) ->
     assert env.is_secondary_rank() is True
 
 
-def test_distributed_rank_falls_back_to_local_rank(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same precedence ``setup_distributed`` uses: RANK, then LOCAL_RANK."""
+def test_local_rank_alone_is_not_a_global_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LOCAL_RANK numbers the processes on one node; as a global rank it made every node's
+    first process rank 0. The rank rule is ``core.topology.resolve_rank`` (#2701)."""
     monkeypatch.setenv(env.WORLD_SIZE, "2")
     monkeypatch.delenv(env.RANK, raising=False)
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
     monkeypatch.setenv(env.LOCAL_RANK, "1")
-    assert env.distributed_rank() == 1
+    assert env.distributed_rank() is None
+    assert env.is_secondary_rank() is False
+
+
+def test_distributed_rank_reads_slurm_procid_beside_a_world_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(env.WORLD_SIZE, "4")
+    monkeypatch.delenv(env.RANK, raising=False)
+    monkeypatch.setenv("SLURM_PROCID", "3")
+    assert env.distributed_rank() == 3
     assert env.is_secondary_rank() is True
 
 

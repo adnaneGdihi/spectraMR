@@ -23,9 +23,14 @@ import matplotlib.pyplot as plt
 _LOG = logging.getLogger(__name__)
 
 _STYLE_DIR = Path(__file__).resolve().parent / "styles"
+#: ``poster`` and ``slides`` keep the Nature column geometry -- the figure is
+#: scaled up where it is placed -- and change only text and stroke weight
+#: relative to the figure, which is what reading distance demands.
 _STYLE_FILES = {
     "ieee": _STYLE_DIR / "ieee.mplstyle",
     "nature": _STYLE_DIR / "nature.mplstyle",
+    "poster": _STYLE_DIR / "poster.mplstyle",
+    "slides": _STYLE_DIR / "slides.mplstyle",
 }
 
 # Nature column widths (mm). Plotters size figures by profile, not magic inches.
@@ -59,7 +64,7 @@ OKABE_ITO = [
     "#009E73",  # bluish green
     "#F0E442",  # yellow
     "#0072B2",  # blue
-    "#D55E00",  # vermillion
+    "#D55E00",  # vermilion
     "#CC79A7",  # reddish purple
 ]
 
@@ -160,6 +165,7 @@ METHOD_COLOURS: dict[str, str] = {
     # ----- Acquisition / active learning -----
     "active_acquisition": "#E69F00",
     "learnable_acquisition": "#D55E00",
+    "acq_hypernetwork": "#D55E00",
     # ----- TTA / TTO -----
     "test_time_adaptation": "#CC79A7",
     "test_time_optimization": "#CC79A7",
@@ -176,6 +182,7 @@ METHOD_COLOURS: dict[str, str] = {
     "synthetic_pathology_aug": "#E69F00",
     # ----- Calibration / certificates -----
     "calibration": "#999999",
+    "hardware_warp_calibration": "#999999",
     "validation_badge": "#000000",
     "distillation": "#56B4E9",
     # ----- Misc primitives -----
@@ -319,6 +326,7 @@ METHOD_COLOURS: dict[str, str] = {
     "generative_refiner": "#CC79A7",
     # ----- Physics: Bloch / field -----
     "bloch_synth": "#56B4E9",
+    "dispersion_bloch_ae": "#56B4E9",
     "field_cocycle": "#009E73",
     # ----- Quantitative / non-anatomical endpoints -----
     # These grade a physical quantity (a spectrum, a perfusion constant, a
@@ -339,7 +347,7 @@ def use_default_style(style: str | None = None, extra_rc: dict[str, object] | No
     """Apply a named house style + optional per-figure overrides.
 
     Args:
-        style: ``"nature"`` or ``"ieee"``. When ``None``, re-apply the
+        style: ``"nature"``, ``"ieee"``, ``"poster"`` or ``"slides"``. When ``None``, re-apply the
             most-recently-selected style — so plotters that call this with no
             argument inherit the style chosen by ``generate_report``.
         extra_rc: Optional dict of additional rcParams overrides.
@@ -743,6 +751,33 @@ def sanitize_figure_text(fig) -> int:
             changed,
         )
     return changed
+
+
+def save_plot(
+    fig,
+    out_path: str | Path,
+    *,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
+    metadata=None,
+) -> Path | None:
+    """Save ``fig`` in every requested format, write its sidecar, return the primary path.
+
+    The one way a plotter ends: ``out_path``'s stem names the files and the first
+    format is the primary. ``formats=None`` means the one format ``out_path``
+    names, so a direct call with ``out.png`` still gets ``out.png``.
+    """
+    out_path = Path(out_path)
+    if formats is None:
+        suffix = out_path.suffix.lstrip(".").lower()
+        formats = (suffix,) if suffix else ("pdf", "png")
+    written = save_figure(fig, out_path.parent, out_path.stem, formats=formats, dpi=dpi)
+    primary = written.get(formats[0])
+    if metadata is not None and primary is not None:
+        from .metadata import write_sidecar
+
+        write_sidecar(primary, metadata)
+    return primary
 
 
 def save_figure(

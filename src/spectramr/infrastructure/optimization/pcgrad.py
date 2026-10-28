@@ -192,25 +192,17 @@ def project_conflicting_gradients(
             projected.append(g_s)
             continue
 
-        # Flatten for dot product computation
-        g_p_flat = g_p.view(-1)
-        g_s_flat = g_s.view(-1)
-
+        # reshape, not view: autograd may return a non-contiguous gradient. The conflict
+        # test stays on device (torch.where) so no parameter forces a host sync.
+        g_p_flat = g_p.reshape(-1)
+        g_s_flat = g_s.reshape(-1)
         dot = torch.dot(g_p_flat, g_s_flat)
-
-        if dot < 0:
-            # Conflicting: project g_s onto the normal plane of g_p
-            # g_s_proj = g_s - (g_s · g_p / ||g_p||²) * g_p
-            norm_sq = torch.dot(g_p_flat, g_p_flat)
-            if norm_sq > 1e-12:
-                coeff = dot / norm_sq
-                g_s_modified = g_s - coeff * g_p
-                projected.append(g_s_modified)
-            else:
-                projected.append(g_s)
-        else:
-            # Non-conflicting: keep secondary gradient as-is
-            projected.append(g_s)
+        norm_sq = torch.dot(g_p_flat, g_p_flat)
+        # Conflicting (dot < 0) with a non-zero primary: g_s - (g_s·g_p / ||g_p||²) g_p.
+        coeff = torch.where(
+            (dot < 0) & (norm_sq > 1e-12), dot / norm_sq.clamp_min(1e-12), torch.zeros_like(dot)
+        )
+        projected.append(g_s - coeff * g_p)
 
     return projected
 

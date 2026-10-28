@@ -223,23 +223,7 @@ def compute_infer_signature(config: Any) -> str:
         TorchIOTransformConfig,
     )
 
-    class _CfgProxy:
-        """Present a data config as a training config for the builder.
-
-        ``from_training_config`` reads ``config.undersampling``; that name IS
-        the contract, so it is set explicitly rather than delegated --
-        ``__getattr__`` would forward it to the DATA config and raise.
-        """
-
-        def __init__(self, data_cfg, undersampling_cfg):
-            self._data = data_cfg
-            self.undersampling = undersampling_cfg
-
-        def __getattr__(self, name):
-            return getattr(self._data, name)
-
-    proxy = _CfgProxy(config.data, getattr(config, "undersampling", None))
-    tcfg = TorchIOTransformConfig.from_training_config(proxy)
+    tcfg = TorchIOTransformConfig.from_settings(config)
     return compute_transform_signature(TorchIOTransformBuilder.build_val_transforms(tcfg))
 
 

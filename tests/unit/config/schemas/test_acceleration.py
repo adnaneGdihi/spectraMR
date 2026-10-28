@@ -282,3 +282,26 @@ class TestDeclaresNoAcceleration:
             base_acceleration=1.0, max_acceleration=1.0, enable_dynamic_mask=True
         )
         assert not cfg.declares_no_acceleration
+
+
+@pytest.mark.parametrize("value", ["y", "x", None])
+def test_retired_line_axis_is_rejected_at_load(value) -> None:
+    """PLANTED (#2160): the block is extra="ignore", so a declared line_axis would
+    otherwise vanish silently; the axis comes from data.acquisition."""
+    with pytest.raises(ValidationError, match=r"data\.acquisition\.phase_encode_axis"):
+        AccelerationConfigSchema(line_axis=value)
+    assert "line_axis" not in AccelerationConfigSchema.model_fields
+
+
+def test_adaptive_budget_rejects_unknown_value_and_rate_must_be_positive() -> None:
+    import pydantic
+    import pytest
+
+    from spectramr.config.schemas.acceleration import AdaptiveAccelerationConfig
+
+    assert AdaptiveAccelerationConfig().budget == "soft"
+    assert AdaptiveAccelerationConfig(budget="hard_topk").budget == "hard_topk"
+    with pytest.raises(pydantic.ValidationError):
+        AdaptiveAccelerationConfig(budget="greedy")
+    with pytest.raises(pydantic.ValidationError):
+        AdaptiveAccelerationConfig(mask_learning_rate=0.0)

@@ -41,8 +41,8 @@ def test_log_kernel_shape() -> None:
 
 
 def test_log_kernel_even_size_raises() -> None:
-    """Even kernel size triggers the ``assert``."""
-    with pytest.raises(AssertionError):
+    """Even kernel size raises even under ``python -O``, where an ``assert`` is stripped."""
+    with pytest.raises(ValueError, match="odd"):
         _build_log_kernel(kernel_size=14, sigma=1.5)
 
 
@@ -202,3 +202,23 @@ def test_hfen_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "hfen" in list_available()
+
+
+def test_hfen_of_identical_images_is_zero_with_finite_gradient() -> None:
+    """The norm floor keeps sqrt'(0) finite without adding 1e-4 to HFEN(x, x)."""
+    target = torch.rand(2, 1, 32, 32, generator=torch.Generator().manual_seed(0))
+    pred = target.clone().requires_grad_(True)
+    out = HFENLoss()(pred, target)
+    out.backward()
+    assert out.item() < 1e-8
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+
+
+def test_hfen_unknown_reduction_raises() -> None:
+    """An unknown reduction used to return the per-sample vector silently."""
+    with pytest.raises(ValueError, match="reduction"):
+        HFENLoss(reduction="meen")
+
+
+def test_hfen_repr_names_the_kernel() -> None:
+    assert "kernel_size=15, sigma=1.5" in repr(HFENLoss())

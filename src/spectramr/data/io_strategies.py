@@ -305,6 +305,14 @@ class FastMRIH5Strategy(BaseIOStrategy):
         return torch.from_numpy(data)
 
 
+def _nifti_spacing_mm(affine: Any) -> tuple[float, float, float]:
+    """``(slice, row, col)`` from a NIfTI affine: voxel axes are (row, col, slice) on disk."""
+    from spectramr.data.nifti_export import zooms_from_affine
+
+    row, col, slc = zooms_from_affine(affine)
+    return (slc, row, col)
+
+
 class NiftiStrategy(BaseIOStrategy):
     """
     Handles .nii.gz files (Brain, Prostate volumes).
@@ -374,6 +382,27 @@ class NiftiStrategy(BaseIOStrategy):
                 "slice_index": slice_idx,
             },
         }
+
+    @staticmethod
+    def load_reference_volume(path: str | Path) -> dict[str, Any]:
+        """The whole volume as ``[S, H, W]`` plus its voxel spacing ``(slice, row, col)`` mm.
+
+        The slice axis is the LAST on disk, as ``load`` and MRIxFields index it
+        (``dataobj[..., i]``). Spacing comes from the affine; the acquisition sidecar
+        is read by the caller.
+        """
+        import nibabel as nib
+
+        img = nib.load(str(path))
+        data = torch.from_numpy(np.asanyarray(img.dataobj, dtype=np.float32).copy())
+        return {"data": data.movedim(-1, 0), "spacing_mm": _nifti_spacing_mm(img.affine)}
+
+    @staticmethod
+    def read_spacing_mm(path: str | Path) -> tuple[float, float, float]:
+        """``(slice, row, col)`` mm from the affine alone; no voxel is decoded."""
+        import nibabel as nib
+
+        return _nifti_spacing_mm(nib.load(str(path)).affine)
 
 
 class DicomStrategy(BaseIOStrategy):
@@ -1015,7 +1044,7 @@ def load_tensor_from_file(path: str | Path, h5_keys: Sequence[str] | None = None
     """Load a single tensor from a file, dispatching on suffix.
 
     Centralizes the multi-format reader that the data-layer builders
-    used to inline. Re-using this from
+    used to inline. Reusing this from
     ``src/data/builders/torchio_subject_builder.py`` and from the inference
     pipeline keeps the "any-format → torch.Tensor" surface in one place
     (CLAUDE.md pitfall #11: data-loading SSOT under ``src/data/``).
@@ -1122,3 +1151,14 @@ def lazy_load_nifti(path):
     import nibabel as nib
 
     return nib.load(str(path))
+
+
+def save_nifti(path, array, affine):
+    """Write *array* as a NIfTI volume at *path* with *affine*.
+
+    The write-side twin of :func:`lazy_load_nifti`: keeps ``nib.save`` inside the
+    data SSOT so ``infrastructure/inference/`` never imports ``nibabel``.
+    """
+    import nibabel as nib
+
+    nib.save(nib.Nifti1Image(array, affine), str(path))

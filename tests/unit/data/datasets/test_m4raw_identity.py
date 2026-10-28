@@ -18,6 +18,7 @@ import math
 import pytest
 
 from spectramr.data.datasets.m4raw_identity import (
+    NEX_AVERAGE_REPETITION,
     parse_m4raw_file_id,
     repetition_group_key,
 )
@@ -53,6 +54,12 @@ class TestItParsesTheConvention:
         t2 = parse_m4raw_file_id("2022061001_T202")
         assert t1.subject == t2.subject
         assert t1.repetition_group != t2.repetition_group
+
+    def test_a_nex_average_keeps_its_contrast_and_cannot_be_an_acquisition(self) -> None:
+        """``nex_averaging`` names its output ``..._T100``; M4Raw counts from ``01``."""
+        identity = parse_m4raw_file_id(f"2022061001_T1{NEX_AVERAGE_REPETITION}")
+        assert (identity.subject, identity.contrast) == ("2022061001", "T1")
+        assert identity.repetition == NEX_AVERAGE_REPETITION == "00"
 
 
 class TestItDoesNotGuessOnUnparseableNames:

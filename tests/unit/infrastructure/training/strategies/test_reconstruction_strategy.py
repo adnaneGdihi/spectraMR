@@ -25,6 +25,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
@@ -621,3 +622,298 @@ def test_apply_builder_image_losses_skips_inline_l1():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRefuseInertDiffusionKnobs:
+    """Planted violations: diffusion-only training knobs routed to the reconstruction
+    strategy are never read, so construction must raise rather than ignore them."""
+
+    @staticmethod
+    def _stub(training: dict) -> object:
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.training.base import TrainingStrategyConfigSchema
+
+        return SimpleNamespace(
+            config=SimpleNamespace(training=TrainingStrategyConfigSchema.model_validate(training))
+        )
+
+    @pytest.mark.parametrize(
+        "training",
+        [{"diffusion": {"type": "score_based"}}, {"num_timesteps": 100}],
+    )
+    def test_inert_knob_raises(self, training: dict) -> None:
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        with pytest.raises(ValueError, match="never reads it"):
+            ReconstructionTrainingStrategy._refuse_inert_diffusion_knobs(self._stub(training))
+
+    def test_clean_training_block_passes(self) -> None:
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        ReconstructionTrainingStrategy._refuse_inert_diffusion_knobs(
+            self._stub({"input_domain": "image", "device": "cuda"})
+        )
+
+
+# ── validation conditions on the batch's contrast, as training does ──────────
+
+
+class _StopForwardError(Exception):
+    pass
+
+
+def _validation_probe():
+    """A strategy whose ``_validation_forward`` records its context and stops."""
+    strategy = ReconstructionTrainingStrategy.__new__(ReconstructionTrainingStrategy)
+    from types import SimpleNamespace
+
+    strategy.adapter_chains = {}
+    strategy.env = SimpleNamespace(generator=torch.nn.Identity())
+    strategy.state = None
+    seen: dict = {}
+
+    def _record(x, ctx, **kwargs):
+        seen["ctx"] = ctx
+        raise _StopForwardError
+
+    strategy._validation_forward = _record
+    return strategy, seen
+
+
+def _run_validation(strategy, batch, x):
+    import inspect
+
+    from spectramr.pipelines.train import select_validation_extra_fields
+
+    extra = select_validation_extra_fields(batch, inspect.signature(strategy.validation_step).parameters)
+    with pytest.raises(_StopForwardError):
+        strategy.validation_step(x, x, batch_idx=0, **extra)
+
+
+def test_validation_receives_the_batch_contrast_idx_as_contrast_id():
+    """The loop hands a TrainingBatch; its metadata contrast_idx must reach the forward."""
+    from spectramr.data.batch_types import TrainingBatch
+
+    strategy, seen = _validation_probe()
+    x = torch.randn(2, 1, 8, 8)
+    batch = TrainingBatch(input=x, target=x, metadata={"contrast_idx": torch.tensor([0, 3])})
+    _run_validation(strategy, batch, x)
+    assert torch.equal(seen["ctx"]["contrast_id"], torch.tensor([0, 3]))
+
+
+def test_validation_without_a_contrast_keeps_the_bare_context():
+    from spectramr.data.batch_types import TrainingBatch
+
+    strategy, seen = _validation_probe()
+    x = torch.randn(2, 1, 8, 8)
+    _run_validation(strategy, TrainingBatch(input=x, target=x), x)
+    assert "contrast_id" not in seen["ctx"]
+
+
+def test_a_contrast_that_does_not_match_the_validation_batch_raises():
+    from spectramr.data.batch_types import TrainingBatch
+
+    strategy, _ = _validation_probe()
+    x = torch.randn(4, 1, 8, 8)
+    batch = TrainingBatch(input=x, target=x, metadata={"contrast_idx": torch.tensor([0, 3])})
+    with pytest.raises(ValueError, match="contrast_id"):
+        strategy.validation_step(x, x, batch_idx=0, batch_data=batch)
+
+
+def test_the_validation_forward_hands_contrast_id_to_the_generator():
+    """End of the seam: the generator that trained on contrast_id is graded with it."""
+    from types import SimpleNamespace
+
+    class _Recorder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen = None
+
+        def forward(self, x, contrast_id=None):
+            self.seen = contrast_id
+            return x
+
+    gen = _Recorder()
+    strategy = ReconstructionTrainingStrategy.__new__(ReconstructionTrainingStrategy)
+    cfg = MagicMock()
+    cfg.data.multislice_enabled = False
+    cfg.model.in_channels = 1
+    cfg.model.input_type = "image"
+    cfg.validation.loader.chunk_size = 2
+    strategy.env = SimpleNamespace(generator=gen, config=cfg)
+    strategy.config = cfg
+    strategy.device = torch.device("cpu")
+    strategy._conditioner = None
+    strategy._ensure_conditioner = lambda channels: None
+    strategy._needs_kspace_adjoint = lambda ctx: False
+    x = torch.randn(2, 1, 8, 8)
+    ctx = {"use_dc": False, "measured_kspace": None, "contrast_id": torch.tensor([1, 2])}
+    strategy._validation_forward(x, ctx)
+    assert torch.equal(gen.seen, torch.tensor([1, 2]))
+
+
+def _chunking_strategy(gen, chunk_size):
+    from types import SimpleNamespace
+
+    strategy = ReconstructionTrainingStrategy.__new__(ReconstructionTrainingStrategy)
+    cfg = MagicMock()
+    cfg.data.multislice_enabled = False
+    cfg.model.in_channels = 1
+    cfg.model.input_type = "image"
+    cfg.validation.loader.chunk_size = chunk_size
+    strategy.env = SimpleNamespace(generator=gen, config=cfg)
+    strategy.config = cfg
+    strategy.device = torch.device("cpu")
+    strategy._conditioner = None
+    strategy._ensure_conditioner = lambda channels: None
+    strategy._needs_kspace_adjoint = lambda ctx: False
+    return strategy
+
+
+class _BatchRecorder(torch.nn.Module):
+    """A per-sample conv that records the batch size of every call."""
+
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+        self.conv = torch.nn.Conv2d(1, 1, 3, padding=1)
+        self.batches = []
+
+    def forward(self, x, contrast_id=None):
+        self.batches.append(x.shape[0])
+        out = self.conv(x)
+        return out if contrast_id is None else out + contrast_id.view(-1, 1, 1, 1)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7])
+def test_validation_forward_reads_chunk_size_and_matches_one_forward(chunk_size):
+    """validation.loader.chunk_size caps the slices per generator call (the 2026-10-22
+    validation OOMs), and the chunked output equals the single forward."""
+    x = torch.randn(7, 1, 8, 8)
+    ctx = {"use_dc": False, "measured_kspace": None, "contrast_id": torch.arange(7.0)}
+    gen = _BatchRecorder()
+    with torch.no_grad():
+        whole = _chunking_strategy(gen, 7)._validation_forward(x, ctx)
+        gen.batches.clear()
+        chunked = _chunking_strategy(gen, chunk_size)._validation_forward(x, ctx)
+    assert max(gen.batches) <= chunk_size
+    assert sum(gen.batches) == 7
+    torch.testing.assert_close(chunked, whole)
+
+
+def test_chunked_validation_forward_takes_the_reconstruction_of_a_dict_output():
+    class _DictGen(torch.nn.Module):
+        def forward(self, x):
+            return {"image": torch.zeros_like(x), "reconstruction": x + 1}
+
+    x = torch.randn(5, 1, 4, 4)
+    out = _chunking_strategy(_DictGen(), 2)._validation_forward(
+        x, {"use_dc": False, "measured_kspace": None}
+    )
+    torch.testing.assert_close(out, x + 1)
+
+
+def _windowing_strategy(gen, patch_size, batch_size=1):
+    strategy = _chunking_strategy(gen, chunk_size=64)
+    strategy.config.data.sampling.patch_size = patch_size
+    strategy.config.data.loader.batch_size = batch_size
+    return strategy
+
+
+class _PatchRecorder(torch.nn.Module):
+    """A pointwise 3-D map that records the spatial shape of every call."""
+
+    def __init__(self, shrink: bool = False):
+        super().__init__()
+        self.shapes = []
+        self.shrink = shrink
+
+    def forward(self, x, mask=None):
+        self.shapes.append(tuple(x.shape[2:]))
+        return x[..., :-1] if self.shrink else 3 * x
+
+
+def test_a_volume_larger_than_the_training_patch_is_graded_in_training_sized_windows():
+    """A volumetric model trained on patches saw whole volumes at validation: more
+    memory than the step, and a shape fixed-size networks cannot take."""
+    x = torch.randn(2, 1, 20, 20, 12)
+    gen = _PatchRecorder()
+    with torch.no_grad():
+        out = _windowing_strategy(gen, [8, 8, 4])._validation_forward(
+            x, {"use_dc": False, "measured_kspace": None}
+        )
+    assert set(gen.shapes) == {(8, 8, 4)}
+    torch.testing.assert_close(out, 3 * x)
+
+
+def test_a_volume_within_the_patch_is_forwarded_whole():
+    x = torch.randn(1, 1, 8, 8, 4)
+    gen = _PatchRecorder()
+    _windowing_strategy(gen, [8, 8, 4])._validation_forward(
+        x, {"use_dc": False, "measured_kspace": None}
+    )
+    assert gen.shapes == [(8, 8, 4)]
+
+
+def test_windowing_refuses_a_whole_volume_generator_input_and_a_shape_changing_model():
+    import pytest
+
+    x = torch.randn(1, 1, 16, 16, 8)
+    strategy = _windowing_strategy(_PatchRecorder(), [8, 8, 4])
+    with pytest.raises(ValueError, match="cannot be windowed"):
+        strategy._validation_window(x, {"mask": torch.ones_like(x)})
+    with pytest.raises(ValueError, match="shape of its input patch"):
+        _windowing_strategy(_PatchRecorder(shrink=True), [8, 8, 4])._validation_forward(
+            x, {"use_dc": False, "measured_kspace": None}
+        )
+
+
+def test_windows_share_a_forward_up_to_the_training_batch_with_per_sample_inputs_aligned():
+    """Batching windows is what makes windowed validation affordable (5x on CPU);
+    a per-sample input must be tiled with the stacked windows, not left at batch size."""
+
+    class _Shift(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rows = []
+
+        def forward(self, x, contrast_id=None):
+            self.rows.append(x.shape[0])
+            return x + contrast_id.view(-1, 1, 1, 1, 1)
+
+    x = torch.randn(2, 1, 16, 16, 8)
+    ctx = {"use_dc": False, "measured_kspace": None, "contrast_id": torch.tensor([1.0, 5.0])}
+    one, many = _Shift(), _Shift()
+    with torch.no_grad():
+        a = _windowing_strategy(one, [8, 8, 4], batch_size=1)._validation_forward(x, ctx)
+        b = _windowing_strategy(many, [8, 8, 4], batch_size=8)._validation_forward(x, ctx)
+    assert max(many.rows) == 8 and max(one.rows) == 2
+    torch.testing.assert_close(a, b)
+    torch.testing.assert_close(a, x + torch.tensor([1.0, 5.0]).view(-1, 1, 1, 1, 1))
+
+
+def test_folded_slices_larger_than_a_depth_one_crop_are_graded_in_crop_sized_windows():
+    """exp_hm_01 trains on 256x256x1 crops; validation folded whole 512x512 slices."""
+    x = torch.randn(3, 1, 16, 16)
+    gen = _PatchRecorder()
+    with torch.no_grad():
+        out = _windowing_strategy(gen, [8, 8, 1])._validation_forward(
+            x, {"use_dc": False, "measured_kspace": None}
+        )
+    assert set(gen.shapes) == {(8, 8)}
+    torch.testing.assert_close(out, 3 * x)
+
+
+def test_folded_slices_within_the_crop_or_a_3d_patch_are_forwarded_whole():
+    x = torch.randn(3, 1, 8, 8)
+    for patch_size in ([8, 8, 1], [4, 4, 4]):
+        gen = _PatchRecorder()
+        _windowing_strategy(gen, patch_size)._validation_forward(
+            x, {"use_dc": False, "measured_kspace": None}
+        )
+        assert gen.shapes == [(8, 8)]

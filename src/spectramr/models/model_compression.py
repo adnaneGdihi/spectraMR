@@ -18,6 +18,8 @@ import torch.nn.functional as F
 
 from spectramr.models.registry import register_model
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class CompressionConfig:

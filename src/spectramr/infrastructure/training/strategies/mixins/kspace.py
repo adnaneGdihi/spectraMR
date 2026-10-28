@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
 from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
@@ -130,8 +131,11 @@ class KspaceMixin:
             return
 
         generator = self.env.generator
-        if hasattr(generator, "dc_layer") and generator.dc_layer is not None:
-            self.dc_layer = generator.dc_layer
+        # Through unwrap_model: a DDP/DP wrapper hides dc_layer, and the probe then
+        # reported a model that owns one as having none.
+        inner = unwrap_model(generator)
+        if hasattr(inner, "dc_layer") and inner.dc_layer is not None:
+            self.dc_layer = inner.dc_layer
             if hasattr(self, "logging_service"):
                 self.logging_service.log_info(
                     f"🧲 Data Consistency: Using model-integrated {type(self.dc_layer).__name__}"
@@ -160,7 +164,7 @@ class KspaceMixin:
         # design, because the per-sample seed jitter lives in
         # ``KSpaceUndersamplingProcess.q_sample``. One object, and
         # ``self.training`` decides whether the pattern jitters.
-        unwrapped = generator.module if hasattr(generator, "module") else generator
+        unwrapped = unwrap_model(generator)
         process = getattr(unwrapped, "kspace_process", None)
         if process is None:
             raise ValueError(
@@ -189,9 +193,60 @@ class KspaceMixin:
             self.logging_service.log_info(
                 f"🔧 Acceleration config: type={pattern}, "
                 f"density_power={accelerator_kwargs.get('density_power', 'default')}, "
+                f"schedule={accelerator_kwargs.get('acceleration_schedule', 'default')}, "
+                f"schedule_power={accelerator_kwargs.get('schedule_power', 'default')}, "
                 f"max_accel={accelerator_kwargs.get('max_acceleration', 'default')}, "
                 f"seed={accelerator_kwargs.get('seed', 'default')}"
             )
+
+    def _check_acquired_lines(
+        self: "BaseTrainingStrategy", kspace: torch.Tensor, batch_data: Any, split: str
+    ) -> None:
+        """Check ``data.acquisition.acquired_pe_lines`` against the first ``split`` batch (#2160).
+
+        ``kspace`` is plane-last and not yet masked. One host read per split; the
+        verdict joins the process's line-axis record, which the snapshot
+        provenance stamps. Arms without a line mask or a declared block skip it.
+        """
+        from spectramr.models.diffusion.acquired_line_budget import check_declared_lines
+
+        gen = getattr(self, "generator_model", None)
+        gen = getattr(gen, "module", gen)
+        process = getattr(gen, "kspace_process", None)
+        key = f"{split}_acquired_lines"
+        if not hasattr(process, "acquired_lines") or key in process.line_axis_gate:
+            return
+        acquisition = getattr(getattr(self.config, "data", None), "acquisition", None)
+        acquired = process.acquired_lines(kspace)
+        if acquisition is None or acquired is None:
+            return
+        contrasts = read_batch_field(batch_data, "contrast")
+        if isinstance(contrasts, str):
+            contrasts = [contrasts]
+        process.line_axis_gate[key] = check_declared_lines(
+            acquisition.acquired_pe_lines, acquired, list(contrasts) if contrasts else None
+        )
+
+    def _gate_validation_line_axis(
+        self: "BaseTrainingStrategy", input_batch: torch.Tensor, batch_data: Any = None
+    ) -> None:
+        """Run the k-space process's line-axis gate on the first validation batch.
+
+        The validation input is the delivered k-space before any mask is applied,
+        so its never-acquired lines are the data's own (#2160). A 5-D batch is
+        ``(B, C, H, W, D)`` here, so the depth axis moves off the plane first.
+        Arms without a ``kspace_process`` have no line mask to check.
+        """
+        gen = getattr(self, "generator_model", None)
+        gen = getattr(gen, "module", gen)
+        process = getattr(gen, "kspace_process", None)
+        check = getattr(process, "check_line_axis", None)
+        if check is None:
+            return
+        plane_last = input_batch.movedim(-1, 1) if input_batch.dim() == 5 else input_batch
+        if "validation" not in process.line_axis_gate:
+            check(plane_last, "validation")
+        self._check_acquired_lines(plane_last, batch_data, "validation")
 
     def _prepare_validation_data(
         self: "BaseTrainingStrategy",
@@ -211,6 +266,7 @@ class KspaceMixin:
         )
         input_batch = TorchIOAdapter.to_batch_format(input_batch, in_channels)
         target_batch = TorchIOAdapter.to_batch_format(target_batch, in_channels)
+        self._gate_validation_line_axis(input_batch, batch_data)
 
         # [FIX] Handle 5D tensors from dataloader (B, C, H, W, D) → (B*D, C, H, W)
         if input_batch.dim() == 5:
@@ -525,8 +581,14 @@ class KspaceMixin:
         target_shape: tuple[int, ...],
         current_step: int = 0,
         batch_data: dict | None = None,
+        acquired: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Generate and process acceleration mask for cold diffusion."""
+        """Generate and process acceleration mask for cold diffusion.
+
+        ``acquired`` (``[B, N]``, the process's ``acquired_lines``) counts each
+        rung's R over the lines each sample acquired, as ``q_sample`` does in
+        training (#2160).
+        """
         mask = None
         if batch_data is not None and isinstance(batch_data, dict):
             mask = pick_present(batch_data.get("mask"), batch_data.get("acceleration_mask"))
@@ -549,16 +611,28 @@ class KspaceMixin:
 
             pattern = None  # Could default from config
 
-            mask = self.mask_generator.generate_batch_masks(
-                batch_size=batch_size,
-                timesteps=timesteps,
-                image_shape=image_shape,
-                pattern=pattern,
-            )
+            gen = getattr(self, "generator_model", None)
+            process = getattr(getattr(gen, "module", gen), "kspace_process", None)
+            if acquired is not None and process is not None:
+                if not isinstance(timesteps, torch.Tensor) or timesteps.dim() == 0:
+                    timesteps = torch.full((batch_size,), int(timesteps), dtype=torch.long)
+                mask = process.cascade_batch_masks(
+                    timesteps, image_shape, acquired.device, acquired=acquired
+                )
+            else:
+                mask = self.mask_generator.generate_batch_masks(
+                    batch_size=batch_size,
+                    timesteps=timesteps,
+                    image_shape=image_shape,
+                    pattern=pattern,
+                )
 
-            # Logging
+            # Logging, on a real step only: validation passes ``current_step=0``,
+            # which satisfies the modulo on every call and made this log (and
+            # its ``mask.sum().item()``) a per-batch sync.
             if (
-                hasattr(self, "_cached_log_interval")
+                current_step > 0
+                and hasattr(self, "_cached_log_interval")
                 and current_step % self._cached_log_interval == 0
             ):
                 try:
@@ -583,52 +657,11 @@ class KspaceMixin:
 
         mask = mask.to(self.device, non_blocking=True).float()
 
-        # Phase 4.1: Asymmetric Degradation Masking for TI-CCD
-        # We want the mask to only degrade the Target channels.
-        # Source channels should always have a mask of 1.0 (fully sampled).
+        # The diffusion state holds the target contrast alone; a source contrast
+        # arrives as the generator's reference and is never masked (#2452).
         C_total = target_shape[1]
-
-        # Determine the number of target channels based on domain (complex vs real-interleaved)
-        # If C_total is 16 (for 2 contrasts, 4 coils, interleaved real/imag), target is 8
-        # We dynamically assume the second half of channels belong to Target
-        # based on TI-CCD design (concatenated [Source, Target])
-
-        # First, ensure the mask itself is expanded to C_total
         if mask.shape[1] != C_total:
             mask = self.mask_generator.expand_mask_to_channels(mask, C_total)
-
-        # Apply asymmetric logic if we're dealing with multi-contrast concatenated input
-        # Standard configs shouldn't be affected if they only have exactly the Target channels
-        # But for TI-CCD where C_total == 16, the first 8 are source, last 8 are target
-        #
-        # [ROBUSTNESS FIX] Use config.data.domain.target_channels (SSOT) to determine the
-        # source/target split boundary instead of assuming C_total // 2.
-        target_ch = self.config.data.domain.target_channels
-        source_channels = 0
-        if target_ch is not None and C_total > target_ch:
-            source_channels = C_total - target_ch  # e.g. 16 - 8 = 8 source channels
-        elif C_total > self.config.model.out_channels and C_total % 2 == 0:
-            # Legacy fallback: assume equal split
-            source_channels = C_total // 2
-
-        if source_channels > 0:
-            # [#1917] This is the ONLY in-place write to a mask that came out of
-            # ``expand_mask_to_channels``; the other ten call sites just multiply.
-            # Copy on this path alone, for two independent reasons:
-            #   1. a widened [B, 1, H, W] mask is a stride-0 broadcast view, so
-            #      every channel aliases one row of memory and the write raises
-            #      "more than one element of the written-to tensor refers to a
-            #      single memory location";
-            #   2. a mask that already had C_total channels is returned unchanged,
-            #      and the ``.to(device).float()`` above is a no-op for an
-            #      already-float tensor on the same device -- so the write would
-            #      reach through and corrupt ``batch_data["mask"]`` for every
-            #      later consumer of that batch.
-            # Copying here keeps the cheap broadcast view for the read-only
-            # callers (non-negotiable 9: no needless allocation in the loop).
-            mask = mask.clone()
-            # Force mask of 1.0 on the Source channels (preserve fully-sampled prior)
-            mask[:, :source_channels, ...] = 1.0
 
         # Saturation check. Gate on the LIVE iteration (loop_state seam): the
         # old ``self.env.step`` was a frozen 0, so ``0 in [0, 1, 2]`` was always

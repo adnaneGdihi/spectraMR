@@ -33,7 +33,9 @@ def _patch_loss_builder_ssot():
         "build_latent_losses",
     ):
         getattr(bi, _m).return_value = bi
-    bi.build.return_value = {}
+    # The computer now requires its declared reconstruction loss to be built (#2016);
+    # the config doubles below declare loss_type "l1", so the stub builds exactly that.
+    bi.build.return_value = {"l1": torch.nn.L1Loss()}
     with patch(
         "spectramr.infrastructure.training.builders.loss_builder.LossBuilder", builder
     ):
@@ -50,6 +52,7 @@ class TestDisentangledStrategySSOT:
         config = MagicMock(spec=TrainingSettings)
         config.losses = MagicMock()
         config.losses.reconstruction = MagicMock()
+        config.losses.reconstruction.loss_type = "l1"
         config.losses.latent = MagicMock()
 
         # Set common weights
@@ -93,6 +96,7 @@ class TestDisentangledStrategySSOT:
         config.model.in_channels = 2
         config.model.target_domain = "image"
         config.model.model_type = "disentangled"
+        config.model.model_kwargs = {}  # a real mapping: validated by the strategy (#2611)
 
         config.physics = MagicMock()
         config.physics.kspace.enable_kspace_recon = False
@@ -379,6 +383,7 @@ class TestDisentangledStrategySSOTIntegration:
         config = MagicMock(spec=TrainingSettings)
         config.losses = MagicMock()
         config.losses.reconstruction = MagicMock()
+        config.losses.reconstruction.loss_type = "l1"
         config.losses.latent = MagicMock()
 
         # Set comprehensive weights for integration test
@@ -405,6 +410,7 @@ class TestDisentangledStrategySSOTIntegration:
         config.model.in_channels = 2
         config.model.target_domain = "image"
         config.model.model_type = "disentangled"
+        config.model.model_kwargs = {}  # a real mapping: validated by the strategy (#2611)
 
         config.physics = MagicMock()
         config.physics.kspace.enable_kspace_recon = False

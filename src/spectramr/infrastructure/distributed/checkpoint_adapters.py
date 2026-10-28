@@ -16,10 +16,9 @@ Three facts differ per strategy, and getting any of them wrong is silent:
    dtypes, and 1/N of the values -- so it loads into a bare model without
    complaint and reconstructs a model that was never trained.
 
-3. **What the artifact IS.** DeepSpeed writes a tag *directory* of per-rank
-   shards, not a file. Every consumer in this repo (``discover_best_checkpoint``,
-   the campaign orchestrator, ``spectramr infer``) expects a single file, so the
-   backend additionally publishes a consolidated one.
+3. **What the artifact IS.** DeepSpeed writes a tag directory of per-rank
+   shards. Resume reads it; every other reader opens the RunState file beside it,
+   whose models ``full_model_state`` gathered.
 
 ``rank0_only=True`` controls who *receives* the gathered tensors, never who
 *participates* -- a distinction that reads as an optimisation and is actually
@@ -28,11 +27,12 @@ the deadlock.
 
 from __future__ import annotations
 
-import contextlib
 import logging
-from collections.abc import Generator, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
+
+from spectramr.infrastructure.distributed.state_io import FSDPStateIO, PassthroughStateIO
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,30 @@ __all__ = [
     "DefaultCheckpointAdapter",
     "FSDPCheckpointAdapter",
     "IParallelCheckpointAdapter",
+    "NativeLoadResult",
     "resolve_checkpoint_adapter",
 ]
 
 #: Subdirectory name for DeepSpeed's sharded tag directories.
 DEEPSPEED_TAG_PREFIX = "deepspeed"
+
+
+class NativeLoadResult(NamedTuple):
+    """What a strategy-native restore produced, and which models it covered.
+
+    ``client_state`` is ``None`` when nothing was loaded and ``{}`` when the
+    tag carried no client state; the two mean opposite things. ``handled`` names
+    the model keys whose weights AND optimizer state came from the native
+    artifact, so the generic parse must not load them a second time: a ZeRO
+    optimizer cannot read the generic dict (#2482), and at world size > 1 the
+    writer rank's copy would overwrite every rank's partition (#1309).
+    """
+
+    client_state: dict[str, Any] | None
+    handled: frozenset[str]
+
+
+_NOTHING_LOADED = NativeLoadResult(None, frozenset())
 
 
 @runtime_checkable
@@ -63,8 +82,21 @@ class IParallelCheckpointAdapter(Protocol):
     #: ``torch.save`` payload would be shard-shaped nonsense.
     writes_native_artifact: bool
 
-    def gather_full_state_dict(self, model: Any) -> Any:
-        """Context manager active while ``model.state_dict()`` is read."""
+    #: Reads and restores model / optimizer state. The one place a strategy's
+    #: sharding is allowed to change *how* state is read, so the director never
+    #: calls ``state_dict()`` on a model or optimizer itself.
+    state_io: PassthroughStateIO
+
+    def full_model_state(self, model: Any) -> dict[str, Any]:
+        """The model's WHOLE state dict on the writer rank, ``{}`` elsewhere; collective."""
+        ...
+
+    def engine_owned_keys(self, models: Mapping[str, Any]) -> frozenset[str]:
+        """Model keys whose optimizer and scheduler state live in the native artifact."""
+        ...
+
+    def ema_is_whole(self, models: Mapping[str, Any]) -> bool:
+        """Whether the EMA shadow is whole-parameter, so the best checkpoint carries it."""
         ...
 
     def save_native(
@@ -79,9 +111,31 @@ class IParallelCheckpointAdapter(Protocol):
         ...
 
     def load_native(
-        self, *, models: Mapping[str, Any], checkpoint_dir: Path, tag: str
-    ) -> dict[str, Any] | None:
-        """Restore from the strategy-native artifact, returning its client state."""
+        self,
+        *,
+        models: Mapping[str, Any],
+        checkpoint_dir: Path,
+        tag: str,
+        optimizer: bool = True,
+        scheduler: bool = True,
+        module_only: bool = False,
+    ) -> NativeLoadResult:
+        """Restore from the strategy-native artifact.
+
+        ``optimizer``/``scheduler`` carry the run's load gates; ``module_only`` restores
+        weights alone, for the best-weights restore. Returns the client state and the
+        model keys the restore covered.
+        """
+        ...
+
+    def native_tag_roots(
+        self, *, models: Mapping[str, Any], checkpoint_dir: Path
+    ) -> tuple[Path, ...]:
+        """The directories :meth:`save_native` writes one ``<tag>/`` into per save.
+
+        Retention prunes a tag's directory under each root together with its ``.pt``;
+        the adapter owns the layout so the writer and the pruner cannot disagree on it.
+        """
         ...
 
 
@@ -96,85 +150,115 @@ class DefaultCheckpointAdapter:
     name = "default"
     requires_all_ranks = False
     writes_native_artifact = False
+    state_io = PassthroughStateIO()
 
-    @contextlib.contextmanager
-    def gather_full_state_dict(self, model: Any) -> Generator[None]:
-        yield
+    def full_model_state(self, model: Any) -> dict[str, Any]:
+        return self.state_io.model_state(model)
+
+    def engine_owned_keys(self, models: Mapping[str, Any]) -> frozenset[str]:
+        return frozenset()
+
+    def ema_is_whole(self, models: Mapping[str, Any]) -> bool:
+        return True
 
     def save_native(self, **_kwargs: Any) -> Path | None:
         return None
 
-    def load_native(self, **_kwargs: Any) -> dict[str, Any] | None:
-        return None
+    def load_native(self, **_kwargs: Any) -> NativeLoadResult:
+        return _NOTHING_LOADED
+
+    def native_tag_roots(self, **_kwargs: Any) -> tuple[Path, ...]:
+        return ()
 
 
 class FSDPCheckpointAdapter:
-    """Gather the full state dict onto rank 0 before it is read.
+    """Gather the full model and optimizer state on the FSDP root before they are read.
 
-    Without the context manager, ``state_dict()`` returns this rank's flat
-    shard. The resulting file has plausible key names and 1/N of the weights,
-    so ``load_state_dict(..., strict=True)`` on a bare model raises a *shape*
-    error at world_size>1 -- but at world_size==1 (``no_shard``, or a
-    single-GPU debug run) it loads cleanly, which is how this class of bug
-    survives local testing.
-
-    ``offload_to_cpu=True`` is not a nicety: the gathered dict is the FULL
-    model on one device, on top of that rank's shard and its optimizer state.
+    A shard saved as-is has plausible key names and 1/N of the values, so a bare
+    model loads it cleanly at world_size==1 (``no_shard``, a single-GPU debug run)
+    and raises a shape error only at world_size>1 -- which is how this class of
+    bug survives local testing. :class:`FSDPStateIO` does the gathering
+    (``offload_to_cpu``: the gathered dict is the FULL model on one device, on top
+    of that rank's shard).
     """
 
     name = "fsdp"
     #: state_dict() under FSDP all-gathers -- every rank must call it.
     requires_all_ranks = True
     writes_native_artifact = False
+    state_io = FSDPStateIO()
 
-    @contextlib.contextmanager
-    def gather_full_state_dict(self, model: Any) -> Generator[None]:
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    def full_model_state(self, model: Any) -> dict[str, Any]:
+        return self.state_io.model_state(model)
 
-        if not isinstance(model, FSDP):
-            # Nested/partially-wrapped trees: the context manager is a no-op on
-            # a module that is not itself an FSDP root, and entering it would
-            # raise rather than degrade.
-            yield
-            return
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            yield
+    def engine_owned_keys(self, models: Mapping[str, Any]) -> frozenset[str]:
+        return frozenset()
+
+    def ema_is_whole(self, models: Mapping[str, Any]) -> bool:
+        return True
 
     def save_native(self, **_kwargs: Any) -> Path | None:
         return None
 
-    def load_native(self, **_kwargs: Any) -> dict[str, Any] | None:
-        return None
+    def load_native(self, **_kwargs: Any) -> NativeLoadResult:
+        return _NOTHING_LOADED
+
+    def native_tag_roots(self, **_kwargs: Any) -> tuple[Path, ...]:
+        return ()
 
 
 class DeepSpeedCheckpointAdapter:
-    """A sharded tag directory for resume, plus a consolidated file for everyone else.
+    """A sharded tag directory for resume; gathered weights for the RunState file beside it.
 
-    Both artifacts are deliberate. ``engine.save_checkpoint`` writes per-rank
-    ZeRO shards -- the only thing that can restore optimizer state at stage 2/3
-    -- but it is a *directory*, and every consumer in this repo
-    (``discover_best_checkpoint``, campaign evaluation, ``spectramr infer``)
-    opens a file. Publishing only the tag directory would mean a run that
-    trains for a week and then cannot be evaluated by any existing tool.
+    ``engine.save_checkpoint`` writes per-rank ZeRO shards, the only thing that can
+    restore optimizer state at stage 2/3. Every other reader opens the RunState file,
+    whose models :meth:`full_model_state` gathered, so no second weights file is written.
     """
 
     name = "deepspeed"
     #: save_checkpoint/load_checkpoint are collective.
     requires_all_ranks = True
     writes_native_artifact = True
+    #: Models the engine does not own (a plain discriminator) go through the
+    #: generic payload, so they read and restore like any unwrapped module.
+    state_io = PassthroughStateIO()
 
-    def __init__(self, *, save_consolidated_best: bool = True) -> None:
-        self.save_consolidated_best = save_consolidated_best
+    def full_model_state(self, model: Any) -> dict[str, Any]:
+        """Gathered weights for every capture, so a step or best file loads without DeepSpeed.
 
-    @contextlib.contextmanager
-    def gather_full_state_dict(self, model: Any) -> Generator[None]:
-        # The engine owns gathering; nothing to arrange around state_dict().
-        yield
+        At ZeRO-3 the unwrapped module holds partitions, so the 16-bit consolidation runs on
+        every rank (it is collective) and only rank 0 receives the dict. Below stage 3 every
+        rank holds whole parameters and the passthrough read is complete.
+        """
+        partitioned = getattr(model, "zero_optimization_partition_weights", None)
+        if callable(partitioned) and partitioned():
+            return model._zero3_consolidated_16bit_state_dict() or {}
+        return self.state_io.model_state(model)
+
+    def engine_owned_keys(self, models: Mapping[str, Any]) -> frozenset[str]:
+        """The engines' keys: their ZeRO optimizer and scheduler are saved in the tag directory.
+
+        The ZeRO optimizer's ``state_dict()`` holds DeepSpeed's ``LossScaler`` object, which
+        no checkpoint codec stores, and it is sharded per rank anyway.
+        """
+        return frozenset(self._engines(models))
+
+    def ema_is_whole(self, models: Mapping[str, Any]) -> bool:
+        """Whether the EMA shadow is whole-parameter: true only when every engine is at ZeRO <= 2.
+
+        At stage 3 the shadow is built from local partitions, so a strict load of it into
+        the full model raises. An engine that cannot report its stage is treated as
+        partitioned rather than assumed whole.
+        """
+        for engine in self._engines(models).values():
+            stage = getattr(engine, "zero_optimization_stage", None)
+            if not callable(stage) or stage() > 2:
+                logger.warning(
+                    "[DeepSpeed] the EMA shadow is partitioned, not whole-parameter: the "
+                    "engine is at ZeRO stage 3 or does not report its stage."
+                )
+                return False
+        return True
 
     @staticmethod
     def _engines(models: Mapping[str, Any]) -> dict[str, Any]:
@@ -190,6 +274,15 @@ class DeepSpeedCheckpointAdapter:
             if model is not None and hasattr(model, "save_checkpoint")
         }
 
+    @staticmethod
+    def _tag_root(checkpoint_dir: Path, key: str) -> Path:
+        return checkpoint_dir / DEEPSPEED_TAG_PREFIX / key
+
+    def native_tag_roots(
+        self, *, models: Mapping[str, Any], checkpoint_dir: Path
+    ) -> tuple[Path, ...]:
+        return tuple(self._tag_root(checkpoint_dir, key) for key in self._engines(models))
+
     def save_native(
         self,
         *,
@@ -202,56 +295,43 @@ class DeepSpeedCheckpointAdapter:
         if not engines:
             return None
 
-        tag_root = checkpoint_dir / DEEPSPEED_TAG_PREFIX
         for key, engine in engines.items():
-            # COLLECTIVE: every rank calls, DeepSpeed decides who writes what.
-            engine.save_checkpoint(str(tag_root / key), tag=tag, client_state=dict(client_state))
-        logger.info("[DeepSpeed] wrote sharded checkpoint tag %r under %s", tag, tag_root)
-
-        if not self.save_consolidated_best:
-            return None
-        return self._save_consolidated(engines, checkpoint_dir, tag)
-
-    def _save_consolidated(
-        self, engines: Mapping[str, Any], checkpoint_dir: Path, tag: str
-    ) -> Path | None:
-        """Single-file fp16/fp32 weights so non-DeepSpeed consumers keep working.
-
-        ``save_16bit_model`` is itself collective at stage 3 (it all-gathers the
-        partitioned parameters), so it is called on every rank; it no-ops off
-        rank 0. Only the generator is consolidated -- the discriminator is not
-        an inference artifact.
-        """
-        engine = engines.get("generator") or next(iter(engines.values()))
-        filename = f"checkpoint_{tag}.pt" if tag != "best" else "checkpoint_best.pt"
-        try:
-            ok = engine.save_16bit_model(str(checkpoint_dir), filename)
-        except Exception as exc:
-            # A failed consolidation must not lose the sharded checkpoint that
-            # DID land -- resume still works, only the eval artifact is missing.
-            logger.error(
-                "[DeepSpeed] consolidated save failed (%s). The sharded tag %r "
-                "was written and resume still works, but discover_best_checkpoint "
-                "and `spectramr infer` will not find a file for this run.",
-                exc,
-                tag,
+            # COLLECTIVE: every rank calls, DeepSpeed decides who writes what. It ends in
+            # a barrier, so on return every rank's shards of this tag have landed.
+            engine.save_checkpoint(
+                str(self._tag_root(checkpoint_dir, key)), tag=tag, client_state=dict(client_state)
             )
-            return None
-        if not ok:
-            return None
-        return checkpoint_dir / filename
+        logger.info(
+            "[DeepSpeed] wrote sharded checkpoint tag %r under %s",
+            tag,
+            checkpoint_dir / DEEPSPEED_TAG_PREFIX,
+        )
+        return None
 
     def load_native(
-        self, *, models: Mapping[str, Any], checkpoint_dir: Path, tag: str
-    ) -> dict[str, Any] | None:
+        self,
+        *,
+        models: Mapping[str, Any],
+        checkpoint_dir: Path,
+        tag: str,
+        optimizer: bool = True,
+        scheduler: bool = True,
+        module_only: bool = False,
+    ) -> NativeLoadResult:
         engines = self._engines(models)
         if not engines:
-            return None
-        tag_root = checkpoint_dir / DEEPSPEED_TAG_PREFIX
+            return _NOTHING_LOADED
         client_state: dict[str, Any] = {}
         for key, engine in engines.items():
+            tag_root = self._tag_root(checkpoint_dir, key)
             # COLLECTIVE, same as the save side.
-            load_path, state = engine.load_checkpoint(str(tag_root / key), tag=tag)
+            load_path, state = engine.load_checkpoint(
+                str(tag_root),
+                tag=tag,
+                load_optimizer_states=optimizer,
+                load_lr_scheduler_states=scheduler,
+                load_module_only=module_only,
+            )
             if load_path is None:
                 # DeepSpeed reports a miss by RETURNING (None, None), not by
                 # raising. Swallowing that yields an empty dict indistinguishable
@@ -263,13 +343,13 @@ class DeepSpeedCheckpointAdapter:
                 # to prevent.
                 raise FileNotFoundError(
                     f"[{self.name}] no checkpoint for tag {tag!r} under "
-                    f"{tag_root / key}. engine.load_checkpoint returned no path, "
+                    f"{tag_root}. engine.load_checkpoint returned no path, "
                     "which is how DeepSpeed reports a missing or incomplete tag "
                     "directory."
                 )
             if state:
                 client_state.update(state)
-        return client_state
+        return NativeLoadResult(client_state, frozenset(engines))
 
 
 def resolve_checkpoint_adapter(parallel: Any) -> IParallelCheckpointAdapter:
@@ -279,13 +359,6 @@ def resolve_checkpoint_adapter(parallel: Any) -> IParallelCheckpointAdapter:
     that knows how the model was wrapped and what the arm declared -- and this
     just reads it back, defaulting for the single-process and scripting-API
     paths where there is no runtime at all.
-
-    Deriving the adapter here instead (by branching on ``parallel.strategy``)
-    was the first shape of this function, and it could not see
-    ``deepspeed.save_consolidated_best``: that knob is a spectramr concern, not a
-    DeepSpeed one, so ``build_deepspeed_config`` correctly omits it from the
-    rendered ds_config that provenance carries. The knob would have read as
-    always-true -- wired, validated, stamped, and inert (pitfall #15).
     """
     if parallel is None:
         return DefaultCheckpointAdapter()

@@ -51,6 +51,10 @@ class MetricContext:
     acceleration: float | None = None  # R, fixes Delta_R      (are)
     acq_order: Tensor | None = None  # k-space line acq order (aoqv)
     noise_cov: Tensor | None = None  # Sigma for CRLB        (qvcr)
+    # The prediction's own coil k-space, linear, in y_kspace's layout (ndcr). Supplied
+    # by the strategy that produced it rather than declared in ``needs``: without it
+    # ndcr re-projects the coil-combined image, which floors on multi-coil noise.
+    pred_kspace: Tensor | None = None
 
     # --- multi-contrast / quantitative --------------------------------------
     sibling_contrasts: dict[str, Tensor] | None = (
@@ -79,6 +83,15 @@ class MetricContext:
 
     # --- multi-sample ensembles ---------------------------------------------
     ensemble_std: Tensor | None = None  # per-pixel std over N reverse samples (empirical_coverage)
+
+    # --- repeated acquisitions ----------------------------------------------
+    # The model's output on a second repetition of the same slice, same layout as
+    # the prediction (rep_variance, bias_squared).
+    pred_alt: Tensor | None = None
+    # What prediction/target/pred_alt ARE -- 'kspace' or 'image' -- as the caller
+    # states it; None leaves the metric's documented default (null_space_residual,
+    # rep_variance and the rest of the coil-manifold family read k-space).
+    signal_domain: str | None = None
 
     def has(self, *names: str) -> bool:
         """True iff every named field is non-None.

@@ -42,6 +42,7 @@ happen in the right interpreter.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -49,7 +50,24 @@ from pathlib import Path
 
 import yaml
 
-from spectramr.core.env_names import SPECTRAMR_WALL_CLOCK_MARKER
+from spectramr.cli.inference_dispatch import (
+    checkpoint_for_task,
+    inference_run_dir,
+    inference_verb_args,
+    write_source,
+)
+from spectramr.core.dispatch_snapshot import (
+    DispatchSnapshotError,
+    allow_drift_requested,
+    manifest_entries,
+    report_snapshot,
+    verify_snapshot,
+)
+from spectramr.core.env_names import (
+    SPECTRAMR_DISPATCH_SNAPSHOT_RECORD,
+    SPECTRAMR_WALL_CLOCK_MARKER,
+)
+from spectramr.infrastructure.checkpointing.layout import run_dir_of
 
 #: Default per-arm log/audit root, relative to the repo root (mirrors the old
 #: ``DISPATCH_DIR`` default in the .sbatch).
@@ -64,8 +82,8 @@ def resolve_manifest_config(manifest_path: str | Path, index: int) -> str:
     ``[0, N)`` — the dispatcher turns that into a non-zero exit so SLURM marks
     the task failed rather than silently training nothing.
     """
-    text = Path(manifest_path).read_text()
-    configs = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # The snapshot record is keyed by these same entries, so one parser serves both.
+    configs = manifest_entries(manifest_path)
     n = len(configs)
     if index < 0 or index >= n:
         raise IndexError(
@@ -166,6 +184,40 @@ def compute_iter_cap_overrides(
             f"[TRAIN] keeping config eval_interval={cfg_eval} (<= {eff_iters}); "
             "already fires within the capped run"
         )
+    qm_overrides, qm_messages = _quality_matching_smoke_caps(cfg)
+    return overrides + qm_overrides, messages + qm_messages
+
+
+#: Volumes a smoke-capped quality-matching arm synthesises.
+QM_SMOKE_SYNTH_VOLUMES = 4
+
+
+def _quality_matching_smoke_caps(cfg: dict) -> tuple[list[str], list[str]]:
+    """Cap the fit seeds and synthesis of a quality-matching arm under ``TRAIN_ITERS``.
+
+    The fit and the synthesis run in full on the first batch, so ``max_iterations``
+    bounds neither. ``max_evals`` is left alone: a small budget trips the fit's own
+    ``DegenerateFitError`` gate on a correct chain.
+    """
+    qm = (cfg.get("training") or {}).get("quality_matching")
+    if not isinstance(qm, dict):
+        return [], []
+    overrides: list[str] = []
+    messages: list[str] = []
+    seeds = qm.get("fit_seeds")
+    if seeds is not None and int(seeds) > 1:
+        overrides += ["--override", "training.quality_matching.fit_seeds=1"]
+        messages.append(f"[TRAIN] capping quality_matching.fit_seeds {seeds}->1")
+    synth = qm.get("max_synth_volumes")
+    if synth is None or int(synth) > QM_SMOKE_SYNTH_VOLUMES:
+        overrides += [
+            "--override",
+            f"training.quality_matching.max_synth_volumes={QM_SMOKE_SYNTH_VOLUMES}",
+        ]
+        shown = "unset" if synth is None else synth
+        messages.append(
+            f"[TRAIN] capping quality_matching.max_synth_volumes {shown}->{QM_SMOKE_SYNTH_VOLUMES}"
+        )
     return overrides, messages
 
 
@@ -182,6 +234,31 @@ def read_parallel_strategy(config_path: str | Path) -> str:
     parallel = cfg.get("parallel") or {}
     strategy = parallel.get("strategy") if isinstance(parallel, dict) else None
     return "none" if strategy is None else str(strategy)
+
+
+def declares_parameter_free_arm(config_path: str | Path) -> bool:
+    """Whether the arm's registered model CLASS declares ``parameter_free``.
+
+    A classical solver has nothing to train, so ``spectramr train`` refuses it without
+    ``--validate-only``. The answer is asked of the class (``core.parameter_free`` is the
+    owner: a model declares the attribute, nothing infers it), never of a list of
+    model types spelled here. A config with no ``model_type`` answers ``False`` without
+    touching the registry, so the registry walk is paid only by arms that name a model.
+
+    Raises :class:`ImportError` on a torch-less interpreter, and :class:`ValueError` for a
+    ``model_type`` the registry does not know (non-negotiable 3): the caller decides
+    whether the first is fatal.
+    """
+    cfg = yaml.safe_load(Path(config_path).read_text()) or {}
+    model = cfg.get("model") or {}
+    model_type = model.get("model_type") if isinstance(model, dict) else None
+    if not model_type:
+        return False
+    from spectramr.models.init_registry import populate_model_registry
+    from spectramr.models.registry import get_model_class
+
+    populate_model_registry()
+    return getattr(get_model_class(str(model_type)), "parameter_free", False) is True
 
 
 def requires_process_group(strategy: str) -> bool:
@@ -237,7 +314,7 @@ def resolve_rendezvous_port(env: dict[str, str] | None = None) -> int:
 def build_launch_argv(
     config: str,
     overrides: list[str],
-    resume: bool,
+    resume: bool | None,
     *,
     distributed: bool,
     nproc_per_node: int = 1,
@@ -316,16 +393,95 @@ def build_launch_argv(
 
 
 def output_dir_override(output_base: str | Path, config: str | Path) -> list[str]:
-    """Return the ``--override training.output_dir=<base>/<stem>`` args.
+    """Return the overrides that put THIS task's whole run under ``<base>/<stem>``.
 
-    Routes THIS task's checkpoints / CSVs into a campaign tree keyed by the
-    config's file stem, so the campaign orchestrator's ``_discover_results``
-    (which globs ``<output_dir>/checkpoints/*.pt``) finds them. The orchestrator
-    records the identical ``<base>/<stem>`` as the arm's ``output_dir``; the two
-    MUST agree, so the path is computed the same way on both sides.
+    The campaign orchestrator records ``<base>/<stem>`` as the arm's
+    ``output_dir`` and its ``_discover_results`` selects from that run's
+    ``checkpoints/``; the two MUST agree, so the path is computed the same way
+    on both sides.
+
+    Checkpoints follow ``training.output_dir`` with no override of their own:
+    the writer and ``--resume if-present`` both use ``<output_dir>/checkpoints``.
+    The log directory is a separate key, so it moves explicitly, and so does every
+    other identity path the arm declares.
     """
-    stem = Path(config).stem
-    return ["--override", f"training.output_dir={Path(output_base) / stem}"]
+    cfg_path = Path(config)
+    cfg = (yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.is_file() else {}
+    return _run_dir_overrides(Path(output_base) / cfg_path.stem, cfg)
+
+
+def _run_dir_overrides(out: Path, cfg: dict | None = None) -> list[str]:
+    overrides = [
+        "--override",
+        f"training.output_dir={out}",
+        "--override",
+        f"logging.sinks.dir={out / 'logs'}",
+    ]
+    return overrides + _declared_identity_overrides(out, cfg or {})
+
+
+def _declared_identity_overrides(out: Path, cfg: dict) -> list[str]:
+    """Rebase the arm's other declared identity paths (``metrics.output_dir``, ...) onto ``out``.
+
+    Left alone they kept naming the standalone arm's tree, so a routed run wrote its
+    metrics into another run's directory. A path under the declared
+    ``training.output_dir`` keeps its suffix; any other keeps its basename.
+    """
+    from spectramr.infrastructure.validation.config_health_checker import IDENTITY_PATHS
+
+    declared_root = (cfg.get("training") or {}).get("output_dir")
+    overrides: list[str] = []
+    for dotted in IDENTITY_PATHS:
+        if dotted in ("training.output_dir", "logging.sinks.dir"):
+            continue
+        node: object = cfg
+        for part in dotted.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        if not node:
+            continue
+        value = Path(str(node))
+        try:
+            rebased = out / value.relative_to(declared_root) if declared_root else out / value.name
+        except ValueError:
+            rebased = out / value.name
+        overrides += ["--override", f"{dotted}={rebased}"]
+    return overrides
+
+
+SMOKE_DIR_SUFFIX = "__smoke"
+
+
+def smoke_output_overrides(config: str | Path) -> list[str]:
+    """Overrides that put a ``TRAIN_ITERS`` smoke run beside the arm's output, not in it.
+
+    ``--prod`` resumes whatever ``<output_dir>/checkpoints`` holds, so a 50-iteration
+    smoke sharing the directory became the starting point of the full run (sabine
+    17897276: ``start_iteration`` 50, scheduler ``T_max`` 50).
+    """
+    cfg = yaml.safe_load(Path(config).read_text()) or {}
+    declared = (cfg.get("training") or {}).get("output_dir")
+    if not declared:
+        raise ValueError(
+            f"{config}: training.output_dir is not declared, so the smoke run cannot be "
+            "kept out of the arm's real checkpoints. Declare it, or route with --output-base."
+        )
+    out = Path(declared)
+    overrides = _run_dir_overrides(out.with_name(out.name + SMOKE_DIR_SUFFIX), cfg)
+    # A QM arm writes its calibration and synthetic pairs to a second directory, the
+    # one its stage-2 arm reads; a smoke must not overwrite the production artifact.
+    qm = (cfg.get("training") or {}).get("quality_matching")
+    qm_out = qm.get("output_dir") if isinstance(qm, dict) else None
+    if qm_out:
+        qm_path = Path(qm_out)
+        smoke_qm = qm_path.with_name(qm_path.name + SMOKE_DIR_SUFFIX)
+        overrides += ["--override", f"training.quality_matching.output_dir={smoke_qm}"]
+    # A stage-2 arm reads stage 1's checkpoint; its smoke reads stage 1's smoke run.
+    vae = ((cfg.get("model") or {}).get("model_kwargs") or {}).get("vae_checkpoint_path")
+    stage1 = run_dir_of(vae) if vae else None
+    if stage1 is not None:
+        smoke_ckpt = stage1.with_name(stage1.name + SMOKE_DIR_SUFFIX) / Path(vae).relative_to(stage1)
+        overrides += ["--override", f"model.model_kwargs.vae_checkpoint_path={smoke_ckpt}"]
+    return overrides
 
 
 
@@ -493,7 +649,7 @@ def _dispatch(
     manifest: str,
     index: int,
     train_iters: int | None,
-    resume: bool,
+    resume: bool | None,
     no_audit: bool,
     dispatch_dir: str,
     dry_run: bool,
@@ -503,6 +659,8 @@ def _dispatch(
     overrides_file: str | None = None,
     verb: str = "train",
     verb_args_file: str | None = None,
+    requeue_resumes: bool = False,
+    inference_checkpoints: str | None = None,
 ) -> int:
     # --prod runs the actual experiment (FULL config max_iterations). A smoke cap
     # (--train-iters) is the opposite intent, so combining them is a contradiction
@@ -517,12 +675,37 @@ def _dispatch(
         )
         return 2
 
+    if requeue_resumes and resume is not False:
+        print(
+            "FATAL: --requeue-resumes is only valid with --resume-off "
+            f"(resume={resume!r}); it exempts a FRESH first link from the "
+            "no-resume yield refusal and means nothing otherwise.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if inference_checkpoints is not None and (
+        prod or train_iters is not None or resume is not None or output_base is None or verb != "train"
+    ):
+        print(
+            "FATAL: --inference-checkpoints grades one checkpoint per task: it needs --output-base "
+            "and the `train` verb, and excludes --prod, --train-iters, --resume and --resume-off.",
+            file=sys.stderr,
+        )
+        return 2
+
     # The verb decides whether the knobs above can be spelled at all, so it is
     # settled before the manifest is even read: an impossible plan is the same
     # refusal on every task and costs nothing to report first.
     plan_error = validate_verb_plan(
         verb,
-        resume=resume or prod,
+        # resume is tri-state: `None` (unset) is where --prod's wall-clock chaining
+        # applies, so the verb must accept --resume in that case. An explicit
+        # `False` (RESUME=0) means "start fresh" and spells no --resume at all, so
+        # it must NOT drag the resume verb check with it.
+        # A fresh first link whose requeued links resume needs a verb that
+        # takes --resume just as much as a chaining one does.
+        resume=(resume if resume is not None else prod) or requeue_resumes,
         overrides=train_iters is not None
         or output_base is not None
         or overrides_file is not None,
@@ -539,8 +722,25 @@ def _dispatch(
         print(f"FATAL: {exc}", file=sys.stderr)
         return 1
 
+    inference_ckpt: str | None = None
+    if inference_checkpoints is not None:
+        try:
+            inference_ckpt = checkpoint_for_task(inference_checkpoints, index)
+        except (IndexError, OSError) as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            return 1
+        verb_args = [*verb_args, *inference_verb_args(inference_ckpt)]
+        resume = False  # the explicit --resume above is the only one
+
     name = Path(config).stem
     print(f"[manifest_dispatch] task {index}: {config}")
+    # Every link checks, a requeued one included: the YAML and src/ are read live (#2662).
+    try:
+        snapshot = verify_snapshot(manifest, config, allow_drift=allow_drift_requested())
+    except (DispatchSnapshotError, ValueError) as exc:
+        print(f"FATAL: [SNAPSHOT] {exc}", file=sys.stderr)
+        return 2
+    report_snapshot(snapshot)
     print(f"[VERB] spectramr {verb}" + (f" {' '.join(verb_args)}" if verb_args else ""))
     # Run-mode provenance (stamped into the SLURM .out — #15): make the
     # smoke-vs-production decision explicit and auditable, not inferred from the
@@ -551,13 +751,30 @@ def _dispatch(
         # run is a CHAIN by definition and every link must continue the last.
         # Without this a yielded task requeues, starts from iteration 0, yields
         # again, and burns the allocation forever without ever finishing.
-        if not resume:
+        #
+        # `resume` is tri-state, not a switch: None is "unset" — where PROD's
+        # chaining applies; True is "resume"; False is "start fresh", an
+        # EXPLICIT intent PROD must not silently override (CLAUDE.md #3/#8).
+        # An array that wants to restart an arm from iteration 0 spells RESUME=0
+        # (-> --resume-off); a bare `--prod` keeps the legacy chaining behaviour.
+        if resume is None:
             print("[MODE] PROD implies --resume if-present (wall-clock chaining)")
             resume = True
+        elif resume is False and not requeue_resumes:
+            print(
+                "[MODE] RESUME=0 overrides PROD: starting FRESH at iteration 0 "
+                "(no --resume); a mid-run yield will be reported, not requeued."
+            )
     elif train_iters is not None:
         print(f"[MODE] SMOKE — capped at TRAIN_ITERS={train_iters}")
     else:
         print("[MODE] default — full config max_iterations (no --prod, no smoke cap)")
+
+    if requeue_resumes:
+        print(
+            "[MODE] FRESH first link: starting at iteration 0 (no --resume); a "
+            "wall-clock yield is requeued and the requeued link resumes."
+        )
 
     if not Path(config).is_file():
         print(f"FATAL: config file missing: {config}", file=sys.stderr)
@@ -573,9 +790,20 @@ def _dispatch(
     # any smoke-cap overrides so both land; absent (None) leaves the config's own
     # output_dir untouched (standalone array dispatcher path).
     if output_base is not None:
-        out_override = output_dir_override(output_base, config)
+        if inference_ckpt is not None:
+            out_override = _run_dir_overrides(inference_run_dir(output_base, config))
+        else:
+            out_override = output_dir_override(output_base, config)
         overrides += out_override
-        print(f"[OUTPUT] routing into {out_override[-1].split('=', 1)[1]}")
+        print(f"[OUTPUT] routing into {out_override[1].split('=', 1)[1]}")
+    elif train_iters is not None:
+        try:
+            out_override = smoke_output_overrides(config)
+        except ValueError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            return 2
+        overrides += out_override
+        print(f"[OUTPUT] SMOKE kept apart from the arm's runs: {out_override[1].split('=', 1)[1]}")
 
     # The caller's explicit -O list lands last. A key already set by the smoke
     # cap is a contradiction of intent, not a precedence question, so it is
@@ -595,6 +823,35 @@ def _dispatch(
         print(f"[OVERRIDE] {len(user_overrides) // 2} from {overrides_file}")
 
     strategy = read_parallel_strategy(config)
+    # Only `train` can run under a process group; every other verb is single-process.
+    is_train = verb == "train"
+
+    # A parameter-free arm is graded, not trained: `train` raises without --validate-only
+    # and has no checkpoint to resume, so both are decided here, per arm, in the array.
+    parameter_free = False
+    if is_train:
+        try:
+            parameter_free = declares_parameter_free_arm(config)
+        except ImportError as exc:
+            if not dry_run:
+                raise
+            print(
+                f"[DRYRUN] model registry unavailable ({exc.name} not importable); whether "
+                "this arm is parameter-free is resolved in the real run."
+            )
+    if parameter_free:
+        print(
+            "[PARAMETER-FREE] the model declares parameter_free -> --validate-only, "
+            "no --resume (nothing to train, no checkpoint to resume)"
+        )
+        if "--validate-only" not in verb_args:
+            verb_args = [*verb_args, "--validate-only"]
+        resume = False
+
+    if inference_ckpt is not None:
+        print(f"[INFERENCE] grading {inference_ckpt} -> {inference_run_dir(output_base, config)}")
+        if not dry_run:
+            write_source(inference_run_dir(output_base, config), checkpoint=inference_ckpt, config=config)
 
     if dry_run:
         print(f"[DRYRUN] would audit + {verb}: {config}")
@@ -617,7 +874,7 @@ def _dispatch(
                 config,
                 overrides,
                 resume,
-                distributed=distributed and verb == "train",
+                distributed=distributed and is_train,
                 nproc_per_node=nproc_per_node,
                 master_port=resolve_rendezvous_port(),
                 verb=verb,
@@ -647,7 +904,7 @@ def _dispatch(
     # correct rather than a downgrade. Said out loud so a log reader is not left
     # inferring why a deepspeed arm ran without torchrun.
     needs_group = requires_process_group(strategy)
-    distributed = needs_group and verb == "train"
+    distributed = needs_group and is_train
     if distributed:
         print(
             f"[PARALLEL] parallel.strategy={strategy!r} requires a process group "
@@ -677,14 +934,30 @@ def _dispatch(
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.unlink(missing_ok=True)
     os.environ[SPECTRAMR_WALL_CLOCK_MARKER] = str(marker)
+    verdict = Path(dispatch_dir) / f"snapshot_{name}_{index}.json"
+    verdict.write_text(json.dumps(snapshot, indent=2) + "\n")
+    os.environ[SPECTRAMR_DISPATCH_SNAPSHOT_RECORD] = str(verdict)
 
-    if verb == "train":
+    if is_train:
         print(f"[TRAIN] {' '.join(argv)}")
     else:
         print(f"[LAUNCH] {verb}: {' '.join(argv)}")
     train_rc = subprocess.run(argv).returncode
 
     if not marker.is_file():
+        return train_rc
+
+    # A genuine yield has every rank exit 0: the decision is collective and the loop
+    # saves and returns. The marker is rank-0-only, so a nonzero exit WITH a marker is a
+    # crash after it was written (teardown, or a peer rank dying). Requeueing that as a
+    # successful yield would restart a broken run indefinitely.
+    if train_rc != 0:
+        print(
+            f"FATAL: {name} left a wall-clock yield marker but exited {train_rc}, so it "
+            "did not yield cleanly. Not requeueing; the checkpoint on disk is the last "
+            "good state.",
+            file=sys.stderr,
+        )
         return train_rc
 
     # A wall-clock yield is a SUCCESSFUL partial run: the loop saved and stopped
@@ -694,7 +967,9 @@ def _dispatch(
     # re-run this same command, start at iteration 0, yield at the next wall and
     # repeat -- an allocation burned forever without ever passing 120h of
     # training. Refuse loudly instead; the checkpoint on disk is still good.
-    if not resume:
+    # The fresh first link of a campaign chain is exempt: its script spells
+    # --resume on every requeued link, so the requeue continues, not restarts.
+    if not resume and not requeue_resumes:
         print(
             f"FATAL: {name} yielded at the wall clock but was launched WITHOUT "
             "resume, so requeueing it would restart it from iteration 0 and loop "
@@ -764,7 +1039,26 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--resume", action="store_true", help="Append --resume if-present."
+        "--resume",
+        action="store_true",
+        help="Append --resume if-present (RESUME=1).",
+    )
+    parser.add_argument(
+        "--resume-off",
+        action="store_true",
+        help=(
+            "Start every arm fresh at iteration 0 (RESUME=0): spells NO --resume, "
+            "and overrides --prod's implied wall-clock chaining."
+        ),
+    )
+    parser.add_argument(
+        "--requeue-resumes",
+        action="store_true",
+        help=(
+            "Only with --resume-off: the submitting script resumes on requeued "
+            "links, so a wall-clock yield of this fresh first link is requeued "
+            "rather than refused (campaign submit --fresh)."
+        ),
     )
     parser.add_argument("--no-audit", action="store_true", help="Skip the audit pre-flight.")
     parser.add_argument("--dispatch-dir", default=_DEFAULT_DISPATCH_DIR)
@@ -774,6 +1068,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Route this task's training.output_dir to <output-base>/<config-stem> "
             "(campaign array mode). Default None keeps the config's own output_dir."
+        ),
+    )
+    parser.add_argument(
+        "--inference-checkpoints",
+        default=None,
+        help=(
+            "Frozen file, one checkpoint per manifest line: each task grades its line once "
+            "(`train --validate-only --resume <line>`) into <output-base>/<stem>/inference "
+            "(`campaign infer`). Needs --output-base."
         ),
     )
     parser.add_argument(
@@ -802,10 +1105,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # `--resume` and `--resume-off` are opposing intents spelled as two flags, so
+    # argparse cannot catch the collision: refuse it rather than let one win by
+    # order. resume is tri-state downstream: None = unset, True = resume,
+    # False = start fresh.
+    if args.resume and args.resume_off:
+        parser.error("--resume and --resume-off are mutually exclusive")
+    resume = False if args.resume_off else (None if not args.resume else True)
+    # The promise only means something for a fresh launch: under resume a yield
+    # already requeues, so accepting it elsewhere would advertise an inert knob.
+    if args.requeue_resumes and not args.resume_off:
+        parser.error("--requeue-resumes is only valid with --resume-off")
+
     if args.check_plan:
         error = validate_verb_plan(
             args.verb,
-            resume=args.resume or args.prod,
+            resume=(resume if resume is not None else args.prod) or args.requeue_resumes,
             overrides=args.train_iters is not None
             or args.output_base is not None
             or args.overrides_file is not None,
@@ -827,7 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
         index=args.index,
         overrides_file=args.overrides_file,
         train_iters=args.train_iters,
-        resume=args.resume,
+        resume=resume,
         no_audit=args.no_audit,
         dispatch_dir=args.dispatch_dir,
         dry_run=args.dry_run,
@@ -836,6 +1151,8 @@ def main(argv: list[str] | None = None) -> int:
         nproc_per_node=args.nproc_per_node,
         verb=args.verb,
         verb_args_file=args.verb_args_file,
+        requeue_resumes=args.requeue_resumes,
+        inference_checkpoints=args.inference_checkpoints,
     )
 
 

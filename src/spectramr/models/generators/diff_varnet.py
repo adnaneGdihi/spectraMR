@@ -21,6 +21,10 @@ from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditioning
 from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
+from spectramr.models.blocks.contrast_conditioning import (
+    expand_contrast_over_slices,
+    fuse_contrast_embedding,
+)
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
 from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
@@ -312,7 +316,11 @@ class DiffVarNet(GradCheckpointingMixin, nn.Module, IGenerator):
         # rather than dividing an R by a step count.
         _max_t = kwargs.get("max_timesteps") if acceleration is None else None
         t_sin = sinusoidal_timestep_embedding(
-            cond_input.squeeze(-1), self.physics_emb_dim, max_timesteps=_max_t
+            cond_input.squeeze(-1),
+            self.physics_emb_dim,
+            max_timesteps=_max_t,
+            scale=kwargs.get("timestep_scale", "unit_interval") if acceleration is None
+            else "unit_interval",
         )
         emb = self.time_pos_enc(t_sin)
 
@@ -331,11 +339,9 @@ class DiffVarNet(GradCheckpointingMixin, nn.Module, IGenerator):
                         "contrast_embedding at that width)."
                     )
                 contrast_emb = self.contrast_proj(contrast_emb)
-            if _was_5d and contrast_emb.shape[0] != emb.shape[0]:
-                contrast_emb = contrast_emb.repeat_interleave(D, dim=0)
-            if contrast_emb.shape[0] != emb.shape[0]:
-                contrast_emb = contrast_emb[: emb.shape[0]]
-            emb = emb + contrast_emb
+            if _was_5d:
+                contrast_emb = expand_contrast_over_slices(contrast_emb, emb.shape[0], D)
+            emb = fuse_contrast_embedding(emb, contrast_emb, owner="DiffVarNet")
 
         # 2. Iterative Unrolling
         curr_x = x

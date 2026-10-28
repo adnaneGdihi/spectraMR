@@ -20,6 +20,8 @@ network-input partition Λ).
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -82,7 +84,7 @@ class AmbientConsistencyLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None or "target_kspace" not in context or "theta_mask" not in context:

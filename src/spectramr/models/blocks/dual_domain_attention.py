@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.models.blocks.attention import ComplexChannelAttention
 from spectramr.models.blocks.attention_domains import (
     complex_to_interleaved,
     interleaved_to_complex,
@@ -22,52 +23,25 @@ from spectramr.models.blocks.attention_domains import (
 )
 
 
-class ComplexSignalAttention(nn.Module):
-    """Channel attention specialized for complex signal pairs."""
+class ComplexSignalAttention(ComplexChannelAttention):
+    """Per-complex-channel gate for the dual-domain branches.
+
+    Signature adapter over :class:`ComplexChannelAttention`, which owns the
+    gate: one sigmoid gain per complex channel, shared by Re and Im and squeezed
+    from ``|z|``, so a global phase rotation passes through unchanged. The former
+    per-real-channel gain on a signed average pool rotated the phase and was
+    driven by the DC bin.
+    """
 
     def __init__(self, complex_channels: int, reduction: int = 4):
         """__init__.
 
         Args:
-            complex_channels (int): Description.
-            reduction (int): Description.
+            complex_channels (int): Complex channel count ``C`` (input is
+                ``[B, 2C, H, W]`` interleaved).
+            reduction (int): Bottleneck divisor on ``C`` (floor 1).
         """
-        super().__init__()
-        # Input has 2*C real channels
-        real_channels = complex_channels * 2
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(real_channels, real_channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(real_channels // reduction, real_channels, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handles Interleaved layout [R1, I1, ...]
-        """forward.
-
-        Args:
-            x (torch.Tensor): Description.
-        Returns:
-            torch.Tensor: Description.
-
-        forward method for ComplexSignalAttention.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        b, c, _, _ = x.shape
-        y = self.avg_pool(x).view(b, c)
-        y = self.mlp(y).view(b, c, 1, 1)
-        return x * y
+        super().__init__(2 * complex_channels, reduction_ratio=reduction)
 
 
 class DualDomainAttention(nn.Module):

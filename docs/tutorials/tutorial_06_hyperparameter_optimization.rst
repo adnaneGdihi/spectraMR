@@ -115,7 +115,6 @@ Create ``experiments/hpo/hpo_reconstruction.yaml``:
      precision:
        enabled: true
    checkpoint:
-     checkpoint_dir: checkpoints/hpo_trials
      save_interval: 999999     # Don't save during trials (space)
      format: safetensors
 

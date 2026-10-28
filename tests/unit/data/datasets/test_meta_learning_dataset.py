@@ -162,3 +162,13 @@ def test_timestep_clamps_below_zero() -> None:
     base = _TinyImageDataset(n=16)
     ds = MetaLearningDataset(base_dataset=base, support_size=2, query_size=2, tasks_per_epoch=2)
     assert ds._get_timestep_for_acceleration(0.0) == 0
+
+
+def test_the_acceleration_mapping_and_the_mask_generator_share_one_ladder():
+    """The two 1000s were independent literals; one named resolution keeps them agreed (#2443)."""
+    from spectramr.data.datasets import meta_learning_dataset as module
+
+    ds = MetaLearningDataset(base_dataset=_TinyImageDataset(), support_size=2, query_size=2, tasks_per_epoch=1)
+    assert ds.mask_generator.num_timesteps == module.MASK_LADDER_STEPS
+    assert ds._get_timestep_for_acceleration(64.0) == module.MASK_LADDER_STEPS - 1
+    assert ds._get_timestep_for_acceleration(1.0) == 0

@@ -27,7 +27,6 @@ def test_default_construction_succeeds() -> None:
     assert cfg.metric == "val_loss"
     assert cfg.mode == MetricMode.MIN
     assert cfg.min_delta == 0.0
-    assert cfg.check_interval == 1000
     assert cfg.restore_best_weights is True
 
 
@@ -59,10 +58,18 @@ def test_min_delta_must_be_non_negative() -> None:
         EarlyStoppingConfigSchema(min_delta=-0.001)
 
 
-def test_check_interval_must_be_positive() -> None:
-    """``check_interval >= 1``."""
-    with pytest.raises(ValidationError):
-        EarlyStoppingConfigSchema(check_interval=0)
+def test_check_interval_is_refused_by_name() -> None:
+    """Planted: the removed knob is refused with its reason and the live key (#1555).
+
+    A bare ``extra="forbid"`` error would also fail the load; this pins that the
+    removal record's mount fires first and tells the author where the cadence lives.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        EarlyStoppingConfigSchema(check_interval=5000)
+    message = str(excinfo.value)
+    assert "`early_stopping.check_interval` was removed" in message
+    assert "`validation.schedule.interval_steps`" in message
+    assert "check_interval" not in EarlyStoppingConfigSchema.model_fields
 
 
 def test_patience_min_iterations_can_be_none() -> None:
@@ -99,7 +106,7 @@ def test_extra_fields_rejected() -> None:
 # mode must not contradict the metric's own direction (metrics plan PR 2, 2.5)
 #
 # `mode: max` on a loss stops the run when the loss stops RISING and writes
-# checkpoint_best.pt at the WORST iterate. Nothing downstream notices: the
+# the best checkpoint at the WORST iterate. Nothing downstream notices: the
 # comparison is well-defined, the wait counter advances, the file is written,
 # every artifact reports success. The selected model is simply the wrong one --
 # pitfall #16, decided by one enum.
@@ -164,8 +171,7 @@ class TestModeMatchesMetricDirection:
         """Anti-vacuity: a second direction table would drift from the first.
 
         ``metric_higher_is_better`` is the one resolver already used by the
-        metrics tracker, ``keep_best_n``, early stopping and the campaign
-        ranker. This asserts the validator agrees with it rather than carrying
+        metrics tracker, early stopping and the campaign ranker. This asserts the validator agrees with it rather than carrying
         its own opinion.
         """
         from spectramr.core.metrics.metric_directions import metric_higher_is_better

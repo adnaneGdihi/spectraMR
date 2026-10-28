@@ -36,6 +36,8 @@ class PhaseContrastVelocityLoss(nn.Module):
         super().__init__()
         if venc <= 0:
             raise ValueError(f"venc must be positive, got {venc}")
+        if p not in (1, 2):
+            raise ValueError(f"p must be 1 (L1) or 2 (L2), got {p!r}")
         self.venc = float(venc)
         self.p = p
 

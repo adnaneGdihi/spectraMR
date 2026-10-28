@@ -14,15 +14,16 @@ Identifiability is a *hard* constraint, not a preference: a :math:`P`-pool BPP
 model has :math:`2P+1` free constants per rate, so recovering them needs
 measurements at :math:`M \ge 2P+1` distinct fields. The Tier-1
 ``dispersion_identifiability`` check enforces
-``2*n_pools + 1 <= len(fields_present)`` as an ERROR -- an under-determined arm
+``2*num_pools + 1 <= len(fields_present)`` as an ERROR -- an under-determined arm
 would otherwise train happily to a meaningless latent (pitfall #9: no silent
 degradation).
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..renames import reject_renamed_keys
 from .base import BaseTrainingConfigSchema
 
 
@@ -31,7 +32,11 @@ class DispersionBlochAEConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    n_pools: int = Field(
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.dispersion_bloch_ae"))  # type: ignore[arg-type]
+    )
+
+    num_pools: int = Field(
         default=1,
         ge=1,
         le=4,

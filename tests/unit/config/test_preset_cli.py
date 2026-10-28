@@ -196,9 +196,9 @@ class TestDeepUpdate:
         assert target == {"a": 1, "b": 2}
 
     def test_dotted_key_writes_into_nested_dict(self) -> None:
-        target: dict = {"optimization": {"learning_rate": 1e-3}}
+        target: dict = {"optimization": {"optimizer": {"learning_rate": 1e-3}}}
         _deep_update(target, {"optimization.optimizer.learning_rate": 1e-4})
-        assert target["optimization"]["learning_rate"] == 1e-4
+        assert target["optimization"]["optimizer"]["learning_rate"] == 1e-4
 
     def test_dotted_key_creates_missing_parent(self) -> None:
         target: dict = {}

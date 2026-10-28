@@ -334,3 +334,32 @@ def test_the_loss_schedule_and_the_metric_throttle_now_agree() -> None:
     assert compute_iters == [_LIVE_ITERATION] * 3, compute_iters
     assert metric_steps == [_LIVE_ITERATION]
     assert set(compute_iters) == set(metric_steps), "two owners disagreed about the iteration"
+
+
+class _TissueVAE(_TinyVAE):
+    """A tissue_params-mode generator: returns a dict of maps, not an image."""
+
+    def forward(self, x, phys):
+        out, mu, logvar = super().forward(x, phys)
+        return {"rho": out}, mu, logvar
+
+
+def test_tissue_dict_output_is_refused(flow_strategy):
+    """The dict used to reach the loss, which graded its first tensor (#2606)."""
+    flow_strategy.env.generator = _TissueVAE()
+    x = torch.randn(2, 1, 16, 16)
+    with pytest.raises(TypeError, match="tissue-parameter dict"):
+        flow_strategy._compute_losses_impl(x, x, epoch=0)
+
+
+def test_validation_metric_failure_propagates(val_strategy):
+    """A swallowed failure left val_psnr unemitted and early stopping blind (#2606)."""
+    from types import SimpleNamespace
+
+    def _boom(pred, target):
+        raise RuntimeError("metric exploded")
+
+    val_strategy._get_validation_metrics_computer = lambda cfg: SimpleNamespace(compute=_boom)
+    x = torch.randn(2, 1, 16, 16)
+    with pytest.raises(RuntimeError, match="metric exploded"):
+        val_strategy.validation_step({"input": x, "target": x}, x, x)

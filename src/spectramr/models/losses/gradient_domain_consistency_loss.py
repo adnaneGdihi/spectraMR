@@ -43,6 +43,9 @@ References
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any, ClassVar
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,12 +111,13 @@ class GradientDomainConsistencyLoss(nn.Module):
             by its own RMS energy before comparing — makes the loss
             scale-invariant under contrast-dependent intensity rescaling.
         anchor: ``"target"`` (default) — the *source* image is the gradient
-            anchor; ``"prediction"`` — symmetric, both contribute.
+            anchor: its gradient field is detached, so only ``prediction``
+            receives gradient; ``"prediction"`` — symmetric, both contribute.
             ``"target"`` is appropriate for translation tasks where the
             target image is the unmodified source.
     """
 
-    _NORM_FNS = {
+    _NORM_FNS: ClassVar[dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]] = {
         "l1": lambda a, b: (a - b).abs().mean(),
         "l2": lambda a, b: (a - b).pow(2).mean(),
         "smooth_l1": lambda a, b: F.smooth_l1_loss(a, b),
@@ -140,15 +144,16 @@ class GradientDomainConsistencyLoss(nn.Module):
 
     @staticmethod
     def _normalise(g: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        # per-image RMS over (C, H, W).
-        rms = g.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(eps)
+        # Per-image RMS over (C, H, W); the floor goes under the root because
+        # sqrt'(0) is infinite and a flat image (zero gradient field) would NaN.
+        rms = g.pow(2).mean(dim=(1, 2, 3), keepdim=True).clamp_min(eps * eps).sqrt()
         return g / rms
 
     def forward(
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if prediction.shape != target.shape:
             raise ValueError(
@@ -157,6 +162,8 @@ class GradientDomainConsistencyLoss(nn.Module):
         op = _OPERATORS[self.operator]
         g_pred = op(prediction)
         g_tgt = op(target)
+        if self.anchor == "target":
+            g_tgt = g_tgt.detach()
         if self.normalise_per_image:
             g_pred = self._normalise(g_pred)
             g_tgt = self._normalise(g_tgt)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spectramr.infrastructure.physics.primary_ideal import vanishing_ideal_residual
 from spectramr.models.losses.registry import register_loss
@@ -59,30 +60,30 @@ class PrimaryIdealMembershipLoss(nn.Module):
 
     @staticmethod
     def _cluster(points: torch.Tensor, k: int, iters: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lloyd's algorithm (detached) → (centers [k,d], radii [k])."""
+        """Lloyd's algorithm (detached) → (centers [k,d], radii [k]).
+
+        Cluster sums go through a one-hot matmul rather than boolean-mask
+        indexing, whose data-dependent shape forces a host sync per cluster per
+        iteration. An empty cluster keeps its previous centre and gets radius 1.
+        """
         n = points.shape[0]
         # Deterministic init: k quantile points along the first coordinate order.
         order = torch.argsort(points[:, 0])
         idx = torch.linspace(0, n - 1, k, device=points.device).round().long()
         centers = points[order[idx]].clone()
         for _ in range(iters):
-            d2 = torch.cdist(points, centers)  # [n, k]
-            assign = d2.argmin(dim=1)
-            new = []
-            for c in range(k):
-                members = points[assign == c]
-                new.append(members.mean(0) if members.numel() else centers[c])
-            centers = torch.stack(new, dim=0)
-        d2 = torch.cdist(points, centers)
-        assign = d2.argmin(dim=1)
-        radii = []
-        for c in range(k):
-            members = points[assign == c]
-            if members.numel():
-                radii.append(((members - centers[c]).pow(2).sum(-1).mean().clamp_min(1e-8)).sqrt())
-            else:
-                radii.append(torch.tensor(1.0, device=points.device))
-        return centers, torch.stack(radii)
+            assign = torch.cdist(points, centers).argmin(dim=1)
+            onehot = F.one_hot(assign, k).to(points.dtype)  # [n, k]
+            counts = onehot.sum(dim=0)
+            means = (onehot.t() @ points) / counts.clamp_min(1.0).unsqueeze(1)
+            centers = torch.where(counts.unsqueeze(1) > 0, means, centers)
+        assign = torch.cdist(points, centers).argmin(dim=1)
+        onehot = F.one_hot(assign, k).to(points.dtype)
+        counts = onehot.sum(dim=0)
+        sq_dist = (points - centers[assign]).pow(2).sum(dim=-1)  # [n]
+        mean_sq = (onehot.t() @ sq_dist) / counts.clamp_min(1.0)
+        radii = torch.where(counts > 0, mean_sq.clamp_min(1e-8).sqrt(), torch.ones_like(mean_sq))
+        return centers, radii
 
     def forward(
         self,

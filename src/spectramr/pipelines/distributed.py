@@ -17,18 +17,34 @@ Usage::
 """
 
 import argparse
+import datetime
 import logging
 import os
 
 import torch
 import torch.distributed as dist
 
-from spectramr.infrastructure.logging.rank_console import quiet_secondary_ranks
+from spectramr.core.topology import resolve_rank
+from spectramr.infrastructure.logging.log_policy import (
+    apply_logging_config,
+    quiet_secondary_ranks,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def setup_distributed(backend: str = "nccl") -> tuple[int, int]:
+def _local_rank(rank: int) -> int:
+    """The rank within this node: LOCAL_RANK (torchrun), else SLURM_LOCALID (hand-rolled srun).
+
+    The global ``rank`` is the last resort and is only right on a single node; the topology
+    module reads the same two variables in the same order.
+    """
+    return int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", rank)))
+
+
+def setup_distributed(
+    backend: str = "nccl", timeout_seconds: int | None = None
+) -> tuple[int, int]:
     """Initialize the distributed process group.
 
     Reads rank/world_size from environment variables set by torchrun.
@@ -39,8 +55,11 @@ def setup_distributed(backend: str = "nccl") -> tuple[int, int]:
     Raises:
         RuntimeError: If environment variables are not set (i.e. not launched via torchrun).
     """
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "-1")))
     world_size = int(os.environ.get("WORLD_SIZE", "-1"))
+    # The one rank rule (``core.topology.resolve_rank``): RANK, else SLURM_PROCID beside an
+    # explicit WORLD_SIZE. LOCAL_RANK is not a global rank, so it is no longer a fallback.
+    resolved_rank, _source = resolve_rank(os.environ)
+    rank = -1 if resolved_rank is None else resolved_rank
 
     if rank == -1 or world_size == -1:
         raise RuntimeError(
@@ -48,8 +67,11 @@ def setup_distributed(backend: str = "nccl") -> tuple[int, int]:
             "Launch with: torchrun --nproc_per_node=N ..."
         )
 
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
+    local_rank = _local_rank(rank)
+    # Only a CUDA-backed group has a device to select; ``gloo`` on a CPU host would
+    # raise here.
+    if backend.lower() == "nccl" and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     # `device_id` BINDS the group to this rank's GPU at init. Without it every
     # device-taking collective infers a device from "the current context",
@@ -68,6 +90,9 @@ def setup_distributed(backend: str = "nccl") -> tuple[int, int]:
     pg_kwargs: dict[str, object] = {}
     if backend.lower() == "nccl" and torch.cuda.is_available():
         pg_kwargs["device_id"] = torch.device("cuda", local_rank)
+
+    if timeout_seconds is not None:
+        pg_kwargs["timeout"] = datetime.timedelta(seconds=timeout_seconds)
 
     dist.init_process_group(
         backend=backend, rank=rank, world_size=world_size, **pg_kwargs
@@ -171,6 +196,7 @@ def run_distributed_training(
     backend: str | None = None,
     resume_path: str | None = None,
     overrides: list[str] | None = None,
+    validate_only: bool = False,
 ) -> dict:
     """Main distributed training function invoked by each torchrun worker.
 
@@ -186,6 +212,8 @@ def run_distributed_training(
             config value (that is how the YAML wins).
         resume_path: Optional checkpoint path for resume.
         overrides: Optional list of ``KEY=VALUE`` config override strings.
+        validate_only: One validation pass on the resumed weights and no
+            optimizer step (``spectramr train-distributed --validate-only``).
     """
     # Backend is resolved from the config AFTER it loads, so parallel.backend
     # can win. The process group therefore starts below, not here.
@@ -219,6 +247,7 @@ def run_distributed_training(
 
         # Load config (all ranks load the same config)
         settings = TrainingSettings.from_yaml(config_path)
+        apply_logging_config(settings.logging)
 
         # Apply overrides. Import from the config layer (rightward), NOT from
         # ``spectramr.main`` — a pipelines→entry-layer leftward import (CLAUDE.md
@@ -236,7 +265,11 @@ def run_distributed_training(
         )
 
         resolved_backend, backend_source = resolve_distributed_backend(settings, backend)
-        rank, world_size = setup_distributed(backend=resolved_backend)
+        declared_parallel = getattr(settings, "parallel", None)
+        rank, world_size = setup_distributed(
+            backend=resolved_backend,
+            timeout_seconds=getattr(declared_parallel, "timeout_seconds", None),
+        )
         logger.info("[DDP] backend=%s (source=%s)", resolved_backend, backend_source)
 
         # The launcher no longer rewrites `strategy`.
@@ -339,13 +372,14 @@ def run_distributed_training(
         )
 
         # Determine device for this rank
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        local_rank = _local_rank(rank)
         device = f"cuda:{local_rank}"
 
         result = run_training_pipeline(
             settings,
             device=device,
             resume_path=resume_path,
+            validate_only=validate_only,
         )
 
         return result
@@ -379,15 +413,28 @@ def main() -> None:
         metavar="KEY=VALUE",
         help="Override config values",
     )
+    parser.add_argument(
+        "--validate-only",
+        dest="validate_only",
+        action="store_true",
+        help="One validation pass on the resumed weights, no optimizer step.",
+    )
 
     args = parser.parse_args()
 
-    run_distributed_training(
+    from spectramr.pipelines.result_status import failure_reason
+
+    result = run_distributed_training(
         config_path=args.config,
         backend=args.backend,
         resume_path=args.resume,
         overrides=args.override,
+        validate_only=args.validate_only,
     )
+    reason = failure_reason(result)
+    if reason is not None:
+        logger.error("Distributed training pipeline reported failure: %s", reason)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -8,13 +8,6 @@ This model uses a Vision Transformer as the encoder and a CNN-based decoder.
 import torch
 from torch import nn
 
-try:
-    from monai.networks.nets import UNETR
-
-    HAS_MONAI = True
-except ImportError:
-    HAS_MONAI = False
-
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -63,10 +56,12 @@ class UNETRGenerator(nn.Module, IGenerator):
         """
         super().__init__()
 
-        if not HAS_MONAI:
+        try:
+            from monai.networks.nets import UNETR
+        except ImportError as exc:
             raise ImportError(
                 "MONAI is not installed. Please install it to use UNETRGenerator.",
-            )
+            ) from exc
 
         self.in_channels = in_channels
         self.out_channels = out_channels

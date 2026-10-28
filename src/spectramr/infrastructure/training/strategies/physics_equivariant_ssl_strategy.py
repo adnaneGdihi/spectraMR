@@ -19,15 +19,18 @@ machinery — only ``_compute_losses_impl`` is overridden.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
+from spectramr.infrastructure.training.strategies.rng_streams import rank_seeded_generator
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +132,17 @@ class PhysicsEquivariantSSLStrategy(BaseTrainingStrategy):
     producing a flat latent of size ``latent_dim``.
     """
 
+    # parallel_compat: The latent operators and projection are bare groups on opt_g, refused under
+    # ddp. Each rank draws its operator from a rank-seeded stream, so ranks train different
+    # operators each step, and the projection is sized by the first encoder output.
+    parallel_compat = frozenset({"replicated"})
+    checkpointed_streams: ClassVar[tuple[str, ...]] = ("_rng",)
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("latent_ops", OWNED_PARAM_GROUP), ("_projection", OWNED_PARAM_GROUP))
+        return (*super().owned_module_declarations(config), *own)
+
     def __init__(
         self,
         env: TrainingEnvironment,
@@ -199,14 +213,24 @@ class PhysicsEquivariantSSLStrategy(BaseTrainingStrategy):
             {op: _LinearLatentOperator(self.latent_dim) for op in self.operator_pool}
         ).to(self.device)
         # Register the latent operators on opt_g or they never train.
+        self._register_on_opt_g(self.latent_ops)
+        # The operator-draw stream: one per rank, carried through the checkpoint.
+        self._rng = rank_seeded_generator(int(self.config.run.seed))
+
+    def _register_on_opt_g(self, module: nn.Module) -> None:
+        """Add ``module``'s parameters to ``opt_g`` as one new param group."""
         _opt = getattr(self.env, "opt_g", None)
         if _opt is not None:
             _existing = {p for g in _opt.param_groups for p in g["params"]}
-            _new = [p for p in self.latent_ops.parameters() if p not in _existing]
+            _new = [p for p in module.parameters() if p not in _existing]
             if _new:
-                _opt.add_param_group({"params": _new})
-        # Track epoch / step for stochastic operator selection.
-        self._rng = torch.Generator(device="cpu").manual_seed(int(self.config.run.seed))
+                add_owned_param_group(self, _opt, {"params": _new}, owner="its latent operators")
+
+    def _build_projection(self, in_features: int, device: torch.device) -> None:
+        # The encoder's flattened output width is out_channels x H x W, so it is
+        # known only once a batch of the run's spatial size has passed through.
+        self._projection = nn.Linear(in_features, self.latent_dim).to(device)
+        self._register_on_opt_g(self._projection)
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         z = self.generator_model(x)
@@ -214,19 +238,27 @@ class PhysicsEquivariantSSLStrategy(BaseTrainingStrategy):
             z = z.flatten(start_dim=1)
         if z.shape[-1] != self.latent_dim:
             # The encoder may produce a richer latent; project to latent_dim.
-            if not hasattr(self, "_projection"):
-                self._projection = nn.Linear(z.shape[-1], self.latent_dim).to(z.device)
-                # Register the lazily-built projection on opt_g; never leave a
-                # learnable layer unoptimized (creating it mid-forward is a
-                # smell, but at minimum it must train).
-                _opt = getattr(self.env, "opt_g", None)
-                if _opt is not None:
-                    _existing = {p for g in _opt.param_groups for p in g["params"]}
-                    _new = [p for p in self._projection.parameters() if p not in _existing]
-                    if _new:
-                        _opt.add_param_group({"params": _new})
+            if getattr(self, "_projection", None) is None:
+                self._build_projection(z.shape[-1], z.device)
             z = self._projection(z)
         return z
+
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Rebuild a saved projection from its weight shape and register it on ``opt_g``.
+
+        ``checkpointing.resume`` restores strategy state before optimizer state,
+        so the param groups match the saved ``opt_g`` when that loads.
+        """
+        super()._materialize_owned_state(state)
+        saved = state.get("modules", {}).get("_projection")
+        if saved is not None and getattr(self, "_projection", None) is None:
+            out_features, in_features = saved["weight"].shape
+            if out_features != self.latent_dim:
+                raise ValueError(
+                    f"The checkpoint's PE-SSL projection maps to {out_features} "
+                    f"features, but physics_eq_ssl.latent_dim is {self.latent_dim}."
+                )
+            self._build_projection(int(in_features), self.device)
 
     def _vicreg_variance(self, z: torch.Tensor) -> torch.Tensor:
         std = z.std(dim=0)
@@ -242,7 +274,7 @@ class PhysicsEquivariantSSLStrategy(BaseTrainingStrategy):
         """Equivariance loss + VICReg variance regulariser."""
         del target_batch  # SSL — no supervised target.
         del epoch
-        idx = int(torch.randint(0, len(self.operator_pool), (1,), generator=self._rng).item())
+        idx = int(torch.randint(0, len(self.operator_pool), (1,), generator=self._rng))
         op_name = self.operator_pool[idx]
         x = input_batch
         with torch.no_grad():

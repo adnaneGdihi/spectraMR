@@ -25,12 +25,14 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
 from spectramr.infrastructure.physics.girf import (
     GIRFKernel,
     apply_girf,
     waveform_to_trajectory,
 )
 
+from .owned_param_groups import add_owned_param_group
 from .reconstruction import ReconstructionTrainingStrategy
 
 logger = logging.getLogger(__name__)
@@ -39,10 +41,19 @@ logger = logging.getLogger(__name__)
 class GIRFAwareStrategy(ReconstructionTrainingStrategy):
     """Reconstruction with learnable GIRF correction on requested gradients."""
 
+    # parallel_compat: The GIRF kernel is a bare group on opt_g, refused under ddp. It is built
+    # only when a batch carries gradient_waveform, sized and rebuilt from that batch, so its
+    # creation is not a rank-symmetric point at which to wrap it.
+    parallel_compat = frozenset({"replicated"})
+
     n_axes: int = 3
     kernel_size: int = 21
     lambda_ridge: float = 1e-3
     dt: float = 1e-5
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("_girf", OWNED_PARAM_GROUP))
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -53,7 +64,12 @@ class GIRFAwareStrategy(ReconstructionTrainingStrategy):
             self._girf = GIRFKernel(n_axes=n_axes, kernel_size=self.kernel_size).to(device)
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
-                opt.add_param_group({"params": list(self._girf.parameters()), "lr": 1e-4})
+                add_owned_param_group(
+                    self,
+                    opt,
+                    {"params": list(self._girf.parameters()), "lr": 1e-4},
+                    owner="its GIRF kernel",
+                )
         return self._girf
 
     def _compute_losses_impl(

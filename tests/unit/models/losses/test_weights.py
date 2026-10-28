@@ -256,6 +256,20 @@ class TestWarmupGate:
         table = build_loss_weight_table(cfg)
         assert resolve_loss_weight(table, "l1", iteration=0) == pytest.approx(3.0)
 
+    def test_misspelt_warmup_loss_raises(self):
+        """A typo matched nothing and let the term train from step 0 with no error."""
+        cfg = LossConfigSchema(
+            reconstruction={"lambda_hfen": 1.0, "warmup_losses": ["complex_spatial_gradiant"]}
+        )
+        with pytest.raises(ConfigurationError, match="complex_spatial_gradiant"):
+            build_loss_weight_table(cfg)
+
+    @pytest.mark.parametrize("name", ["complex_spatial_gradient", "adversarial", "pre_dc_kspace"])
+    def test_known_warmup_names_are_accepted(self, name):
+        """Registered, alias-resolved and strategy-inline (lambda-only) names all pass."""
+        cfg = LossConfigSchema(reconstruction={"lambda_hfen": 1.0, "warmup_losses": [name]})
+        assert canonical_loss_name(name) in build_loss_weight_table(cfg).warmup_losses
+
     def test_warmup_losses_is_stamped_into_provenance(self):
         cfg = LossConfigSchema(reconstruction={"lambda_hfen": 1.0, "warmup_losses": ["hfen"]})
         assert build_loss_weight_table(cfg).provenance()["warmup_losses"] == ["hfen"]
@@ -865,3 +879,67 @@ class TestAccessorReadPathsAreTheExecutedReadSet:
         """The value is prose for a human triaging a verdict; it may not be empty."""
         for path, reader in accessor_read_paths().items():
             assert "build_loss_weight_table" in reader, path
+
+
+class TestAForeignModelIsRefused:
+    """A settings object passed where ``.losses`` was meant carries none of the
+    declaration surfaces, so it resolved to the same empty table a loss-free arm
+    does -- and every comparison built on it passed vacuously (#1978).
+    """
+
+    def test_a_losses_sub_block_raises(self):
+        with pytest.raises(TypeError, match="LossConfigSchema"):
+            build_loss_weight_table(LossConfigSchema().reconstruction)
+
+    def test_the_settings_object_raises(self):
+        from spectramr.config.settings import TrainingSettings
+
+        settings = TrainingSettings.settings_from_dict(
+            {
+                "model": {"model_type": "unet"},
+                "data": {"dataset_type": "synthetic"},
+                "optimization": {},
+                "logging": {},
+                "checkpoint": {},
+                "training": {"strategy_class": "reconstruction", "epochs": 1},
+                "losses": {
+                    "policy": {"output_domain": "image"},
+                    "image_losses": [{"name": "l1", "weight": 0.7}],
+                },
+            }
+        )
+        assert build_loss_weight_table(settings.losses)["l1"].weight == pytest.approx(0.7)
+        with pytest.raises(TypeError, match=r"Pass `config\.losses`"):
+            build_loss_weight_table(settings)
+
+    def test_none_and_config_doubles_still_resolve(self):
+        """Controls: ``None`` is a legal empty config, and test doubles are not models."""
+        assert len(build_loss_weight_table(None)) == 0
+        double = SimpleNamespace(
+            image_losses=[SimpleNamespace(name="hfen", weight=0.2, enabled=True)]
+        )
+        assert build_loss_weight_table(double).weight("hfen") == pytest.approx(0.2)
+
+    def test_an_entry_double_without_enabled_reads_as_enabled(self):
+        """The schema default is True; a dict entry already honoured it, an object did not."""
+        as_object = SimpleNamespace(image_losses=[SimpleNamespace(name="hfen", weight=0.2)])
+        as_dict = SimpleNamespace(image_losses=[{"name": "hfen", "weight": 0.2}])
+        for double in (as_object, as_dict):
+            spec = build_loss_weight_table(double)["hfen"]
+            assert spec.enabled and spec.weight == pytest.approx(0.2)
+
+
+def test_declared_list_kwargs_stamps_entry_knobs_by_source():
+    from spectramr.models.losses.weights import declared_list_kwargs
+
+    cfg = SimpleNamespace(
+        kspace_losses=[
+            SimpleNamespace(name="frequency_weighted_l1_kspace", kwargs={"profile": "ring_band"}),
+            SimpleNamespace(name="complex_l1", kwargs=None),
+        ],
+        image_losses=[{"name": "spectral_radial_prior", "kwargs": {"comparison": "log_ratio"}}],
+    )
+    assert declared_list_kwargs(cfg) == {
+        "losses.kspace_losses[frequency_weighted_l1_kspace]": {"profile": "ring_band"},
+        "losses.image_losses[spectral_radial_prior]": {"comparison": "log_ratio"},
+    }

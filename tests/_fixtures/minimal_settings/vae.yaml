@@ -21,7 +21,6 @@ training:
   task: reconstruction
   output_dir: /tmp/spectramr_test/vae
   enable_mixed_precision: false
-  enable_gradient_checkpointing: false
   physics_informed: false
   diffusion:
     timesteps: 10

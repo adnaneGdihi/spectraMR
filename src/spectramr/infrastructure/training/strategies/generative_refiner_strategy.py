@@ -31,7 +31,7 @@ import torch
 from .field_guided_diffusion_strategy import make_alphas_cumprod
 from .reconstruction import ReconstructionTrainingStrategy
 from .ulf_dps_strategy import compute_ulf_dps_loss
-from .ulf_map_strategy import ulf_degrade
+from .ulf_lowpass_operator import UlfLowpassOperator, build_ulf_lowpass_operator
 
 # ── Forward-operator dispatch table (the arm's mechanism, as A(x)) ───────────
 # Signature: (x0_hat, op_kwargs) -> A(x0_hat). Registry-style dispatch, never if/elif.
@@ -39,8 +39,13 @@ ForwardOp = Callable[[torch.Tensor, dict[str, Any]], torch.Tensor]
 
 
 def _field_lowpass_op(x: torch.Tensor, kw: dict[str, Any]) -> torch.Tensor:
-    """b22 recipe: a fixed field-dependent low-pass blur at a free ``blur_cutoff``."""
-    return ulf_degrade(x, float(kw.get("blur_cutoff", 0.5)))
+    """b22 recipe: the ULF low-pass ``A`` (``kw['forward_op']``, or a ``blur_cutoff``)."""
+    op = kw.get("forward_op")
+    if op is None:
+        if "blur_cutoff" not in kw:
+            raise ValueError("field_lowpass needs op_kwargs 'forward_op' or 'blur_cutoff'.")
+        op = UlfLowpassOperator.constant_cutoff(float(kw["blur_cutoff"]))
+    return op.apply(x, kw.get("contrast_id"))
 
 
 def _wiener_recoverable_noise(source_field_tesla: float) -> float:
@@ -80,6 +85,9 @@ def _wiener_band_op(x: torch.Tensor, kw: dict[str, Any]) -> torch.Tensor:
     xf = torch.fft.rfft2(x, norm="ortho")
     return torch.fft.irfft2(gain * xf, s=(h, w), norm="ortho")
 
+
+#: Operators that apply the shared ULF low-pass A, so the arm must declare training.ulf_lowpass.
+_OPERATORS_USING_ULF_FORWARD = frozenset({"field_lowpass"})
 
 _FORWARD_OPERATORS: dict[str, ForwardOp] = {
     # Field-dependent low-pass degradation (the b22 recipe).
@@ -146,7 +154,7 @@ def refiner_sample(
             a_t = alphas_cumprod[t]
             x0_hat = (x - (1.0 - a_t).sqrt() * eps) / a_t.sqrt().clamp_min(1e-3)
             x0_hat = x0_hat.clamp(-1.0, 2.0)  # data range guard (images are [0,1])
-            residual = forward_op(x0_hat, op_kwargs) - y  # A(x0) - y
+            residual = forward_op(x0_hat, {**op_kwargs, "contrast_id": contrast_id}) - y
             if i < n - 1:
                 a_next = alphas_cumprod[int(idx[i + 1])]
                 x_prior = a_next.sqrt() * x0_hat + (1.0 - a_next).sqrt() * eps
@@ -195,9 +203,10 @@ class GenerativeRefinerStrategy(ReconstructionTrainingStrategy):
             str(getattr(cfg, "forward_operator", "field_lowpass")) if cfg else "field_lowpass"
         )
         self._gr_op_kwargs: dict[str, Any] = {
-            "blur_cutoff": float(getattr(cfg, "blur_cutoff", 0.5)) if cfg else 0.5,
             "source_field": float(getattr(cfg, "source_field", 0.1)) if cfg else 0.1,
         }
+        if self._gr_operator_name in _OPERATORS_USING_ULF_FORWARD:
+            self._gr_op_kwargs["forward_op"] = build_ulf_lowpass_operator(self.config)
         # Resolve now so an unknown operator fails at setup, not mid-validation.
         self._gr_forward_op = self._forward_operator()
         self._acp_cache: dict[tuple, torch.Tensor] = {}

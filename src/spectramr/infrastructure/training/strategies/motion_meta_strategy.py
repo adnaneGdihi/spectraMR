@@ -17,12 +17,13 @@ Reference:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
 from spectramr.infrastructure.physics.kinematic_forward import KinematicForwardOperator
 from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
+from spectramr.infrastructure.training.utils.held_out_severity import held_out_severity_points
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.loss_folding import declared_loss_weights
 from spectramr.models.losses.registry import create_loss
@@ -45,6 +46,8 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         loss_hfen: High-frequency error norm loss.
     """
 
+    synthesises_model_input: ClassVar[bool] = True
+
     def __init__(
         self,
         env: Any,
@@ -59,7 +62,8 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
             **kwargs: Additional kwargs.
         """
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize physics operators and loss functions."""
@@ -237,6 +241,51 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
             "loss_hfen": loss_hfen.detach(),
         }
 
+    def _heldout_motion_scales(self) -> list[float]:
+        """Multipliers (> 1) of the training motion magnitude to also validate at."""
+        scales = held_out_severity_points(self.config)
+        bad = [x for x in scales if x <= 1.0]
+        if bad:
+            raise ValueError(
+                f"validation.gates.held_out_severity_grid {bad} is not beyond the training "
+                "motion range for motion_meta: values are multipliers and must exceed 1."
+            )
+        return scales
+
+    def _corrupt_and_score(
+        self, target_complex: torch.Tensor, scale: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Corrupt with random motion at ``scale`` x the training magnitude; return pred, target, PSNR."""
+        from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+        B = target_complex.shape[0]
+        theta = self.kinematic_op.generate_random_motion(
+            batch_size=B,
+            max_translation=self._max_translation * scale,
+            max_rotation=self._max_rotation * scale,
+            motion_type=self._motion_type,
+            device=self.device,
+        )
+        corrupted_kspace = self.kinematic_op(target_complex, theta)
+        corrupted_image = ifft2c(corrupted_kspace)
+        corrupted_input = torch.cat([corrupted_image.real, corrupted_image.imag], dim=1)
+
+        fiducial_image = self.fiducial(batch_size=B)
+        corrupted_fiducial_kspace = self.kinematic_op(fiducial_image.to(self.device), theta)
+        corrupted_fiducial_real = torch.stack(
+            [corrupted_fiducial_kspace.real, corrupted_fiducial_kspace.imag],
+            dim=1,
+        ).squeeze(2)
+
+        pred = self.generator_model(
+            corrupted_input,
+            corrupted_fiducial=corrupted_fiducial_real,
+        )
+
+        target_real = torch.cat([target_complex.real, target_complex.imag], dim=1)
+        mse = torch.nn.functional.mse_loss(pred, target_real)
+        return pred, target_real, -10.0 * torch.log10(mse + 1e-10)
+
     def validation_step(
         self,
         input_batch: torch.Tensor,
@@ -293,8 +342,6 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
 
             # Compute image quality metric (PSNR) for early stopping
             # Lightweight forward pass mirroring _compute_losses_impl
-            from spectramr.infrastructure.physics.fft_ops import ifft2c
-
             if not torch.is_complex(target):
                 C = target.shape[1]
                 if C % 2 == 0:
@@ -309,39 +356,17 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
             # target rendered as a k-space blob.
             target_complex = self._ensure_image_domain_target(target_complex)
 
-            B = target.shape[0]
-            theta = self.kinematic_op.generate_random_motion(
-                batch_size=B,
-                max_translation=self._max_translation,
-                max_rotation=self._max_rotation,
-                motion_type=self._motion_type,
-                device=self.device,
-            )
-            corrupted_kspace = self.kinematic_op(target_complex, theta)
-            corrupted_image = ifft2c(corrupted_kspace)
-            corrupted_input = torch.cat([corrupted_image.real, corrupted_image.imag], dim=1)
-
-            fiducial_image = self.fiducial(batch_size=B)
-            corrupted_fiducial_kspace = self.kinematic_op(fiducial_image.to(self.device), theta)
-            corrupted_fiducial_real = torch.stack(
-                [corrupted_fiducial_kspace.real, corrupted_fiducial_kspace.imag],
-                dim=1,
-            ).squeeze(2)
-
-            pred = self.generator_model(
-                corrupted_input,
-                corrupted_fiducial=corrupted_fiducial_real,
-            )
-
-            # target_complex is image-domain after the step-2b conversion above.
-            target_image = target_complex
-            target_real = torch.cat([target_image.real, target_image.imag], dim=1)
-
-            mse = torch.nn.functional.mse_loss(pred, target_real)
-            psnr = -10.0 * torch.log10(mse + 1e-10)
+            pred, target_real, psnr = self._corrupt_and_score(target_complex, 1.0)
+            heldout_psnr = {
+                f"val_psnr_heldout_x{scale:g}": float(
+                    self._corrupt_and_score(target_complex, scale)[2]
+                )
+                for scale in self._heldout_motion_scales()
+            }
 
         result = {k: float(v) for k, v in losses.items() if isinstance(v, torch.Tensor)}
         result["val_psnr"] = float(psnr)
+        result.update(heldout_psnr)
 
         # Emit YAML-configured ``validation.metrics`` so early-stopping /
         # best-metric monitors (val_robust_mri_psnr, val_hfen, …) resolve;

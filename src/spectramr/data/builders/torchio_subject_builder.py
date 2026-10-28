@@ -51,6 +51,10 @@ import torch
 import torchio as tio
 
 from spectramr.data.metadata.physics_registry import get_physics_vector
+from spectramr.data.transforms.image_domain_crop import (
+    crop_or_pad_kspace_in_image_domain,
+    validate_image_size,
+)
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 
 logger = logging.getLogger(__name__)
@@ -205,6 +209,7 @@ class FastMRISubjectBuilder(SubjectBuilder):
         num_virtual_coils: int = 4,
         svd_calibration_lines: int | None = None,
         coil_processing=None,
+        image_domain_crop_or_pad: tuple[int, int] | None = None,
     ):
         """Initialize with IO strategies.
 
@@ -218,6 +223,9 @@ class FastMRISubjectBuilder(SubjectBuilder):
                 - "rss": RSS coil combination to (2, H, W, D) real
                 - "svd": Compress into virtual coils
             num_virtual_coils: Number of virtual coils when mode="svd"
+            image_domain_crop_or_pad: When set, the ``(height, width)`` the complex
+                k-space is resized to through its image, before coil processing
+                (``data.processing.image_domain_crop_or_pad``).
             normalize_kspace: Whether to normalize k-space data by magnitude percentile
             kspace_percentile: Percentile for normalization (default 0.99 to avoid DC spike)
             log_scaling: Apply phase-preserving log1p magnitude compression after the
@@ -235,6 +243,11 @@ class FastMRISubjectBuilder(SubjectBuilder):
         # pipeline runs; legacy combinations fall through to the byte-parity
         # mode-based branches below. None → pure legacy coil_processing_mode path.
         self.coil_processing = coil_processing
+        self.image_domain_crop_or_pad = (
+            validate_image_size(image_domain_crop_or_pad)
+            if image_domain_crop_or_pad is not None
+            else None
+        )
 
     def _is_nifti_strategy(self, io_strategy, path: str = "") -> bool:
         """Check if strategy is NIfTI-based."""
@@ -323,6 +336,23 @@ class FastMRISubjectBuilder(SubjectBuilder):
             return out
         # magnitude
         return combined.abs().float() if torch.is_complex(combined) else combined.float()
+
+    def _crop_or_pad_primary(
+        self, tensor: torch.Tensor, is_kspace: bool, sensitivity: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Resize the complex k-space through its image; refuse what cannot follow."""
+        if not is_kspace:
+            raise ValueError(
+                "data.processing.image_domain_crop_or_pad resizes raw k-space, but "
+                "this record served an image. Drop the knob or serve k-space."
+            )
+        if sensitivity is not None:
+            raise ValueError(
+                "data.processing.image_domain_crop_or_pad would leave the loaded "
+                "sensitivity maps on the uncropped grid. Disable sensitivity loading "
+                "or resize the maps upstream."
+            )
+        return crop_or_pad_kspace_in_image_domain(tensor, self.image_domain_crop_or_pad)
 
     def _apply_coil_processing(
         self,
@@ -625,6 +655,9 @@ class FastMRISubjectBuilder(SubjectBuilder):
             except Exception as e:
                 logger.debug(f"Failed to load sensitivity maps: {e}")
 
+        if self.image_domain_crop_or_pad is not None:
+            primary_tensor = self._crop_or_pad_primary(primary_tensor, is_kspace, sensitivity)
+
         # Apply coil processing at load time (critical for TorchIO sampling)
         logger.debug(
             f"[BUILD] Before coil processing: is_kspace={is_kspace}, shape={primary_tensor.shape}"
@@ -656,6 +689,15 @@ class FastMRISubjectBuilder(SubjectBuilder):
             subject_dict["kspace"] = tio.ScalarImage(tensor=primary_tensor, affine=affine)
             # Add input alias
             subject_dict["input"] = subject_dict["image"]
+
+        if self.image_domain_crop_or_pad is not None and any(
+            key in primary_data for key in ("mask", "sampling_mask", "acceleration_mask")
+        ):
+            raise ValueError(
+                f"{record.get('primary_path')} carries a stored sampling mask, which "
+                "indexes the uncropped k-space grid and cannot follow an image-domain "
+                "crop. Point image_domain_crop_or_pad arms at fully sampled data."
+            )
 
         # [FIX] Propagate Mask if available (Critical for validation consistency)
         # Check both top-level and physics dict

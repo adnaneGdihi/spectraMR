@@ -21,10 +21,15 @@ repos:
       - id: detect-private-key
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.10.0
+    rev: v1.13.0
     hooks:
       - id: mypy
         files: ^src/spectramr/(core|config|domain)/
+        # The hook env has no torch, so with the default follow_imports every import that
+        # leaves these three packages drags models/ in and reports its torch.nn.Module
+        # subclasses as errors, in files the commit never touched (#2706). `silent` still
+        # checks the files this hook is given and stops reporting inside what they import.
+        args: [--ignore-missing-imports, --scripts-are-modules, --follow-imports=silent]
         additional_dependencies: [pydantic>=2.6, types-PyYAML]
 
   - repo: https://github.com/codespell-project/codespell
@@ -41,6 +46,10 @@ repos:
         # must spell as the registry does -- same reason as `te` above.
         # `nce` is Noise-Contrastive Estimation: it appears only as a LaTeX
         # subscript in the InfoNCE loss formulas on losses_reference.rst.
+        # `reson` is the journal abbreviation in `Magn. Reson. Med.`, cited in
+        # experiments/inprogress/n2n/PAPER.md's IEEE references.
+        # `nmae` is normalized mean absolute error, a registered metric name the
+        # settings module spells as the registry does.
         # `strat` is a real identifier in two independent places, not a
         # misspelling of "start"/"strata":
         #   - a local abbreviation for `strategy_class`
@@ -52,7 +61,8 @@ repos:
         #     the 30 files issue #1918 touched alone).
         # `gool` is Luc Van Gool, a co-author on the SwinIR paper every arm
         # citing that backbone names; codespell reads the surname as "ghoul".
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat,gool"]
+        # `lamda` is sigpy's own `SenseRecon` keyword (`lambda` is reserved).
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat,gool,reson,nmae,notin,lamda"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint
@@ -93,6 +103,13 @@ repos:
         entry: python scripts/ci/check_no_stale_package_name.py
         language: python
         additional_dependencies: [pytest]
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: scratch-untracked
+        name: nothing tracked under scratch/
+        entry: python scripts/ci/check_scratch_untracked.py
+        language: python
         always_run: true
         pass_filenames: false
         stages: [pre-commit]

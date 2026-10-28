@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (  # noqa: E402
+from spectramr.infrastructure.physics.degradations import (  # noqa: E402
     DEGRADATION_REGISTRY,
     apply_degradation,
     degrade_concomitant_phase,
@@ -89,13 +89,12 @@ class TestWave1_Cleanup:
         # Legacy behaviour: prior is [1, 1, H, W].
         assert prior.shape[1] == 1
 
-    def test_delegated_callables_compiled_once(self) -> None:
-        """Mod6: the dispatch table is a single dict, not a per-call closure."""
-        from spectramr.infrastructure.physics import digital_twin_extensions as ext
+    def test_delegated_callables_bound_on_the_spec(self) -> None:
+        """Mod6: each delegate kernel is bound once as its spec's ``fn``."""
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
-        assert hasattr(ext, "_DELEGATED_FNS")
-        assert "b0" in ext._DELEGATED_FNS
-        assert "gradient_nonlinearity" in ext._DELEGATED_FNS  # Mod7
+        for name in ("b0", "gradient_nonlinearity"):  # Mod7
+            assert callable(DEGRADATION_REGISTRY[name].fn)
 
     def test_kwargs_forwarded_through_delegated(self) -> None:
         """Min5: caller-supplied kwargs reach the underlying simulator."""
@@ -398,18 +397,31 @@ class TestWave5_ArchitecturalFlags:
         assert sim.embedder.per_channel_marker_prior is True
 
     def test_coherent_3d_motion_shares_trajectory_across_slices(self) -> None:
-        """Mod4: 5-D input with coherent_3d_motion uses one trajectory per subject."""
-        sim_coh = DigitalTwinSimulator(
-            im_size=(16, 16), motion_type="random_shot",
-            enable_motion=True, enable_b0=False, enable_b1=False,
-            snr_range=(100.0, 100.0),
-            coherent_3d_motion=True,
+        """Mod4: a canonical (B, C, D, H, W) multislice stack gets one trajectory per subject."""
+        from spectramr.infrastructure.physics.degradations.geometry import (
+            AcquisitionGeometry,
+            AcquisitionMode,
         )
-        # 5-D input: B=1, C=1, H=16, W=16, D=4.
-        x5 = _phantom(16, 16).unsqueeze(-1).expand(1, 1, 16, 16, 4).contiguous()
-        torch.manual_seed(0)
-        out, _, _ = sim_coh(x5)
-        # Simulator un-folds the depth dim, preserving 5-D shape.
-        assert torch.isfinite(out.real).all()
-        assert torch.isfinite(out.imag).all()
+
+        ms = AcquisitionGeometry(mode=AcquisitionMode.MULTISLICE_2D, voxel_mm=None)
+        kw = {
+            "im_size": (16, 16), "motion_type": "random_shot",
+            "enable_motion": True, "enable_b0": False, "enable_b1": False,
+            "snr_range": (100.0, 100.0),
+        }
+        # Identical slices along D (dim -3): coherent motion keeps them identical.
+        x5 = _phantom(16, 16).unsqueeze(2).expand(1, 1, 4, 16, 16).contiguous()
+        out, _, _ = DigitalTwinSimulator(coherent_3d_motion=True, **kw)(x5, seed=0, geometry=ms)
         assert out.shape == x5.shape
+        assert torch.isfinite(out.real).all() and torch.isfinite(out.imag).all()
+        for d in range(1, 4):
+            assert torch.allclose(out[:, :, d], out[:, :, 0], atol=1e-3)
+        indep, _, _ = DigitalTwinSimulator(coherent_3d_motion=False, **kw)(x5, seed=0, geometry=ms)
+        assert not torch.allclose(indep[:, :, 1], indep[:, :, 0], atol=1e-3)
+
+    def test_depth_last_5d_without_a_mode_is_refused(self) -> None:
+        """The old (B, C, H, W, D) fold is gone: 5-D needs a declared acquisition mode."""
+        sim = DigitalTwinSimulator(im_size=(16, 16), enable_b0=False, enable_b1=False)
+        x5 = _phantom(16, 16).unsqueeze(-1).expand(1, 1, 16, 16, 4).contiguous()
+        with pytest.raises(ValueError, match="AcquisitionMode"):
+            sim(x5)

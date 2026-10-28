@@ -332,3 +332,52 @@ def test_dry_run_reports_the_filtered_count_and_destination(tmp_path, monkeypatc
     assert "Would index 3 files" in out
     assert "m4raw_train_nex3.json" in out
     assert not (tmp_path / "data/manifests").exists()
+
+
+# ── fastMRI acquisition -> contrast ───────────────────────────────────
+#
+# fastMRI filenames carry no contrast token; the protocol lives only in the
+# ``acquisition`` attribute, so a contrast-conditioned arm depends on the builder
+# copying it onto the record the dataset reads.
+
+
+def test_fastmri_acquisition_reaches_the_loader_as_contrast(tmp_path):
+    from spectramr.data.datasets.universal_dataset import parse_fastmri_index
+
+    h5py = pytest.importorskip("h5py")
+    data_root = tmp_path / "databases/fastmri/multicoil_train"
+    data_root.mkdir(parents=True)
+    for stem, acquisition in (("file_brain_AXT2_1", b"AXT2"), ("file_brain_2", "AXFLAIR")):
+        with h5py.File(data_root / f"{stem}.h5", "w") as f:
+            f.create_dataset("kspace", data=np.zeros((2, 4, 16, 8), dtype=np.complex64))
+            f.attrs["acquisition"] = acquisition
+    with h5py.File(data_root / "file_no_attr.h5", "w") as f:
+        f.create_dataset("kspace", data=np.zeros((2, 16, 8), dtype=np.complex64))
+    out = tmp_path / "manifest.json"
+
+    RCM.create_manifest(data_root, tmp_path / "databases", "*.h5", out, "h5")
+
+    records = parse_fastmri_index(str(out), data_root=str(data_root))
+    contrasts = {r["file_id"]: r.get("contrast") for r in records}
+    assert contrasts == {"file_brain_AXT2_1": "AXT2", "file_brain_2": "AXFLAIR", "file_no_attr": None}
+
+
+def test_fastmri_patient_id_reaches_the_record(tmp_path):
+    """split_manifest.py keeps a patient's volumes on one side by this key."""
+    h5py = pytest.importorskip("h5py")
+    data_root = tmp_path / "databases/fastmri/multicoil_train"
+    data_root.mkdir(parents=True)
+    for stem, patient in (("file_brain_1", b"abc123"), ("file_brain_2", None)):
+        with h5py.File(data_root / f"{stem}.h5", "w") as f:
+            f.create_dataset("kspace", data=np.zeros((2, 4, 16, 8), dtype=np.complex64))
+            if patient is not None:
+                f.attrs["patient_id"] = patient
+    out = tmp_path / "manifest.json"
+
+    RCM.create_manifest(data_root, tmp_path / "databases", "*.h5", out, "h5")
+
+    records = json.loads(out.read_text())["records"]
+    assert {r["file_id"]: r.get("patient_id") for r in records} == {
+        "file_brain_1": "abc123",
+        "file_brain_2": None,
+    }

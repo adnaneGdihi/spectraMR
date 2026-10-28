@@ -90,3 +90,29 @@ def test_shape_mismatch_raises(metric_fn):
     b = np.zeros((64, 64), dtype=np.float32)
     with pytest.raises(ValueError, match="shape mismatch"):
         metric_fn(a, b)
+
+
+@pytest.mark.unit
+def test_fsim_ranks_a_degraded_image_below_the_clean_one():
+    """FSIM used to call `sewar.fsim`, which no released sewar provides (#2499)."""
+    rng = np.random.default_rng(4)
+    img = rng.random((48, 48)).astype(np.float32)
+    noisy = np.clip(img + rng.normal(0, 0.2, img.shape), 0, 1).astype(np.float32)
+    assert feature_similarity_index(img, img) == pytest.approx(1.0, abs=1e-4)
+    assert feature_similarity_index(noisy, img) < feature_similarity_index(img, img)
+
+
+@pytest.mark.unit
+def test_each_package_is_guarded_on_its_own():
+    from spectramr.infrastructure.reporting.metrics import vif_fsim
+
+    assert isinstance(vif_fsim.HAVE_SEWAR, bool) and isinstance(vif_fsim.HAVE_PIQ, bool)
+
+@pytest.mark.unit
+def test_fsim_sees_errors_in_negative_valued_images():
+    """Clipping to [0, data_range] hid every error below zero in z-scored images."""
+    rng = np.random.default_rng(5)
+    target = rng.normal(0, 1, (48, 48)).astype(np.float32)
+    pred = target.copy()
+    pred[pred < 0] = -3.0
+    assert feature_similarity_index(pred, target) < 0.999

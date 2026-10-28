@@ -32,7 +32,7 @@ References
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -56,6 +56,8 @@ class HSSCStrategy(BaseTrainingStrategy):
     * Hard data-consistency clamp ``where(mask, k_obs, k_hat)``
     * Composite loss = complex k-space MSE + α · image-domain (1 − SSIM)
     """
+
+    forwards_loss_components: ClassVar[bool] = True
 
     def __init__(self, env=None, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)

@@ -161,44 +161,25 @@ register("qc_group_strip", group_strip.make)
 register("qc_subject_mosaic", subject_mosaic.make)
 register("qc_carpet", carpet_spike.make)
 
-# Certificate / learnable-acquisition figures. These modules expose
-# ``render_*(out_path, *, ...)`` rather than the ``make(df, out_path)`` registry
-# contract, so they are wrapped in soft-skipping adapters here. They render when
-# their certificate / result / arms payload is routed (via report_artifacts/ or an
-# explicit caller kwarg), and soft-skip like any data-less plotter otherwise — so
-# they can join the "plot all" default without breaking data-less runs.
-from . import (  # noqa: E402
-    certificate_summary,
-    ksd_certificate,
-    learnable_acquisition_pareto,
-)
+# Per-slice distribution, bivariate, embedding and background figures.
+from .distributions import FIGURES as _SLICE_FIGURES  # noqa: E402
 
+for _fig_id, _make in _SLICE_FIGURES.items():
+    register(_fig_id, _make)
 
-def _adapt_certificate_summary(df, out_path, *, certificate_paths=None, metadata=None, **_):
-    if not certificate_paths:
-        return None
-    return certificate_summary.render_certificate_summary(
-        out_path, metadata=metadata, **certificate_paths
-    )
+# Figures read from a run's checkpoints and saved validation images.
+from .images import FIGURES as _IMAGE_FIGURES  # noqa: E402
+from .weights import FIGURES as _WEIGHT_FIGURES  # noqa: E402
 
+for _fig_id, _make in {**_WEIGHT_FIGURES, **_IMAGE_FIGURES}.items():
+    register(_fig_id, _make)
 
-def _adapt_ksd_certificate(df, out_path, *, ksd_result=None, metadata=None, **_):
-    if ksd_result is None:
-        return None
-    return ksd_certificate.render_ksd_certificate(out_path, result=ksd_result, metadata=metadata)
+# Figures whose callable is not ``make(df, out_path, **kw)``: certificates,
+# learnable acquisition and the cross-run plotters (see ``_adapters``).
+from ._adapters import ADAPTERS  # noqa: E402
 
-
-def _adapt_learnable_acquisition_pareto(df, out_path, *, acquisition_arms=None, **_):
-    if not acquisition_arms:
-        return None
-    return learnable_acquisition_pareto.render_learnable_acquisition_pareto(
-        out_path, acquisition_arms
-    )
-
-
-register("certificate_summary", _adapt_certificate_summary)
-register("ksd_certificate", _adapt_ksd_certificate)
-register("learnable_acquisition_pareto", _adapt_learnable_acquisition_pareto)
+for _fig_id, _adapter in ADAPTERS.items():
+    register(_fig_id, _adapter)
 
 
 def _accepts(fn: PlotterFn, name: str) -> bool:

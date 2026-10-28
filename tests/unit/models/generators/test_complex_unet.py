@@ -709,3 +709,268 @@ class TestTimestepNormalization:
             model(x, torch.tensor([2, 2]))
         occurrences = sum("No max_timesteps supplied" in r.message for r in caplog.records)
         assert occurrences == 1
+
+    def test_zero_timesteps_need_no_horizon_and_do_not_warn(self, caplog):
+        """The reconstruction seam's constant t=0 scales to 0 under any horizon."""
+        model, x = self._model(), torch.randn(2, 8, 32, 32)
+        with caplog.at_level("WARNING"):
+            model(x, torch.zeros(2))
+        assert not any("No max_timesteps supplied" in r.message for r in caplog.records)
+
+
+def test_each_scale_reaches_the_sinusoid_that_owns_its_codes():
+    """The default divides by ``max_timesteps`` and ``integer`` keeps the step, both
+    in the private sinusoid; ``horizon_band`` reaches the canonical owner with its
+    step and horizon (#2315)."""
+    from unittest import mock
+
+    import spectramr.models.generators.complex_unet as cu
+
+    private_seen, shared_seen = [], []
+    real_private, real_shared = ComplexUNet._get_sinusoidal_embedding, cu.sinusoidal_timestep_embedding
+
+    def spy_private(self, t, dim):
+        private_seen.append(float(t.flatten()[0]))
+        return real_private(self, t, dim)
+
+    def spy_shared(t, dim, *, max_timesteps=None, scale="unit_interval"):
+        shared_seen.append((float(t.flatten()[0]), max_timesteps, scale))
+        return real_shared(t, dim, max_timesteps=max_timesteps, scale=scale)
+
+    model = ComplexUNet(in_channels=4, out_channels=4, features=(16, 32), img_size=(32, 32)).eval()
+    x = torch.randn(1, 4, 32, 32)
+    with (
+        mock.patch.object(ComplexUNet, "_get_sinusoidal_embedding", spy_private),
+        mock.patch.object(cu, "sinusoidal_timestep_embedding", spy_shared),
+        torch.no_grad(),
+    ):
+        model(x, timesteps=torch.tensor([3]), max_timesteps=29.0)
+        model(x, timesteps=torch.tensor([3]), max_timesteps=29.0, timestep_scale="integer")
+        model(x, timesteps=torch.tensor([3]), max_timesteps=29.0, timestep_scale="horizon_band")
+    assert private_seen == [pytest.approx(3 / 29), pytest.approx(3.0)]
+    assert shared_seen == [(3.0, 29.0, "horizon_band")]
+
+
+def test_integer_never_reaches_the_canonical_sinusoid():
+    """The two sinusoids differ by up to 1.9e-6; keeping ``integer`` off the
+    canonical owner is what keeps trained checkpoints on their exact codes."""
+    from unittest import mock
+
+    import spectramr.models.generators.complex_unet as cu
+
+    model = ComplexUNet(in_channels=4, out_channels=4, features=(16, 32), img_size=(32, 32)).eval()
+    with mock.patch.object(cu, "sinusoidal_timestep_embedding", side_effect=AssertionError), torch.no_grad():
+        model(torch.randn(1, 4, 32, 32), timesteps=torch.tensor([3]), max_timesteps=29.0, timestep_scale="integer")
+
+
+def test_horizon_band_without_a_horizon_raises_rather_than_assuming_one():
+    """The legacy form's stand-in horizon must not leak into a derived scale."""
+    model = ComplexUNet(in_channels=4, out_channels=4, features=(16, 32), img_size=(32, 32))
+    with pytest.raises(ValueError, match="needs max_timesteps"):
+        model(torch.randn(1, 4, 32, 32), timesteps=torch.tensor([3]), timestep_scale="horizon_band")
+
+
+def test_unknown_timestep_scale_raises():
+    model = ComplexUNet(in_channels=4, out_channels=4, features=(16, 32), img_size=(32, 32))
+    with pytest.raises(ValueError, match="timestep embedding scale"):
+        model(torch.randn(1, 4, 32, 32), timesteps=torch.tensor([3]), timestep_scale="log")
+
+
+class TestContrastEmbeddingBatch:
+    """Exactly one contrast row per sample: neither a truncated batch nor a broadcast row.
+
+    The pre-fix forward sliced ``contrast_emb[:B]``, so three contrast rows
+    against a batch of two conditioned both samples on whichever rows came
+    first and the run trained without complaint.
+    """
+
+    @staticmethod
+    def _model() -> ComplexUNet:
+        torch.manual_seed(0)
+        return ComplexUNet(
+            in_channels=8,
+            out_channels=8,
+            features=(8, 16),
+            img_size=(32, 32),
+            attention_type="none",
+        ).eval()
+
+    def test_contrast_batch_larger_than_timestep_batch_raises(self):
+        model, x = self._model(), torch.randn(2, 8, 32, 32)
+        contrast_emb = torch.randn(3, model.time_embedding_dim)
+        with pytest.raises(ValueError, match="contrast_emb batch 3"), torch.no_grad():
+            model(x, torch.tensor([1, 2]), max_timesteps=29.0, contrast_emb=contrast_emb)
+
+    def test_a_single_broadcast_row_raises(self):
+        model, x = self._model(), torch.randn(2, 8, 32, 32)
+        contrast_emb = torch.randn(1, model.time_embedding_dim)
+        with pytest.raises(ValueError, match="contrast_emb batch 1"), torch.no_grad():
+            model(x, torch.tensor([1, 2]), max_timesteps=29.0, contrast_emb=contrast_emb)
+
+    def test_per_sample_rows_pass(self):
+        model, x = self._model(), torch.randn(2, 8, 32, 32)
+        contrast_emb = torch.randn(2, model.time_embedding_dim)
+        with torch.no_grad():
+            out = model(x, torch.tensor([1, 2]), max_timesteps=29.0, contrast_emb=contrast_emb)
+        assert out.shape == x.shape
+
+
+# ── v2 conditioning: phase-preserving gains, a conditioned bottleneck, contrast everywhere
+def _conditioned_model() -> ComplexUNet:
+    """A tiny ComplexUNet whose zero-initialised gains carry trained-like weights."""
+    from spectramr.models.blocks.complex_channel_gain import ComplexChannelGain
+
+    torch.manual_seed(0)
+    model = ComplexUNet(
+        in_channels=4, out_channels=4, features=(8, 16), img_size=(32, 32),
+        attention_type="none", time_embedding_dim=32,
+    ).eval()
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, ComplexChannelGain):
+                module.proj[1].weight.normal_(std=0.5)
+                module.proj[1].bias.normal_(std=0.5)
+    return model
+
+
+class TestConditioning:
+    def test_every_block_gain_is_per_complex_channel(self):
+        from spectramr.models.blocks.complex_channel_gain import ComplexChannelGain
+
+        model = _conditioned_model()
+        gains = [m for m in model.modules() if isinstance(m, ComplexChannelGain)]
+        assert len(gains) == len(model.downs) + len(model.ups) + 1
+        assert all(g.interleaved and g.gains * 2 == g.channels for g in gains)
+
+    def test_the_bottleneck_is_time_conditioned(self):
+        model = _conditioned_model()
+        fired: list[bool] = []
+        model.bottleneck_gain.register_forward_hook(lambda m, i, o: fired.append(i[1] is not None))
+        x = torch.randn(1, 4, 32, 32)
+        with torch.no_grad():
+            model(x, torch.tensor([1]), max_timesteps=29.0)
+        assert fired == [True]
+
+    def test_the_encoder_receives_the_contrast(self):
+        """Spy on the first down block: its embedding is time + contrast."""
+        model = _conditioned_model()
+        seen: list[torch.Tensor] = []
+        model.downs[0].register_forward_hook(lambda m, i, o: seen.append(o[1]))
+        x, t = torch.randn(2, 4, 32, 32), torch.tensor([3, 3])
+        with torch.no_grad():
+            model(x, t, max_timesteps=29.0, contrast_emb=torch.zeros(2, 32))
+            model(x, t, max_timesteps=29.0, contrast_emb=torch.randn(2, 32))
+        assert not torch.allclose(seen[0], seen[1]), "the encoder is still contrast-blind"
+
+    def test_the_backbone_is_phase_equivariant_with_time_conditioning(self):
+        """The retired per-real-channel FiLM rotated phase as a function of t; the
+        complex gain commutes with ``e^{i theta}`` at any t."""
+        model = _conditioned_model()
+        rotate = TestPhaseEquivariance._rotate
+        x, t = torch.randn(1, 4, 32, 32), torch.tensor([11])
+        with torch.no_grad():
+            baseline = model(x, t, max_timesteps=29.0)
+            rotated = model(rotate(x, 0.7), t, max_timesteps=29.0)
+        deviation = (rotated - rotate(baseline, 0.7)).abs().max() / baseline.abs().max()
+        assert float(deviation) < 1e-4
+
+
+def test_zero_kspace_in_zero_out_for_any_timestep():
+    """A bias-free k-space net maps 0 to 0; any constant it adds is a delta at the image centre."""
+    torch.manual_seed(0)
+    net = ComplexUNet(
+        in_channels=16,
+        out_channels=8,
+        features=(4, 8, 16),
+        time_embedding_dim=16,
+        kspace_feature_norm="rms",
+        max_timesteps=29,
+    ).eval()
+    for p in net.parameters():
+        if p.requires_grad and not p.any():
+            p.data.normal_(0, 0.1)
+    with torch.no_grad():
+        out = net(torch.zeros(2, 16, 32, 32), torch.tensor([3, 17]), timestep_scale="integer")
+    assert out.abs().max() == 0
+
+
+def _geometry_net(planes: int = 6) -> ComplexUNet:
+    torch.manual_seed(0)
+    net = ComplexUNet(
+        in_channels=16,
+        out_channels=8,
+        features=(4, 8, 16),
+        time_embedding_dim=16,
+        kspace_feature_norm="rms",
+        max_timesteps=29,
+        kspace_geometry_gain_planes=planes,
+    ).eval()
+    for p in net.parameters():
+        if p.requires_grad and not p.any():
+            p.data.normal_(0, 0.1)
+    return net
+
+
+def test_geometry_planes_add_no_kspace_term():
+    """As input channels the planes made zero k-space map to a centre dot; as a gain they cannot."""
+    net = _geometry_net()
+    geometry = torch.rand(2, 6, 32, 32) + 0.5
+    with torch.no_grad():
+        out = net(
+            torch.zeros(2, 16, 32, 32),
+            torch.tensor([3, 17]),
+            timestep_scale="integer",
+            geometry=geometry,
+        )
+    assert out.abs().max() == 0
+
+
+def test_geometry_planes_as_input_channels_do_add_a_kspace_term():
+    """Control for the test above: the concatenated planes are the measurement-independent term."""
+    torch.manual_seed(0)
+    net = ComplexUNet(
+        in_channels=16 + 12,
+        out_channels=8,
+        features=(4, 8, 16),
+        time_embedding_dim=16,
+        kspace_feature_norm="rms",
+        max_timesteps=29,
+    ).eval()
+    for p in net.parameters():
+        if p.requires_grad and not p.any():
+            p.data.normal_(0, 0.1)
+    planes = torch.rand(2, 6, 32, 32) + 0.5
+    as_channels = torch.stack([planes, torch.zeros_like(planes)], dim=2).flatten(1, 2)
+    x = torch.cat([torch.zeros(2, 16, 32, 32), as_channels], dim=1)
+    with torch.no_grad():
+        out = net(x, torch.tensor([3, 17]), timestep_scale="integer")
+    assert out.abs().max() > 0
+
+
+def test_geometry_gain_reaches_the_output():
+    net = _geometry_net()
+    x, t = torch.randn(1, 16, 32, 32), torch.tensor([5])
+    with torch.no_grad():
+        a = net(x, t, timestep_scale="integer", geometry=torch.zeros(1, 6, 32, 32))
+        b = net(x, t, timestep_scale="integer", geometry=torch.ones(1, 6, 32, 32))
+    assert (a - b).abs().max() > 0
+
+
+def test_geometry_without_the_gain_and_the_reverse_raise():
+    x, t = torch.randn(1, 16, 32, 32), torch.tensor([5])
+    with pytest.raises(ValueError, match="must come together"):
+        _geometry_net()(x, t, timestep_scale="integer")
+    plain = ComplexUNet(in_channels=16, out_channels=8, features=(4, 8, 16), time_embedding_dim=16)
+    with pytest.raises(ValueError, match="must come together"):
+        plain(x, t, timestep_scale="integer", geometry=torch.ones(1, 6, 32, 32))
+
+
+def test_geometry_gain_refuses_an_image_domain_unet():
+    with pytest.raises(ValueError, match="feature_domain='kspace'"):
+        ComplexUNet(
+            in_channels=16,
+            out_channels=8,
+            features=(4, 8, 16),
+            feature_domain="image",
+            kspace_geometry_gain_planes=6,
+        )

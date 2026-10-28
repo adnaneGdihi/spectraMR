@@ -224,6 +224,34 @@ def test_loss_domain_consistency_error_when_kspace_loss_in_image_config() -> Non
     assert "kspace_losses" in " ".join(failures[0].yaml_keys)
 
 
+@pytest.mark.parametrize(
+    ("target", "names", "bridged"),
+    [
+        ("alternate_repetition", ["masked_kspace_l2"], True),
+        ("measured", ["masked_kspace_l2"], False),
+        ("alternate_repetition", ["kspace_l1_sparsity"], False),
+        ("alternate_repetition", ["masked_kspace_l2", "kspace_l1_sparsity"], False),
+    ],
+    ids=["ei-anchor", "anchor-on-y", "other-loss", "extra-loss"],
+)
+def test_the_ei_anchor_bridges_only_its_own_kspace_loss(
+    target: str, names: list[str], bridged: bool
+) -> None:
+    """supervised_bound_mc: the EI anchor scores F S x_hat with masked_kspace_l2.
+
+    Any other target, or any other k-space loss, is never called by the strategy
+    and is still the unbridged combination the check exists for.
+    """
+    cfg = _losses_cfg(
+        "image", kspace=[types.SimpleNamespace(name=n, weight=1.0, enabled=True) for n in names]
+    )
+    cfg.training = types.SimpleNamespace(
+        equivariant_imaging=types.SimpleNamespace(measurement_target=target)
+    )
+    results = ConfigHealthChecker().check_loss_domain_consistency(cfg)
+    assert all(r.passed for r in results) is bridged
+
+
 # ── VF-smoke-2026-05-25: complex_image output domain bridging ───────────
 #
 # LossBuilder._build_list_based_losses accepts ``complex_image`` (raises on
@@ -886,6 +914,29 @@ def test_output_dir_check_warns_on_nonstandard_prefix() -> None:
     res = ConfigHealthChecker().check_output_dir_convention(cfg)
     assert not res.passed
     assert res.severity == "warning"
+    assert res.category == "output_dir_nonstandard"
+
+
+def test_output_dir_check_passes_absolute_path_under_results_root() -> None:
+    """The campaign orchestrator resolves its base dir, so its runs carry an absolute path."""
+    cfg = _output_dir_cfg("/project/x/repo/experiments/results/campaigns/c/arm")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert res.passed, res.message
+
+
+def test_output_dir_check_errors_on_absolute_deprecated_prefix() -> None:
+    """PLANTED: absolute spelling must not launder a deprecated prefix."""
+    cfg = _output_dir_cfg("/project/x/experiments/results/linear_configs/experiment_42")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert not res.passed
+    assert res.category == "output_dir_deprecated"
+
+
+def test_output_dir_check_warns_on_absolute_path_without_a_name() -> None:
+    """PLANTED: the results root itself names no experiment."""
+    cfg = _output_dir_cfg("/project/x/experiments/results")
+    res = ConfigHealthChecker().check_output_dir_convention(cfg)
+    assert not res.passed
     assert res.category == "output_dir_nonstandard"
 
 
@@ -1646,14 +1697,12 @@ class TestMambaSsmAuditHook:
 def _identity_cfg(
     *,
     output_dir: Any = None,
-    checkpoint_dir: Any = None,
     sinks_dir: Any = None,
     metrics_dir: Any = None,
 ) -> Any:
-    """The four identity paths a stub can express, each independently settable."""
+    """The three identity paths a stub can express, each independently settable."""
     return types.SimpleNamespace(
         training=types.SimpleNamespace(output_dir=output_dir),
-        checkpoint=types.SimpleNamespace(checkpoint_dir=checkpoint_dir),
         logging=types.SimpleNamespace(sinks=types.SimpleNamespace(dir=sinks_dir)),
         metrics=types.SimpleNamespace(output_dir=metrics_dir),
     )
@@ -1664,7 +1713,6 @@ def test_identity_paths_that_agree_pass() -> None:
     red assertion below and still be worthless."""
     cfg = _identity_cfg(
         output_dir="experiments/results/arm_alpha",
-        checkpoint_dir="experiments/results/arm_alpha/checkpoints",
         sinks_dir="experiments/results/arm_alpha/logs",
         metrics_dir="experiments/results/arm_alpha/metrics",
     )
@@ -1674,22 +1722,33 @@ def test_identity_paths_that_agree_pass() -> None:
     assert "arm_alpha" in res.message
 
 
-def test_a_split_between_output_dir_and_the_checkpoint_tree_is_reported() -> None:
+def test_an_absolute_output_dir_is_compared_with_the_relative_trees() -> None:
+    """PLANTED: a campaign run redirects output_dir (absolute) but not metrics.output_dir."""
+    cfg = _identity_cfg(
+        output_dir="/project/x/experiments/results/campaigns/c/arm_alpha",
+        metrics_dir="experiments/results/arm_alpha/metrics",
+    )
+    res = ConfigHealthChecker().check_identity_paths_agree(cfg)
+    assert not res.passed
+    assert set(res.yaml_keys) == {"training.output_dir", "metrics.output_dir"}
+
+
+def test_a_split_between_output_dir_and_the_log_tree_is_reported() -> None:
     """The shape that motivates the check: two names, so two trees.
 
     This is ``conditioning/recon_field_conditioned_off_v1.yaml`` reduced -- an
     ``off`` control arm whose ``training.output_dir`` still names the ``on`` arm
-    it was copied from, while its checkpoints and logs name itself.
+    it was copied from, while its logs name itself.
     """
     cfg = _identity_cfg(
         output_dir="experiments/results/recon_field_conditioned_v1",
-        checkpoint_dir="experiments/results/recon_field_conditioned_off_v1/checkpoints",
+        sinks_dir="experiments/results/recon_field_conditioned_off_v1/logs",
     )
     res = ConfigHealthChecker().check_identity_paths_agree(cfg)
     assert not res.passed
     assert res.severity == "warning"
     assert res.category == "identity_paths_disagree"
-    assert set(res.yaml_keys) == {"training.output_dir", "checkpoint.checkpoint_dir"}
+    assert set(res.yaml_keys) == {"training.output_dir", "logging.sinks.dir"}
     assert "recon_field_conditioned_v1" in res.message
     assert "recon_field_conditioned_off_v1" in res.message
     assert res.fix_hint is not None
@@ -1700,7 +1759,7 @@ def test_a_third_disagreeing_path_is_counted_and_named() -> None:
     and which key put the arm in each, or the reader cannot tell which is wrong."""
     cfg = _identity_cfg(
         output_dir="experiments/results/arm_a",
-        checkpoint_dir="experiments/results/arm_b",
+        metrics_dir="experiments/results/arm_b",
         sinks_dir="experiments/results/arm_c",
     )
     res = ConfigHealthChecker().check_identity_paths_agree(cfg)
@@ -1708,61 +1767,36 @@ def test_a_third_disagreeing_path_is_counted_and_named() -> None:
     assert "3 different" in res.message
     assert set(res.yaml_keys) == {
         "training.output_dir",
-        "checkpoint.checkpoint_dir",
+        "metrics.output_dir",
         "logging.sinks.dir",
     }
 
 
-def test_the_split_is_seen_through_the_save_dir_alias(tmp_path: Any) -> None:
-    """Declared as ``save_dir``, compared as ``checkpoint_dir``.
+def test_checkpoints_are_not_an_identity_path() -> None:
+    """Checkpoints land in ``<training.output_dir>/checkpoints`` by construction (#2842).
 
-    ``checkpoint.checkpoint_dir`` carries ``validation_alias="save_dir"`` and is
-    the ONLY aliased field in the schema tree; 293 corpus arms spell it the alias
-    way. A check that parsed YAML would see ``save_dir`` and ``output_dir`` as
-    two unrelated keys and never compare them. This one reads the RESOLVED
-    settings object, so the fold has already happened -- which is also why the
-    reported key is the canonical spelling the run actually used, not the one the
-    arm typed.
+    No key can send them elsewhere, so there is nothing to disagree with
+    ``output_dir``. A stray ``checkpoint`` attribute on a stub naming another
+    experiment is not compared.
     """
-    import yaml as _yaml
+    from spectramr.infrastructure.validation.config_health_checker import IDENTITY_PATHS
 
-    from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
-    from spectramr.config.settings import TrainingSettings
-
-    doc = {
-        "config_version": CANONICAL_CONFIG_VERSION,
-        "data": {"train_path": "/tmp/t", "val_path": "/tmp/v"},
-        "optimization": {"learning_rate": 1e-4},
-        "logging": {},
-        "model": {"model_type": "unet"},
-        "training": {"output_dir": "experiments/results/arm_alpha"},
-        "checkpoint": {"save_dir": "experiments/results/arm_beta"},
-    }
-    path = tmp_path / "aliased_arm.yaml"
-    path.write_text(_yaml.dump(doc))
-    settings = TrainingSettings.from_yaml(str(path))
-
-    # The fold is what makes the comparison possible; assert it happened.
-    assert settings.checkpoint.checkpoint_dir == "experiments/results/arm_beta"
-
-    res = ConfigHealthChecker().check_identity_paths_agree(settings)
-    assert not res.passed
-    assert "checkpoint.checkpoint_dir" in res.yaml_keys
-    assert "arm_alpha" in res.message and "arm_beta" in res.message
+    assert not [p for p in IDENTITY_PATHS if p.startswith("checkpoint.")]
+    cfg = _identity_cfg(output_dir="experiments/results/arm_alpha")
+    cfg.checkpoint = types.SimpleNamespace(checkpoint_dir="experiments/results/arm_beta")
+    assert ConfigHealthChecker().check_identity_paths_agree(cfg).passed
 
 
-def test_a_cwd_relative_checkpoint_dir_is_out_of_scope() -> None:
+def test_a_cwd_relative_path_is_out_of_scope() -> None:
     """The noise control, and the reason this check is usable at all.
 
-    ``./checkpoints`` is the schema default and 252 of 660 inprogress arms
-    resolve to a CWD-relative checkpoint path. Comparing those against
-    ``experiments/results/<name>`` would fire on a third of the corpus, the check
-    would be baselined, and the 2 real splits would be lost in it. That is a
-    separate defect with its own issue, not this one.
+    Comparing CWD-relative paths against ``experiments/results/<name>`` would
+    fire on much of the corpus, the check would be baselined, and the real
+    splits would be lost in it. That is a separate defect with its own issue.
     """
     cfg = _identity_cfg(
         output_dir="experiments/results/arm_alpha",
-        checkpoint_dir="./checkpoints",
+        metrics_dir="./metrics",
     )
     res = ConfigHealthChecker().check_identity_paths_agree(cfg)
     assert res.passed
@@ -1791,7 +1825,7 @@ def test_an_arm_with_no_convention_path_reports_the_absence() -> None:
     ``check_output_dir_convention``'s finding, not this one's -- so the message
     says so rather than claiming agreement it never checked.
     """
-    cfg = _identity_cfg(output_dir="./training_output", checkpoint_dir="./checkpoints")
+    cfg = _identity_cfg(output_dir="./training_output", metrics_dir="./metrics")
     res = ConfigHealthChecker().check_identity_paths_agree(cfg)
     assert res.passed
     assert "no identity path" in res.message
@@ -1818,7 +1852,7 @@ def test_the_check_is_registered_in_run_all_checks(tmp_path: Any) -> None:
         "logging": {},
         "model": {"model_type": "unet"},
         "training": {"output_dir": "experiments/results/arm_alpha"},
-        "checkpoint": {"checkpoint_dir": "experiments/results/arm_beta"},
+        "metrics": {"output_dir": "experiments/results/arm_beta/metrics"},
     }
     path = tmp_path / "split_arm.yaml"
     path.write_text(_yaml.dump(doc))

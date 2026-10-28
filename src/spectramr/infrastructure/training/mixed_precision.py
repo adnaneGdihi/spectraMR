@@ -147,6 +147,16 @@ class MixedPrecisionIntegrationHelper:
             ).device
         self.device_type = torch.device(device).type
         self.enabled = config.enabled
+        if self.enabled and config.precision == "fp16" and config.enable_complex_support:
+            # fp16 autocast cannot run on complex tensors, so this combination
+            # used to run in fp32 while reporting AMP on, and its GradScaler
+            # turned the non-finite-loss raise into a silently skipped step (#2302).
+            raise AMPPrecisionUnsupportedError(
+                "optimization.precision.dtype='float16' on a complex-valued arm "
+                "(model.target_domain: kspace or physics.kspace.enable_kspace_recon). "
+                "fp16 autocast cannot run on complex tensors. Declare "
+                "precision.dtype: bfloat16 (sm_80+) or float32."
+            )
         if self.enabled:
             # Probed here rather than threaded in: this runs once per helper, not
             # per step, and the probe is a `get_device_capability` call plus a
@@ -233,11 +243,8 @@ class MixedPrecisionIntegrationHelper:
     def get_autocast_context(self) -> ContextManager:
         """Returns the appropriate autocast context manager.
 
-        For complex-valued MRI pipelines, fp16 autocast is fundamentally
-        incompatible because complex64 tensors cannot interact with Half-precision
-        model weights (PyTorch has no complex16 type). When complex support is
-        enabled with fp16, we disable autocast entirely to prevent
-        'Input type (complex<float>) and bias type (Half)' crashes.
+        Complex-valued arms autocast only in bf16: fp16 has no complex type, so
+        ``__init__`` rejects fp16 there rather than returning a disabled context.
         """
         from contextlib import nullcontext
 
@@ -249,12 +256,6 @@ class MixedPrecisionIntegrationHelper:
         # If complex support is disabled, use standard autocast (allows TF32 if globally enabled)
         if not self.config.enable_complex_support:
             return torch.amp.autocast(device_type=self.device_type, dtype=dtype, enabled=True)
-
-        # [FIX] Complex + fp16 is fundamentally broken: complex64 cannot mix
-        # with Half weights. Disable autocast entirely for fp16 complex flows.
-        # bfloat16 CAN work with complex on some hardware but is still risky.
-        if dtype == torch.float16:
-            return nullcontext()
 
         # Use our SafeComplexAutocast with proper device_type and TF32 disabled
         return SafeComplexAutocast(

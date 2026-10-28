@@ -1,4 +1,4 @@
-"""Unit tests for the digital_twin_extensions module (D1-D20 with deterministic seed).
+"""Unit tests for the degradations package (D1-D20 with deterministic seed).
 
 Pin two contracts that the meta-evaluation pipeline depends on:
 
@@ -9,16 +9,28 @@ Pin two contracts that the meta-evaluation pipeline depends on:
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (
+from spectramr.infrastructure.physics.degradations import (
     DEGRADATION_REGISTRY,
     apply_degradation,
     degrade_complex_gaussian_noise,
     degrade_radial_undersampling,
     degrade_susceptibility,
     list_degradations,
+)
+from spectramr.infrastructure.physics.degradations.registry_queries import (
+    requirement_free_degradations,
+    slice_capable_degradations,
+)
+
+# These harnesses feed a single-coil 2-D slice. Volume-only and multi-coil axes are covered by
+# their own mode-rejection and coil-stack tests under degradations/catalogue/.
+_SINGLE_COIL_SLICE_AXES = sorted(
+    set(slice_capable_degradations()) & set(requirement_free_degradations())
 )
 
 
@@ -94,7 +106,7 @@ class TestSeverityProgression:
 
 
 class TestShapePreservation:
-    @pytest.mark.parametrize("name", list(DEGRADATION_REGISTRY.keys()))
+    @pytest.mark.parametrize("name", _SINGLE_COIL_SLICE_AXES)
     def test_shape_preserved(self, name):
         x = _make_phantom(64, 64)
         out = apply_degradation(name, x, theta=0.5, seed=0)
@@ -163,20 +175,25 @@ class TestSpecificDegradations:
 
 import itertools  # noqa: E402
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (  # noqa: E402
+from spectramr.infrastructure.physics.degradations import (  # noqa: E402
     DECLARED_THETA_ZERO_PEDESTAL,
     KNOWN_COLLINEAR_PAIRS,
     MAGNITUDE,
     PHASE,
+    AcquisitionGeometry,
+    AcquisitionMode,
     affected_components,
     is_identity_at_theta_zero,
     is_known_collinear,
     is_phase_only,
     phase_only_degradations,
 )
+from spectramr.infrastructure.physics.degradations.declarations import (  # noqa: E402
+    DECLARED_PHYSICAL_FOV_MM,
+)
 from spectramr.infrastructure.physics.fft_ops import fft2c  # noqa: E402
 
-_ALL_AXES = sorted(DEGRADATION_REGISTRY)
+_ALL_AXES = _SINGLE_COIL_SLICE_AXES
 
 
 def _brain(H: int = 64, W: int = 64, textured: bool = True) -> torch.Tensor:
@@ -216,7 +233,13 @@ def _as_complex(t: torch.Tensor) -> torch.Tensor:
 
 
 def _mag(name: str, x: torch.Tensor, theta: float, seed: int = 0) -> torch.Tensor:
-    return _as_complex(apply_degradation(name, x, theta=theta, seed=seed)).abs()
+    # A declared FOV-dependent axis is measured on a phantom of its physical size.
+    fov, geometry = DECLARED_PHYSICAL_FOV_MM.get(name), None
+    if fov is not None:
+        voxel = (5.0, fov / x.shape[-2], fov / x.shape[-1])
+        geometry = AcquisitionGeometry(mode=AcquisitionMode.SLICE_2D, voxel_mm=voxel)
+    out = apply_degradation(name, x, theta=theta, seed=seed, geometry=geometry)
+    return _as_complex(out).abs()
 
 
 class TestCleanAnchor:
@@ -356,7 +379,7 @@ class TestPhaseOnlyRegistry:
         """Re-derive every ``affects`` flag from the operator itself.
 
         A declaration that nothing checks is exactly the facade this repo polices
-        (pitfall #16). If a degrader is retuned so it stops moving phase (or
+        (pitfall #16). If a degrader is re-tuned so it stops moving phase (or
         starts), this fails rather than letting the flag go stale.
         """
         H = W = 64
@@ -510,11 +533,10 @@ class TestAxisOrthogonality:
 
 
 def test_registry_count_matches_d1_d31_taxonomy() -> None:
-    """The module docstring advertises the ``D1-D31`` taxonomy; ``DEGRADATION_REGISTRY``
-    is the count SSOT (31 ops). Pinned exactly here (co-located drift guard) so a
+    """``DEGRADATION_REGISTRY`` is the count SSOT of the D-coded taxonomy. Pinned exactly here (co-located drift guard) so a
     docstring/count divergence — the stale ``D1-D20`` this replaced — fails at the
     module's own test, not only in the sim2rank canonical-counts guard."""
-    assert len(DEGRADATION_REGISTRY) == 31
+    assert len(DEGRADATION_REGISTRY) == 70
 
 
 def test_resolution_snr_is_distinct_from_pure_blur_and_pure_noise() -> None:
@@ -524,7 +546,7 @@ def test_resolution_snr_is_distinct_from_pure_blur_and_pure_noise() -> None:
     theta). This is the anti-facade check that the coupling actually fires."""
     import torch
 
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
+    from spectramr.infrastructure.physics.degradations import (
         degrade_complex_gaussian_noise,
         degrade_resolution_snr,
         degrade_t2star_blur,
@@ -544,8 +566,11 @@ def test_resolution_snr_is_distinct_from_pure_blur_and_pure_noise() -> None:
     yb = degrade_t2star_blur(x.to(torch.complex64), 0.6)
     yn = degrade_complex_gaussian_noise(x, 0.6, seed=3)
 
-    # Noise signature: phase present (a pure blur leaves a real input's phase at 0).
-    assert yr.angle().abs().mean() > 1e-2 > yb.angle().abs().mean()
+    # Noise signature: an imaginary part (a pure blur leaves a real input real).
+    def imag_ratio(t: torch.Tensor) -> float:
+        return (t.imag.norm() / t.real.norm()).item()
+
+    assert imag_ratio(yr) > 1e-2 > 1e-5 > imag_ratio(yb)
     # Apodization signature: less high-freq energy than pure noise (which only adds it).
     assert hf(yr.abs()) < hf(yn.abs())
 
@@ -556,7 +581,7 @@ def test_motion_types_are_distinct_schedules() -> None:
     identity for the deterministic-schedule axes (anti-facade: the new axes fire)."""
     import torch
 
-    from spectramr.infrastructure.physics.digital_twin_extensions import apply_degradation
+    from spectramr.infrastructure.physics.degradations import apply_degradation
 
     torch.manual_seed(0)
     n = 48
@@ -580,7 +605,7 @@ def test_advisor_major_axis_repairs() -> None:
     localized central-FOV spike (not a flat image-wide pedestal)."""
     import torch
 
-    from spectramr.infrastructure.physics.digital_twin_extensions import apply_degradation
+    from spectramr.infrastructure.physics.degradations import apply_degradation
 
     torch.manual_seed(0)
     n = 64
@@ -622,7 +647,7 @@ def test_advisor_units_honesty_reconciliations() -> None:
     peak, and geometric_warp is labelled a per-mode scale rather than px."""
     import torch
 
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
+    from spectramr.infrastructure.physics.degradations import (
         DEGRADATION_REGISTRY,
         apply_degradation,
     )
@@ -630,12 +655,14 @@ def test_advisor_units_honesty_reconciliations() -> None:
     eddy = DEGRADATION_REGISTRY["eddy"].severity
     assert [p.name for p in eddy.params] == ["linear_phase_scale", "quadratic_phase_scale"]
     assert "rad per PE line" not in {p.units for p in eddy.params}
+    # geometric_warp is normalised so its declared px IS the realised peak displacement
+    # (pinned in test_degradation_physics.py).
     gw = DEGRADATION_REGISTRY["geometric_warp"].severity.primary
-    assert gw.units != "px" and "scale" in gw.units
+    assert gw.units == "px" and gw.name == "peak_displacement"
 
     # susceptibility declared peak dropout matches the realized peak (was 0.5 vs ~0.98).
     declared = DEGRADATION_REGISTRY["susceptibility"].severity.params[1].at_theta_max
-    assert declared == 0.98
+    assert declared == pytest.approx(1.0 - math.exp(-4.0), abs=1e-4)
     n = 64
     yy, xx = torch.meshgrid(
         torch.linspace(-1, 1, n), torch.linspace(-1, 1, n), indexing="ij"
@@ -668,9 +695,7 @@ class TestRicianScaleInvariance:
     @pytest.mark.parametrize("theta", [0.05, 0.5, 1.0])
     def test_severity_is_invariant_to_input_scale(self, theta: float) -> None:
         """The same theta must mean the same damage at any input scale."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_rician_noise,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
 
         base = _make_phantom(64, 64, complex_=False)
         base = base * torch.linspace(0.6, 1.0, 64).view(1, 1, 1, 64)  # texture
@@ -690,9 +715,7 @@ class TestRicianScaleInvariance:
         means the two noise axes are on incompatible severity yardsticks and no
         cross-axis aggregate over them is meaningful.
         """
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_rician_noise,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
 
         x = _make_phantom(64, 64, complex_=False)
         rician = self._nmse(x, degrade_rician_noise(x, 1.0, seed=0))
@@ -704,22 +727,20 @@ class TestRicianScaleInvariance:
         ), f"rician NMSE {rician:.4g} vs complex_gaussian {cgauss:.4g}"
 
     def test_declared_unit_matches_the_implementation(self) -> None:
-        """``_SEVERITY`` must not advertise a unit the operator does not use.
+        """The registry severity must not advertise a unit the operator does not use.
 
         The spec said "fraction of max signal" while the code applied an
         absolute intensity — an unwired declaration (pitfall #15).
         """
-        from spectramr.infrastructure.physics.digital_twin_extensions import _SEVERITY
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
-        (param,) = _SEVERITY["rician"].params
+        (param,) = DEGRADATION_REGISTRY["rician"].severity.params
         assert param.name == "sigma"
         assert "fraction" in param.units
 
         # And the operator honours it: at theta=1 the background (zero signal)
         # settles at the Rayleigh mean sigma*sqrt(pi/2) with sigma = 0.3 * p99.
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_rician_noise,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
 
         x = _make_phantom(64, 64, complex_=False)
         p99 = float(torch.quantile(x.reshape(-1), 0.99))
@@ -729,9 +750,7 @@ class TestRicianScaleInvariance:
         assert float(background.mean()) == pytest.approx(expected, rel=0.1)
 
     def test_all_zero_input_does_not_divide_by_zero(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_rician_noise,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
 
         out = degrade_rician_noise(torch.zeros(1, 1, 16, 16), 1.0, seed=0)
         assert torch.isfinite(out).all()
@@ -742,7 +761,7 @@ class TestDeriveAxisSeed:
     uses. Its contract: distinct per axis, stable across processes."""
 
     def test_distinct_axes_get_distinct_seeds(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
+        from spectramr.infrastructure.physics.degradations import (
             DEGRADATION_REGISTRY,
             derive_axis_seed,
         )
@@ -757,11 +776,12 @@ class TestDeriveAxisSeed:
         """The reason it is ``zlib.crc32`` and not the builtin ``hash``: the
         latter is salted by PYTHONHASHSEED, which would put cross-process
         non-determinism back in through the side door."""
+        import os
         import subprocess
         import sys
 
         snippet = (
-            "from spectramr.infrastructure.physics.digital_twin_extensions import "
+            "from spectramr.infrastructure.physics.degradations import "
             "derive_axis_seed; print(derive_axis_seed(42, 'rician'))"
         )
         runs = {
@@ -770,7 +790,7 @@ class TestDeriveAxisSeed:
                 capture_output=True,
                 text=True,
                 check=True,
-                env={"PYTHONHASHSEED": str(h)},
+                env={"PYTHONHASHSEED": str(h), "PYTHONPATH": os.environ.get("PYTHONPATH", "")},
             ).stdout.strip()
             for h in (0, 1)
         }
@@ -778,9 +798,7 @@ class TestDeriveAxisSeed:
 
     def test_seed_does_not_depend_on_severity(self) -> None:
         """theta must stay the only free variable across a severity grid."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            derive_axis_seed,
-        )
+        from spectramr.infrastructure.physics.degradations import derive_axis_seed
 
         assert derive_axis_seed(7, "spike") == derive_axis_seed(7, "spike")
         assert derive_axis_seed(7, "spike") != derive_axis_seed(8, "spike")

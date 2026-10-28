@@ -158,3 +158,35 @@ def test_coil_count_disagreement_raises() -> None:
             torch.randn(1, 4, *IM, dtype=torch.complex64),
             sample_measurement=measurement,
         )
+
+
+def _log_scaled_measurement() -> tuple[torch.Tensor, object]:
+    """A compressed x_0 and the LINEAR measurement a log-scaled process publishes."""
+    from spectramr.data.transforms.normalization import compress_kspace_log
+
+    process = NonCartesianSpokeProcess(
+        num_spokes=128,
+        samples_per_spoke=64,
+        im_size=IM,
+        num_timesteps=len(LADDER),
+        max_acceleration=16.0,
+        base_acceleration=1.0,
+        schedule_kwargs={"acceleration_range": list(LADDER)},
+        kspace_log_scaled=True,
+    )
+    x0_compressed = compress_kspace_log(fft2c(_phantom()) * 40.0)
+    process.q_sample(x0_compressed, torch.tensor([1]))
+    return x0_compressed, process.last_sample_measurement
+
+
+def test_log_scaled_it_scores_a_perfect_compressed_prediction_at_zero() -> None:
+    """#2341: the loss decompresses the prediction to meet the linear measurement."""
+    x0_compressed, measurement = _log_scaled_measurement()
+    loss = NUFFTSampleConsistencyLoss()
+    assert loss.use_fourier_bridge is True and loss.log_scaled is False
+    loss.log_scaled = True
+    flagged = float(loss(x0_compressed, x0_compressed, sample_measurement=measurement))
+    loss.log_scaled = False
+    unflagged = float(loss(x0_compressed, x0_compressed, sample_measurement=measurement))
+    assert flagged < 1e-3
+    assert unflagged > 100 * max(flagged, 1e-6)

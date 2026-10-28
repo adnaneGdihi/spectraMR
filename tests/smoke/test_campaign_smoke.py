@@ -23,6 +23,8 @@ from tests.utils.repo_scripts import skip_if_public_export
 
 # ── Fixtures ─────────────────────────────────────────────────────────
 
+pytestmark = pytest.mark.usefixtures("slurm_account")
+
 
 @pytest.fixture
 def project_root() -> Path:

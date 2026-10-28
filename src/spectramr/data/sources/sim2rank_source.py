@@ -28,9 +28,15 @@ from typing import Protocol, runtime_checkable
 import torch
 
 __all__ = [
+    "DEFAULT_SYNTHETIC_VOLUME_HWD",
     "Sim2RankSlice",
+    "Sim2RankVolume",
     "Sim2RankVolumeSource",
+    "synthetic_phantom_volume",
 ]
+
+#: ``(H, W, D)`` of the ``--mode 3d --synthetic`` phantom; stamped into every 3-D bundle.
+DEFAULT_SYNTHETIC_VOLUME_HWD: tuple[int, int, int] = (128, 128, 64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,3 +121,69 @@ class Sim2RankVolumeSource(Protocol):
     def __iter__(self) -> Iterator[Sim2RankSlice]: ...
 
     def __len__(self) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Sim2RankVolume:
+    """One clean reference volume for the ``--mode 3d`` sweep.
+
+    The volumetric operators degrade the whole stack at once (motion across slices,
+    kz encoding), so the volume is never split into :class:`Sim2RankSlice` objects.
+    """
+
+    content_id: str
+    clean: torch.Tensor
+    """``[1, D, H, W]`` real magnitude; D is the slice (multislice) or kz (3-D) axis."""
+
+    contrast: str
+    provenance: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.clean.ndim != 4 or self.clean.shape[0] != 1:
+            raise ValueError(f"clean must be [1, D, H, W]; got {tuple(self.clean.shape)}.")
+        if self.clean.is_complex():
+            raise TypeError("clean must be a real magnitude volume, not complex.")
+        if self.clean.shape[1] < 2:
+            raise ValueError(
+                f"a volume needs D >= 2 slices; got D={self.clean.shape[1]}. A single slice "
+                "belongs to the 2-D path."
+            )
+
+    @property
+    def size_hwd(self) -> dict[str, int]:
+        d, h, w = self.clean.shape[-3:]
+        return {"H": int(h), "W": int(w), "D": int(d)}
+
+    def as_batch(self) -> torch.Tensor:
+        """The canonical degradation layout ``(1, 1, D, H, W)``."""
+        return self.clean.unsqueeze(0)
+
+
+def synthetic_phantom_volume(
+    height: int = DEFAULT_SYNTHETIC_VOLUME_HWD[0],
+    width: int = DEFAULT_SYNTHETIC_VOLUME_HWD[1],
+    depth: int = DEFAULT_SYNTHETIC_VOLUME_HWD[2],
+    *,
+    device: torch.device | None = None,
+) -> Sim2RankVolume:
+    """An ellipsoid phantom whose cross-section and inserts change along D.
+
+    The 3-D analogue of the 2-D ``--synthetic`` phantom. The outer ellipsoid's z
+    semi-axis exceeds the stack so every slice carries signal; the two inserts are
+    off-centre in z, so the stack is not one slice repeated.
+    """
+    z, y, x = torch.meshgrid(
+        torch.linspace(-1, 1, depth, device=device),
+        torch.linspace(-1, 1, height, device=device),
+        torch.linspace(-1, 1, width, device=device),
+        indexing="ij",
+    )
+    vol = ((x / 0.7) ** 2 + (y / 0.9) ** 2 + (z / 1.2) ** 2 < 1.0).float()
+    vol = torch.where((x - 0.2) ** 2 + (y + 0.1) ** 2 + (z - 0.3) ** 2 < 0.15, vol * 0.5, vol)
+    vol = torch.where((x + 0.3) ** 2 + (y - 0.2) ** 2 + (z + 0.4) ** 2 < 0.1, vol * 0.8, vol)
+    return Sim2RankVolume(
+        content_id="synthetic_phantom#volume",
+        clean=vol.unsqueeze(0),
+        contrast="synthetic",
+        provenance={"source": "synthetic_phantom_volume", "size": {"H": height, "W": width, "D": depth}},
+    )

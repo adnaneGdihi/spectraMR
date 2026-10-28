@@ -29,10 +29,19 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-__all__ = ["M4RawIdentity", "parse_m4raw_file_id", "repetition_group_key"]
+__all__ = [
+    "NEX_AVERAGE_REPETITION",
+    "M4RawIdentity",
+    "parse_m4raw_file_id",
+    "repetition_group_key",
+]
 
 #: The trailing repetition counter, e.g. ``01`` in ``2022061001_T101``.
 _REPETITION_DIGITS = 2
+
+#: The counter of a group's NEX average (``nex_averaging``). M4Raw numbers its own
+#: acquisitions from ``01``, so ``00`` names a derived file and cannot shadow one.
+NEX_AVERAGE_REPETITION = "00"
 
 
 class M4RawIdentity(NamedTuple):

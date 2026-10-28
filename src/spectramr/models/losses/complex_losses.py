@@ -6,11 +6,13 @@ addressing phase blindness issues in MRI reconstruction.
 """
 
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.models.losses.kspace_physics_losses import check_reduction
 from spectramr.models.losses.registry import register_loss
 
 logger = logging.getLogger(__name__)
@@ -34,21 +36,33 @@ class ComplexL1Loss(nn.Module):
         \mathcal{L}_{ComplexL1} = \| \hat{y} - y \|_1 = \sqrt{ (\Re(\hat{y}) - \Re(y))^2 + (\Im(\hat{y}) - \Im(y))^2 + \epsilon^2 }
     """
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean", restrict_to_acquired: bool = False) -> None:
         """__init__.
 
         Args:
             reduction (str): Description.
+            restrict_to_acquired (bool): Score only the lines the scanner wrote, so the
+                never-acquired zero lines do not dilute the mean. Off by default: it moves
+                the loss scale of every arm that already declares ``complex_l1``.
         """
         super().__init__()
+        check_reduction(reduction, "complex_l1")
         self.reduction = reduction
+        self.restrict_to_acquired = bool(restrict_to_acquired)
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input: torch.Tensor,
+        target: torch.Tensor,
+        acquired: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute complex L1 loss.
 
         Args:
             input: Input tensor (complex or real)
             target: Target tensor (complex or real)
+            acquired: ``[B, 1, H, W]`` plane of the acquired lines; read only when
+                ``restrict_to_acquired`` is set, and required then.
 
         Returns:
             Loss value
@@ -67,10 +81,12 @@ class ComplexL1Loss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
         """
-        # DEBUG: Check input types before conversion
         logger.debug(
-            f"[ComplexL1Loss ENTRY] input: shape={input.shape}, complex={torch.is_complex(input)}, "
-            f"target: shape={target.shape}, complex={torch.is_complex(target)}"
+            "[ComplexL1Loss ENTRY] input: shape=%s, complex=%s, target: shape=%s, complex=%s",
+            input.shape,
+            input.is_complex(),
+            target.shape,
+            target.is_complex(),
         )
 
         # Ensure inputs are complex
@@ -99,10 +115,12 @@ class ComplexL1Loss(nn.Module):
             # For now, keep it as-is (it's already the right type)
             pass
 
-        # DEBUG: Check after conversion
         logger.debug(
-            f"[ComplexL1Loss AFTER_CONVERT] input: shape={input.shape}, complex={torch.is_complex(input)}, "
-            f"target: shape={target.shape}, complex={torch.is_complex(target)}"
+            "[ComplexL1Loss AFTER_CONVERT] input: shape=%s, complex=%s, target: shape=%s, complex=%s",
+            input.shape,
+            input.is_complex(),
+            target.shape,
+            target.is_complex(),
         )
 
         # Handle channel mismatch
@@ -144,6 +162,16 @@ class ComplexL1Loss(nn.Module):
             # Handle real inputs (imag is 0)
             loss = torch.sqrt(diff.pow(2) + eps**2)
 
+        if self.restrict_to_acquired:
+            if acquired is None:
+                raise ValueError(
+                    "complex_l1 has restrict_to_acquired=True but no `acquired` plane reached it."
+                )
+            weight = acquired.to(device=loss.device, dtype=loss.dtype)
+            loss = loss * weight
+            if self.reduction == "mean":
+                return loss.sum() / weight.expand_as(loss).sum().clamp_min(1.0)
+
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
@@ -173,7 +201,7 @@ class WeightedKSpaceL1Loss(nn.Module):
 
         \mathcal{L}_{WeightedKSpaceL1} = W(k_x, k_y) \odot | \hat{k} - k |"""
 
-    def __init__(self, exponent: float = 1.0, reduction: str = "mean"):
+    def __init__(self, exponent: float = 1.0, reduction: str = "mean") -> None:
         """__init__.
 
         Args:
@@ -181,9 +209,10 @@ class WeightedKSpaceL1Loss(nn.Module):
             reduction (str): Description.
         """
         super().__init__()
+        check_reduction(reduction, "weighted_kspace_l1")
         self.exponent = exponent
         self.reduction = reduction
-        self._weight_cache = {}
+        self._weight_cache: dict[tuple[int, int, str], torch.Tensor] = {}
 
     def _get_weight_mask(self, height: int, width: int, device: torch.device) -> torch.Tensor:
         """Generate or retrieve pre-calculated frequency weight mask."""
@@ -208,9 +237,9 @@ class WeightedKSpaceL1Loss(nn.Module):
 
             # Weight formula: (1 + R)^exponent
             # Base weight is 1.0 (at DC), grows with radius
-            W = (1.0 + R) ** self.exponent
+            weight: torch.Tensor = (1.0 + R) ** self.exponent
 
-            self._weight_cache[key] = W
+            self._weight_cache[key] = weight
 
         return self._weight_cache[key]
 
@@ -279,10 +308,10 @@ class LogSpectralPhaseLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{LogSpectralPhase} = | \\log(1 + |\\hat{y}|) - \\log(1 + |y|) | + \\lambda_{phase} W_{phase} \\odot | e^{j \angle \\hat{y}} - e^{j \angle y} |
+        \\mathcal{L}_{LogSpectralPhase} = | \\log(1 + |\\hat{y}|) - \\log(1 + |y|) | + \\lambda_{phase} W_{phase} \\odot | e^{j \\angle \\hat{y}} - e^{j \\angle y} |
     """
 
-    def __init__(self, phase_weight: float = 0.1, reduction: str = "mean"):
+    def __init__(self, phase_weight: float = 0.1, reduction: str = "mean") -> None:
         """__init__.
 
         Args:
@@ -290,6 +319,7 @@ class LogSpectralPhaseLoss(nn.Module):
             reduction (str): Description.
         """
         super().__init__()
+        check_reduction(reduction, "log_spectral_phase")
         self.phase_weight = phase_weight
         self.reduction = reduction
 
@@ -392,13 +422,14 @@ class ComplexMSELoss(nn.Module):
         \mathcal{L}_{ComplexMSE} = (\Re(\hat{y}) - \Re(y))^2 + (\Im(\hat{y}) - \Im(y))^2
     """
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean") -> None:
         """__init__.
 
         Args:
             reduction (str): Description.
         """
         super().__init__()
+        check_reduction(reduction, "complex_mse")
         self.reduction = reduction
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -456,7 +487,7 @@ class FrequencyDomainLoss(nn.Module):
 
         \mathcal{L}_{FrequencyDomain} = \| \mathcal{F}(\hat{y}) - \mathcal{F}(y) \|_2"""
 
-    def __init__(self, use_log: bool = True, reduction: str = "mean"):
+    def __init__(self, use_log: bool = True, reduction: str = "mean") -> None:
         """__init__.
 
         Args:
@@ -464,6 +495,7 @@ class FrequencyDomainLoss(nn.Module):
             reduction (str): Description.
         """
         super().__init__()
+        check_reduction(reduction, "frequency_domain_consistency")
         self.use_log = use_log
         self.reduction = reduction
 
@@ -540,7 +572,7 @@ class SENSEAdjointL1Loss(nn.Module):
         use_fourier_bridge: bool = True,
         normalize: bool = False,
         min_support_frac: float = 1e-2,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -566,17 +598,20 @@ class SENSEAdjointL1Loss(nn.Module):
                 dominant term.
         """
         super().__init__()
+        check_reduction(reduction, "sense_adjoint_l1")
         self.reduction = reduction
         self.use_fourier_bridge = use_fourier_bridge
         self.normalize = normalize
         self.min_support_frac = float(min_support_frac)
+        # Set by LossBuilder from the arm's k-space normalisation (#2338).
+        self.log_scaled = False
 
     def forward(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        smaps: torch.Tensor = None,
-        **kwargs,
+        smaps: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """forward.
 
@@ -679,14 +714,16 @@ class SENSEAdjointL1Loss(nn.Module):
                 "Refusing to poison the fidelity gradient; fix coil estimation."
             )
 
-        from spectramr.infrastructure.physics.fft_ops import ifft2c
+        from spectramr.models.losses.physics_losses import kspace_to_image
 
         # 1. Transform pure complex k-space to spatial domain FIRST.
         # Skipped when an outer bridge already did it (use_fourier_bridge=False),
         # so the iFFT is applied exactly once on the loss path (issue #467).
         if self.use_fourier_bridge:
-            img_pred = ifft2c(pred_complex)
-            img_target = ifft2c(target_complex)
+            img_pred = kspace_to_image(pred_complex, return_complex=True, log_scaled=self.log_scaled)
+            img_target = kspace_to_image(
+                target_complex, return_complex=True, log_scaled=self.log_scaled
+            )
         else:
             img_pred = pred_complex
             img_target = target_complex

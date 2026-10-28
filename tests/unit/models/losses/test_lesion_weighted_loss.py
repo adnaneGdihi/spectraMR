@@ -205,3 +205,18 @@ def test_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "lesion_weighted" in list_available()
+
+
+def test_multichannel_zero_boost_equals_the_plain_mean() -> None:
+    """The weighted mean counts every channel in its denominator: with ``boost=0``
+    a ``(B, 1, H, W)`` mask on a 2-channel input reproduces the unmasked mean
+    rather than twice it."""
+    gen = torch.Generator().manual_seed(0)
+    pred = torch.randn(2, 2, 4, 4, generator=gen)
+    target = torch.randn(2, 2, 4, 4, generator=gen)
+    mask = torch.zeros(2, 1, 4, 4)
+    mask[..., :2, :2] = 1.0
+    masked = LesionWeightedLoss(base="l1", boost=0.0)(pred, target, context={"lesion_mask": mask})
+    unmasked = LesionWeightedLoss(base="l1", require_mask=False)(pred, target)
+    torch.testing.assert_close(masked, unmasked)
+    torch.testing.assert_close(masked, (pred - target).abs().mean())

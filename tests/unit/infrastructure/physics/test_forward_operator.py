@@ -15,6 +15,8 @@ Categories:
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 
@@ -381,3 +383,72 @@ def test_readout_transform_pairs_round_trip_on_an_odd_axis() -> None:
     k = torch.randn(1, 2, 8, 17, dtype=torch.complex64)
     assert torch.allclose(fft1c(ifft1c(k, dim=-1), dim=-1), k, atol=1e-5)
     assert torch.allclose(fft1_uncentered(ifft1_uncentered(k, dim=-1), dim=-1), k, atol=1e-5)
+
+
+# --- #2327: per-sample maps and a DC step that keeps the caller's layout -------
+
+
+def _batched_maps(batch: int = 2, coils: int = 4, size: int = 8) -> torch.Tensor:
+    torch.manual_seed(3)
+    maps = torch.randn(batch, coils, size, size, dtype=torch.complex64)
+    return maps / maps.abs().pow(2).sum(1, keepdim=True).sqrt()
+
+
+def test_per_sample_maps_are_applied_per_sample() -> None:
+    """``x * maps.unsqueeze(0)`` broadcast (B, 1) against (1, B, C) into nonsense."""
+    maps = _batched_maps()
+    op = MultiCoilForwardOperator(coil_sensitivities=maps, mask=_full_mask(8, 8))
+    x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+    out = op.forward(x)
+    assert out.shape == (2, 4, 8, 8)
+    assert torch.allclose(
+        out[1], MultiCoilForwardOperator(maps[1], _full_mask(8, 8)).forward(x[1:2])[0]
+    )
+
+
+def test_the_batched_adjoint_is_an_adjoint() -> None:
+    maps = _batched_maps()
+    op = MultiCoilForwardOperator(coil_sensitivities=maps, mask=_full_mask(8, 8))
+    x = torch.randn(2, 1, 8, 8, dtype=torch.complex64)
+    y = torch.randn(2, 4, 8, 8, dtype=torch.complex64)
+    lhs = (op.forward(x).conj() * y).sum()
+    rhs = (x.conj() * op.adjoint(y)).sum()
+    assert abs(lhs - rhs) / abs(lhs) < 1e-5
+
+
+def test_dc_returns_the_real_interleaved_layout_it_was_given() -> None:
+    """A complex (B, 1) update from a real (B, 2) image fed the next Conv2d a complex tensor."""
+    maps = _batched_maps()
+    op = MultiCoilForwardOperator(coil_sensitivities=maps, mask=_full_mask(8, 8))
+    dc = MultiCoilDataConsistency(op, mode="soft", lambda_dc=1.0)
+    x = torch.randn(2, 2, 8, 8)
+    y = torch.randn(2, 4, 8, 8, dtype=torch.complex64)
+    out = dc(x, y)
+    assert out.shape == (2, 2, 8, 8) and not out.is_complex()
+    complex_out = dc(torch.complex(x[:, :1], x[:, 1:]), y)
+    assert torch.allclose(out, torch.cat([complex_out.real, complex_out.imag], dim=1), atol=1e-6)
+
+
+def test_dc_on_a_half_precision_image_builds_no_complex_half() -> None:
+    maps = _batched_maps()
+    op = MultiCoilForwardOperator(coil_sensitivities=maps, mask=_full_mask(8, 8))
+    dc = MultiCoilDataConsistency(op, mode="soft", lambda_dc=1.0)
+    x = torch.randn(2, 2, 8, 8).half()
+    y = torch.randn(2, 4, 8, 8, dtype=torch.complex64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = dc(x, y)
+    assert out.dtype == torch.float32 and out.shape == (2, 2, 8, 8)
+
+
+def test_per_batch_maps_and_mask_stay_out_of_the_checkpoint() -> None:
+    """`set_coil_sensitivities` / `set_mask` hold one batch's data; a strict
+    resume into a fresh operator must not see them as unexpected keys."""
+    coils = _identity_coils(2, 8, 8)
+    op = MultiCoilForwardOperator()
+    op.set_coil_sensitivities(coils.unsqueeze(0))
+    op.set_mask(_full_mask(8, 8))
+    state = op.state_dict()
+    assert not any(k.endswith(("coil_sensitivities", "mask")) for k in state)
+    MultiCoilForwardOperator().load_state_dict(state, strict=True)
+    assert torch.equal(op.mask.flatten()[:4], torch.ones(4))  # still usable in-process

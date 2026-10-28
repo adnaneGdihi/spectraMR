@@ -99,7 +99,7 @@ def test_all_registered_with_contract():
 
 @pytest.mark.unit
 def test_metrics_return_nan_without_context():
-    """Absent measurement context ⇒ nan (never raise — computer.py re-raises ValueError)."""
+    """Absent measurement context is the declared N/A, so it is nan rather than a raise."""
     img = _blob()
     for key in ("ndcr", "prp_snr", "fmrs", "csoe", "aoqv"):
         out = get_metric(key)(img, context=MetricContext())
@@ -174,6 +174,114 @@ def test_ndcr_mask_none_is_fully_sampled():
     ctx_ones = MetricContext(y_kspace=y, mask=ones, coil_maps=smaps)
     assert abs(ndcr(xrec + 0.2 * noise, context=ctx_none)
                - ndcr(xrec + 0.2 * noise, context=ctx_ones)) < 1e-5
+
+
+def _noisy_multicoil(sigma: float = 0.02):
+    """A 4-coil measurement whose noise is i.i.d. per coil, hence partly off span(S).
+
+    Returns ``(img, smaps, clean, full, mask, y)``: ``clean = F S img``, ``full``
+    the fully-sampled noisy k-space (what the validation target is), ``y = M full``.
+    """
+    img, smaps = _blob(), _smooth_smaps()
+    clean = sense_forward(img, smaps=smaps)
+    g = torch.Generator().manual_seed(0)
+    scale = sigma * float(clean.abs().max())
+    noise = scale * torch.complex(
+        torch.randn(clean.shape, generator=g), torch.randn(clean.shape, generator=g)
+    )
+    full = clean + noise
+    mask = torch.zeros(32, 32)
+    mask[:, ::2] = 1.0  # R=2
+    mask[:, 12:20] = 1.0  # ACS
+    return img, smaps, clean, full, mask, full * mask
+
+
+@pytest.mark.unit
+def test_ndcr_reprojection_floor_ranks_the_truth_below_zero_filling():
+    """PLANTED (#2316): the coil-combine-then-reproject path without ``pred_kspace``.
+
+    A coil-combined image re-expanded through ``S`` reproduces only the part of
+    ``y`` on the sensitivity subspace, so noise off it is a floor: the zero-filled
+    image, which reproduces the acquired lines exactly, reads far from 0, and the
+    noiseless truth reads worse still. This is the inversion seen on 0.3 T data.
+    """
+    img, smaps, _, _, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps)
+    ndcr = get_metric("ndcr")
+    zf = ndcr(sense_adjoint(y, smaps=smaps), context=ctx)
+    truth = ndcr(img, context=ctx)
+    assert zf > 0.2
+    assert truth > zf
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_scores_data_consistent_predictions_zero():
+    r"""With ``pred_kspace`` the residual is per coil, and the floor is gone.
+
+    By the definition :math:`\lVert M(\hat k - y)\rVert/\lVert My\rVert`:
+    zero-filled k-space IS ``y`` and the fully-sampled target agrees with ``y`` on
+    every acquired sample, so both score exactly 0; an all-zero prediction scores
+    1. The coil-combined ``prediction`` argument is not read on this branch.
+    """
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    ndcr = get_metric("ndcr")
+
+    def score(k: torch.Tensor) -> float:
+        ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=k)
+        return ndcr(torch.zeros(1, 1, 32, 32), context=ctx)
+
+    assert score(y) < 1e-6  # zero-filled
+    assert score(full) < 1e-6  # the fully-sampled target
+    assert abs(score(torch.zeros_like(y)) - 1.0) < 1e-6
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_reads_the_noise_of_a_clean_truth():
+    """A noiseless ``F S x`` misses ``y`` by exactly the acquired noise, ``||Mn||/||My||``."""
+    _, smaps, clean, full, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=clean)
+    expected = float(torch.linalg.vector_norm((full - clean) * mask) / torch.linalg.vector_norm(y))
+    assert get_metric("ndcr")(torch.zeros(1), context=ctx) == pytest.approx(expected, rel=1e-4)
+
+
+@pytest.mark.unit
+def test_ndcr_on_the_coil_kspace_is_monotone_in_acquired_line_error():
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    g = torch.Generator().manual_seed(3)
+    err = torch.complex(torch.randn(full.shape, generator=g), torch.randn(full.shape, generator=g))
+    err = err * float(full.abs().mean())
+    ndcr = get_metric("ndcr")
+    sevs = [0.0, 0.05, 0.1, 0.2, 0.4]
+    vals = [
+        ndcr(torch.zeros(1), context=MetricContext(
+            y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=full + s * err
+        ))
+        for s in sevs
+    ]
+    assert vals[0] < 1e-6
+    assert _spearman(sevs, vals) > 0.99
+
+
+@pytest.mark.unit
+def test_ndcr_rejects_a_pred_kspace_in_another_layout():
+    _, smaps, _, full, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=smaps, pred_kspace=full[:, :1])
+    with pytest.raises(ValueError, match="pred_kspace"):
+        get_metric("ndcr")(torch.zeros(1), context=ctx)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", ["ndcr", "csoe"])
+def test_a_failure_that_used_to_be_swallowed_now_raises(key):
+    """PLANTED: coil maps that disagree with the measurement's coil count.
+
+    Both metrics returned ``nan`` here from a blanket ``except Exception``, which
+    the computer cannot tell apart from a declared N/A.
+    """
+    _, _, _, _, mask, y = _noisy_multicoil()
+    ctx = MetricContext(y_kspace=y, mask=mask, coil_maps=_smooth_smaps(c=3))
+    with pytest.raises(RuntimeError):
+        get_metric(key)(_blob(), context=ctx)
 
 
 # --------------------------------------------------------------------------- #

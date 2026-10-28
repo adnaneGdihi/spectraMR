@@ -4,11 +4,8 @@ Provides both a flexible strategy-based system and a small compatibility
 facade used by tests (CompositeLoss, LossConfig, etc.).
 """
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 import enum
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -18,8 +15,10 @@ import torch.nn.functional as F
 from torch import autograd, nn
 
 # Import SSOT Perceptual Loss
-from spectramr.models.losses.perceptual_loss import PerceptualLoss
+from spectramr.models.losses.perceptual_loss import PerceptualLoss, rss_magnitude
 from spectramr.models.losses.registry import register_loss
+
+logger = logging.getLogger(__name__)
 
 # Adversarial loss strategies
 
@@ -27,8 +26,7 @@ from spectramr.models.losses.registry import register_loss
 class AdversarialLossStrategy(nn.Module):
     """AdversarialLossStrategy class."""
 
-    def compute_generator_loss(self, fake_outputs_d, **kwargs):
-        # TODO: Subclasses must implement this method
+    def compute_generator_loss(self, fake_outputs_d: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -41,8 +39,9 @@ class AdversarialLossStrategy(nn.Module):
             "`compute_generator_loss` to define how generator loss is calculated.",
         )
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
-        # TODO: Subclasses must implement this method
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
 
         Args:
@@ -56,7 +55,7 @@ class AdversarialLossStrategy(nn.Module):
             "`compute_discriminator_loss` to define how discriminator loss is calculated.",
         )
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Dummy forward to handle being called like a standard loss (pred, target)
         during validation loops."""
         device = (
@@ -81,7 +80,7 @@ class StandardGANLoss(AdversarialLossStrategy):
         self.loss = nn.BCEWithLogitsLoss()
         self.label_smoothing = label_smoothing
 
-    def compute_generator_loss(self, fake_outputs_d, **kwargs):
+    def compute_generator_loss(self, fake_outputs_d: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -90,13 +89,17 @@ class StandardGANLoss(AdversarialLossStrategy):
             Any: Description.
         """
         real_target = 1.0 - self.label_smoothing
-        # Ensure loss function is on the same device as inputs
-        if hasattr(self.loss, "to"):
-            self.loss = self.loss.to(fake_outputs_d.device)
-        return self.loss(fake_outputs_d, torch.full_like(fake_outputs_d, real_target))
+        out: torch.Tensor = self.loss(fake_outputs_d, torch.full_like(fake_outputs_d, real_target))
+        return out
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
+
+        A non-finite term is returned as it is: the step executor's loss guard
+        (or the AMP scaler) owns the response, and a substituted zero would stop
+        the critic training without any signal (non-negotiable 3).
 
         Args:
             real_outputs_d (Any): Description.
@@ -106,30 +109,20 @@ class StandardGANLoss(AdversarialLossStrategy):
         """
         real_target = 1.0 - self.label_smoothing
         fake_target = 0.0 + self.label_smoothing
-        # Ensure loss function is on the same device as inputs
-        if hasattr(self.loss, "to"):
-            self.loss = self.loss.to(real_outputs_d.device)
-        real_loss = self.loss(
+        real_loss: torch.Tensor = self.loss(
             real_outputs_d,
             torch.full_like(real_outputs_d, real_target),
         )
-        fake_loss = self.loss(
+        fake_loss: torch.Tensor = self.loss(
             fake_outputs_d,
             torch.full_like(fake_outputs_d, fake_target),
         )
-
-        # Safety check for numerical stability
-        if not torch.isfinite(real_loss):
-            real_loss = torch.tensor(0.0, device=real_outputs_d.device)
-        if not torch.isfinite(fake_loss):
-            fake_loss = torch.tensor(0.0, device=fake_outputs_d.device)
-
         return real_loss, fake_loss
 
 
 @register_loss(name="r1_regularization", aliases=["R1RegularizationLoss"], domain="agnostic")
 class R1RegularizationLoss(nn.Module):
-    """R1 Regularization for GANs.
+    r"""R1 Regularization for GANs.
 
     Penalizes gradients of the discriminator to stabilize training.
     Loss = 0.5 * ||grad(D(real))||^2
@@ -143,7 +136,7 @@ class R1RegularizationLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{R1} = \frac{\\gamma}{2} \\mathbb{E}_{x} \\left[ \\| \nabla_x D(x) \\|_2^2 \right]
+        \mathcal{L}_{R1} = \frac{\gamma}{2} \mathbb{E}_{x} \left[ \| \nabla_x D(x) \|_2^2 \right]
     """
 
     def __init__(self, weight: float = 10.0):
@@ -159,9 +152,9 @@ class R1RegularizationLoss(nn.Module):
         self,
         discriminator: Any,
         real_images: torch.Tensor,
-        *args,
+        *args: Any,
         critic_cond: "Mapping[str, Any] | None" = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """
         Args:
@@ -189,13 +182,15 @@ class R1RegularizationLoss(nn.Module):
             dev = discriminator.device if hasattr(discriminator, "device") else torch.device("cpu")
             return torch.tensor(0.0, device=dev)
 
-        real_images.requires_grad_(True)
-        real_logits = discriminator(real_images, **(critic_cond or {}))
+        # A detached leaf, so the caller's batch tensor is not switched to
+        # requires_grad and the penalty cannot reach whatever produced it.
+        real = real_images.detach().requires_grad_(True)
+        real_logits = discriminator(real, **(critic_cond or {}))
 
         # Compute gradients of logits w.r.t input images
         grads = torch.autograd.grad(
             outputs=real_logits.sum(),
-            inputs=real_images,
+            inputs=real,
             create_graph=True,
             retain_graph=True,
             only_inputs=True,
@@ -205,25 +200,11 @@ class R1RegularizationLoss(nn.Module):
         if grads is None:
             return torch.tensor(0.0, device=real_images.device)
 
-        # R1 penalty: 0.5 * ||grad||^2, flattened over all dims except batch.
-        #
-        # ``(g.conj() * g).real`` rather than ``g.pow(2)`` because this critic's
-        # input may be complex (#1931). For complex ``g = a + bi``, ``g**2`` is
-        # ``a^2 - b^2 + 2abi`` -- not a squared magnitude, and not even real, so
-        # the penalty poisons the total loss and ``backward()`` dies with "grad
-        # can be implicitly created only for real scalar outputs". Torch's
-        # convention for a real loss gives ``g == dL/da + i*dL/db``, so
-        # ``(g.conj() * g).real == (dL/da)^2 + (dL/db)^2`` is exactly the squared
-        # Euclidean norm over the real view, and is identical to ``g**2`` when
-        # ``g`` is real. ``g.abs().pow(2)`` computes the same value but is
-        # differentiated by ``create_graph=True`` and is undefined at zero.
-        # Same defect, same fix as :func:`gradient_penalty_loss`.
+        # ``(g.conj() * g).real`` is the squared Euclidean norm over the real view,
+        # so a complex critic input (#1931) yields a real penalty (``g**2`` would be
+        # the complex square); a non-finite value is left for the step guard.
         grads = grads.view(grads.size(0), -1)
         r1_penalty = 0.5 * (grads.conj() * grads).real.sum(dim=1).mean()
-
-        if torch.isnan(r1_penalty) or torch.isinf(r1_penalty):
-            return torch.tensor(0.0, device=real_images.device)
-
         return self.weight * r1_penalty
 
 
@@ -249,7 +230,7 @@ class LSGANLoss(AdversarialLossStrategy):
         super().__init__()
         self.label_smoothing = label_smoothing
 
-    def compute_generator_loss(self, fake_outputs_d, **kwargs):
+    def compute_generator_loss(self, fake_outputs_d: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -260,7 +241,9 @@ class LSGANLoss(AdversarialLossStrategy):
         real_target = 1.0 - self.label_smoothing
         return torch.mean((fake_outputs_d - real_target) ** 2)
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
 
         Args:
@@ -294,7 +277,12 @@ class RALSGANLoss(AdversarialLossStrategy):
         super().__init__()
         self.label_smoothing = label_smoothing
 
-    def compute_generator_loss(self, fake_outputs_d, real_outputs_d=None, **kwargs):
+    def compute_generator_loss(
+        self,
+        fake_outputs_d: torch.Tensor,
+        real_outputs_d: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -315,7 +303,9 @@ class RALSGANLoss(AdversarialLossStrategy):
         loss_real = torch.mean((real_outputs_d - mean_fake + 1.0) ** 2)
         return (loss_real + loss_fake) * 0.5
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
 
         Args:
@@ -324,8 +314,9 @@ class RALSGANLoss(AdversarialLossStrategy):
         Returns:
             Any: Description.
         """
-        # Relativistic average margins are a fixed ±1 (see generator loss).
-        mean_fake = torch.mean(fake_outputs_d.detach())
+        # Relativistic average margins are a fixed ±1 (see generator loss). Both
+        # batch means stay in the graph, as in the objective the docstring states.
+        mean_fake = torch.mean(fake_outputs_d)
         mean_real = torch.mean(real_outputs_d)
         loss_real = torch.mean((real_outputs_d - mean_fake - 1.0) ** 2)
         loss_fake = torch.mean((fake_outputs_d - mean_real + 1.0) ** 2)
@@ -345,7 +336,7 @@ class WGANLoss(AdversarialLossStrategy):
         super().__init__()
         self.label_smoothing = label_smoothing
 
-    def compute_generator_loss(self, fake_outputs_d, **kwargs):
+    def compute_generator_loss(self, fake_outputs_d: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -355,7 +346,9 @@ class WGANLoss(AdversarialLossStrategy):
         """
         return -torch.mean(fake_outputs_d)
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
 
         Args:
@@ -389,7 +382,7 @@ class HingeLoss(AdversarialLossStrategy):
         super().__init__()
         self.label_smoothing = label_smoothing
 
-    def compute_generator_loss(self, fake_outputs_d, **kwargs):
+    def compute_generator_loss(self, fake_outputs_d: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """compute_generator_loss.
 
         Args:
@@ -399,7 +392,9 @@ class HingeLoss(AdversarialLossStrategy):
         """
         return -torch.mean(fake_outputs_d)
 
-    def compute_discriminator_loss(self, real_outputs_d, fake_outputs_d, **kwargs):
+    def compute_discriminator_loss(
+        self, real_outputs_d: torch.Tensor, fake_outputs_d: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """compute_discriminator_loss.
 
         Args:
@@ -419,7 +414,13 @@ class HingeLoss(AdversarialLossStrategy):
         return real_loss, fake_loss
 
 
-def gradient_penalty_loss(discriminator, real_data, fake_data, eps=1e-8, critic_cond=None):
+def gradient_penalty_loss(
+    discriminator: Callable[..., torch.Tensor],
+    real_data: torch.Tensor,
+    fake_data: torch.Tensor,
+    eps: float = 1e-8,
+    critic_cond: "Mapping[str, Any] | None" = None,
+) -> torch.Tensor:
     """WGAN-GP: penalise the critic gradient norm away from 1 on interpolates.
 
     This is the **fourth** critic call on a discriminator step -- ``real``,
@@ -458,13 +459,20 @@ def gradient_penalty_loss(discriminator, real_data, fake_data, eps=1e-8, critic_
         Any: The scalar penalty. Always real, whatever the input dtype.
     """
     batch = real_data.size(0)
-    alpha = torch.rand(batch, 1, 1, 1, device=real_data.device)
-    interp = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
+    # One coefficient per sample at any rank: a fixed (B, 1, 1, 1) aligned against
+    # a 5-D volume indexes alpha by channel. Detached inputs keep the penalty a
+    # critic-only regularizer.
+    alpha = torch.rand((batch,) + (1,) * (real_data.dim() - 1), device=real_data.device)
+    interp = (alpha * real_data.detach() + (1 - alpha) * fake_data.detach()).requires_grad_(True)
     disc_interp = discriminator(interp, **(critic_cond or {}))
+    # The per-sample critic value is the mean over its output map, the quantity WGANLoss
+    # scores. Differentiating the map's SUM constrained a function P times larger for a
+    # P-patch critic, shrinking the enforced bound to about 1/P.
+    per_sample = disc_interp.reshape(batch, -1).mean(dim=1)
     grads = autograd.grad(
-        outputs=disc_interp,
+        outputs=per_sample,
         inputs=interp,
-        grad_outputs=torch.ones_like(disc_interp),
+        grad_outputs=torch.ones_like(per_sample),
         create_graph=True,
         retain_graph=True,
     )[0]
@@ -506,7 +514,7 @@ class CompositeGANLoss(nn.Module):
         lambda_gp: float,
         lambda_ssim: float = 0.0,
         lambda_lpips: float = 0.0,
-        **kwargs,
+        **kwargs: Any,
     ):
         """__init__.
 
@@ -541,14 +549,15 @@ class CompositeGANLoss(nn.Module):
         # A lambda > 0 advertises the mechanism: failing to build it must
         # RAISE, never silently zero the weight or skip the term at forward
         # time (pitfall #9/#16). Deferred imports avoid circular imports.
+        self.ssim_loss: nn.Module | None = None
+        self.ms_ssim_loss: nn.Module | None = None
+        self.lpips_loss: nn.Module | None = None
         if lambda_ssim > 0:
             try:
                 from .ssim_loss import SSIMLoss
             except ImportError as exc:
                 raise ImportError(_SSIM_IMPORT_HINT) from exc
             self.ssim_loss = SSIMLoss()
-        else:
-            self.ssim_loss = None
 
         if self.lambda_ms_ssim > 0:
             try:
@@ -556,8 +565,6 @@ class CompositeGANLoss(nn.Module):
             except ImportError as exc:
                 raise ImportError(_SSIM_IMPORT_HINT) from exc
             self.ms_ssim_loss = MSSSIMLoss()
-        else:
-            self.ms_ssim_loss = None
 
         if lambda_lpips > 0:
             try:
@@ -568,10 +575,8 @@ class CompositeGANLoss(nn.Module):
                 self.lpips_loss = LPIPSLoss(net="vgg")
             except ImportError as exc:
                 raise ImportError(_LPIPS_INSTALL_HINT) from exc
-        else:
-            self.lpips_loss = None
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Dummy forward for audit compliance.
 
         forward method for CompositeGANLoss.
@@ -592,22 +597,6 @@ class CompositeGANLoss(nn.Module):
             return torch.tensor(0.0, device=args[0].device)
         return torch.tensor(0.0)
 
-    def to(self, *args, **kwargs):
-        """Override to ensure loss functions are on correct device."""
-        super().to(*args, **kwargs)
-        # Move loss functions to the same device
-        if hasattr(self.l1_loss, "to"):
-            self.l1_loss = self.l1_loss.to(*args, **kwargs)
-        if hasattr(self.complex_l1_loss, "to"):
-            self.complex_l1_loss = self.complex_l1_loss.to(*args, **kwargs)
-        if self.perceptual_loss and hasattr(self.perceptual_loss, "to"):
-            self.perceptual_loss = self.perceptual_loss.to(*args, **kwargs)
-        if self.ssim_loss and hasattr(self.ssim_loss, "to"):
-            self.ssim_loss = self.ssim_loss.to(*args, **kwargs)
-        if self.lpips_loss and hasattr(self.lpips_loss, "to"):
-            self.lpips_loss = self.lpips_loss.to(*args, **kwargs)
-        return self
-
     def _feature_matching_loss(
         self,
         real_feats: Sequence[torch.Tensor] | None,
@@ -622,7 +611,8 @@ class CompositeGANLoss(nn.Module):
             torch.Tensor: Description.
         """
         if not real_feats or not fake_feats:
-            dev = real_feats[0].device if real_feats else fake_feats[0].device
+            present = real_feats or fake_feats
+            dev = present[0].device if present else torch.device("cpu")
             return torch.tensor(0.0, device=dev)
         loss = torch.tensor(0.0, device=real_feats[0].device)
         for rf, ff in zip(real_feats, fake_feats, strict=False):
@@ -700,7 +690,11 @@ class CompositeGANLoss(nn.Module):
             losses["lpips_loss"] = self.lpips_loss(fake_images, real_images) * self.lambda_lpips
         else:
             losses["lpips_loss"] = torch.tensor(0.0, device=real_images.device)
-        losses["g_total_loss"] = sum(losses.values())
+        terms = list(losses.values())
+        total = terms[0]
+        for term in terms[1:]:
+            total = total + term
+        losses["g_total_loss"] = total
         return losses
 
     def compute_discriminator_loss(
@@ -787,6 +781,9 @@ class VGG19FeatureExtractor(nn.Module):
     Handles 1-channel, 2-channel (k-space), and 3-channel inputs.
     """
 
+    mean: torch.Tensor
+    std: torch.Tensor
+
     def __init__(self, use_input_norm: bool = True, feature_layers: list[str] | None = None):
         """Initialize VGG19 feature extractor.
 
@@ -795,7 +792,7 @@ class VGG19FeatureExtractor(nn.Module):
             feature_layers: Which layers to extract. Default: relu1_2, relu2_2, relu3_3, relu4_3, relu5_4
         """
         try:
-            from torchvision import models
+            from torchvision import models  # type: ignore[import-untyped]
         except (ImportError, RuntimeError) as exc:  # pragma: no cover
             raise ImportError(
                 "VGG19FeatureExtractor requires torchvision, which is a core "
@@ -879,11 +876,7 @@ class VGG19FeatureExtractor(nn.Module):
         """
         # Handle multi-channel complex data: compute magnitude
         if x.shape[1] % 2 == 0 and not x.is_complex():
-            B, C, H, W = x.shape
-            x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(B, H, W, C // 2, 2)
-            x_complex = torch.view_as_complex(x_reshaped).permute(0, 3, 1, 2)
-            magnitude = torch.sqrt(torch.sum(x_complex.abs() ** 2, dim=1, keepdim=True))
-            x = magnitude.repeat(1, 3, 1, 1)
+            x = rss_magnitude(x).repeat(1, 3, 1, 1)
         # Handle 1-channel grayscale
         elif x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
@@ -913,8 +906,9 @@ class VGG19FeatureExtractor(nn.Module):
 class VGGPerceptualLoss(PerceptualLoss):
     """VGG19-based perceptual loss. Compatibility wrapper for SSOT PerceptualLoss."""
 
-    def __init__(self, _feature_extractor=None, _loss_func=None, _weights=None):
-        # Ignore legacy args and init SSOT PerceptualLoss
+    def __init__(
+        self, _feature_extractor: Any = None, _loss_func: Any = None, _weights: Any = None
+    ) -> None:
         """__init__.
 
         Args:
@@ -941,7 +935,7 @@ class CompositeLoss(nn.Module):
 
         \mathcal{L}_{Composite} = \sum_i w_i \mathcal{L}_i"""
 
-    def __init__(self, config: LossConfig = LossConfig()):
+    def __init__(self, config: LossConfig | None = None):
         """Initializes the composite loss module.
 
         Args:
@@ -949,14 +943,12 @@ class CompositeLoss(nn.Module):
                 and active strategies. Defaults to an empty LossConfig.
         """
         super().__init__()
+        config = config if config is not None else LossConfig()
         self.config = config
         adv = _select_adv_strategy(config.gan_loss_type)
-        perceptual = None
-        if config.lambda_perceptual > 0:
-            try:
-                perceptual = VGGPerceptualLoss()
-            except Exception:
-                perceptual = None
+        # A declared perceptual weight whose module cannot be built raises here;
+        # swallowing it would train the arm with the term silently at zero.
+        perceptual = VGGPerceptualLoss() if config.lambda_perceptual > 0 else None
         self._core: CompositeGANLoss = CompositeGANLoss(
             adv_strategy=adv,
             perceptual_loss=perceptual,
@@ -1125,11 +1117,17 @@ def _select_adv_strategy(
         return WGANLoss(label_smoothing=label_smoothing)
     if "hinge" in name:
         return HingeLoss(label_smoothing=label_smoothing)
-    if "lsgan" in name:
-        return LSGANLoss(label_smoothing=label_smoothing)
+    # "ralsgan" contains "lsgan", so the relativistic name is tested first.
     if "ralsgan" in name:
         return RALSGANLoss(label_smoothing=label_smoothing)
-    return StandardGANLoss(label_smoothing=label_smoothing)
+    if "lsgan" in name:
+        return LSGANLoss(label_smoothing=label_smoothing)
+    if name in ("", "standard", "vanilla", "bce"):
+        return StandardGANLoss(label_smoothing=label_smoothing)
+    raise ValueError(
+        f"Unknown gan_loss_type {name!r}: expected one of standard, vanilla, bce, "
+        "hinge, lsgan, ralsgan, wgan, wgan-gp."
+    )
 
 
 def create_gan_loss_system(
@@ -1161,6 +1159,7 @@ def create_gan_loss_system(
         dict[str, Any]: Description.
     """
     gan_loss_type = gan_loss_type.lower()
+    adv_strategy: AdversarialLossStrategy
     if "wgan" in gan_loss_type or "wasserstein" in gan_loss_type:
         adv_strategy = WGANLoss(label_smoothing=label_smoothing)
     elif "hinge" in gan_loss_type:
@@ -1244,171 +1243,35 @@ def get_gan_loss(
     """
     name = name.lower()
 
+    strategy: AdversarialLossStrategy
     if name in ("bce", "standard", "vanilla"):
         strategy = StandardGANLoss()
-
-        def d_loss(
-            real_outputs: torch.Tensor,
-            fake_outputs: torch.Tensor,
-        ) -> torch.Tensor:
-            """d_loss.
-
-            Args:
-                real_outputs (torch.Tensor): Description.
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            real_loss, fake_loss = strategy.compute_discriminator_loss(
-                real_outputs,
-                fake_outputs,
-            )
-            return real_loss + fake_loss
-
-        def g_loss(fake_outputs: torch.Tensor) -> torch.Tensor:
-            """g_loss.
-
-            Args:
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            return strategy.compute_generator_loss(fake_outputs)
-
     elif name == "hinge":
         strategy = HingeLoss()
-
-        def d_loss(
-            real_outputs: torch.Tensor,
-            fake_outputs: torch.Tensor,
-        ) -> torch.Tensor:
-            """d_loss.
-
-            Args:
-                real_outputs (torch.Tensor): Description.
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            real_loss, fake_loss = strategy.compute_discriminator_loss(
-                real_outputs,
-                fake_outputs,
-            )
-            return real_loss + fake_loss
-
-        def g_loss(fake_outputs: torch.Tensor) -> torch.Tensor:
-            """g_loss.
-
-            Args:
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            return strategy.compute_generator_loss(fake_outputs)
-
     elif name == "ralsgan":
         strategy = RALSGANLoss()
-
-        def d_loss(
-            real_outputs: torch.Tensor,
-            fake_outputs: torch.Tensor,
-        ) -> torch.Tensor:
-            """d_loss.
-
-            Args:
-                real_outputs (torch.Tensor): Description.
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            real_loss, fake_loss = strategy.compute_discriminator_loss(
-                real_outputs,
-                fake_outputs,
-            )
-            return real_loss + fake_loss
-
-        def g_loss(
-            fake_outputs: torch.Tensor,
-            real_outputs: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            """g_loss.
-
-            Args:
-                fake_outputs (torch.Tensor): Description.
-                real_outputs (Optional[torch.Tensor]): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            return strategy.compute_generator_loss(
-                fake_outputs,
-                real_outputs,
-            )
-
     elif name == "lsgan":
         strategy = LSGANLoss()
-
-        def d_loss(
-            real_outputs: torch.Tensor,
-            fake_outputs: torch.Tensor,
-        ) -> torch.Tensor:
-            """d_loss.
-
-            Args:
-                real_outputs (torch.Tensor): Description.
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            real_loss, fake_loss = strategy.compute_discriminator_loss(
-                real_outputs,
-                fake_outputs,
-            )
-            return real_loss + fake_loss
-
-        def g_loss(fake_outputs: torch.Tensor) -> torch.Tensor:
-            """g_loss.
-
-            Args:
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            return strategy.compute_generator_loss(fake_outputs)
-
     elif name in ("wgan", "wasserstein"):
         strategy = WGANLoss()
-
-        def d_loss(
-            real_outputs: torch.Tensor,
-            fake_outputs: torch.Tensor,
-        ) -> torch.Tensor:
-            """d_loss.
-
-            Args:
-                real_outputs (torch.Tensor): Description.
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            real_loss, fake_loss = strategy.compute_discriminator_loss(
-                real_outputs,
-                fake_outputs,
-            )
-            return real_loss + fake_loss
-
-        def g_loss(fake_outputs: torch.Tensor) -> torch.Tensor:
-            """g_loss.
-
-            Args:
-                fake_outputs (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            return strategy.compute_generator_loss(fake_outputs)
-
     else:
         raise ValueError(
             f"Unsupported GAN loss type: {name}. Supported: bce, hinge, ralsgan, lsgan, wgan",
         )
 
-    return d_loss, g_loss
+    def d_loss(real_outputs: torch.Tensor, fake_outputs: torch.Tensor) -> torch.Tensor:
+        """Sum of the strategy's real and fake discriminator terms."""
+        real_loss, fake_loss = strategy.compute_discriminator_loss(real_outputs, fake_outputs)
+        return real_loss + fake_loss
+
+    def g_loss(fake_outputs: torch.Tensor) -> torch.Tensor:
+        """The strategy's generator term."""
+        return strategy.compute_generator_loss(fake_outputs)
+
+    def g_loss_relativistic(
+        fake_outputs: torch.Tensor, real_outputs: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The relativistic generator term, which also reads the real scores."""
+        return strategy.compute_generator_loss(fake_outputs, real_outputs_d=real_outputs)
+
+    return d_loss, (g_loss_relativistic if isinstance(strategy, RALSGANLoss) else g_loss)

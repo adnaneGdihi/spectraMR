@@ -80,6 +80,41 @@ def _cartesian_mask(h: int, w: int, acceleration: float) -> torch.Tensor:
     return mask
 
 
+def _rep_mask(config: Any) -> torch.Tensor | None:
+    """``(1, 1, H, W)`` M1 of a declared ``complementary_rep_masking``, else ``None``.
+
+    The arm's own mask family on its own patch grid: a 1-D stand-in would certify
+    an operator a Poisson-disc or pseudo-radial arm never trains with, and the
+    R fallback reads the compressed-sensing default, not the transform's R. The
+    support is the whole axis; the partial-FOV band is data, not configuration.
+    """
+    from spectramr.data.transforms.complementary_rep_masking import draw_rep_masks
+    from spectramr.data.transforms.registry import build_transform
+    from spectramr.data.transforms.rep_mask_patterns import CARTESIAN_1D, draw_rep_masks_2d
+
+    data = getattr(config, "data", None)
+    entries = getattr(getattr(data, "processing", None), "transforms", None) or []
+    entry = next((e for e in entries if getattr(e, "name", None) == "complementary_rep_masking"), None)
+    if entry is None:
+        return None
+    t = build_transform("complementary_rep_masking", **entry.resolved_kwargs())
+    patch = list(getattr(getattr(data, "sampling", None), "patch_size", None) or [256, 256])
+    height, width = int(patch[0]), int(patch[1])
+    support = torch.ones(width, dtype=torch.bool)
+    kwargs = {
+        "acceleration": t.acceleration,
+        "center_fraction": t.center_fraction,
+        "mode": "same",
+        "keys": ("ei_probe", 0, t.seed),
+    }
+    if t.pattern == CARTESIAN_1D:
+        line, _ = draw_rep_masks(support, **kwargs)
+        mask = line[None, :].expand(height, width)
+    else:
+        mask, _, _ = draw_rep_masks_2d(t.pattern, support, height, **kwargs)
+    return mask.to(torch.float32)[None, None]
+
+
 def _build_model(config: Any) -> torch.nn.Module:
     """Instantiate the configured recon model (signature-filtered kwargs)."""
     import inspect
@@ -150,7 +185,10 @@ def ei_forward_probe(config: Any, device: str = "cpu") -> ProbeResult:
             }
         group = get_group_action(group_name, **group_kwargs)
 
-        mask = _cartesian_mask(side, side, accel).to(dev)
+        rep_mask = _rep_mask(config)
+        mask = _cartesian_mask(side, side, accel) if rep_mask is None else rep_mask
+        mask = mask.to(dev)
+        height, width = mask.shape[-2:]
         mask_c = mask.to(torch.complex64)
 
         def _to_complex(x_model: torch.Tensor) -> torch.Tensor:
@@ -170,7 +208,7 @@ def ei_forward_probe(config: Any, device: str = "cpu") -> ProbeResult:
             return _to_model_input(ifft2c(mask_c * k))
 
         # ── (i) numeric identifiability ────────────────────────────────
-        phantom = torch.randn(1, in_ch, side, side, device=dev)
+        phantom = torch.randn(1, in_ch, height, width, device=dev)
         margin = sensing_margin(forward_op, adjoint_to_model, group, phantom, n_samples=4)
         if margin <= _MIN_SENSING_MARGIN:
             return _fail(
@@ -223,7 +261,7 @@ def ei_forward_probe(config: Any, device: str = "cpu") -> ProbeResult:
         message=(
             f"equivariant_imaging: group='{group_name}', sensing_margin={margin:.2e}, "
             f"equivariance fires (loss={float(ei_loss.detach()):.3e}, "
-            f"grad-norm={grad_sq**0.5:.2e}) on {side}x{side}."
+            f"grad-norm={grad_sq**0.5:.2e}) on {height}x{width}."
         ),
         severity="info",
         device=device,

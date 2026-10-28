@@ -24,6 +24,7 @@ import math
 import torch
 from torch import Tensor
 
+from spectramr.data.transforms.normalization import compress_kspace_log, decompress_kspace_log
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
 from spectramr.models.diffusion.sample_measurement import SampleMeasurement
@@ -64,10 +65,14 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
         im_size: tuple[int, int] = (256, 256),
         density_compensation: str = "radial",
         schedule_kwargs: dict | None = None,
+        kspace_log_scaled: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(schedule_kwargs=schedule_kwargs, **kwargs)
         self.schedule_kwargs = dict(schedule_kwargs or {})
+        # Masking commutes with the element-wise log1p compression; NUFFT
+        # resampling does not, so q_sample works on the linear plane (#2341).
+        self.kspace_log_scaled = bool(kspace_log_scaled)
         if num_spokes < 1 or samples_per_spoke < 1:
             raise ValueError(
                 f"num_spokes and samples_per_spoke must be >= 1, got "
@@ -94,11 +99,6 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
                 "enable_dynamic_mask randomises the Cartesian mask per sample; "
                 "a golden-angle prefix IS the acquisition and has no per-sample "
                 "randomisation. Set it false on a non-Cartesian arm."
-            )
-        if getattr(self, "prior_channel_range", None) is not None:
-            raise ValueError(
-                "prior_channel_range keeps a channel range fully sampled on the "
-                "grid; this acquisition has no grid bins to keep."
             )
         self.num_spokes = int(num_spokes)
         self.samples_per_spoke = int(samples_per_spoke)
@@ -333,6 +333,8 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
         traj = self.trajectory.to(device)
         dcf = self.dcf.to(device)
 
+        if self.kspace_log_scaled:
+            x_start = decompress_kspace_log(x_start, channel_dim=1)
         image = ifft2c(x_start)
         y_full = self.nufft.forward_project(image, traj)
         masks = self.sample_masks.to(device)[t.clamp(0, self.sample_masks.shape[0] - 1)]
@@ -355,7 +357,12 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
         coverage = self.grid_coverage.to(device)[
             t.clamp(0, self.grid_coverage.shape[0] - 1)
         ].unsqueeze(1)
-        return fft2c(gridded.reshape(batch, channels, height, width)), coverage
+        x_t = fft2c(gridded.reshape(batch, channels, height, width))
+        if self.kspace_log_scaled:
+            # The measurement above stays linear; the network keeps its input
+            # in the compressed units the rest of the arm uses.
+            x_t = compress_kspace_log(x_t, channel_dim=1)
+        return x_t, coverage
 
     @property
     def last_sample_measurement(self) -> SampleMeasurement | None:

@@ -104,6 +104,54 @@ class TrainingConfigEquivariantImaging(BaseModel):
         ge=0,
         description="RNG seed for reproducible group-element sampling.",
     )
+    measurement_target: Literal["measured", "alternate_repetition"] = Field(
+        default="measured",
+        description=(
+            "What the measurement-consistency anchor scores the reconstruction "
+            "against. 'measured' (default): the input measurement y itself, "
+            "||A x_hat - y||^2. 'alternate_repetition' (Rep-EI): an independent "
+            "repetition of the same slice on the lines `loss_mask` selects, scored "
+            "by the declared `masked_kspace_l2` loss -- Lemma 8 of "
+            "experiments/inprogress/n2n/PAPER.md with M_j = M_i. Its noise is "
+            "independent of the input's, so the anchor is the supervised loss on "
+            "those lines plus a constant. Requires `loss_mask` in the batch "
+            "(`complementary_rep_masking` emits it), a `masked_kspace_l2` entry "
+            "in losses.kspace_losses, and robust_correction off."
+        ),
+    )
+
+    anchor_mask: Literal["input", "with_structural_zeros"] = Field(
+        default="input",
+        description=(
+            "Which k-space locations the measured anchor scores. 'input': the input "
+            "mask M1 only, so every location outside the acquired lines is "
+            "unconstrained. 'with_structural_zeros': M1 plus the columns outside the "
+            "acquired phase-encode support, where y is zero by construction, so the "
+            "reconstruction is pulled to the acquisition's band without any reference. "
+            "Needs `support_mask` in the batch (`complementary_rep_masking` emits it)."
+        ),
+    )
+    anchor_normalization: Literal["all_entries", "selected"] = Field(
+        default="all_entries",
+        description=(
+            "How the measured anchor is averaged. 'all_entries' divides by every "
+            "k-space entry, zeros included, so its scale falls with the acceleration "
+            "and alpha_equivariance means a different balance on every arm. "
+            "'selected' divides by the number of scored entries, as masked_kspace_l2 "
+            "does, so alpha is comparable across arms."
+        ),
+    )
+    equivariance_target: Literal["transformed", "band_limited"] = Field(
+        default="transformed",
+        description=(
+            "The reference the equivariance term matches f(A T_g x_hat) to. "
+            "'transformed': T_g x_hat. 'band_limited': T_g x_hat projected onto the "
+            "acquired phase-encode support, so a 90-degree rotation, which moves "
+            "full-band readout content onto the band-limited axis, never asks the "
+            "network to invent content outside the acquired band. Needs "
+            "`support_mask` in the batch."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_robust_requires_noise(self) -> TrainingConfigEquivariantImaging:
@@ -112,6 +160,19 @@ class TrainingConfigEquivariantImaging(BaseModel):
                 "equivariant_imaging.robust_correction=true requires "
                 "noise_std_estimate (the k-space noise σ); none was set "
                 "(pitfall #15: the knob must be wired)."
+            )
+        if self.robust_correction and self.measurement_target != "measured":
+            raise ValueError(
+                "equivariant_imaging.robust_correction replaces the anchor on the "
+                "MEASURED y with a GSURE risk; it has no meaning against an "
+                f"alternate repetition (measurement_target={self.measurement_target!r})."
+            )
+        anchor_changed = self.anchor_mask != "input" or self.anchor_normalization != "all_entries"
+        if anchor_changed and (self.robust_correction or self.measurement_target != "measured"):
+            raise ValueError(
+                "equivariant_imaging.anchor_mask / anchor_normalization shape the plain "
+                "anchor on the measured y; the GSURE risk and the alternate-repetition "
+                "anchor (masked_kspace_l2) never read them."
             )
         return self
 

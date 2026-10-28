@@ -5,56 +5,129 @@ Fast Iterative Shrinkage-Thresholding Algorithm (FISTA).
 """
 
 import math
+from typing import Protocol
 
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.forward_operator import MultiCoilForwardOperator
+from spectramr.infrastructure.physics.wavelet_ops import (
+    OrthogonalWavelet2D,
+    complex_soft_threshold,
+)
+
+#: The regularizers the solver implements; anything else raises.
+REGULARIZATIONS = ("identity", "tv", "wavelet")
+
+
+class LinearOperator(Protocol):
+    """What FISTA needs from ``A``: the forward map and its adjoint."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor: ...
+
+    def adjoint(self, y: torch.Tensor) -> torch.Tensor: ...
 
 
 class FISTAMBIRSolver(nn.Module):
     """FISTA solver for L1-regularized Model-Based Image Reconstruction.
 
-    Solves: min_x 0.5 * ||A(x) - y||_2^2 + lambda * ||Psi(x)||_1
+    Solves: min_x 0.5 * ||A(x) - y||_2^2 + lambda * R(x)
 
-    Where A is the MultiCoilForwardOperator (with B0/S-maps), y is measured data.
+    Where A is any forward/adjoint pair (``MultiCoilForwardOperator``,
+    ``MulticoilEIOperator``) and R is one of ``REGULARIZATIONS``:
 
-    Note:
-        The 'tv' regularizer uses a surrogate proximal step (see ``_apply_tv``),
-        not the exact TV proximal map, so FISTA's convergence guarantees hold
-        rigorously only for the identity / l1-soft-threshold regularizers.
+    * ``identity``: ``||x||_1``, exact prox (complex soft threshold);
+    * ``wavelet``: ``||D Psi x||_1`` with ``Psi`` an orthonormal periodized wavelet
+      and ``D`` selecting the detail coefficients (the coarsest approximation is not
+      penalised). Exact prox, ``Psi^H soft(Psi x)``, because ``Psi`` is orthonormal;
+    * ``tv``: a surrogate proximal step (see ``_apply_tv``), not the exact TV prox,
+      so FISTA's convergence guarantees do not cover it.
+
+    Args:
+        forward_operator: the ``A`` to invert.
+        num_iterations: FISTA iterations.
+        lambda_reg: regularization weight.
+        step_size: upper bound on the gradient step, or ``None`` for exactly ``1/L``.
+        regularization: one of ``REGULARIZATIONS``; anything else raises.
+        wavelet: the transform ``Psi``; required by, and only by, ``"wavelet"``.
+        lipschitz: a known upper bound on ``||A^H A||``; ``None`` estimates it by
+            power iteration, which approaches it from below.
     """
 
     def __init__(
         self,
-        forward_operator: MultiCoilForwardOperator,
+        forward_operator: LinearOperator,
         num_iterations: int = 50,
         lambda_reg: float = 0.01,
-        step_size: float = 0.5,
+        step_size: float | None = 0.5,
         regularization: str = "tv",
+        wavelet: OrthogonalWavelet2D | None = None,
+        lipschitz: float | None = None,
     ):
-        """__init__.
-
-        Args:
-            forward_operator (MultiCoilForwardOperator): Description.
-            num_iterations (int): Description.
-            lambda_reg (float): Description.
-            step_size (float): Description.
-            regularization (str): Description.
-        """
         super().__init__()
+        if regularization not in REGULARIZATIONS:
+            raise ValueError(
+                f"Unknown regularization {regularization!r}; choose one of {REGULARIZATIONS}."
+            )
+        if (regularization == "wavelet") != (wavelet is not None):
+            raise ValueError(
+                "regularization='wavelet' requires a wavelet transform, and no other "
+                f"regularization reads one (got regularization={regularization!r}, "
+                f"wavelet={wavelet!r})."
+            )
+        if lambda_reg < 0 or num_iterations < 0:
+            raise ValueError(
+                f"lambda_reg and num_iterations must be >= 0, got {lambda_reg}, {num_iterations}."
+            )
+        if lipschitz is not None and not lipschitz > 0:
+            raise ValueError(f"lipschitz must be a positive bound, got {lipschitz}.")
         self.A = forward_operator
         self.num_iterations = num_iterations
         self.lambda_reg = lambda_reg
         self.alpha = step_size
         self.regularization = regularization
+        self.wavelet = wavelet
+        self.lipschitz = lipschitz
 
     def _soft_threshold(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
-        """Apply soft thresholding to a complex tensor."""
-        mag = torch.abs(x)
-        # max(0, |x| - t) * (x / |x|)
-        scale = torch.clamp(mag - threshold, min=0.0) / (mag + 1e-8)
-        return x * scale
+        """Apply soft thresholding to a complex tensor (exact prox of the l1 norm)."""
+        return complex_soft_threshold(x, threshold)
+
+    def _wavelet_details(self, coeffs: torch.Tensor) -> torch.Tensor:
+        assert self.wavelet is not None
+        return self.wavelet.detail_mask(*coeffs.shape[-2:], device=coeffs.device)
+
+    def _apply_wavelet(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        r"""Exact :math:`\operatorname{prox}_{\tau\lVert D\Psi\cdot\rVert_1}`."""
+        assert self.wavelet is not None
+        coeffs = self.wavelet.forward(x)
+        shrunk = torch.where(
+            self._wavelet_details(coeffs), self._soft_threshold(coeffs, threshold), coeffs
+        )
+        return self.wavelet.inverse(shrunk)
+
+    def regularizer(self, x: torch.Tensor) -> torch.Tensor:
+        """``R(x)`` summed over the batch, for the objective (not used by the iteration)."""
+        if self.regularization == "wavelet":
+            assert self.wavelet is not None
+            coeffs = self.wavelet.forward(x)
+            return coeffs.abs()[..., self._wavelet_details(coeffs)].sum()
+        if self.regularization == "tv":
+            dh = x - torch.roll(x, shifts=1, dims=-2)
+            dw = x - torch.roll(x, shifts=1, dims=-1)
+            return dh.abs().sum() + dw.abs().sum()
+        return x.abs().sum()
+
+    def objective(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """``0.5 ||A x - y||^2 + lambda R(x)``, summed over the batch."""
+        residual = self.A.forward(x) - y
+        return 0.5 * residual.abs().pow(2).sum() + self.lambda_reg * self.regularizer(x)
+
+    def _prox(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        if self.regularization == "tv":
+            return self._apply_tv(x, threshold)
+        if self.regularization == "wavelet":
+            return self._apply_wavelet(x, threshold)
+        return self._soft_threshold(x, threshold)
 
     def _apply_tv(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
         """One-step TV gradient surrogate (NOT the exact TV proximal operator).
@@ -83,69 +156,68 @@ class FISTAMBIRSolver(nn.Module):
 
         return x - div
 
-    def forward(self, y: torch.Tensor, x_init: torch.Tensor | None = None) -> torch.Tensor:
-        """Run FISTA iterations to reconstruct image.
+    def forward(
+        self,
+        y: torch.Tensor | None = None,
+        x_init: torch.Tensor | None = None,
+        *,
+        adjoint_measurement: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        r"""Run FISTA from the measurement ``y`` or from :math:`b=A^Hy` alone.
+
+        The data-term gradient is :math:`A^H(Az-y)=A^HAz-b`, so the iteration needs
+        :math:`y` only through :math:`b`. A caller that already holds :math:`b` (the
+        SENSE-combined zero-filled image a reconstruction strategy feeds its
+        network) passes it as ``adjoint_measurement`` and the minimiser is the same.
 
         Args:
-            y: Acquired k-space measurements [B, C, H, W]
-            x_init: Optional initial guess [B, 1, H, W] (e.g. adjoint recon)
+            y: acquired k-space ``[B, C, H, W]``; exclusive with ``adjoint_measurement``.
+            x_init: initial image ``[B, 1, H, W]``; defaults to :math:`b`.
+            adjoint_measurement: :math:`b=A^Hy`, ``[B, 1, H, W]`` complex.
 
         Returns:
-            Reconstructed image [B, 1, H, W]
-
-        forward method for FISTAMBIRSolver.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            y (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            x_init (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        if x_init is None:
-            # Start with simple adjoint reconstruction
-            x = self.A.adjoint(y)
-        else:
-            x = x_init.clone()
+            The reconstructed image ``[B, 1, H, W]``.
+        """
+        if (y is None) == (adjoint_measurement is None):
+            raise ValueError("FISTAMBIRSolver needs exactly one of y and adjoint_measurement.")
+        b = self.A.adjoint(y) if adjoint_measurement is None else adjoint_measurement
+        x = b.clone() if x_init is None else x_init.clone()
 
         # FISTA's O(1/k^2) guarantee needs the gradient step alpha <= 1/L with
-        # L = ||A*A||_2 (the Lipschitz constant of the data-fidelity gradient). A
-        # fixed alpha diverges when ||A*A|| > 1/alpha — easy to hit for multi-coil
-        # A where ||S|| > 1. Estimate L once via power iteration (loop-invariant)
-        # and clamp the effective step size; the configured ``step_size`` is then
-        # an upper bound, not an unguarded constant.
-        with torch.no_grad():
-            v = torch.randn_like(x)
-            v = v / (v.norm() + 1e-12)
-            lam = v.norm().real  # real-valued Lipschitz estimate
-            for _ in range(8):
-                av = self.A.adjoint(self.A.forward(v))
-                lam = av.norm()  # ||A*A v|| / ||v|| with ||v|| = 1
-                v = av / (lam + 1e-12)
-        # ``lam`` (a vector norm) is real; keep alpha real so the complex
-        # gradient step ``alpha * gradient`` is well-defined.
-        alpha = torch.minimum(lam.new_tensor(self.alpha), 1.0 / lam.clamp_min(1e-8))
+        # L = ||A*A||_2. A declared bound is used as is; otherwise L is estimated by
+        # power iteration, which approaches it from below. ``step_size`` caps the
+        # step; ``None`` takes exactly 1/L.
+        if self.lipschitz is not None:
+            lam = x.real.new_tensor(self.lipschitz)
+        else:
+            with torch.no_grad():
+                v = torch.randn_like(x)
+                v = v / (v.norm() + 1e-12)
+                lam = v.norm().real
+                for _ in range(8):
+                    av = self.A.adjoint(self.A.forward(v))
+                    lam = av.norm()  # ||A*A v|| / ||v|| with ||v|| = 1
+                    v = av / (lam + 1e-12)
+        inverse_l = 1.0 / lam.clamp_min(1e-8)
+        alpha = inverse_l if self.alpha is None else torch.minimum(lam.new_tensor(self.alpha), inverse_l)
 
         z = x.clone()  # Nesterov momentum state
         t = 1.0  # Momentum scaling
 
-        for k in range(self.num_iterations):
+        for _ in range(self.num_iterations):
             # 1. Evaluate gradient at z
-            residual = self.A.forward(z) - y
-            gradient = self.A.adjoint(residual)
+            # With y in hand the residual form keeps precision near the solution,
+            # where A^H A z and b agree to most of their digits.
+            if y is None:
+                gradient = self.A.adjoint(self.A.forward(z)) - b
+            else:
+                gradient = self.A.adjoint(self.A.forward(z) - y)
 
             # 2. Gradient Descent Step (Lipschitz-safe step size)
             x_next_unproxed = z - alpha * gradient
 
             # 3. Proximal Step (Regularization)
-            if self.regularization == "tv":
-                x_next = self._apply_tv(x_next_unproxed, self.lambda_reg * alpha)
-            else:
-                x_next = self._soft_threshold(x_next_unproxed, self.lambda_reg * alpha)
+            x_next = self._prox(x_next_unproxed, self.lambda_reg * alpha)
 
             # 4. Nesterov Momentum Update
             t_next = (1.0 + math.sqrt(1.0 + 4.0 * t * t)) / 2.0

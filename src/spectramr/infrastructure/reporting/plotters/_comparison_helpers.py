@@ -84,7 +84,10 @@ def _format_metric_str(
     parts: list[str] = []
     if "psnr" in show:
         try:
-            parts.append(f"PSNR {psnr(pred, ref):.1f}")
+            # Peak = max|ref|, the convention fiducial_check uses; a fixed 1.0
+            # printed negative dB on every magnitude image outside [0, 1].
+            peak = float(np.abs(ref).max()) or 1.0
+            parts.append(f"PSNR {psnr(pred, ref, data_range=peak):.1f}")
         except Exception:
             pass
     if "ssim" in show:

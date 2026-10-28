@@ -1050,17 +1050,6 @@ dimension-mismatch detection.  All raise ``ValueError`` (never fall back
 silently) so out-of-spec tensors are caught at module boundaries rather than
 deep inside forward passes.
 
-Parameter Normalization (``models.parameter_normalization``)
--------------------------------------------------------------
-
-:class:`ParameterNormalizer` maintains a per-model-type
-:class:`ModelParameterSchema` registry.  Call
-:func:`normalize_model_parameters` to remap legacy alias keys (e.g.
-``in_channels`` → canonical target) and
-:func:`validate_model_parameters` to obtain a list of validation errors
-before constructing a module.
-
-
 Stability Utilities
 ===================
 
@@ -1297,3 +1286,28 @@ References
 
 19. Hatamizadeh, A., et al. "DiffiT: Diffusion Vision Transformers for
     Image Generation." ECCV, 2024.
+
+
+Line-token backbones (``kspace_ar``, ``kspace_masked``)
+-------------------------------------------------------
+
+Two further ``backbone_type`` values tokenise **k-space lines** instead of patches,
+because the cohort masks remove whole lines and a square patch is often half
+sampled. Both are one-step restoration nets inside the unchanged cold-diffusion
+loss and reverse sampler, conditioned on the timestep and contrast through the
+same adaLN-Zero path as ``dit``; they need ``force_pure_kspace: true`` and
+``attention_type: none``.
+
+``kspace_ar``
+   Prefix-causal transformer over lines ordered centre-out. Acquired lines attend
+   to each other in both directions (the prompt); a missing line is a learned
+   mask token that attends to every acquired line and to the missing lines nearer
+   the centre, so gaps are filled coarse to fine.
+``kspace_masked``
+   Bidirectional transformer; lines absent from the current ``mask`` are replaced
+   by a learned mask token.
+
+``model_kwargs.line_axis`` (``-2`` rows or ``-1`` columns, default ``-1``, the M4Raw and fastMRI-brain phase-encode axis) must name
+the axis the mask removes lines along, i.e. ``data.acquisition.phase_encode_axis``
+for ``mask_direction: phase``. A mask that varies along the line raises on the
+first forward in each of train and eval mode. ``depth``, ``heads`` and ``mlp_ratio`` read as for ``dit``.

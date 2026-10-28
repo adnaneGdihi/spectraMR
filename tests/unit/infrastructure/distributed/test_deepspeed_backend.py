@@ -198,6 +198,18 @@ class TestStepPolicyOwnership:
             torch.tensor(float("nan")), name="g", global_step=1, scaler=None
         )
 
+    def test_guard_loss_records_nothing_into_an_attached_monitor(self) -> None:
+        """The engine skips the overflowing step itself, so the per-config flag
+        must not reach the loop's divergence verdict either."""
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        DeepSpeedStepPolicy().guard_loss(
+            torch.tensor(float("nan")), name="g", global_step=1, scaler=None, monitor=monitor
+        )
+        monitor.end_step(1)
+        assert monitor.resolve() is None
+
     def test_clip_gradients_is_a_no_op(self) -> None:
         """Clipping is declared in the ds_config and applied by the engine;
         doing it here too would clip already-clipped gradients."""
@@ -496,6 +508,57 @@ class TestEngineCompileIsActuallyCalled:
             self._initialize(
                 monkeypatch, {"compile": {"deepcompile": True}}, engine=_OldEngine()
             )
+
+
+class TestDeepCompileGpuFamilyGate:
+    """Planted violations (LM-16): DeepCompile lowers through Inductor, so a P100
+    rank must be refused before ``deepspeed.initialize`` rather than at step 1."""
+
+    def _initialize(self, monkeypatch, config, capability):
+        import torch
+
+        import spectramr.core.device_capabilities as dc
+        import spectramr.infrastructure.distributed.deepspeed_backend.runtime as rt
+
+        calls = []
+        fake_ds = SimpleNamespace(
+            initialize=lambda **kw: calls.append(kw)
+            or (TestEngineCompileIsActuallyCalled._FakeEngine(), "opt", None, "sched")
+        )
+        monkeypatch.setattr(rt, "require_deepspeed", lambda: fake_ds)
+        monkeypatch.setattr(rt, "_deepcompile_device", lambda model: torch.device("cuda", 0))
+        monkeypatch.setattr(dc, "capability_of_device", lambda device: capability)
+        import spectramr.core.compile_capability as cc
+
+        monkeypatch.setattr(cc, "triton_available", lambda: True)
+        rt.initialize_deepspeed_engine(
+            model=None, optimizer=None, lr_scheduler=None, config=config
+        )
+        return calls
+
+    def test_a_p100_rank_is_refused_before_initialize(self, monkeypatch):
+        from spectramr.core.compile_capability import CompileUnsupportedError
+
+        calls = []
+        with pytest.raises(CompileUnsupportedError, match=r"6\.0"):
+            calls = self._initialize(monkeypatch, {"compile": {"deepcompile": True}}, (6, 0))
+        assert calls == []
+
+    def test_an_unreadable_capability_is_refused(self, monkeypatch):
+        from spectramr.core.compile_capability import CompileUnsupportedError
+
+        with pytest.raises(CompileUnsupportedError, match="could not be read"):
+            self._initialize(monkeypatch, {"compile": {"deepcompile": True}}, None)
+
+    @pytest.mark.parametrize("capability", [(7, 0), (8, 9)])
+    def test_volta_and_ada_ranks_initialize(self, monkeypatch, capability):
+        calls = self._initialize(monkeypatch, {"compile": {"deepcompile": True}}, capability)
+        assert len(calls) == 1
+
+    def test_a_p100_without_deepcompile_is_not_refused(self, monkeypatch):
+        """The gate guards compilation, not DeepSpeed itself."""
+        calls = self._initialize(monkeypatch, {"compile": {"deepcompile": False}}, (6, 0))
+        assert len(calls) == 1
 
 
 class TestEveryRenderedConfigSurvivesTheRealParser:

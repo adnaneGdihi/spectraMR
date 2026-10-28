@@ -20,6 +20,7 @@ Coverage areas (per ``TODO/audit/data_layer_unification_plan.md`` Phase 3):
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from spectramr.config.schemas.augmentation import AugmentationConfigSchema
 from spectramr.config.schemas.data import (
@@ -29,7 +30,6 @@ from spectramr.config.schemas.data import (
     ModeSamplerSchema,
 )
 from spectramr.data.builders.torchio_queue_builder import TorchIOQueueConfig
-
 
 # ── Section 1: legacy → modes derivation ────────────────────────────────────
 
@@ -51,7 +51,6 @@ def test_legacy_yaml_derives_val_full_volume_by_default() -> None:
     val = c.resolve_mode("val")
     assert val.sampler.type == "full"
     assert val.sampler.shuffle is False
-    assert val.augmentation_enabled is False
 
 
 def test_legacy_yaml_derives_infer_and_eval_full_no_aug() -> None:
@@ -60,22 +59,18 @@ def test_legacy_yaml_derives_infer_and_eval_full_no_aug() -> None:
         cfg = c.resolve_mode(mode)
         assert cfg.sampler.type == "full"
         assert cfg.sampler.shuffle is False
-        assert cfg.augmentation_enabled is False
 
 
-def test_legacy_aug_enabled_propagates_to_train_mode() -> None:
-    """When ``data.augmentation.enabled=True``, the derived
-    ``modes.train.augmentation_enabled`` mirrors it."""
+def test_mode_block_has_no_augmentation_switch() -> None:
+    """Nothing read ``modes.<mode>.augmentation_enabled``; declaring it raises.
+
+    ``data.augmentation.enabled`` is the one switch: it gates the train chain, and
+    the val chain builds no augmentation step.
+    """
+    with pytest.raises(ValidationError, match="augmentation_enabled"):
+        ModeConfigSchema(augmentation_enabled=True)
     c = DataConfigSchema(augmentation=AugmentationConfigSchema(enabled=True))
-    assert c.resolve_mode("train").augmentation_enabled is True
-    # Val/infer/eval always disable aug regardless of legacy field.
-    for mode in ("val", "infer", "eval"):
-        assert c.resolve_mode(mode).augmentation_enabled is False
-
-
-def test_legacy_aug_disabled_propagates_to_train_mode() -> None:
-    c = DataConfigSchema(augmentation=AugmentationConfigSchema(enabled=False))
-    assert c.resolve_mode("train").augmentation_enabled is False
+    assert not hasattr(c.resolve_mode("train"), "augmentation_enabled")
 
 
 # ── Section 2: user overrides ───────────────────────────────────────────────
@@ -191,26 +186,26 @@ def test_is_graph_paradigm_false_by_default() -> None:
 
 def test_is_graph_paradigm_true_when_graph_encoding_enabled() -> None:
     """Amendment A: graph datasets bypass the patch/resample pipeline."""
-    c = DataConfigSchema(enable_graph_encoding=True)
+    c = DataConfigSchema(domain={"enable_graph_encoding": True})
     assert c.is_graph_paradigm() is True
 
 
 def test_graph_paradigm_with_modes_still_dispatches_modes() -> None:
-    """Graph paradigm CAN carry ``modes`` (e.g., for augmentation_enabled
-    or transforms_override); ``is_graph_paradigm`` is purely an
+    """Graph paradigm CAN carry ``modes`` (e.g., for a sampler or
+    transforms_override); ``is_graph_paradigm`` is purely an
     early-exit signal for the spatial-sampling layer.
 
     The downstream builder (Phase 3.5 / Phase 2) consults
     ``is_graph_paradigm`` to skip GridSampler / Resample only — other
     mode-aware behavior remains in effect."""
     c = DataConfigSchema(
-        enable_graph_encoding=True,
+        domain={"enable_graph_encoding": True},
         modes=DataModesSchema(
-            train=ModeConfigSchema(augmentation_enabled=True)
+            train=ModeConfigSchema(transforms_override=[{"name": "noop"}])
         ),
     )
     assert c.is_graph_paradigm() is True
-    assert c.resolve_mode("train").augmentation_enabled is True
+    assert c.resolve_mode("train").transforms_override == [{"name": "noop"}]
 
 
 # ── Section 5: invariants ───────────────────────────────────────────────────

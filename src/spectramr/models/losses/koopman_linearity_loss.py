@@ -12,9 +12,10 @@ This loss makes the ``koopman_fmri`` paradigm honour that mathematics rather
 than degrading to a vanilla reconstruction term. Given a *temporal* sequence
 (an fMRI volume series), it
 
-1. lifts each spatial snapshot into the learned observable space
-   :math:`\Phi` using the encoder of the existing primitive
-   :class:`spectramr.models.temporal.koopman_operator.KoopmanMotionFilter`;
+1. lifts each spatial snapshot into a fixed observable space :math:`\Phi`
+   using the encoder of the existing primitive
+   :class:`spectramr.models.temporal.koopman_operator.KoopmanMotionFilter`,
+   seeded and frozen (extended DMD on random features);
 2. fits the best-fit linear Koopman operator :math:`K` to the prediction's
    *own* snapshots by least squares (the exact-DMD estimator
    :math:`K = Z_{+}\,Z_{-}^{+}`, where :math:`Z_{-} = [\Phi(x_0)\dots
@@ -30,6 +31,12 @@ yields a positive one. The fitted :math:`K` is detached so the loss measures
 *how far the prediction is from admitting a constant linear propagator*, not
 how well a free matrix can memorise it.
 
+The fit has ``L^2`` unknowns and ``(T-1) L`` equations, so with ``T - 1 <= L``
+it interpolates any series exactly and the residual is ~0 whatever the dynamics
+(#2279); the loss raises in that regime instead of returning a zero. The encoder
+is frozen because nothing trains a loss module's parameters, and training it
+against this residual alone would be minimised by a constant :math:`\Phi`.
+
 Reference:
     Lusch, Kutz & Brunton, "Deep learning for universal linear embeddings of
     nonlinear dynamics," *Nature Communications*, 2018.
@@ -44,6 +51,9 @@ import torch.nn as nn
 
 from spectramr.models.losses.registry import register_loss
 from spectramr.models.temporal.koopman_operator import KoopmanMotionFilter
+
+#: Every rebuild of the observable encoder draws the same weights.
+_ENCODER_SEED = 0
 
 
 @register_loss(
@@ -62,6 +72,7 @@ class KoopmanLinearityLoss(nn.Module):
 
     The loss is computed on ``prediction`` (the model's reconstructed series);
     ``target`` is accepted for API parity and not required by the residual.
+    The series needs ``T >= latent_dim + 2`` snapshots.
 
     Args:
         latent_dim: Dimension of the Koopman observable space :math:`\Phi`.
@@ -90,24 +101,26 @@ class KoopmanLinearityLoss(nn.Module):
         self.latent_dim = latent_dim
         self.ridge = ridge
         self.reduction = reduction
-        # Spatial dimensionality is unknown until the first forward pass, so
-        # the observable encoder is built lazily once H*W is known.
+        # H*W is unknown until the first forward pass, so the encoder is rebuilt
+        # for it then; seeding makes the rebuild the same observable every time.
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.koopman: KoopmanMotionFilter | None = None
-        # Eagerly build a default-sized filter so the primitive is always
-        # present (tests / introspection); it is rebuilt if the spatial
-        # dimensionality differs from the default.
         self._build_filter(input_dim=64)
 
     def _build_filter(self, input_dim: int) -> None:
-        self.koopman = KoopmanMotionFilter(
-            input_dim=input_dim,
-            latent_dim=self.latent_dim,
-            hidden_dim=self.hidden_dim,
-            num_layers=self.num_layers,
-            prediction_horizon=1,
-        )
+        # Seed only the CPU generator the fork restores: torch.manual_seed would
+        # also reseed every CUDA generator, which fork_rng(devices=[]) leaves unrestored.
+        with torch.random.fork_rng(devices=[]):
+            torch.default_generator.manual_seed(_ENCODER_SEED)
+            koopman = KoopmanMotionFilter(
+                input_dim=input_dim,
+                latent_dim=self.latent_dim,
+                hidden_dim=self.hidden_dim,
+                num_layers=self.num_layers,
+                prediction_horizon=1,
+            )
+        self.koopman = koopman.requires_grad_(False)
 
     def _ensure_filter(self, input_dim: int, device: torch.device) -> None:
         assert self.koopman is not None
@@ -136,9 +149,8 @@ class KoopmanLinearityLoss(nn.Module):
         gram = gram + self.ridge * eye
         cross = zm_t @ z_plus  # [B, L, L]  == Z_-^T Z_+
         # K^T solves gram @ K^T = cross  (since (Z_+^T Z_-) = cross^T)
-        k_t = torch.linalg.solve(gram, cross)  # [B, L, L]
-        k = k_t.transpose(1, 2)  # [B, L, L]
-        return k.detach()
+        k_t: torch.Tensor = torch.linalg.solve(gram, cross)  # [B, L, L]
+        return k_t.transpose(1, 2).detach()
 
     def forward(
         self,
@@ -158,10 +170,11 @@ class KoopmanLinearityLoss(nn.Module):
                 f"{tuple(prediction.shape)} vs {tuple(target.shape)}."
             )
         b, t, h, w = prediction.shape
-        if t < 2:
+        if t - 1 <= self.latent_dim:
             raise ValueError(
-                "Koopman linearity needs at least 2 temporal snapshots "
-                f"(time axis length >= 2); got T={t}."
+                f"Koopman linearity needs T >= latent_dim + 2 = {self.latent_dim + 2} "
+                f"snapshots on axis 1; got T={t}. With fewer, the least-squares operator "
+                "interpolates any series exactly and the residual is ~0 (#2279)."
             )
 
         # Flatten spatial dims into the per-snapshot feature vector.
@@ -169,7 +182,7 @@ class KoopmanLinearityLoss(nn.Module):
         self._ensure_filter(input_dim=h * w, device=prediction.device)
         assert self.koopman is not None
 
-        # Lift to the learned observable space Phi via the primitive's encoder.
+        # Lift to the fixed observable space Phi via the primitive's frozen encoder.
         z = self.koopman.encode(snapshots)  # [B, T, L]
         z_minus = z[:, :-1]  # Phi(x_t),    [B, T-1, L]
         z_plus = z[:, 1:]  # Phi(x_{t+1}), [B, T-1, L]

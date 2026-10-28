@@ -159,9 +159,21 @@ def _score_field_unet(**overrides):
     return ScoreFieldUNet(**{**_ARCH, **overrides})
 
 
-def _write_checkpoint(tmp_path: Path, payload, name: str = "ckpt.pth") -> Path:
-    path = tmp_path / name
-    torch.save(payload, path)
+def _write_checkpoint(tmp_path: Path, state_dict: dict) -> Path:
+    from spectramr.infrastructure.checkpointing import codecs
+    from spectramr.infrastructure.checkpointing.payload import build_meta
+
+    path = tmp_path / "ckpt" / "best.pt"
+    meta = build_meta(
+        role="best",
+        reason="best",
+        epoch=1,
+        step=5,
+        fmt="pt",
+        topology={"world_size": 1, "parallel_strategy": "none"},
+        best_metric={"name": "val_loss", "value": 0.1},
+    )
+    codecs.write(path, {"meta": meta, "models": {"generator": state_dict}})
     return path
 
 
@@ -184,80 +196,25 @@ def _infer_args(checkpoint: Path, image: Path, **kwargs) -> argparse.Namespace:
     return _make_args(**base)
 
 
-def test_infer_protocol_runs_on_a_canonical_envelope(
+def test_infer_protocol_runs_on_a_run_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The envelope ``CheckpointService`` actually writes must still work.
-
-    ``checkpoint_service.py:324`` stores ``model_state_dict`` beside epoch /
-    step / RNG state and *no* config block -- which is why the architecture is
-    derived from tensor shapes rather than resolved through ``MODEL_REGISTRY``
-    as ``D01#1`` proposes.
-    """
+    """A RunState carries no config block, so the architecture is derived from
+    tensor shapes rather than resolved through ``MODEL_REGISTRY`` (``D01#1``)."""
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
-    from spectramr.core.rng_state import capture_rng_state
 
-    ckpt = _write_checkpoint(
-        tmp_path,
-        {
-            "epoch": 3,
-            "step": 120,
-            "model_state_dict": _score_field_unet().state_dict(),
-            # The half that made the first version of this test vacuous: the
-            # real writer stamps rng_state unconditionally, and its numpy
-            # entry is what a plain ``torch.load`` refuses on torch >= 2.6.
-            "rng_state": capture_rng_state(),
-        },
-    )
+    ckpt = _write_checkpoint(tmp_path, _score_field_unet().state_dict())
     assert infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path))) == 0
     out = capsys.readouterr().out
     # cond_dim=3 was read off the checkpoint, not taken from the old default 5.
     assert "c[2]" in out and "c[3]" not in out
 
 
-def test_infer_protocol_accepts_a_bare_state_dict(tmp_path: Path) -> None:
-    """Layout 2 of the three the docstring advertises."""
-    from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
-
-    ckpt = _write_checkpoint(tmp_path, _score_field_unet().state_dict())
-    assert infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path))) == 0
-
-
-def test_instantiate_accepts_a_pickled_module() -> None:
-    """Layout 3: a pickled module already carries its architecture.
-
-    Pinned at the helper on purpose -- see the next test for why the verb
-    itself can no longer reach this branch.
-    """
-    from spectramr.cli.audit_plan_novel_cli import _instantiate_model_from_state
-
-    model = _instantiate_model_from_state(_score_field_unet(), cond_dim=None)
-    assert model.head_sc.out_features == _ARCH["cond_dim"]
-    assert not model.training
-
-
-def test_pickled_module_checkpoints_are_refused_by_torch_load(tmp_path: Path) -> None:
-    """torch >= 2.6 defaults ``weights_only=True``, so layout 3 dies at load.
-
-    The verb's own ``torch.load`` refuses a pickled ``ScoreFieldUNet`` before
-    ``_instantiate_model_from_state`` ever sees it. That is a *loud* refusal,
-    which is why it is pinned rather than worked around: relaxing it would
-    mean ``weights_only=False`` on an untrusted path.
-    """
-    import pickle
-
-    from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
-
-    ckpt = _write_checkpoint(tmp_path, _score_field_unet())
-    with pytest.raises(pickle.UnpicklingError, match=r"[Ww]eights only"):
-        infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path)))
-
-
 def test_infer_protocol_raises_on_a_foreign_checkpoint(tmp_path: Path) -> None:
     """The defect: this used to warn and report a CI from random weights."""
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
 
-    ckpt = _write_checkpoint(tmp_path, {"model_state_dict": {"fc.weight": torch.randn(4, 4)}})
+    ckpt = _write_checkpoint(tmp_path, {"fc.weight": torch.randn(4, 4)})
     with pytest.raises(KeyError, match=r"lift\.weight"):
         infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path)))
 
@@ -268,7 +225,7 @@ def test_infer_protocol_raises_on_a_partial_state_dict(tmp_path: Path) -> None:
 
     sd = _score_field_unet().state_dict()
     del sd["head_sx.weight"]
-    ckpt = _write_checkpoint(tmp_path, {"model_state_dict": sd})
+    ckpt = _write_checkpoint(tmp_path, sd)
     with pytest.raises(RuntimeError, match=r"head_sx\.weight"):
         infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path)))
 
@@ -279,7 +236,7 @@ def test_infer_protocol_raises_when_cond_dim_contradicts_the_checkpoint(
     """An explicit ``--cond-dim`` is an assertion, not a source of truth."""
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
 
-    ckpt = _write_checkpoint(tmp_path, {"model_state_dict": _score_field_unet().state_dict()})
+    ckpt = _write_checkpoint(tmp_path, _score_field_unet().state_dict())
     with pytest.raises(ValueError, match="--cond-dim 5 contradicts"):
         infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path), cond_dim=5))
 
@@ -287,7 +244,7 @@ def test_infer_protocol_raises_when_cond_dim_contradicts_the_checkpoint(
 def test_infer_protocol_accepts_a_cond_dim_that_agrees(tmp_path: Path) -> None:
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
 
-    ckpt = _write_checkpoint(tmp_path, {"model_state_dict": _score_field_unet().state_dict()})
+    ckpt = _write_checkpoint(tmp_path, _score_field_unet().state_dict())
     assert infer_protocol_cmd(_infer_args(ckpt, _write_image(tmp_path), cond_dim=3)) == 0
 
 
@@ -316,20 +273,6 @@ def test_architecture_rejects_an_internally_inconsistent_state_dict() -> None:
         _architecture_from_state_dict(sd)
 
 
-def test_instantiate_rejects_a_foreign_module() -> None:
-    from spectramr.cli.audit_plan_novel_cli import _instantiate_model_from_state
-
-    with pytest.raises(TypeError, match="not a ScoreFieldUNet"):
-        _instantiate_model_from_state(torch.nn.Linear(4, 4), cond_dim=None)
-
-
-def test_instantiate_rejects_a_non_dict_payload() -> None:
-    from spectramr.cli.audit_plan_novel_cli import _instantiate_model_from_state
-
-    with pytest.raises(TypeError, match="unsupported checkpoint payload"):
-        _instantiate_model_from_state([1, 2, 3], cond_dim=None)
-
-
 def test_infer_protocol_cond_dim_default_is_none() -> None:
     """A concrete default cannot be told apart from a declaration (D01#4)."""
     from spectramr.cli.audit_plan_novel_cli import attach_subparsers
@@ -346,25 +289,40 @@ def test_infer_protocol_loads_a_checkpoint_the_framework_actually_wrote(
 ) -> None:
     """End-to-end against the real writer, not a hand-built dict.
 
-    ``CheckpointService.save_checkpoint`` is the canonical producer, and its
-    envelope is the one the verb must read. Building the payload by hand is
-    how the rng_state gap survived: the fixture agreed with the docstring
-    rather than with the writer.
+    ``checkpointing.store`` is the canonical producer. Building the payload by
+    hand is how the rng_state gap survived: the fixture agreed with the
+    docstring rather than with the writer.
     """
+    from types import SimpleNamespace
+
     from spectramr.cli.audit_plan_novel_cli import infer_protocol_cmd
-    from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
-    from spectramr.infrastructure.services.checkpoint_service import CheckpointService
+    from spectramr.infrastructure.checkpointing.facade import CheckpointStore
+    from spectramr.infrastructure.checkpointing.layout import CheckpointLayout
+    from tests.unit.infrastructure.checkpointing.conftest import FakeEarlyStopping
 
     model = _score_field_unet()
-    service = CheckpointService(
-        CheckpointConfigSchema(checkpoint_dir=str(tmp_path / "ckpts"), format="pth")
+    pipeline = SimpleNamespace(
+        generator=model,
+        discriminator=None,
+        optimizer_g=torch.optim.Adam(model.parameters()),
+        optimizer_d=None,
+        scheduler_g=None,
+        scheduler_d=None,
+        ema=None,
+        scaler=None,
+        device="cpu",
     )
-    written = service.save_checkpoint(
-        model=model,
-        optimizer=torch.optim.Adam(model.parameters()),
+    written = CheckpointStore().save_best(
+        pipeline,
+        layout=CheckpointLayout.for_run(tmp_path),
+        config=SimpleNamespace(checkpoint=SimpleNamespace(format="pt", keep_last_n=2)),
+        strategy=None,
+        parallel=None,
+        early_stopping=FakeEarlyStopping(),
         epoch=1,
         step=5,
-        loss=0.1,
+        metric_name="val_loss",
+        metric_value=0.1,
     )
 
     args = _infer_args(Path(written), _write_image(tmp_path))

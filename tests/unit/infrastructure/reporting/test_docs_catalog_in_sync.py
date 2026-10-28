@@ -18,9 +18,9 @@ _NEW_FIGURES = (
 
 
 def test_new_figures_documented():
-    doc = Path("docs/reporting_pipeline.rst").read_text()
+    doc = Path("docs/reporting.rst").read_text()
     for fid in _NEW_FIGURES:
-        assert fid in doc, f"{fid} missing from docs/reporting_pipeline.rst"
+        assert fid in doc, f"{fid} missing from docs/reporting.rst"
 
 
 def test_documented_figures_are_registered():
@@ -33,13 +33,13 @@ def test_documented_figures_are_registered():
 
 def test_every_registered_figure_documented():
     """Registry -> docs completeness: EVERY registered plotter id must appear in
-    docs/reporting_pipeline.rst. Since ``spectramr report`` is the plotting SSOT and
+    docs/reporting.rst. Since ``spectramr report`` is the plotting SSOT and
     renders all registered figures, the docs must be their catalog — a newly
     registered figure cannot ship undocumented (the drift direction the older
     ``_NEW_FIGURES`` allowlist does not cover)."""
-    doc = Path("docs/reporting_pipeline.rst").read_text()
+    doc = Path("docs/reporting.rst").read_text()
     undocumented = sorted(fid for fid in plotters.list_available() if fid not in doc)
     assert not undocumented, (
-        "registered but undocumented in docs/reporting_pipeline.rst: "
+        "registered but undocumented in docs/reporting.rst: "
         f"{undocumented} — document each so the reporting docs stay the catalog SSOT"
     )

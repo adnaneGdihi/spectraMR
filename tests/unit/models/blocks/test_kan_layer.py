@@ -7,6 +7,8 @@ needed for any assertion here.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -329,3 +331,22 @@ def test_the_grid_still_moves_when_it_is_refitted():
     before = layer.grid.clone()
     layer.update_grid_from_samples(_t.randn(256, 4) * 3.0)
     assert not _t.equal(before, layer.grid)
+
+
+class TestKANGridRefitNonFiniteGuard:
+    """A non-finite least-squares solution must not reach the layer (step-4000 NaN)."""
+
+    def test_nonfinite_lstsq_solution_keeps_previous_grid_and_weights(self, monkeypatch):
+        layer = KANLayer(in_dim=3, out_dim=4, grid_size=5, spline_order=3)
+        old_grid = layer.grid.clone()
+        old_weight = layer.spline_weight.clone()
+
+        def _nan_lstsq(A, B):
+            return types.SimpleNamespace(solution=torch.full((A.shape[1], B.shape[1]), float("nan")))
+
+        monkeypatch.setattr(torch.linalg, "lstsq", _nan_lstsq)
+        layer.update_grid_from_samples(torch.randn(500, 3) * 3.0 + 5.0)
+
+        assert torch.equal(layer.grid, old_grid)
+        assert torch.equal(layer.spline_weight, old_weight)
+        assert torch.isfinite(layer(torch.randn(8, 3))).all()

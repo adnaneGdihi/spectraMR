@@ -49,7 +49,9 @@ for name in sorted(SUPPORTED_ACCELERATION_TYPES):
     if DIRECTION is not None:
         block["mask_direction"] = DIRECTION
     try:
-        kwargs = resolve_undersampling_kwargs(AccelerationConfigSchema(**block), {})
+        kwargs = resolve_undersampling_kwargs(
+            AccelerationConfigSchema(**block), {}, phase_encode_axis=-1 if DIRECTION else None
+        )
         process = KSpaceUndersamplingProcess(num_timesteps=8, **kwargs)
         x0 = torch.randn(2, 2, 64, 64)
         xt, mask = process.q_sample(x0, torch.tensor([7, 7]))

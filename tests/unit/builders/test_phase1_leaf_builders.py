@@ -123,7 +123,7 @@ class TestGeneratorBuilder:
         """REGRESSION: ``model.checkpoint_path`` must NOT reach the model factory.
 
         ``checkpoint_path`` is the warm-start / transfer-init knob, loaded by
-        ``ModelBuilder._load_init_checkpoint`` AFTER the generator is built — it is
+        ``ModelBuilder._warm_start`` AFTER the generator is built — it is
         NOT a constructor parameter. Forwarding it to a strict model config
         (``UNetConfig``, a frozen ``@dataclass``) crashed
         ``exp_p1_b1_equivariance_conformal`` / ``eval_c5_exchangeability_test`` with

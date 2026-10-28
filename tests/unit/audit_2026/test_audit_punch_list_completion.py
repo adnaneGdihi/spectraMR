@@ -114,6 +114,9 @@ def test_teichmuller_cold_diffusion_strategy_smoke() -> None:
 
     inst.n_steps = 4
     inst.schedule_head = TeichmullerScheduleHead(hidden=4, r_max=0.9)
+    # What register_owned_module records in __init__ (the call_owned lookup reads it).
+    inst._owned_modules = {"schedule_head": inst.schedule_head}
+    inst._owned_wrappers = {}
     inst.mu0 = torch.zeros(8, 8, dtype=torch.complex64)
     inst.muT = 0.5 * torch.exp(1j * torch.zeros(8, 8))
     # Both weights that `_compute_losses_impl` reads. `__init__` sets them from

@@ -7,7 +7,7 @@ each NR metric tracks degradation severity.
 
 This is the §8.1 "physics-anchored concordance" tier: the simulator's
 ``operator_library`` is the *audited digital twin*
-(:func:`spectramr.infrastructure.physics.digital_twin_extensions.apply_degradation`,
+(:func:`spectramr.infrastructure.physics.degradations.apply_degradation`,
 the deterministic ``(name, theta, seed)`` SSOT), injected via the
 dependency-inversion seam so ``core/`` never imports ``infrastructure/`` at
 module scope. The sweep, metric pre-computation (with a per-sample
@@ -97,10 +97,7 @@ def build_physics_operator_library(
     twin holds end-to-end. Unknown family names raise (the twin's
     ``apply_degradation`` validates against its registry — no silent fallback).
     """
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
-        apply_degradation,
-        list_degradations,
-    )
+    from spectramr.infrastructure.physics.degradations import apply_degradation, list_degradations
 
     known = set(list_degradations())
     families = list(families)

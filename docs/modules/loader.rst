@@ -35,8 +35,21 @@ Operational mechanisms:
 3.  **Prefetch depth.** ``data.loader.prefetch_factor`` (default ``2``) keeps
     ``prefetch_factor × num_workers`` samples in flight across all workers, so the
     GPU does not wait on Python overhead. ``persistent_workers`` (default
-    ``False``) keeps worker processes alive between epochs, trading resident memory
-    for the per-epoch respawn cost.
+    ``True``) keeps worker processes alive between epochs, trading resident memory
+    for the per-epoch respawn cost. It is forced off per loader where persistence
+    cannot help or torch rejects it: a loader whose clamped worker count is ``0``
+    (the validation default), and the single-pass loaders built by the inference,
+    ``make`` and ``data_utils`` paths. The TorchIO patch-queue path is unaffected,
+    because ``PrefetchingQueue`` does not pass persistence to its subject loader.
+    The value each loader actually received is recorded as ``persistent`` beside
+    its worker decision in the run provenance.
+4.  **Reserved cores.** ``data.loader.reserved_cores`` (default ``2``) withholds
+    cores per rank for the main training process and its helper threads, so the
+    ceiling on workers is ``max(1, cpus_per_rank - reserved_cores)``. It lowers
+    the ceiling only; it never raises ``num_workers``. Example: with
+    ``--cpus-per-task=4`` and ``num_workers: 4`` the run gets 2 workers; request
+    ``--cpus-per-task = num_workers + 2`` (6 here) to keep all 4. Set
+    ``reserved_cores: 0`` to restore the previous behaviour.
 
 Configuration
 -------------
@@ -48,7 +61,8 @@ Configuration
        num_workers: 4          # a ceiling; clamped to this rank's core share
        pin_memory: true        # ANDed with accelerator availability
        prefetch_factor: 2      # 2 x num_workers samples in flight
-       persistent_workers: false
+       persistent_workers: true   # forced off for 0-worker and single-pass loaders
+       reserved_cores: 2          # ceiling = max(1, cpus_per_rank - reserved_cores)
 
 Sizing note: workers are the dominant data-side memory term — the default of 4
 adds roughly 1.3 GB over ``num_workers: 0``, and 8 adds about 2.5 GB. Size against

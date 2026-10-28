@@ -49,12 +49,8 @@ undersampling:
   base_acceleration: 4
   center_fraction: 0.08
 
-artifacts:
-  persistent_root: experiments/results/<arm_name>
-
 checkpoint:
   enabled: true
-  keep_best_n: 3
   keep_last_n: 5
   save_interval: 10000
 
@@ -219,10 +215,9 @@ epoch 1.
 
 ### 7. Strategy class + `training_mode` must agree
 
-`training_mode` is matched against `TRAINING_MODE_CONSTRAINTS` in
-`src/spectramr/config/validation_constants.py`. Adding a new strategy
-means adding **three** entries: `STRATEGY_CLASS_PATHS`,
-`VALID_TRAINING_MODES`, and `TRAINING_MODE_CONSTRAINTS`. See
+`training_mode` is matched against `VALID_TRAINING_MODES` in
+`src/spectramr/config/validation_constants.py` and dispatched through
+`STRATEGY_CLASS_PATHS`. Adding a new strategy means adding **both** entries. See
 [add_paradigm](add_paradigm.md#2-register-the-dispatch-key).
 
 ### 8. Use `${SPECTRAMR_DATA_ROOT}` for data paths

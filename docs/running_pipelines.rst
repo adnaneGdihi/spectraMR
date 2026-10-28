@@ -117,7 +117,7 @@ zero if the model, losses, and gradients are wired correctly. A sanity check tha
                              -O validation.schedule.interval_steps=100
 
    # resume from a checkpoint (explicit path, or 'auto' for the latest in output_dir):
-   spectramr train -c exp.yaml --resume experiments/results/exp/checkpoints/best.pt
+   spectramr train -c exp.yaml --resume experiments/results/exp/checkpoints/step_00010000.safetensors
    spectramr train -c exp.yaml --resume auto
 
 ``--override / -O`` uses **dotted nested paths** because the config is nested
@@ -127,7 +127,7 @@ fails loudly.
 
 .. _what-a-resume-restores:
 
-**What a resume restores.** A checkpoint written by ``CheckpointDirector`` — the
+**What a resume restores.** A checkpoint written by ``checkpointing.store`` — the
 writer every periodic and wall-clock-yield save uses — carries the generator and
 discriminator, both optimizers, both LR schedulers, the AMP scaler, the EMA
 shadow weights, the step/epoch counters, the **global** torch / CUDA / numpy /
@@ -145,20 +145,22 @@ Two things no checkpoint carries, and both are silent:
 * **the dataloader's within-epoch position** — the epoch is recomputed from
   ``global_step``, but the sampler restarts at that epoch's beginning, so a
   resume mid-epoch replays samples it has already seen;
-* **the config** — nothing compares the resumed configuration against the saved
-  one, so an edited YAML resumes without comment.
+* **the config** — ``meta.config_fingerprint`` records it, but nothing compares
+  the resumed configuration against it, so an edited YAML resumes without comment.
 
 Under DDP the file holds rank 0's RNG streams, since only rank 0 reaches the
 save. Rank 0 replays; the other ranks continue on the rank-offset streams they
 were seeded with, which is what keeps their augmentations from collapsing onto
 one sequence.
 
-Read the groups off a real artifact rather than trusting the list above:
+Read the parts off a real artifact rather than trusting the list above. The
+script prints ``meta`` and each part's tensor count and bytes, and exits 1 when a
+part a resume needs is missing and 2 when the file predates schema 1:
 
 .. code-block:: bash
 
    python scripts/verification/inspect_checkpoint.py \
-       --checkpoint experiments/results/<arm>/checkpoints/checkpoint_epoch_0003_step_040000.pt
+       --checkpoint experiments/results/<arm>/checkpoints/step_00040000.safetensors
 
 **5. Figures and tables.** ``report`` — runs the same reporting pipeline the
 end-of-training hook uses, against an existing output directory. Idempotent: the
@@ -180,7 +182,7 @@ blocks, at WARNING and in the result's ``config_source``), not used.
 
 .. code-block:: bash
 
-   spectramr infer --checkpoint experiments/results/exp/checkpoints/best.pt \
+   spectramr infer --checkpoint experiments/results/exp/checkpoints/best.safetensors \
                  --input data/test/ --output predictions/ --device cuda
    # the training YAML, even when the artifact exists beside the checkpoint:
    spectramr infer --config exp.yaml --from-yaml --checkpoint ... --input ... --output ...
@@ -214,6 +216,27 @@ by that loop. The result dict and ``run_summary.json`` record a
 of batches the predict step projected, and the loops that projected instead.
 The measurement is used as acquired; ``eval_noise_level`` is a validation-time
 simulation parameter and is not added.
+
+**k-space normalisation and the recorrupted estimator at predict.** An arm
+that trained on normalised k-space (``data.processing.enable_kspace_normalization``)
+is fed normalised k-space at predict: the scale comes from the arm's own
+``KSpaceNormalizationSpec``, one per volume (one per slice under
+``data.slice_level_records``), and the output is multiplied back to scanner
+units before it is written or scored. Training measures that scale on the
+target, which a deployed scan does not have, so predict measures it on the
+input. Diffusion and cold-diffusion strategies normalise inside their own
+sampler and are not normalised a second time. A complex multi-coil k-space
+input is passed to the model real/imag interleaved per coil, the layout the
+loader serves. An R2R arm that declares
+``validation.scoring.recorrupted_inference`` is run through the same
+``J``-sample estimator validation scores, seeded by ``run.seed`` and the index
+of the batch's first slice. ``nullspace_r2r`` reads the coil maps from
+``data.coil_maps_root``. If there is no file and the arm declares
+``coil_maps_missing: estimate``, the maps are estimated from the input
+repetition alone. A self-calibrated arm fits ``Sigma_n`` on the input with the
+loader's fit function. The result dict and ``run_summary.json`` record a
+``kspace_at_predict`` block with these choices and the per-file sources
+(#2581, #2329).
 
 Variant modes — same config, different question
 -----------------------------------------------
@@ -261,9 +284,15 @@ Utility modes
 .. code-block:: bash
 
    spectramr benchmark --suite all          # quality / throughput / memory micro-benchmarks
-   spectramr export --model best.pt --config exp.yaml --format onnx   # ONNX / TorchScript
+   spectramr export --model best.safetensors --config exp.yaml --format onnx   # ONNX / TorchScript
    spectramr list-features --module models --format markdown          # what's registered
    spectramr meta-evaluate ...              # rank a metric set (see meta-evaluation docs)
+
+``export`` and ``campaign evaluate`` read a checkpoint the way ``infer`` does: the
+run's ``resolved_config.json`` beside the checkpoint wins over ``--config`` when it
+carries the ``_declared`` block, and the weights are the checkpoint's ``generator``
+part. ``export`` loads them strictly; campaign evaluation transfers the shared
+parameter names and refuses a checkpoint that shares none.
 
 Scaling out & choosing where to run
 -----------------------------------
@@ -275,7 +304,7 @@ other two axes, handled by the unified launcher and campaign manifests:
 .. code-block:: bash
 
    spectramr launch exp.yaml --where slurm --gpus 2          # train as a SLURM job
-   spectramr launch exp.yaml --pipeline infer --where local -- --checkpoint best.pt --input d/
+   spectramr launch exp.yaml --pipeline infer --where local -- --checkpoint best.safetensors --input d/
    spectramr launch campaign.yaml --fanout campaign --where slurm   # a whole sweep
 
 ``launch`` is an additive front door over the same machinery — every dedicated

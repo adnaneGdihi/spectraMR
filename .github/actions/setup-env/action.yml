@@ -40,3 +40,12 @@ runs:
     - name: Install spectramr
       shell: bash
       run: pip install -e ".[${{ inputs.extras }}]"
+
+    - name: Install the prior-method baselines plugin
+      shell: bash
+      # The kspace_filling baseline arms name its modules in `plugins.paths`, so config
+      # load raises without it. fastmri goes in --no-deps because the Shen upstream imports
+      # only its FFT, coil and data modules, never the pytorch-lightning half it declares.
+      run: |
+        pip install -e plugins/spectramr_baselines --no-deps
+        pip install fastmri==0.3.0 --no-deps

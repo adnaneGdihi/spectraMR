@@ -146,3 +146,35 @@ def test_headers_round_trip_into_a_realistic_prior():
     delta = predicted_snr_delta_db(hq, lq)
     # 3T -> 0.3T, LQ records neither averages nor bandwidth, so both are neutral.
     assert delta == pytest.approx(-20.0)
+
+
+def test_sidecar_reads_bids_keys_and_converts_seconds_to_ms():
+    from spectramr.infrastructure.physics.acquisition_params import acquisition_from_sidecar
+
+    got = acquisition_from_sidecar(
+        {
+            "MagneticFieldStrength": 0.064,
+            "RepetitionTime": 1.5,
+            "EchoTime": 0.004,
+            "NumberOfAverages": 2,
+        }
+    )
+    assert got.field_strength_t == pytest.approx(0.064)
+    assert got.tr_ms == pytest.approx(1500.0)
+    assert got.te_ms == pytest.approx(4.0)
+    assert got.averages == pytest.approx(2.0)
+    assert got.bandwidth_hz_px is None
+
+
+def test_sidecar_without_field_strength_raises():
+    from spectramr.infrastructure.physics.acquisition_params import acquisition_from_sidecar
+
+    with pytest.raises(MissingAcquisitionParameter, match="MagneticFieldStrength"):
+        acquisition_from_sidecar({"RepetitionTime": 1.5, "EchoTime": 0.004})
+
+
+def test_sidecar_that_is_not_an_object_raises():
+    from spectramr.infrastructure.physics.acquisition_params import acquisition_from_sidecar
+
+    with pytest.raises(ValueError, match="JSON object"):
+        acquisition_from_sidecar([0.064])

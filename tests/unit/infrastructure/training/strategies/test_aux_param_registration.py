@@ -76,6 +76,10 @@ class TestAuxParamRegistration:
         s.env = _env_with_opt()
         s.estimator = None
         s._estimator_channels = None
+        s._estimate_b1 = False
+        s.config = types.SimpleNamespace(parallel=None)  # read when the estimator is registered
+        s.device = torch.device("cpu")
+        s._owned_modules, s._owned_wrappers = {}, {}
         before = _param_ids(s.env.opt_g)
         est = s._get_estimator(torch.randn(1, 2, 8, 8))
         after = _param_ids(s.env.opt_g)

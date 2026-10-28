@@ -240,3 +240,42 @@ def test_the_image_stream_does_not_read_the_kspace_mask() -> None:
         "the image branch changed with the k-space mask: it is being masked in "
         "the wrong domain"
     )
+
+
+# ── PE-distance bias and masked normalisation on the k-space stream ──────────
+
+
+def test_only_the_kspace_stream_carries_the_pe_distance_bias() -> None:
+    """Column distance is a k-space quantity; on the image view it means nothing."""
+    block = _block()
+    assert block.kspace_attn.pe_slope_raw is not None
+    assert block.image_attn.pe_slope_raw is None
+
+
+def test_the_pe_distance_bias_is_on_the_production_path() -> None:
+    """Observed to fire through ``forward``, not merely registered (pitfall #16)."""
+    block = _block()
+    x = torch.randn(1, CHANNELS, GRID, GRID)
+    mask = _mask(batch=1)
+    with torch.no_grad():
+        before = block(x, mask=mask)
+        block.kspace_attn.pe_slope_raw.fill_(4.0)
+        after = block(x, mask=mask)
+    assert not torch.allclose(before, after)
+
+
+def test_kspace_stream_normaliser_ignores_zero_filled_bins() -> None:
+    """Garbage in the null bins must not move the stream's output at the acquired
+    bins: keys there are masked and the RMS scale reads observed power only.
+    Queries at the null bins do read the garbage, so only acquired bins compare.
+    """
+    torch.manual_seed(0)
+    attn = PhaseInvariantScoreAttention(CHANNELS // 2, num_features=8, pe_distance_bias=True).eval()
+    observed = _mask(batch=1)
+    x = torch.randn(1, CHANNELS, GRID, GRID) * observed
+    garbage = x + 50.0 * (1.0 - observed)
+    sel = observed.bool().expand_as(x)
+    with torch.no_grad():
+        torch.testing.assert_close(attn(garbage, observed)[sel], attn(x, observed)[sel])
+        # Planted contrast: the unmasked ComplexRMSNorm scale moves.
+        assert not torch.allclose(attn.norm(garbage)[sel], attn.norm(x)[sel])

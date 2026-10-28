@@ -266,3 +266,30 @@ def test_ssl_config_mounts_block_and_rejects_unknown() -> None:
     assert SSLConfigSchema().multi_contrast_contrastive is None
     with pytest.raises(ValidationError):
         MultiContrastContrastiveConfigSchema(unknown_field=1)
+
+
+# ---------------------------------------------------------------------------
+# #2820 — the momentum encoder's EMA weights survive a resume.
+# ---------------------------------------------------------------------------
+
+
+def test_a_resume_restores_the_momentum_encoder_not_a_copy_of_the_generator() -> None:
+    saved = _make_strategy(generator=_ProjEncoder(seed=0))
+    saved._ensure_momentum_encoder()
+    with torch.no_grad():
+        saved._target_encoder.fc.weight.add_(1.0)
+
+    resumed = _make_strategy(generator=_ProjEncoder(seed=0))
+    resumed.load_strategy_state_dict(saved.strategy_state_dict())
+
+    assert torch.equal(resumed._target_encoder.fc.weight, saved._target_encoder.fc.weight)
+    assert not torch.equal(resumed._target_encoder.fc.weight, resumed.env.generator.fc.weight)
+
+
+def test_a_saved_momentum_encoder_is_refused_when_momentum_is_off() -> None:
+    saved = _make_strategy(generator=_ProjEncoder(seed=0))
+    saved._ensure_momentum_encoder()
+
+    resumed = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder(seed=0))
+    with pytest.raises(RuntimeError, match="_target_encoder"):
+        resumed.load_strategy_state_dict(saved.strategy_state_dict())

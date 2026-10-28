@@ -3,15 +3,15 @@
 ``spectramr audit`` is ``--strict`` by default and a warning exits 2, which the
 SLURM dispatcher reads as "skip train" (non-negotiable 4). That is the right
 posture for a warning somebody can act on. It is the wrong posture for a warning
-whose fix does not exist: the 2026-09-16 run never launched
+whose fix does not exist. The 2026-09-16 run never launched
 ``experiment_11_kspace_cold_diffusion_radial`` or ``_spiral`` because
-``schedule.nesting_leakfree`` fires on every non-Cartesian cascade, and the
-witness's own fix hint -- ``undersampling.enforce_nested: true`` -- RAISES on
-those families (``sampling.py`` refuses a cascade collapsed below
-``nested_tolerance``: radial keeps 3.5 % of k-space at t=1 where its own draw
-kept 50 %). An unsatisfiable gate is not a gate; it teaches everyone to reach
-for ``--allow-warnings``, which is the flag that then hides the warnings that
-DID have a fix.
+``schedule.nesting_leakfree`` fired on both cascades and the witness's own fix
+hint -- ``undersampling.enforce_nested: true`` -- raised on those families. An
+unsatisfiable gate is not a gate; it teaches everyone to reach for
+``--allow-warnings``, which is the flag that then hides the warnings that DID
+have a fix. (That finding later turned out to have a fix: since #612 radial and
+spiral are prefixes of one golden-angle ordering, nest on their own, and carry no
+waiver.)
 
 So the arm may acknowledge the finding by name, in writing, in its own YAML::
 
@@ -19,8 +19,8 @@ So the arm may acknowledge the finding by name, in writing, in its own YAML::
       audit_waivers:
       - check: schedule.nesting_leakfree
         justification: >
-          Radial redraws its spoke set per timestep, so the cascade cannot nest
-          (#1573) and enforce_nested raises here. The leak IS this arm's subject.
+          This family re-draws its pattern per timestep, so the cascade cannot
+          nest and enforce_nested raises here. The leak IS this arm's subject.
 
 The key already existed in the corpus and nothing read it -- an advertised knob
 with no reader (pitfall #15) is indistinguishable from one that works, and every

@@ -16,7 +16,17 @@ class LogSpectralLoss(nn.Module):
 
     Computes distance in log-frequency domain. Works on both domains via
     magnitude spectrum representation.
-    Loss = || log(1 + |FFT(pred)|) - log(1 + |FFT(target)|) ||_1
+    Loss = || log(eps + |FFT(pred)|) - log(eps + |FFT(target)|) ||_1, eps = 1 by default.
+    With ``skip_fft=True`` the input is taken as the spectrum itself and no FFT is applied.
+
+    The input is never decompressed. When the data path has already
+    ``log1p``-compressed the k-space (``enable_log_scaling``, magnitude
+    ``m -> log1p(m)``), the term therefore scores ``log(1 + log1p(m))``, a second compression of the
+    spectrum rather than the log-spectral distance of the raw data. Its gradient
+    with respect to the compressed magnitude is ``1 / (1 + log1p(m))``, so the
+    high-energy centre is weighted about 4-7x less than the periphery. The term
+    is phase-blind either way.
+
     Mathematical Formulation:
     .. math::
 

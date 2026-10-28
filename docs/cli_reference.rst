@@ -66,7 +66,17 @@ takes the YAML as a positional). ``launch?`` marks the verbs reachable through
    * - ``spectramr profile``
      - yes
      - —
-     - Profile a training step and write a line-level report.
+     - Run a capped train + validation (``--iterations``, default 100;
+       ``--val-batches``, default 4) under Scalene; writes the profile,
+       ``phases/`` and a ranked ``hotspots.json``. ``--backend auto`` (default)
+       runs ``torch.profiler`` instead when the mode would sample the GPU
+       through Scalene, or Scalene is not installed, and stamps why in the
+       manifest; that backend records GPU kernel time only (no ``phases/``, no
+       ``hotspots.json``) and needs CUDA and ``--iterations >= 16``. The child is stopped after ``--timeout-min``
+       (default 30; ``0`` = no cap). ``scripts/profiling/submit_profile_array.sh``
+       submits a whole folder as an array (``audit`` first, ``--mode cpu-only``:
+       ``cpu+gpu`` is for one arm, not an array) and a parameter-free arm is
+       refused up front.
    * - ``spectramr benchmark``
      - —
      - —
@@ -278,6 +288,10 @@ Global flags (before the subcommand):
 * ``--version`` — print the installed version and exit.
 * ``-v`` / ``--verbose`` — print full tracebacks on error (otherwise a concise
   one-line error is logged; the env var ``SPECTRAMR_DEBUG=1`` does the same).
+* ``--log-level LEVEL`` — ``debug``, ``info``, ``warning``, ``error`` or ``critical``
+  for this run. Beats ``SPECTRAMR_LOG_LEVEL`` and the config's
+  ``logging.sinks.level``; an unknown value exits ``2``. ``train --debug`` is
+  shorthand for ``--log-level debug``.
 
 **Error boundary.** ``main()`` wraps the dispatch: ``Ctrl-C`` exits ``130`` with
 a clean message (no raw ``KeyboardInterrupt`` traceback in the SLURM log), a
@@ -354,7 +368,34 @@ Related verbs
 from the ``resolved_config.json`` beside the checkpoint when it exists
 (``--config`` optional; the YAML is used when the artifact is absent or predates
 its ``_declared`` block, and under ``--from-yaml``); see
-:doc:`running_pipelines`.
+:doc:`running_pipelines`. A key that the schema removed after the run was written
+(``config/schemas/removals.py``) is dropped from the artifact with a warning
+naming it, because nothing read it; any other key the schema refuses still fails
+the rebuild, and a training YAML that declares a removed key is still refused.
+
+``predict --acceleration R`` (cold diffusion only) reproduces what validation
+scores at ``R``. A fully sampled input is masked to the rung for ``R``, counted
+over the lines its ISMRMRD header says were acquired, and the reverse loop starts
+at that rung's timestep. Validation resolves the rung through the same owner,
+``models/diffusion/cold_rung.py``. If the input file carries its own ``mask``
+dataset, it is treated as already undersampled. That mask is passed to the
+sampler unchanged, and the start timestep comes from ``R``, or from the mask's
+acceleration over the acquired lines when ``R`` is not given. Predict refuses an
+``R`` that the schedule does not realise, which is a level validation would skip.
+It also refuses ``--acceleration`` on an input that is not fully sampled. Without
+the flag or a file mask, predict behaves as before: it infers the mask and starts
+at ``T - 1``. The rung each file was sampled from is stamped as
+``rung_at_predict`` in the result and in the run summary.
+
+``infer --test-split --checkpoint <run>/checkpoints/<step> --config <arm>.yaml`` scores
+the arm's held-out test set (``data.source.test_index_path``) on that checkpoint and
+writes ``test/final_eval.json`` into the checkpoint's own run directory. An arm with
+``data.source.test_pass: infer`` is scored only this way; the default ``train_end``
+also scores it once when training finishes. A sharded arm (deepspeed, FSDP) is launched
+under ``torchrun`` as its training was. When the test set is carved from a paired
+manifest by the config rather than named by file, the first run writes
+``test_split.json`` (strategy, fractions, manifest digest, test subjects) into its run
+directory, and every later run on that directory raises if it derives a different set.
 
 ``infer-dataset`` is a **separate verb**, not an alias: it requires ``--config``,
 ``--input`` and ``--output``, and adds ``--batch-size``, which ``infer`` does not

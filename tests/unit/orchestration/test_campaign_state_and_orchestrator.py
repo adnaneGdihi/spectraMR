@@ -43,6 +43,8 @@ from spectramr.config.schemas.campaign import AblationAxisSchema
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+pytestmark = pytest.mark.usefixtures("slurm_account")
+
 
 def _make_state(tmp_path: Path, **kwargs) -> CampaignState:
     return CampaignState(
@@ -787,7 +789,7 @@ class TestAblationConfigGeneratorExtended:
                 values=[0.5],
             ),
         ]
-        with pytest.raises(ValueError, match="[Uu]nknown mode"):
+        with pytest.raises(ValueError, match=r"(?i)unknown mode"):
             AblationConfigGenerator.generate(
                 str(base), axes, str(tmp_path / "out"), mode="invalid_mode"
             )

@@ -112,7 +112,7 @@ class TestTheHelperEnforcesIt:
     def test_fp16_on_a_v100_still_builds_its_scaler(self):
         """The gate must not disturb the path it does not govern."""
         helper = MixedPrecisionIntegrationHelper(
-            MixedPrecisionConfig(enabled=True, precision="fp16"),
+            MixedPrecisionConfig(enabled=True, precision="fp16", enable_complex_support=False),
             device="cuda",
             capabilities=V100,
         )

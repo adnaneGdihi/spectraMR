@@ -21,7 +21,8 @@ Two measurements:
   on magnitude-scaled / phase-perturbed OOD batches; record per-block ``rho`` and
   how it grows with the scale factor (the input-dependence signature).
 * **B (trajectory, accelerator only):** run the real ``generator.sample`` reverse
-  loop with the same hooks; record per-block ``rho`` and the model-output norm at
+  loop with the same hooks, starting from the phantom undersampled by the arm's
+  own mask at t = T-1; record per-block ``rho`` and the model-output norm at
   each reverse step (the actual compounding on the model's own states).
 
 Softmax / sigmoid families (channel, sparse=WindowAttention, self=LinearAttention)
@@ -34,6 +35,8 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,12 +51,15 @@ __all__ = [
     "StepEnergy",
     "build_ood_batch",
     "build_probe_batch",
+    "build_probe_mask",
     "build_probe_model",
+    "build_trajectory_input",
     "measure_forward_energy",
     "measure_trajectory_energy",
     "probe_arm",
     "rank_arms",
     "register_energy_hooks",
+    "stashed_mask",
 ]
 
 _EPS = 1e-12
@@ -106,6 +112,10 @@ class ArmEnergyReport:
     trajectory: tuple[StepEnergy, ...] | None
     worst_rho: float | None
     rho_growth: float | None
+    # Where Measurement B started and how much of k-space its mask kept. Reports
+    # written before #2527 lack both: their trajectory ran fully sampled.
+    trajectory_start_timestep: int | None = None
+    trajectory_sampled_fraction: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -379,22 +389,29 @@ def build_probe_batch(model: torch.nn.Module, config: Any, device: str) -> torch
       ``imag == real`` — a constant global 45 degree phase and zero coil
       diversity.
     """
-    from spectramr.infrastructure.physics.fft_ops import fft2c
-    from spectramr.infrastructure.validation.phantom_builder import synthetic_phantom
     from spectramr.models.generators.kspace_cold_diffusion_generator import (
         model_expects_smaps_concat,
     )
 
     in_ch = _in_channels(config)
     width = in_ch * 2 if model_expects_smaps_concat(model) else in_ch
+    return _kspace_phantom(width, _batch_size(config), _spatial(config), device)
+
+
+def _kspace_phantom(width: int, batch: int, spatial: list[int], device: str) -> torch.Tensor:
+    """Interleaved-complex coil k-space of a Shepp-Logan phantom, ``[B, width, H, W, *trailing]``.
+
+    The one builder of the probes' synthetic k-space: Measurement A sizes it to
+    the forward width, Measurement B to the pure-k-space width ``sample`` takes.
+    """
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+    from spectramr.infrastructure.validation.phantom_builder import synthetic_phantom
+
     if width % 2 != 0:
         raise ValueError(
-            f"energy_probe: interleaved-complex input needs an even channel width, "
-            f"got {width} (in_channels={in_ch})."
+            f"energy_probe: interleaved-complex input needs an even channel width, got {width}."
         )
     n_coils = width // 2
-    batch = _batch_size(config)
-    spatial = _spatial(config)
     if len(spatial) < 2:
         raise ValueError(f"energy_probe: need at least 2 spatial dims, got {spatial}.")
     h, w = int(spatial[0]), int(spatial[1])
@@ -428,13 +445,76 @@ def build_probe_batch(model: torch.nn.Module, config: Any, device: str) -> torch
     return out
 
 
+def build_probe_mask(model: torch.nn.Module, batch: torch.Tensor, timestep: int) -> torch.Tensor:
+    """The acquisition mask the arm's own ladder pairs with ``batch`` at ``timestep``.
+
+    Read off the generator's ``kspace_process`` -- the fixed-seed cascade the
+    reverse loops and validation use -- so the probe measures the arm's declared
+    undersampling rather than a fully-sampled operating point, and does not
+    rebuild the ladder as a second owner. Returns ``[B, 1, H, W]`` float32, the
+    4-D layout the null-space blocks require even when ``batch`` is ``[B, C, H, W, 1]``.
+    Null-space attention refuses to run without it (#2145).
+    """
+    process = getattr(model, "kspace_process", None)
+    if process is None:
+        raise ValueError(
+            f"probe: {type(model).__name__} has no kspace_process, so there is no "
+            "acquisition ladder to take the mask from; an all-ones mask would make an "
+            "unconditioned measurement look conditioned."
+        )
+    shape = tuple(int(v) for v in batch.shape)
+    if len(shape) < 4 or any(v != 1 for v in shape[4:]):
+        raise ValueError(
+            f"probe: need a [B, C, H, W] batch (trailing axes of size 1 allowed); got {shape}."
+        )
+    t = torch.full((shape[0],), int(timestep), device=batch.device, dtype=torch.long)
+    mask = process.cascade_batch_masks(t, (shape[2], shape[3]), batch.device)
+    return mask.to(torch.float32)
+
+
+@contextmanager
+def stashed_mask(model: torch.nn.Module, mask: torch.Tensor | None) -> Iterator[None]:
+    """Hold ``mask`` on the generator for the duration, then restore the previous one.
+
+    A generator exposing ``mask_scope`` reads its stash only inside that scope (the
+    one ``sample()`` opens), so the probe enters it; a probe's bare
+    ``model(x, timesteps=t)`` then sees the support without a second calling
+    convention. ``None`` is a no-op for models that consume no mask.
+    """
+    if mask is None:
+        yield
+        return
+    scope = getattr(model, "mask_scope", None)
+    if scope is not None:
+        with scope(mask):
+            yield
+        return
+    setter = getattr(model, "set_current_mask", None)
+    if setter is None:
+        raise ValueError(
+            f"probe: {type(model).__name__} has no set_current_mask, so the mask "
+            "would be dropped without a word."
+        )
+    previous = getattr(model, "_current_mask", None)
+    setter(mask)
+    try:
+        yield
+    finally:
+        setter(previous)
+
+
 def _num_timesteps(config: Any) -> int:
     mk = dict(getattr(config.model, "model_kwargs", None) or {})
     t = mk.get("timesteps")
     if t is None:
         diff = getattr(getattr(config, "training", None), "diffusion", None)
         t = getattr(diff, "timesteps", None)
-    return int(t) if t else 28
+    if not t:
+        raise ValueError(
+            "The energy probe needs the arm's diffusion horizon: declare "
+            "training.diffusion.timesteps (or model.model_kwargs.timesteps)."
+        )
+    return int(t)
 
 
 # ── measurement A: controlled OOD forward sweep ───────────────────────────────
@@ -445,8 +525,14 @@ def measure_forward_energy(
     scales: list[float],
     phase_perturb: bool,
     timestep: int,
+    mask: torch.Tensor | None = None,
 ) -> tuple[ScaleEnergy, ...]:
-    """Per-block ``rho`` on in-distribution + magnitude/phase OOD batches."""
+    """Per-block ``rho`` on in-distribution + magnitude/phase OOD batches.
+
+    ``mask`` is held on the generator for every forward (:func:`stashed_mask`);
+    :func:`probe_arm` always supplies it, so a null-space attention arm is measured
+    at its declared acquisition support instead of refusing.
+    """
     device = x_base.device
     out_scales: list[ScaleEnergy] = []
     handles, records = register_energy_hooks(model)
@@ -459,7 +545,7 @@ def measure_forward_energy(
                 records[k].clear()
             x = build_ood_batch(x_base, scale=scale, phase_perturb=perturb, seed=int(scale))
             t = torch.full((x.shape[0],), int(timestep), device=device, dtype=torch.long)
-            with torch.no_grad():
+            with torch.no_grad(), stashed_mask(model, mask):
                 out = model(x, timesteps=t)
             blocks = tuple(records[k][-1] for k in records if records[k])
             max_rho = max((b.rho for b in blocks), default=math.nan)
@@ -482,22 +568,49 @@ def measure_forward_energy(
 
 
 # ── measurement B: real reverse-sampler trajectory (accelerator only) ─────────
+def build_trajectory_input(
+    model: torch.nn.Module, config: Any, device: str, timestep: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fully-sampled phantom k-space at ``sample``'s width, and the arm's mask at ``timestep``.
+
+    The width is ``in_channels``, not the forward width: ``sample`` runs its own
+    physics on pure k-space and receives coil maps separately. The mask comes
+    from :func:`build_probe_mask`, which raises when the arm has no ladder.
+    """
+    kspace = _kspace_phantom(_in_channels(config), _batch_size(config), _spatial(config), device)
+    return kspace, build_probe_mask(model, kspace, timestep)
+
+
 def measure_trajectory_energy(
     model: torch.nn.Module,
-    config: Any,
-    device: str,
+    kspace: torch.Tensor,
+    *,
+    mask: torch.Tensor,
+    timestep: int,
 ) -> tuple[StepEnergy, ...]:
     """Per-block ``rho`` + model-output norm across the real reverse loop.
 
-    Runs ``model.sample`` on a synthetic undersampled measurement; the attention
-    hooks fire once per reverse step, so per-step slicing is by call order. Also
-    captures the generator's output norm per step via a top-level hook.
+    ``kspace`` is undersampled by ``mask`` and the reverse loop starts at
+    ``timestep``, so the trajectory begins on the rung the arm is trained to
+    invert. Without a mask ``sample`` infers one from the non-zero support, which
+    for a fully-sampled phantom is all ones: the null space is empty and every
+    reading describes an operating point the arm never sees (#2527). A missing or
+    fully-sampled mask therefore raises. The attention hooks fire once per reverse
+    step, so per-step slicing is by call order.
     """
-    in_ch = _in_channels(config)
-    from spectramr.infrastructure.validation.phantom_builder import synthetic_phantom
-
-    shape = [_batch_size(config), in_ch, *_spatial(config)]
-    measurement = synthetic_phantom(shape, device=device, dtype="float32").to(device)
+    if mask is None:
+        raise ValueError(
+            "energy_probe: Measurement B needs the arm's acquisition mask; sample() "
+            "would otherwise infer an all-ones mask from a fully-sampled phantom."
+        )
+    if bool((mask >= 1).all()):
+        raise ValueError(
+            f"energy_probe: the arm's mask at t={int(timestep)} samples every k-space "
+            "location, so Measurement B would run at the fully-sampled point (#2527)."
+        )
+    spatial_mask = mask.reshape(*mask.shape, *([1] * (kspace.dim() - mask.dim())))
+    measurement = kspace * spatial_mask.to(kspace.dtype)
+    in_ch = int(kspace.shape[1])
 
     out_norms: list[float] = []
 
@@ -506,22 +619,14 @@ def measure_trajectory_energy(
         if isinstance(t, torch.Tensor):
             out_norms.append(_energy(t))
 
-    # [S-MAP CONDITIONING] Gate on the generator's own contract, exactly as
-    # ColdDiffusionInferenceStrategy and forward_probe do — this is a further
-    # reader of one rule, not a new spelling (CLAUDE.md #17).
-    #
-    # ``measurement`` must stay pure k-space (``sample()`` runs its own
-    # physics), so the maps are handed over SEPARATELY and the generator
-    # completes the stack per reverse step. Without them the reverse loop used
-    # to run through an untrained ChannelAdapter and every energy reading here
-    # described a random projection rather than the trained backbone (#1326);
-    # it now raises instead. Synthetic unit maps are the right calibration for a
-    # phantom probe: this measures energy propagation, not reconstruction.
+    # Coil maps go in separately because ``measurement`` must stay pure k-space,
+    # gated on the generator's own contract as the inference strategy does
+    # (#1326). Unit maps suit a phantom: this measures energy propagation.
     from spectramr.models.generators.kspace_cold_diffusion_generator import (
         model_expects_smaps_concat,
     )
 
-    probe_kwargs: dict[str, Any] = {"mask": None}
+    probe_kwargs: dict[str, Any] = {"mask": mask, "start_timestep": int(timestep)}
     if model_expects_smaps_concat(model) and in_ch % 2 == 0:
         probe_kwargs["smaps"] = (
             torch.ones(
@@ -537,7 +642,7 @@ def measure_trajectory_energy(
     handles, records = register_energy_hooks(model)
     top = model.register_forward_hook(_out_hook)
     try:
-        with torch.no_grad():
+        with torch.no_grad(), stashed_mask(model, mask):
             model.sample(measurement, **probe_kwargs)
     finally:
         top.remove()
@@ -612,12 +717,14 @@ def probe_arm(
         dict(getattr(config.model, "model_kwargs", None) or {}).get("attention_type", "none")
     )
     x_base = build_probe_batch(model, config, device)
+    timestep = _num_timesteps(config) // 2
     per_scale = measure_forward_energy(
         model,
         x_base,
         scales=scales,
         phase_perturb=phase_perturb,
-        timestep=_num_timesteps(config) // 2,
+        timestep=timestep,
+        mask=build_probe_mask(model, x_base, timestep),
     )
 
     # Facade guard: a non-none arm that hooks zero blocks is misconfigured.
@@ -629,8 +736,13 @@ def probe_arm(
         )
 
     traj: tuple[StepEnergy, ...] | None = None
+    head: int | None = None
+    sampled: float | None = None
     if trajectory:
-        traj = measure_trajectory_energy(model, config, device)
+        head = _num_timesteps(config) - 1
+        kspace, traj_mask = build_trajectory_input(model, config, device, head)
+        traj = measure_trajectory_energy(model, kspace, mask=traj_mask, timestep=head)
+        sampled = float(traj_mask.mean().item())
 
     worst, growth = _worst_and_growth(per_scale)
     return ArmEnergyReport(
@@ -642,4 +754,6 @@ def probe_arm(
         trajectory=traj,
         worst_rho=(None if attn == "none" else worst),
         rho_growth=(None if attn == "none" else growth),
+        trajectory_start_timestep=head,
+        trajectory_sampled_fraction=sampled,
     )

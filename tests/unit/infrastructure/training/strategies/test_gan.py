@@ -28,7 +28,7 @@ from spectramr.infrastructure.training.strategies.gan import (  # noqa: E402
 
 def test_train_step_uses_live_loop_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
     # One discriminator update per step keeps the loop deterministic.
-    monkeypatch.setattr(gan_mod, "_resolve_disc_updates", lambda cfg: 1)
+    monkeypatch.setattr(gan_mod, "_resolve_disc_updates", lambda cfg, *, iteration: 1)
 
     strategy = object.__new__(GANTrainingStrategy)
     strategy._step_counter = 0
@@ -147,3 +147,44 @@ def test_every_gan_subclass_reaches_the_unconditional_setup_that_installs_it():
     for cls in (GANTrainingStrategy, BetaVAEGANStrategy, ProgressiveGANStrategy):
         src = inspect.getsource(cls._setup_strategy_specific_components)
         assert "setup_adversarial(" in src, cls.__name__
+
+
+def test_validation_scores_the_critic_in_the_domain_it_was_trained_on():
+    """#1921: the D and G steps convert the critic's input through the loss
+    computer's ``_to_critic``; validation fed ``disc(target)`` raw, so a k-space
+    generator's critic was trained on images and scored on k-space."""
+    import types
+
+    import torch
+    from torch import nn
+
+    from spectramr.infrastructure.training.strategies.gan import GANTrainingStrategy
+
+    seen: list[str] = []
+
+    class _Computer:
+        def _to_critic(self, x):
+            seen.append("converted")
+            return x * 0.0
+
+    class _Critic(nn.Module):
+        def forward(self, x):
+            assert torch.count_nonzero(x) == 0, "critic saw an unconverted tensor"
+            return x.mean(dim=(1, 2, 3))
+
+    gen = nn.Conv2d(1, 1, 1)
+    s = object.__new__(GANTrainingStrategy)
+    s.env = types.SimpleNamespace(generator=gen, discriminator=_Critic())
+    s.loss_computer = _Computer()
+    s.config = types.SimpleNamespace(
+        training=types.SimpleNamespace(enforce_output_range=False),
+        validation=types.SimpleNamespace(
+            scoring=types.SimpleNamespace(enable_image_metrics=False)
+        ),
+    )
+    s._log_validation_images_to_tensorboard = lambda **_: None
+    s.__dict__["generator_model"] = gen
+    x = torch.rand(2, 1, 8, 8) + 0.1
+    out = s.validation_step(x, x.clone())
+    assert seen == ["converted", "converted"]
+    assert {"real_score", "fake_score"} <= out.keys()

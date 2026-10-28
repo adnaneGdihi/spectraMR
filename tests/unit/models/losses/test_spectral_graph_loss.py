@@ -42,3 +42,19 @@ def test_target_agnostic_smoothness_prior() -> None:
     noisy = torch.randn(1, 1, 8, 8)
     smooth = torch.ones(1, 1, 8, 8)
     assert float(loss(smooth)) <= float(loss(noisy))
+
+
+def test_block_path_matches_the_dense_path() -> None:
+    """N > 4096 takes the row-block loop; it must equal the dense top-k energy."""
+    torch.manual_seed(0)
+    x = torch.rand(1, 4100, 2, dtype=torch.float64)
+    loss_fn = SpectralGraphLoss(k=3)
+    dense = torch.cdist(x, x).pow(2).topk(4, largest=False, dim=-1).values[:, :, 1:].sum()
+    torch.testing.assert_close(loss_fn(x), dense)
+
+
+def test_accepts_registry_kwargs_and_non_contiguous_input() -> None:
+    x = torch.rand(1, 1, 8, 8).transpose(-1, -2)
+    assert not x.is_contiguous()
+    loss_fn = SpectralGraphLoss(k=2)
+    torch.testing.assert_close(loss_fn(x, None, mask=None), loss_fn(x.contiguous()))

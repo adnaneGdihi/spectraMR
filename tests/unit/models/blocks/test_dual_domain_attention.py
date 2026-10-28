@@ -22,12 +22,12 @@ class TestComplexSignalAttention:
         reduction = 4
         attn = ComplexSignalAttention(complex_channels=channels, reduction=reduction)
 
-        assert isinstance(attn.avg_pool, nn.Module)
-        assert isinstance(attn.mlp, nn.Module)
-        # mlp[0] is Linear(real_channels, real_channels // reduction)
-        # real_channels = channels * 2
-        assert attn.mlp[0].in_features == channels * 2
-        assert attn.mlp[2].out_features == channels * 2
+        assert isinstance(attn.fc, nn.Module)
+        # One gain per COMPLEX channel (shared by Re and Im), so the bottleneck
+        # MLP is sized on ``channels``, not on the 2*channels real planes.
+        assert attn.fc[0].in_features == channels
+        assert attn.fc[0].out_features == channels // reduction
+        assert attn.fc[2].out_features == channels
 
     def test_forward_shape(self):
         """Test forward pass preserves shape."""
@@ -86,9 +86,8 @@ class TestDualDomainAttention:
         assert isinstance(attn.freq_attn, ComplexSignalAttention)
         assert isinstance(attn.spat_attn, ComplexSignalAttention)
 
-        # Internal complex channels should be tensor_channels // 2, so 8.
-        # It's mlp[0].in_features that stores the input channels (= tensor_channels)
-        assert attn.freq_attn.mlp[0].in_features == tensor_channels
+        # The gate MLP is sized on complex channels: tensor_channels // 2.
+        assert attn.freq_attn.fc[0].in_features == tensor_channels // 2
 
     def test_forward_shape(self):
         """Test forward pass preserves shape."""
@@ -208,3 +207,49 @@ class TestDualDomainAttentionFeatureDomain:
             out_k = bk(c2i(fft2c(i2c(x))))
             rhs = c2i(fft2c(i2c(out_i)))
         torch.testing.assert_close(out_k, rhs, rtol=1e-4, atol=1e-4)
+
+
+def _rotate(x: torch.Tensor, theta: float) -> torch.Tensor:
+    """Multiply an interleaved ``[R1, I1, ...]`` map by ``e^{i theta}``."""
+    re, im = x[:, 0::2], x[:, 1::2]
+    c, s = torch.cos(torch.tensor(theta)), torch.sin(torch.tensor(theta))
+    return torch.stack([c * re - s * im, s * re + c * im], dim=2).flatten(1, 2)
+
+
+class TestDualDomainPhaseEquivariance:
+    """A global phase on the input must come out as the same global phase.
+
+    The block-level gates used one sigmoid gain per REAL channel from a signed
+    average pool, so Re and Im of one complex channel were scaled differently.
+    """
+
+    def test_gate_and_block_commute_with_a_global_phase(self):
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 16, 16)
+        block = DualDomainAttention(in_channels=8, feature_domain="kspace").eval()
+        with torch.no_grad():
+            torch.testing.assert_close(
+                block.freq_attn(_rotate(x, 0.9)), _rotate(block.freq_attn(x), 0.9)
+            )
+            torch.testing.assert_close(
+                block(_rotate(x, 0.9)), _rotate(block(x), 0.9), rtol=1e-4, atol=1e-5
+            )
+
+    def test_planted_per_real_channel_gate_breaks_equivariance(self):
+        """The pre-fix gate shape, swapped in, must fail the same assertion."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 16, 16)
+        block = DualDomainAttention(in_channels=8, feature_domain="kspace").eval()
+
+        class _PerRealChannelGate(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mlp = nn.Sequential(nn.Linear(8, 2), nn.ReLU(), nn.Linear(2, 8), nn.Sigmoid())
+
+            def forward(self, t: torch.Tensor) -> torch.Tensor:
+                return t * self.mlp(t.mean(dim=(-2, -1)))[..., None, None]
+
+        block.freq_attn = _PerRealChannelGate()
+        block.spat_attn = _PerRealChannelGate()
+        with torch.no_grad():
+            assert not torch.allclose(block(_rotate(x, 0.9)), _rotate(block(x), 0.9), atol=1e-3)

@@ -67,7 +67,7 @@ class _Strat(AdversarialMixin):
         self._disc = disc
         # disc_updates lives at config.losses.gan.disc_updates (v6.0 SSOT)
         cfg = SimpleNamespace(
-            losses=SimpleNamespace(gan=SimpleNamespace(disc_updates=1)),
+            losses=SimpleNamespace(gan=SimpleNamespace(disc_updates=1, disc_update_interval=1)),
             training=SimpleNamespace(enforce_output_range=False),
         )
         self.config = cfg

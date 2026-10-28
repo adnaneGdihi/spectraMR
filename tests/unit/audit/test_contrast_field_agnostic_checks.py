@@ -109,7 +109,7 @@ class TestDispersionBlochAEChecks:
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
                 _dlbae_cfg(
                     {
-                        "n_pools": 2,
+                        "num_pools": 2,
                         "fields_present": [0.055, 0.3, 1.5, 3.0, 7.0],
                         "monotonicity_weight": 1.0,
                     }
@@ -126,17 +126,18 @@ class TestDispersionBlochAEChecks:
     def test_under_determined_arm_is_an_error(self, n_pools: int, fields: list) -> None:
         res = _by_name(
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
-                _dlbae_cfg({"n_pools": n_pools, "fields_present": fields})
+                _dlbae_cfg({"num_pools": n_pools, "fields_present": fields})
             )
         )
         assert not res["dispersion_identifiability"].passed
         assert res["dispersion_identifiability"].severity == "error"
+        assert "Reduce num_pools" in res["dispersion_identifiability"].fix_hint
 
     def test_duplicate_fields_do_not_buy_identifiability(self) -> None:
         """The check counts DISTINCT fields; repeats add no rank."""
         res = _by_name(
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
-                _dlbae_cfg({"n_pools": 1, "fields_present": [1.5, 1.5, 1.5]})
+                _dlbae_cfg({"num_pools": 1, "fields_present": [1.5, 1.5, 1.5]})
             )
         )
         assert not res["dispersion_identifiability"].passed
@@ -146,7 +147,7 @@ class TestDispersionBlochAEChecks:
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
                 _dlbae_cfg(
                     {
-                        "n_pools": 1,
+                        "num_pools": 1,
                         "fields_present": [0.3, 1.5, 3.0],
                         "monotonicity_weight": 0.0,
                     }

@@ -113,6 +113,13 @@ The annotations mark the choices that matter for a diffusion arm.
 
    data:
      dataset_type: kspace
+     # Which axis of the training batch carries the phase-encode lines, and
+     # how many were acquired. M4Raw T1/T2/FLAIR: dim -1. Measure your own
+     # data with scripts/physics/measure_phase_encode_axis.py --arm <yaml>;
+     # mask_direction: phase raises without this block.
+     acquisition:
+       phase_encode_axis: -1
+       acquired_pe_lines: {FLAIR: 198, T1: 195, T2: 195}
 
      loader:
        batch_size: 2                      # Reduce to 1 if <16 GB VRAM
@@ -212,7 +219,7 @@ The annotations mark the choices that matter for a diffusion arm.
      - 25.6
      - 28.444
      - 32.0
-     mask_direction: phase
+     mask_direction: phase             # resolved through data.acquisition below
      schedule_type: step
      schedule_steps: 28
      enable_dynamic_mask: true         # Vary mask across training steps
@@ -263,7 +270,6 @@ The annotations mark the choices that matter for a diffusion arm.
      compute_phase_mse: true           # Phase fidelity
      compute_psnr: false               # Computed at validation (image domain)
      enable_tracking: true
-     track_best_metric: true
      best_metric_name: lpips
      best_metric_mode: min
 
@@ -286,7 +292,6 @@ The annotations mark the choices that matter for a diffusion arm.
      enabled: true
      save_interval: 10000
      keep_last_n: 5
-     keep_best_n: 3
 
    early_stopping:
      enabled: true
@@ -422,17 +427,26 @@ After training, run the cold diffusion reverse process:
 .. code-block:: bash
 
    spectramr infer \
-       --checkpoint experiments/results/tutorial_03_cold_diffusion/checkpoints/checkpoint_epoch_<E>_step_<S>.pt \
+       --checkpoint experiments/results/tutorial_03_cold_diffusion/checkpoints/step_<NNNNNNNN>.safetensors \
        --input databases/m4raw/data/multicoil_val \
        --output experiments/results/tutorial_03_cold_diffusion/inference
 
 ``ls`` the ``checkpoints/`` directory and substitute the file you want.
-A ``checkpoint_best.pt`` is written there instead once more than one
+A ``best.safetensors`` is written there too once more than one
 validation event has been scored.
 
 The sampler's step count is not a CLI flag — it is read from the config's
 diffusion block, so change it there (or in a copy of the YAML) rather than at
 the command line.
+
+An arm with a phase-encode line axis counts each rung's R over the lines the
+scan acquired, as training did. At predict that support is read from the input
+HDF5 file's ISMRMRD ``encodingLimits/kspace_encoding_step_1`` (``minimum`` to
+``maximum``, inclusive), not from the input's own zero lines. A file without
+``ismrmrd_header``, without those limits, or with data outside them makes
+``infer`` fail for that file with the missing key named; there is no fallback
+to the full plane. M4Raw writes a line count into ``maximum``, so check a file
+with ``scripts/physics/measure_phase_encode_axis.py`` first.
 
 Inference writes ``final_eval.json`` (aggregated scores),
 ``final_eval_manifest.json`` (what was computed and why anything was skipped),

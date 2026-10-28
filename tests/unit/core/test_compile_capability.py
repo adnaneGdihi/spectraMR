@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from spectramr.core.compile_capability import (
+    MIN_TRITON_CAPABILITY,
     CompileUnsupportedError,
     compile_backend_for,
     triton_available,
@@ -13,26 +14,26 @@ from spectramr.core.compile_capability import (
 
 class TestCompileBackendFor:
     def test_cuda_with_triton_resolves(self):
-        assert compile_backend_for("cuda", triton=True) == "inductor"
+        assert compile_backend_for("cuda", triton=True, capability=(8, 9)) == "inductor"
 
     def test_cuda_without_triton_raises(self):
         """Inductor cannot emit CUDA kernels without Triton, and a run that
         asked to be compiled must not quietly be eager."""
         with pytest.raises(CompileUnsupportedError, match="needs Triton"):
-            compile_backend_for("cuda", triton=False)
+            compile_backend_for("cuda", triton=False, capability=(8, 9))
 
     def test_cpu_does_not_need_triton(self):
         """Inductor on CPU uses its C++/OpenMP path, so the requirement is
         per-device rather than per-backend."""
-        assert compile_backend_for("cpu", triton=False) == "inductor"
+        assert compile_backend_for("cpu", triton=False, capability=None) == "inductor"
 
     def test_mps_does_not_need_triton(self):
-        assert compile_backend_for("mps", triton=False) == "inductor"
+        assert compile_backend_for("mps", triton=False, capability=None) == "inductor"
 
     @pytest.mark.parametrize("device_type", ["xpu", "hpu", "tpu", "", "CUDA"])
     def test_an_unknown_device_type_raises(self, device_type):
         with pytest.raises(ValueError, match=r"No torch\.compile backend"):
-            compile_backend_for(device_type, triton=True)
+            compile_backend_for(device_type, triton=True, capability=(8, 9))
 
     def test_it_does_not_validate_the_backend_vocabulary(self):
         """That belongs to ``CompileConfigSchema._validate_backend``, which
@@ -44,6 +45,32 @@ class TestCompileBackendFor:
         assert "backend" not in {
             name for name in inspect.signature(compile_backend_for).parameters if name != "triton"
         }
+
+
+class TestTritonCapabilityFloor:
+    """Planted violations for the GPU-family gate (LM-16): Triton, and so Inductor
+    and DeepCompile, cannot target sm_60, and the clusters mix P100s in."""
+
+    def test_the_floor_is_sm70(self):
+        assert MIN_TRITON_CAPABILITY == (7, 0)
+
+    @pytest.mark.parametrize("capability", [(6, 0), (6, 1), (5, 2)])
+    def test_a_pre_volta_gpu_raises(self, capability):
+        with pytest.raises(CompileUnsupportedError, match=r"Triton supports only >= 7\.0"):
+            compile_backend_for("cuda", triton=True, capability=capability)
+
+    @pytest.mark.parametrize("capability", [(7, 0), (7, 5), (8, 9)])
+    def test_volta_and_later_resolve(self, capability):
+        assert compile_backend_for("cuda", triton=True, capability=capability) == "inductor"
+
+    def test_an_unknown_cuda_capability_raises(self):
+        """Absent is reported, not inferred: the floor cannot be checked blind."""
+        with pytest.raises(CompileUnsupportedError, match="could not be read"):
+            compile_backend_for("cuda", triton=True, capability=None)
+
+    @pytest.mark.parametrize("device_type", ["cpu", "mps"])
+    def test_non_triton_devices_ignore_the_capability(self, device_type):
+        assert compile_backend_for(device_type, triton=False, capability=(6, 0)) == "inductor"
 
 
 class TestTritonAvailable:

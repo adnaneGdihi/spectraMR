@@ -58,6 +58,24 @@ EXPECTED_ARMS = {
 }
 
 
+REFERENCE_ARM = MATRIX_DIR.parent / "attention_shootout" / "experiment_11_attention_none.yaml"
+
+
+def _reference_budget() -> int:
+    """The shootout reference's budget in samples: iterations x batch size."""
+    training = TrainingSettings.from_yaml(str(REFERENCE_ARM)).training
+    return training.max_iterations * training.batch_size
+
+
+def _iteration_budget_offenders(configs: dict[str, dict[str, Any]], budget: int) -> list[str]:
+    """Arms whose samples differ from ``budget``; batch 1 runs twice the iterations of batch 2."""
+    return [
+        f"{name}: {cfg['training']['max_iterations']} x {cfg['training']['batch_size']} != {budget}"
+        for name, cfg in configs.items()
+        if cfg["training"]["max_iterations"] * cfg["training"]["batch_size"] != budget
+    ]
+
+
 @pytest.fixture(scope="module")
 def matrix_configs() -> dict[str, dict[str, Any]]:
     """Resolve all 10 enhancement-matrix arms into a {name -> resolved dump} dict.
@@ -164,9 +182,22 @@ class TestPinnedAcrossArms:
             assert cfg["undersampling"] == ref, "undersampling schedule diverged"
 
     def test_training_iterations_pinned(self, matrix_configs):
-        """All arms run for the same iteration budget (fair wall-clock)."""
-        for cfg in self._arms(matrix_configs):
-            assert cfg["training"]["max_iterations"] == 30000
+        """All arms train on the shootout reference's number of samples.
+
+        The budget is read from ``attention_none`` rather than written here: a
+        literal went stale when the cohort moved from 30000 to 70000 (#2196).
+        """
+        offenders = _iteration_budget_offenders(matrix_configs, _reference_budget())
+        assert not offenders, "iteration budget diverged:\n  " + "\n  ".join(offenders)
+
+    def test_iteration_pin_flags_a_divergent_arm(self, matrix_configs):
+        """Planted violation: one arm off the reference budget is named."""
+        name, cfg = next(iter(matrix_configs.items()))
+        planted = {name: {**cfg, "training": {**cfg["training"], "max_iterations": 30000}}}
+        batch = cfg["training"]["batch_size"]
+        assert _iteration_budget_offenders(planted, _reference_budget()) == [
+            f"{name}: 30000 x {batch} != {_reference_budget()}"
+        ]
 
     def test_diffusion_block_identical(self, matrix_configs):
         arms = self._arms(matrix_configs)
@@ -176,7 +207,7 @@ class TestPinnedAcrossArms:
 
 
 class TestGatingBackendAxis:
-    """KAN row uses kan_adaptive ADC + KAN-friendly LR ratios; MLP row uses CNN ADC + 1.0 ratios."""
+    """Both rows share DC and optimizer ratios; they differ in the attention gate."""
 
     def _kan_arms(self, matrix_configs):
         return [v for k, v in matrix_configs.items() if "_kan_" in k]
@@ -224,7 +255,7 @@ class TestGatingBackendAxis:
         They are now stated as *forbidden* values, which is what makes them
         stable — the pair above enumerated the ALLOWED heads instead, and went
         red across the board when the cohort moved to ``hard`` DC (48/58 arms,
-        2026-07-29 soft-DC review). ``hard`` smuggles neither row's head, so the
+        2026-07-29 soft-DC review, and again for ``wiener_gain``). Neither smuggles a row's head, so the
         invariant these tests exist for was never violated; the enumeration had
         simply gone stale against a landed decision.
 
@@ -234,7 +265,7 @@ class TestGatingBackendAxis:
         methods = {
             cfg["model"]["model_kwargs"]["dc_method"] for cfg in matrix_configs.values()
         }
-        assert methods == {"hard"}, (
+        assert methods == {"wiener_gain"}, (
             f"the matrix no longer shares one DC method ({methods}); the "
             "head-to-head compares arms with different data consistency"
         )
@@ -248,21 +279,27 @@ class TestGatingBackendAxis:
                 f"kan_lr_ratio < 1.0"
             )
 
-    def test_mlp_arms_use_unit_lr_ratio(self, matrix_configs):
-        """MLP arms have no KAN params — leaving lr_ratio at 1.0 is the
-        correct null choice (the param-group split degenerates to a single
-        effective LR)."""
+    def test_mlp_arms_declare_their_kan_pairs_optimizer_ratios(self, matrix_configs):
+        """The MLP column carries the KAN column's LR/WD ratios (#2833, #2837).
+
+        They are inert there (no ``KANLayer`` parameters, so the param-group split
+        degenerates to one LR), and declaring them keeps each pair single-factor:
+        the pair then differs only in ``gate_type``.
+        """
         for cfg in self._mlp_arms(matrix_configs):
+            name = cfg["metadata"]["name"]
+            kan = matrix_configs[name.replace("_mlp_", "_kan_")]["model"]["model_kwargs"]
             mk = cfg["model"]["model_kwargs"]
-            assert mk.get("kan_lr_ratio", 1.0) == 1.0
+            for key in ("kan_lr_ratio", "kan_weight_decay_ratio"):
+                assert mk.get(key) == kan.get(key), (
+                    f"{name}: {key}={mk.get(key)!r} but its KAN pair declares {kan.get(key)!r}"
+                )
 
 
 class TestEnhancementAxis:
     """Each enhancement variant carries the right architectural flag."""
 
-    def test_baseline_arms_use_kan_dual_domain_with_default_kspace_score(
-        self, matrix_configs
-    ):
+    def test_baseline_arms_use_kan_dual_domain_with_default_kspace_score(self, matrix_configs):
         for label in (
             "experiment_11_attn_kan_baseline",
             "experiment_11_attn_mlp_baseline",
@@ -330,10 +367,7 @@ class TestKanVsMlpDiffOnlyOnGatingAxis:
         assert kan_cfg["data"] == mlp_cfg["data"]
         assert kan_cfg["undersampling"] == mlp_cfg["undersampling"]
         assert kan_cfg["training"]["diffusion"] == mlp_cfg["training"]["diffusion"]
-        assert (
-            kan_cfg["training"]["max_iterations"]
-            == mlp_cfg["training"]["max_iterations"]
-        )
+        assert kan_cfg["training"]["max_iterations"] == mlp_cfg["training"]["max_iterations"]
 
         # Same architectural enhancement (attention_type at minimum)
         assert (
@@ -341,13 +375,36 @@ class TestKanVsMlpDiffOnlyOnGatingAxis:
             == mlp_cfg["model"]["model_kwargs"]["attention_type"]
         ), f"attention_type diverged for enhancement={enhancement}"
 
-        # The gating axis is realised via gating-specific kwargs (kan_lr_ratio
-        # vs the unit-ratio MLP control). After the 2026-04-26 smoke audit
-        # all arms route DC through the physics block (dc_method: null), so
-        # the differentiator is now the LR/WD ratio knobs — not dc_method.
-        kan_mk = kan_cfg["model"]["model_kwargs"]
-        mlp_mk = mlp_cfg["model"]["model_kwargs"]
-        assert kan_mk.get("kan_lr_ratio", 1.0) != mlp_mk.get("kan_lr_ratio", 1.0), (
-            f"KAN and MLP arms for enhancement={enhancement} must differ on "
-            f"the gating-axis LR ratio (the test would be vacuous otherwise)"
+        # The gating axis is the attention gate's parameterisation and nothing
+        # else in the model: the optimizer ratios are shared (inert in the MLP
+        # column) since #2833, so a pair differing anywhere else is two factors.
+        kan_mk = _flat(kan_cfg["model"]["model_kwargs"])
+        mlp_mk = _flat(mlp_cfg["model"]["model_kwargs"])
+        differing = {k for k in kan_mk.keys() | mlp_mk.keys() if kan_mk.get(k) != mlp_mk.get(k)}
+        assert differing == {"kan_dual_domain_kwargs.gate_type"}, (
+            f"enhancement={enhancement}: the KAN/MLP pair differs on {sorted(differing)}"
         )
+        assert (kan_mk[_GATE], mlp_mk[_GATE]) == ("kan", "mlp")
+
+
+_GATE = "kan_dual_domain_kwargs.gate_type"
+
+
+def _flat(tree: dict, prefix: str = "") -> dict:
+    """``{"a.b": leaf}`` for a nested mapping."""
+    out: dict = {}
+    for key, value in tree.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(_flat(value, f"{path}."))
+        else:
+            out[path] = value
+    return out
+
+
+def test_the_pair_rule_sees_a_second_factor() -> None:
+    """PLANTED: a pair that also differs in its LR ratio is two factors."""
+    kan = {"kan_lr_ratio": 0.1, "kan_dual_domain_kwargs": {"gate_type": "kan"}}
+    mlp = {"kan_lr_ratio": 1.0, "kan_dual_domain_kwargs": {"gate_type": "mlp"}}
+    a, b = _flat(kan), _flat(mlp)
+    assert {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)} == {"kan_lr_ratio", _GATE}

@@ -183,6 +183,24 @@ def _make_config() -> MagicMock:
     return cfg
 
 
+def _n2n_batch() -> dict[str, torch.Tensor]:
+    """The loader's Noise2Noise batch: slot 0 of ``kspace_reps`` is the input, slot 1 the pair."""
+    batch = _make_batch()
+    batch["kspace_reps"] = torch.cat([batch["input"], batch["target"]], dim=1)
+    return batch
+
+
+def _n2n_env_factory(generator: nn.Module):
+    """An env whose config declares the pairing the strategy refuses to run without."""
+
+    def build() -> MagicMock:
+        config = _make_config()
+        config.data.n2n_pairing = "ordered"
+        return _make_env(generator, config=config)
+
+    return build
+
+
 # ---------------------------------------------------------------------------
 # TEST 1: Gradient Isolation — target must never accumulate gradients
 # ---------------------------------------------------------------------------
@@ -241,12 +259,7 @@ class TestGradientIsolation:
         from spectramr.infrastructure.training.strategies.n2n_strategy import (
             NoiseToNoiseStrategy,
         )
-        batch = _make_batch()
-        self._run_gradient_check(
-            NoiseToNoiseStrategy,
-            lambda: _make_env(TinyGenerator()),
-            batch,
-        )
+        self._run_gradient_check(NoiseToNoiseStrategy, _n2n_env_factory(TinyGenerator()), _n2n_batch())
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +328,8 @@ class TestTargetNotInForwardPass:
             return orig(x, *a, **k)
 
         gen.forward = spy
-        batch = _make_batch()
-        env = _make_env(gen)
+        batch = _n2n_batch()
+        env = _n2n_env_factory(gen)()
 
         with patch("spectramr.infrastructure.di.di_container.resolve_service", return_value=MagicMock()):
             strategy = NoiseToNoiseStrategy(env=env, device="cpu")

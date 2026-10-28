@@ -15,7 +15,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from spectramr.infrastructure.physics.multicoil_ei_operator import MulticoilEIOperator
+from spectramr.infrastructure.physics.multicoil_ei_operator import (
+    MulticoilEIOperator,
+    interleaved_to_complex,
+)
 
 _B, _C, _S = 2, 4, 32
 
@@ -105,8 +108,44 @@ class TestItIsAnAdjointPair:
 
     def test_the_forward_maps_a_combined_image_to_coil_kspace(self) -> None:
         operator = MulticoilEIOperator(_maps(), _mask(), where="in the test")
-        image = torch.randn(_B, 1, _S, _S)
+        image = torch.randn(_B, 2, _S, _S)
         assert operator.forward(image).shape == (_B, _C, _S, _S)
+
+    def test_the_forward_reads_the_networks_real_imag_output_as_one_image(self) -> None:
+        """#2326: the network emits ``(B, 2, H, W)`` Re/Im. The operator used to
+        coerce it with ``torch.complex(x, 0)``, a 2-"coil" image against 4 maps, and
+        ``sense_forward`` raised ``size 2 vs 4``."""
+        from spectramr.infrastructure.physics.fft_ops import sense_forward
+
+        maps, mask = _maps(), _mask()
+        operator = MulticoilEIOperator(maps, mask, where="in the test")
+        interleaved = torch.randn(_B, 2, _S, _S)
+        expected = sense_forward(
+            torch.complex(interleaved[:, :1], interleaved[:, 1:]), maps, mask.to(torch.complex64)
+        )
+        assert torch.allclose(operator.forward(interleaved), expected, atol=1e-6)
+
+    def test_the_old_coercion_is_the_crash_it_caused(self) -> None:
+        """The planted shape: a zero-imaginary coercion makes two coils out of one image."""
+        from spectramr.infrastructure.physics.fft_ops import sense_forward
+
+        interleaved = torch.randn(_B, 2, _S, _S)
+        with pytest.raises(RuntimeError, match="size"):
+            sense_forward(torch.complex(interleaved, torch.zeros_like(interleaved)), _maps(), None)
+
+    def test_combine_is_the_unmasked_sense_adjoint(self) -> None:
+        """A k-space network's output reaches the group as one combined image."""
+        from spectramr.infrastructure.physics.fft_ops import sense_adjoint
+
+        maps = _maps()
+        operator = MulticoilEIOperator(maps, _mask(), where="in the test")
+        kspace = _kspace()
+        combined = operator.combine(
+            torch.cat([kspace.real, kspace.imag], dim=1)[:, [0, 4, 1, 5, 2, 6, 3, 7]]
+        )
+        expected = sense_adjoint(kspace, maps, None)
+        assert combined.shape == (_B, 2, _S, _S)
+        assert torch.allclose(torch.complex(combined[:, :1], combined[:, 1:]), expected, atol=1e-5)
 
     def test_the_model_input_is_two_real_channels(self) -> None:
         """`in_channels: 2` is unchanged: the coils never reach the network."""
@@ -118,7 +157,7 @@ class TestItIsAnAdjointPair:
     def test_the_mask_is_applied(self) -> None:
         """An unmasked operator would invert a problem the arm is not solving."""
         maps, mask = _maps(), _mask()
-        masked = MulticoilEIOperator(maps, mask, where="t").forward(torch.randn(_B, 1, _S, _S))
+        masked = MulticoilEIOperator(maps, mask, where="t").forward(torch.randn(_B, 2, _S, _S))
         assert torch.allclose(masked[..., 1::4, :], torch.zeros_like(masked[..., 1::4, :]))
 
 
@@ -330,3 +369,74 @@ class TestPrepareSuppressesBothAdjointRoutes:
             "the generic builder would ifft2c the SENSE-combined image a second time"
         )
         assert model_input.shape == (1, 2, 8, 8)
+
+
+def test_complex_adjoint_pairs_with_forward_and_feeds_model_input() -> None:
+    """``adjoint`` is the solver form of A^H; ``model_input`` is its interleaved view."""
+    gen = torch.Generator().manual_seed(0)
+    maps = torch.randn(1, 4, 16, 16, dtype=torch.complex64, generator=gen)
+    mask = (torch.rand(1, 1, 1, 16, generator=gen) > 0.5).float()
+    op = MulticoilEIOperator(maps, mask, where="in the test")
+    x = torch.randn(1, 1, 16, 16, dtype=torch.complex64, generator=gen)
+    y = torch.randn(1, 4, 16, 16, dtype=torch.complex64, generator=gen)
+    lhs = torch.vdot(op.forward(x).flatten(), y.flatten())
+    rhs = torch.vdot(x.flatten(), op.adjoint(y).flatten())
+    assert abs(lhs - rhs) < 1e-3 * abs(lhs)
+    adj = op.adjoint(y)
+    torch.testing.assert_close(op.model_input(y), torch.cat([adj.real, adj.imag], dim=1))
+    assert op.lipschitz_bound() == float(maps.abs().pow(2).sum(dim=1).amax())
+
+
+def test_model_input_is_unchanged_by_the_adjoint_refactor() -> None:
+    """The EI arms train on ``model_input``; routing it through ``adjoint`` must not move it.
+
+    The reference is the pre-refactor body, ``sense_adjoint`` called directly, on a
+    non-separable 2-D mask as well as on lines.
+    """
+    from spectramr.infrastructure.physics.fft_ops import sense_adjoint
+
+    gen = torch.Generator().manual_seed(3)
+    line = _mask()
+    point = (torch.rand(1, 1, _S, _S, generator=gen) > 0.75).float()
+    for mask in (line, point):
+        op = MulticoilEIOperator(_maps(), mask, where="in the test")
+        before = sense_adjoint(_kspace(), op.maps, op.mask)
+        torch.testing.assert_close(
+            op.model_input(_kspace()), torch.cat([before.real, before.imag], dim=1), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_precision_reconstruction_pairs_into_complex64(dtype):
+    x = torch.randn(2, 4, 8, 8).to(dtype)
+    out = interleaved_to_complex(x)
+    assert out.dtype == torch.complex64
+    torch.testing.assert_close(out.real, x.float()[:, 0::2], rtol=0, atol=0)
+
+
+class TestTheImageIsRestrictedToTheMapsSupport:
+    """``A = M F S`` cannot see a pixel with ``S = 0``; the bound's background grew there."""
+
+    @staticmethod
+    def _op() -> MulticoilEIOperator:
+        maps = _maps()
+        maps[..., :, :8] = 0.0  # a band no coil covers
+        return MulticoilEIOperator(maps, _mask(), where="in the test")
+
+    def test_the_unsupported_band_is_zeroed_and_carries_no_gradient(self) -> None:
+        op = self._op()
+        x = torch.randn(_B, 2, _S, _S, requires_grad=True)
+        restricted = op.restrict(x)
+        assert restricted.shape == x.shape
+        assert torch.all(restricted[..., :8] == 0) and torch.equal(restricted[..., 8:], x[..., 8:])
+        restricted.sum().backward()
+        assert torch.all(x.grad[..., :8] == 0)
+
+    def test_the_operator_cannot_tell_the_restricted_image_from_the_raw_one(self) -> None:
+        """Planted background: invisible to A, so removing it changes no measurement."""
+        op = self._op()
+        x = torch.randn(_B, 2, _S, _S)
+        planted = x.clone()
+        planted[..., :8] += 50.0
+        torch.testing.assert_close(op.forward(planted), op.forward(op.restrict(x)))
+        torch.testing.assert_close(op.restrict(planted), op.restrict(x))

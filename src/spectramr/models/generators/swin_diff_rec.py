@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 from spectramr.models.blocks.complex_blocks import ComplexResBlock
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
 from spectramr.models.blocks.residual import ResidualBlock as ResBlock
 from spectramr.models.blocks.swin import SwinBlock
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
@@ -284,7 +285,11 @@ class SwinDiffRec(GradCheckpointingMixin, nn.Module, IGenerator):
         # count, so leave that path unscaled.
         _max_t = kwargs.get("max_timesteps") if acceleration is None else None
         t_sin = sinusoidal_timestep_embedding(
-            cond_input.squeeze(-1), self.emb_dim, max_timesteps=_max_t
+            cond_input.squeeze(-1),
+            self.emb_dim,
+            max_timesteps=_max_t,
+            scale=kwargs.get("timestep_scale", "unit_interval") if acceleration is None
+            else "unit_interval",
         )
         emb = self.time_pos_enc(t_sin)
 
@@ -301,9 +306,7 @@ class SwinDiffRec(GradCheckpointingMixin, nn.Module, IGenerator):
                     "model_kwargs.time_embedding_dim (the generator builds "
                     "contrast_embedding at that width)."
                 )
-            if contrast_emb.shape[0] != emb.shape[0]:
-                contrast_emb = contrast_emb[: emb.shape[0]]
-            emb = emb + contrast_emb
+            emb = fuse_contrast_embedding(emb, contrast_emb, owner="SwinDiffRec")
 
         # 2. Encoder
         ckpt = self._checkpointing_active()

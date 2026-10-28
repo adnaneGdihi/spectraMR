@@ -22,6 +22,7 @@ from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
     resolution_agnostic_mode,
 )
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.generators.hilbert_mamba_generators import (
     _MambaEncoder,
 )
@@ -347,9 +348,12 @@ class HDSFHLDMamba(nn.Module):
         time_embed_dim: int = 256,
         block_size: int = 16,
         dilation: int = 4,
+        num_timesteps: int = DEFAULT_DIFFUSION_TIMESTEPS,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        # The builder injects training.diffusion.timesteps, the range t is drawn from (#2442).
+        self.num_timesteps = int(num_timesteps)
         self.stem = nn.Sequential(
             nn.Conv3d(in_channels, d_model, kernel_size=3, padding=1),
             nn.GELU(),
@@ -398,7 +402,7 @@ class HDSFHLDMamba(nn.Module):
 
         # Inject timestep embedding (spatial broadcast)
         if timesteps is not None:
-            t_norm = timesteps.float() / 1000.0
+            t_norm = timesteps.float() / self.num_timesteps
             t_emb = self.time_mlp(t_norm.unsqueeze(-1))  # [B, d_model]
             t_emb = t_emb.view(*t_emb.shape, 1, 1, 1)
             feat = feat + t_emb

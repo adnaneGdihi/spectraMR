@@ -88,6 +88,30 @@ def test_complex_l1_real_2channel_input() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_complex_l1_restricted_to_acquired_ignores_never_acquired_lines() -> None:
+    pred = torch.zeros(1, 2, 4, 4, dtype=torch.complex64)
+    target = torch.zeros_like(pred)
+    target[..., :2] = 1.0  # error only on the acquired columns
+    acquired = torch.zeros(1, 1, 4, 4)
+    acquired[..., :2] = 1.0
+    diluted = ComplexL1Loss()(pred, target)
+    scoped = ComplexL1Loss(restrict_to_acquired=True)(pred, target, acquired=acquired)
+    assert scoped == pytest.approx(1.0, abs=1e-4)
+    assert diluted == pytest.approx(0.5, abs=1e-4)
+
+
+def test_complex_l1_restricted_without_acquired_plane_raises() -> None:
+    x = _complex_tensor((1, 2, 4, 4))
+    with pytest.raises(ValueError, match="acquired"):
+        ComplexL1Loss(restrict_to_acquired=True)(x, x)
+
+
+def test_complex_l1_default_ignores_acquired_plane() -> None:
+    x, y = _complex_tensor((1, 2, 4, 4), 0), _complex_tensor((1, 2, 4, 4), 1)
+    plane = torch.zeros(1, 1, 4, 4)
+    assert ComplexL1Loss()(x, y, acquired=plane) == ComplexL1Loss()(x, y)
+
+
 def test_weighted_kspace_uses_radial_weight() -> None:
     """Higher exponent → higher loss for high-frequency-only differences."""
     loss_low = WeightedKSpaceL1Loss(exponent=0.0)  # uniform weight
@@ -526,3 +550,38 @@ def test_the_support_floor_is_reachable_from_the_yaml_kwargs():
         SENSEAdjointL1Loss(normalize=True, min_support_frac=0.0).eval()(noisy, k, smaps=dead)
     )
     assert unprotected > 5 * floored, (unprotected, floored)
+
+
+# #2338: with the arm's log1p compression, the loss must decompress before its iFFT,
+# so it scores the same image it would score on the uncompressed plane.
+def test_sense_adjoint_l1_decompresses_when_log_scaled():
+    from spectramr.data.transforms.normalization import compress_kspace_log
+
+    torch.manual_seed(0)
+    img_t = torch.randn(1, _COILS, 16, 16, dtype=torch.complex64)
+    img_p = img_t + 0.1 * torch.randn_like(img_t)
+    maps = torch.randn(1, _COILS, 16, 16, dtype=torch.complex64)
+    k_t, k_p = _interleaved_kspace(img_t), _interleaved_kspace(img_p)
+
+    loss = SENSEAdjointL1Loss()
+    assert loss.log_scaled is False
+    expected = loss(k_p, k_t, smaps=maps)
+    loss.log_scaled = True
+    got = loss(
+        compress_kspace_log(k_p, channel_dim=1), compress_kspace_log(k_t, channel_dim=1), smaps=maps
+    )
+    torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_restrict_to_acquired_is_reached_through_the_computer_kwarg_filter() -> None:
+    from spectramr.models.losses.computers.unified_diffusion_reconstruction import _call_safe_loss
+
+    pred = torch.zeros(1, 2, 4, 4, dtype=torch.complex64)
+    target = torch.zeros_like(pred)
+    target[..., :2] = 1.0
+    acquired = torch.zeros(1, 1, 4, 4)
+    acquired[..., :2] = 1.0
+    loss = _call_safe_loss(
+        ComplexL1Loss(restrict_to_acquired=True), pred, target, acquired=acquired, mask=acquired
+    )
+    assert loss == pytest.approx(1.0, abs=1e-4)

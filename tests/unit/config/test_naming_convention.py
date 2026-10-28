@@ -86,11 +86,9 @@ RULES = {
 #: drains the entries for the block it touches.
 KNOWN_NAMING_EXCEPTIONS: frozenset[str] = frozenset(
     {
-        "augmentation_enabled",
         "auto_ratio",
         "background_suppression_threshold_ratio",
         "concomitant_enabled",
-        "disable_default_losses",
         "mask_ratio",
         "mlp_ratio",
         "multislice_enabled",
@@ -104,7 +102,6 @@ KNOWN_NAMING_EXCEPTIONS: frozenset[str] = frozenset(
         "n_frames",
         "n_group_samples",
         "n_iter",
-        "n_layers",
         "n_mamba_layers",
         "n_orientations",
         "n_phase_cycles",
@@ -141,10 +138,8 @@ KNOWN_NAMING_EXCEPTIONS: frozenset[str] = frozenset(
         "use_memory_bank",
         "use_momentum",
         "use_orig_params",
-        "use_physical_arc",
         "use_real_stack",
         "use_repetitions",
-        "use_training_loss",
     }
 )
 

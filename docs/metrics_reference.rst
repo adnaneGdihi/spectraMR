@@ -51,6 +51,13 @@ path emits three families per rung:
    against, and a second pass over a full metric set would double every
    perceptual metric per rung per batch.
 
+   The equivariant-imaging and SSDU strategies emit ``val_zf_<k>`` themselves
+   when their network predicts an image against a k-space target: the baseline is
+   the adjoint image the network is handed (:math:`A^H\mathbf{y}`), graded against
+   the target's RSS image, because ``ifft_target_magnitude`` -- the transform those
+   arms score with -- brings only the target out of k-space and would read the
+   k-space input as an image.
+
 ``val_zf_delta_<k>``
    the signed ``val_<k> - val_zf_<k>``. It is deliberately **not** oriented to
    "positive is better": ``metric_higher_is_better`` resolves an unknown key
@@ -82,6 +89,18 @@ silently overwrite a registration:
 Without this, a name could resolve to two different classes within one
 training run depending on import order. The regression tests are under
 ``tests/unit/models/test_registry_strict_duplicates.py``.
+
+Which metrics validation computes
+=================================
+
+``validation.scoring.compute`` names two kinds of key: registered metrics,
+which the validation metrics computer scores, and keys the strategy's own
+``validation_step`` writes (``val_loss``, or a name in the strategy's
+``capabilities.emitted_metrics``). The computer receives only the registered
+names. When none remain -- the list is empty, or every name in it is emitted by
+the strategy -- the computer has no metrics and the default validation step
+returns without a forward pass (#2839). Only an undeclared ``compute``
+(``None``) falls back to a default, the metric set ``training.metrics`` selects.
 
 .. _metric-direction-ssot:
 
@@ -434,6 +453,116 @@ Two further ``(prediction, target)`` quality metrics:
    ``parameters``, ``forward_time`` and ``throughput``. Listing either name under
    ``metrics:`` is a warn-skip, not an error.
 
+Coil null-space and repetition metrics
+--------------------------------------
+
+Reference-free (or reference-noise-corrected) quantities for multi-coil
+k-space reconstruction, derived in ``experiments/inprogress/n2n/PAPER.md``
+(§ 3 and § 5). All four ``needs=("coil_maps", ...)`` metrics read the complex
+ESPIRiT maps under ``sensitivity_complex``: published by the M4Raw loader from
+``data.coil_maps_root`` (one file per repetition group, written by
+``scripts/precompute_m4raw_coil_maps.py``), or estimated by the
+``espirit_sensitivity`` transform when no map root is declared. The
+``pred_alt`` ones additionally need ``data.emit_alternate_input: true`` so the
+validation step can run the model on a second repetition of the same slice.
+Every value is a device scalar with no host sync.
+
+``data.coil_maps_recipe`` says which repetitions the stored maps came from:
+``all_reps_mean`` (the default, and every file written before the field existed)
+or ``input_repetition``, the served input alone, for an arm graded against the
+leave-one-out mean of the other repetitions. ``data.coil_maps_acs_size`` is the
+ESPIRiT ACS width the store was written with; set to the masked input's ACS band,
+the stored maps equal ESPIRiT run per load on the masked input. A file of the
+other recipe or width raises.
+
+All four metrics read coil k-space. A strategy whose network emits one
+SENSE-combined image (Equivariant Imaging, SSDU) hands them
+:math:`F S \hat{x}` through ``_context_metric_prediction`` and says the domain
+is ``kspace``; without that override an image output is refused rather than
+graded as k-space. When the model's output on ``input_alt`` equals its output on
+``input`` -- a validation forward that reads the measurement from the batch
+context and ignores the tensor it is handed -- the pass raises instead of
+reporting zero variance (one host read per validation batch, off the training
+step).
+
+.. list-table:: Coil null-space and repetition metrics
+   :header-rows: 1
+   :widths: 30 12 58
+
+   * - Metric
+     - Direction
+     - Definition / home
+   * - ``null_space_residual``
+     - lower = better
+     - Support-weighted mean energy of the prediction's coil images off the
+       per-pixel coil direction, :math:`\sum_r w_r \lVert P_r^{\perp}
+       \hat{x}_r \rVert^2 / \sum_r w_r`; no reference. Under exact maps it is
+       a lower bound on the reconstruction error (Theorem 5).
+       ``coil_null_space_metrics``.
+   * - ``null_space_residual_fraction``
+     - lower = better
+     - The same energy as a share of the prediction's supported energy.
+       ``coil_null_space_metrics``.
+   * - ``rep_variance``
+     - lower = better
+     - Half the mean squared difference between the model's outputs on two
+       repetitions of the same slice (``pred`` and ``pred_alt``): an unbiased
+       estimator-variance estimate (Theorem 12). ``rep_bias_variance``.
+   * - ``reference_noise_corrected_mse``
+     - lower = better
+     - Coil-image MSE against a noisy reference minus the reference's own
+       noise energy, estimated from its coil null space (Theorem 11). Assumes
+       isotropic coil noise. ``rep_bias_variance``.
+   * - ``bias_squared``
+     - lower = better
+     - ``reference_noise_corrected_mse`` minus ``rep_variance``: the
+       estimator's squared bias per pixel. ``rep_bias_variance``.
+   * - ``nex_equivalent``
+     - higher = better
+     - The number of averaged repetitions whose noise energy equals the
+       corrected error: how many excitations the network's output is worth.
+       ``rep_bias_variance``.
+   * - ``sense_psnr``, ``sense_ssim``
+     - higher = better
+     - ``psnr`` / ``ssim`` on the SENSE combination
+       :math:`|\hat{S}^{H}F^{H}\cdot|` of prediction and reference, with the
+       batch's unit-normalised complex maps and the arm's declared
+       ``data_range``. A coil k-space prediction is combined like the
+       reference; a single-image prediction (EI, SSDU) is taken as it is.
+       Raises when the batch carries no maps; a one-virtual-coil arm keeps the
+       RSS pair. ``sense_image_metrics``, which also owns the combine behind the
+       ``sense_magnitude`` value of ``validation.scoring.output_transform``.
+
+When ``validation.scoring.coil_manifold_projection: true`` the scored output is
+first projected onto the coil manifold, :math:`\hat{s}\hat{s}^{H}\hat{x}`; the
+null-space and repetition metrics are computed on the raw, unprojected output
+in a separate pass so the projection's effect stays visible.
+
+When ``validation.scoring.recorrupted_inference: {samples: J}`` is declared (R2R
+arms only, #2329) every scored output -- the prediction and ``pred_alt`` -- is
+the mean of the model over :math:`J` fresh recorruptions of its input, the
+estimator the R2R objective trains (``PAPER.md`` Theorem 4). ``r2r`` draws
+:math:`z\sim\mathcal{CN}(0,\Sigma)` from the arm's covariance source, divided
+by the per-sample ``kspace_scale``; ``nullspace_r2r`` takes the input half of
+:math:`J` coil splits with fresh null directions, using the published maps. The
+average precedes the projection, and the knob raises on any other
+``data.target_mode``.
+
+``kspace_cold_diffusion`` validation calibrates its coil maps from the fully
+sampled reference, so its ``ifft_sense_adjoint`` image metrics, its zero-filled
+baseline and its measurement-aware metrics are scored with oracle maps. When
+``validation.scoring.measurement_maps: metrics`` is declared, each rung's
+prediction is scored a second time with maps calibrated from that rung's masked
+measurement (``estimate_smaps_from_measurement``, the estimator predict uses),
+under ``val_<m>_measmaps``, ``val_zf_<m>_measmaps`` and, over the cascade,
+``val_<m>_measmaps_mean`` and ``val_hfen_measmaps_vs_zf_mean``. The re-scored image
+metrics are ``psnr``, ``robust_mri_psnr``, ``hfen``, ``ssim`` and
+``power_spectrum_consistency`` where the arm computes them. Both families share
+the oracle ``data_range``, so they differ only through the maps. The prediction
+is still conditioned on the oracle maps; ``val_measmaps_applied`` is 1 per scored
+rung and 0 on a single-coil rung, which has no sensitivity profile and is
+skipped.
+
 ---
 
 Image Quality Metrics
@@ -494,6 +623,40 @@ test would read an all-positive sample of a ``[-1, 1]`` dataset as ``[0, 1]``
 and halve its range. On mixed-sign data that contract can still differ between
 two batch compositions; declare ``metrics.data_range`` to pin it.
 
+**How the image range is resolved.** ``resolve_image_data_range``
+(``core/metrics/evaluation_metrics.py``) is the one resolver for PSNR, SSIM and
+``clinical_ssim``, and for the fallback ``val_psnr`` the validation mixin writes
+when the metrics computer fails. It takes the first of three sources that
+applies, and the run log names the one it took (``[Metrics] image data_range``):
+
+1. **A declared range**, ``data.processing.data_range`` (or the metrics block's
+   ``data_range``), used as given.
+2. **A percentile scale.** With ``enable_kspace_normalization: true``,
+   ``kspace_scale_domain: image``, no ``enable_log_scaling`` and a
+   ``kspace_percentile`` :math:`q` in :math:`[0.9, 1)`, the data path divides
+   each volume so the :math:`q`-quantile of its coil-RSS image is 1.0, and
+   :math:`L = 1`. The scale fixes a quantile, not the peak, so the peak may sit
+   above 1.0 (2.05 on M4Raw at :math:`q = 0.99`, #2241). A target that peaks
+   above :math:`1 / (1 - q)` (100 at the 99th percentile, 20 at the 95th) is
+   off the declared scale by more than anatomy explains, and raises
+   ``DataRangeContractError``, which stops validation instead of reporting NaN.
+   A signed target is not the magnitude image the scale describes and goes to
+   the sign test.
+3. **The sign test**: ``[0, 1]`` or ``[-1, 1]``, verified by requiring the peak
+   magnitude to stay within 2.0. A target outside it is *not applicable*,
+   recorded as NaN with ``data_range_unresolved_for_range_sensitive_metric``.
+
+The percentile scale is not inferred under ``kspace_scale_domain: kspace``
+(a k-space quantile says nothing about the image level), ``acs`` or
+``acs_window`` (the calibration image's level relative to the full image is
+unmeasured), or log compression
+(the metric transforms IFFT the compressed spectrum). On 2026-10-04 the 21
+``experiments/inprogress`` arms on the percentile scale (n2n and
+self_supervised) all also declare ``data_range: 1.0``. The declaration
+resolves to the same value, and
+``tests/unit/infrastructure/training/utils/test_metric_data_range.py`` checks
+that on every declared arm.
+
 The epoch value is weighted by each batch's **sample** count, not by batch
 count, so a short final batch under ``drop_last=False`` does not weigh as much as
 a full one. Both conventions are stamped into ``provenance.json`` under
@@ -512,15 +675,19 @@ Robust MRI PSNR
 
 **Registry name:** ``robust_mri_psnr`` — **Higher is better** ✓
 
-A modified PSNR that clips outlier voxels before computing MSE, reducing
-sensitivity to rare high-error pixels at the boundary:
+PSNR restricted to the tissue support of the target, with a percentile data
+range that ignores DC spikes:
 
 .. math::
 
-   \text{PSNR}_{\text{robust}} = 10 \cdot \log_{10}\left(\frac{L^2}{\text{MSE}_{\text{clip}}}\right)
+   \text{PSNR}_{\text{robust}} = 20 \cdot \log_{10}\left(\frac{L_q}{\sqrt{\text{MSE}_{\Omega}} + 10^{-10}}\right)
 
-where :math:`\text{MSE}_{\text{clip}}` excludes the top/bottom 1% of
-error values.
+where :math:`L_q` is the ``data_range_percentile`` quantile (default 0.999) of
+the target magnitude and :math:`\Omega` is the set of voxels above 5% of
+:math:`L_q` (or above ``background_threshold`` when :math:`L_q` itself is below
+it). An empty :math:`\Omega` falls back to whole-image PSNR. The value is a
+0-d device tensor computed without a host sync, so the metrics computer's
+fused transfer is the only one.
 
 
 Structural Similarity Index (SSIM)
@@ -738,8 +905,10 @@ segmenter has cancels in the prediction-vs-target comparison.
      - 95th-percentile Hausdorff distance between tissue boundaries, in **pixels**
        (MONAI-backed). Boundary-sensitive where Dice is area-sensitive.
 
-**Relationship to** ``synthseg_dice``. That metric's local backend
-(:class:`~spectramr.core.metrics.quantitative.segmentation.LabelDiceBackend`) bins by
+**Relationship to** ``intensity_quantile_dice_proxy``. That metric (the local
+``label_dice`` backend of ``synthseg_dice``, registered under its own name so it is
+never reported as SynthSeg-Dice;
+:class:`~spectramr.core.metrics.quantitative.segmentation.LabelDiceBackend`) bins by
 intensity **quantile**, so its classes are equal-population *by construction*: it sees
 spatial arrangement only and is invariant to any monotone intensity change, and its
 class volumes can never disagree. The Otsu family derives thresholds from the
@@ -899,7 +1068,21 @@ Measures phase accuracy for complex-valued reconstructions:
 
    \text{Phase-MSE} = \frac{1}{N}\sum_i \left(\angle x_i - \angle \hat{x}_i\right)^2
 
-where angles are wrapped to :math:`[-\pi, \pi]`.
+where angles are wrapped to :math:`[-\pi, \pi]` and the mean runs over voxels
+whose target magnitude exceeds 0.05 (0 when none do). The value is a 0-d device
+tensor computed without a host sync.
+
+``phase_mse``, ``ipen`` and ``complex_hfen`` are registered
+``requires_complex=True``. The metrics computer scores them on the complex
+image the metric transform produces before its final ``abs()``: the SENSE
+adjoint under ``ifft_sense_adjoint`` (per-coil complex images when no
+sensitivity maps are available), the per-coil inverse FFT under
+``ifft_magnitude``, and the paired real/imag channels under ``magnitude``. When
+no complex image exists -- a real single-channel output with no transform, or a
+1-channel magnitude reference -- the computer raises ``PhaseBlindInputError``
+rather than reporting the phase of a magnitude image. Before #867 such inputs
+were Fourier-transformed and the logged value was the k-space phase of
+:math:`|x|`, which is not a phase error.
 
 
 ---
@@ -1981,7 +2164,7 @@ The LoG kernel:
    from spectramr.core.metrics.hfen import HFENMetric
 
    hfen = HFENMetric(sigma=1.5, kernel_size=15)
-   score = hfen(pred, target)    # Tensor[B, 1, H, W]
+   score = hfen(pred, target)    # 0-d tensor on pred's device, no host sync
 
 .. list-table::
    :header-rows: 1

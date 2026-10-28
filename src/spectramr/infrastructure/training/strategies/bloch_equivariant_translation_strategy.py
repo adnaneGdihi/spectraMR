@@ -82,7 +82,7 @@ class BlochEquivariantTranslationStrategy(BaseTrainingStrategy):
         # opt-in flag wraps each Bloch call in ``torch.utils.checkpoint``
         # to recompute activations during backward at ~2× compute cost.
         self.use_bloch_checkpoint = (
-            bool(getattr(bet, "use_bloch_checkpoint", False)) if bet else False
+            bool(getattr(bet, "enable_bloch_checkpoint", False)) if bet else False
         )
         self.bloch = DifferentiableBlochLayer().to(self.device)
         self.atlas = _TissueAtlas(device=self.device)

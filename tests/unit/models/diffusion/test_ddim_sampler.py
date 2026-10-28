@@ -70,3 +70,13 @@ class TestConstruction:
         runs is indistinguishable in a profile from one that is doing work."""
         assert _sampler(dc_weight=0.0).data_consistency is None
         assert _sampler(dc_weight=0.5).data_consistency is not None
+
+
+class TestNoPerStepHostSync:
+    def test_the_loop_reads_the_schedule_once(self) -> None:
+        """Planted: a per-step ``t.item()`` is a device-to-host sync on every DDIM step."""
+        import inspect
+
+        source = inspect.getsource(DDIMSampler.sample)
+        assert ".item()" not in source
+        assert ".tolist()" in source

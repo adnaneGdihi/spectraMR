@@ -24,6 +24,14 @@ from spectramr.cli.manifest_dispatch import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _scoped_snapshot_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_dispatch exports the verdict path for its child; keep it out of later tests."""
+    from spectramr.core.env_names import SPECTRAMR_DISPATCH_SNAPSHOT_RECORD
+
+    monkeypatch.setenv(SPECTRAMR_DISPATCH_SNAPSHOT_RECORD, "")
+
+
 def _manifest(tmp_path: Path) -> Path:
     m = tmp_path / "manifest.txt"
     m.write_text(
@@ -197,7 +205,7 @@ class _FakeRun:
 def _real_cfg(tmp_path: Path) -> tuple[Path, Path]:
     """A manifest + an actually-existing config (manifest_dispatch is_file-checks)."""
     cfg = tmp_path / "arm.yaml"
-    cfg.write_text("training:\n  max_iterations: 5\n")
+    cfg.write_text("training:\n  max_iterations: 5\n  output_dir: out/arm\n")
     man = tmp_path / "m.txt"
     man.write_text(str(cfg) + "\n")
     return man, cfg
@@ -302,7 +310,7 @@ def test_prod_dry_run_stamps_mode_and_no_override(tmp_path, capsys) -> None:
         manifest=str(man),
         index=0,
         train_iters=None,
-        resume=False,
+        resume=None,  # unset: --prod's wall-clock chaining applies
         no_audit=True,
         dispatch_dir=str(tmp_path / "d"),
         dry_run=True,
@@ -312,6 +320,151 @@ def test_prod_dry_run_stamps_mode_and_no_override(tmp_path, capsys) -> None:
     out = capsys.readouterr().out
     assert "[MODE] PROD" in out
     assert "--override" not in out  # production run — no smoke-cap overrides
+
+
+# --- RESUME tri-state: unset (None) / resume (True) / start-fresh (False) ------
+# resume is no longer a switch. RESUME=0 is an EXPLICIT "start fresh" intent that
+# --prod must not silently override into --resume if-present; an unset resume is
+# where the PROD chaining still applies. The 2026-09-28 reverse_* array (job
+# 8718294) lost its 12 fresh arms to exactly this clobber.
+
+
+def test_unset_resume_under_prod_implies_resume_if_present(tmp_path, monkeypatch, capsys) -> None:
+    """Bare --prod (resume unset) keeps the legacy wall-clock chaining."""
+    man, _ = _real_cfg(tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=None,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=True,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PROD implies --resume if-present" in out
+    train_cmd = next(c for c in fake.calls if "train" in c)
+    assert "if-present" in train_cmd and "--resume" in train_cmd
+
+
+def test_explicit_fresh_under_prod_starts_fresh_not_chained(tmp_path, monkeypatch, capsys) -> None:
+    """RESUME=0 (resume=False) overrides --prod: no --resume, fresh start."""
+    man, _ = _real_cfg(tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=True,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RESUME=0 overrides PROD" in out
+    # fresh: the train command must NOT carry --resume at all.
+    train_cmd = next(c for c in fake.calls if "train" in c)
+    assert "--resume" not in train_cmd
+
+
+def test_fresh_resume_spells_no_resume_flag_for_both_verbs(distributed: bool = False) -> None:
+    """build_launch_argv: False and None both spell no --resume; True spells if-present."""
+    fresh = md.build_launch_argv("c.yaml", [], False, distributed=distributed)
+    assert "if-present" not in fresh and "--resume" not in fresh
+    unset = md.build_launch_argv("c.yaml", [], None, distributed=distributed)
+    assert "--resume" not in unset
+    chained = md.build_launch_argv("c.yaml", [], True, distributed=distributed)
+    assert "if-present" in chained
+
+
+def test_resume_and_resume_off_are_mutually_exclusive(tmp_path) -> None:
+    man, _ = _real_cfg(tmp_path)
+    with pytest.raises(SystemExit):
+        md.main(
+            [
+                "--manifest", str(man),
+                "--index", "0",
+                "--prod",
+                "--resume",
+                "--resume-off",
+                "--dry-run",
+            ]
+        )
+
+
+def test_resume_off_flag_parsed_and_forwarded(tmp_path, monkeypatch) -> None:
+    """--resume-off reaches _dispatch as resume=False, not None/True."""
+    man, _ = _real_cfg(tmp_path)
+    seen = {}
+
+    def _fake_dispatch(**kwargs):
+        seen["resume"] = kwargs["resume"]
+        return 0
+
+    monkeypatch.setattr(md, "_dispatch", _fake_dispatch)
+    rc = md.main(["--manifest", str(man), "--index", "0", "--resume-off", "--dry-run"])
+    assert rc == 0
+    assert seen["resume"] is False
+
+
+def test_requeue_resumes_parsed_and_forwarded(tmp_path, monkeypatch) -> None:
+    man, _ = _real_cfg(tmp_path)
+    seen = {}
+
+    def _fake_dispatch(**kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(md, "_dispatch", _fake_dispatch)
+    argv = ["--manifest", str(man), "--index", "0", "--resume-off", "--requeue-resumes"]
+    assert md.main([*argv, "--dry-run"]) == 0
+    assert seen["resume"] is False and seen["requeue_resumes"] is True
+
+
+@pytest.mark.parametrize("other", [[], ["--resume"]])
+def test_requeue_resumes_without_resume_off_is_refused(tmp_path, other) -> None:
+    """Planted: the exemption is meaningless unless the link starts fresh."""
+    man, _ = _real_cfg(tmp_path)
+    with pytest.raises(SystemExit):
+        md.main(["--manifest", str(man), "--index", "0", "--requeue-resumes", *other, "--dry-run"])
+
+
+@pytest.mark.parametrize("resume", [None, True])
+def test_dispatch_refuses_requeue_resumes_unless_fresh(tmp_path, resume) -> None:
+    """The same guard for callers that reach _dispatch without the parser."""
+    man, _ = _real_cfg(tmp_path)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=resume,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=True,
+        requeue_resumes=True,
+    )
+    assert rc == 2
+
+
+def test_unset_resume_reaches_dispatch_as_none(tmp_path, monkeypatch) -> None:
+    man, _ = _real_cfg(tmp_path)
+    seen = {}
+
+    def _fake_dispatch(**kwargs):
+        seen["resume"] = kwargs["resume"]
+        return 0
+
+    monkeypatch.setattr(md, "_dispatch", _fake_dispatch)
+    rc = md.main(["--manifest", str(man), "--index", "0", "--dry-run"])
+    assert rc == 0
+    assert seen["resume"] is None
 
 
 def test_prod_passes_no_override_to_train(tmp_path, monkeypatch) -> None:
@@ -422,6 +575,214 @@ def test_output_base_composes_with_smoke_cap(tmp_path, monkeypatch) -> None:
     joined = " ".join(train_cmd)
     assert "training.max_iterations=3" in joined  # smoke cap
     assert f"training.output_dir={base / 'arm'}" in joined  # routing
+
+
+def _smoke_dispatch(tmp_path, monkeypatch, cfg_text: str, **kw):
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text(cfg_text)
+    man = tmp_path / "m.txt"
+    man.write_text(f"{cfg}\n")
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=3,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=False,
+        output_base=None,
+        **kw,
+    )
+    return rc, fake
+
+
+def test_smoke_run_is_kept_out_of_the_arms_checkpoints(tmp_path, monkeypatch) -> None:
+    """A smoke under the arm's own output_dir became the full run's resume point (17897276)."""
+    rc, fake = _smoke_dispatch(
+        tmp_path, monkeypatch, "training:\n  max_iterations: 70000\n  output_dir: out/arm\n"
+    )
+    joined = " ".join(next(c for c in fake.calls if "train" in c))
+    assert rc == 0
+    assert "training.output_dir=out/arm__smoke" in joined
+    assert "logging.sinks.dir=out/arm__smoke/logs" in joined
+
+
+def test_smoke_keeps_a_quality_matching_artifact_out_of_production(tmp_path, monkeypatch) -> None:
+    """exp_qm_02a reads the QM output_dir; a smoke fit must not overwrite it."""
+    rc, fake = _smoke_dispatch(
+        tmp_path,
+        monkeypatch,
+        "training:\n  output_dir: out/qm\n  quality_matching:\n    output_dir: res/qm\n",
+    )
+    joined = " ".join(next(c for c in fake.calls if "train" in c))
+    assert rc == 0
+    assert "training.quality_matching.output_dir=res/qm__smoke" in joined
+
+
+def test_a_stage2_smoke_reads_the_stage1_smoke_checkpoint(tmp_path, monkeypatch) -> None:
+    """A stage-2 smoke must not need the production stage-1 checkpoint to exist."""
+    rc, fake = _smoke_dispatch(
+        tmp_path,
+        monkeypatch,
+        "training:\n  output_dir: out/s2\nmodel:\n  model_kwargs:\n"
+        "    vae_checkpoint_path: res/s1/checkpoints/best.safetensors\n",
+    )
+    joined = " ".join(next(c for c in fake.calls if "train" in c))
+    assert rc == 0
+    assert "model.model_kwargs.vae_checkpoint_path=res/s1__smoke/checkpoints/best.safetensors" in joined
+
+
+def test_a_path_outside_the_checkpoint_layout_is_left_alone(tmp_path, monkeypatch) -> None:
+    rc, fake = _smoke_dispatch(
+        tmp_path,
+        monkeypatch,
+        "training:\n  output_dir: out/s2\nmodel:\n  model_kwargs:\n"
+        "    vae_checkpoint_path: weights/vae.pt\n",
+    )
+    assert rc == 0
+    assert "vae_checkpoint_path" not in " ".join(next(c for c in fake.calls if "train" in c))
+
+
+def test_iter_cap_bounds_the_quality_matching_fit_and_synthesis(tmp_path) -> None:
+    cfg = tmp_path / "qm.yaml"
+    cfg.write_text("training:\n  quality_matching:\n    fit_seeds: 5\n")
+    overrides, _ = compute_iter_cap_overrides(cfg, 50)
+    assert "training.quality_matching.fit_seeds=1" in overrides
+    assert "training.quality_matching.max_synth_volumes=4" in overrides
+
+    small = tmp_path / "small.yaml"
+    small.write_text("training:\n  quality_matching:\n    fit_seeds: 1\n    max_synth_volumes: 2\n")
+    overrides, _ = compute_iter_cap_overrides(small, 50)
+    assert not any("quality_matching" in o for o in overrides)
+
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("training:\n  max_iterations: 10\n")
+    overrides, _ = compute_iter_cap_overrides(plain, 50)
+    assert not any("quality_matching" in o for o in overrides)
+
+
+def test_smoke_without_a_declared_output_dir_is_refused(tmp_path, monkeypatch) -> None:
+    rc, fake = _smoke_dispatch(tmp_path, monkeypatch, "training:\n  max_iterations: 70000\n")
+    assert rc == 2
+    assert not any("train" in c for c in fake.calls)
+
+
+def _override_values(args: list[str]) -> dict[str, str]:
+    pairs = [args[i + 1] for i, a in enumerate(args) if a == "--override"]
+    return dict(p.split("=", 1) for p in pairs)
+
+
+def _one_tree_error(args: list[str], expected_out: Path) -> str | None:
+    """Why the routed run would not live in one tree, or ``None``."""
+    values = _override_values(args)
+    want = {
+        # Checkpoints follow it: the writer and --resume both use <output_dir>/checkpoints.
+        "training.output_dir": expected_out,
+        "logging.sinks.dir": expected_out / "logs",
+    }
+    for key, path in want.items():
+        if key not in values:
+            return f"{key} is not routed"
+        if Path(values[key]) != path:
+            return f"{key} is {values[key]}; expected {path}"
+    # A checkpoint path override names a retired key (#2842), which the run refuses.
+    for key in values:
+        if key.startswith("checkpoint."):
+            return f"{key} is routed"
+    return None
+
+
+def test_routing_keeps_the_whole_run_in_one_tree(tmp_path) -> None:
+    """Saving and ``--resume if-present`` read the same directory (sabine 17877924).
+
+    Both derive it from ``training.output_dir``, so routing that one key moves the
+    checkpoints; no checkpoint key is overridden.
+    """
+    args = md.output_dir_override(tmp_path / "camp", "x/arm.yaml")
+    assert _one_tree_error(args, tmp_path / "camp" / "arm") is None
+
+
+def test_routing_moves_every_declared_identity_path(tmp_path) -> None:
+    """A routed arm wrote metrics into the standalone arm's tree (exp 11 m4raw campaign)."""
+    import types
+
+    import yaml
+
+    from spectramr.infrastructure.validation.config_health_checker import ConfigHealthChecker
+
+    arm = tmp_path / "arm.yaml"
+    arm.write_text(
+        yaml.safe_dump(
+            {
+                "training": {"output_dir": "experiments/results/arm"},
+                "metrics": {"output_dir": "experiments/results/arm/metrics"},
+                "loss_logging": {"output_dir": "experiments/results/other/losses"},
+            }
+        )
+    )
+    out = tmp_path / "experiments" / "results" / "campaigns" / "c" / "arm"
+    args = md.output_dir_override(out.parent, arm)
+    values = dict(a.split("=", 1) for a in args if a != "--override")
+    assert values["metrics.output_dir"] == str(out / "metrics")
+    assert values["loss_logging.output_dir"] == str(out / "losses")
+
+    cfg = types.SimpleNamespace(
+        training=types.SimpleNamespace(output_dir=values["training.output_dir"]),
+        logging=types.SimpleNamespace(sinks=types.SimpleNamespace(dir=values["logging.sinks.dir"])),
+        metrics=types.SimpleNamespace(output_dir=values["metrics.output_dir"]),
+        loss_logging=types.SimpleNamespace(
+            output_dir=values["loss_logging.output_dir"], csv_path=None
+        ),
+    )
+    assert ConfigHealthChecker().check_identity_paths_agree(cfg).passed
+
+
+def test_the_routed_run_is_where_campaign_discovery_selects(tmp_path) -> None:
+    """The array task writes under the routed dir; the orchestrator must find it there."""
+    import torch
+
+    from spectramr.infrastructure.orchestration.campaign_orchestrator import (
+        CampaignOrchestrator,
+    )
+    from spectramr.infrastructure.orchestration.campaign_state import ExperimentStatus
+    from tests.fixtures.run_state_files import write_run_state
+
+    args = md.output_dir_override(tmp_path / "camp", "x/arm.yaml")
+    run = Path(args[args.index("--override") + 1].split("=", 1)[1])
+    step = run / "checkpoints" / "step_00000010.safetensors"
+    step.parent.mkdir(parents=True)
+    write_run_state(step, {"generator": {"w": torch.zeros(1)}}, role="step")
+    exp = ExperimentStatus(name="arm", config_path="x/arm.yaml", output_dir=str(run))
+    CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)._discover_results(exp)
+    assert exp.checkpoint_path == str(step)
+
+
+@pytest.mark.parametrize(
+    ("args", "reason"),
+    [
+        (["--override", "training.output_dir={out}"], "logging.sinks.dir is not routed"),
+        (
+            [
+                "--override",
+                "training.output_dir={out}",
+                "--override",
+                "checkpoint.checkpoint_dir=experiments/results/self_supervised_v2/arm/checkpoints",
+                "--override",
+                "logging.sinks.dir={out}/logs",
+            ],
+            "checkpoint.checkpoint_dir is routed",
+        ),
+    ],
+    ids=["output-dir-only", "checkpoints-in-the-yaml-tree"],
+)
+def test_the_one_tree_check_rejects_a_planted_routing(tmp_path, args, reason) -> None:
+    out = tmp_path / "camp" / "arm"
+    planted = [a.format(out=out) for a in args]
+    error = _one_tree_error(planted, out)
+    assert error is not None and error.startswith(reason), error
 
 
 def test_output_base_flag_parsed_by_main(tmp_path, monkeypatch) -> None:
@@ -711,7 +1072,7 @@ class TestOverridesFileCapCollision:
 
     def _cfg(self, tmp_path):
         cfg = tmp_path / "arm.yaml"
-        cfg.write_text("training:\n  max_iterations: 70000\n")
+        cfg.write_text("training:\n  max_iterations: 70000\n  output_dir: out/arm\n")
         man = tmp_path / "manifest.txt"
         man.write_text(f"{cfg}\n")
         return man
@@ -951,6 +1312,13 @@ class TestVerbPlanValidation:
         assert md.main(["--check-plan", "--verb", "train"]) == 0
         assert "plan accepted" in capsys.readouterr().out
 
+    def test_check_plan_refuses_a_fresh_chain_on_a_verb_without_resume(self) -> None:
+        """A requeued link of a --fresh chain passes --resume, so the pre-screen
+        must judge the plan the same way _dispatch does."""
+        argv = ["--check-plan", "--verb", "infer", "--resume-off"]
+        assert md.main(argv) == 0
+        assert md.main([*argv, "--requeue-resumes"]) == 2
+
     def test_check_plan_reports_the_refusal(self, capsys) -> None:
         assert md.main(["--check-plan", "--verb", "infer", "--resume"]) == 2
         assert "--resume" in capsys.readouterr().err
@@ -960,3 +1328,265 @@ class TestVerbPlanValidation:
         become a run with no arms."""
         with pytest.raises(SystemExit):
             md.main(["--verb", "train"])
+
+
+# --- submit-time snapshot (#2662): every task start checks HEAD + its YAML ------
+
+
+class TestSnapshotCheck:
+    """A task whose YAML or HEAD moved since submit refuses before audit/train."""
+
+    @pytest.fixture
+    def armed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+        import subprocess
+
+        from spectramr.core import dispatch_snapshot as ds
+
+        git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q", "-b", "dev", str(tmp_path)], check=True)
+        man, cfg = _real_cfg(tmp_path)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "base"], check=True)
+        ds.write_snapshot(man, tmp_path)
+        head = json.loads(ds.snapshot_path(man).read_text())["head"]
+        # The fake subprocess.run below would also answer git, so every git question is
+        # pinned: on dev, HEAD unmoved, history intact, and an edited YAML uncommitted.
+        monkeypatch.setattr(ds, "git_head", lambda _root: head)
+        monkeypatch.setattr(ds, "off_run_branch", lambda _root: None)
+        monkeypatch.setattr(ds, "contains", lambda _root, _a, _b: True)
+        monkeypatch.setattr(ds, "committed", lambda _path: False)
+        monkeypatch.delenv("SPECTRAMR_DISPATCH_ALLOW_DRIFT", raising=False)
+        monkeypatch.delenv("SLURM_RESTART_COUNT", raising=False)
+        return man, cfg, head, ds
+
+    @staticmethod
+    def _run(man: Path, tmp_path: Path, *, dry_run: bool = False) -> int:
+        return md._dispatch(
+            manifest=str(man),
+            index=0,
+            train_iters=None,
+            resume=False,
+            no_audit=False,
+            dispatch_dir=str(tmp_path / "d"),
+            dry_run=dry_run,
+        )
+
+    def test_an_unchanged_task_trains_and_stamps_verified(
+        self, armed, tmp_path, monkeypatch
+    ) -> None:
+        import json
+
+        from spectramr.core.env_names import SPECTRAMR_DISPATCH_SNAPSHOT_RECORD
+
+        man, _cfg, _head, _ds = armed
+        seen: list[str] = []
+        fake = _FakeRun()
+
+        def _spy(cmd, **kw):
+            seen.append(md.os.environ[SPECTRAMR_DISPATCH_SNAPSHOT_RECORD])
+            return fake(cmd, **kw)
+
+        monkeypatch.setattr(md.subprocess, "run", _spy)
+        assert self._run(man, tmp_path) == 0
+        assert any("train" in c for c in fake.calls)
+        assert json.loads(Path(seen[-1]).read_text())["status"] == "verified"
+
+    def test_a_yaml_edited_after_submit_refuses_before_audit(
+        self, armed, tmp_path, monkeypatch, capsys
+    ) -> None:
+        man, cfg, _head, _ds = armed
+        cfg.write_text("training:\n  max_iterations: 6\n")
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 2
+        assert fake.calls == []
+        assert f"config {cfg} changed since submit" in capsys.readouterr().err
+
+    def test_dev_advancing_past_the_submitted_commit_trains(
+        self, armed, tmp_path, monkeypatch
+    ) -> None:
+        man, _cfg, _head, ds = armed
+        monkeypatch.setattr(ds, "git_head", lambda _root: "f" * 40)
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 0
+        assert any("train" in c for c in fake.calls)
+
+    def test_a_head_without_the_submitted_commit_refuses_naming_both(
+        self, armed, tmp_path, monkeypatch, capsys
+    ) -> None:
+        man, _cfg, head, ds = armed
+        monkeypatch.setattr(ds, "git_head", lambda _root: "f" * 40)
+        monkeypatch.setattr(ds, "contains", lambda _root, _a, _b: False)
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 2
+        assert fake.calls == []
+        assert f"{head} is not in the history of {'f' * 40}" in capsys.readouterr().err
+
+    def test_a_checkout_off_dev_refuses(self, armed, tmp_path, monkeypatch, capsys) -> None:
+        man, _cfg, _head, ds = armed
+        monkeypatch.setattr(ds, "off_run_branch", lambda _root: "x is on 'feat/y'")
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 2
+        assert fake.calls == []
+        assert "is on 'feat/y'" in capsys.readouterr().err
+
+    def test_the_dry_run_refuses_the_same_drift(self, armed, tmp_path) -> None:
+        man, cfg, _head, _ds = armed
+        cfg.write_text("training:\n  max_iterations: 6\n")
+        assert self._run(man, tmp_path, dry_run=True) == 2
+
+    def test_a_requeued_link_is_checked_too(self, armed, tmp_path, monkeypatch) -> None:
+        man, cfg, _head, _ds = armed
+        monkeypatch.setenv("SLURM_RESTART_COUNT", "2")
+        cfg.write_text("training:\n  max_iterations: 6\n")
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 2
+        assert fake.calls == []
+
+    def test_opting_in_trains_and_stamps_the_drift(
+        self, armed, tmp_path, monkeypatch, capsys
+    ) -> None:
+        import json
+
+        from spectramr.core.env_names import SPECTRAMR_DISPATCH_SNAPSHOT_RECORD
+
+        man, cfg, head, ds = armed
+        monkeypatch.setenv("SPECTRAMR_DISPATCH_ALLOW_DRIFT", "1")
+        monkeypatch.setattr(ds, "git_head", lambda _root: "f" * 40)
+        monkeypatch.setattr(ds, "contains", lambda _root, _a, _b: False)
+        cfg.write_text("training:\n  max_iterations: 6\n")
+        fake = _FakeRun()
+        monkeypatch.setattr(md.subprocess, "run", fake)
+        assert self._run(man, tmp_path) == 0
+        assert any("train" in c for c in fake.calls)
+        assert "DRIFT ALLOWED" in capsys.readouterr().err
+        stamp = json.loads(Path(md.os.environ[SPECTRAMR_DISPATCH_SNAPSHOT_RECORD]).read_text())
+        assert stamp["status"] == "drift_allowed"
+        assert (stamp["recorded_head"], stamp["current_head"]) == (head, "f" * 40)
+        assert len(stamp["drift"]) == 2
+
+    def test_a_malformed_opt_in_refuses(self, armed, tmp_path, monkeypatch) -> None:
+        man, _cfg, _head, _ds = armed
+        monkeypatch.setenv("SPECTRAMR_DISPATCH_ALLOW_DRIFT", "yes")
+        assert self._run(man, tmp_path, dry_run=True) == 2
+
+    def test_a_manifest_without_a_record_warns_and_proceeds(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        man, _cfg = _real_cfg(tmp_path)
+        monkeypatch.setattr(md.subprocess, "run", _FakeRun())
+        assert self._run(man, tmp_path, dry_run=True) == 0
+        assert "no submit-time snapshot" in capsys.readouterr().err
+
+
+def test_dispatch_compares_the_verb_with_train_once() -> None:
+    """Three independent ``verb == "train"`` checks read as a dispatch chain to the fitness
+    gate; one ``is_train`` computed up front is the same logic stated once."""
+    import inspect
+
+    from spectramr.cli import manifest_dispatch as md
+
+    src = inspect.getsource(md._dispatch)
+    assert src.count('verb == "train"') == 1
+    assert "is_train" in src
+
+
+# --- parameter-free arms: graded with --validate-only, never trained ----------
+
+_REPO = Path(__file__).resolve().parents[3]
+_SELF_SUPERVISED = _REPO / "experiments" / "inprogress" / "self_supervised"
+
+
+def test_a_config_without_a_model_type_never_touches_the_registry(tmp_path, monkeypatch) -> None:
+    def _boom() -> None:
+        raise AssertionError("the registry walk is paid only by arms that name a model")
+
+    monkeypatch.setattr("spectramr.models.init_registry.populate_model_registry", _boom)
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  max_iterations: 5\n")
+    assert md.declares_parameter_free_arm(cfg) is False
+
+
+def test_the_cs_wavelet_arm_declares_parameter_free_and_a_learned_arm_does_not() -> None:
+    """Asked of the registered class, on the shipped YAMLs: no model-type list lives here."""
+    assert md.declares_parameter_free_arm(_SELF_SUPERVISED / "cs_l1wavelet_sense_m4raw_r4.yaml")
+    assert not md.declares_parameter_free_arm(_SELF_SUPERVISED / "ssdu_m4raw_r4.yaml")
+
+
+def test_an_unknown_model_type_raises_rather_than_reading_as_learned(tmp_path) -> None:
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("model:\n  model_type: no_such_model_anywhere\n")
+    with pytest.raises(ValueError, match="no_such_model_anywhere"):
+        md.declares_parameter_free_arm(cfg)
+
+
+@pytest.mark.parametrize("prod", [False, True])
+def test_a_parameter_free_arm_is_launched_validate_only_without_resume(
+    tmp_path, monkeypatch, prod
+) -> None:
+    """The 11 cs_l1wavelet_sense arms were refused by `train`, and `--prod` would also have
+    spelled `--resume if-present` for a model that has no checkpoint."""
+    man, _ = _real_cfg(tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    monkeypatch.setattr(md, "declares_parameter_free_arm", lambda _cfg: True)
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=None,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=prod,
+    )
+    assert rc == 0
+    train_cmd = next(c for c in fake.calls if "train" in c)
+    assert "--validate-only" in train_cmd
+    assert "--resume" not in train_cmd
+
+
+def test_a_learned_arm_is_launched_exactly_as_before(tmp_path, monkeypatch) -> None:
+    man, _ = _real_cfg(tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    monkeypatch.setattr(md, "declares_parameter_free_arm", lambda _cfg: False)
+    md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=None,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=True,
+    )
+    train_cmd = next(c for c in fake.calls if "train" in c)
+    assert "--validate-only" not in train_cmd
+    assert "if-present" in train_cmd
+
+
+def test_a_submitters_own_validate_only_is_not_doubled(tmp_path, monkeypatch) -> None:
+    man, _ = _real_cfg(tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(md.subprocess, "run", fake)
+    monkeypatch.setattr(md, "declares_parameter_free_arm", lambda _cfg: True)
+    verb_args = tmp_path / "verb_args.txt"
+    verb_args.write_text("--validate-only\n")
+    md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        verb_args_file=str(verb_args),
+    )
+    train_cmd = next(c for c in fake.calls if "train" in c)
+    assert train_cmd.count("--validate-only") == 1

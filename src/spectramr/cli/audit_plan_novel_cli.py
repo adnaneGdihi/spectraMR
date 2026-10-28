@@ -221,9 +221,7 @@ def infer_protocol_cmd(args: argparse.Namespace) -> int:
 
     import torch
 
-    from spectramr.infrastructure.services.checkpoint_service import (
-        RNG_STATE_SAFE_GLOBALS,
-    )
+    from spectramr.infrastructure.checkpointing.restore import read_part
 
     if not checkpoint.is_file():
         print(f"infer-protocol: checkpoint not found: {checkpoint}", file=sys.stderr)
@@ -232,16 +230,8 @@ def infer_protocol_cmd(args: argparse.Namespace) -> int:
         print(f"infer-protocol: image not found: {image_path}", file=sys.stderr)
         return 2
 
-    # A checkpoint this framework writes carries ``rng_state``, whose numpy
-    # half needs four data-only globals the weights-only unpickler does not
-    # allow by default — so a plain ``torch.load(path)`` refuses every
-    # CheckpointService envelope on torch >= 2.6. Allowlist exactly those four
-    # (owned by checkpoint_service, next to the function that pickles them)
-    # instead of dropping to ``weights_only=False``, which would re-open the
-    # pickle-RCE surface on an operator-supplied path. Scoped to this call: a
-    # process-global registration would leak into every other caller.
-    with torch.serialization.safe_globals(RNG_STATE_SAFE_GLOBALS):
-        state = torch.load(checkpoint, map_location="cpu")
+    # The generator part of a RunState; read without pickle by the checkpoint codecs.
+    state = read_part(checkpoint, "generator")
     model = _instantiate_model_from_state(state, cond_dim=cond_dim)
     image = _load_image_tensor(image_path)
 
@@ -273,12 +263,10 @@ def infer_protocol_cmd(args: argparse.Namespace) -> int:
 def _architecture_from_state_dict(sd: dict) -> dict[str, int]:
     """Read ``ScoreFieldUNet``'s constructor arguments off the tensor shapes.
 
-    The canonical checkpoint envelope (``CheckpointService.save_checkpoint``,
-    ``checkpoint_service.py:324``) stores ``epoch`` / ``step`` /
-    ``model_state_dict`` / optimizer / RNG state and **no config block**, so
-    there is nothing to resolve through ``MODEL_REGISTRY``: the only
-    architecture the checkpoint actually carries is the shape of its own
-    tensors. Those pin all three arguments exactly:
+    A RunState carries **no config block**, so there is nothing to resolve
+    through ``MODEL_REGISTRY``: the only architecture the checkpoint actually
+    carries is the shape of its own tensors. Those pin all three arguments
+    exactly:
 
     ``lift.weight``       -> ``[base_width, in_channels, 3, 3]``
     ``head_sc.weight``    -> ``[cond_dim, base_width]``
@@ -326,61 +314,23 @@ def _architecture_from_state_dict(sd: dict) -> dict[str, int]:
     }
 
 
-def _instantiate_model_from_state(state: Any, *, cond_dim: int | None):
-    """Instantiate ``score_field_unet`` from a checkpoint.
+def _instantiate_model_from_state(sd: dict, *, cond_dim: int | None):
+    """Instantiate ``score_field_unet`` from a generator state dict.
 
-    Conserves every layout this verb has always accepted: the canonical
-    envelope (``model_state_dict``), a Lightning-style ``state_dict``
-    envelope, a bare state dict, and a pickled full module.
-
-    The last of those no longer arrives *through the CLI*: torch >= 2.6
-    defaults ``torch.load(weights_only=True)``, so ``infer_protocol_cmd``'s
-    own load refuses a pickled module before this function is reached. The
-    branch stays for direct callers, and because relaxing that refusal would
-    mean ``weights_only=False`` on an untrusted path.
-
-    What it no longer does is *succeed anyway*. The previous form built a
-    fixed ``base_width=32`` model, loaded with ``strict=False`` -- which
-    loads **nothing** from a mismatched checkpoint while reporting success --
-    and swallowed the remaining failures into a ``logger.warning`` before
-    returning the randomly-initialised weights. ``infer-protocol`` then
-    printed a posterior mode and a 95% credible interval computed from noise,
-    indistinguishable in its output from a real result (#1351, D01#1).
-    Every one of those paths now raises.
+    Every mismatch raises: loading is strict and the architecture is read off
+    the tensor shapes, so ``infer-protocol`` cannot print a credible interval
+    computed from a randomly-initialised network (#1351, D01#1).
 
     ``cond_dim`` is the value the user *declared* on the command line, or
     ``None`` when they did not. It is a cross-check, never the source of
     truth: the checkpoint's own shapes are.
     """
-    from torch import nn
-
     from spectramr.models.diffusion.score_field_unet import ScoreFieldUNet
 
-    if isinstance(state, nn.Module):
-        # A pickled module carries its own architecture; there is nothing to
-        # rebuild. Reject a foreign one rather than calling ``s_c`` on a
-        # module that has no such head.
-        if not isinstance(state, ScoreFieldUNet):
-            raise TypeError(
-                f"infer-protocol: checkpoint holds a {type(state).__name__}, not a ScoreFieldUNet"
-            )
-        model = state
-    else:
-        if not isinstance(state, dict):
-            raise TypeError(
-                f"infer-protocol: unsupported checkpoint payload {type(state).__name__}; "
-                f"expected a state-dict envelope or a pickled ScoreFieldUNet"
-            )
-        sd = state.get("model_state_dict", state.get("state_dict", state))
-        if not isinstance(sd, dict):
-            raise TypeError(
-                f"infer-protocol: checkpoint 'model_state_dict' is a "
-                f"{type(sd).__name__}, not a state dict"
-            )
-        arch = _architecture_from_state_dict(sd)
-        model = ScoreFieldUNet(**arch)
-        # strict=True: a key mismatch is a wrong checkpoint, not a warning.
-        model.load_state_dict(sd, strict=True)
+    arch = _architecture_from_state_dict(sd)
+    model = ScoreFieldUNet(**arch)
+    # strict=True: a key mismatch is a wrong checkpoint, not a warning.
+    model.load_state_dict(sd, strict=True)
 
     resolved = model.head_sc.out_features
     if cond_dim is not None and cond_dim != resolved:

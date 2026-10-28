@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figure, write_sidecar
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import use_default_style, save_plot
 
 
 def _safe_load(path: str | Path | None) -> dict[str, Any] | None:
@@ -46,6 +46,8 @@ def render_certificate_summary(
     r5_path: str | Path | None = None,
     badge_path: str | Path | None = None,
     title: str = "Regulatory certificate summary",
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path:
     """Render the 2×3 certificate-summary figure to PNG.
@@ -154,12 +156,7 @@ def render_certificate_summary(
     if metadata is not None:
         stamp_figure(fig, metadata)
     out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out, metadata)
-    return out
+    return save_plot(fig, out, formats=formats, dpi=dpi, metadata=metadata)
 
 
 __all__ = ["render_certificate_summary"]

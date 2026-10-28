@@ -6,14 +6,12 @@ dropout masks, augmentation draws and — for cold diffusion — the per-step
 timestep and mask samples all diverge from the moment the run is requeued. The
 run still trains and still reports success, so the divergence is invisible.
 
-These helpers lived as private functions inside ``CheckpointService`` while the
-production writer (:class:`CheckpointDirector`) never called them, which is the
-facade shape of non-negotiable 16: the capability existed, was tested, and was
-unreachable from the path that actually runs. They live here so both writers
-share one definition of what "the RNG state" is (non-negotiable 17).
+They live outside any writer so that ``checkpointing.capture``, which writes the
+state, and ``checkpointing.resume``, which restores it, share one definition of
+what "the RNG state" is (non-negotiable 17).
 
 **What a checkpoint can carry is one rank's streams.** Under plain DDP only
-rank 0 reaches the director's save (``may_checkpoint = is_main_process or
+rank 0 reaches ``checkpointing.store``'s save (``may_checkpoint = is_main_process or
 checkpoints_need_all_ranks``), so there is no rendezvous at which the other
 ranks could contribute theirs — a collective placed there would hang the job.
 Rank 0's stream is therefore the one that is replayed; the callers restore it
@@ -71,14 +69,12 @@ def capture_rng_state() -> dict[str, Any]:
 def _as_cpu_byte(state: Any) -> Any:
     """Bring an RNG blob back to the CPU before the generator is handed it.
 
-    ``CheckpointDirector.load_from`` passes ``map_location=pipeline.device``,
-    which applies to *every* storage in the envelope — including these. The
-    generators refuse a non-CPU tensor (``check_rng_state`` asserts
-    ``device().type() == kCPU``), so on a GPU resume the restore raises
-    ``TypeError: RNG state must be a torch.ByteTensor``, the director's broad
-    except turns it into a failed load, and the chain link reports
-    ``success: False``. A CPU run never sees it, because there
-    ``map_location`` is the identity.
+    ``checkpointing.resume`` reads through the codecs, which return CPU tensors,
+    so this is defensive: a caller that loads with a GPU ``map_location`` hands
+    these over on the device. The generators refuse a non-CPU tensor
+    (``check_rng_state`` asserts ``device().type() == kCPU``) with
+    ``TypeError: RNG state must be a torch.ByteTensor``, which would fail the
+    resume and report the chain link as ``success: False``.
 
     This is resume-time, once per job, so the copy is not the host sync
     non-negotiable 9 forbids inside the training loop.

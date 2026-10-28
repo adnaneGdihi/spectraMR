@@ -20,8 +20,6 @@ Categories
 - ``_convert_metrics_to_floats``: scalar tensor, multi-element tensor,
   complex tensor, native float / int, native complex, unsupported type
   raises ``TypeError``
-- ``_slice_to_target_contrast`` (paired wrapper) preserves shape and
-  applies the slicer to both tensors symmetrically.
 - ``_validate_metrics_domain_consistency``: emits a warning through the
   attached logging service when training & validation domains
   disagree.
@@ -102,6 +100,9 @@ class _FakeComputer:
         self.finalize_calls = 0
         self.compute_calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
         self._final: dict[str, float] = {}
+
+    def get_metric_names(self) -> list[str]:
+        return list(self._metrics)
 
     def compute(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
         self.compute_calls.append((tuple(pred.shape), tuple(target.shape)))
@@ -262,32 +263,6 @@ class TestConvertMetricsToFloats:
         with pytest.raises(TypeError) as exc_info:
             MetricsMixin._convert_metrics_to_floats({"weird": object()})
         assert "weird" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# _slice_to_target_contrast (paired wrapper)
-# ---------------------------------------------------------------------------
-
-
-class TestSliceToTargetContrastPaired:
-    def test_paired_passthrough_when_target_channels_small(self) -> None:
-        s = _make_mixin(config=SimpleNamespace(data=SimpleNamespace(target_channels=1)))
-        pred = torch.randn(2, 8, 16, 16)
-        target = torch.randn(2, 8, 16, 16)
-        out_pred, out_target = s._slice_to_target_contrast(pred, target)
-        assert torch.equal(out_pred, pred)
-        assert torch.equal(out_target, target)
-
-    def test_paired_slices_both_to_target_channels(self) -> None:
-        s = _make_mixin(config=SimpleNamespace(data=SimpleNamespace(target_channels=8)))
-        pred = torch.randn(1, 16, 4, 4)
-        target = torch.randn(1, 16, 4, 4)
-        out_pred, out_target = s._slice_to_target_contrast(pred, target)
-        assert out_pred.shape == (1, 8, 4, 4)
-        assert out_target.shape == (1, 8, 4, 4)
-        # Slicer keeps last ``target_channels`` channels.
-        assert torch.equal(out_pred, pred[:, 8:])
-        assert torch.equal(out_target, target[:, 8:])
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +977,18 @@ class TestIfftSenseAdjointSmapsSelection:
         out_pred, _ = s._apply_metric_transforms(pred, target, cfg)
         assert out_pred.shape[1] == 1
         assert torch.isfinite(out_pred).all()
+
+    def test_missing_maps_on_multicoil_data_is_announced_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """PLANTED: no maps at all fell back to per-coil magnitudes without a word."""
+        s = _make_mixin(config=_config_with())
+        s._current_smaps = s._cached_smaps = None
+        cfg = SimpleNamespace(domain=None, transform="ifft_sense_adjoint")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(2):
+                s._apply_metric_transforms(self._coil_kspace(), self._coil_kspace(), cfg)
+        assert caplog.text.count("no sensitivity maps for a 4-coil prediction") == 1
 
     def test_bare_or_on_multielement_tensor_is_the_documented_failure(self) -> None:
         # Documents the exact pre-fix failure mode the production code hit.

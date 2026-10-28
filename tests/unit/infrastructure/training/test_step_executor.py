@@ -389,6 +389,59 @@ class TestNonFiniteLossGuard:
         trainer.execute_step([config], epoch=0, global_step=0)  # no raise
         assert amp_policy.backward_and_step.called
 
+    @staticmethod
+    def _nan_step(trainer, simple_model, simple_optimizer) -> None:
+        config = {
+            "optimizer": simple_optimizer,
+            "closure": lambda: _connected_loss(float("nan")),
+            "model": simple_model,
+            "name": "gen",
+        }
+        trainer.execute_step([config], epoch=0, global_step=42)
+
+    def test_an_attached_monitor_records_instead_of_raising(
+        self, amp_helper, simple_model, simple_optimizer
+    ):
+        """The training loop attaches a monitor: the guard then queues a device
+        flag and the loop stops on the verdict, so the step pays no host sync."""
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+        from spectramr.infrastructure.training.optimizers import AMPPolicy
+
+        amp_helper.scaler = None
+        policy = AMPPolicy(max_grad_norm=1.0, enable_gradient_clipping=False)
+        policy.backward_and_step = MagicMock()  # type: ignore[method-assign]
+        trainer = StepExecutor(amp_helper=amp_helper, amp_policy=policy)
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        trainer.nonfinite_monitor = monitor
+
+        self._nan_step(trainer, simple_model, simple_optimizer)
+
+        assert policy.backward_and_step.called
+        monitor.end_step(42)
+        verdict = monitor.resolve()
+        assert verdict is not None and verdict.iteration == 42 and verdict.names == ("gen",)
+
+    def test_the_fallback_for_a_policy_without_guard_loss_uses_the_same_rule(
+        self, amp_helper, simple_model, simple_optimizer
+    ):
+        """One owner: a policy object predating the ABC gets the default rule,
+        recording under a monitor and raising without one."""
+        from spectramr.infrastructure.training.nonfinite_monitor import NonFiniteMonitor
+
+        class _NoGuard:
+            backward_and_step = MagicMock()
+
+        amp_helper.scaler = None
+        trainer = StepExecutor(amp_helper=amp_helper, amp_policy=_NoGuard())
+        with pytest.raises(RuntimeError, match="Non-finite loss"):
+            self._nan_step(trainer, simple_model, simple_optimizer)
+
+        monitor = NonFiniteMonitor(torch.device("cpu"), distributed=False)
+        trainer.nonfinite_monitor = monitor
+        self._nan_step(trainer, simple_model, simple_optimizer)
+        monitor.end_step(42)
+        assert monitor.resolve().names == ("gen",)
+
     def test_finite_loss_passes_fp32(self, amp_helper, amp_policy, simple_model, simple_optimizer):
         amp_helper.scaler = None
         trainer = StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy)
@@ -416,6 +469,9 @@ class TestDDPNoSyncUnderAccumulation:
             super().__init__()
             self.linear = torch.nn.Linear(4, 4)
             self.entered = 0
+            self.active = False
+            #: ``active`` as observed at the moment the closure (the forward) ran.
+            self.active_at_forward: list[bool] = []
 
         def forward(self, x):
             return self.linear(x)
@@ -423,7 +479,11 @@ class TestDDPNoSyncUnderAccumulation:
         @contextlib.contextmanager
         def no_sync(self):
             self.entered += 1
-            yield
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
 
     def _run(self, amp_helper, amp_policy, steps: int, accumulation: int):
         model = self._SyncSpy()
@@ -438,7 +498,9 @@ class TestDDPNoSyncUnderAccumulation:
                 [
                     {
                         "optimizer": optimizer,
-                        "closure": lambda: _connected_loss(1.0),
+                        "closure": lambda: (
+                            model.active_at_forward.append(model.active) or _connected_loss(1.0)
+                        ),
                         "model": model,
                         "name": "gen",
                     }
@@ -450,8 +512,17 @@ class TestDDPNoSyncUnderAccumulation:
 
     def test_suppressed_on_every_micro_batch_but_the_boundary(self, amp_helper, amp_policy):
         model = self._run(amp_helper, amp_policy, steps=4, accumulation=4)
-        # steps 0,1,2 accumulate; step 3 is the boundary and must sync.
-        assert model.entered == 3
+        # steps 0,1,2 accumulate; step 3 is the boundary and must sync. Entered twice
+        # per accumulating micro-batch: around the forward (DDP) and around backward (FSDP).
+        assert model.entered == 6
+
+    def test_active_while_the_forward_runs_on_accumulating_micro_batches(
+        self, amp_helper, amp_policy
+    ):
+        """Planted: DDP arms its reducer when the forward runs, so ``no_sync`` entered only
+        around backward() is too late and every micro-batch still all-reduces."""
+        model = self._run(amp_helper, amp_policy, steps=4, accumulation=4)
+        assert model.active_at_forward == [True, True, True, False]
 
     def test_never_suppressed_without_accumulation(self, amp_helper, amp_policy):
         """Every step is a boundary at accumulation=1, so no_sync must not fire

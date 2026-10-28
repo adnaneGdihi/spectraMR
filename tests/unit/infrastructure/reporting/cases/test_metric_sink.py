@@ -219,3 +219,85 @@ def test_every_declared_context_column_is_actually_emitted():
         "Either emit it where the context dict is built, or stop declaring it "
         "(and drop its row from docs/reporting_pipeline.rst)."
     )
+
+
+def test_the_loop_feeds_only_batches_the_strategy_did_not():
+    import pytest
+    import torch
+
+    from spectramr.infrastructure.reporting.cases.metric_sink import (
+        PerCallMetricSink,
+        feed_from_validation_loop,
+    )
+
+    sink = PerCallMetricSink(enabled=True)
+    mark = sink.n_observed
+    assert feed_from_validation_loop(
+        sink, {"psnr": 30.0}, step=5, batch_index=0, observed_before=mark
+    )
+    mark = sink.n_observed
+    sink.observe(case_id="own", metrics={"psnr": 31.0}, step=5)
+    assert not feed_from_validation_loop(
+        sink, {"psnr": 31.0}, step=5, batch_index=1, observed_before=mark
+    )
+    assert sink.n_rows == 2
+    mark = sink.n_observed
+    feed_from_validation_loop(
+        sink, {"ssim": torch.tensor(0.9), "flag": True}, step=5, batch_index=2, observed_before=mark
+    )
+    assert sink._rows[-1]["ssim"] == pytest.approx(0.9)
+    assert "flag" not in sink._rows[-1]
+
+
+def test_n_observed_keeps_counting_past_the_row_cap():
+    from spectramr.infrastructure.reporting.cases.metric_sink import PerCallMetricSink
+
+    sink = PerCallMetricSink(enabled=True, max_rows=2)
+    for i in range(5):
+        sink.observe(case_id=str(i), metrics={"psnr": 1.0})
+    assert sink.n_rows == 2 and sink.n_observed == 5
+
+
+def test_a_disabled_or_absent_sink_is_left_alone():
+    from spectramr.infrastructure.reporting.cases.metric_sink import (
+        PerCallMetricSink,
+        feed_from_validation_loop,
+    )
+
+    assert not feed_from_validation_loop(
+        None, {"psnr": 1.0}, step=1, batch_index=0, observed_before=0
+    )
+    off = PerCallMetricSink(enabled=False)
+    assert not feed_from_validation_loop(
+        off, {"psnr": 1.0}, step=1, batch_index=0, observed_before=0
+    )
+
+def test_numpy_scalars_are_recorded():
+    import numpy as np
+
+    from spectramr.infrastructure.reporting.cases.metric_sink import (
+        PerCallMetricSink,
+        feed_from_validation_loop,
+    )
+
+    sink = PerCallMetricSink(enabled=True)
+    assert feed_from_validation_loop(
+        sink, {"psnr": np.float32(30.5)}, step=1, batch_index=0, observed_before=0
+    )
+    assert sink._rows[0]["psnr"] == 30.5
+
+
+def test_a_scalar_tensor_is_recorded_and_a_map_is_skipped():
+    """``val_loss`` arrives as a 0-dim device tensor; it used to be dropped from every row."""
+    import torch
+
+    from spectramr.infrastructure.reporting.cases.metric_sink import (
+        PerCallMetricSink,
+        feed_from_validation_loop,
+    )
+
+    sink = PerCallMetricSink(enabled=True)
+    metrics = {"val_loss": torch.tensor(0.25), "psnr": 30.0, "error_map": torch.ones(2, 2)}
+    assert feed_from_validation_loop(sink, metrics, step=1, batch_index=0, observed_before=0)
+    assert sink._rows[0]["val_loss"] == 0.25
+    assert "error_map" not in sink._rows[0]

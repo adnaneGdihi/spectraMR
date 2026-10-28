@@ -96,8 +96,11 @@ class StructureTensorAttention(nn.Module):
         num_heads: int = 8,
         qkv_bias: bool = True,
         gamma: float = 1.0,
+        gamma_trainable: bool = True,
     ) -> None:
         super().__init__()
+        if not isinstance(gamma_trainable, bool):
+            raise TypeError(f"gamma_trainable must be a bool, got {gamma_trainable!r}.")
         self.dim = dim
         self.window_size = window_size  # (Wd, Wh, Ww)
         self.num_heads = num_heads
@@ -108,8 +111,11 @@ class StructureTensorAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
-        # Learnable structural modulation weight
-        self.gamma_param = nn.Parameter(torch.tensor(gamma))
+        # Structural modulation weight; a frozen one (a buffer) makes gamma=0 an exact ablation.
+        if gamma_trainable:
+            self.gamma_param = nn.Parameter(torch.tensor(float(gamma)))
+        else:
+            self.register_buffer("gamma_param", torch.tensor(float(gamma)))
 
         # Precompute relative position distance vectors (p_i - p_j) within the window
         Wd, Wh, Ww = window_size
@@ -218,11 +224,16 @@ class StructureTensorTransformerBlock(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         gamma: float = 1.0,
+        gamma_trainable: bool = True,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = StructureTensorAttention(
-            dim, window_size=window_size, num_heads=num_heads, gamma=gamma
+            dim,
+            window_size=window_size,
+            num_heads=num_heads,
+            gamma=gamma,
+            gamma_trainable=gamma_trainable,
         )
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)

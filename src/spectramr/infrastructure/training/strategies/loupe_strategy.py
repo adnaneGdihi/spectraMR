@@ -18,6 +18,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE, OwnedParameter
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 
 from .mixins.utils import pick_present
@@ -29,9 +30,19 @@ logger = logging.getLogger(__name__)
 class LOUPEStrategy(ReconstructionTrainingStrategy):
     """Joint learnable-mask + reconstruction strategy."""
 
+    # parallel_compat: The mask logits are an owned module, built on every rank's first batch,
+    # DDP-wrapped and read via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
     #: Learns the sampling pattern from ``undersampling.adaptive``: the block is
     #: applied in-strategy (witness ``undersampling_block_is_applied``).
     applies_undersampling = True
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        adaptive = getattr(getattr(config, "undersampling", None), "adaptive", None)
+        own = (("_mask_logits", OWNED_MODULE),) if getattr(adaptive, "enabled", False) else ()
+        return (*super().owned_module_declarations(config), *own)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -75,8 +86,18 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
                 float(torch.logit(torch.tensor(self._adaptive_cfg.target_rate))),
             )
             self._mask_logits = nn.Parameter(mu.to(self.device))
+            self.register_owned_module("_mask_logits", OwnedParameter(self._mask_logits))
             self._register_on_opt_g(self._mask_logits)
         return self._mask_logits
+
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Rebuild saved mask logits from their shape and register them on ``opt_g``."""
+        super()._materialize_owned_state(state)
+        saved = state.get("params", {}).get("_mask_logits")
+        if saved is not None and self._mask_logits is None:
+            self._mask_logits = nn.Parameter(torch.zeros_like(saved, device=self.device))
+            self.register_owned_module("_mask_logits", OwnedParameter(self._mask_logits))
+            self._register_on_opt_g(self._mask_logits)
 
     def _register_on_opt_g(self, module: nn.Parameter | nn.Module) -> None:
         """Add any not-yet-registered params of ``module`` to ``self.env.opt_g``."""
@@ -87,7 +108,7 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
         existing = {p for g in opt.param_groups for p in g["params"]}
         new = [p for p in params if p not in existing]
         if new:
-            opt.add_param_group({"params": new, "lr": 1e-3})
+            opt.add_param_group({"params": new, "lr": self._adaptive_cfg.mask_learning_rate})
 
     def _current_tau(self) -> float:
         """Anneal Gumbel temperature from tau_init → tau_final linearly."""
@@ -103,6 +124,38 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
         # Straight-through: hard forward, soft backward.
         hard = (soft > 0.5).float()
         return hard + (soft - soft.detach())
+
+    def _eval_mask(self, logits: torch.Tensor) -> torch.Tensor:
+        """Deterministic validation mask: the same budget the training mask targets.
+
+        ``soft`` keeps ``sigmoid(logits) > 0.5``; ``hard_topk`` keeps the
+        ``round(target_rate * W)`` highest logits, so the eval mask is not empty at
+        a low target rate (the logits start at ``logit(target_rate) < 0``).
+        """
+        budget = self._adaptive_cfg.budget
+        if budget == "soft":
+            return (torch.sigmoid(logits) > 0.5).to(logits.dtype)
+        if budget == "hard_topk":
+            w = logits.shape[-1]
+            k = max(1, round(self._adaptive_cfg.target_rate * w))
+            flat = logits.reshape(-1, w)
+            keep = torch.zeros_like(flat).scatter_(-1, flat.topk(k, dim=-1).indices, 1.0)
+            return keep.reshape(logits.shape)
+        raise ValueError(f"undersampling.adaptive.budget must be soft|hard_topk, got {budget!r}")
+
+    def _validation_forward(
+        self,
+        input_batch: torch.Tensor,
+        batch_context: dict[str, Any],
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Grade the deterministic learned mask, not the fully sampled input (cohort5 §2.0)."""
+        if not self._adaptive_cfg.enabled:
+            return super()._validation_forward(input_batch, batch_context, **kwargs)
+        n_coils = input_batch.shape[1] if input_batch.ndim == 4 else 1
+        logits = self._ensure_mask(input_batch.shape[-2], input_batch.shape[-1], n_coils=n_coils)
+        masked = self._apply_learned_mask(input_batch, self._eval_mask(logits.detach()))
+        return super()._validation_forward(masked, batch_context, **kwargs)
 
     def _apply_learned_mask(self, image: torch.Tensor, mask_line: torch.Tensor) -> torch.Tensor:
         """Undersample ``image`` with the learned per-line mask in k-space.
@@ -158,6 +211,9 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
         """
         batch = self._resolve_legacy_batch(input_batch, kwargs)
         masked_input = pick_present(batch if isinstance(batch, torch.Tensor) else None, input_batch)
+        training = bool(self.generator_model.training)
+        # The training step's one call_owned output; the mask and the density penalty share it.
+        owned: torch.Tensor | None = None
 
         if self._adaptive_cfg.enabled and isinstance(masked_input, torch.Tensor):
             # [B, C, H, W] — W is the phase-encode line axis the mask indexes.
@@ -168,8 +224,13 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
             # The logits may have been created before the env optimizer was
             # attached; re-assert registration cheaply (dedup makes it a no-op).
             self._register_on_opt_g(logits)
-            soft_mask = self._gumbel_sigmoid_mask(logits, self._current_tau())
-            masked_input = self._apply_learned_mask(masked_input, soft_mask)
+            # The Gumbel draw and the schedule belong to training only.
+            if training:
+                owned = self.call_owned("_mask_logits")
+                mask = self._gumbel_sigmoid_mask(owned, self._current_tau())
+            else:
+                mask = self._eval_mask(logits.detach())
+            masked_input = self._apply_learned_mask(masked_input, mask)
 
         # Run base reconstruction forward + losses on the (now-undersampled) input.
         base_losses = super()._compute_losses_impl(
@@ -181,13 +242,17 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
         if not self._adaptive_cfg.enabled:
             return base_losses
 
+        if not training:
+            return base_losses
         self._steps_seen += 1
 
         # Density penalty: pull sigmoid(logits) (expected sampling rate) toward
         # the target acceleration. This is the only gradient signal that fights
         # the recon loss's incentive to sample everything.
         if self._mask_logits is not None:
-            expected_rate = torch.sigmoid(self._mask_logits).mean()
+            if owned is None:
+                owned = self.call_owned("_mask_logits")
+            expected_rate = torch.sigmoid(owned).mean()
             target = torch.tensor(self._adaptive_cfg.target_rate, device=self.device)
             density_loss = (expected_rate - target).pow(2)
             base_losses["loss_density_penalty"] = (

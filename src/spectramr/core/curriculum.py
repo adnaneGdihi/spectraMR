@@ -29,6 +29,7 @@ disagree in the first place.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Final, NamedTuple
 
 #: Runs at or below this many iterations skip every curriculum/ramp cap.
@@ -44,6 +45,13 @@ SHORT_RUN_BYPASS_ITERATIONS: Final[int] = 5000
 #: long-standing ``or 500_000`` default at the call sites.
 DEFAULT_MAX_ITERATIONS: Final[int] = 500_000
 
+#: A top rung that first becomes drawable after this fraction of the budget is
+#: reported as late. Measured on the 69 kspace_filling arms at start 1, rate
+#: 0.0005, 70000 iterations: t=28 opens at 0.8 of the budget and receives 1.1 %
+#: of all draws against 8.3 % for t=1, although ``balanced_high_t`` weights high
+#: t up (#2066).
+LATE_TOP_RUNG_FRACTION: Final[float] = 0.5
+
 
 class CurriculumState(NamedTuple):
     """What the arm asked for, and what it will actually get.
@@ -57,6 +65,9 @@ class CurriculumState(NamedTuple):
         ramp_rate: ``training.curriculum_ramp_rate`` as read.
         max_iterations: the horizon the bypass was judged against, after the
             ``DEFAULT_MAX_ITERATIONS`` fallback.
+        top_opens_at: first iteration at which the top timestep ``T - 1`` is
+            drawable, or ``None`` when the curriculum is not effective or the
+            horizon is unknown.
     """
 
     declared: bool
@@ -65,6 +76,35 @@ class CurriculumState(NamedTuple):
     start_timestep: int | None
     ramp_rate: float | None
     max_iterations: int
+    top_opens_at: int | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """The top rung never opens inside the budget."""
+        return self.top_opens_at is not None and self.top_opens_at > self.max_iterations
+
+    @property
+    def opens_late(self) -> bool:
+        """The top rung opens after :data:`LATE_TOP_RUNG_FRACTION` of the budget."""
+        return (
+            self.top_opens_at is not None
+            and self.top_opens_at > LATE_TOP_RUNG_FRACTION * self.max_iterations
+        )
+
+    def ladder_warning(self) -> str | None:
+        """Why the top rung is under-trained, or ``None`` when it is not."""
+        if self.top_opens_at is None or not (self.truncated or self.opens_late):
+            return None
+        where = (
+            "never inside the budget"
+            if self.truncated
+            else f"at {self.top_opens_at / self.max_iterations:.0%} of the budget"
+        )
+        return (
+            f"the curriculum opens the top timestep at iteration {self.top_opens_at} "
+            f"of {self.max_iterations} ({where}), so the hardest rung is trained "
+            "least; validation at that rung scores timesteps with few or no draws."
+        )
 
     def describe(self) -> str:
         """One field for the startup knob line.
@@ -74,7 +114,8 @@ class CurriculumState(NamedTuple):
         take, which is the case a reader needs to be able to spot.
         """
         if self.effective:
-            return f"curriculum=on(t0={self.start_timestep},rate={self.ramp_rate})"
+            opens = "" if self.top_opens_at is None else f",top_opens_at={self.top_opens_at}"
+            return f"curriculum=on(t0={self.start_timestep},rate={self.ramp_rate}{opens})"
         if self.suppressed_by is not None:
             # Keyed on `suppressed_by`, not on `declared`: a half-declared
             # curriculum is not "declared" (it cannot run) but reporting it as
@@ -115,11 +156,29 @@ def resolve_curriculum_state(config: Any) -> CurriculumState:
             "only one of curriculum_start_timestep / curriculum_ramp_rate is set; both are required"
         )
 
+    effective = declared and suppressed_by is None
     return CurriculumState(
         declared=declared,
-        effective=declared and suppressed_by is None,
+        effective=effective,
         suppressed_by=suppressed_by,
         start_timestep=start_t,
         ramp_rate=rate,
         max_iterations=max_iters,
+        top_opens_at=(
+            _top_opens_at(config, int(start_t), float(rate))
+            if effective and start_t is not None and rate is not None
+            else None
+        ),
     )
+
+
+def _top_opens_at(config: Any, start_t: int, rate: float) -> int | None:
+    """First iteration with ``int(start_t + i * rate) >= T``, the cap
+    ``DiffusionTrainingStrategy.sample_timesteps`` applies to ``arange(t_low, cap)``."""
+    diffusion = getattr(getattr(config, "training", None), "diffusion", None)
+    horizon = getattr(diffusion, "timesteps", None)
+    if not isinstance(horizon, int) or rate <= 0:
+        return None
+    if start_t >= horizon:
+        return 0
+    return math.ceil((horizon - start_t) / rate)

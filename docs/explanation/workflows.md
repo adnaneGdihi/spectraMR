@@ -384,7 +384,7 @@ that contradicts itself errors.
 ### Artifact origin
 
 Every degradation in `DEGRADATION_REGISTRY`
-(`infrastructure/physics/digital_twin_extensions`) carries an `ArtifactOrigin`
+(`infrastructure/physics/degradations`) carries an `ArtifactOrigin`
 (`scanner` / `acquisition` / `patient`), so `list_degradations(origin=…)` is a
 real query. The classification is completeness-enforced: the registry rebuild
 indexes the origin table by name, so a new degradation added without an origin

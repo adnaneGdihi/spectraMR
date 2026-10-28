@@ -21,19 +21,32 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
+from spectramr.core.metrics.complex_input import PhaseBlindInputError
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.physics.spin_history import SpinHistoryStage
+from spectramr.infrastructure.training.strategies.vf_phase_stego import PhaseStegoHook
+from spectramr.infrastructure.training.strategies.vf_null_space import NullSpaceErasureHook
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
+from spectramr.infrastructure.training.strategies.mixins.conditioning_mixin import (
+    conditioning_block_of,
+    conditioning_enabled,
+)
 from spectramr.infrastructure.training.strategies.ood_acceleration_readout import (
     ood_acceleration_readout,
     ood_accelerations,
 )
 from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
+    require_epi_profile,
     undersampling_mask_kwargs,
 )
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.conditioning import AdaptiveConditioner, ConditioningContext
 from spectramr.models.losses.registry import create_loss
 
@@ -72,6 +85,24 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         simulator: Digital Twin forward physics model (config-driven).
     """
 
+    # parallel_compat: With model.conditioning on, the conditioner is a bare group on opt_g,
+    # refused under ddp: its null_token gets no gradient (VF never drops the condition), so a
+    # DDP-wrapped conditioner fails the next step's reduction. Without it VF owns nothing.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        on = conditioning_enabled(conditioning_block_of(config))
+        own = (("_conditioner", OWNED_PARAM_GROUP),) if on else ()
+        return (*super().owned_module_declarations(config), *own)
+
+    synthesises_model_input: ClassVar[bool] = True
+
+    _spin_history: SpinHistoryStage | None = None
+
+    _phase_stego_hook: PhaseStegoHook | None = None
+    _null_space_hook: NullSpaceErasureHook | None = None
+
     #: The twin undersamples at ``physics.digital_twin.acceleration`` when its
     #: ``enable_undersampling`` is true; the top-level ``undersampling:`` block
     #: reaches nothing here (the k-space mixin's generator is never called), so
@@ -107,12 +138,14 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize simulator from config and register losses dynamically."""
         # ── Build simulator from config.physics.digital_twin (SSOT) ──
         self.simulator = build_simulator_from_config(self.config, self.device)
+        require_epi_profile(self.simulator)
 
         # ── Adaptive conditioning (config.model.conditioning) ──
         # Lazily built on first forward so num_features matches the real input
@@ -156,6 +189,37 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     self._loss_specs.append(
                         (name, create_loss(name).to(self.device), weight, "image")
                     )
+
+        # ── Phase-domain steganographic marker (training.phase_steganography) ──
+        ps = getattr(self.config.training, "phase_steganography", None)
+        self._phase_stego_hook = (
+            PhaseStegoHook(ps, self.device) if ps is not None and ps.enabled else None
+        )
+        # ── Null-space marker erasure at validation (training.null_space_erasure) ──
+        nse = getattr(self.config.training, "null_space_erasure", None)
+        self._null_space_hook: NullSpaceErasureHook | None = None
+        if nse is not None and nse.enabled:
+            if not nse.apply_at_inference:
+                raise ValueError(
+                    "training.null_space_erasure.enabled with apply_at_inference=false would "
+                    "erase nowhere; set apply_at_inference=true or enabled=false."
+                )
+            self._null_space_hook = NullSpaceErasureHook(nse.epsilon)
+
+        # ── Spin-history corruption (training.bloch_ode) ──
+        bo = getattr(self.config.training, "bloch_ode", None)
+        self._spin_history = None
+        if bo is not None and bo.enabled:
+            self._spin_history = SpinHistoryStage(
+                dt=bo.dt,
+                slice_thickness=bo.slice_thickness,
+                n_steps=bo.n_steps,
+                tr=bo.tr,
+                t1_ms=bo.t1_ms,
+                t2_ms=bo.t2_ms,
+                amplitude=bo.amplitude,
+                period_ms=bo.period_ms,
+            )
 
         # Marker-anchored loss (always enabled for VF)
         self.loss_marker = create_loss("marker_corruption").to(self.device)
@@ -293,8 +357,8 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         they actually train (mirrors ``XFieldFMStrategy._ensure_hypernet``).
         Returns ``None`` when conditioning is disabled.
         """
-        cfg = getattr(self.config.model, "conditioning", None)
-        if cfg is None or not getattr(cfg, "enabled", False) or not getattr(cfg, "sources", None):
+        cfg = conditioning_block_of(self.config)
+        if not conditioning_enabled(cfg):
             return None
         if self._conditioner is None:
             cond = AdaptiveConditioner.from_config(cfg, num_features=n_channels)
@@ -306,7 +370,9 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     or getattr(self.env, "optimizer", None)
                 )
                 if opt is not None:
-                    opt.add_param_group({"params": list(cond.parameters())})
+                    add_owned_param_group(
+                        self, opt, {"params": list(cond.parameters())}, owner="its conditioner"
+                    )
                 else:
                     logger.warning(
                         "[VirtualFiducialStrategy] no generator optimizer found; "
@@ -326,7 +392,8 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         dropped, preserving prior behaviour for those models).
         """
         try:
-            params = inspect.signature(gen.forward).parameters
+            # The inner forward: a DDP/DP wrapper's is ``(*args, **kwargs)``.
+            params = inspect.signature(unwrap_model(gen).forward).parameters
         except (TypeError, ValueError):  # pragma: no cover - exotic callables
             return False
         return "marker_signal" in params
@@ -381,13 +448,15 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # layers when undersampling is active (no-op for non-undersampling arms).
         physics_kwargs.update(undersampling_mask_kwargs(self.simulator))
 
-        if hasattr(gen, "cross_attention"):
+        # Capability probes read the inner module; the call itself stays on the wrapper.
+        inner = unwrap_model(gen)
+        if hasattr(inner, "cross_attention"):
             out = gen(
                 corrupted_real,
                 marker_residual=marker_res_real,
                 **physics_kwargs,
             )
-        elif hasattr(gen, "bridge"):
+        elif hasattr(inner, "bridge"):
             fiducial_input = marker_res_real[:, :2]  # 2 real channels
             out = gen(
                 corrupted_real,
@@ -414,6 +483,16 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
 
         # ── Convert output back to complex64 ──
         return self._to_complex(out)
+
+    def _twin_input(self, target_complex: torch.Tensor) -> torch.Tensor:
+        """Anatomy the twin corrupts: the clean target, carrying the phase marker when enabled."""
+        twin_input = target_complex
+        if self._phase_stego_hook is not None:
+            twin_input = self._phase_stego_hook.inject(twin_input)
+        if self._spin_history is not None:
+            self._last_spin_gain = self._spin_history.gain(twin_input)
+            twin_input = twin_input * self._last_spin_gain
+        return twin_input
 
     def _compute_marker_residual(
         self,
@@ -607,7 +686,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # it verbatim so the field-scoring grades against a real off-resonance
         # pattern instead of a random simulation (VF real-reference seam).
         corrupted_image, marker_prior, joint_clean = self.simulator(
-            target_complex, external_b0_field=self._slice_field(external_b0_field)
+            self._twin_input(target_complex), external_b0_field=self._slice_field(external_b0_field)
         )
 
         # 2. Compute native complex marker residual ΔM
@@ -674,7 +753,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # A field-deforming generator (neural_advection) caches its STN velocity
         # field; route it as an intermediate so the hyperelastic-Jacobian loss
         # regularises the DEFORMATION FIELD, not the reconstructed image.
-        _deform = getattr(self.generator_model, "last_deformation_field", None)
+        _deform = getattr(unwrap_model(self.generator_model), "last_deformation_field", None)
         g_total_loss, loss_dict = self._apply_domain_losses(
             self._loss_specs,
             pred,
@@ -858,8 +937,8 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         keys. ``cache_visuals`` stores the magnitude pair for the pipeline's
         image logging (the in-distribution pass only).
         """
-        corrupted_image, marker_prior, _ = self.simulator(
-            target_complex, external_b0_field=self._slice_field(b0_map)
+        corrupted_image, marker_prior, joint_clean = self.simulator(
+            self._twin_input(target_complex), external_b0_field=self._slice_field(b0_map)
         )
         marker_residual = self._compute_marker_residual(corrupted_image, marker_prior)
 
@@ -900,6 +979,19 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
 
         pred = self._to_image_domain(pred, infer_output_domain(self.config), self.device)
 
+        # Erase the twin's marker from the reconstruction; the unerased PSNR rides along as the
+        # arm's baseline so one run carries both sides of the contrast.
+        null_space_scores: dict[str, float] = {}
+        if self._null_space_hook is not None:
+            unerased = pred.abs()
+            pred = self._null_space_hook.erase(pred, marker_prior_norm)
+            null_space_scores = self._null_space_hook.scores(pred, clean_norm, marker_prior_norm)
+            mse_u = torch.nn.functional.mse_loss(unerased, clean_norm.abs())
+            rng = clean_norm.abs().max() - clean_norm.abs().min() + 1e-8
+            null_space_scores["val_psnr_unerased"] = float(
+                10.0 * torch.log10(rng**2 / (mse_u + 1e-10))
+            )
+
         # PSNR on magnitude images (standard MRI metric)
         pred_mag = pred.abs()
         target_mag = clean_norm.abs()
@@ -916,6 +1008,18 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
             self._last_visual_target = target_mag.detach().cpu()
 
         scores: dict[str, float] = {"val_psnr": float(psnr)}
+        scores.update(null_space_scores)
+        if self._spin_history is not None:
+            scores["val_spin_history_gain_std"] = float(self._last_spin_gain.std())
+        if self._phase_stego_hook is not None:
+            scores.update(self._phase_stego_hook.scores(target_complex))
+            displacement = getattr(self.simulator, "last_elastic_displacement_px", None)
+            if displacement is not None:
+                scores.update(
+                    self._phase_stego_hook.displacement_rmse_px(
+                        corrupted_image, joint_clean, displacement
+                    )
+                )
         # Emit the YAML-configured ``validation.metrics`` so early-stopping /
         # best-metric monitors (e.g. ``val_hfen``, ``val_robust_mri_psnr``)
         # resolve. Without this the strategy only returned ``val_psnr`` and
@@ -926,9 +1030,20 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # (CLAUDE.md #9/#10).
         computer = getattr(self, "validation_metrics_computer", None)
         if computer is not None:
+            # The complex pair goes with the magnitudes so phase metrics are
+            # scored on phase (#867). A PhaseBlindInputError is a wiring
+            # defect and propagates; the warning below is for metric failures.
+            views = MetricViews(
+                pred_mag,
+                target_mag,
+                pred if torch.is_complex(pred) else None,
+                clean_norm if torch.is_complex(clean_norm) else None,
+            )
             try:
-                computed = computer.compute(pred_mag, target_mag)
+                computed = views.compute(computer)
                 scores.update({k: float(v) for k, v in computed.items()})
+            except PhaseBlindInputError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "[VirtualFiducialStrategy] validation_metrics_computer "
@@ -956,7 +1071,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         (no new YAML knob — it self-gates on the two attributes; pitfall #15).
         """
         twin_shift = getattr(self.simulator, "last_pe_shift_field", None)
-        est = getattr(self.generator_model, "last_shift_estimate", None)
+        est = getattr(unwrap_model(self.generator_model), "last_shift_estimate", None)
         if twin_shift is None or est is None:
             # Phase-path arms (graph_cut_unwrap / phase_tracking_lstm) have no
             # geometric PE shift; grade their field estimate against the REAL B0's
@@ -1009,7 +1124,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         a model estimate (pitfall #15); returns ``{}`` otherwise.
         """
         b0 = getattr(self.simulator, "last_b0_field", None)
-        est = getattr(self.generator_model, "last_field_estimate", None)
+        est = getattr(unwrap_model(self.generator_model), "last_field_estimate", None)
         if not real_reference or b0 is None or est is None:
             return {}
         try:

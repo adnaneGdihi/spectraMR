@@ -15,24 +15,38 @@ from typing import Any, ClassVar
 
 import torch
 
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.losses.heteroscedastic_losses import heteroscedastic_ulf_loss
 
 from .reconstruction import ReconstructionTrainingStrategy
 
 
 def _hoult_sigma_per_sample(
-    field_strength: torch.Tensor | None, sigma_floor: float, max_sigma: float = 0.2
-) -> torch.Tensor | float:
+    field_strength: torch.Tensor | None,
+    sigma_floor: float,
+    max_sigma: float = 0.2,
+    source_field: float | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """Per-sample ULF noise std on the [0,1] data scale (Hoult, CLAMPED).
+
+    The per-sample source field is ``batch['field_strength']`` when a dataset stamps
+    it, else the declared ``source_field`` (the paired ULF route stamps only the
+    3T target). Neither present raises: the anchor is never silently the 3T floor.
 
     The raw Hoult amplification ``(3/B0)^1.75`` is ~370x at 0.1 T — an ABSOLUTE
     pre-normalisation factor that is meaningless once each image is renormalised to
-    [0,1] (a [0,1] residual variance cannot exceed ~1). We therefore clamp the std
-    to ``max_sigma`` so the variance anchor (``sigma^2``) stays on the data scale:
-    sigma rises from ``sigma_floor`` at high field to ``max_sigma`` at ULF.
+    [0,1]. We clamp the std to ``max_sigma`` so the variance anchor stays on the data
+    scale: 64 mT (sigma 41.9 raw) saturates at ``max_sigma``.
     """
     if field_strength is None:
-        return float(min(sigma_floor, max_sigma))
+        if source_field is None:
+            raise ValueError(
+                "HeteroscedasticULFStrategy needs the source field: batch['field_strength'] "
+                "is absent and training.heteroscedastic_ulf.source_field is unset."
+            )
+        # Built on the loss's device with a fill, so the CUDA path neither mixes devices nor syncs.
+        field_strength = torch.full((1,), float(source_field), device=device)
     b0 = field_strength.reshape(-1).float().clamp_min(1e-6)
     return (sigma_floor / (b0 / 3.0) ** 1.75).clamp(max=max_sigma)
 
@@ -59,13 +73,16 @@ def compute_heteroscedastic_ulf_losses(
     lambda_mean: float = 0.0,
     logvar_min: float = -10.0,
     logvar_max: float = 2.0,
+    source_field: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Gaussian NLL + Hoult variance prior over the 2-channel prediction, plus the
     anti-degeneracy mean-anchor + logvar-clamp guards (#20)."""
     x = batch["input"]
     y = batch["target"]
     mean, logvar = _as_mean_logvar(generator(x))
-    sigma_t = _hoult_sigma_per_sample(batch.get("field_strength"), sigma_floor, max_sigma)
+    sigma_t = _hoult_sigma_per_sample(
+        batch.get("field_strength"), sigma_floor, max_sigma, source_field=source_field, device=y.device
+    )
     return heteroscedastic_ulf_loss(
         mean,
         logvar,
@@ -109,6 +126,8 @@ class HeteroscedasticULFStrategy(ReconstructionTrainingStrategy):
             float(getattr(cfg, "logvar_min", -10.0)) if cfg is not None else -10.0
         )
         self._het_logvar_max = float(getattr(cfg, "logvar_max", 2.0)) if cfg is not None else 2.0
+        src = getattr(cfg, "source_field", None) if cfg is not None else None
+        self._het_source_field = float(src) if src is not None else None
         if getattr(self, "logging_service", None):
             self.logging_service.log_info(
                 f"[B-2.9] guards: lambda_mean={self._het_lambda_mean}, "
@@ -137,6 +156,7 @@ class HeteroscedasticULFStrategy(ReconstructionTrainingStrategy):
             lambda_mean=getattr(self, "_het_lambda_mean", 0.0),
             logvar_min=getattr(self, "_het_logvar_min", -10.0),
             logvar_max=getattr(self, "_het_logvar_max", 2.0),
+            source_field=getattr(self, "_het_source_field", None),
         )
 
     def _validation_forward(
@@ -158,9 +178,14 @@ class HeteroscedasticULFStrategy(ReconstructionTrainingStrategy):
             out = out.get("reconstruction", next(iter(out.values())))
         return out
 
-    def _apply_metric_transforms(
-        self, pred: torch.Tensor, target: torch.Tensor, metrics_config: Any = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _metric_transform_views(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        metrics_config: Any = None,
+        *,
+        batch_data: Any = None,
+    ) -> MetricViews:
         """No-op: the 2-channel output is a ``[mean, logvar]`` distribution head,
         NOT complex real/imag.
 
@@ -171,8 +196,11 @@ class HeteroscedasticULFStrategy(ReconstructionTrainingStrategy):
         (the b29_heteroscedastic_ulf / b29_ablate_var_prior crash, pitfall #18).
         ``gaussian_nll`` consumes the 2-channel prediction directly (it slices
         ``[mean, logvar]`` itself), so the head must reach the metric untransformed.
+        Overriding the views hook also covers ``_apply_metric_transforms``, which
+        delegates to it.
         """
-        return pred, target
+        del metrics_config, batch_data
+        return MetricViews(pred, target)
 
     def _prediction_for_visualization(self, predictions: torch.Tensor) -> torch.Tensor:
         """Visualise the MEAN channel (channel 0), not ``sqrt(mean**2 + logvar**2)``.
@@ -184,7 +212,7 @@ class HeteroscedasticULFStrategy(ReconstructionTrainingStrategy):
         (issue #371 - the b29 dark-brain-on-grey wrong-channel viz, near input-independent
         because the logvar is anchored to a flat Hoult ``sigma``). Slice channel 0 so the
         saved ``fake_images`` are the mean reconstruction. Symmetric with the
-        ``_apply_metric_transforms`` no-op above.
+        ``_metric_transform_views`` no-op above.
         """
         if predictions.dim() >= 2 and predictions.shape[1] >= 2:
             return predictions[:, 0:1]

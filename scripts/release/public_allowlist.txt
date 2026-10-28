@@ -10,6 +10,7 @@
 
 # ---- the package -----------------------------------------------------------
 src/                       # the framework itself
+plugins/spectramr_baselines/  # prior-method adapters; shipped from src/ before they moved out of tree
 
 # ---- tests -----------------------------------------------------------------
 # Ships wholesale, minus the denials below. A gate that can no longer see its
@@ -267,6 +268,10 @@ conftest.py
 # tests/unit/infrastructure/execution/test_backends.py got) is not enough here:
 # the test would then assert a placeholder against a script that never ships.
 !tests/unit/scripts/test_dispatch_experiments.py
+# Guards the committed *.sbatch corpus, none of which ships; its non-empty floor
+# would read the export's absence of scripts as a vacuous scan.
+!tests/unit/scripts/test_sbatch_has_no_partition.py
+!tests/unit/scripts/test_submit_batch_partition_opt_in.py
 !tests/unit/scripts/test_submit_exp11_ema_warmup_ablation.py
 !tests/unit/scripts/test_submit_exp11_fpk_ablation.py
 
@@ -412,13 +417,13 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 !tests/unit/diagnostics/test_trace_exp11_dataflow.py
 !tests/unit/scripts/test_vf_mechanism_demo.py
 
-# scripts/ci/, scripts/audit/, scripts/migrations/, scratch/ -- internal gates,
+# scripts/ci/, scripts/audit/, scripts/migrations/, tools/triage/ -- internal gates,
 # corpus censuses and one-shot migrations. The migrations in particular operate
 # on experiments/inprogress/, which does not ship at all.
 !tests/unit/audit/test_framework_coverage_audit.py
 !tests/unit/ci/test_a6_batch_key_census.py
 !tests/unit/ci/test_a6_triage_orphan_keys.py
-!tests/unit/scratch/test_compile_diagnostics.py
+!tests/unit/tools/test_compile_diagnostics.py
 !tests/unit/scripts/test_check_produced_by_arm_resolves.py
 !tests/unit/scripts/test_cluster_verify.py
 !tests/unit/scripts/test_migrate_config_version_to_v1.py
@@ -648,6 +653,39 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 # boundary from someone deleting the Dockerfile. Denying the file removes the
 # blind guard with it rather than leaving it in the public tree as a green.
 !tests/unit/scripts/test_container_entrypoint.py             # 0 / 1 (+2 absence-skips)
+
+# ---- deny block 5: collection errors added since the 0.1.3.dev1 snapshot ------
+# Measured by `pytest --collect-only` over a materialized export of 365c0d4f2
+# (2026-10-23): each file below raised at import because its subject -- a script,
+# an experiment YAML or the experiments/ corpus -- does not ship, and the public
+# pr-required lane collects tests/unit, tests/audit and tests/contracts.
+!tests/audit/test_kspace_filling_cohort_invariants.py
+!tests/unit/ci/test_check_optimizer_specs_resolve.py
+!tests/unit/models/generators/test_hilbert_mamba_generators.py
+!tests/unit/scripts/test_average_m4raw_nex.py
+!tests/unit/scripts/test_benchmark_data_loader.py
+!tests/unit/scripts/test_build_registered_m4raw_manifests.py
+!tests/unit/scripts/test_coil_subspace_budget.py
+!tests/unit/scripts/test_contrast_registration_check.py
+!tests/unit/scripts/test_degradation_order_dispersion.py
+!tests/unit/scripts/test_exp11_spectral_transfer_probe.py
+!tests/unit/scripts/test_generate_fastmri_kspace_filling.py
+!tests/unit/scripts/test_gi_scbd_rank_gate.py
+!tests/unit/scripts/test_loss_frequency_pull.py
+!tests/unit/scripts/test_lr_schedule_trace.py
+!tests/unit/scripts/test_m4raw_repetition_registration.py
+!tests/unit/scripts/test_m4raw_series_gain_gate.py
+!tests/unit/scripts/test_make_slicechunked_manifests.py
+!tests/unit/scripts/test_measure_kspace_scale_candidates.py
+!tests/unit/scripts/test_measure_phase_encode_axis.py
+!tests/unit/scripts/test_pretrain_fno_epg.py
+!tests/unit/scripts/test_rechunk_m4raw_kspace.py
+!tests/unit/scripts/test_register_m4raw_contrasts.py
+!tests/unit/scripts/test_reverse_loops_on_shared_checkpoint.py
+!tests/unit/scripts/test_split_manifest.py
+!tests/unit/scripts/test_ssdu_loader_starvation.py
+!tests/unit/test_sim2rank_3d_mode.py
+!tests/unit/test_sim2rank_volume_mode_axes.py
 
 # ---- CI workflows ----------------------------------------------------------
 # Workstream F's condition is met: the two Claude workflows are denied below, so
@@ -888,6 +926,7 @@ scripts/ci/baselines/f821_unparseable.txt #   ship, so the gate exits 1 in the e
 #   new repo (`--write`). The direction is DOWNWARD -- rows removed, never a raised
 #   ceiling -- which is the only direction non-negotiable 20 permits.
 scripts/ci/check_test_paired_with_source.py
+scripts/ci/check_scratch_untracked.py     # the .pre-commit-config.yaml hook that keeps scratch/ untracked; stdlib-only, passes vacuously where nothing is tracked
 scripts/ci/check_no_stale_package_name.py # the third .pre-commit-config.yaml local
 #   hook. It is a RUNNER, not a rule: NEEDLES and _offending_files come from
 #   tests/architecture/test_no_stale_package_name.py, which ships under the wholesale
@@ -921,6 +960,9 @@ scripts/ci/check_docs_paths_exist.py
 # adds a capability rather than deleting a test.
 scripts/ci/migrate_config_keys.py
 scripts/ci/check_no_legacy_config_keys.py
+scripts/ci/degradation_golden_inputs.py   # torch-only; tests/utils/degradation_inputs.py imports it,
+#   so without it four shipped physics test files fail at collection.
+scripts/ci/check_degradation_golden.py    # its gate; reads tests/fixtures/degradation_golden_2d.json, which ships
 scripts/ci/report_discarded_config_keys.py  # the detector that answers "is this key
 #   actually read?" -- 155 lines, stdlib plus spectramr.config.settings and
 #   spectramr.core.execution_ledger, both of which ship. It ships because CONTRIBUTING
@@ -1033,7 +1075,7 @@ scripts/data/regenerate_cluster_manifests.py
 #    a rule of their own -- there is no directory whose name is quoted. That
 #    misreading came from parsing ls-tree without -z, which quotes the whole
 #    path and so appears to create a top-level root named '"experiments'.)
-# scratch/ runners/    explicitly not production surface
+# scratch/ runners/    explicitly not production surface (scratch/ is gitignored and holds nothing tracked)
 # data/                dataset payloads
 # paper/               JOSS draft -- a separate deadline
 # docs/audits/ docs/superpowers/ docs/presentation/ docs/lean/ docs/analysis/

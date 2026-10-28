@@ -635,3 +635,56 @@ class TestSenseAdjointNormalize:
         k, s, _ = self._phantom(shaded=True)
         combined = coil_combine(ifft2c(k), method="sense", smaps=s)
         assert torch.allclose(combined, sense_adjoint(k, s, normalize=True).abs(), atol=1e-6)
+
+
+class TestCentredFreqs:
+    @pytest.mark.parametrize("n", [8, 9, 64, 65])
+    def test_zero_on_the_dc_sample_and_spacing_one_over_n(self, n):
+        from spectramr.infrastructure.physics.fft_ops import centred_freqs
+
+        f = centred_freqs(n)
+        assert f[n // 2] == 0.0
+        assert torch.allclose(f[1:] - f[:-1], torch.full((n - 1,), 1.0 / n))
+
+    @pytest.mark.parametrize("n", [64, 65])
+    def test_phase_ramp_is_an_exact_integer_shift(self, n):
+        from spectramr.infrastructure.physics.fft_ops import centred_freqs, fft2c, ifft2c
+
+        x = torch.randn(1, 1, n, n, dtype=torch.complex64)
+        ramp = torch.exp(-2j * torch.pi * centred_freqs(n).view(1, 1, 1, -1) * 7)
+        assert torch.allclose(ifft2c(fft2c(x) * ramp), torch.roll(x, 7, dims=-1), atol=1e-5)
+
+
+class TestSpatialDimsAndAmp:
+    def test_spatial_dims_is_layout_agnostic(self):
+        from spectramr.infrastructure.physics.fft_ops import spatial_dims
+
+        assert spatial_dims(torch.zeros(2, 1, 4, 5)) == (2, 3)
+        assert spatial_dims(torch.zeros(2, 1, 3, 4, 5)) == (2, 3, 4)
+        for shape in [(4,), (2, 4), (2, 1, 3, 4, 5, 6)]:
+            with pytest.raises(ValueError):
+                spatial_dims(torch.zeros(*shape))
+
+    def test_fftnc_under_autocast_is_complex64(self, monkeypatch):
+        from spectramr.infrastructure.physics import fft_ops
+
+        seen: list[bool] = []
+
+        def spy(fn):
+            def wrapper(*a, **kw):
+                seen.append(torch.is_autocast_enabled("cuda"))
+                return fn(*a, **kw)
+
+            return wrapper
+
+        monkeypatch.setattr(fft_ops.torch.fft, "fftn", spy(torch.fft.fftn))
+        monkeypatch.setattr(fft_ops.torch.fft, "ifftn", spy(torch.fft.ifftn))
+        x = torch.randn(1, 2, 4, 6, 8)
+        ref = fft_ops.fftnc(x)
+        seen.clear()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            k = fft_ops.fftnc(x)
+            back = fft_ops.ifftnc(k)
+        assert seen == [False, False]
+        assert k.dtype == back.dtype == torch.complex64
+        assert torch.equal(k, ref)

@@ -11,8 +11,6 @@ from typing import Any
 
 import torch
 
-from spectramr.config.schemas.enums import SchedulerTypes
-
 # Import unified physics operator interface
 from spectramr.infrastructure.physics.interfaces import IPhysicsOperator
 
@@ -61,10 +59,6 @@ class StrategyContext:
     # Performance settings
     use_amp: bool = False
     gradient_clip_norm: float | None = None
-
-    # Diffusion-specific parameters (for diffusion strategies)
-    num_timesteps: int = 1000
-    beta_schedule: str = "linear"
 
     # Additional utility services
     fft_transformer: Any | None = None  # FFTTransformer
@@ -169,73 +163,6 @@ class StrategyContext:
             logger.debug(f"  GPU Memory - Total: {total_gb:.2f} GB")
 
 
-@dataclass
-class DiffusionStrategyContext(StrategyContext):
-    """Specialized context for diffusion-based training strategies.
-
-    Extends StrategyContext with diffusion-specific parameters
-    and utilities.
-    """
-
-    # Diffusion-specific parameters
-    num_timesteps: int = 1000
-    beta_schedule: str = "linear"
-    noise_schedule_type: str = "cosine"
-
-    # Pre-computed noise schedules
-    betas: torch.Tensor | None = None
-    alphas: torch.Tensor | None = None
-    alphas_cumprod: torch.Tensor | None = None
-
-    def __post_init__(self):
-        """Initialize diffusion-specific parameters."""
-        super().__post_init__()
-        self._setup_noise_schedule()
-
-    def _setup_noise_schedule(self):
-        """Setup the noise schedule for diffusion."""
-        if self.beta_schedule == SchedulerTypes.LINEAR.value:
-            self.betas = torch.linspace(
-                1e-4,
-                0.02,
-                self.num_timesteps,
-                device=self.device,
-            )
-        elif self.beta_schedule == SchedulerTypes.COSINE.value:
-            t = torch.linspace(
-                0,
-                self.num_timesteps,
-                self.num_timesteps + 1,
-                device=self.device,
-            )
-            alphas_cumprod = torch.cos(0.5 * torch.pi * t / self.num_timesteps) ** 2
-            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-            self.betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
-            # Ensure tensor type for clamp
-            assert self.betas is not None
-            self.betas = torch.clamp(self.betas, min=0.0, max=0.999)
-        else:
-            raise ValueError(f"Unknown beta schedule: {self.beta_schedule}")
-
-        # Calculate cumulative products
-        assert self.betas is not None
-        self.alphas = 1.0 - self.betas
-        assert self.alphas is not None
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-    def get_sqrt_alphas_cumprod(self) -> torch.Tensor:
-        """Get sqrt(alphas_cumprod) for forward diffusion."""
-        if self.alphas_cumprod is None:
-            raise RuntimeError("Noise schedule not initialized")
-        return torch.sqrt(self.alphas_cumprod)
-
-    def get_sqrt_one_minus_alphas_cumprod(self) -> torch.Tensor:
-        """Get sqrt(1 - alphas_cumprod) for forward diffusion."""
-        if self.alphas_cumprod is None:
-            raise RuntimeError("Noise schedule not initialized")
-        return torch.sqrt(1.0 - self.alphas_cumprod)
-
-
 def create_strategy_context(
     device: torch.device | str | Any,
     config: Any,
@@ -275,36 +202,5 @@ def create_strategy_context(
         fft_transformer=fft_transformer,
         complex_handler=complex_handler,
         loss_fn=loss_fn,
-        **kwargs,
-    )
-
-
-def create_diffusion_strategy_context(
-    device: torch.device | str | Any,
-    config: Any,
-    num_timesteps: int = 1000,
-    beta_schedule: str = "linear",
-    **kwargs,
-) -> DiffusionStrategyContext:
-    """Factory function for creating DiffusionStrategyContext instances.
-
-    Args:
-        device: PyTorch device
-        config: Training configuration
-        num_timesteps: Number of diffusion timesteps
-        beta_schedule: Type of beta schedule ('linear' or 'cosine')
-        **kwargs: Additional context parameters
-
-    Returns:
-        Configured DiffusionStrategyContext instance
-
-    """
-    coerced_device = _coerce_device(device)
-
-    return DiffusionStrategyContext(
-        device=coerced_device,
-        config=config,
-        num_timesteps=num_timesteps,
-        beta_schedule=beta_schedule,
         **kwargs,
     )

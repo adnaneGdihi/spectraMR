@@ -112,13 +112,19 @@ class HeteroscedasticULFLoss(nn.Module):
         mean = prediction[:, 0:1]
         logvar = prediction[:, 1:2]
         sigma_target = kwargs.get("sigma_target", 0.05)
-        lam = float(kwargs.get("lambda_var_prior", 0.1))  # type: ignore[arg-type]
+        lam = kwargs.get("lambda_var_prior", 0.1)
+        if not isinstance(sigma_target, (int, float, torch.Tensor)):
+            raise TypeError(
+                f"sigma_target must be a float or tensor, got {type(sigma_target).__name__}"
+            )
+        if not isinstance(lam, (int, float)):
+            raise TypeError(f"lambda_var_prior must be a float, got {type(lam).__name__}")
         return heteroscedastic_ulf_loss(
             mean,
             logvar,
             target,
             sigma_target,
-            lambda_var_prior=lam,  # type: ignore[arg-type]
+            lambda_var_prior=float(lam),
         )["loss_total"]
 
 

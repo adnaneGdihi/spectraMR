@@ -133,6 +133,15 @@ the ``_ledger`` block below:
     ``infer`` rebuild their settings from that block when the artifact sits
     beside the checkpoint.
 
+    One field is rewritten to state what was applied rather than the schema
+    default. ``optimization.lr_scheduler_strategy`` defaults to ``"cosine"``,
+    but a scheduler is built only when the YAML declares one. When the YAML does
+    not declare that field, the dump records the scheduler that was actually
+    built, or ``null`` for a constant learning rate. The additive
+    ``_lr_schedule`` block carries the same record as ``provenance.json``'s
+    ``lr_schedule``. If the scheduler could not be resolved, the block holds
+    ``{"unresolved": <message>}`` instead (#2760).
+
 ``provenance_run_<run_id>.json`` / ``resolved_config_run_<run_id>.json``
     Run-id-qualified **copies** of the two above, written only when a ``run_id``
     is known — the ``spectramr audit`` path has none and so writes neither.
@@ -187,6 +196,41 @@ describe one config differently.
     **wall-clock duration + iterations/sec**, and the provenance subset
     (``run_id``, ``git``, ``host``, ``config_sha256``, ``effective_batch``,
     ``model_params``, ``hardware``, ``slurm``).
+
+    A run the divergence guard stopped on a non-finite loss has
+    ``success: false`` and an ``error`` naming the iteration, and
+    ``final_metrics.json`` carries it as ``diverged_at_iteration`` (``null`` on a
+    run that did not diverge). The guard is ``NonFiniteMonitor``: the step
+    executor's pre-backward guard and the loop's own record of the total both
+    queue a device flag, and the loop reads it one step late, so a training step
+    pays no host sync for it. The flag is read early before any checkpoint save,
+    validation, wall-clock yield and loop exit, so the non-finite step's weights
+    are never saved, and the iteration named is the step whose loss was
+    non-finite. When the step after a non-finite one fails on the weights it
+    left (every loss component dropped, so the total has no graph), the unread
+    verdict is reported instead of that secondary error. ``final_loss`` in the
+    result and in ``run_summary.json`` is a float, or ``null`` when the run
+    recorded no ``g_total_loss``. A ``GradScaler`` and DeepSpeed defer the per-config guard; the
+    loop's record of the total still applies to them. A non-finite *component* is
+    dropped from the total before it gets there (#1986). Code outside the
+    training loop that calls ``IStepPolicy.guard_loss`` with no monitor still
+    gets the synchronous ``RuntimeError``.
+
+    ``success`` is earned, never defaulted. It is ``true`` only when the
+    pipeline returned an explicit ``True``: training completed and, if
+    validation ran, at least one validation event produced a finite metric
+    (the failure sentinel ``validation_error`` and the ``val_batches_*``
+    counts do not count). ``validation_events`` and
+    ``validation_events_with_finite_metric`` record the tally behind the
+    verdict, and an absent flag is written as ``null``. A run that crashes,
+    fails to build, or fails to resume also writes the footer, with
+    ``success: false``, ``error`` and ``error_type``, overwriting the previous
+    run's footer in the same directory (#181, #182).
+
+    ``loader_wait`` is ``{fraction, wait_s, wall_s, steps}``: the share of the
+    run's wall time spent inside ``next(data_iter)``. ``fraction`` near 1 means
+    the accelerator sat idle waiting for a batch, whatever its memory shows; it
+    needs no profiler, and is ``null`` for a run that timed no step.
 
     ``hardware`` is the flattened ``env.node`` census —
     ``gpu_count`` / ``gpu_types`` / ``gpu_node_count`` / ``gpu_driver_version``,
@@ -274,8 +318,7 @@ Two mechanisms put a log somewhere other than beside the run:
 
 **1. ``logging.sinks.dir`` outranks the run directory.**
 :meth:`LoggingServiceFactory.create` passes ``log_dir=config.sinks.dir``
-straight through, and ``ComprehensiveLoggingService`` resolves
-``sinks.dir or log_dir``. That precedence is **correct** — a caller default
+straight through. That precedence is **correct** — a caller default
 must not replace a declared value — so an arm declaring
 
 .. code-block:: yaml
@@ -341,17 +384,100 @@ Console-logging configuration
 
 Run *provenance* (above) is the on-disk record of a run. Separately, the
 **console logging** — the colored, badge-prefixed lines you see in a terminal —
-is owned by :mod:`spectramr.infrastructure.services.logging_service`. Two entry
-points configure it:
+is owned by :mod:`spectramr.infrastructure.logging.log_policy`, which is the only
+module that decides the root level, the console handler or the secondary-rank floor.
+Only that module, its ``console`` helper and ``LoggingService`` may write process-wide
+logging state; ``scripts/ci/check_logging_owner.py`` fails a ``basicConfig``, a root
+``setLevel`` / ``addHandler``, a ``logging.getLogger`` patch or a second
+``LoggingService(...)`` anywhere else under ``src/`` (the ``scripts/`` tree is baselined
+and may only shrink). The level is resolved in one place, highest first:
 
-* :func:`~spectramr.infrastructure.services.logging_service.bootstrap_console_logging`
-  is called once at the very top of ``spectramr.cli.app.main`` (before any
-  subcommand), so ``logger.info(...)`` in *every* CLI flow renders through the
-  :class:`~spectramr.infrastructure.services.logging_service.ColoredConsoleFormatter`
-  rather than Python's plain ``lastResort`` handler.
-* :meth:`LoggingService.setup` runs later, inside ``build_container``, applying
-  the resolved :class:`~spectramr.config.schemas.logging.LoggingConfigSchema`
-  (level, ``log_to_file`` / ``log_to_console`` / ``silent``, file handler).
+#. ``--log-level`` on the command line (``train --debug`` means ``debug``);
+#. the ``SPECTRAMR_LOG_LEVEL`` environment variable;
+#. the config's ``logging.sinks.level``;
+#. ``info``.
+
+On a secondary rank of a distributed launch the result is floored at ``warning``
+whatever was asked. An unknown level from any source raises. Three call sites feed
+the policy:
+
+* :func:`~spectramr.infrastructure.logging.log_policy.configure_entry` runs once in
+  ``spectramr.cli.app.main`` after argument parsing, installing the colored handler
+  and applying the flag and the environment variable.
+* :func:`~spectramr.infrastructure.logging.log_policy.apply_logging_config` runs in
+  every verb right after its config loads (``train``, ``experiment``, ``infer``,
+  ``predict``, ``export``, ``audit`` of one config, ``report``, ``ablation``,
+  ``train-distributed``), so the declared level holds from that line on rather than
+  only once the container builds. Bulk audit and the ``hpo`` parent do not apply
+  one: a single level cannot stand for many configs, and each trial applies its own.
+* :meth:`LoggingService.setup` runs later, inside ``build_container``, and asks
+  :func:`~spectramr.infrastructure.logging.log_policy.effective_level` for the level,
+  so a ``--log-level`` is not undone there.
+
+The level and where it came from are stamped under ``logging.level`` in the run
+provenance.
+
+Where a run writes
+------------------
+
+Every output a run produces is a *sink* registered on the ``LoggingService``
+(:mod:`spectramr.infrastructure.logging.sinks`). The writers did not move; a sink is
+the handle that names the destination, says whether it is live, and closes it.
+
+====================  ==============================================  ==================
+Sink                  Destination                                     Writer
+====================  ==============================================  ==================
+``file``              ``<sinks dir>/<model_type>.log``                ``LoggingService``
+``tensorboard``       ``<output_dir>/<tracking.tensorboard_dir>``     ``TensorBoardWriter``
+``metrics_csv``       the validation CSV of ``MetricsTracker``        ``MetricsTracker``
+``loss_csv``          the training CSV of ``MetricsTracker``          ``MetricsTracker``
+====================  ==============================================  ==================
+
+``<sinks dir>`` is ``logging.sinks.dir`` **when the arm declares it** and
+``<training.output_dir>/logs`` otherwise (a sanity check is rooted under
+``<output_dir>/sanity_check``). The schema default ``./logs`` is no longer applied to an
+arm that does not mention the key: it used to put the text log in the working directory,
+away from the run it describes. A declared value, including the flat ``log_dir``, still
+wins, and an unwritable directory still relocates the log loudly.
+
+What changes for existing runs: of the 1,707 configs under ``experiments/`` that train,
+1,249 declare a log directory and keep it exactly; the other 458 now write their text log
+under their own output directory instead of ``./logs``.
+
+The run's provenance carries ``logging.sinks`` (name, enabled, path for each sink) and
+``logging.sinks_dir_source`` (``declared`` or ``run_dir``). ``TrainingLogDelegate``, an
+async loss-CSV writer that nothing instantiated, was removed: ``MetricsTracker`` writes the
+training CSV.
+
+Distributed runs and the writing policy
+---------------------------------------
+
+Three declared settings decide who writes what, so a ``torchrun`` job's SLURM files
+stay readable. All three live in the config and are stamped under ``logging.policy``.
+
+* **Who logs.** ``logging.distributed.console_ranks: rank0`` (the default) lets rank 0
+  log at the full level and holds every other rank to
+  ``logging.distributed.secondary_level`` (default ``error``), so a rank-specific
+  failure still surfaces. ``all`` gives every rank the full level. Rank 0 alone writes
+  the text log unless ``logging.distributed.file_ranks: all``, which gives each rank its
+  own ``<name>.rank<N>.log`` rather than interleaving ranks in one file.
+* **Which stream.** ``logging.sinks.console_stream: split`` (the default) sends DEBUG
+  and INFO to stdout and WARNING and above to stderr, so a SLURM ``.out`` reads as the
+  run log and ``.err`` holds only problems. ``stdout`` and ``stderr`` send everything to
+  one stream.
+* **How progress shows.** ``logging.progress.mode: auto`` draws a tqdm bar on a terminal
+  only, and the log gets one generic tracking line every
+  ``logging.progress.log_every_n_iterations`` iterations (default 1500), in both cases. tqdm in a file turns every refresh into a line, and its ``set_postfix``
+  refreshes on every call by default; the progress module never does either. The bar and
+  the lines follow ``console_ranks``. ``logging.progress_bar_enabled: false`` or
+  ``progress_bar_no_progress: true`` turns progress off, and so does
+  ``progress_bar_on_warning: false`` once the resolved level is ``warning`` or above.
+Tracking lines are the one INFO output a ``warning``-level run keeps: they print to stderr
+even when ``logging.sinks.level`` filters everything else below WARNING.
+
+Before the config loads, the defaults above apply, so the first lines of a launch are
+already held to rank 0. Lines logged while the YAML itself is being parsed precede the config,
+so only ``--log-level`` and ``SPECTRAMR_LOG_LEVEL`` can reach them.
 
 The single source of truth
 --------------------------
@@ -359,14 +485,16 @@ The single source of truth
 "Put exactly one colored console handler on this logger — upgrading any
 pre-existing plain ``StreamHandler`` *in place* (so handler identity, stream and
 filters survive) rather than stacking a duplicate" is the
-:func:`_install_or_upgrade_colored_console` helper. Both entry points above
-delegate to it. ``setup`` passes ``install_if_missing=log_to_console`` so silent
+:func:`~spectramr.infrastructure.logging.console.install_or_upgrade_colored_console`
+helper. The policy and ``setup`` both delegate to it. ``setup`` passes ``install_if_missing=log_to_console`` so silent
 mode upgrades existing handlers but never *adds* a console sink.
 
-Two behaviours follow from having one owner. ``ComprehensiveLoggingService.log``
-injects default metadata and delegates; the base
-:meth:`LoggingService.log` is the single throttle authority, and it rate-limits
-only ``INFO`` / ``DEBUG`` — a ``WARNING`` or above is never throttled. The file
+There is one service class. ``ComprehensiveLoggingService`` and
+``create_logging_service`` were removed: nothing resolved the extra DI keys, every
+TensorBoard branch in the subclass was a no-op (its writer was always ``None``), and
+the container now registers the one :class:`LoggingService` under ``ILoggingService``
+only. Two behaviours follow from having one owner. :meth:`LoggingService.log` is the
+single throttle authority, and it rate-limits only ``INFO`` / ``DEBUG`` — a ``WARNING`` or above is never throttled. The file
 handler's format string is the single ``_FILE_LOG_FORMAT`` constant, shared by
 the normal path and the permission-fallback path.
 
@@ -664,6 +792,18 @@ an error, as it does a patch depth other than 1. Under
 ``coils.processing_mode: rss`` the phase-reference coil is selected per record,
 which on this route is per slice.
 
+Two quantities follow the record and one does not. The k-space scale is one
+robust quantile per subject, so on this route it is measured per slice, in
+training and validation alike, and predict follows the same flag. An epoch is
+one pass over the slices, so an arm that moves to this route should declare its
+budget as ``training.max_iterations`` rather than ``epochs`` (#2673). The
+self-calibrated noise covariance is a property of the scan: a slice record reads
+the input repetition's central slices (``sigma_fit_window``) on a cache miss and
+fits those, as the group route and predict do, rather than the one slice it
+serves. Precomputed coil maps are memory-mapped and the record's slice is
+copied out, so a record does not carry the whole volume's maps through the
+loader's shared memory.
+
 An empty loader records ``batches: 0``, not ``null``. A truthiness test would
 write ``null``, because a ``DataLoader`` defines ``__len__`` and an empty one is
 falsy -- indistinguishable from a split that was never built. ``0`` is a
@@ -911,7 +1051,7 @@ Two independent triggers, both under ``validation.schedule``:
 ``on_epoch`` is **additive**: it adds validation events, it never removes the
 step-interval event an arm selects its checkpoint from. That is the safe
 direction — the opposite reading could silently delete the only event feeding
-``checkpoint_best.pt``.
+the best checkpoint.
 
 .. rubric:: ``on_epoch`` defaults to ``false``
 
@@ -929,24 +1069,18 @@ is consulted only in epoch mode.
 
     "checkpoints": {
       "dir": "/project/.../experiments/results/exp_x/checkpoints",
-      "inside_run_dir": false,
-      "files": [{"name": "checkpoint_best.pt", "bytes": 41231872}],
+      "files": [{"name": "best.safetensors", "bytes": 41231872}],
       "total_bytes": 41231872
     }
 
-``inside_run_dir`` is the load-bearing field. When it is ``false`` the files do
-not travel with a retrieved artifact bundle, and the bundle's ``checkpoints/``
-directory arrives **empty** — which reads as "no checkpoint was saved".
+``dir`` is ``<training.output_dir>/checkpoints``, the directory every
+training-loop save writes. No config key moves it.
 
-An arm whose ``checkpoint.checkpoint_dir`` points outside the collected run
-directory produces exactly that: the log names files it wrote, the weights exist
-on the cluster, and the retrieved bundle contains none of them. Both statements
-are true at once. No weights are then recoverable from a completed run, and
-``early_stopping.restore_best_weights`` cannot function across a resume.
-
-"Written elsewhere" and "never written" need opposite responses — fix the sync
-versus fix the run — so the footer now records enough to tell them apart, and
-the run logs a warning at the end in both cases.
+``files`` lists the 1.0 checkpoint files (``step_NNNNNNNN.<format>`` and
+``best.<format>``) present when the summary is written. An
+empty bundle ``checkpoints/`` next to a non-empty ``files`` list means the sync
+dropped them (#503); an empty list means nothing was saved, and the run logs a
+warning when checkpointing was enabled.
 
 The block never fails the run: a ``stat()`` hiccup on a network filesystem must
 not cost a finished run its summary, so the helper swallows and reports

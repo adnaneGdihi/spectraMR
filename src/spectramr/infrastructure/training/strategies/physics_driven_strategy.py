@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.domain.interfaces.service_interfaces import ILoggingService
 from spectramr.infrastructure.physics.coordinate_utils import CoordinateSampler
 
@@ -97,6 +98,10 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
         device: Torch device (typically CUDA)
         _b0_simulator: Optional B0 field map simulator
     """
+
+    # parallel_compat: Calls the generator only through its wrapped forward and builds no parameters;
+    # a permission is not inherited from the reconstruction parent, so it is stated here.
+    parallel_compat = frozenset({"replicated"})
 
     def __init__(
         self,
@@ -223,7 +228,7 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
                 lr_image = lr_image.float()
 
             # [HYBRID-AWARE] Handle coordinate sampling for continuous resolution models
-            if getattr(self.env.generator, "use_coordinate_sampling", False):
+            if getattr(unwrap_model(self.env.generator), "use_coordinate_sampling", False):
                 # We use the full grid for standard training context.
                 # In optimized pipelines, this could be a subset of points.
                 forward_kwargs["query_coords"] = CoordinateSampler.get_full_grid(
@@ -308,9 +313,6 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
                 hr_fakes = hr_fakes[0]
 
             intermediate_outputs = None
-            if hasattr(self.env.generator, "forward_with_intermediates"):
-                # Re-implement safety check if needed, or assume main generator is enough
-                pass
 
             # [DC CONSOLIDATION] DC is now applied internally by the generator
             # if 'kspace_measured' and 'mask' are passed in kwargs.

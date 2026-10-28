@@ -42,6 +42,8 @@ This loss is part of the *Pattern A/C joint reconstruction* described in
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -97,7 +99,7 @@ class JointMultiContrastSparsityLoss(nn.Module):
         self,
         prediction: torch.Tensor | list[torch.Tensor],
         target: torch.Tensor | list[torch.Tensor] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Return the joint multi-contrast sparsity penalty on ``prediction``.
 

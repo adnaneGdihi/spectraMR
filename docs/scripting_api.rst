@@ -172,7 +172,7 @@ model object:
 
    trainer.predict(
        config_path="experiments/<paradigm>/<your-arm>.yaml",
-       checkpoint_path="runs/my_arm/checkpoints/best.pt",
+       checkpoint_path="runs/my_arm/checkpoints/best.safetensors",
        input_path="data/test/",
        output_path="runs/my_arm/predictions/",
    )

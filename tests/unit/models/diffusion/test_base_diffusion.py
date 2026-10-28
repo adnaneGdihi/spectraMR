@@ -77,6 +77,16 @@ class TestBaseDiffusion:
         out = diffusion.p_sample(model, x, t, t_index=99)
         assert out.shape == x.shape
 
+    def test_p_sample_step_drops_noise_only_at_timestep_zero(self):
+        """``t_index`` is the timestep: t=0 returns the mean, any later step samples (#482)."""
+        diffusion = Diffusion(timesteps=100)
+        x = torch.randn(2, 1, 8, 8)
+        noise = torch.randn_like(x)
+        final = [diffusion.p_sample_step(x, torch.tensor([0, 0]), noise, 0) for _ in range(2)]
+        assert torch.equal(final[0], final[1])
+        first = [diffusion.p_sample_step(x, torch.tensor([99, 99]), noise, 99) for _ in range(2)]
+        assert not torch.equal(first[0], first[1])
+
     def test_p_sample_rejects_model_without_t_arg(self):
         """F-DIFFUSION-T / 2026-05-20 — diffusion p_sample must reject
         models whose forward signature can't accept the timestep

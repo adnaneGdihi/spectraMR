@@ -55,6 +55,11 @@ class NullSpaceContentLoss(nn.Module):
         without one, and silently skipping would leave the term reading as
         "on" in the YAML while training without it (pitfall #9).
 
+        ``acquired`` (optional, ``[B|1, 1, H, W]``): the plane of lines the scanner
+        wrote. Bins outside it are structural zeros (M4Raw pads 58-61 of 256
+        phase-encode lines), so the null space is ``(1 - M) * acquired``; ``None``
+        keeps the legacy ``(1 - M)`` weight exactly.
+
         The mask may be ``bool`` (what the loader delivers), float or complex;
         all three are cast to the k-space dtype before the complement is taken.
     """
@@ -92,6 +97,7 @@ class NullSpaceContentLoss(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: torch.Tensor | None = None,
+        acquired: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError(
@@ -113,18 +119,20 @@ class NullSpaceContentLoss(nn.Module):
         # as a WEIGHT below, so a soft mask has to keep its fractional values.
         weight_dtype = k_pred.real.dtype if torch.is_complex(k_pred) else k_pred.dtype
         null = 1.0 - m.to(weight_dtype)
+        if acquired is not None:
+            # Bins the scanner never wrote are zero in the target; nothing zeroes the prediction
+            # there, so content written on them is left to the whole-plane terms (complex_l1,
+            # frequency_weighted_l1_kspace) and the null-band metrics, not to this mean.
+            null = null * acquired.to(device=null.device, dtype=weight_dtype)
 
         diff = k_pred - k_target
-        if torch.is_complex(diff):
-            mag2 = diff.real**2 + diff.imag**2
-        else:
-            mag2 = diff**2
+        mag2 = diff.real**2 + diff.imag**2 if torch.is_complex(diff) else diff**2
         per_element = torch.sqrt(mag2 + self.eps**2) if self.loss_type == "l1" else mag2
 
         weighted = per_element * null
-        # Mean over the null bins only: the loss scale is then independent of
-        # the acceleration factor (a 12x mask and a 2x mask penalise invented
-        # content equally per bin).
+        # Mean over the acquirable-but-unkept bins only: the scale is then
+        # independent of the acceleration factor and of how many lines the
+        # contrast pads.
         denom = null.expand_as(per_element).sum().clamp_min(1.0)
         return weighted.sum() / denom
 

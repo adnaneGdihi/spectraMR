@@ -339,3 +339,81 @@ def test_it_declares_its_own_loss_ownership() -> None:
     """
     assert FlowMatchingStrategy.__dict__["folds_image_losses"] is False
     assert FlowMatchingStrategy.__dict__["inline_losses"] == frozenset()
+
+
+class _CondGen(torch.nn.Module):
+    """A conditional velocity model: records what it saw, depends on the condition."""
+
+    conditional_velocity = True
+
+    def __init__(self, recorder: dict) -> None:
+        super().__init__()
+        self.recorder = recorder
+        self.w = torch.nn.Parameter(torch.ones(()))
+
+    def forward(self, x, measurement=None, mask=None, *, t=None, condition=None):
+        self.recorder.update(x=x, t=t, condition=condition)
+        return self.w * (x + condition)
+
+
+def _cond_fm(recorder: dict) -> FlowMatchingStrategy:
+    s = object.__new__(FlowMatchingStrategy)
+    s.device = torch.device("cpu")
+    s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
+    s._declared_model_input = None
+    s.env = MagicMock()
+    s.env.generator = _CondGen(recorder)
+    return s
+
+
+def test_a_conditional_velocity_is_trained_on_the_input() -> None:
+    """The ULF input reaches the velocity as its condition and moves the CFM loss."""
+    rec: dict = {}
+    s = _cond_fm(rec)
+    x1 = torch.randn(2, 1, 8, 8, 1)  # TorchIO's trailing depth
+    y = torch.randn(2, 1, 8, 8, 1)
+
+    torch.manual_seed(0)
+    a = s._compute_losses_impl(input_batch={"target": x1, "input": y}, epoch=0)["loss_total"]
+    assert rec["condition"].shape == (2, 1, 8, 8)
+    torch.testing.assert_close(rec["condition"], y[..., 0])
+    assert rec["t"].shape == (2,)
+    torch.manual_seed(0)
+    b = s._compute_losses_impl(input_batch={"target": x1, "input": 5 * y}, epoch=0)["loss_total"]
+    assert not torch.allclose(a, b)
+    tensors, _, _ = s._declared_model_input
+    assert torch.equal(tensors["condition"], rec["condition"])
+
+
+def test_a_conditional_velocity_without_an_input_raises() -> None:
+    s = _cond_fm({})
+    with pytest.raises(ValueError, match="needs batch\\['input'\\]"):
+        s._compute_losses_impl(input_batch={"target": torch.randn(1, 1, 4, 4)}, epoch=0)
+
+
+def test_validation_samples_the_flow_under_the_ulf_input(training_env) -> None:
+    """The inherited validation path hands the generator's ODE the ULF input as y."""
+    from spectramr.models.generators.rectified_flow_generator import RectifiedFlowGenerator
+
+    torch.manual_seed(0)
+    gen = RectifiedFlowGenerator(
+        in_channels=1, out_channels=1, features=[8, 16], context_dim=8, flow_steps=2,
+        conditioning="spatial",
+    )
+    seen: list[torch.Tensor] = []
+    real_generate = gen.generate
+
+    def _spy(z, **kw):
+        seen.append(z)
+        return real_generate(z, **kw)
+
+    gen.generate = _spy  # type: ignore[method-assign]
+    strategy = FlowMatchingStrategy(env=training_env)
+    strategy.env.models["generator"] = gen
+    strategy.env.generator = gen
+    y = torch.randn(2, 1, 16, 16)
+    out = strategy._generate_validation_prediction(
+        y, torch.randn(2, 1, 16, 16), torch.zeros(2, dtype=torch.long), None, {}
+    )
+    assert out.shape == y.shape
+    assert seen and torch.equal(seen[0], y)

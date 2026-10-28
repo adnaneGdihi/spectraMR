@@ -158,8 +158,6 @@ training:
   # Results have one owner: the experiment name is derived from this path, and
   # mosaic_validation.py auto-discovery walks experiments/results/.
   output_dir: experiments/results/comprehensive_experiment_template
-  num_workers: 4
-  enable_gradient_checkpointing: false
   diffusion:
     timesteps: 1000
     noise_schedule: cosine
@@ -170,7 +168,6 @@ training:
     type: null
     prediction_type: epsilon
     degradation: null
-    degradation_dynamics: null
     enable_diffusion_amp: false
     enforce_output_range: true
     lambda_mse: 1.0
@@ -267,7 +264,6 @@ physics:
     method: projection_2d_consistency
   coil_sensitivity:
     enable_estimation: false
-    estimation_method: espirit
     estimation_type: dynamic
     calibration_region_size: 24
     num_threads: 4
@@ -349,28 +345,17 @@ validation:
   validation_batch_size: null
   num_samples: null
   num_validation_batches: null
-  enable_validation_augmentation: false
   validation_metric: loss
   output_transform: null
-  use_training_loss: true
   compute_image_metrics: true
   enable_visualization: false
   visualization_interval: 1000
-  num_visualizations: 4
-  visualization_dir: ./visualizations
 checkpoint:
   enabled: true
-  # `save_dir:` is an accepted alias for this same field -- declare one, not
-  # both, or an edit to one silently leaves the other behind.
-  checkpoint_dir: ./checkpoints
   save_interval: 1000            # in steps
-  save_on_epoch: true
   keep_last_n: 5
-  keep_best_n: 3
-  pretrained_path: null
   load_optimizer_state: true
   load_scheduler_state: true
-  resume_training: false
 logging:
   level: warning
   silent: false
@@ -418,7 +403,6 @@ metrics:
   compute_kspace_error: false
   metric_interval: 1000
   eval_on_epoch: false
-  track_best_metric: true
   best_metric_name: val_loss
   best_metric_mode: min
 early_stopping:
@@ -427,7 +411,6 @@ early_stopping:
   metric: val_loss
   mode: min
   min_delta: 0.0
-  check_interval: 1000
   restore_best_weights: true
 ema:
   enabled: false
@@ -445,9 +428,6 @@ undersampling:
   # [0, schedule_steps) and the diffusion process runs t in [0, timesteps).
   # A mismatch either saturates the schedule at max or never reaches its tail.
   schedule_steps: 1000
-artifacts:
-
-  persistent_root: ./experiments
 
 run:
   seed: 42

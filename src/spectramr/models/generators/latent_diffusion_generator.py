@@ -17,6 +17,7 @@ Rombach et al. "High-Resolution Image Synthesis with Latent
 Diffusion Models" CVPR 2022
 """
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -27,14 +28,14 @@ from spectramr.models.diffusion.base_diffusion import Diffusion
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
+from ..blocks.acquisition_film import AcquisitionTableFiLM
 from ..latent_diffusion.latent_unet import LatentUNet
-
-# [DIFFBOOST] Text Conditioning
-try:
-    from transformers import CLIPTextModel, CLIPTokenizer
-except ImportError:
-    CLIPTextModel = None
-    CLIPTokenizer = None
+from .latent_cfg import axis_keep_masks, guided_noise, resolve_latent_cfg
+from .latent_scale_calibration import (
+    AUTO_LATENT_SCALE,
+    global_latent_std,
+    parse_latent_scaling_factor,
+)
 
 
 @dataclass
@@ -183,20 +184,13 @@ class AttnBlock(nn.Module):
         k = self.k(h_)
         v = self.v(h_)
 
-        # Compute attention
+        # Single-head SDPA over the h*w tokens; default scale is c**-0.5.
         b, c, h, w = q.shape
-        q = q.reshape(b, c, h * w)
-        q = q.permute(0, 2, 1)  # b,hw,c
-        k = k.reshape(b, c, h * w)  # b,c,hw
-        w_ = torch.bmm(q, k)  # b,hw,hw
-        w_ = w_ * (int(c) ** (-0.5))
-        w_ = F.softmax(w_, dim=2)
-
-        # Attend to values
-        v = v.reshape(b, c, h * w)
-        w_ = w_.permute(0, 2, 1)  # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v, w_)  # b, c,hw (hw of q)
-        h_ = h_.reshape(b, c, h, w)
+        q = q.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+        k = k.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+        v = v.reshape(b, c, h * w).transpose(1, 2).unsqueeze(1)
+        h_ = F.scaled_dot_product_attention(q, k, v)
+        h_ = h_.squeeze(1).transpose(1, 2).reshape(b, c, h, w)
 
         h_ = self.proj_out(h_)
         return x + h_
@@ -737,10 +731,12 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         self.context_dim = None
 
         if self.config.text_conditioning_enabled:
-            if CLIPTextModel is None:
+            try:
+                from transformers import CLIPTextModel, CLIPTokenizer
+            except ImportError as exc:
                 raise ImportError(
                     "transformers is required for text conditioning. Install with `pip install transformers`."
-                )
+                ) from exc
 
             self.tokenizer = CLIPTokenizer.from_pretrained(self.config.text_model_id)
             self.text_encoder = CLIPTextModel.from_pretrained(self.config.text_model_id)
@@ -755,13 +751,14 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             else self.latent_channels
         )
 
+        self._channel_mult = _parse_channel_multipliers(kwargs.get("channel_multipliers"))
         self.denoise_net = LatentUNet(
             in_channels=unet_in_channels,
             out_channels=self.latent_channels,  # Output is just noise prediction
             time_emb_dim=128,
             cond_channels=0,  # Spatial conditioning via concatenation, not cross-attention
             base_channels=self.config.base_channels,
-            channel_mult=(1, 2, 4),  # Reduced depth for latent space? Or default?
+            channel_mult=self._channel_mult,
             num_res_blocks=2,
             attention_levels=(),
             dropout=0.1,
@@ -771,6 +768,35 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
 
         # Scale factor for latent space (learned or fixed)
         self.scale_factor = nn.Parameter(torch.ones(1))
+
+        # Per-axis CFG (LM-19): training dropout per axis and sampling guidance weights.
+        self._cfg = resolve_latent_cfg(
+            kwargs.get("cfg_drop_probs"),
+            kwargs.get("cfg_weights"),
+            has_condition=bool(self.config.conditional_translation),
+            has_contrast=bool(self.config.use_contrast_guidance),
+        )
+        import logging
+
+        logging.getLogger(__name__).info(
+            "[LDM] CFG: %s; channel_multipliers=%s", self._cfg.to_dict(), self._channel_mult
+        )
+
+        # Pattern-C acquisition FiLM on the contrast embedding (LM-20); the table is
+        # bound by the training strategy from data.multi_contrast.acquisition_params.
+        acq_film = kwargs.get("acquisition_film", False)
+        if not isinstance(acq_film, bool):
+            raise ValueError(f"acquisition_film must be true/false; got {acq_film!r}.")
+        if acq_film and not self.config.use_contrast_guidance:
+            raise ValueError(
+                "acquisition_film modulates the contrast embedding, so it needs "
+                "use_contrast_guidance: true."
+            )
+        self.acquisition_film = (
+            AcquisitionTableFiLM(self.config.num_contrasts, self.config.contrast_embed_dim)
+            if acq_film
+            else None
+        )
 
         # [Experiment 32b] Contrast Embedding
         if self.config.use_contrast_guidance:
@@ -805,11 +831,8 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         # historical behavior, so the ~16 existing custom-backbone LDM configs are
         # unaffected). The 'sd' backbone self-scales internally, so setting the knob
         # there RAISES (double-scaling corrupts) (#9/#15).
-        lsf = kwargs.get("latent_scaling_factor")
+        lsf = parse_latent_scaling_factor(kwargs.get("latent_scaling_factor"))
         if lsf is not None:
-            lsf = float(lsf)
-            if lsf <= 0:
-                raise ValueError(f"latent_scaling_factor must be > 0; got {lsf}.")
             if self._vae_backbone in (
                 "sd",
                 "sd_vae",
@@ -822,24 +845,28 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
                     "setting it here would double-scale (#9). Remove the knob for "
                     "vae_backbone='sd'."
                 )
+        if lsf == AUTO_LATENT_SCALE:
+            # Calibrated on the first training encode; the flag is a buffer so a
+            # resumed or predicted checkpoint keeps the scale it trained with.
+            self.register_buffer("latent_scale_calibrated", torch.zeros((), dtype=torch.bool))
+            self._latent_scale_ready = False
+            self.register_load_state_dict_post_hook(_sync_latent_scale_ready)
+        elif lsf is not None:
             self.set_latent_statistics(
                 torch.zeros(self.latent_channels),
                 torch.full((self.latent_channels,), 1.0 / lsf),
             )
         self._latent_scaling_factor = lsf
 
-        # [STAGING] Optional pretrained-VAE loading + freeze for two-stage
-        # LDM training (Stable-Diffusion-style). Driven by YAML
-        # ``model.model_kwargs.vae_checkpoint_path`` and ``freeze_vae``.
-        vae_ckpt = kwargs.get("vae_checkpoint_path")
-        freeze_vae = bool(kwargs.get("freeze_vae", True))
-        # Only the custom backbone loads a stage-1 checkpoint; the 'sd' backbone
-        # is already loaded + frozen from the HF hub, and a stage-1 .pt would
-        # key-mismatch it (matched=0). A stray checkpoint path alongside an 'sd'
-        # backbone is a config error, not a silent no-op.
-        if vae_ckpt and self._vae_backbone in ("custom", "kl", "autoencoder_kl"):
-            self._load_pretrained_autoencoder(vae_ckpt, freeze=freeze_vae)
-        elif vae_ckpt:
+        # The stage-1 VAE is loaded by the training builder (load_autoencoder_state),
+        # never here: models/ does no checkpoint IO, and inference already holds the
+        # autoencoder inside the stage-2 checkpoint. A path beside the hub backbone is
+        # still a config error, because the 'sd' VAE comes from its hub id.
+        if kwargs.get("vae_checkpoint_path") and self._vae_backbone not in (
+            "custom",
+            "kl",
+            "autoencoder_kl",
+        ):
             raise ValueError(
                 f"vae_checkpoint_path is set but vae_backbone={self._vae_backbone!r} "
                 "does not load a stage-1 checkpoint (the pretrained VAE is loaded "
@@ -847,68 +874,23 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
                 "vae_backbone='custom'."
             )
 
-    def _load_pretrained_autoencoder(self, checkpoint_path: str, freeze: bool = True) -> None:
-        """Load AutoencoderKL weights from a stage-1 VAE checkpoint.
+    def load_autoencoder_state(
+        self, state: Mapping[str, torch.Tensor], *, freeze: bool, source: str
+    ) -> None:
+        """Load a stage-1 VAE's state dict into ``self.autoencoder``.
 
-        Accepts the framework's standard checkpoint dict shape
-        (``{model_state_dict: ..., ...}``) and falls back to a raw
-        ``state_dict`` when present. Filters keys to those that match
-        ``self.autoencoder``'s parameter names so a stage-1 *full*
-        VAE checkpoint can be reused without manual surgery.
+        The training builder reads the stage-1 checkpoint's generator part and calls
+        this; the keys may sit under ``autoencoder.`` / ``vae.`` / ``module.``. Any
+        incomplete restore raises, because stage 2 cannot train in a random latent
+        space (#9).
 
         Args:
-            checkpoint_path: Path to the stage-1 VAE checkpoint.
-            freeze: If True (default), set ``requires_grad=False`` on
-                every autoencoder parameter so the LDM only trains
-                its diffusion U-Net + conditioning encoder.
+            state: The stage-1 generator's state dict.
+            freeze: If True, set ``requires_grad=False`` on every autoencoder
+                parameter so the LDM only trains its diffusion U-Net + conditioning
+                encoder.
+            source: Where ``state`` came from, for the error messages.
         """
-        from pathlib import Path
-
-        ckpt_path = Path(checkpoint_path)
-        if not ckpt_path.exists():
-            # CLAUDE.md #9 — silent fallbacks are forbidden. A missing VAE
-            # checkpoint silently leaves the AutoencoderKL random-initialised,
-            # which means the LDM trains in a *random* latent space instead
-            # of Stage 1's. Hard-fail so the wiring bug surfaces immediately.
-            raise RuntimeError(
-                f"vae_checkpoint_path={ckpt_path} does not exist. "
-                "Stage 2 LDM requires a frozen Stage-1 VAE checkpoint. "
-                "Note: CheckpointDirector.save_best() writes "
-                "'checkpoint_best.pt', not 'best.pt' — verify your YAML/"
-                "campaign manifest points at the correct filename."
-            )
-
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state = (
-            ckpt.get("model_state_dict")
-            or ckpt.get("state_dict")
-            # ``CheckpointDirector.save()`` — the only writer of stage-1
-            # checkpoints in this repo — stores the weights under "generator".
-            or ckpt.get("generator")
-            or ckpt.get("generator_state")
-            or (
-                ckpt
-                if isinstance(ckpt, dict)
-                and not any(
-                    k in ckpt for k in ("optimizer_state_dict", "optimizer_g", "epoch", "config")
-                )
-                else None
-            )
-        )
-        if not isinstance(state, dict) or not state:
-            # CLAUDE.md #9 — silent fallbacks are forbidden. The old warn-and-
-            # return left the AutoencoderKL RANDOM-INITIALISED, so stage 2 trained
-            # in a random latent space and still reported PASS (val_psnr≈6 dB).
-            # Every checkpoint this framework writes carries "generator" + "epoch",
-            # which the pre-fix lookup matched on neither branch.
-            keys = sorted(ckpt)[:10] if isinstance(ckpt, dict) else type(ckpt).__name__
-            raise RuntimeError(
-                f"vae_checkpoint_path={ckpt_path} has no recognisable state-dict "
-                "(looked for 'model_state_dict', 'state_dict', 'generator', "
-                f"'generator_state'; found {keys}). Stage 2 requires a real "
-                "Stage-1 VAE checkpoint — it cannot train in a random latent space."
-            )
-
         # Strip a wrapping prefix when the stage-1 model embedded the
         # autoencoder under e.g. ``autoencoder.``, ``vae.``, or ``module.``.
         autoencoder_state = {}
@@ -927,7 +909,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         if not autoencoder_state:
             # #9 — raise rather than degrade to a random-initialised VAE.
             raise RuntimeError(
-                f"vae_checkpoint_path={ckpt_path} loaded but contained no keys "
+                f"vae_checkpoint_path={source} loaded but contained no keys "
                 "matching the LDM autoencoder. Names diverge between the stage-1 "
                 "and stage-2 VAE architectures — check that stage-1 used "
                 "model_type=autoencoder_kl_pretrain with the SAME latent_channels/"
@@ -944,7 +926,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             # inside load_state_dict; name drift is what slips through. Demand a
             # complete restore.
             raise RuntimeError(
-                f"vae_checkpoint_path={ckpt_path} restored only "
+                f"vae_checkpoint_path={source} restored only "
                 f"{len(autoencoder_state)} of {len(ae_param_names)} autoencoder "
                 f"tensors; {len(missing)} would stay randomly initialised "
                 f"(first: {sorted(missing)[:5]}). Stage 2 cannot train in a "
@@ -961,7 +943,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         logging.getLogger(__name__).info(
             "[LDM] Loaded pretrained AutoencoderKL from %s (matched=%d, "
             "missing=%d, unexpected=%d, frozen=%s)",
-            ckpt_path,
+            source,
             len(autoencoder_state),
             len(missing),
             len(unexpected),
@@ -1051,9 +1033,35 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             # quant_conv = nn.Identity() because diffusers applies its own
             # inside encode() (pretrained_vae_adapter.py:169).
 
+            if self._latent_scaling_factor == AUTO_LATENT_SCALE and not self._latent_scale_ready:
+                self._calibrate_latent_scale(z)
             # [AUDIT FIX] Standardize to N(0,1) for Diffusion
             z = (z - self.latent_mean) / (self.latent_std + 1e-8)
         return z
+
+    def _calibrate_latent_scale(self, mu: torch.Tensor) -> None:
+        """Set ``latent_std`` to the pooled std of the first training batch's ``mu``."""
+        if not self.training:
+            raise RuntimeError(
+                "latent_scaling_factor='auto' is not calibrated: it is measured on the "
+                "first TRAINING encode, and this model is in eval mode with no calibrated "
+                "checkpoint loaded. Train at least one step, or load a stage-2 checkpoint."
+            )
+        std = global_latent_std(mu).clamp_min(1e-6)
+        self.latent_std.data.fill_(0.0).add_(std)
+        self.latent_scale_calibrated.fill_(True)
+        self._latent_scale_ready = True
+        import logging
+
+        # One host read, once per run: the calibrated value is the provenance.
+        value = float(std)
+        logging.getLogger(__name__).info(
+            "[LDM] latent_scaling_factor=auto calibrated: std(mu)=%.6g -> scale=%.6g "
+            "over %d latent elements (stored in the latent_std buffer).",
+            value,
+            1.0 / value,
+            mu.numel(),
+        )
 
     def forward(
         self,
@@ -1129,13 +1137,10 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         if self.config.conditional_translation and condition_image is not None:
             cond_latent = self.encode_condition(condition_image)
 
-            # [CFG TRAINING] Random Dropout (10%)
-            if self.training:
-                # Create mask with 10% probability of being 0
-                prob = 0.1
-                mask = torch.bernoulli(torch.zeros(x.shape[0], device=x.device) + (1 - prob))
-                mask = mask.view(-1, 1, 1, 1)  # Broadcast
-                cond_latent = cond_latent * mask
+        # [CFG TRAINING] Per-axis dropout; absent knobs keep the 10% condition drop.
+        keep = axis_keep_masks(self._cfg, x.shape[0], x.device) if self.training else {}
+        if cond_latent is not None and "condition" in keep:
+            cond_latent = cond_latent * keep["condition"].view(-1, 1, 1, 1)
 
         # Handle 3D slicing if needed, but usually we train on 2D/slabs
         return self._process_slices(
@@ -1145,6 +1150,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             cond_latent=cond_latent,
             contrast_idx=context.get("contrast_idx") if context else None,
             text_context=context.get("text_context") if context else None,
+            contrast_keep=keep.get("contrast"),
         )
 
     def _process_slices(
@@ -1155,6 +1161,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         cond_latent: torch.Tensor | None = None,
         contrast_idx: torch.Tensor | None = None,
         text_context: torch.Tensor | None = None,
+        contrast_keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Process latent tensor using 2D U-Net.
 
@@ -1178,7 +1185,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             if self.config.use_contrast_guidance and contrast_idx is not None:
                 # Logic: We compute t_emb using the UNet's time_mlp, and extract contrast_emb
                 time_context = self.denoise_net.time_mlp(t)
-                contrast_context = self.contrast_embedder(contrast_idx)
+                contrast_context = self._contrast_context(contrast_idx, contrast_keep)
 
             # [CONDITIONING] Concatenate cond_latent for conditional translation
             unet_input = z
@@ -1219,7 +1226,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
                 contrast_context = None
                 if self.config.use_contrast_guidance and contrast_idx is not None:
                     time_context = self.denoise_net.time_mlp(t)
-                    contrast_context = self.contrast_embedder(contrast_idx)
+                    contrast_context = self._contrast_context(contrast_idx, contrast_keep)
 
                 if operation == "denoise":
                     # Denoise slice
@@ -1248,6 +1255,29 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         raise ValueError(
             f"Unsupported tensor dimensions: {z.dim()}. Expected 4D (2D) or 5D (3D)",
         )
+
+    def _contrast_context(
+        self, contrast_idx: torch.Tensor, contrast_keep: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Contrast embedding, FiLM-ed by acquisition when on, then CFG-dropped."""
+        context = self.contrast_embedder(contrast_idx)
+        if self.acquisition_film is not None:
+            context = self.acquisition_film(context, contrast_idx)
+        if contrast_keep is not None:
+            context = context * contrast_keep.view(-1, 1)
+        return context
+
+    @property
+    def uses_acquisition_film(self) -> bool:
+        return self.acquisition_film is not None
+
+    def set_acquisition_params(
+        self, contrast_map: Mapping[str, int], rows: Sequence[Mapping[str, object]]
+    ) -> None:
+        """Bind the per-contrast acquisition table the FiLM reads (strategy setup)."""
+        if self.acquisition_film is None:
+            raise RuntimeError("set_acquisition_params called but acquisition_film is off.")
+        self.acquisition_film.bind(contrast_map, rows)
 
     def decode_from_latent(self, z: torch.Tensor) -> torch.Tensor:
         """Decode from latent space to image."""
@@ -1286,6 +1316,11 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         # Start from random noise in latent space
         batch_size = shape[0]
         ds = self.autoencoder.downsample_factor
+        if self._cfg.guided and len(shape) != 4:
+            raise ValueError(
+                "cfg_weights guidance is implemented for 2-D latents only; got a "
+                f"{len(shape)}-D sample shape. Run slice-mode 2D or drop cfg_weights."
+            )
 
         if len(shape) == 4:
             latent_shape = (
@@ -1353,9 +1388,19 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             if z_cond is not None:
                 unet_input = torch.cat([z_t, z_cond], dim=1)
 
-            predicted_noise = self._process_slices(
-                unet_input, t_tensor, "denoise", contrast_idx=contrast_idx
-            )
+            if self._cfg.guided:
+                predicted_noise = guided_noise(
+                    self._stacked_denoiser(contrast_idx, batch_size),
+                    z_t,
+                    t_tensor,
+                    z_cond,
+                    self.config.use_contrast_guidance and contrast_idx is not None,
+                    self._cfg,
+                )
+            else:
+                predicted_noise = self._process_slices(
+                    unet_input, t_tensor, "denoise", contrast_idx=contrast_idx
+                )
 
             if strided:
                 # -1 on the last hop means "decode the x_0 estimate" (alpha_bar_prev = 1).
@@ -1367,7 +1412,8 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
                     predicted_noise,
                 )
             else:
-                z_t = self.diffusion.p_sample_step(z_t, t_tensor, predicted_noise, t_index)
+                # The timestep, not the loop counter: noise is dropped only at t == 0 (#482).
+                z_t = self.diffusion.p_sample_step(z_t, t_tensor, predicted_noise, t)
 
         # Decode to image space, then crop/pad to the requested output size.
         # The latent used ``shape[i] // ds`` (a floor), so decode can land a few
@@ -1375,6 +1421,18 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         # ds; align to the caller's shape so metrics/DC see the exact geometry.
         decoded = self.decode_from_latent(z_t)
         return self._match_spatial(decoded, shape[2:])
+
+    def _stacked_denoiser(self, contrast_idx: torch.Tensor | None, batch_size: int):
+        """Denoise a stack of ``n * batch_size`` inputs, repeating ``contrast_idx`` to match."""
+
+        def denoise(unet_input, t, keep):
+            reps = unet_input.shape[0] // batch_size
+            idx = None if contrast_idx is None else contrast_idx.repeat(reps)
+            return self._process_slices(
+                unet_input, t, "denoise", contrast_idx=idx, contrast_keep=keep
+            )
+
+        return denoise
 
     @staticmethod
     def _match_spatial(x: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
@@ -1447,6 +1505,29 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         if device is not None:
             self.diffusion.to(device)
         return self
+
+
+def _parse_channel_multipliers(raw: object) -> tuple[int, ...]:
+    """``model_kwargs.channel_multipliers`` -> the latent U-Net's ``channel_mult``.
+
+    Absent keeps the historical ``(1, 2, 4)``. Anything but a non-empty list of
+    positive ints raises.
+    """
+    if raw is None:
+        return (1, 2, 4)
+    if isinstance(raw, (str, bytes)) or not hasattr(raw, "__iter__"):
+        raise ValueError(f"channel_multipliers must be a list of positive ints; got {raw!r}.")
+    mult = tuple(raw)  # type: ignore[arg-type]
+    if not mult or not all(isinstance(m, int) and not isinstance(m, bool) and m > 0 for m in mult):
+        raise ValueError(f"channel_multipliers must be a non-empty list of positive ints; got {raw!r}.")
+    return mult
+
+
+def _sync_latent_scale_ready(module: nn.Module, incompatible_keys: object) -> None:
+    """After ``load_state_dict``, mirror the loaded calibration flag (one sync, at load)."""
+    flag = getattr(module, "latent_scale_calibrated", None)
+    if flag is not None:
+        module._latent_scale_ready = bool(flag)
 
 
 def create_latent_diffusion_generator(

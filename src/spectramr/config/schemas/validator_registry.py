@@ -365,15 +365,6 @@ def _initialize_default_validators(registry: ValidatorRegistry) -> None:
         )
     )
 
-    registry.register(
-        ValidationRule(
-            name="training_mode_compatibility",
-            category="training",
-            description="Training mode compatibility with objectives",
-            validator_fn=_validate_training_mode_compatibility,
-        )
-    )
-
     # Model validation rules
     registry.register(
         ValidationRule(
@@ -686,7 +677,7 @@ def _validate_model_in_out_channels(config: dict[str, Any]) -> list[str]:
 
 def _validate_acceleration_factors(config: dict[str, Any]) -> list[str]:
     """Validate acceleration-specific configuration."""
-    messages = []
+    messages: list[str] = []
 
     acceleration_config = config.get("acceleration")
     if acceleration_config is None:
@@ -776,75 +767,18 @@ def _validate_loss_weights_positive(config: dict[str, Any]) -> list[str]:
     return messages
 
 
-def _validate_training_mode_compatibility(config: dict[str, Any]) -> list[str]:
-    """Validate training mode is compatible with configured objectives.
-
-    Scope is *objectives only*. Whether the mode exists at all is enforced by
-    ``spectramr.infrastructure.validation.config_validation``
-    ``._validate_training_mode_dispatchable`` against ``STRATEGY_CLASS_PATHS``.
-
-    Supports both v4.0 (training_mode) and v5.0 (strategy_class) formats.
-    Supports both objectives and losses configuration formats.
-    Skips validation if strategy not yet resolved.
-    """
-    from spectramr.config.validation_constants import TRAINING_MODE_CONSTRAINTS
-
-    messages = []
-    training_config = config.get("training") or {}
-    training_mode = training_config.get("training_mode")
-
-    # Skip validation if no training_mode (v5.0 uses strategy_class instead)
-    if training_mode is None:
-        return messages
-
-    # Defensive check: ensure TRAINING_MODE_CONSTRAINTS is available and not None
-    if TRAINING_MODE_CONSTRAINTS is None:
-        return messages
-
-    # NOTE: this rule does NOT decide whether the mode exists -- that is owned by
-    # STRATEGY_CLASS_PATHS and enforced in
-    # ``spectramr.infrastructure.validation.config_validation``. TRAINING_MODE_CONSTRAINTS
-    # is sparse: an absent mode simply declares no objective requirements. Treating
-    # absence as "unknown mode" here rejected 90 dispatchable modes (physics_driven,
-    # cyclegan, meta_learning, ...) and blocked real experiment YAMLs from loading.
-    constraints = TRAINING_MODE_CONSTRAINTS.get(training_mode) or {}
-
-    # Defensive check: ensure constraints is not None
-    if constraints is None:
-        constraints = {}
-
-    # Check both objectives and losses formats for backward compatibility
-    objectives_config = config.get("objectives") or {}
-    losses_config = config.get("losses") or {}
-
-    # Use whichever is available (objectives takes precedence if both present)
-    combined_config = losses_config.copy()
-    combined_config.update(objectives_config)
-
-    # Check required objectives
-    required_objectives = constraints.get("required_objectives") or []
-    for required_obj in required_objectives:
-        if required_obj not in combined_config:
-            messages.append(
-                f"Training mode '{training_mode}' requires objectives.{required_obj} to be configured"
-            )
-
-    return messages
-
-
 def _validate_metric_domain_compatibility(config: dict[str, Any]) -> list[str]:
     """Validate metrics are compatible with training mode and model type."""
-    messages = []
+    messages: list[str] = []
 
-    validation_config = config.get("validation", {})
+    validation_config = config.get("validation") or {}
     metrics = validation_config.get("metrics", [])
 
     if not metrics:
         return messages
 
-    data_config = config.get("data", {})
+    data_config = config.get("data") or {}
     patch_size = data_config.get("patch_size")
-    in_channels = config.get("model", {}).get("in_channels")
 
     # FID requires high-resolution images
     if "fid" in metrics:
@@ -862,7 +796,7 @@ def _validate_metric_domain_compatibility(config: dict[str, Any]) -> list[str]:
 
     # LPIPS designed for RGB/grayscale
     if "lpips" in metrics:
-        model_config = config.get("model", {})
+        model_config = config.get("model") or {}
         model_domain = model_config.get("model_domain", "image")
         # K-space models apply iFFT before metric evaluation, so channel count
         # in model config is irrelevant — LPIPS receives magnitude images.
@@ -948,7 +882,7 @@ def _validate_logging_config(config: dict[str, Any]) -> list[str]:
 
 def _validate_device_config(config: dict[str, Any]) -> list[str]:
     """Validate device configuration."""
-    messages = []
+    messages: list[str] = []
 
     acceleration_config = config.get("acceleration")
     if acceleration_config is None:

@@ -44,7 +44,7 @@ def _variant_path() -> Path:
     return require_repo_file(_VARIANT_REL)
 
 # Selection is held IDENTICAL across the pair, so it is not a second variable.
-_SELECTION_METRIC = "val_hfen_mean"
+_SELECTION_METRIC = "val_hfen_vs_zf_mean"
 
 
 def _entries(settings: TrainingSettings, section: str) -> list[dict[str, Any]]:
@@ -91,7 +91,8 @@ def test_selection_metric_is_identical_and_not_psnr(
 
     In the attention_none run PSNR ranked the two blurriest cases (7.8% of target
     high-band power) at 42.2 / 41.4 dB and the one case matching high-band power (103%)
-    at 33.4 dB. ``val_hfen_mean`` is a LoG-filtered error norm against the TRUE target,
+    at 33.4 dB. ``val_hfen_vs_zf_mean`` (HFEN over the zero-filled HFEN per rung, #2756) is
+    a LoG-filtered error norm against the TRUE target,
     so it cannot reward hallucinated texture. Held identical across the pair.
     """
     for settings, label in ((baseline, "baseline"), (variant, "variant")):
@@ -114,7 +115,8 @@ def test_selection_metric_is_actually_produced(
     """
     for settings, label in ((baseline, "baseline"), (variant, "variant")):
         declared = [str(getattr(m, "value", m)) for m in settings.validation.scoring.compute]
-        base = _SELECTION_METRIC.removeprefix("val_").removesuffix("_mean")
+        # ``<m>_vs_zf_mean`` is the zero-filled-normalised mean of ``<m>``.
+        base = _SELECTION_METRIC.removeprefix("val_").removesuffix("_mean").removesuffix("_vs_zf")
         assert base in declared, (
             f"{label}: selects on {_SELECTION_METRIC} but validation.metrics={declared} "
             f"never emits {base} -- selection on a key the run does not compute (#18)."
@@ -195,20 +197,16 @@ def test_declared_kwargs_survive_the_schema() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The hard-DC arms (2026-07-29): attention_shootout carries the same term.
+# The DC family: attention_shootout carries the same term.
 #
 # Which arms CAN show sharp images is decided by data consistency, not by the
-# loss. ``SimpleDataConsistency`` in k-space returns, at sampled lines:
-#
-#     hard:  k = measured                              (100% of the measurement)
-#     soft:  k = (pred + w*measured) / (1 + w)         (w=0.5 -> 33%)
-#
-# So a soft-DC arm emits 2/3 prediction + 1/3 measurement at the very lines
-# whose truth it already HAS. hard is now the cohort standard (48 of 58 arms);
-# the 9 exemptions are the arms where DC is the INDEPENDENT VARIABLE -- all of
-# dc_shootout/, the two CNN-ADC ablations, and the two cross-contrast arms that
-# declare a named non-default method (#611). The loss term below is a separate
-# lever, applied to attention_shootout only.
+# loss. A uniform soft blend at w=0.5 keeps a third of the measurement even where
+# the signal dominates, so the measured high frequencies never reach the output.
+# The cohort standard, ``wiener_gain``, trusts each measured bin by its SNR:
+# signal-dominated bins approach hard DC and only noise-dominated ones are
+# down-weighted (``wiener_gain_dc.py``). The exemptions, where DC is the
+# independent variable, are enumerated in ``test_kspace_filling_cohort_invariants``.
+# The loss term below is a separate lever, applied to attention_shootout only.
 # ---------------------------------------------------------------------------
 
 _SHOOTOUT = _REPO_ROOT / "experiments" / "inprogress" / "kspace_filling" / (
@@ -220,15 +218,15 @@ def _shootout_arms() -> list[Path]:
     return tracked_yamls(_SHOOTOUT, "experiment_11_attention_*.yaml", recursive=False)
 
 
-def test_shootout_is_the_hard_dc_family() -> None:
-    """The premise for applying the term here: the measurement survives DC."""
+def test_shootout_is_the_snr_trusting_dc_family() -> None:
+    """The premise for applying the term here: the measured signal survives DC."""
     for path in _shootout_arms():
         settings = TrainingSettings.from_yaml(str(path))
         method = settings.physics.data_consistency.method
-        assert str(getattr(method, "value", method)) == "hard", (
-            f"{path.name} is not hard-DC ({method!r}); its measured k-space is "
-            "attenuated before it reaches the output, so a high-frequency loss "
-            "term cannot be the binding constraint."
+        assert str(getattr(method, "value", method)) == "wiener_gain", (
+            f"{path.name} is not wiener_gain DC ({method!r}); a uniform blend "
+            "attenuates the measured signal before it reaches the output, so a "
+            "high-frequency loss term cannot be the binding constraint."
         )
 
 

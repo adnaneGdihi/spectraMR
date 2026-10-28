@@ -64,6 +64,10 @@ class ScoutHypernet(nn.Module):
 class SCASStrategy(LOUPEStrategy):
     """Scout-conditioned learnable mask via relaxed-Bernoulli sampling."""
 
+    # parallel_compat: Its scout hypernet is a bare group on opt_g, so DDP never reduces it. Not
+    # migrated: the scout path cannot run, since it indexes the parent's (image, kwargs) tuple.
+    parallel_compat = frozenset()
+
     target_rate: float = 0.125
     tau: float = 0.5
     lambda_density: float = 1e-1

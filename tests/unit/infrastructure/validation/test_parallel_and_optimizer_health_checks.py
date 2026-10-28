@@ -146,20 +146,6 @@ class TestDeepSpeedPrecisionCoherent:
         assert result.passed and result.severity == "info"
 
 
-class TestDeepSpeedConsolidatedBestCheckpoint:
-    def test_disabling_it_warns_that_the_run_becomes_resume_only(self) -> None:
-        """DeepSpeed writes a sharded tag DIRECTORY. Without the consolidated
-        copy, discover_best_checkpoint / campaign eval / `spectramr infer` find
-        nothing -- at the END of the run."""
-        result = _checker().check_deepspeed_consolidated_best_checkpoint(
-            _config(save_consolidated_best=False)
-        )
-        assert not result.passed and result.severity == "warning"
-
-    def test_the_default_passes(self) -> None:
-        assert _checker().check_deepspeed_consolidated_best_checkpoint(_config()).passed
-
-
 class TestLionLearningRateScale:
     """Lion's update is a SIGN, so every parameter moves by exactly ``lr``.
 
@@ -446,18 +432,19 @@ class TestEveryCheckIsActuallyWired:
     """A ``check_*`` that ``run_all_checks`` never calls protects nothing.
 
     ``meta.health_checker_no_orphan_checks`` enforces this repo-wide; this states
-    it locally for the seven added here, so the failure names them directly.
+    it locally for the checks added here, so the failure names them directly.
     """
 
     ADDED = (
         "check_deepspeed_extra_installed",
         "check_deepspeed_precision_coherent",
         "check_deepspeed_topology_coherent",
-        "check_deepspeed_consolidated_best_checkpoint",
         "check_optimizer_registered",
         "check_lion_learning_rate_scale",
         "check_compile_with_sharded_strategy",
         "check_bf16_requires_ampere",
+        "check_strategy_parallel_compat",
+        "check_deepspeed_optimizer_supported",
     )
 
     @pytest.mark.parametrize("name", ADDED)
@@ -1063,3 +1050,28 @@ class TestTheComplexGuardCoversDeepCompile:
         )
         assert result.passed
         assert result.severity == "info"
+
+
+class TestCompileApplyToExcludesTheKspaceModel:
+    """A GAN with one k-space model compiles the other via ``apply_to``."""
+
+    @staticmethod
+    def _config(apply_to, model_type="unet"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            optimization=SimpleNamespace(
+                compile=SimpleNamespace(enabled=True, allow_complex=False, apply_to=apply_to)
+            ),
+            model=SimpleNamespace(model_type=model_type, target_domain="kspace"),
+            physics=SimpleNamespace(kspace=SimpleNamespace(enable_kspace_recon=True)),
+        )
+
+    def test_naming_a_subset_passes_and_stays_visible(self) -> None:
+        result = _checker().check_compile_with_complex_model(self._config(["generator"]))
+        assert result.passed and result.severity == "info"
+        assert result.always_report, "the assertion about the compiled models must be logged"
+
+    def test_no_apply_to_is_still_an_error(self) -> None:
+        result = _checker().check_compile_with_complex_model(self._config(None))
+        assert not result.passed and result.severity == "error"

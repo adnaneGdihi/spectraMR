@@ -149,3 +149,34 @@ def test_a_non_empty_stack_never_resolves_the_strategy() -> None:
     builder._losses["l1"] = object()  # type: ignore[assignment]
 
     assert builder.validate() is builder
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("multi_acquisition_strategy", "ConcreteMultiAcquisitionStrategy"),
+        ("pma_varnet_strategy", "ConcretePMAVarNetStrategy"),
+        ("mrf_acquisition_strategies", "ConformalMRFDictlessReconStrategy"),
+        ("spectra_tta_strategy", "SpectraTestTimeAdaptationStrategy"),
+        ("fmri_surface_strategies", "RiemannianDFCDiffusionStrategy"),
+        ("fmri_surface_strategies", "HRFManifoldDiffusionStrategy"),
+        ("phys_residual_conformal_strategy", "PhysResidualConformalStrategy"),
+        ("multi_echo_b0_fit_strategy", "MultiEchoB0FitStrategy"),
+        ("jepa_strategy", "JEPAStrategy"),
+        ("beltrami_motion_cortical_strategies", "BeltramiMotionCorrectionStrategy"),
+    ],
+)
+def test_self_contained_strategies_declare_their_objective(module: str, name: str) -> None:
+    """These compute their own loss and read no list entry; undeclared, 43 arms refused to build."""
+    import importlib
+
+    from spectramr.infrastructure.training.strategies.loss_folding import (
+        declares_inline_objective,
+    )
+
+    cls = getattr(
+        importlib.import_module(f"spectramr.infrastructure.training.strategies.{module}"), name
+    )
+    assert declares_inline_objective(cls)
+    builder = _builder_with_no_losses(f"{cls.__module__}.{cls.__qualname__}")
+    assert builder.validate() is builder

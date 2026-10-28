@@ -36,10 +36,6 @@ _BASELINE: dict[str, str] = {
         "operator-id figures in models/ (fold-in candidate)",
     "models/diffusion/noise_schedules.py":
         "noise-schedule viz incl. plt.show (extract candidate)",
-    "infrastructure/reporting/metrics_report_generator.py":
-        "legacy in-dir generator, off-registry (retire)",
-    "infrastructure/reporting/advanced_reporting.py":
-        "legacy in-dir generator, off-registry (retire)",
     "application/use_cases/nr_validation/report.py":
         "NR-validation report (sim2rank orbit)",
     "infrastructure/validation/phantom_builder.py":

@@ -46,7 +46,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.models.blocks.mamba_block import MambaBlock
-from spectramr.models.blocks.tall import TALL, locality_loss
+from spectramr.models.blocks.tall import TALL
 from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
@@ -182,13 +182,22 @@ class TALLSuperResolution(nn.Module):
             out = out + x
         return out
 
-    def last_locality_loss(self) -> torch.Tensor:
-        r"""Locality regulariser (Spec §9.3) of the most recent forward pass.
+    @property
+    def track_locality(self) -> bool:
+        """Keep the TALL traversal graph for the next forward (see ``TALL``)."""
+        return self.tall.track_locality
 
-        Mean Euclidean step length between consecutive entries of the
-        content-adaptive traversal. Exposed for a future TALL-aware
-        strategy; the stand-alone SR arm trains the policy through the
-        task loss and does not require this term.
+    @track_locality.setter
+    def track_locality(self, value: bool) -> None:
+        self.tall.track_locality = bool(value)
+
+    def last_locality_loss(self) -> torch.Tensor:
+        r"""Differentiable locality regulariser (Spec §9.3) of the latest forward.
+
+        Mean step length between consecutive entries of the soft traversal,
+        computed from the Gumbel-softmax choice so the gradient reaches the
+        TALL policy. Consumed by ``ReconstructionTrainingStrategy`` when
+        ``training.tall_sr.lambda_locality > 0``.
 
         Raises:
             RuntimeError: if called before any :meth:`forward`.
@@ -197,7 +206,7 @@ class TALLSuperResolution(nn.Module):
             raise RuntimeError(
                 "last_locality_loss() called before forward(); no traversal has been computed yet."
             )
-        return locality_loss(self._last_permutation, self.side, n_dims=2)
+        return self.tall.last_locality_loss()
 
 
 __all__ = ["TALLSuperResolution"]

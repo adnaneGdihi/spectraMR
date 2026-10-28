@@ -215,3 +215,112 @@ def test_validation_forward_threads_contrast_id() -> None:
         None, {"input": torch.rand(1, 1, 16, 16), "contrast_id": cid}
     )
     assert rec.seen_contrast is cid
+
+
+# --------------------------------------------------------------------------- #
+# degradation: gaussian (the b24 isotropic-noising comparator)
+# --------------------------------------------------------------------------- #
+class _OracleRestorer(nn.Module):
+    """R(x_t, t) = a fixed image, whatever the input."""
+
+    def __init__(self, image: torch.Tensor) -> None:
+        super().__init__()
+        self.image = image
+
+    def forward(self, x: torch.Tensor, *, field_strength: torch.Tensor, **_):
+        return self.image.expand_as(x)
+
+
+def test_gaussian_sampler_ends_on_the_restorer_estimate_unlike_the_lowpass_one() -> None:
+    from spectramr.infrastructure.training.strategies.field_cold_diffusion_strategy import (
+        gaussian_diffusion_sample,
+    )
+
+    torch.manual_seed(0)
+    y, x_true = torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16)
+    oracle = _OracleRestorer(x_true)
+    gauss = gaussian_diffusion_sample(oracle, y, n_steps=4, sigma_min=0.01, sigma_max=0.2)
+    lowpass = cold_diffusion_sample(oracle, y, n_steps=4, min_cutoff=0.25, max_cutoff=5.0)
+    torch.testing.assert_close(gauss, x_true)
+    assert not torch.allclose(lowpass, gauss)
+
+
+def test_gaussian_sampler_start_noise_is_reseeded_per_call() -> None:
+    from spectramr.infrastructure.training.strategies.field_cold_diffusion_strategy import (
+        gaussian_diffusion_sample,
+    )
+
+    # Identity restorer => eps_hat = 0 after the first step, so the output is the start.
+    y = torch.rand(1, 1, 16, 16)
+    kw = {"n_steps": 3, "sigma_min": 0.01, "sigma_max": 0.2}
+    a = gaussian_diffusion_sample(_IdentityRestorer(), y, seed=7, **kw)
+    b = gaussian_diffusion_sample(_IdentityRestorer(), y, seed=7, **kw)
+    c = gaussian_diffusion_sample(_IdentityRestorer(), y, seed=8, **kw)
+    torch.testing.assert_close(a, b)
+    assert not torch.allclose(a, c)
+    assert 0.1 < float((a - y).std()) < 0.3  # the start is y + sigma_max * noise
+
+
+def _gaussian_strategy(restorer: nn.Module, **cfg_kw):
+    import types
+
+    from spectramr.config.schemas.training.field_cold_diffusion import FieldColdDiffusionConfig
+    from spectramr.infrastructure.training.strategies.field_cold_diffusion_strategy import (
+        FieldColdDiffusionStrategy,
+    )
+
+    strat = object.__new__(FieldColdDiffusionStrategy)
+    strat._verify_strategy_config = lambda **_: None
+    strat.config = types.SimpleNamespace(
+        training=types.SimpleNamespace(field_cold_diffusion=FieldColdDiffusionConfig(**cfg_kw))
+    )
+    strat.env = types.SimpleNamespace(generator=restorer)
+    strat._setup_strategy_specific_components()
+    return strat
+
+
+def test_gaussian_degradation_changes_the_training_loss() -> None:
+    from spectramr.data.batch_types import BatchAdapter
+
+    target = torch.rand(2, 1, 16, 16)
+    tb = BatchAdapter.from_dict({"input": torch.rand(2, 1, 16, 16), "target": target})
+    gauss = _gaussian_strategy(
+        _IdentityRestorer(), degradation="gaussian", noise_sigma_min=0.5, noise_sigma_max=0.5
+    )
+    lowpass = _gaussian_strategy(_IdentityRestorer())
+    torch.manual_seed(0)
+    g = gauss._compute_losses_impl(input_batch=tb.input, target_batch=target, batch=tb)
+    torch.manual_seed(0)
+    lp = lowpass._compute_losses_impl(input_batch=tb.input, target_batch=target, batch=tb)
+    # Identity restorer: the gaussian loss is E|sigma * eps| = 0.5 * sqrt(2/pi) ~ 0.40.
+    assert 0.3 < float(g["loss_total"]) < 0.5
+    assert not torch.isclose(g["loss_total"], lp["loss_total"])
+
+
+def test_gaussian_validation_forward_runs_the_gaussian_sampler() -> None:
+    x_true = torch.rand(1, 1, 16, 16)
+    strat = _gaussian_strategy(
+        _OracleRestorer(x_true), degradation="gaussian", noise_sigma_min=0.01, noise_sigma_max=0.2
+    )
+    out = strat._validation_forward(torch.rand(1, 1, 16, 16), {})
+    torch.testing.assert_close(out, x_true)
+
+
+def test_degradation_knobs_are_validated() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from spectramr.config.schemas.training.field_cold_diffusion import FieldColdDiffusionConfig as C
+
+    with pytest.raises(ValidationError, match="requires"):
+        C(degradation="gaussian", noise_sigma_max=0.2)
+    with pytest.raises(ValidationError, match="not read"):
+        C(degradation="gaussian", noise_sigma_min=0.01, noise_sigma_max=0.2, min_cutoff=0.25)
+    with pytest.raises(ValidationError, match="not read"):
+        C(noise_sigma_min=0.01, noise_sigma_max=0.2)
+    with pytest.raises(ValidationError, match="not read"):
+        C(sampler_seed=3)
+    with pytest.raises(ValidationError, match="must not exceed"):
+        C(degradation="gaussian", noise_sigma_min=0.3, noise_sigma_max=0.2)
+    with pytest.raises(ValidationError):
+        C(degradation="poisson")

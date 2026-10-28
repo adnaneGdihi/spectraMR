@@ -18,7 +18,7 @@ that quotes the spelling is one ``Constant``, never a ``Call``.
 
 **Why the receiver must be the ``**kwargs``-bound name** rather than the literal
 ``kwargs``: ``pipelines/hpo.py:548`` reads ``metrics.get("step", ...)`` off a metrics
-CSV and ``services/checkpoint_service.py:300`` reads a ``step`` its callers really do
+CSV and the pre-1.0 checkpoint service read a ``step`` its callers really did
 pass -- both correct, both caught by a bare-name rule. Binding to the parameter also
 means a renamed bag (``**kw``) is still covered.
 

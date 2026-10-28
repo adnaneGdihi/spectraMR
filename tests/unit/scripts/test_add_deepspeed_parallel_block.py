@@ -45,6 +45,7 @@ def test_the_builtin_block_is_still_the_default(mod) -> None:
     out = mod.insert_block(_ARM)
     assert out is not None
     assert "strategy: deepspeed" in out
+    assert "save_consolidated_best" not in out
     assert out.index("parallel:") < out.index("data:"), "block goes above the data: anchor"
 
 

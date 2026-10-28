@@ -21,6 +21,15 @@ from spectramr.config.schemas.campaign import (
     CampaignExperimentSchema,
     SlurmDefaultsSchema,
 )
+from spectramr.core.dispatch_snapshot import write_snapshot
+from spectramr.infrastructure.checkpointing.layout import CheckpointLayout
+from spectramr.infrastructure.checkpointing.payload import CONVERTER
+from spectramr.infrastructure.checkpointing.select import (
+    ConversionPendingError,
+    best_then_latest,
+    pre_v1_names,
+    refuse_pending_conversion,
+)
 from spectramr.infrastructure.orchestration.ablation_config_generator import (
     AblationConfigGenerator,
 )
@@ -28,7 +37,7 @@ from spectramr.infrastructure.orchestration.campaign_state import (
     CampaignState,
     ExperimentStatus,
 )
-from spectramr.infrastructure.orchestration.slurm_backend import SLURMBackend
+from spectramr.infrastructure.orchestration.slurm_backend import JobStatus, SLURMBackend
 
 logger = logging.getLogger(__name__)
 
@@ -57,18 +66,31 @@ class CampaignOrchestrator:
         base_dir: str = ".",
         dry_run: bool = False,
         resume: bool = False,
+        fresh: bool = False,
         only: list[str] | None = None,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         where: str = "slurm",
         slurm_overrides: dict[str, Any] | None = None,
+        array_concurrency: int | None = None,
     ) -> None:
         """Initialise orchestrator.
 
         Args:
             base_dir: Project root directory (for SLURM scripts).
             dry_run: If True, generate scripts but do not submit.
-            resume: If True, add --resume auto to training commands.
+            resume: Continue a prior submission of this campaign: arms its
+                ``campaign_state.json`` records as completed or in flight are
+                skipped, and every submitted arm resumes from its latest
+                checkpoint (``--resume auto`` per arm, ``--resume`` on every
+                array link).
+            fresh: Start every arm at iteration 0. Array links after the first
+                still resume their own run, so a wall-clock chain continues;
+                an array arm whose output dir already holds checkpoints is
+                refused, because a requeued link would resume those instead.
+                Mutually exclusive with ``resume``. With neither flag, per-arm
+                and container arms start fresh, while array arms run ``--prod``,
+                which resumes any checkpoint already in the output dir.
             where: Execution target for each arm — ``slurm`` (default, sbatch),
                 ``docker`` or ``apptainer`` (run each arm in a container,
                 sequentially).
@@ -90,15 +112,27 @@ class CampaignOrchestrator:
                 ``data.batch_size``, with no world-size LR scaling in-tree), so
                 committing one number to the corpus would fix an optimisation
                 decision on behalf of every future submitter.
+            array_concurrency: ``%N`` throttle of an array campaign; overrides
+                the campaign's ``array_concurrency`` when given.
         """
+        if resume and fresh:
+            raise ValueError("Campaign --resume and --fresh are mutually exclusive.")
         if where not in self._CAMPAIGN_WHERE:
             raise ValueError(
                 f"Unknown campaign --where {where!r}. Choose from {list(self._CAMPAIGN_WHERE)}."
             )
+        if array_concurrency is not None and array_concurrency < 1:
+            raise ValueError(f"Campaign --concurrency must be >= 1 (got {array_concurrency}).")
+        self.array_concurrency = array_concurrency
         self.slurm_overrides = self._validate_slurm_overrides(slurm_overrides)
         self.base_dir = str(Path(base_dir).resolve())
         self.dry_run = dry_run
-        self.resume = resume
+        # Two decisions that used to share one flag: whether arms resume from
+        # checkpoints, and whether arms a prior submission handled are skipped.
+        self.resume_checkpoints = resume
+        self.fresh = fresh
+        self.skip_handled = resume
+        self.resume_mode = "resume" if resume else ("fresh" if fresh else "default")
         self.where = where
         self.only = list(only or [])
         self.include = list(include or [])
@@ -228,6 +262,7 @@ class CampaignOrchestrator:
         logger.info(f"  Ablation axes: {len(config.ablation_axes)}")
         logger.info(f"  Output: {campaign_dir}")
         logger.info(f"  Dry run: {self.dry_run}")
+        logger.info(f"  Resume mode: {self.resume_mode}")
         logger.info("═══════════════════════════════════════════════════")
 
         # Initialise campaign state
@@ -237,6 +272,7 @@ class CampaignOrchestrator:
             campaign_dir=str(campaign_dir),
             description=config.description,
             test_manifest=config.test_manifest,
+            resume_mode=self.resume_mode,
         )
 
         # Dispatch based on execution mode
@@ -388,7 +424,8 @@ class CampaignOrchestrator:
         the indices stay contiguous). A file-stem collision among the surviving
         arms is fatal (two arms would write the same output dir) — raise rather
         than silently overwrite (#9/#15). Campaign-level ``--resume`` carries
-        already-handled arms forward and drops them from the array.
+        already-handled arms forward and drops them from the array; ``--fresh``
+        refuses arms whose output dir already holds checkpoints.
         """
         handled = self._prior_handled(campaign_dir)
 
@@ -441,29 +478,38 @@ class CampaignOrchestrator:
                 )
             stem_to_arm[stem] = name
 
+        if self.fresh:
+            self._refuse_stale_checkpoints(manifest_arms)
+
         # Freeze the manifest (one resolved config per line, array-index order).
         manifest_path = campaign_dir / "array_manifest.txt"
         manifest_path.write_text("\n".join(cfg for _n, _r, cfg, _s, _o in manifest_arms) + "\n")
+        # Each task checks its HEAD and YAML against this record at start (#2662).
+        snapshot_file = write_snapshot(manifest_path, self.base_dir)
 
         # Pre-create per-arm output dirs so _discover_results has somewhere to look.
         for _n, _r, _cfg, _s, out in manifest_arms:
             out.mkdir(parents=True, exist_ok=True)
 
         # Generate ONE array script and submit it ONCE.
+        concurrency = self.array_concurrency or config.array_concurrency
         script = SLURMBackend.generate_array_job_script(
             manifest_path=str(manifest_path),
             n_tasks=len(manifest_arms),
             output_base=str(campaign_dir),
             base_dir=self.base_dir,
-            concurrency=config.array_concurrency,
+            concurrency=concurrency,
             dispatch_dir=str(campaign_dir / "dispatch"),
             slurm_params=self._resolve_slurm_params(config),
-            resume=self.resume,
+            resume=self.resume_checkpoints,
+            fresh=self.fresh,
+            manifest_text=manifest_path.read_text(),
+            snapshot_text=snapshot_file.read_text(),
         )
         array_job_id = self.slurm.submit_job(script)
         logger.info(
             f"✓ Submitted array of {len(manifest_arms)} arms → Job {array_job_id} "
-            f"(%{min(config.array_concurrency, len(manifest_arms))} concurrency)"
+            f"(%{min(concurrency, len(manifest_arms))} concurrency)"
         )
 
         # Record each arm against the single array job id + its task index.
@@ -490,6 +536,28 @@ class CampaignOrchestrator:
         logger.info(f"  Monitor: python -m spectramr.cli campaign status {campaign_dir}")
         return state
 
+    @staticmethod
+    def _refuse_stale_checkpoints(manifest_arms: list[tuple[str, str, str, str, Path]]) -> None:
+        """Raise if a ``--fresh`` array arm's output dir already holds checkpoints.
+
+        A requeued link resumes the run's latest step (``select(run, "latest")``), so a
+        stale one from an earlier run would be continued one link late, the defect
+        ``--fresh`` exists to prevent (#2542). Pre-1.0 files count too: resume refuses
+        them rather than starting fresh beside them.
+        """
+        stale = [
+            f"{name} ({CheckpointLayout.for_run(out).directory})"
+            for name, _role, _cfg, _stem, out in manifest_arms
+            if CheckpointLayout.for_run(out).entries() or pre_v1_names(out)
+        ]
+        if stale:
+            raise ValueError(
+                "--fresh refuses array arms whose output dir already holds "
+                "checkpoints, because a requeued link would resume them: "
+                + ", ".join(stale)
+                + ". Move them aside, or give the campaign a new output_dir."
+            )
+
     # ── Per-arm dispatch (slurm submit vs container run) ──────────
 
     def _submit_one_arm(
@@ -510,7 +578,7 @@ class CampaignOrchestrator:
                 output_dir=str(exp_output),
                 base_dir=self.base_dir,
                 slurm_params=slurm_params,
-                resume=self.resume,
+                resume=self.resume_checkpoints,
                 test_manifest=test_manifest_path,
             )
             job_id = self.slurm.submit_job(script)
@@ -558,7 +626,7 @@ class CampaignOrchestrator:
 
         backend = {"docker": DockerBackend, "apptainer": ApptainerBackend}[self.where]()
         extra = ["-O", f"training.output_dir={exp_output}"]
-        if self.resume:
+        if self.resume_checkpoints:
             extra += ["--resume", "auto"]
         invocation = SpectraMRInvocation(verb="train", config=cfg_path, extra_args=tuple(extra))
         resources = ResourceSpec(
@@ -614,7 +682,7 @@ class CampaignOrchestrator:
         it skips) remains a follow-up — see
         ``TODO/infrastructure_audit_2026_06_12.md``.
         """
-        if not self.resume:
+        if not self.skip_handled:
             return {}
         state_file = Path(campaign_dir) / "campaign_state.json"
         if not state_file.exists():
@@ -630,7 +698,7 @@ class CampaignOrchestrator:
         handled = {
             e.name: e
             for e in prior.experiments
-            if e.status in ("completed", "submitted", "running")
+            if e.status in ("completed", "submitted", "running", "conversion_pending")
         }
         if handled:
             logger.info(f"Resume: {len(handled)} arm(s) already handled — they will be skipped")
@@ -649,8 +717,12 @@ class CampaignOrchestrator:
         finished run's results."""
         if not exp.output_dir:
             return False
-        ckpt_dir = Path(exp.output_dir) / "checkpoints"
-        return ckpt_dir.is_dir() and any(ckpt_dir.glob("*.pt"))
+        # Mid-conversion the files present say nothing about completion; surface it.
+        refuse_pending_conversion(exp.output_dir)
+        if CheckpointLayout.for_run(exp.output_dir).entries():
+            return True
+        _warn_pre_v1_only(exp.output_dir, "is not counted as a completion artifact")
+        return False
 
     def check_progress(
         self,
@@ -679,15 +751,40 @@ class CampaignOrchestrator:
             logger.info("\n%s", state.summary_table())
             return state
 
-        # Batch query SLURM
-        statuses = self.slurm.query_batch_status(active_jobs)
+        # Batch query SLURM. An array arm is one task of a shared job, so it is read
+        # by (job, task); keying it by job alone gave every arm task 0's state.
+        array_jobs = sorted(
+            {
+                exp.slurm_job_id
+                for exp in state.experiments
+                if exp.slurm_job_id is not None
+                and not exp.is_terminal
+                and exp.array_task_id is not None
+            }
+        )
+        plain_jobs = [
+            jid
+            for jid in active_jobs
+            if not any(
+                e.slurm_job_id == jid and e.array_task_id is not None for e in state.experiments
+            )
+        ]
+        statuses = self.slurm.query_batch_status(plain_jobs)
+        task_statuses = self.slurm.query_array_task_status(array_jobs)
 
         # Update experiment states
         for exp in state.experiments:
             if exp.slurm_job_id is None or exp.is_terminal:
                 continue
+            was_pending = exp.status == "conversion_pending"
 
-            job_status = statuses.get(exp.slurm_job_id)
+            if exp.array_task_id is not None:
+                job_status = task_statuses.get((exp.slurm_job_id, exp.array_task_id))
+                if job_status is None:
+                    # Not in sacct yet: treated as UNKNOWN, which caps the polls below.
+                    job_status = JobStatus(job_id=exp.slurm_job_id, state="UNKNOWN")
+            else:
+                job_status = statuses.get(exp.slurm_job_id)
             if job_status is None:
                 continue
 
@@ -703,7 +800,12 @@ class CampaignOrchestrator:
                 polls = int(getattr(exp, "unknown_polls", 0)) + 1
                 exp.unknown_polls = polls
                 if polls >= self._UNKNOWN_TERMINAL_POLLS:
-                    new_state = "completed" if self._has_completion_artifact(exp) else "failed"
+                    try:
+                        has_artifact = self._has_completion_artifact(exp)
+                    except ConversionPendingError as exc:
+                        _mark_conversion_pending(exp, exc)
+                        continue
+                    new_state = "completed" if has_artifact else "failed"
                     logger.warning(
                         f"  {exp.name}: job {exp.slurm_job_id} vanished from SLURM "
                         f"after {polls} polls → {new_state}"
@@ -728,7 +830,13 @@ class CampaignOrchestrator:
 
             # If completed, discover checkpoint and metrics
             if exp.status == "completed" and exp.output_dir:
-                self._discover_results(exp)
+                try:
+                    self._discover_results(exp)
+                except ConversionPendingError as exc:
+                    _mark_conversion_pending(exp, exc)
+                    continue
+            if was_pending:
+                exp.error_message = None
 
         state.save()
         logger.info("\n%s", state.summary_table())
@@ -826,9 +934,9 @@ class CampaignOrchestrator:
         parallel, but the group as a whole waits for all parent groups
         via ``--dependency=afterok``.
 
-        Checkpoint injection: experiments with ``checkpoint_from`` get
-        the parent experiment's deterministic checkpoint path injected
-        as a ``-O`` config override.
+        Checkpoint injection: experiments with ``checkpoint_from`` get the
+        parent's run directory; the job resolves its checkpoint when it starts
+        and passes it as a ``-O`` config override.
         """
         ordered_groups = self._topological_sort(config.stage_groups)
 
@@ -935,18 +1043,13 @@ class CampaignOrchestrator:
                     config, group.slurm_overrides, exp.slurm_overrides
                 )
 
-                # Resolve checkpoint_from → config overrides
-                extra_overrides: dict[str, str] | None = None
+                # checkpoint_from → the parent's checkpoint, chosen when this job starts.
+                checkpoint_injections: dict[str, str] | None = None
                 if exp.checkpoint_from:
                     ref = exp.checkpoint_from
                     parent_output = campaign_dir / ref.experiment
-                    # Deterministic checkpoint path. 'best.pt' is a symlink
-                    # to 'checkpoint_best.pt' published by CheckpointService /
-                    # CheckpointDirector (_publish_best_alias). Both names
-                    # resolve to the same checkpoint.
-                    ckpt_path = parent_output / "checkpoints" / "best.pt"
-                    extra_overrides = {ref.inject_as: str(ckpt_path)}
-                    logger.info(f"  ⬆ {exp.name}: injecting {ref.inject_as}={ckpt_path}")
+                    checkpoint_injections = {ref.inject_as: str(parent_output)}
+                    logger.info(f"  ⬆ {exp.name}: injecting {ref.inject_as} from {parent_output}")
 
                 # Generate and submit
                 script = SLURMBackend.generate_job_script(
@@ -955,9 +1058,10 @@ class CampaignOrchestrator:
                     output_dir=str(exp_output),
                     base_dir=self.base_dir,
                     slurm_params=slurm_params,
-                    resume=self.resume,
+                    resume=self.resume_checkpoints,
                     test_manifest=test_manifest_path,
-                    config_overrides=extra_overrides,
+                    config_overrides=None,
+                    checkpoint_injections=checkpoint_injections,
                 )
 
                 try:
@@ -1065,16 +1169,12 @@ class CampaignOrchestrator:
         if output is None:
             return
 
-        # Find checkpoint via the shared discovery helper, which knows the real
-        # writer conventions (best.{pt,safetensors} alias, checkpoint_best.*,
-        # checkpoint_step_*/epoch_*) rather than the dead ``model_iter_*.pt`` glob.
-        from spectramr.infrastructure.services.checkpoint_service import (
-            discover_best_checkpoint,
-        )
-
-        ckpt = discover_best_checkpoint(output / "checkpoints")
+        # One selector: best, else the latest step, of any format.
+        ckpt, _rule = best_then_latest(output)
         if ckpt is not None:
             exp.checkpoint_path = str(ckpt)
+        else:
+            _warn_pre_v1_only(output, "is not recorded as the arm's checkpoint")
 
         # Find metrics CSV. MetricsTracker writes
         # ``{training,validation}_metrics_<model_type>.csv`` at the run root (and
@@ -1083,6 +1183,9 @@ class CampaignOrchestrator:
         csv_path = self._discover_metrics_csv(output)
         if csv_path is not None:
             exp.metrics_csv_path = str(csv_path)
+        from spectramr.infrastructure.reporting.per_slice import find_rows_files
+
+        exp.slice_rows_paths = [str(p) for p in find_rows_files(output)]
 
         # Now that the path is known, read the run's best metrics out of it.
         self._extract_best_metrics(exp)
@@ -1138,6 +1241,30 @@ class CampaignOrchestrator:
                             exp.best_metrics[metric] = float(numeric.max())
         except Exception as e:
             logger.debug(f"Could not parse metrics CSV: {e}")
+
+
+def _mark_conversion_pending(exp: ExperimentStatus, exc: ConversionPendingError) -> None:
+    """Hold one arm whose run is mid-conversion; the poll goes on for the others.
+
+    The status is not terminal, so the next poll discovers the arm again once the
+    converter has finished.
+    """
+    logger.warning(f"  {exp.name}: checkpoint conversion pending: {exc}")
+    exp.status = "conversion_pending"
+    exp.error_message = str(exc)
+
+
+def _warn_pre_v1_only(run_dir: str | Path, consequence: str) -> None:
+    """Name a run's pre-1.0 files and the converter, worded as resume's refusal is."""
+    legacy = pre_v1_names(run_dir)
+    if not legacy:
+        return
+    directory = CheckpointLayout.for_run(run_dir).directory
+    shown = ", ".join(legacy[:5]) + (f" and {len(legacy) - 5} more" if len(legacy) > 5 else "")
+    logger.warning(
+        f"{directory} holds only pre-1.0 checkpoint files ({shown}), which {consequence}. "
+        f"Convert the run first: python {CONVERTER} {run_dir}"
+    )
 
 
 def _parse_elapsed(elapsed: str) -> float | None:

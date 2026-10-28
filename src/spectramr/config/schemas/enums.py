@@ -9,7 +9,7 @@ Example:
     >>> loss = GANLossType.WGAN_GP
 """
 
-from enum import Enum
+from enum import Enum, StrEnum
 
 
 class TrainingMode(str, Enum):
@@ -390,6 +390,37 @@ class LogLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class ConsoleStream(str, Enum):  # noqa: UP042 — matches the other 17
+    """Which stream the console log writes to.
+
+    ``split`` sends DEBUG/INFO to stdout and WARNING and above to stderr, so a
+    SLURM ``.out`` reads as the run log and ``.err`` holds only problems.
+    """
+
+    SPLIT = "split"
+    STDOUT = "stdout"
+    STDERR = "stderr"
+
+
+class RankScope(str, Enum):  # noqa: UP042 — matches the other 17
+    """Which ranks of a distributed launch write to a sink."""
+
+    RANK0 = "rank0"
+    ALL = "all"
+
+
+class ProgressMode(str, Enum):  # noqa: UP042 — matches the other 17
+    """How progress is shown: a live bar, periodic log lines, or not at all.
+
+    ``auto`` is a bar on a TTY and periodic lines otherwise.
+    """
+
+    AUTO = "auto"
+    BAR = "bar"
+    LINES = "lines"
+    OFF = "off"
+
+
 class GradientClipMethod(str, Enum):
     """Valid gradient clipping methods."""
 
@@ -417,6 +448,13 @@ class NormalizationType(str, Enum):
     INSTANCE_NORM = "instance_norm"
     GROUP_NORM = "group_norm"
     NONE = "none"
+
+
+class SelectionRule(StrEnum):
+    """Checkpoint-selection rules over the cascade's stamped metrics (``validation.selection``)."""
+
+    NONE = "none"
+    GUARDED_RING_FIDELITY = "guarded_ring_fidelity"
 
 
 class MetricMode(str, Enum):
@@ -649,6 +687,8 @@ class ReportStyle(str, Enum):
 
     NATURE = "nature"
     IEEE = "ieee"
+    POSTER = "poster"
+    SLIDES = "slides"
 
 
 class DiffusionParadigm(str, Enum):
@@ -734,6 +774,9 @@ __all__ = [
     "KANType",
     "InputType",
     "LogLevel",
+    "ConsoleStream",
+    "RankScope",
+    "ProgressMode",
     "TrackingService",
     "GradientClipMethod",
     "ActivationFunction",

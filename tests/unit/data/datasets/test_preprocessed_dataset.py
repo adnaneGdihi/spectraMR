@@ -194,3 +194,20 @@ def test_init_assigns_each_filter_exactly_once(attr: str) -> None:
         f"self.{attr} is assigned {len(writes)}x in __init__; a second write "
         "silently discards whatever the first one computed"
     )
+
+
+def test_apply_split_keeps_each_subject_on_one_side() -> None:
+    """Two volumes per subject: a by-sample split put subject 2 on both sides."""
+    from pathlib import Path
+
+    from spectramr.data.datasets.preprocessed_dataset import PreprocessedSample
+
+    samples = [
+        PreprocessedSample(f"subj{i // 2}", Path(f"in{i}.npy"), Path(f"tg{i}.npy"))
+        for i in range(10)
+    ]
+    inst = PreprocessedMRIDataset.__new__(PreprocessedMRIDataset)
+    train = PreprocessedMRIDataset._apply_split(inst, samples, "train", validation_split=0.3)
+    val = PreprocessedMRIDataset._apply_split(inst, samples, "val", validation_split=0.3)
+    assert {s.subject_id for s in train}.isdisjoint({s.subject_id for s in val})
+    assert len(train) + len(val) == 10

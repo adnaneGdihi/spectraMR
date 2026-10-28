@@ -423,3 +423,40 @@ def test_slice_cache_two_thrashes_under_interleave() -> None:
     for i in [0, 2, 4, 1, 3, 5]:
         _ = ds[i]
     assert base.load_count > 3
+
+
+class _StampedVolumeBase(_MockVolumeBase):
+    """Each load returns a new stamp, standing in for a fresh augmentation draw."""
+
+    def __getitem__(self, i: int) -> tio.Subject:
+        subject = super().__getitem__(i)
+        subject["draw"] = self.load_count
+        return subject
+
+
+def test_slice_volume_redraw_reloads_after_one_epoch_of_windows() -> None:
+    base = _StampedVolumeBase([4], with_shape=True)
+    ds = SliceVolumeDataset(base, cache_size=8, redraw=True)
+    first_epoch = [ds[i]["draw"] for i in range(4)]
+    second_epoch = [ds[i]["draw"] for i in range(4)]
+    assert first_epoch == [1, 1, 1, 1]
+    assert second_epoch == [2, 2, 2, 2]
+
+
+def test_slice_volume_without_redraw_keeps_the_resident_volume() -> None:
+    base = _StampedVolumeBase([4], with_shape=True)
+    ds = SliceVolumeDataset(base, cache_size=8)
+    assert {ds[i % 4]["draw"] for i in range(12)} == {1}
+    assert base.load_count == 1
+
+
+def test_slice_volume_redraw_budget_is_split_across_workers(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import spectramr.data.datasets.slice_dataset as mod
+
+    monkeypatch.setattr(mod, "get_worker_info", lambda: SimpleNamespace(num_workers=2))
+    base = _StampedVolumeBase([4], with_shape=True)
+    ds = SliceVolumeDataset(base, cache_size=8, redraw=True)
+    # A worker sees about half of the windows per epoch, so it redraws after 2.
+    assert [ds[i]["draw"] for i in range(4)] == [1, 1, 2, 2]

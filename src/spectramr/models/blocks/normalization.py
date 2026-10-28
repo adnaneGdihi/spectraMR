@@ -173,10 +173,10 @@ class ComplexAdaptiveGroupNorm(nn.Module):
         self.num_groups = num_groups  # Groups for complex channels (C)
         self.eps = 1e-5
 
-        # Modulation: Scale (C), Shift_R (C), Shift_I (C) -> 3*C total
+        # Scale only: a per-channel shift is a constant over the feature map, which on a
+        # k-space block is a delta at the k centre and a cross-hair in the output image.
         C = channels // 2
-        out_dim = C + channels  # C + 2C = 3C
-        self.proj = nn.Linear(emb_channels, out_dim)
+        self.proj = nn.Linear(emb_channels, C)
         self.proj.weight.data.zero_()
         self.proj.bias.data.zero_()
 
@@ -228,11 +228,9 @@ class ComplexAdaptiveGroupNorm(nn.Module):
             # Identity modulation if no embedding
             real_out, imag_out = real_norm, imag_norm
         else:
-            mod = self.proj(emb).view(B, -1, 1, 1)
-            scale, shift_r, shift_i = torch.split(mod, [C, C, C], dim=1)
-            # z_out = (1 + scale) * z_norm + shift
-            real_out = (1.0 + scale) * real_norm + shift_r
-            imag_out = (1.0 + scale) * imag_norm + shift_i
+            scale = self.proj(emb).view(B, C, 1, 1)
+            real_out = (1.0 + scale) * real_norm
+            imag_out = (1.0 + scale) * imag_norm
 
         # 4. Return Interleaved: [R1, I1, R2, I2, ...]
         return torch.stack([real_out, imag_out], dim=2).flatten(1, 2)

@@ -39,6 +39,7 @@ from spectramr.data.batch_types import BatchAdapter
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
 )
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 
 # The grep-pin reads a file by path, so anchor on the repo root rather than the
 # process cwd — tests/unit/infrastructure/training/strategies/ -> parents[5].
@@ -84,10 +85,12 @@ def _metrics_mock() -> MagicMock:
     which isolates the seam under test (the batch read) from the transform's own
     behaviour.
     """
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
+
     mock = MagicMock()
     mock.config = SimpleNamespace(
         data=SimpleNamespace(
-            processing=SimpleNamespace(
+            processing=DataProcessingConfigSchema(
                 enable_kspace_normalization=False, enable_log_scaling=False
             )
         ),
@@ -100,6 +103,11 @@ def _metrics_mock() -> MagicMock:
     )
     mock._is_cold_diffusion = MagicMock(return_value=True)
     mock._apply_metric_transforms = lambda pred, target, cfg: (pred, target)
+    # Read late so a test that swaps ``_apply_metric_transforms`` still sees
+    # the call the validation path makes through the views hook.
+    mock._metric_transform_views = lambda pred, target, cfg: MetricViews(
+        *mock._apply_metric_transforms(pred, target, cfg)
+    )
     mock._measure_prediction_scale = lambda pred, target: {
         "pred_above_target_fraction": 0.0,
         "target_abs_max": 1.0,
@@ -198,8 +206,6 @@ def test_a_resolved_marker_announces_the_split_in_the_log():
     """
     mock = MagicMock()
     mock.metrics_service.save_images_batch = MagicMock(return_value=([], []))
-    mock._slice_to_target_contrast = lambda pred, target: (pred, target)
-    mock._slice_to_target_contrast_single = lambda ksp: ksp
     mock._resolve_federated_target_start = (
         DiffusionTrainingStrategy._resolve_federated_target_start
     )

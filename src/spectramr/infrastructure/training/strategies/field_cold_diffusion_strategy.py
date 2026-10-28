@@ -13,6 +13,7 @@ Lineage: the project's experiment_11 cold diffusion uses a k-space-undersampling
 degradation; this is the same algorithm with a field-down-conversion operator,
 built self-contained on the physics SSOT (``fft2c`` via ``_lowpass_otf``) rather
 than the k-space-specific machinery. Pure helpers hold the testable math.
+``degradation: gaussian`` swaps ``D_t`` for isotropic Gaussian noising (the b24 comparator).
 
 SCOPE / LIMITATION: ``compute_field_cold_diffusion_loss`` trains the restorer to
 invert a SYNTHETIC low-pass of the high-field **target** (it ignores ``batch['input']``).
@@ -133,6 +134,70 @@ def cold_diffusion_sample(
     return x
 
 
+def _sigma_at(t: int, n_steps: int, sigma_min: float, sigma_max: float) -> float:
+    """Gaussian noise std at step ``t``: 0 at t=0, geometric from min (t=1) to max (t=T)."""
+    if t <= 0:
+        return 0.0
+    if n_steps <= 1:
+        return sigma_max
+    frac = min((t - 1) / (n_steps - 1), 1.0)
+    return sigma_min * (sigma_max / sigma_min) ** frac
+
+
+def compute_gaussian_diffusion_loss(
+    restorer: Any,
+    target: torch.Tensor,
+    train_steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    contrast_id: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """As :func:`compute_field_cold_diffusion_loss` with ``D_t(x) = x + sigma_t * eps``."""
+    b = target.shape[0]
+    t = int(torch.randint(1, train_steps + 1, (1,)).item())
+    sigma = _sigma_at(t, train_steps, sigma_min, sigma_max)
+    x_t = target + sigma * torch.randn_like(target)
+    t_norm = torch.full((b,), t / train_steps, device=target.device, dtype=target.dtype)
+    pred = _restore(restorer, x_t, t_norm, contrast_id)
+    loss = torch.mean(torch.abs(pred - target))
+    return {"loss_total": loss, "loss_restore": loss}
+
+
+@torch.no_grad()
+def gaussian_diffusion_sample(
+    restorer: Any,
+    x_start: torch.Tensor,
+    n_steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    seed: int = 0,
+    contrast_id: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Bansal Alg. 2 under Gaussian noising, started from the noised ULF image.
+
+    With ``D_s(x0) = x0 + sigma_s * eps_hat`` and ``eps_hat`` read off the current
+    iterate, the update ``x - D_t(x0_hat) + D_{t-1}(x0_hat)`` is the deterministic
+    DDIM step ``x0_hat + sigma_{t-1} * eps_hat``. The start noise is re-seeded per
+    call so every validation pass draws the same noise.
+    """
+    gen = torch.Generator(device=x_start.device).manual_seed(int(seed))
+    noise = torch.randn(x_start.shape, generator=gen, device=x_start.device, dtype=x_start.dtype)
+    x = x_start + _sigma_at(n_steps, n_steps, sigma_min, sigma_max) * noise
+    for t in range(n_steps, 0, -1):
+        t_norm = torch.full((x.shape[0],), t / n_steps, device=x.device, dtype=x.dtype)
+        x0_hat = _restore(restorer, x, t_norm, contrast_id)
+        eps_hat = (x - x0_hat) / _sigma_at(t, n_steps, sigma_min, sigma_max)
+        x = x0_hat + _sigma_at(t - 1, n_steps, sigma_min, sigma_max) * eps_hat
+    return x
+
+
+#: degradation -> (training loss, sampler). Both share the restorer, curriculum and objective.
+_DEGRADATION_PATHS: dict[str, tuple[Any, Any]] = {
+    "field_lowpass": (compute_field_cold_diffusion_loss, cold_diffusion_sample),
+    "gaussian": (compute_gaussian_diffusion_loss, gaussian_diffusion_sample),
+}
+
+
 class FieldColdDiffusionStrategy(ReconstructionTrainingStrategy):
     """Train a field-down-conversion cold-diffusion restorer (B-2.4)."""
 
@@ -149,6 +214,18 @@ class FieldColdDiffusionStrategy(ReconstructionTrainingStrategy):
         self._fcd_train_steps = int(getattr(cfg, "train_steps", 10)) if cfg is not None else 10
         self._fcd_min = float(getattr(cfg, "min_cutoff", 0.25)) if cfg is not None else 0.25
         self._fcd_max = float(getattr(cfg, "max_cutoff", 5.0)) if cfg is not None else 5.0
+        self._fcd_degradation = str(getattr(cfg, "degradation", "field_lowpass"))
+        if self._fcd_degradation not in _DEGRADATION_PATHS:
+            raise ValueError(
+                f"field_cold_diffusion.degradation={self._fcd_degradation!r} is unknown; "
+                f"expected one of {sorted(_DEGRADATION_PATHS)}."
+            )
+        if self._fcd_degradation == "gaussian":
+            self._fcd_schedule = {
+                "sigma_min": float(cfg.noise_sigma_min),
+                "sigma_max": float(cfg.noise_sigma_max),
+            }
+            self._fcd_sample_extra = {"seed": int(cfg.sampler_seed)}
 
     def _compute_losses_impl(
         self,
@@ -163,14 +240,27 @@ class FieldColdDiffusionStrategy(ReconstructionTrainingStrategy):
                 "FieldColdDiffusionStrategy requires a mapping batch (dict/TrainingBatch) from the mrixfields "
                 f"dataset; got {type(batch)!r}."
             )
-        return compute_field_cold_diffusion_loss(
+        loss_fn, _ = _DEGRADATION_PATHS[self._degradation()]
+        return loss_fn(
             self.env.generator,
             batch["target"],
             train_steps=getattr(self, "_fcd_train_steps", 10),
-            min_cutoff=getattr(self, "_fcd_min", 0.25),
-            max_cutoff=getattr(self, "_fcd_max", 5.0),
             contrast_id=batch.get("contrast_id"),
+            **self._schedule_kwargs(),
         )
+
+    def _degradation(self) -> str:
+        return getattr(self, "_fcd_degradation", "field_lowpass")
+
+    def _schedule_kwargs(self) -> dict[str, float]:
+        """The schedule of the declared degradation (cutoffs, or noise stds)."""
+        schedule = getattr(self, "_fcd_schedule", None)
+        if schedule is not None:
+            return dict(schedule)
+        return {
+            "min_cutoff": getattr(self, "_fcd_min", 0.25),
+            "max_cutoff": getattr(self, "_fcd_max", 5.0),
+        }
 
     def validation_step(
         self,
@@ -198,11 +288,12 @@ class FieldColdDiffusionStrategy(ReconstructionTrainingStrategy):
         high-field image scored by the image metrics)."""
         x0 = batch_context.get("input", input_batch)
         contrast_id = batch_context.get("contrast_id", kwargs.get("contrast_id"))
-        return cold_diffusion_sample(
+        _, sample_fn = _DEGRADATION_PATHS[self._degradation()]
+        return sample_fn(
             self.env.generator,
             x0,
             n_steps=getattr(self, "_fcd_n_steps", 10),
-            min_cutoff=getattr(self, "_fcd_min", 0.25),
-            max_cutoff=getattr(self, "_fcd_max", 5.0),
             contrast_id=contrast_id,
+            **self._schedule_kwargs(),
+            **getattr(self, "_fcd_sample_extra", {}),
         )

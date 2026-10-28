@@ -19,8 +19,6 @@ of with torch.
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -211,111 +209,6 @@ def test_pipelines_parallel_reexports_the_same_helper() -> None:
     from spectramr.pipelines.parallel import unwrap_model as reexported
 
     assert reexported is unwrap_model
-
-
-# ---------------------------------------------------------------------------
-# resolve_state_dict -- the one checkpoint reader
-# ---------------------------------------------------------------------------
-
-
-class TestResolveStateDict:
-    """The single envelope-unwrapping reader every load path now shares.
-
-    Before this existed, *six* call sites each knew a different subset of the
-    envelope vocabulary, and the two writers in the repo disagreed with each
-    other: ``checkpoint_director`` writes ``{"generator": ...}`` while
-    ``checkpoint_service`` writes ``{"model_state_dict": ...}``. A reader that
-    knew only one of them either raised ``KeyError: 'generator'`` (#1310) or --
-    far worse -- fell through to loading the *whole envelope* under
-    ``strict=False``, matching nothing, and reporting success. That is the
-    Method-C facade: a run that looks warm-started while training from scratch
-    (pitfalls #9/#16).
-
-    Selection is by **key overlap with the model, not by key order**. The
-    order-driven draft of this function picked the config dict out of a
-    ``{"model": <config>, "generator": <weights>}`` payload -- which is a real
-    checkpoint shape here, not a hypothetical one.
-    """
-
-    @staticmethod
-    def _weights() -> dict:
-        return Tiny().state_dict()
-
-    @staticmethod
-    def _keys() -> set[str]:
-        return set(Tiny().state_dict().keys())
-
-    def test_generator_envelope_resolves(self) -> None:
-        """The envelope ``checkpoint_director`` actually writes (#1310)."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        w = self._weights()
-        out = resolve_state_dict({"generator": w, "epoch": 7}, self._keys(), source="t")
-        assert set(out) == set(w)
-
-    def test_model_state_dict_envelope_resolves(self) -> None:
-        """The envelope ``checkpoint_service`` writes -- the other writer."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        w = self._weights()
-        out = resolve_state_dict({"model_state_dict": w}, self._keys(), source="t")
-        assert set(out) == set(w)
-
-    def test_bare_state_dict_resolves(self) -> None:
-        """A raw ``model.state_dict()`` saved with no envelope at all."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        w = self._weights()
-        assert set(resolve_state_dict(w, self._keys(), source="t")) == set(w)
-
-    def test_wrapper_prefixes_are_stripped(self) -> None:
-        """A DDP/compile-wrapped payload loads into a bare model."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        w = self._weights()
-        wrapped = {f"module.{k}": v for k, v in w.items()}
-        out = resolve_state_dict({"generator": wrapped}, self._keys(), source="t")
-        assert set(out) == set(w)
-
-    def test_overlap_beats_order_when_a_config_shares_the_key(self) -> None:
-        """The decoy case the order-driven version got wrong.
-
-        ``"model"`` precedes ``"generator"`` in the key vocabulary, and some
-        checkpoints store the *config* under ``"model"``. Selecting the first
-        recognised key would hand a config dict to ``load_state_dict``.
-        """
-        from spectramr.core.module_utils import resolve_state_dict
-
-        w = self._weights()
-        payload = {"model": {"model_type": "unet", "base_channels": 32}, "generator": w}
-        out = resolve_state_dict(payload, self._keys(), source="t")
-        assert set(out) == set(w), "picked the config dict over the weights"
-
-    def test_zero_overlap_raises_instead_of_loading_nothing(self) -> None:
-        """No silent no-op load: a payload that matches nothing must raise."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        foreign = {"totally.other.weight": torch.zeros(1)}
-        with pytest.raises(ValueError, match="zero parameter"):
-            resolve_state_dict(foreign, self._keys(), source="ckpt.pt")
-
-    def test_non_mapping_payload_raises_typeerror(self) -> None:
-        """A pickled ``nn.Module`` (the deprecated format) is not a state dict."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        with pytest.raises(TypeError):
-            resolve_state_dict(Tiny(), self._keys(), source="ckpt.pt")
-
-    def test_source_is_named_in_the_error(self) -> None:
-        """The message must say *which* checkpoint failed, not just that one did."""
-        from spectramr.core.module_utils import resolve_state_dict
-
-        with pytest.raises(ValueError, match=re.escape("run42/best.pt")):
-            resolve_state_dict(
-                {"totally.other.weight": torch.zeros(1)},
-                self._keys(),
-                source="run42/best.pt",
-            )
 
 
 class TestMidPathWrapperSegments:

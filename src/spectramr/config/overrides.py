@@ -12,7 +12,11 @@ import rightward. ``spectramr.main`` re-exports both for backward compatibility.
 from __future__ import annotations
 
 import logging
+import types
+import typing
 from typing import Any
+
+from pydantic import BaseModel
 
 from spectramr.config.schemas.renames import canonical_override_path
 
@@ -99,6 +103,10 @@ def apply_overrides(settings: Any, overrides: list[str]) -> Any:
 
         # Parse value type
         parsed_value = _parse_value(value)
+        # `none` is a legal Literal member of fields such as parallel.strategy
+        # (#1480); there it means the string, since None would fail validation.
+        if value.strip().lower() == "none" and _destination_rejects_none(keys):
+            parsed_value = "none"
 
         # Navigate to the nested key and set value. An absent/None node may be
         # created (building a new nested path is legitimate), but an existing
@@ -198,6 +206,50 @@ def applied_override_paths(settings: Any) -> tuple[str, ...]:
         Canonical paths in application order; ``()`` if none.
     """
     return tuple(getattr(settings, "_override_paths", ()) or ())
+
+
+def _models_in(annotation: Any) -> list[type[BaseModel]]:
+    """The Pydantic model classes an annotation names, through Optional/Union/Annotated."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    if typing.get_origin(annotation) is typing.Annotated:
+        return _models_in(typing.get_args(annotation)[0])
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return [m for arg in typing.get_args(annotation) for m in _models_in(arg)]
+    return []
+
+
+def _destination_rejects_none(keys: list[str]) -> bool:
+    """Whether the schema field at ``keys`` refuses ``None`` but accepts ``'none'``.
+
+    ``False`` whenever the path cannot be resolved to one schema field (a dict-typed
+    subtree, an unknown key), which keeps the historical ``none`` → ``None`` parse.
+    """
+    from pydantic import TypeAdapter, ValidationError
+
+    from spectramr.config.settings import TrainingSettings
+
+    models: list[type[BaseModel]] = [TrainingSettings]
+    field = None
+    for i, key in enumerate(keys):
+        field = next((m.model_fields[key] for m in models if key in m.model_fields), None)
+        if field is None:
+            return False
+        if i < len(keys) - 1:
+            models = _models_in(field.annotation)
+    if field is None or _models_in(field.annotation):
+        return False
+    adapter: TypeAdapter[Any] = TypeAdapter(field.annotation)
+    try:
+        adapter.validate_python(None)
+        return False
+    except ValidationError:
+        pass
+    try:
+        adapter.validate_python("none")
+    except ValidationError:
+        return False
+    return True
 
 
 def _parse_value(value: str) -> Any:

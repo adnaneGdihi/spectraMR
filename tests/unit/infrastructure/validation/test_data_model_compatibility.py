@@ -128,7 +128,6 @@ class TestDataModelCompatibility:
             adapter_cfg = _SmallNamespace(
                 pre_model=[_SmallNamespace(name="slice_3d_to_2d", enabled=True, model_dump=lambda: {"name": "slice_3d_to_2d", "enabled": True})],
                 post_model=[],
-                pre_loss_pred=[],
                 pre_loss_target=[],
                 pre_metric=[],
             )
@@ -349,7 +348,7 @@ class TestModelLossOutputDomain:
             r = ConfigHealthChecker().check_model_loss_output_domain(cfg)
             assert not r.passed and r.severity == "error"
             assert "kspace" in r.message and "image" in r.message
-            assert r.fix_hint and "pre_loss_pred" in r.fix_hint
+            assert r.fix_hint and "output_domain" in r.fix_hint
         finally:
             _unannotate("__test_oo_unbridged", was_test_only=True)
 

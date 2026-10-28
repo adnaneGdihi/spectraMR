@@ -350,6 +350,9 @@ class MEMNOOperator(nn.Module):
                 f"got rank {backbone_rank} backbone"
             )
 
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        self.backbone.set_grad_checkpointing(enable)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Group-averaging: f̂(x) = mean_g g⁻¹·f(g·x)
         if self.symmetry_group == "oh":

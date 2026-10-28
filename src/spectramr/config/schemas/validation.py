@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .enums import SelectionRule
 from .renames import (
     RENAMES,
     fold_renamed_keys,
@@ -21,6 +22,7 @@ __all__ = [
     "ValidationSamplingConfigSchema",
     "ValidationScheduleConfigSchema",
     "ValidationScoringConfigSchema",
+    "ValidationSelectionConfigSchema",
     "ValidationVisualizationConfigSchema",
 ]
 
@@ -28,26 +30,6 @@ __all__ = [
 #: unmigrated key that the fold table forgot RAISES rather than vanishing —
 #: the opposite of `data:`, where `extra="ignore"` silently ate one (#550).
 _VAL_SUBBLOCK = ConfigDict(extra="forbid", frozen=True)
-
-
-_UNREAD_NUM_VIS = (
-    "NOT READ — nothing in src/ consumes it (KNOWN_UNCONSUMED ledger, "
-    "tests/unit/config/test_schema_key_consumption.py). 209 arms declare it "
-    'and this block is extra="forbid", so deleting the field would fail every one of them at load. '
-    "Wire it or retire it with a corpus migration; do not trust it today."
-)
-_UNREAD_VIS_DIR = (
-    "NOT READ — nothing in src/ consumes it (KNOWN_UNCONSUMED ledger, "
-    "tests/unit/config/test_schema_key_consumption.py). 60 arms declare it "
-    'and this block is extra="forbid", so deleting the field would fail every one of them at load. '
-    "Wire it or retire it with a corpus migration; do not trust it today."
-)
-_UNREAD_USE_TRAIN_LOSS = (
-    "NOT READ — nothing in src/ consumes it (KNOWN_UNCONSUMED ledger, "
-    "tests/unit/config/test_schema_key_consumption.py). 136 arms declare it "
-    'and this block is extra="forbid", so deleting the field would fail every one of them at load. '
-    "Wire it or retire it with a corpus migration; do not trust it today."
-)
 
 
 class HallucinationTestConfig(BaseModel):
@@ -93,7 +75,7 @@ class ValidationScheduleConfigSchema(BaseModel):
             "exceed `training.max_iterations`: the loop gate is a bare "
             "`iteration % interval_steps == 0` with no first/last-iteration "
             "force, so an interval above the budget yields ZERO validation "
-            "events -- early stopping never evaluates, no `checkpoint_best.pt` "
+            "events -- early stopping never evaluates, no best checkpoint "
             "is written, and the run still exits reporting success. "
             "`_execute_training_loop` rejects that combination at startup "
             "(`ConfigurationError`) unless `on_epoch` supplies events instead. "
@@ -194,6 +176,54 @@ class ValidationLoaderConfigSchema(BaseModel):
     )
 
 
+class RecorruptedInferenceConfigSchema(BaseModel):
+    """``validation.scoring.recorrupted_inference``: the R2R Monte-Carlo estimator (#2329).
+
+    An R2R-trained network denoises a *recorrupted* input, so it is scored on the
+    average of its outputs over ``samples`` fresh recorruptions of the
+    validation input rather than on the raw repetition (``PAPER.md`` Theorem 4).
+    Read by ``ModelValidationMixin.validation_step`` through
+    ``mixins/recorrupted_inference.py``, which refuses it on any
+    ``data.target_mode`` other than ``r2r``/``nullspace_r2r``.
+    """
+
+    model_config = _VAL_SUBBLOCK
+
+    samples: int = Field(
+        ge=1,
+        description=(
+            "J, the recorruptions averaged per validation input; each is one forward, "
+            "run sequentially. Generalized R2R uses 5 for Gaussian noise."
+        ),
+    )
+    alpha: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "target_mode 'r2r' only: the draw strength tau. None uses data.r2r_alpha, "
+            "the strength the network was trained at."
+        ),
+    )
+    angle_deg: float | None = Field(
+        default=None,
+        gt=0.0,
+        lt=90.0,
+        description=(
+            "target_mode 'nullspace_r2r' only: the split angle, tau = tan(angle). None "
+            "uses data.r2r_split_angle_deg, the angle the network was trained at."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _one_strength(self) -> "RecorruptedInferenceConfigSchema":
+        if self.alpha is not None and self.angle_deg is not None:
+            raise ValueError(
+                "recorrupted_inference takes alpha (r2r) or angle_deg (nullspace_r2r), "
+                "never both: one of them would be unread."
+            )
+        return self
+
+
 class ValidationScoringConfigSchema(BaseModel):
     """*What* validation measures.
 
@@ -216,8 +246,10 @@ class ValidationScoringConfigSchema(BaseModel):
         default=None,
         description=(
             "Metrics to compute during validation; None inherits "
-            "`training.metrics`. A list of registry names — ['psnr', 'ssim', "
-            "'lpips'] — is the only shape any arm uses; the dict form "
+            "`training.metrics`. An empty list, or one naming only keys the "
+            "strategy emits itself, computes no registry metric. A list of "
+            "registry names — ['psnr', 'ssim', 'lpips'] — is the only shape "
+            "any arm uses; the dict form "
             "{'psnr': True} is accepted for back compatibility."
         ),
     )
@@ -235,8 +267,12 @@ class ValidationScoringConfigSchema(BaseModel):
     output_transform: str | None = Field(
         default=None,
         description=(
-            "Transform applied before validation metrics: 'ifft_magnitude', "
-            "'ifft_sense_adjoint', 'magnitude', or None. Any other name RAISES "
+            "Transform applied before validation metrics: 'ifft_magnitude' (RSS "
+            "image), 'ifft_target_magnitude', 'ifft_sense_adjoint', 'magnitude', "
+            "'sense_magnitude' (|S^H F^H y| with the validation batch's normalised "
+            "coil maps; raises when the batch carries none), or None. One "
+            "transform per block: the SENSE image metrics beside an RSS pair are "
+            "the `sense_psnr`/`sense_ssim` entries of `compute`. Any other name RAISES "
             "— 'fft' and 'ifft_mag_combine' were advertised here and dispatched "
             "by nothing. This is the knob the VALIDATION path reads; "
             "`metrics.transform` is read by the training-metrics path only. "
@@ -249,14 +285,50 @@ class ValidationScoringConfigSchema(BaseModel):
             "Compute image-quality metrics (PSNR, SSIM, MAE) in addition to the validation loss."
         ),
     )
+    coil_manifold_projection: bool = Field(
+        default=False,
+        description=(
+            "Project a multi-coil k-space prediction onto the per-pixel coil manifold "
+            "(s_hat s_hat^H from the batch's complex coil maps) before the image metrics "
+            "and val_loss. ||Pf - x|| <= ||f - x|| for any rank-one truth, so it never "
+            "increases error. Raises when the batch carries no complex maps (declare "
+            "`espirit_sensitivity`) or the model does not output k-space. The null-space "
+            "certificate (null_space_residual, _fraction) still reads the unprojected "
+            "output; every other metric, the repetition-based decomposition included, "
+            "grades the projected one, with pred_alt projected the same way. Read by "
+            "ModelValidationMixin.validation_step."
+        ),
+    )
+    measurement_maps: Literal["off", "metrics"] = Field(
+        default="off",
+        description=(
+            "kspace_cold_diffusion validation calibrates coil maps from the fully "
+            "sampled reference, so every SENSE-combined metric is oracle-assisted at "
+            "high R. 'metrics' re-scores the same prediction with maps calibrated "
+            "from the rung's masked measurement alone (the predict estimator) and "
+            "publishes them beside the oracle numbers as `val_<m>_measmaps`, "
+            "`val_zf_<m>_measmaps` and `val_hfen_measmaps_vs_zf_mean`; the "
+            "prediction itself stays conditioned on the oracle maps. 'off' "
+            "publishes nothing extra. Raises at strategy construction on a model "
+            "that takes no coil maps. Read by DiffusionTrainingStrategy."
+        ),
+    )
+    recorrupted_inference: RecorruptedInferenceConfigSchema | None = Field(
+        default=None,
+        description=(
+            "R2R arms only: score the mean of the model over `samples` fresh "
+            "recorruptions of each validation input, the estimator the R2R objective "
+            "defines, instead of the model on the raw repetition. `pred_alt` is formed "
+            "the same way, and the average is taken before coil_manifold_projection."
+        ),
+    )
 
 
 class ValidationVisualizationConfigSchema(BaseModel):
     """Validation image dumps.
 
     Only the gate and its cadence live here. ``num_visualizations`` and
-    ``visualization_dir`` stay flat on the parent because nothing reads them —
-    see the parent's inert-knob note.
+    ``visualization_dir`` were never read and are refused at load (#563).
     """
 
     model_config = _VAL_SUBBLOCK
@@ -409,10 +481,18 @@ class ValidationGatesConfigSchema(BaseModel):
     held_out_severity_eval: bool = Field(
         default=False,
         description=(
-            "Evaluate at the "
-            "model.model_kwargs.digital_twin_kwargs.held_out_severity_grid points "
-            "in addition to standard in-distribution validation. Cold-diffusion "
-            "paradigm pitfall guard (plan §12 / A5.8)."
+            "Evaluate at the held_out_severity_grid points in addition to standard "
+            "in-distribution validation. Cold-diffusion paradigm pitfall guard "
+            "(plan §12 / A5.8)."
+        ),
+    )
+    held_out_severity_grid: list[float] | None = Field(
+        default=None,
+        description=(
+            "Out-of-training-range severities for held_out_severity_eval. Cold "
+            "diffusion reads them as accelerations, motion-meta as multipliers (> 1) of "
+            "training.motion's translation and rotation. Falls back to the legacy "
+            "model.model_kwargs.digital_twin_kwargs.held_out_severity_grid."
         ),
     )
     hallucination_test: HallucinationTestConfig = Field(
@@ -421,6 +501,54 @@ class ValidationGatesConfigSchema(BaseModel):
             "Hallucination test sweep — clinical-defensibility hook "
             "(plan §13 / A5.9). Disabled by default."
         ),
+    )
+
+
+class ValidationSelectionConfigSchema(BaseModel):
+    """Checkpoint selection on the cascade's ring fidelity, with fabrication guards.
+
+    ``rule: none`` (the default) emits nothing and changes no column. ``guarded_ring_fidelity``
+    scores ``val_guarded_ring_fidelity_mean``: the mean over mid1/mid2 of the ring NRMSE
+    relative to zero-fill, plus ``penalty`` times the guard excess at the 8x rung. Thresholds
+    were read from the kspace_filling M4Raw loss_v2 cohort (18 arms, last iteration, 8x):
+    fabrication_excess median 0.270, range 0.247 to 0.313; nse_hall median 0.835, range 0.791
+    to 0.860. The defaults sit above that median, so a typical arm passes and the two highest
+    fabrication arms trip. The ring power-ratio guard defaults to 1.05, the value the analysis
+    plan names.
+    """
+
+    model_config = _VAL_SUBBLOCK
+
+    rule: SelectionRule = Field(
+        default=SelectionRule.NONE,
+        description=(
+            "Selection rule: 'none' (no extra metric) or 'guarded_ring_fidelity'. Read by "
+            "DiffusionTrainingStrategy, which stamps the composite after the cascade mean; "
+            "an arm that selects on it names the composite in early_stopping.metric."
+        ),
+    )
+    fabrication_max: float = Field(
+        default=0.30,
+        gt=0,
+        description="Guard: fabrication_excess at 8x above this adds penalty x excess.",
+    )
+    nse_hall_max: float = Field(
+        default=0.88,
+        gt=0,
+        description="Guard: nse_hall at 8x above this adds penalty x excess.",
+    )
+    power_ratio_max: float = Field(
+        default=1.05,
+        gt=0,
+        description=(
+            "Guard: a ring whose target SNR at 8x is at least 4 must have a prediction/target "
+            "power ratio at or below this."
+        ),
+    )
+    penalty: float = Field(
+        default=10.0,
+        ge=0,
+        description="Weight on the summed guard excess in the composite.",
     )
 
 
@@ -516,19 +644,19 @@ class ValidationConfigSchema(BaseModel):
     sub-block before validation — but they are gone from Python, so there is one
     read path and, temporarily, two accepted spellings in YAML.
 
-    Nine scalars stay flat on purpose. **Nothing reads them**, and giving an
+    Six scalars stay flat on purpose. **Nothing reads them**, and giving an
     inert knob a tidy home implies it works (the call `data.test_split` and
     `optimization.num_steps` already got). They stay visibly odd beside the
     grouped blocks until each is wired or deleted:
 
     * `enabled` — 1006 arms set it, 8 to `false`, and validation runs anyway.
-      A comment in `metrics_report_generator.py` even attributes a missing CSV
-      to `validation.enabled=false`, a cause that cannot occur. Issue #673.
+      Issue #673.
     * `split` — 388 arms set it; the live validation fraction is
       `data.split.validation_fraction` (10+ readers). Issue #673.
-    * `use_training_loss`, `enable_validation_augmentation`, `validation_dir`,
-      `validation_metric`, `num_visualizations`, `visualization_dir` — already
-      carried by `KNOWN_UNCONSUMED` in `test_schema_key_consumption.py`.
+    * `validation_dir`, `validation_metric` — already carried by
+      `KNOWN_UNCONSUMED` in `test_schema_key_consumption.py`.
+      (`use_training_loss`, `num_visualizations`, `visualization_dir` and
+      `enable_validation_augmentation` were removed and are refused at load.)
     * `empty_cache_before_validation` — the one LIVE ungrouped scalar; a
       memory-policy knob that belongs to no group here.
 
@@ -553,6 +681,9 @@ class ValidationConfigSchema(BaseModel):
     sampling: ValidationSamplingConfigSchema = Field(default_factory=ValidationSamplingConfigSchema)
     gates: ValidationGatesConfigSchema = Field(default_factory=ValidationGatesConfigSchema)
     cascade: ValidationCascadeConfigSchema = Field(default_factory=ValidationCascadeConfigSchema)
+    selection: ValidationSelectionConfigSchema = Field(
+        default_factory=ValidationSelectionConfigSchema
+    )
 
     __folded_input_keys__ = folded_input_keys("validation")
     __folded_input_paths__ = folded_input_paths("validation")
@@ -567,8 +698,10 @@ class ValidationConfigSchema(BaseModel):
     # place: the key stops working AND stops being visible. Promoting a
     # drained record in a block without this validator converts a working
     # fold into exactly that.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("validation")))
-    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("validation")))
+    # mypy cannot match a classmethod-wrapped factory to pydantic's validator
+    # protocols; the runtime binding is the one every schema block uses.
+    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("validation")))  # type: ignore[arg-type]
+    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("validation")))  # type: ignore[arg-type]
 
     # ---- ungrouped scalars ------------------------------------------------
     # See the class docstring: every one of these but `empty_cache_before_
@@ -594,10 +727,6 @@ class ValidationConfigSchema(BaseModel):
         default=None,
         description="Separate directory for validation data (if None, use split).",
     )
-    enable_validation_augmentation: bool = Field(
-        default=False,
-        description="Apply augmentation during validation.",
-    )
     validation_metric: str = Field(
         default="loss",
         description=(
@@ -605,22 +734,6 @@ class ValidationConfigSchema(BaseModel):
             "`metrics.primary`, but with a different default, so it was not "
             "merged into it."
         ),
-    )
-    use_training_loss: bool = Field(
-        default=True,
-        description=(
-            "Use the same loss computation as training (includes L1, perceptual, "
-            "LPIPS). If False, only compute MSE. " + _UNREAD_USE_TRAIN_LOSS
-        ),
-    )
-    num_visualizations: int = Field(
-        default=4,
-        ge=1,
-        description=("Number of samples to visualize. " + _UNREAD_NUM_VIS),
-    )
-    visualization_dir: str = Field(
-        default="./visualizations",
-        description=("Directory to save validation visualizations. " + _UNREAD_VIS_DIR),
     )
     empty_cache_before_validation: bool = Field(
         default=True,
@@ -631,6 +744,21 @@ class ValidationConfigSchema(BaseModel):
             "True preserves the OOM-safe behavior. Set False on memory-headroom "
             "runs to avoid the allocator re-grow cost on the next train step "
             "(backlog_wasted_compute_audit_2026_05_29 PIPE-2)."
+        ),
+    )
+    per_batch_rows: bool = Field(
+        default=False,
+        description=(
+            "Write one row per validation batch to logs/validation_batches.csv "
+            "beside validation_metrics.csv, carrying the samples' identifiers as "
+            "the loader put them on the batch (subject_id, contrast, slice_index, "
+            "repetition_group, file_id) and the batch's metrics. With "
+            "validation.loader.batch_size 1 that is one row per slice, which is what "
+            "a paired test across arms needs; a loader that serves whole volumes is "
+            "scored one depth slice at a time, and the pass mean is the mean over "
+            "slices. Metric values cross to the host once "
+            "per pass, not once per batch; each rank writes its own file "
+            "(validation_batches_rank<N>.csv off rank 0)."
         ),
     )
 

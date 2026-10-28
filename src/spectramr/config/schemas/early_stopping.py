@@ -3,6 +3,7 @@
 from pydantic import BaseModel, Field, model_validator
 
 from .enums import MetricMode
+from .renames import reject_renamed_keys
 
 
 class EarlyStoppingConfigSchema(BaseModel):
@@ -25,6 +26,11 @@ class EarlyStoppingConfigSchema(BaseModel):
         "frozen": True,
     }
 
+    # Removed keys (removals.py) are refused with the reason, not a bare extra error.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("early_stopping"))  # type: ignore[arg-type]
+    )
+
     enabled: bool = Field(
         default=False,
         description="Enable early stopping",
@@ -32,7 +38,11 @@ class EarlyStoppingConfigSchema(BaseModel):
     patience: int = Field(
         default=10,
         ge=1,
-        description="Number of validity checks with no improvement after which training will be stopped",
+        description=(
+            "Number of consecutive validation passes with no improvement after which "
+            "training stops. Early stopping is evaluated on every validation pass, so "
+            "its cadence is validation.schedule.interval_steps."
+        ),
     )
     patience_min_iterations: int | None = Field(
         default=None,
@@ -52,11 +62,6 @@ class EarlyStoppingConfigSchema(BaseModel):
         ge=0,
         description="Minimum change in monitored metric to qualify as an improvement",
     )
-    check_interval: int = Field(
-        default=1000,
-        ge=1,
-        description="Interval in iterations between early stopping checks",
-    )
     restore_best_weights: bool = Field(
         default=True,
         description="Restore best model after early stopping",
@@ -67,14 +72,14 @@ class EarlyStoppingConfigSchema(BaseModel):
         """Refuse a ``mode`` that contradicts the metric's own direction.
 
         ``mode: max`` on a loss stops the run when the loss stops RISING, and
-        writes ``checkpoint_best.pt`` at the WORST iterate. Nothing downstream
+        writes the best checkpoint at the WORST iterate. Nothing downstream
         notices: the comparison is well-defined, the counter advances, the file
         is written, and every artifact reports success. The selected model is
         simply the wrong one -- pitfall #16, decided by a single enum.
 
         The direction is not guessed. ``metric_higher_is_better`` is the single
-        resolver already shared by the metrics tracker, ``keep_best_n``, early
-        stopping itself and the campaign ranker, and it RAISES rather than
+        resolver already shared by the metrics tracker, early stopping itself
+        and the campaign ranker, and it RAISES rather than
         guessing on an unresolvable key. An unknown metric is therefore left
         alone here: naming a metric this schema cannot resolve is a different
         defect with a different owner (the monitor resolution at first
@@ -119,7 +124,7 @@ class EarlyStoppingConfigSchema(BaseModel):
                 f"early_stopping.mode={self.mode.value!r} contradicts "
                 f"metric={self.metric!r}, for which {better} is better. As "
                 f"written, early stopping would wait for the metric to stop "
-                f"getting WORSE and checkpoint_best.pt would hold the worst "
+                f"getting WORSE and the best checkpoint would hold the worst "
                 f"iterate -- silently, since every comparison is still "
                 f"well-defined. Set mode: {wanted}."
             )

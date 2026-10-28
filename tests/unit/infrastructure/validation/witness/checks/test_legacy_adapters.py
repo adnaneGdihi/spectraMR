@@ -111,12 +111,9 @@ def test_validator_registry_adapter_reports_a_missing_training_mode():
 def test_validator_registry_findings_are_reported_but_never_blocking():
     """CONTROL + the ratchet decision, asserted.
 
-    `_validate_training_mode_compatibility` requires `objectives.reconstruction`,
-    but `objectives` was REMOVED from TrainingSettings in the v6 migration, so
-    every `training_mode: reconstruction` config fails it for a defect in the RULE.
-    Surfacing that as a blocking error would reject a large slice of the corpus, so
-    the adapter reports at WARNING. This test pins that decision: if someone
-    promotes it to ERROR, this fails and forces the rule set to be fixed first.
+    The adapter reports at WARNING until the rule set has been shown satisfiable
+    corpus-wide. This test pins that decision, so promoting it to ERROR is a
+    deliberate change rather than a side effect.
     """
     subject = WitnessSubject.for_audit(config_path=None, settings=_settings())
     registry = [
@@ -126,7 +123,7 @@ def test_validator_registry_findings_are_reported_but_never_blocking():
     ]
     assert registry, "the audit still cannot see ValidatorRegistry findings"
     assert all(str(v.severity) != "error" for v in registry), (
-        "ValidatorRegistry findings must not block until the known-unsatisfiable rules are repaired"
+        "ValidatorRegistry findings must not block until the ratchet is taken deliberately"
     )
 
 

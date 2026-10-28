@@ -91,3 +91,28 @@ def test_the_arm_on_disk_still_resolves_to_its_declared_sampler():
     cfg = TrainingSettings.from_yaml(ARM)
     assert cfg.training.diffusion.sampler == "cold_mri"
     assert _resolve(cfg).get("sampler") == "cold_mri"
+
+
+def _without_declared_sampler():
+    """The arm's config with ``sampler`` back at its schema default and unset."""
+    base = TrainingSettings.from_yaml(ARM)
+    fields = base.training.diffusion.model_dump(exclude={"sampler"}, exclude_unset=True)
+    diffusion = type(base.training.diffusion).model_validate(fields)
+    training = base.training.model_copy(update={"diffusion": diffusion})
+    return base.model_copy(update={"training": training})
+
+
+def test_an_undeclared_schema_default_sampler_is_not_injected():
+    """#2445: the schema default ``ddpm`` is registered by no k-space sampler."""
+    cfg = _without_declared_sampler()
+    assert "sampler" not in cfg.training.diffusion.model_fields_set
+    assert cfg.training.diffusion.sampler == "ddpm"
+    assert "sampler" not in _resolve(cfg)
+
+
+def test_an_arm_that_declares_no_sampler_builds_its_generator():
+    """dummy_validation_run declares training.diffusion without a sampler (#2445)."""
+    cfg = TrainingSettings.from_yaml("experiments/inprogress/dummy/dummy_validation_run.yaml")
+    assert "sampler" not in cfg.training.diffusion.model_fields_set
+    generator = KSpaceColdDiffusionGenerator(**_resolve(cfg))
+    assert generator.num_timesteps == cfg.training.diffusion.timesteps == 100

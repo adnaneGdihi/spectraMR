@@ -226,7 +226,7 @@ class FNOEPGSurrogate(nn.Module):
         t1: torch.Tensor,
         t2: torch.Tensor,
         b1_plus: torch.Tensor | None = None,
-        te_spacing: float = 10.0,
+        te_spacing: float | torch.Tensor = 10.0,
         echo_train_length: int = 16,
         excitation_fa: float = 90.0,
         refocusing_fa: float = 180.0,
@@ -238,7 +238,8 @@ class FNOEPGSurrogate(nn.Module):
             t1: T1 relaxation time in ms [B, 1, H, W].
             t2: T2 relaxation time in ms [B, 1, H, W].
             b1_plus: B1+ transmit field map [B, 1, H, W] (optional, defaults to 1.0).
-            te_spacing: Echo spacing in ms.
+            te_spacing: Echo spacing in ms; a tensor of one value per batch row (e.g.
+                ``[B, 1, 1, 1]``) gives each row its own.
             echo_train_length: Number of echoes.
             excitation_fa: Nominal excitation flip angle in degrees.
             refocusing_fa: Nominal refocusing flip angle in degrees.
@@ -271,8 +272,12 @@ class FNOEPGSurrogate(nn.Module):
         if b1_plus is None:
             b1_plus = torch.ones_like(rho)
 
-        # Normalize tissue parameters to [0, 1] for numerical stability
-        rho_n = rho.clamp(0, 1)
+        # Normalize tissue parameters to [0, 1] for numerical stability. The echo amplitude
+        # per unit proton density does not depend on rho, which scales the output below, so
+        # its channel carries a constant: fed rho, a surrogate fitted at rho = 1 met every
+        # rendered voxel out of distribution. Four channels are kept so the layer's shape
+        # (and any stored weights) stay as they were.
+        rho_n = torch.ones_like(rho)
         t1_n = t1.clamp(100, 5000) / 5000.0
         t2_n = t2.clamp(10, 2500) / 2500.0
         b1_n = b1_plus.clamp(0.3, 1.7) / 1.7
@@ -282,7 +287,6 @@ class FNOEPGSurrogate(nn.Module):
 
         # Flatten spatial dims: [B, 4, H*W] -> [B*H*W, 4]
         tissue_flat = tissue.view(B, 4, -1).permute(0, 2, 1).reshape(-1, 4)
-        N_voxels = tissue_flat.shape[0]
 
         # Lift to hidden: [N_voxels, hidden_width]
         h = self.lift(tissue_flat)
@@ -291,23 +295,19 @@ class FNOEPGSurrogate(nn.Module):
         etl = echo_train_length
         h = h.unsqueeze(-1).expand(-1, -1, etl).contiguous()
 
-        # Build sequence parameter vector: [N_voxels, seq_param_dim]
-        # Normalize to reasonable ranges for the network
-        seq_params = (
-            torch.tensor(
-                [excitation_fa / 180.0, refocusing_fa / 180.0, te_spacing / 50.0],
-                device=device,
-                dtype=h.dtype,
-            )
-            .unsqueeze(0)
-            .expand(N_voxels, -1)
+        # Sequence parameter vector [N_voxels, 3], normalised for the network. B1+ scales both
+        # flip angles pixel-wise; built by multiplication, not slice assignment, because the
+        # B1+ map is the network's own output and autograd saves the slice being overwritten.
+        flip = torch.tensor(
+            [excitation_fa / 180.0, refocusing_fa / 180.0], device=device, dtype=h.dtype
         )
-
-        # Apply B1+ modulation to sequence params (pixel-wise)
         b1_flat = b1_n.view(B, -1).reshape(-1, 1)  # [N_voxels, 1]
-        seq_params = seq_params.clone()
-        seq_params[:, 0:1] = seq_params[:, 0:1] * b1_flat  # Modulate excitation FA
-        seq_params[:, 1:2] = seq_params[:, 1:2] * b1_flat  # Modulate refocusing FA
+        if isinstance(te_spacing, torch.Tensor):  # one echo spacing per batch row
+            te_col = te_spacing.to(device=device, dtype=h.dtype).reshape(B, 1)
+            te_col = te_col.expand(B, H * W).reshape(-1, 1) / 50.0
+        else:
+            te_col = torch.full_like(b1_flat, te_spacing / 50.0)
+        seq_params = torch.cat([flip.unsqueeze(0) * b1_flat, te_col], dim=1)
 
         # FNO backbone with FiLM conditioning
         for spectral, film, residual in zip(

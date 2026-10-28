@@ -121,6 +121,16 @@ def test_subvoxel_sr_frames_are_distinct_lowres_views() -> None:
     assert not torch.allclose(res.stack[:, 0], res.stack[:, 3])
 
 
+def test_subvoxel_sr_dither_repeats_under_a_fixed_generator_seed() -> None:
+    """Validation seeds its generator so one checkpoint scores the same twice."""
+    sim = MultiAcquisitionSimulator("subvoxel_sr", n_frames=4, sr_scale=2)
+    img, _ = _phantom(3)
+    a = sim(img, generator=torch.Generator().manual_seed(0))
+    b = sim(img, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(a.shifts, b.shifts)
+    assert torch.equal(a.stack, b.stack)
+
+
 def test_subvoxel_sr_accepts_cpu_generator() -> None:
     """A CPU generator must drive subvoxel_sr without device errors (regression
     guard that the offset draws now pass an explicit device matching the
@@ -415,6 +425,19 @@ def test_tissue_gain_field_is_a_three_class_intensity_proxy() -> None:
     pd = torch.linspace(0.0, 1.0, 32 * 32).reshape(1, 1, 32, 32)
     field = sim._tissue_gain_field(pd)
     assert sorted(float(v) for v in field.unique()) == pytest.approx([0.40, 0.45, 0.86], abs=1e-6)
+
+
+def test_tissue_gain_table_is_built_once_and_reset_on_reinstall() -> None:
+    """The per-step transfer reuses one device table; a new transfer replaces it."""
+    sim = MultiAcquisitionSimulator("subvoxel_sr", n_frames=2, sr_scale=2)
+    sim.set_field_transfer({"white_matter": 0.4, "gray_matter": 0.45, "csf": 0.86}, None)
+    pd = torch.linspace(0.0, 1.0, 32 * 32).reshape(1, 1, 32, 32)
+    sim._tissue_gain_field(pd)
+    table = sim._gain_tables[(pd.device, pd.dtype)]
+    sim._tissue_gain_field(pd)
+    assert sim._gain_tables[(pd.device, pd.dtype)] is table
+    sim.set_field_transfer({"white_matter": 1.0, "gray_matter": 2.0, "csf": 3.0}, None)
+    assert sorted(float(v) for v in sim._tissue_gain_field(pd).unique()) == [1.0, 2.0, 3.0]
 
 
 def test_marker_gain_is_declared_not_proxied() -> None:

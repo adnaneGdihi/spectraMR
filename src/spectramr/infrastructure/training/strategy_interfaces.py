@@ -12,6 +12,10 @@ import torch
 # Canonical IOptimizerStepper lives in interfaces.py — re-exported here for
 # backwards-compatibility so existing imports keep working.
 from spectramr.infrastructure.training.interfaces import IOptimizerStepper  # noqa: F401
+from spectramr.infrastructure.training.nonfinite_monitor import (
+    NonFiniteMonitor,
+    guard_nonfinite_loss,
+)
 
 
 class ILossComputer(ABC):
@@ -72,6 +76,10 @@ class IStepPolicy(ABC):
         step.
     ``owns_zero_grad``
         The policy zeroes gradients inside its own step. The executor must not.
+    ``owns_lr_scheduler``
+        The backend steps the LR scheduler it was handed inside its own step
+        (DeepSpeed does, at every accumulation boundary). The loop must not step
+        it again, or the schedule decays at twice the configured rate.
 
     Defaults are ``False``, so an existing policy that declares neither behaves
     exactly as before.
@@ -80,6 +88,7 @@ class IStepPolicy(ABC):
     #: See the class docstring. Read once by ``StepExecutor.__init__``.
     owns_gradient_accumulation: bool = False
     owns_zero_grad: bool = False
+    owns_lr_scheduler: bool = False
 
     def guard_loss(
         self,
@@ -88,24 +97,20 @@ class IStepPolicy(ABC):
         name: str,
         global_step: int,
         scaler: Any | None,
+        monitor: NonFiniteMonitor | None = None,
     ) -> None:
         """Reject a loss that must not be allowed to reach ``backward()``.
 
-        Default: fail fast on a non-finite loss when no ``GradScaler`` is in play.
-        Without a scaler, a non-finite loss produces non-finite gradients, which
-        ``clip_grad_norm_`` does NOT clamp, so ``optimizer.step()`` permanently
-        poisons the weights. Under AMP the scaler already skips inf/nan steps, so
-        this defers to it and avoids the per-step device sync.
+        Default: ``guard_nonfinite_loss`` -- defer to a ``GradScaler``, record
+        into the training loop's ``monitor`` (no sync; the loop stops on the
+        verdict), or, with no monitor, raise synchronously on a non-finite loss.
 
         Override to no-op when the backend has its own overflow handling --
-        raising here would kill runs it is designed to survive.
+        stopping here would kill runs it is designed to survive.
         """
-        if scaler is None and not torch.isfinite(loss).all():
-            raise RuntimeError(
-                f"Non-finite loss for config {name!r} at step {global_step} "
-                "before backward; refusing to poison weights (check coil maps / "
-                "fidelity terms)."
-            )
+        guard_nonfinite_loss(
+            loss, name=name, global_step=global_step, scaler=scaler, monitor=monitor
+        )
 
     @abstractmethod
     def clip_gradients(self, model: "torch.nn.Module", max_norm: float) -> None:

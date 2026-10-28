@@ -46,7 +46,7 @@ DATASET_CONFIGS = {
         "file_type": "h5",
     },
     "fastmri_brain_multicoil": {
-        "subpath": "brain/fastmri/multicoil_train/multicoil_train",
+        "subpath": "brain/fastmri/multicoil_train",
         "pattern": "**/*.h5",
         "manifest": "data/manifests/fastmri_brain_multicoil_train.json",
         "file_type": "h5",
@@ -112,6 +112,11 @@ def _reader_missing(package: str, suffix: str) -> str:
         "which loads without complaint and OOMs later at queue-build time.\n"
         f"Install it first:  pip install {package}"
     )
+
+
+def _attr_str(value: object) -> str:
+    """An HDF5 string attribute as ``str``; h5py returns ``bytes`` for fixed-length ones."""
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 def repetition_group_key(file_id: str) -> str:
     """The NEX group a file belongs to, by M4Raw's own naming convention.
@@ -207,6 +212,8 @@ def create_manifest(
     for p in files:
         try:
             shape = None
+            contrast = None
+            patient_id = None
             if p.suffix == ".h5":
                 # SystemExit is a BaseException, so it escapes the ``except
                 # Exception`` below rather than being downgraded to a per-file
@@ -222,6 +229,16 @@ def create_manifest(
                         shape = list(f["kspace"].shape)
                     elif "reconstruction_rss" in f:
                         shape = list(f["reconstruction_rss"].shape)
+                    # fastMRI names the protocol (AXT2, CORPD_FBK, ...) only here;
+                    # a contrast-conditioned arm maps it through contrast_map.
+                    acquisition = f.attrs.get("acquisition")
+                    if acquisition is not None:
+                        contrast = _attr_str(acquisition)
+                    # One fastMRI patient can own several volumes; the split
+                    # keeps them on one side (scripts/data/split_manifest.py).
+                    patient = f.attrs.get("patient_id")
+                    if patient is not None:
+                        patient_id = _attr_str(patient)
             elif ".nii" in p.name:
                 try:
                     import nibabel as nib
@@ -238,6 +255,10 @@ def create_manifest(
             }
             if shape is not None:
                 record["shape"] = shape
+            if contrast is not None:
+                record["contrast"] = contrast
+            if patient_id is not None:
+                record["patient_id"] = patient_id
 
             records.append(record)
         except Exception as e:

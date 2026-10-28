@@ -39,6 +39,8 @@ def _simple_model() -> torch.nn.Module:
 def _mock_config(teichmuller: TeichmullerTrainingConfigSchema | None) -> MagicMock:
     config = MagicMock()
     config.device = "cpu"
+    # No parallel block: a bare MagicMock would read as an unknown parallel.strategy.
+    config.parallel = None
     config.optimization = MagicMock()
     config.optimization.optimizer.learning_rate = 1e-3
     # schema defaults; bare MagicMock fails StandardOptimizerStepper's raise-on-unknown
@@ -185,3 +187,23 @@ def test_schema_rejects_unknown_knob() -> None:
 def test_schema_rejects_out_of_ball_r_max() -> None:
     with pytest.raises(Exception):
         TeichmullerTrainingConfigSchema(r_max=1.5)
+
+
+# ---------------------------------------------------------------------------
+# Owned state checkpoint round trip (#2629): the schedule head keeps its key.
+# ---------------------------------------------------------------------------
+def test_schedule_head_checkpoint_keys_and_round_trip() -> None:
+    torch.manual_seed(0)
+    cfg = TeichmullerTrainingConfigSchema(spatial_size=8, n_steps=6)
+    saved = _build_strategy(_simple_model(), teichmuller=cfg)
+    state = saved.strategy_state_dict()
+    # Registration must not move the head out of the checkpoint's "modules" entry.
+    assert set(state["modules"]) == {"schedule_head"}
+    assert set(state["modules"]["schedule_head"]) == set(saved.schedule_head.state_dict())
+    assert not any(k.startswith("module.") for k in state["modules"]["schedule_head"])
+
+    torch.manual_seed(1)
+    fresh = _build_strategy(_simple_model(), teichmuller=cfg)
+    fresh.load_strategy_state_dict(state)
+    for key, value in saved.schedule_head.state_dict().items():
+        assert torch.equal(fresh.schedule_head.state_dict()[key], value), key

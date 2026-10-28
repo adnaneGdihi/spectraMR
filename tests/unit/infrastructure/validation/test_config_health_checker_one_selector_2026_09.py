@@ -4,7 +4,7 @@
 and ``save_best`` consumes it. The other three do nothing —
 ``metrics.best_metric_name`` is read only by the witness check and the report,
 ``checkpoint.monitor``/``mode`` are swallowed by the block's ``extra="ignore"``
-(#2205), and ``CheckpointDirector._resolve_monitor_metric`` had zero callers.
+(#2205), and the pre-1.0 checkpoint director's ``_resolve_monitor_metric`` had zero callers.
 
 That last one was the dangerous one, which is why this module also pins its
 deletion. It tried ``metrics.best_metric_name`` FIRST, so wiring it — the
@@ -131,18 +131,19 @@ class TestTheModeIsComparedByValueNotRepr:
 class TestTheDeadResolverIsGone:
     """It is deleted, not wired: its precedence was the wrong way round."""
 
-    def test_checkpoint_director_no_longer_defines_it(self) -> None:
-        from spectramr.infrastructure.builders.directors import checkpoint_director
+    def test_no_checkpointing_module_defines_it(self) -> None:
+        from spectramr.infrastructure.checkpointing import capture, resume, store
 
-        assert not hasattr(checkpoint_director.CheckpointDirector, "_resolve_monitor_metric")
+        for module in (capture, store, resume):
+            assert not hasattr(module, "_resolve_monitor_metric"), module.__name__
 
     def test_nothing_reintroduces_a_best_metric_name_first_precedence(self) -> None:
         """The shape to keep out, not just the name."""
-        from spectramr.infrastructure.builders.directors import checkpoint_director
+        from spectramr.infrastructure.checkpointing import capture, resume, store
 
-        source = inspect.getsource(checkpoint_director)
-        body = source.split("# `_resolve_monitor_metric` was deleted here")[-1]
-        assert '("metrics", "best_metric_name")' not in body
+        for module in (capture, store, resume):
+            source = inspect.getsource(module)
+            assert '("metrics", "best_metric_name")' not in source, module.__name__
 
 
 class TestItIsInvokedByTheAudit:

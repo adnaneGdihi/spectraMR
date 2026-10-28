@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.precision_annotations import (
@@ -15,6 +16,10 @@ from spectramr.infrastructure.training.precision_annotations import (
     VQVAEPrecisionManager,
 )
 from spectramr.infrastructure.training.step_io import accepts_step_io
+from spectramr.models.losses.latent_orthogonality_loss import (
+    LatentOrthogonalityLoss,
+    latent_cross_covariance,
+)
 from spectramr.models.losses.computers import (
     UnifiedVAELossComputer,
     UnifiedVQVAELossComputer,
@@ -110,11 +115,40 @@ class VAETrainingStrategy(BaseTrainingStrategy):
         self.precision_manager = VAEPrecisionManager(device=self.device)
 
         self._setup_strategy_specific_components()
+        self._refuse_inconsistent_latent_knobs()
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize VAE-specific components and perform validation."""
         self._verify_strategy_config(expected_modes=("vae", "reconstruction"))
         self._log_config_features(self.logging_service)
+
+    def _orthogonality_loss(self) -> LatentOrthogonalityLoss | None:
+        """The declared ``latent_orthogonality`` term, if the arm has one."""
+        losses = getattr(self.env, "losses", None) if self.env else None
+        if not isinstance(losses, dict):
+            return None
+        found = [fn for fn in losses.values() if isinstance(fn, LatentOrthogonalityLoss)]
+        return found[0] if found else None
+
+    def _refuse_inconsistent_latent_knobs(self) -> None:
+        """A deterministic VAE needs a zero KL weight; the orthogonality term a batch of >= 2."""
+        gen = getattr(self.env, "generator", None) if self.env else None
+        model = getattr(gen, "module", gen)
+        if getattr(model, "deterministic", False) is True:
+            final_kl = self.loss_computer._get_loss_weight("kl", 0, iteration=2**31)
+            if final_kl > 0:
+                raise ValueError(
+                    f"model_kwargs.deterministic: true decodes z = mu, so the KL term (final "
+                    f"weight {final_kl}) only shrinks mu; set training.vae.kl_anneal_end: 0.0 "
+                    "and enable_kl_annealing: false for the deterministic-AE comparator."
+                )
+        if self._orthogonality_loss() is not None:
+            batch = int(self.config.data.loader.batch_size)
+            if batch < 2:
+                raise ValueError(
+                    f"latent_orthogonality is a batch cross-covariance and data.loader."
+                    f"batch_size={batch} gives it no second sample; use >= 2."
+                )
 
     def _compute_losses_impl(
         self,
@@ -169,7 +203,9 @@ class VAETrainingStrategy(BaseTrainingStrategy):
             # constant zero, so the "VAE" trained as a plain autoencoder with an
             # unregularised latent (a silent-fallback facade, pitfalls #9/#16). Ask
             # the model for its posterior before assuming it has none.
-            last_aux = getattr(self.env.generator, "last_aux", None)
+            # Read through unwrap_model: DDP/DP hide attributes, and last_aux() was
+            # set by the wrapper's forward on the inner module.
+            last_aux = getattr(unwrap_model(self.env.generator), "last_aux", None)
             aux = last_aux() if callable(last_aux) else None
 
             if (
@@ -399,6 +435,10 @@ class VAETrainingStrategy(BaseTrainingStrategy):
                 kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
                 metrics["kl_divergence"] = kl_loss
                 metrics["latent_std"] = torch.exp(0.5 * logvar).mean()
+            ortho = self._orthogonality_loss()
+            # A batch of 1 has no cross-covariance; that batch reports none.
+            if ortho is not None and mu.dim() == 2 and mu.shape[0] >= 2:
+                metrics["latent_orthogonality"] = latent_cross_covariance(mu.float(), ortho.split)
 
             return self._convert_metrics_to_floats(metrics)
 

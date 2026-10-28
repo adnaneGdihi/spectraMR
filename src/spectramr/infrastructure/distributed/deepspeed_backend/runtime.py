@@ -126,6 +126,8 @@ def initialize_deepspeed_engine(
     multipliers and ``resolve_scheduler_spec`` keep describing what actually ran.
     """
     deepspeed = require_deepspeed()
+    if config.get("compile", {}).get("deepcompile"):
+        _assert_deepcompile_supported(model)
     engine, ds_optimizer, _, ds_scheduler = deepspeed.initialize(
         model=model,
         optimizer=optimizer,
@@ -140,6 +142,36 @@ def initialize_deepspeed_engine(
     )
     _activate_deepcompile(engine, config)
     return engine, ds_optimizer, ds_scheduler
+
+
+def _deepcompile_device(model: Any) -> Any:
+    """The device this rank compiles on: the model's, else the current CUDA device."""
+    import torch
+
+    params = getattr(model, "parameters", None)
+    if callable(params):
+        first = next(iter(params()), None)
+        if first is not None:
+            return first.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _assert_deepcompile_supported(model: Any) -> None:
+    """Refuse DeepCompile on a GPU family Inductor cannot target, before ``initialize``.
+
+    DeepCompile lowers through Inductor (DeepSpeed's CUDA accelerator default), so
+    it inherits Triton's sm_70 floor; on a P100 the failure otherwise surfaces at
+    the first compiled step, after the allocation has been paid for.
+    """
+    from spectramr.core.compile_capability import compile_backend_for, triton_available
+    from spectramr.core.device_capabilities import capability_of_device
+
+    device = _deepcompile_device(model)
+    compile_backend_for(
+        device.type, triton=triton_available(), capability=capability_of_device(device)
+    )
 
 
 def _activate_deepcompile(engine: Any, config: dict[str, Any]) -> None:
@@ -193,6 +225,8 @@ class DeepSpeedStepPolicy(IStepPolicy):
 
     owns_gradient_accumulation = True
     owns_zero_grad = True
+    #: ``engine.step()`` steps the scheduler handed to ``deepspeed.initialize``.
+    owns_lr_scheduler = True
 
     def __init__(self, engines: dict[int, Any] | None = None) -> None:
         #: keyed by ``id(optimizer)`` so one policy can serve several engines
@@ -212,12 +246,12 @@ class DeepSpeedStepPolicy(IStepPolicy):
             )
         return engine
 
-    def guard_loss(self, loss, *, name, global_step, scaler) -> None:
+    def guard_loss(self, loss, *, name, global_step, scaler, monitor=None) -> None:
         """No-op: DeepSpeed's fp16 path has its own overflow detect + step skip.
 
-        Raising here would kill runs the engine is designed to survive -- an
-        overflowing micro-batch is an expected event under dynamic loss scaling,
-        not a corrupted one.
+        Raising here, or recording into the loop's ``monitor``, would kill runs
+        the engine is designed to survive -- an overflowing micro-batch is an
+        expected event under dynamic loss scaling, not a corrupted one.
         """
         return
 

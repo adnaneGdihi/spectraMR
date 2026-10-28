@@ -81,6 +81,10 @@ def _gen_adv_loss(loss_type: str, fake: torch.Tensor) -> torch.Tensor:
 class FieldCocycleTranslationStrategy(GANTrainingStrategy):
     """Adversarial cocycle-consistent unified cross-field translator (idea 4.2)."""
 
+    # parallel_compat: Calls generator.encode and generator.render outside the wrapped
+    # forward, so DDP/ZeRO reduce no gradient for them and FSDP reads a shard.
+    parallel_compat = frozenset()
+
     #: Loss ownership (mrixfields review 2026-09-03): folds the builder's other declared entries (calls the fold or the parent path).
     inline_losses: ClassVar[frozenset[str] | None] = frozenset(
         {"cocycle_consistency", "field_identity", "l1", "latent_cycle"}
@@ -485,8 +489,8 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
         metrics: dict[str, float] = {}
         if compute_img_metrics:
             try:
-                out_t, tgt_t = self._apply_metric_transforms(hr_fakes, target_batch, val_config)
-                metrics.update(self.validation_metrics_computer.compute(out_t, tgt_t))
+                views = self._metric_transform_views(hr_fakes, target_batch, val_config)
+                metrics.update(views.compute(self.validation_metrics_computer))
             except Exception as e:  # pragma: no cover - logged, non-fatal
                 if getattr(self, "logging_service", None):
                     self.logging_service.log_warning(f"Validation metrics failed: {e}")

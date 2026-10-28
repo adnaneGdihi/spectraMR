@@ -34,10 +34,14 @@ _LOCAL_RSS_NORMALISE = re.compile(
 _LOCAL_MAP_INTERPOLATE = re.compile(r"interpolate\(\s*smaps\.(real|imag)", re.MULTILINE)
 
 
+#: Shared entry points that reach the owner themselves; a consumer may call one of these.
+_OWNER_ROUTES = ("estimate_smaps_calibrated", "estimate_smaps_from_measurement")
+
+
 @pytest.mark.parametrize("module", CONSUMERS, ids=lambda m: m.__name__.rsplit(".", 1)[-1])
 def test_consumer_calls_the_owner(module) -> None:
     source = inspect.getsource(module)
-    assert "estimate_smaps_calibrated" in source, (
+    assert any(route in source for route in _OWNER_ROUTES), (
         f"{module.__name__} resolves coil maps without the owner; a second "
         "calibration order is a train/sample divergence nothing reports."
     )
@@ -78,10 +82,16 @@ def test_the_planted_patterns_match_the_retired_code() -> None:
 
 
 def test_owner_is_exported_and_shared() -> None:
-    """Both consumers bind the same object, not same-named local helpers."""
+    """Both consumers bind the shared objects, not same-named local helpers.
+
+    Predict reaches the owner through ``estimate_smaps_from_measurement`` (#2831), which
+    validation's measured-map scoring shares; that route must itself call the owner.
+    """
     assert "estimate_smaps_calibrated" in coil_sensitivity.__all__
+    assert diffusion.estimate_smaps_calibrated is coil_sensitivity.estimate_smaps_calibrated
     assert (
-        diffusion.estimate_smaps_calibrated
-        is cold_diffusion_inference_strategy.estimate_smaps_calibrated
-        is coil_sensitivity.estimate_smaps_calibrated
+        cold_diffusion_inference_strategy.estimate_smaps_from_measurement
+        is coil_sensitivity.estimate_smaps_from_measurement
     )
+    route = inspect.getsource(coil_sensitivity.estimate_smaps_from_measurement)
+    assert "estimate_smaps_calibrated(" in route

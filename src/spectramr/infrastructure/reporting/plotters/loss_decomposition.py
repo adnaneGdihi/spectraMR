@@ -13,6 +13,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from spectramr.infrastructure.reporting.legend import (
+    collect_handles,
+    reserve_legend_space,
+    shared_legend,
+    sparse_ticks,
+)
 from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figure, write_sidecar
 from spectramr.infrastructure.reporting.style import (
     OKABE_ITO,
@@ -72,14 +78,20 @@ def make(
         plt.close(fig)
         return None
     colours = [OKABE_ITO[i % len(OKABE_ITO)] for i in range(pivot.shape[1])]
-    ax.stackplot(
-        pivot.index,
-        pivot.T.values,
-        labels=[pretty_label(c) for c in pivot.columns],
-        colors=colours,
-        alpha=0.85,
-        linewidth=0,
-    )
+    if pivot.shape[1] == 1:
+        # one component is its own total: a line, not a stack with the same line over it
+        ax.plot(pivot.index, pivot.iloc[:, 0].values, color=colours[0], linewidth=0.9,
+                label=pretty_label(pivot.columns[0]))
+        total_metric = None
+    else:
+        ax.stackplot(
+            pivot.index,
+            pivot.T.values,
+            labels=[pretty_label(c) for c in pivot.columns],
+            colors=colours,
+            alpha=0.85,
+            linewidth=0,
+        )
 
     # Total overlay
     if total_metric is not None:
@@ -95,8 +107,9 @@ def make(
 
     ax.set_xlabel(pretty_label("step"))
     ax.set_ylabel("loss component")
-    ax.legend(frameon=False, fontsize=6, loc="upper right", ncol=2)
-    fig.tight_layout()
+    shared_legend(fig, *collect_handles([ax]))
+    sparse_ticks(ax)
+    fig.tight_layout(rect=(0, reserve_legend_space(fig), 1, 1))
     if metadata is not None:
         stamp_figure(fig, metadata)
     out_path = Path(out_path)

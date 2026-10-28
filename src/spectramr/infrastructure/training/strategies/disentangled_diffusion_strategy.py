@@ -27,6 +27,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_CALL
 from spectramr.infrastructure.physics.multi_physics_bloch import MultiPhysicsBlochLayer
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.step_io import accepts_step_io
@@ -48,6 +50,18 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
     is NOT the model input. The class says so and emits the real one under
     ``diffusion_step`` (cohort review 2026-09-02, T0.8).
     """
+
+    # parallel_compat: With lambda_bloch_dc > 0 the training loss calls generator.bloch outside
+    # the wrapped forward, which the call declaration refuses under ddp. ddpm_sample runs only
+    # in validation, where nothing is reduced; FSDP would read a shard there, so no "sharded".
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        model_kwargs = getattr(getattr(config, "model", None), "model_kwargs", None) or {}
+        bloch = float(model_kwargs.get("lambda_bloch_dc", 0.1)) > 0
+        own = (("generator.bloch", OWNED_CALL),) if bloch else ()
+        return (*super().owned_module_declarations(config), *own)
 
     snapshot_prepared_is_model_input: bool = False
     snapshot_model_input_tag: str | None = "diffusion_step"
@@ -141,7 +155,7 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
 
         # Sample random timesteps
         B = x.shape[0]
-        n_steps = generator.n_steps
+        n_steps = unwrap_model(generator).n_steps
         t = torch.randint(0, n_steps, (B,), device=device)
 
         # Compute DDPM schedule (linear beta schedule)
@@ -161,7 +175,9 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
         # Step 3: Predict noise via generator. Declare the tensor the model is
         # ACTUALLY fed (a dict-of-references stash; the snapshot service owns
         # enabled / interval / budget).
-        self._declare_model_input({"x_noisy": x_noisy, "timesteps": t})
+        self._declare_model_input(
+            {"x_noisy": x_noisy, "timesteps": t}, extra={"model_input_key": "x_noisy"}
+        )
         noise_pred = generator(x_noisy, timesteps=t)
 
         # Step 4: Primary loss — noise prediction via SSOT
@@ -179,10 +195,9 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
                 x_0_pred = x_0_pred.clamp(0, 1)
 
             # Synthesize via Bloch (requires tissue map → image)
-            if hasattr(generator, "bloch"):
-                synth = generator.bloch(x_0_pred)
-            else:
-                synth = x_0_pred  # Fallback: treat prediction as image
+            inner = self.inner_for_call(generator, "generator.bloch")
+            # Fallback (unchanged): without a bloch() the prediction is treated as the image.
+            synth = inner.bloch(x_0_pred) if hasattr(inner, "bloch") else x_0_pred
 
             # Target image (assumed to be the same as input for self-recon)
             target = batch.get("target", x)
@@ -263,8 +278,10 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
         }
 
         # Full DDPM sampling with Bloch DC
-        tissue_shape = (B, generator.tissue_channels, H, W)
-        tissue_dict = generator.ddpm_sample(
+        # Sampling reads the inner module: a DDP wrapper hides both, and no step follows.
+        inner = unwrap_model(generator)
+        tissue_shape = (B, inner.tissue_channels, H, W)
+        tissue_dict = inner.ddpm_sample(
             shape=tissue_shape,
             device=self.device,
             bloch_layer=self._bloch_layer,

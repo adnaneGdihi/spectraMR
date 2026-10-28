@@ -186,7 +186,11 @@ Errors (always block)
    * - ``loss_domain_consistency``
      - 1
      - ``losses.image_losses`` is non-empty but
-       ``losses.output_domain == "kspace"`` (or symmetric variants).
+       ``losses.output_domain == "kspace"`` (or symmetric variants). An image
+       arm's ``kspace_losses`` pass when each loss applies the forward operator
+       itself, or when the list is the one ``masked_kspace_l2`` an
+       Equivariant Imaging arm's ``measurement_target: alternate_repetition``
+       anchor calls on :math:`FS\hat x`.
    * - ``metric_channel_compatibility``
      - 1
      - ``metrics.compute_fid=true`` with non-3-channel output, or
@@ -211,7 +215,7 @@ Errors (always block)
        marker basis is declared or present locally.
    * - ``checkpoint_existence``
      - 1
-     - (VF plan CW-2) A declared ``checkpoint.resume_from`` /
+     - (VF plan CW-2) A declared ``training.distillation.teacher_checkpoint`` /
        ``model.checkpoint_path`` / ``*_basis_path`` / ``*_template_path``
        does not exist on disk. Warning severity (``--strict`` escalates),
        so an arm whose upstream artefact was never built is gated before
@@ -589,11 +593,13 @@ the warnings that *did* have a fix.
 The 2026-09-16 dispatch is the worked example. Neither
 ``experiment_11_kspace_cold_diffusion_radial`` nor ``_spiral`` ever launched —
 the dispatcher read the audit's exit 2 and skipped train — because
-``schedule.nesting_leakfree`` fires on every non-Cartesian cascade, and the
-witness's own fix hint (``undersampling.enforce_nested: true``) **raises** on
-those families: the cumulative intersection keeps 3.5 % of k-space at ``t=1``
-where radial's own draw kept 50 %, which ``sampling.py`` refuses as below
-``nested_tolerance``.
+``schedule.nesting_leakfree`` fired on both cascades, and the witness's own fix
+hint (``undersampling.enforce_nested: true``) **raised** on those families: the
+cumulative intersection kept 3.5 % of k-space at ``t=1`` where radial's own draw
+kept 50 %, which ``sampling.py`` refuses as below ``nested_tolerance``. The
+finding later turned out to have a fix (#612): radial and spiral are now prefixes
+of one golden-angle ordering, nest on their own, and carry no waiver. The
+mechanism is unchanged for a family that genuinely re-draws per timestep.
 
 So the arm acknowledges the finding by name, in its own YAML:
 
@@ -603,9 +609,9 @@ So the arm acknowledges the finding by name, in its own YAML:
      audit_waivers:
      - check: schedule.nesting_leakfree
        justification: >
-         RadialKSpaceAccelerator redraws its spoke set per level, so the cascade
-         cannot nest (#1573) and enforce_nested raises here. The leak is the
-         geometry this arm exists to measure.
+         This family re-draws its pattern per level, so the cascade cannot
+         nest and enforce_nested raises here. The leak is the geometry this
+         arm exists to measure.
 
 The finding is still printed in full, prefixed ``WAIVED`` and carrying the
 justification; only its contribution to the exit code is cleared. Name the check
@@ -1057,6 +1063,11 @@ advisory and what promotes them.
      - a declared ``data.source.test_index_path`` that shares a subject or file
        with the train or validation manifest (validation selects the checkpoint,
        so it is part of the training pool).
+   * - ``paired_route_holdout_site``
+     - error
+     - ``data.split.holdout_site`` with ``data.source.paired_manifest_path``: the
+       paired loader raises on it at load under every ``split.type``, because its
+       records carry subject ids, not sites. Declare a config-owned subject split.
    * - ``held_out_test_declared``
      - info (advisory)
      - a baseline / headline / reference arm with no held-out test set. Promoted
@@ -1103,12 +1114,33 @@ advisory and what promotes them.
      - error
      - ``training.enable_mixed_precision`` declared: no code path reads it and the
        run uses ``optimization.precision.enabled`` either way. Use the latter.
+   * - ``measurement_maps_need_coil_maps``
+     - error
+     - ``validation.scoring.measurement_maps`` is not ``off`` on a model validated
+       without coil maps (anything but ``kspace_cold_diffusion``), so the
+       ``_measmaps`` family it declares would never be produced.
+   * - ``kspace_backbone_kwargs_compatible``
+     - error
+     - a ``kspace_cold_diffusion`` arm whose ``model_kwargs`` its ``backbone_type``
+       cannot take: ``force_pure_kspace`` on an image-domain-DC backbone
+       (``diff_varnet*``, ``swin_diff_rec*``), ``kspace_feature_norm`` or
+       ``radial_band_tokens_bands`` off ``complex_unet``, band tokens without
+       ``force_pure_kspace``, a declared ``radial_band_tokens_rungs``, or a
+       misspelled ``radial_band_tokens_*`` key. The rules are
+       ``backbone_kwargs_defects`` in the generator module, which the constructor
+       raises on, so the audit and the build give one verdict (#2047).
    * - ``validation_metric_names_resolve``
      - error / info
-     - a name in ``validation.scoring.compute``, ``metrics.best_metric_name`` or
-       ``early_stopping.metric`` that is neither registered nor declared by the
-       strategy in ``capabilities.emitted_metrics``. Error when the strategy
-       declares its emitted set, an UNVERIFIED line when it does not.
+     - a selector in ``metrics.best_metric_name`` or ``early_stopping.metric``
+       that is neither registered nor declared by the strategy in
+       ``capabilities.emitted_metrics`` (a cascade suffix such as ``_4x`` may be
+       stripped). Error when the strategy declares its emitted set, an
+       UNVERIFIED line when it does not. ``val_loss`` resolves without a
+       declaration only on a strategy whose ``validation_step`` is not
+       ``MetricsMixin.validation_step``, since that default returns registry
+       keys alone (#2838). ``validation.scoring.compute`` belongs
+       to ``health:metric_names_are_registered``, which applies the runtime's
+       own predicate, ``core.metrics.validation_names`` (#2819).
 
 Two existing detectors changed in the same review: a schedule-certification
 witness that does not apply now returns an INFO skip instead of a warning that

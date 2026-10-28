@@ -214,26 +214,10 @@ class TestRegistryIntegrity:
         scanner.scan_directory(models_path)
         return scanner
 
-    # Names that are intentionally registered BOTH in the per-file
-    # baseline implementation AND the v6.1 metadata manifest
-    # (src/models/_v6_1_registrations.py). The manifest enrichment is a
-    # known design point — the last-write-wins behaviour of the
-    # registry promotes the enriched (input_domain, output_domain,
-    # accepts_complex) record over the bare per-file one.
-    KNOWN_DUAL_REGISTERED = {
-        "cdiffmr_baseline",
-        "shen2024_baseline",
-        "fdb_baseline",
-    }
-
     def test_no_duplicate_registrations(self, scanner):
         """Verify no model name is registered twice (except known dual sites)."""
         duplicates = scanner.get_duplicates()
-        unexpected = {
-            name: locs
-            for name, locs in duplicates.items()
-            if name not in self.KNOWN_DUAL_REGISTERED
-        }
+        unexpected = dict(duplicates)
 
         if unexpected:
             error_msg = "Found duplicate model registrations:\n"

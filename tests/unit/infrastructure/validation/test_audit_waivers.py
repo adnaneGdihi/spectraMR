@@ -2,9 +2,9 @@
 
 The key sat in the corpus with no reader until the 2026-09-16 run made the cost
 visible: ``experiment_11_kspace_cold_diffusion_radial`` and ``_spiral`` never
-launched, because ``schedule.nesting_leakfree`` warns on every non-Cartesian
-cascade and the witness's own fix hint (``enforce_nested: true``) RAISES on those
-families. ``audit --strict`` exits 2 on a warning and the dispatcher skips train,
+launched, because ``schedule.nesting_leakfree`` warned on both cascades and the
+witness's own fix hint (``enforce_nested: true``) raised on those families (both
+nest since #612, and the arms no longer carry the waiver). ``audit --strict`` exits 2 on a warning and the dispatcher skips train,
 so the arm was unrunnable without ``--allow-warnings``, which CLAUDE.md forbids.
 
 Each test here plants one shape the mechanism must handle, including the three

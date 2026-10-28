@@ -157,3 +157,48 @@ def test_default_contrast_id_collapses_to_single_sigma() -> None:
     assert grad[0].item() != 0.0
     # log_sigma[1] never participates -> zero grad.
     assert grad[1].item() == 0.0
+
+
+def _reference_loop(
+    loss: MaskedUncertaintyMultiContrastLoss,
+    per_sample_l1: torch.Tensor,
+    cid: torch.Tensor,
+) -> torch.Tensor:
+    """The per-contrast Python loop the scatter-add path replaces."""
+    total = per_sample_l1.new_zeros(())
+    present = 0
+    for c in range(loss.n_contrasts):
+        sel = cid == c
+        if not bool(sel.any()):
+            continue
+        present += 1
+        log_sigma_c = loss.log_sigma[c]
+        precision = (-2.0 * log_sigma_c).exp().clamp_min(loss.eps)
+        total = total + 0.5 * precision * per_sample_l1[sel].mean() + log_sigma_c
+    return total / present if loss.reduction == "mean" else total
+
+
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("cid_list", [[0, 1, 2, 0, 1], [2, 2, 2, 2, 2], [0, 2, 0, 2, 0]])
+def test_scatter_add_path_matches_the_per_contrast_loop(
+    reduction: str, cid_list: list[int]
+) -> None:
+    g = torch.Generator().manual_seed(3)
+    pred = torch.randn(5, 1, 6, 6, generator=g, dtype=torch.float64, requires_grad=True)
+    target = torch.randn(5, 1, 6, 6, generator=g, dtype=torch.float64)
+    mask = (torch.randn(5, 1, 6, 6, generator=g) > 0).to(torch.float64)
+    cid = torch.tensor(cid_list)
+    loss = MaskedUncertaintyMultiContrastLoss(n_contrasts=3, reduction=reduction).double()
+    with torch.no_grad():
+        loss.log_sigma.copy_(torch.tensor([0.3, -0.2, 0.7], dtype=torch.float64))
+
+    out = loss(pred, target, mask=mask, contrast_id=cid)
+    grad_pred, grad_sigma = torch.autograd.grad(out, (pred, loss.log_sigma))
+
+    per_sample = ((pred - target).abs() * mask).flatten(1).sum(1) / mask.flatten(1).sum(1)
+    ref = _reference_loop(loss, per_sample, cid)
+    ref_grad_pred, ref_grad_sigma = torch.autograd.grad(ref, (pred, loss.log_sigma))
+
+    torch.testing.assert_close(out, ref)
+    torch.testing.assert_close(grad_pred, ref_grad_pred)
+    torch.testing.assert_close(grad_sigma, ref_grad_sigma)

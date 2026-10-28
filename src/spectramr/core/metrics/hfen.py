@@ -82,6 +82,9 @@ class HFENMetric:
         """
         self._kernel = _log_kernel(kernel_size, sigma)
         self._pad = kernel_size // 2
+        # A pageable host-to-device copy is a sync, so the kernel is uploaded once
+        # per (device, dtype) rather than on every call.
+        self._kernel_cache: dict[tuple[torch.device, torch.dtype], Tensor] = {}
 
     @property
     def name(self) -> str:
@@ -107,7 +110,11 @@ class HFENMetric:
         ``"shape ... invalid for input of size N"`` warning observed in
         the 2026-05-14 smoke run.
         """
-        kernel = self._kernel.to(device=x.device, dtype=x.dtype)
+        key = (x.device, x.dtype)
+        kernel = self._kernel_cache.get(key)
+        if kernel is None:
+            kernel = self._kernel.to(device=x.device, dtype=x.dtype)
+            self._kernel_cache[key] = kernel
 
         # Promote rank to at least 4D.
         if x.dim() == 2:
@@ -140,7 +147,7 @@ class HFENMetric:
         prediction: Tensor,
         target: Tensor,
         **kwargs,
-    ) -> float:
+    ) -> Tensor:
         """Compute HFEN.
 
         Args:
@@ -148,7 +155,8 @@ class HFENMetric:
             target: Ground truth ``(B, C, H, W)``.
 
         Returns:
-            Scalar HFEN value (lower = better).
+            0-d tensor on the input's device (lower = better). It stays on the
+            device so the metrics computer's fused host transfer is the only sync.
         """
         # Handle complex inputs → magnitude
         if torch.is_complex(prediction):
@@ -159,10 +167,10 @@ class HFENMetric:
         pred_log = self._apply_log(prediction)
         tgt_log = self._apply_log(target)
 
-        numer = (pred_log - tgt_log).abs().sum()
+        numerator = (pred_log - tgt_log).abs().sum()
         denom = tgt_log.abs().sum() + 1e-8
 
-        return (numer / denom).item()
+        return numerator / denom
 
 
 __all__ = ["HFENMetric"]

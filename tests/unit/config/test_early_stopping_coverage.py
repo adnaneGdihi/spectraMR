@@ -26,7 +26,6 @@ class TestEarlyStoppingSchemaCoverage:
         "min_delta",
         "metric",
         "mode",
-        "check_interval",
     }
 
     # Technical debt: Schema fields defined but never referenced by the service

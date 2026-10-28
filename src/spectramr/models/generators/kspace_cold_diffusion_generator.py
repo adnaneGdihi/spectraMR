@@ -30,18 +30,21 @@ This generator now supports optional integration of three physics-informed compo
 
 import inspect
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.physics.data_consistency import (
     VALID_DC_METHODS,
     AdaptiveDataConsistency,
     HardDataConsistency,
     NoiseAdaptiveDataConsistency,
+    NoiseAdjustedDataConsistency,
     SimpleDataConsistency,
     SoftDataConsistency,
     TargetAwareFSDC,
@@ -51,10 +54,12 @@ from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c, sense_adjoin
 from spectramr.infrastructure.physics.kan_data_consistency import (
     KANAdaptiveDataConsistency,
 )
+from spectramr.infrastructure.physics.wiener_gain_dc import WienerGainDataConsistency
 from spectramr.models.blocks.activation import ComplexActivation
 from spectramr.models.blocks.attention import (
     CBAMSpatialAttention,
     ChannelAttention,
+    ComplexChannelAttention,
     IdentityAtInitAttention,
     KernelizedAttention,
     LinearAttention,
@@ -66,6 +71,11 @@ from spectramr.models.blocks.attention_domains import (
     complex_to_interleaved,
     validate_feature_domain,
 )
+from spectramr.models.blocks.complex_channel_gain import ComplexChannelGain
+from spectramr.models.blocks.contrast_conditioning import (
+    expand_contrast_over_slices,
+    fuse_contrast_embedding,
+)
 from spectramr.models.blocks.dual_domain import DualDomainBlock
 from spectramr.models.blocks.dual_domain_attention import DualDomainAttention
 from spectramr.models.blocks.dual_domain_attention_kan import (
@@ -75,18 +85,36 @@ from spectramr.models.blocks.dual_domain_attention_kan import (
 from spectramr.models.blocks.hermitian_null_space_attention import (
     HermitianNullSpaceAttention,
 )
+from spectramr.models.blocks.kspace_geometry_encoding import (
+    KSPACE_GEOMETRY_CHANNELS,
+    as_interleaved_complex,
+    kspace_geometry_channels,
+    measurement_support,
+    resolve_geometry_planes,
+)
 from spectramr.models.blocks.null_space_attention import NullSpaceDualDomainAttention
 from spectramr.models.blocks.radial_band_gain import DEFAULT_MAX_LOG_GAIN, RadialBandGain
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 from spectramr.models.generators.backbone_builders import (
     BackboneBuildContext,
     build_backbone,
     registered_backbone_names,
 )
+from spectramr.models.generators.kspace_line_tokens import LINE_AXES, LINE_BACKBONES
+from spectramr.models.generators.option_parsing import parse_enum_option
+from spectramr.models.generators.reference_conditioning import (
+    prepend_reference,
+    resolve_reference_channels,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.registry import register_model
 from spectramr.models.utils.shape_validator import validate_5d_or_4d_tensor
+from spectramr.models.generators.kan_param_groups import (
+    build_kan_param_groups,
+    resolve_kan_param_group_ratios,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +226,151 @@ def config_expects_smaps_concat(model_kwargs: Mapping[str, Any] | None) -> bool:
         backbone_type=str(kw.get("backbone_type", DEFAULT_BACKBONE_TYPE)),
         condition_with_smaps=bool(kw.get("condition_with_smaps", DEFAULT_CONDITION_WITH_SMAPS)),
     )
+
+
+#: The radial-band-token knobs an arm may declare. ``radial_band_tokens_rungs`` is
+#: deliberately absent: the generator derives it from the timestep count.
+_RADIAL_BAND_TOKEN_KNOBS = frozenset(
+    {"radial_band_tokens_bands", "radial_band_tokens_dim", "radial_band_tokens_max_log"}
+)
+
+
+#: The model_kwargs each transformer backbone's builder reads (besides ``heads``).
+_TRANSFORMER_KNOBS: dict[str, frozenset[str]] = {
+    "dit": frozenset({"depth", "patch_size", "mlp_ratio"}),
+    "uvit": frozenset({"depth", "patch_size", "mlp_ratio"}),
+    "diffit": frozenset({"depth", "patch_size", "mlp_ratio"}),
+    "hat": frozenset({"depth", "window_size", "cab_weight"}),
+}
+_TRANSFORMER_ALIASES = {"u_vit": "uvit"}
+
+
+def _transformer_knob_defects(backbone_type: str, kw: Mapping[str, Any]) -> list[str]:
+    """Inert and misspelt knobs for dit/uvit/diffit/hat, which absorb unknown keys."""
+    import difflib
+
+    name = _TRANSFORMER_ALIASES.get(backbone_type, backbone_type)
+    own = _TRANSFORMER_KNOBS.get(name)
+    if own is None:
+        return []
+    out: list[str] = []
+    others = frozenset().union(*_TRANSFORMER_KNOBS.values()) - own
+    inert = sorted(k for k in kw if k in others)
+    if inert:
+        out.append(f"{inert} are never read by backbone_type={backbone_type!r}.")
+    known = (
+        own
+        | others
+        | set(inspect.signature(KSpaceColdDiffusionGenerator.__init__).parameters)
+        | {"heads", "max_timesteps"}
+    )
+    for key in sorted(k for k in kw if k not in known):
+        near = difflib.get_close_matches(key, sorted(own | {"heads"}), n=1, cutoff=0.75)
+        if near:
+            out.append(f"model_kwargs.{key} is not read by backbone_type={backbone_type!r}; did you mean {near[0]!r}?")
+    return out
+
+
+def _accepts_timesteps(backbone: nn.Module) -> bool:
+    """True when ``backbone.forward`` names a ``timesteps`` parameter (exact name, not a substring)."""
+    return "timesteps" in inspect.signature(backbone.forward).parameters
+
+
+def backbone_kwargs_defects(model_kwargs: Mapping[str, Any] | None) -> list[str]:
+    """Every ``backbone_type`` x ``model_kwargs`` incompatibility in an arm, as messages.
+
+    **The one owner of these rules** (CLAUDE.md #17). The constructor raises on the
+    first entry; the audit witness ``kspace_backbone_kwargs_compatible`` reports all
+    of them from the frozen config, without building the model. Before #2047 the
+    rules lived only in the constructor, so ``audit --strict`` passed four arms that
+    then died at generator construction. Absent keys take the constructor's defaults.
+    """
+    kw = dict(model_kwargs or {})
+    backbone_type = str(kw.get("backbone_type", DEFAULT_BACKBONE_TYPE))
+    force_pure_kspace = bool(kw.get("force_pure_kspace", False))
+    feature_norm = kw.get("kspace_feature_norm", "none")
+    bands = kw.get("radial_band_tokens_bands", 0)
+    defects: list[str] = []
+
+    if "radial_band_tokens_rungs" in kw:
+        defects.append(
+            "radial_band_tokens_rungs is derived from the process's timestep count, "
+            "not declared. Remove it; model_kwargs.timesteps already owns that fact."
+        )
+    unknown = sorted(
+        k
+        for k in kw
+        if k.startswith("radial_band_tokens")
+        and k not in _RADIAL_BAND_TOKEN_KNOBS
+        and k != "radial_band_tokens_rungs"
+    )
+    if unknown:
+        defects.append(
+            f"Unrecognised radial band token knob(s) {unknown}. This constructor "
+            "absorbs **kwargs, so a misspelled knob runs as the control in silence."
+        )
+
+    if "kspace_geometry_planes" in kw:
+        if backbone_type in KSpaceColdDiffusionGenerator._GEOMETRY_EXEMPT_BACKBONES:
+            defects.append(
+                f"kspace_geometry_planes applies only to backbones built with geometry "
+                f"planes, not backbone_type={backbone_type!r}."
+            )
+        try:
+            resolve_geometry_planes(kw["kspace_geometry_planes"])
+        except ValueError as exc:
+            defects.append(str(exc))
+
+    line_knobs = sorted(k for k in kw if k.startswith("line_ax") or k == "line_axes")
+    if backbone_type in LINE_BACKBONES:
+        if line_knobs not in ([], ["line_axis"]):
+            defects.append(f"Unrecognised line-token knob(s) {line_knobs}; the knob is 'line_axis'.")
+        elif "line_axis" in kw and kw["line_axis"] not in LINE_AXES:
+            defects.append(f"line_axis={kw['line_axis']!r}; expected one of {LINE_AXES}.")
+        inert = sorted(k for k in ("patch_size", "window_size", "cab_weight") if k in kw)
+        if inert:
+            defects.append(
+                f"{inert} are patch/window knobs that backbone_type={backbone_type!r} never "
+                "reads: it tokenises whole k-space lines (see line_axis)."
+            )
+    elif line_knobs:
+        defects.append(f"line_axis applies only to the line-token backbones, not {backbone_type!r}.")
+
+    defects.extend(_transformer_knob_defects(backbone_type, kw))
+
+    if backbone_type != "complex_unet":
+        if str(feature_norm).lower() != "none":
+            defects.append(
+                f"kspace_feature_norm={feature_norm!r} applies only to "
+                f"backbone_type='complex_unet', not {backbone_type!r}."
+            )
+        if bands:
+            defects.append(
+                f"radial_band_tokens_bands={bands} applies only to "
+                f"backbone_type='complex_unet', not {backbone_type!r}: no other "
+                "backbone exposes a per-up-step seam for it."
+            )
+    elif bands and not force_pure_kspace:
+        defects.append(
+            "radial_band_tokens_bands needs force_pure_kspace: true -- the annuli are "
+            "k-space annuli, and without it the decoder's feature maps are images."
+        )
+
+    # The bridge is the single owner of domain conversion: force_pure_kspace skips
+    # its entry ifft2c, so an image-domain DC backbone would FFT k-space a second time
+    # and enforce DC in the wrong domain with no shape error. A pure-k-space VarNet
+    # needs a k-space-native DC operator, which is a new component, not a flag.
+    if force_pure_kspace and backbone_type in KSpaceColdDiffusionGenerator._IMAGE_DOMAIN_DC_BACKBONES:
+        defects.append(
+            f"backbone_type={backbone_type!r} performs data consistency "
+            "internally on IMAGE-domain tensors (its MaskedReplacementDataConsistency "
+            "FFTs its own input), so force_pure_kspace=true would hand it "
+            "k-space and cause a second forward transform -- DC applied in "
+            "the wrong domain. Set model_kwargs.force_pure_kspace: false so "
+            "FourierBridgeNetwork performs the entry ifft2c, or choose "
+            "backbone_type: 'complex_unet', which is k-space-native."
+        )
+    return defects
 
 
 class ChannelAdapter(nn.Module):
@@ -605,9 +778,11 @@ class KSpaceDownsampleBlock(nn.Module):
             )
 
         # Time embedding projection
-        self.time_proj = None
+        self.time_gain = None
         if time_embedding_dim is not None:
-            self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_embedding_dim, out_channels))
+            self.time_gain = ComplexChannelGain(
+                time_embedding_dim, out_channels, interleaved=use_complex_conv
+            )
 
         # Adapter for DualDomainBlock channel matching
         if in_channels != out_channels:
@@ -670,7 +845,13 @@ class KSpaceDownsampleBlock(nn.Module):
         elif attention_type == "sparse":
             self.attention = SparseAttention(out_channels, zero_init_output=False)
         elif attention_type == "channel":
-            self.attention = ChannelAttention(out_channels)
+            # Interleaved complex features need one gain per complex channel; a
+            # per-real-channel gate scales Re and Im differently and rotates phase.
+            self.attention = (
+                ComplexChannelAttention(out_channels)
+                if use_complex_conv
+                else ChannelAttention(out_channels)
+            )
         elif attention_type == "dual_domain":
             self.attention = DualDomainAttention(out_channels, feature_domain=self.feature_domain)
         elif attention_type == "null_space_dual_domain":
@@ -761,14 +942,9 @@ class KSpaceDownsampleBlock(nn.Module):
         """
         x = self.adapter(x)
 
-        # Inject time embedding (MULTIPLICATIVE for K-Space: prevents spatial impulse)
-        if self.time_proj is not None and t_emb is not None:
-            emb = self.time_proj(t_emb)
-            # Scale embeddings to stable range: (1.0 + emb/scale) stays near 1.0
-            emb = emb / 10.0
-            while emb.dim() < x.dim():
-                emb = emb.unsqueeze(-1)
-            x = x * (1.0 + emb)  # FiLM: multiplicative instead of additive
+        # Phase-preserving multiplicative conditioning (see ComplexChannelGain).
+        if self.time_gain is not None:
+            x = self.time_gain(x, t_emb)
 
         x = self.unet_block(x, t_emb)
         skip = x  # Save for skip connection
@@ -852,9 +1028,11 @@ class KSpaceUpsampleBlock(nn.Module):
                 padding_mode=padding_mode,
             )
 
-        self.time_proj = None
+        self.time_gain = None
         if time_embedding_dim is not None:
-            self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_embedding_dim, out_channels))
+            self.time_gain = ComplexChannelGain(
+                time_embedding_dim, out_channels, interleaved=use_complex_conv
+            )
 
         # Reduce channels after concatenation (out_channels + out_channels -> out_channels)
         if use_complex_conv:
@@ -888,7 +1066,13 @@ class KSpaceUpsampleBlock(nn.Module):
         elif attention_type == "sparse":
             self.attention = SparseAttention(out_channels, zero_init_output=False)
         elif attention_type == "channel":
-            self.attention = ChannelAttention(out_channels)
+            # Interleaved complex features need one gain per complex channel; a
+            # per-real-channel gate scales Re and Im differently and rotates phase.
+            self.attention = (
+                ComplexChannelAttention(out_channels)
+                if self.use_complex_conv
+                else ChannelAttention(out_channels)
+            )
         elif attention_type == "spatial":
             self.attention = CBAMSpatialAttention(
                 7
@@ -1000,14 +1184,9 @@ class KSpaceUpsampleBlock(nn.Module):
         # Reduce and process
         x = self.adapter(x)
 
-        # Inject time embedding (MULTIPLICATIVE for K-Space: prevents spatial impulse)
-        if self.time_proj is not None and t_emb is not None:
-            emb = self.time_proj(t_emb)
-            # Scale embeddings to stable range: (1.0 + emb/scale) stays near 1.0
-            emb = emb / 10.0
-            while emb.dim() < x.dim():
-                emb = emb.unsqueeze(-1)
-            x = x * (1.0 + emb)  # FiLM: multiplicative instead of additive
+        # Phase-preserving multiplicative conditioning (see ComplexChannelGain).
+        if self.time_gain is not None:
+            x = self.time_gain(x, t_emb)
 
         x = self.unet_block(x, t_emb)
 
@@ -1088,10 +1267,9 @@ class FourierBridgeNetwork(nn.Module):
         }
 
         # ``kspace_feature_norm`` and the radial-band-token knobs are gated by
-        # KSpaceColdDiffusionGenerator._gate_complex_unet_knobs, which is the one
-        # owner: it runs before EITHER backbone branch, where a gate sited here
-        # missed the PureKSpaceUNet one entirely. A direct caller of this class
-        # is a Python caller, not a config, and carries its own kwargs.
+        # :func:`backbone_kwargs_defects`, which runs before EITHER backbone branch;
+        # a gate sited here missed the PureKSpaceUNet one entirely. A direct caller
+        # of this class is a Python caller, not a config, and carries its own kwargs.
         if backbone_type != "complex_unet":
             base_clean_kwargs.pop("kspace_feature_norm", None)
 
@@ -1264,7 +1442,7 @@ class FourierBridgeNetwork(nn.Module):
 
             embed_dim = config.features[0]
             h0 = max(1, embed_dim // 16)
-            default_heads = (h0,) * 4
+            depths = tuple(base_clean_kwargs.pop("depths", (6, 6, 6, 6)))
 
             self.backbone = SwinIRGenerator(
                 in_channels=config.in_channels,
@@ -1272,8 +1450,8 @@ class FourierBridgeNetwork(nn.Module):
                 in_chans=config.in_channels,
                 img_size=img_size_int,
                 embed_dim=embed_dim,
-                depths=base_clean_kwargs.pop("depths", (6, 6, 6, 6)),
-                num_heads=base_clean_kwargs.pop("num_heads", default_heads),
+                depths=depths,
+                num_heads=base_clean_kwargs.pop("num_heads", (h0,) * len(depths)),
                 window_size=base_clean_kwargs.pop("window_size", 8),
                 **base_clean_kwargs,
             )
@@ -1346,17 +1524,12 @@ class FourierBridgeNetwork(nn.Module):
             # PhaseSafeDualAttention expects in_channels=1 (one complex channel)
             num_heads = backbone_kwargs.get("phase_safe_attention_num_heads", 1)
             reduction = backbone_kwargs.get("phase_safe_attention_reduction", 1)
-            # OOM cap on the dense spatial-attention matrix. Default 4096
-            # tokens (64x64) keeps the [B, N, N] softmax ~134 MiB even when
-            # the feature map is 256x256. See PhaseSafeDualAttention.
-            max_tokens = backbone_kwargs.get("phase_safe_attention_max_tokens", 4096)
             # in_channels should be config.out_channels // 2 for complex data (1 complex = 2 real)
             attention_in_channels = max(1, config.out_channels // 2)
             self.phase_safe_attention = PhaseSafeDualAttention(
                 in_channels=attention_in_channels,
                 num_heads=num_heads,
                 reduction=reduction,
-                max_tokens=max_tokens,
             )
         else:
             self.phase_safe_attention = None
@@ -1403,6 +1576,9 @@ class FourierBridgeNetwork(nn.Module):
         Returns:
             Same shape as input (kspace_input)
         """
+        # Real [N, K, H, W] planes the generator built; never forwarded to the backbone.
+        geometry = kwargs.pop("geometry", None)
+
         # ✅ Validate input shape
         input_is_5d_flag, original_shape_check = validate_5d_or_4d_tensor(
             kspace_input, name="FourierBridgeNetwork input"
@@ -1543,6 +1719,23 @@ class FourierBridgeNetwork(nn.Module):
             stacked = torch.stack([real, imag], dim=2)  # (B, C, 2, H, W)
             image_input = stacked.permute(0, 1, 2, 3, 4).contiguous()
             image_input = image_input.view(B, C * 2, H, W)  # (B, 2*C, H, W)
+
+        # Appended AFTER the entry transform: the planes describe the k-space grid
+        # in either domain, and joining as (plane, 0) pairs keeps the Re/Im pairing
+        # of every channel before them.
+        geometry_as_gain = getattr(self.backbone, "geometry_gain", None) is not None
+        if geometry is not None:
+            if geometry.shape[0] != image_input.shape[0]:
+                raise ValueError(
+                    f"[FourierBridgeNetwork] geometry batch {geometry.shape[0]} does not "
+                    f"match the backbone input batch {image_input.shape[0]}."
+                )
+        if geometry is not None and geometry_as_gain:
+            kwargs["geometry"] = geometry
+        elif geometry is not None:
+            image_input = torch.cat(
+                [image_input, as_interleaved_complex(geometry).to(image_input.dtype)], dim=1
+            )
 
         # 3. BACKBONE PROCESSING
         # [WIDTH CONTRACT] The backbone was built for exactly
@@ -1832,7 +2025,7 @@ class PureKSpaceUNet(nn.Module):
                     ),  # Phase-safe activation instead of nn.SiLU (Trabelsi et al. 2018)
                 )
             )
-            self.time_projs.append(nn.Linear(time_embedding_dim, f * 2))
+            self.time_projs.append(ComplexChannelGain(time_embedding_dim, f * 2))
             cin = f
 
         self.decoder = nn.ModuleList()
@@ -1842,7 +2035,7 @@ class PureKSpaceUNet(nn.Module):
         features_rev = features[::-1]
         for i, f in enumerate(features_rev[:-1]):
             target_f = features_rev[i + 1]
-            self.decoder_time_projs.append(nn.Linear(time_embedding_dim, target_f * 2))
+            self.decoder_time_projs.append(ComplexChannelGain(time_embedding_dim, target_f * 2))
             self.decoder.append(
                 nn.Sequential(
                     ComplexConv2d(f, target_f, 3, padding=1, padding_mode="circular", bias=False),
@@ -1892,27 +2085,16 @@ class PureKSpaceUNet(nn.Module):
         else:
             t_emb = None
 
-        # Contrast conditioning: additively fuse contrast embedding into time embedding for DECODER
-        contrast_emb = kwargs.get("contrast_emb")
-        combined_emb = t_emb
-        if contrast_emb is not None:
-            # Fix batch mismatch: contrast_emb may have training batch size
-            # while t_emb has validation batch size during cascading validation
-            if t_emb is not None and contrast_emb.shape[0] != t_emb.shape[0]:
-                contrast_emb = contrast_emb[: t_emb.shape[0]]
-            combined_emb = (t_emb + contrast_emb) if t_emb is not None else contrast_emb
+        # The contrast conditions the encoder as well as the decoder: a decoder-only
+        # contrast leaves every skip feature contrast-blind.
+        combined_emb = fuse_contrast_embedding(
+            t_emb, kwargs.get("contrast_emb"), owner="PureKSpaceUNet"
+        )
 
         skips = []
         for i, block in enumerate(self.encoder):
             x = block(x)
-
-            # Inject time embedding (MULTIPLICATIVE for K-Space: prevents spatial impulse)
-            if t_emb is not None:
-                t_proj = self.time_projs[i](t_emb)
-                # Scale embeddings to stable range: (1.0 + emb/scale) stays near 1.0
-                t_proj = t_proj / 10.0
-                t_proj = t_proj.view(t_proj.shape[0], -1, 1, 1)
-                x = x * (1.0 + t_proj)  # FiLM: multiplicative instead of additive
+            x = self.time_projs[i](x, combined_emb)
 
             skips.append(x)
             x = self.pooling(x)
@@ -1923,14 +2105,7 @@ class PureKSpaceUNet(nn.Module):
             x = self.upsample(x, target_shape=skip.shape[-2:])
             x = x + skip
             x = block(x)
-
-            # Inject combined embedding (time + contrast) (MULTIPLICATIVE for K-Space)
-            if combined_emb is not None:
-                t_proj = self.decoder_time_projs[i](combined_emb)
-                # Scale embeddings to stable range: (1.0 + emb/scale) stays near 1.0
-                t_proj = t_proj / 10.0
-                t_proj = t_proj.view(t_proj.shape[0], -1, 1, 1)
-                x = x * (1.0 + t_proj)  # FiLM: multiplicative instead of additive
+            x = self.decoder_time_projs[i](x, combined_emb)
 
         x = self.upsample(x)
         x = x + skips[0]
@@ -1943,8 +2118,39 @@ from spectramr.infrastructure.physics.sense import SENSESubspaceProjector
 #: Data-consistency methods that pin CARTESIAN bins, and so have no correct
 #: reading under an off-grid acquisition.
 GRID_DC_METHODS: frozenset[str] = frozenset(
-    {"hard", "soft", "noise_adaptive", "target_aware_fsdc", "kan_adaptive"}
+    {
+        "hard",
+        "soft",
+        "adaptive",
+        "noise_adaptive",
+        "noise_adjusted",
+        "target_aware_fsdc",
+        "kan_adaptive",
+        "wiener_gain",
+    }
 )
+
+#: Data-consistency methods whose blend is defined on LINEAR k-space, so they need
+#: the arm's log1p-compression flag.
+LINEAR_DOMAIN_DC_METHODS: frozenset[str] = frozenset(
+    {"soft", "noise_adaptive", "noise_adjusted", "target_aware_fsdc", "wiener_gain"}
+)
+
+#: A model built under a non-default timestep scale carries the buffer
+#: ``timestep_embedding_scale_<scale>``; a default-scale model carries none.
+_DEFAULT_T_SCALE = "unit_interval"
+_T_SCALE_MARKER_PREFIX = "timestep_embedding_scale_"
+
+#: Backbones whose private sinusoid takes the raw step and ignores ``timestep_embedding_scale``.
+_RAW_STEP_BACKBONES = frozenset({"unet", "nafnet"})
+
+#: Architecture version stamped into every state dict as a buffer. Version 2:
+#: phase-preserving per-complex-channel timestep gain in the k-space blocks, a
+#: conditioned bottleneck, contrast conditioning in the encoder, and the k-space
+#: geometry planes on every backbone input.
+KSPACE_GENERATOR_ARCH_VERSION = 2
+KSPACE_GENERATOR_ARCH_VERSION_KEY = "kspace_generator_arch_version"
+
 
 @register_model(
     name="kspace_cold_diffusion",
@@ -2016,6 +2222,13 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
     # ``force_pure_kspace: true`` reach the swin backbones unchecked.
     _INTERNAL_DC_BACKBONES: frozenset[str] = frozenset({"diff_varnet", "diff_varnet_kan"})
 
+    #: Backbones built without the k-space geometry planes. The internal-DC
+    #: unrolled networks iterate on their input as the reconstruction state and
+    #: hold no input stem, so an appended plane would be iterated as k-space and
+    #: compared against the measurement; conditioning them needs a path inside the
+    #: unrolled block, which they do not have.
+    _GEOMETRY_EXEMPT_BACKBONES: frozenset[str] = _INTERNAL_DC_BACKBONES
+
     #: Backbones whose internal ``MaskedReplacementDataConsistency`` consumes an
     #: IMAGE-domain tensor and FFTs it itself
     #: (``physics/data_consistency_layer.py`` step 1). Membership is the DOMAIN
@@ -2028,7 +2241,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
     #: harmless for WIDTH -- but neither file contains a single ``fft2c`` /
     #: ``torch.fft`` call, so whatever domain the bridge hands them is the
     #: domain their DC receives. ``swin_diff_rec``'s own comment states the
-    #: precondition: "DC requires: image, measured_kspace, mask".
+    #: precondition: "DC requires: image, measured_kspace, mask". The guard that
+    #: reads this set is :func:`backbone_kwargs_defects`.
     _IMAGE_DOMAIN_DC_BACKBONES: frozenset[str] = frozenset(
         {"diff_varnet", "diff_varnet_kan", "swin_diff_rec", "swin_diff_rec_kan"}
     )
@@ -2072,6 +2286,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             "u_vit",
             "hat",
             "diffit",
+            "kspace_ar",
+            "kspace_masked",
         }
     )
 
@@ -2082,7 +2298,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         base_channels: int = 64,
         num_layers: int = 4,
         attention_type: str | None = None,
-        num_timesteps: int = 1000,
+        num_timesteps: int | None = None,
+        sampling_steps: int | None = None,
         time_embedding_dim: int = 256,
         time_embedding_type: str = "sinusoidal",
         training_mode: str | None = None,
@@ -2091,6 +2308,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         acceleration_config: dict | None = None,
         kspace_log_scaled: bool | None = None,
         device: "torch.device | str | None" = None,
+        phase_encode_axis: int | None = None,
         **kwargs,
     ):
         """__init__.
@@ -2101,7 +2319,11 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             base_channels (int): Description.
             num_layers (int): Description.
             attention_type (str): Description.
-            num_timesteps (int): Description.
+            num_timesteps (int | None): The diffusion horizon T; the builder
+                injects training.diffusion.timesteps. Also accepted as ``timesteps``.
+            sampling_steps (int | None): Reverse steps of :meth:`sample`; the builder
+                injects training.diffusion.sampling_steps, and ``None`` takes
+                ``resolve_sampling_steps``'s logged default (#566).
             time_embedding_dim (int): Description.
             time_embedding_type (str): Description.
             training_mode (str | None): Description.
@@ -2125,6 +2347,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 ``KSpaceUndersamplingProcess`` so its mask generator serves from
                 a device-resident table; ``None`` leaves the historical CPU
                 behaviour and its per-step host sync (#1508).
+            phase_encode_axis: ``data.acquisition.phase_encode_axis``, injected
+                by ``resolve_generator_kwargs``; ``mask_direction: phase``
+                resolves through it and raises without it (#2160).
         """
         super().__init__()
 
@@ -2132,21 +2357,12 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         if "num_res_blocks" in kwargs:
             num_layers = kwargs.pop("num_res_blocks")
 
-        # Bind the YAML ``model_kwargs.timesteps`` knob to ``num_timesteps``
-        # (the time-embedding's ``max_timesteps`` divisor passed to the
-        # backbone). The config exposes the diffusion horizon as ``timesteps``
-        # (== training.diffusion.timesteps), but this constructor's parameter
-        # is ``num_timesteps`` — so a bare ``timesteps=28`` silently fell into
-        # **kwargs and ``num_timesteps`` stayed 1000. The backbone then divided
-        # t in [1, 27] by 1000, collapsing the sinusoidal time embedding (code
-        # separation ~1200x smaller) so FiLM ``x*(1+emb)`` was timestep-blind —
-        # the cold-diffusion conditioning no-op behind the Experiment-11 DC
-        # blob (the model was ~30x less timestep-sensitive, worst at 32x).
-        # Bind it; RAISE on a conflicting explicit num_timesteps (no silent
-        # fallback, CLAUDE.md pitfall #9).
+        # ``model_kwargs.timesteps`` and ``num_timesteps`` name one horizon, the
+        # mask ladder's length and the time embedding's divisor; two differing
+        # values raise, with None (not 1000) as the "not given" marker.
         if "timesteps" in kwargs:
             _ts = int(kwargs.pop("timesteps"))
-            if num_timesteps != 1000 and num_timesteps != _ts:
+            if num_timesteps is not None and num_timesteps != _ts:
                 raise ValueError(
                     "KSpaceColdDiffusionGenerator received conflicting "
                     f"num_timesteps={num_timesteps} and timesteps={_ts}; they "
@@ -2154,10 +2370,15 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     "exactly one (prefer model_kwargs.timesteps)."
                 )
             num_timesteps = _ts
+        if num_timesteps is None:
+            # Only direct construction lands here: the builder injects
+            # training.diffusion.timesteps on every configured path.
+            num_timesteps = DEFAULT_DIFFUSION_TIMESTEPS
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.num_timesteps = num_timesteps
+        self.reference_channels = resolve_reference_channels(kwargs)
 
         # [PHYSICS INTEGRATION] Repetition (NEX) Fusion -- OPT-IN, not universal.
         #
@@ -2206,7 +2427,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         )
 
         accel_config = acceleration_config or kwargs.get("acceleration_config", {})
-        process_kwargs = resolve_undersampling_kwargs(accel_config, kwargs)
+        process_kwargs = resolve_undersampling_kwargs(
+            accel_config, kwargs, phase_encode_axis=phase_encode_axis
+        )
         self.center_fraction = process_kwargs["center_fraction"]
 
         acceleration_params = kwargs.get("acceleration_params", {})
@@ -2228,17 +2451,6 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         from spectramr.models.diffusion.forward_process_registry import (
             build_forward_process,
         )
-
-        # Cross-contrast prior support: when the model is fed a paired
-        # k-space tensor like ``[T1 || T2]``, declaring
-        # ``prior_channel_range=(0, n_t1_channels)`` tells the diffusion
-        # forward process to keep T1 fully sampled while T2 is degraded.
-        # Validated by the audit's ``model_loss_output_domain`` and the
-        # cross-contrast YAML's ``model.model_kwargs.prior_channel_range``.
-        prior_channel_range = kwargs.get("prior_channel_range")
-        if prior_channel_range is not None and not isinstance(prior_channel_range, tuple):
-            # YAML round-trips list — coerce.
-            prior_channel_range = tuple(prior_channel_range)
 
         # ``device`` is the run's already-resolved compute device, injected by
         # ``resolve_generator_kwargs`` step 3d because this constructor names it
@@ -2264,6 +2476,18 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 f"none of them. Declare kspace_process_type explicitly or drop "
                 f"the knobs (non-negotiable 8)."
             )
+        # Training-time forward noise is read by the Cartesian process only; declared on
+        # any other process it would be inert, so refuse it (non-negotiable 8).
+        forward_noise = {
+            key: kwargs[key] for key in ("forward_noise_sigma", "forward_noise_schedule") if key in kwargs
+        }
+        if forward_noise and process_type != "cartesian_mask":
+            raise ValueError(
+                f"{sorted(forward_noise)} are read only by the cartesian_mask forward process, "
+                f"and kspace_process_type is {process_type!r}. Drop the knobs or declare "
+                "kspace_process_type: cartesian_mask."
+            )
+        extra_process_kwargs.update(forward_noise)
         if process_type != "cartesian_mask":
             # The trajectory is built for one matrix size and the process raises
             # on a mismatch at the first forward. Take the size from the arm
@@ -2278,10 +2502,12 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             if isinstance(declared, int):
                 declared = (declared, declared)
             extra_process_kwargs["im_size"] = tuple(declared)
+            # An off-grid process resamples through a NUFFT, which does not commute
+            # with log1p compression, so it must know the plane is compressed (#2341).
+            extra_process_kwargs["kspace_log_scaled"] = bool(kspace_log_scaled)
         self.kspace_process = build_forward_process(
             process_type,
             num_timesteps=num_timesteps,
-            prior_channel_range=prior_channel_range,
             device=device,
             **process_kwargs,
             **extra_process_kwargs,
@@ -2309,7 +2535,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 f"sample-domain consistency term on this arm instead."
             )
         self._dc_weight = float(kwargs.get("dc_weight", 1.0))
-        self._sampling_steps = int(kwargs.get("sampling_steps", 50))
+        from spectramr.models.diffusion.kspace_process import resolve_sampling_steps
+
+        self._sampling_steps = resolve_sampling_steps(sampling_steps, num_timesteps)
         self._sampler_name = str(
             kwargs.get("sampler") or kwargs.get("inference_sampler") or "cold_mri"
         )
@@ -2332,12 +2560,60 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             VALID_REVERSE_MODES,
         )
 
+        # How the backbone maps t before its sinusoid (#2315). The default keeps
+        # the codes existing checkpoints were trained on; validated at build.
+        from spectramr.models.blocks.timestep_embedding import validate_timestep_scale
+
+        self._timestep_embedding_scale = validate_timestep_scale(
+            str(kwargs.get("timestep_embedding_scale", _DEFAULT_T_SCALE))
+        )
+        # These two embed the raw step index with a private sinusoid and never read the scale, so a
+        # declared non-integer scale would be stamped on a checkpoint the model never used.
+        _declared_scale = kwargs.get("timestep_embedding_scale")
+        _backbone_kind = str(kwargs.get("backbone_type", DEFAULT_BACKBONE_TYPE))
+        if (
+            _backbone_kind in _RAW_STEP_BACKBONES
+            and _declared_scale is not None
+            and self._timestep_embedding_scale != "integer"
+        ):
+            raise ConfigurationError(
+                f"backbone_type={_backbone_kind!r} embeds the raw integer step and ignores "
+                f"timestep_embedding_scale={_declared_scale!r}. Declare 'integer' (what it "
+                "computes) or use complex_unet, which honours the scale."
+            )
+        # A checkpoint's time_mlp is fitted to one scale; the marker travels in
+        # the state dict so the hook below refuses a load under any other.
+        if self._timestep_embedding_scale != _DEFAULT_T_SCALE:
+            self.register_buffer(
+                _T_SCALE_MARKER_PREFIX + self._timestep_embedding_scale, torch.ones(1)
+            )
+        self.register_load_state_dict_pre_hook(self._refuse_mismatched_timestep_scale)
+        # Version 2 changed the k-space block conditioning and widened every
+        # backbone input; the stamp lets a version-1 checkpoint fail by name.
+        self.register_buffer(
+            KSPACE_GENERATOR_ARCH_VERSION_KEY,
+            torch.tensor(KSPACE_GENERATOR_ARCH_VERSION, dtype=torch.long),
+        )
+        self.register_load_state_dict_pre_hook(self._refuse_other_arch_version)
         self._reverse_mode = str(kwargs.get("reverse_sampling_mode", "additive"))
         if self._reverse_mode not in VALID_REVERSE_MODES:
             raise ValueError(
                 f"Unknown reverse_sampling_mode {self._reverse_mode!r}. "
                 f"Valid: {sorted(VALID_REVERSE_MODES)}."
             )
+        from spectramr.models.diffusion.reverse_refine import validate_refine_alpha
+
+        self._refine_alpha = validate_refine_alpha(
+            self._reverse_mode, kwargs.get("reverse_refine_alpha")
+        )
+        from spectramr.models.diffusion.reverse_integrity import validate_integrity_check
+
+        self._integrity_check = validate_integrity_check(kwargs.get("reverse_integrity_check"))
+        from spectramr.models.diffusion.reverse_physics import resolve_reverse_physics_kwargs
+
+        self._reverse_physics = resolve_reverse_physics_kwargs(
+            self._reverse_mode, str(self._dc_method), kwargs
+        )
         self._reverse_clip_ratio = float(kwargs.get("reverse_clip_ratio", 4.0))
         if not (self._reverse_clip_ratio > 0):
             raise ValueError(f"reverse_clip_ratio must be > 0, got {self._reverse_clip_ratio!r}.")
@@ -2356,6 +2632,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 f"Valid: {sorted(VALID_CLIP_REFERENCES)}."
             )
 
+        # Read by the forward process at build (above) and by the reverse loop through it;
+        # the exclusivity with ``sampler_sigma`` is checked here so the build fails, not sample().
+        self._forward_noise_sigma = float(self.kspace_process.forward_noise_sigma) if process_type == "cartesian_mask" else 0.0
         # C6 sampler-determinism knobs: ``sampler_sigma`` / ``sampler_seed`` /
         # ``selection_rule``. Read from model_kwargs here, validated at BUILD
         # through the SAME function both samplers use, and forwarded to the
@@ -2373,6 +2652,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         self._sampler_seed = None if _sampler_seed is None else int(_sampler_seed)
         self._selection_rule = str(kwargs.get("selection_rule", "fixed"))
         validate_sampler_determinism(self._sampler_sigma, self._selection_rule)
+        from spectramr.models.diffusion.kspace_process import validate_forward_noise_exclusive
+
+        validate_forward_noise_exclusive(self._forward_noise_sigma, self._sampler_sigma)
 
         # Set by :meth:`sample` from the per-call sampler before it is discarded.
         # ``None`` means no reverse sampling has run on this generator yet, or
@@ -2463,33 +2745,27 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # features list: [base, base*2, base*4...]
         features = tuple(base_channels * (2**i) for i in range(num_layers))
 
-        # Robust String-to-Enum Conversion
-        # Normalization Type
-        raw_norm = kwargs.get("norm_type", "group")
-        try:
-            norm_enum = NormalizationType(raw_norm.lower())
-        except ValueError:
-            norm_enum = NormalizationType.GROUP
+        # An unknown option raises: degrading to GROUP / STANDARD would train a different network
+        # than the YAML declares (non-negotiable 3).
+        norm_enum = parse_enum_option(
+            NormalizationType, kwargs.get("norm_type", "group"), "norm_type"
+        )
+        block_enum = parse_enum_option(BlockType, kwargs.get("block_type", "standard"), "block_type")
 
-        # Block Type
-        raw_block = kwargs.get("block_type", "standard")
-        try:
-            block_enum = BlockType(raw_block.lower())
-        except ValueError:
-            block_enum = BlockType.STANDARD
+        # backbone_type x model_kwargs legality has one owner, which the audit also
+        # runs on the frozen config (#2047). It sits before EITHER backbone branch:
+        # the ``force_pure_kspace and backbone_type == 'unet'`` branch below builds
+        # PureKSpaceUNet directly and never constructs the bridge.
+        defects = backbone_kwargs_defects(kwargs)
+        if defects:
+            raise ValueError(defects[0])
 
         force_pure_kspace = kwargs.pop("force_pure_kspace", False)
         backbone_type = kwargs.pop("backbone_type", DEFAULT_BACKBONE_TYPE)
         self.backbone_type = backbone_type
+        geometry_planes = resolve_geometry_planes(kwargs.pop("kspace_geometry_planes", None))
 
-        # [COMPLEX_UNET-ONLY KNOBS] One owner for "which backbone may carry these".
-        # It sits HERE, not in FourierBridgeNetwork, because the
-        # ``force_pure_kspace and backbone_type == 'unet'`` branch below builds
-        # PureKSpaceUNet directly and never constructs the bridge -- so the gate
-        # that lived there was bypassed, and an arm declaring
-        # ``kspace_feature_norm: rms`` on that branch got zero ComplexRMSNorm
-        # modules with nothing reporting it.
-        self._gate_complex_unet_knobs(kwargs, backbone_type, force_pure_kspace)
+        self._gate_complex_unet_knobs(kwargs, backbone_type)
 
         # F-SPADE (2026-05-24 smoke_audit_20260524): fail loud on a silent
         # SPADE fallback. ``SPADEBlock`` / ``SPADEEncoder``
@@ -2574,10 +2850,32 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # every smaps-conditioned cold-diffusion arm -- a diagnostic crying wolf
         # across most of the cohort, which is how a check gets muted rather than
         # read.
+        # The reference is excluded: ``forward`` concatenates it after the
+        # ``model_input`` this attribute describes, so only the build adds it.
         self.backbone_in_channels = backbone_in_channels
+        # Geometry planes join after the reference and the entry transform, as
+        # (plane, 0) complex pairs, so they widen the build but not the published
+        # model-input width above.
+        self.kspace_geometry_planes = (
+            () if backbone_type in self._GEOMETRY_EXEMPT_BACKBONES else geometry_planes
+        )
+        self.kspace_geometry_channels = len(self.kspace_geometry_planes)
+        geometry_width = 2 * self.kspace_geometry_channels
+        # A pure-k-space complex_unet takes the planes as a per-bin gain: as input
+        # channels they are a measurement-independent k-space term, which is the
+        # centre dot and centre-row line in its output (KSpaceGeometryGain).
+        if "kspace_geometry_gain_planes" in kwargs:
+            raise ValueError(
+                "kspace_geometry_gain_planes is derived from kspace_geometry_planes and "
+                "the backbone; declare kspace_geometry_planes instead."
+            )
+        if self.kspace_geometry_channels and backbone_type == "complex_unet" and force_pure_kspace:
+            kwargs["kspace_geometry_gain_planes"] = self.kspace_geometry_channels
+            geometry_width = 0
 
         unet_config = UNetConfig(
-            in_channels=backbone_in_channels,  # noisy + smaps when conditioning enabled
+            # noisy + smaps when conditioning enabled, the source reference, geometry
+            in_channels=backbone_in_channels + self.reference_channels + geometry_width,
             out_channels=out_channels,  # Output image channels
             features=features,
             depth=num_layers,
@@ -2589,36 +2887,6 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             block_type=block_enum,
             use_residual=True,
         )
-
-        # Domain guard for the internal-DC backbones. ``DiffVarNet`` unrolls
-        # ``x_{k+1} = DC(x_k + CNN(x_k))`` and its ``MaskedReplacementDataConsistency`` takes
-        # an IMAGE and FFTs it internally (physics/data_consistency_layer.py:44).
-        # ``force_pure_kspace=true`` tells FourierBridgeNetwork to skip the entry
-        # ``ifft2c``, so the backbone would receive k-space and the DC layer would
-        # transform it a SECOND time -- data consistency enforced in the wrong
-        # domain, silently. Verified live: with kspace_measured + mask supplied,
-        # all 5 MaskedReplacementDataConsistency instances fire (forward-hook count), so this
-        # is a live path and not a dormant branch.
-        #
-        # The bridge is the single owner of domain conversion (canonical homes),
-        # so the fix is to let it do its job rather than teach the backbone to
-        # convert as a second owner. A genuinely pure-k-space VarNet would need a
-        # k-space-native DC operator; that is a new component, not a flag.
-        # Keys on the DOMAIN set, not the width set. It used to key on
-        # ``_INTERNAL_DC_BACKBONES``, which is scoped to channel width, so the
-        # swin backbones -- image-domain DC, no FFT anywhere in either file --
-        # slipped past and enforced data consistency on a doubly-transformed
-        # tensor with no error at all.
-        if force_pure_kspace and backbone_type in self._IMAGE_DOMAIN_DC_BACKBONES:
-            raise ValueError(
-                f"backbone_type={backbone_type!r} performs data consistency "
-                "internally on IMAGE-domain tensors (its MaskedReplacementDataConsistency "
-                "FFTs its own input), so force_pure_kspace=true would hand it "
-                "k-space and cause a second forward transform -- DC applied in "
-                "the wrong domain. Set model_kwargs.force_pure_kspace: false so "
-                "FourierBridgeNetwork performs the entry ifft2c, or choose "
-                "backbone_type: 'complex_unet', which is k-space-native."
-            )
 
         if force_pure_kspace and backbone_type == "unet":
             # PureKSpaceUNet is specialized for unet structure in K-Space.
@@ -2643,7 +2911,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             # Phase 5: Pass config-driven reflect padding parameter
             num_bottleneck_reflect_pad_layers = kwargs.get("reflect_padding_bottleneck_layers", 2)
             self.backbone = PureKSpaceUNet(
-                in_channels=backbone_in_channels,
+                in_channels=backbone_in_channels + self.reference_channels + geometry_width,
                 out_channels=out_channels,
                 features=features,
                 time_embedding_dim=time_embedding_dim,
@@ -2779,10 +3047,31 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 f"caused the experiment_11 'DC blob' regression."
             )
 
+        # Blend-based layers compute on LINEAR k-space; replacement (hard) commutes with
+        # the log1p compression and needs no flag.
+        if (
+            self.use_dc
+            and self.dc_method in LINEAR_DOMAIN_DC_METHODS
+            and self._kspace_log_scaled is None
+        ):
+            raise ValueError(
+                f"dc_method={self.dc_method!r} blends on linear k-space but "
+                "kspace_log_scaled was never declared; pass it from "
+                "data.processing.enable_log_scaling."
+            )
+        dc_log_scaled = bool(self._kspace_log_scaled)
+
         if not self.use_dc:
             self.dc_layer = None
-        elif self.dc_method == "soft" or self.dc_method == "noise_adjusted":
-            self.dc_layer = SoftDataConsistency(lambda_init=self.dc_weight)
+        elif self.dc_method == "soft":
+            self.dc_layer = SoftDataConsistency(
+                lambda_init=self.dc_weight, log_scaled=dc_log_scaled
+            )
+        elif self.dc_method == "noise_adjusted":
+            # One Wiener trust per sample from its noise level (dc_weight is beta).
+            self.dc_layer = NoiseAdjustedDataConsistency(
+                beta=self.dc_weight, log_scaled=dc_log_scaled
+            )
         elif self.dc_method == "adaptive":
             self.dc_layer = AdaptiveDataConsistency()
         elif self.dc_method == "kan_adaptive":
@@ -2792,7 +3081,15 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             # Closed-form Wiener/SNR trust: denoise the low-field measured lines
             # (dc_weight is the trust temperature β). No learned per-pixel map, so
             # no CNN-adaptive blob risk. See NoiseAdaptiveDataConsistency.
-            self.dc_layer = NoiseAdaptiveDataConsistency(beta=self.dc_weight)
+            self.dc_layer = NoiseAdaptiveDataConsistency(
+                beta=self.dc_weight, log_scaled=dc_log_scaled
+            )
+        elif self.dc_method == "wiener_gain":
+            # Wiener trust plus a closed-form gain fit, both on LINEAR k-space, so
+            # the layer must know whether this arm's plane is log1p-compressed.
+            self.dc_layer = WienerGainDataConsistency(
+                log_scaled=dc_log_scaled, beta=self.dc_weight
+            )
         elif self.dc_method == "hard":
             # No weight argument, deliberately: hard DC REPLACES the acquired
             # bins ((1 - m) * recon + m * obs), which is weight 1.0 by
@@ -2805,9 +3102,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 noise_type=self.dc_noise_type,
             )
         elif self.dc_method == "target_aware_fsdc":
-            # TA-FSDC needs the TRUE target channel count (from data config),
-            # NOT out_channels which includes source+target.
-            dc_target_ch = kwargs.get("target_channels", out_channels // 2)
+            # Every output channel is the target: a source contrast reaches the
+            # model as ``reference`` and never enters the diffusion state.
+            dc_target_ch = out_channels
             # ``ta_fsdc_acs_taper`` opt-in (audit-2026-05-14 §1 round-5):
             # set ``None`` (legacy hard rectangle) or ``"hann"`` (Hann-tapered
             # ACS edge). The Hann taper mitigates the "white spot" central
@@ -2820,6 +3117,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 center_fraction=self.center_fraction,
                 hf_lambda=self.dc_weight,
                 acs_taper=kwargs.get("ta_fsdc_acs_taper"),
+                log_scaled=dc_log_scaled,
             )
         else:
             self.dc_layer = SimpleDataConsistency(
@@ -2832,6 +3130,10 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
 
         # [PHYSICS INTEGRATION] Orthogonal Projection onto True Spatial Manifold
         self.sense_projector = SENSESubspaceProjector()
+        self.last_backbone_output: torch.Tensor | None = None
+        self.last_backbone_projected: torch.Tensor | None = None
+        #: ``(fraction, mean overshoot)`` of the output clamp on the last training forward.
+        self.last_clip_stats: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # [DC PASSTHROUGH] Hardcoded centre-patch skip-connect.
         # The CNN should not be reconstructing the DC bin (or its
@@ -2891,14 +3193,11 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     f"got {self._dc_passthrough_size}"
                 )
 
-        # KAN parameter group config — used by get_differential_lr_param_groups.
-        # The plan calls for KAN params to train at a reduced LR with reduced
-        # weight decay because B-spline coefficient gradient scales differ from
-        # standard linear weights. Disabled by default; opt in via
-        # model_kwargs.kan_lr_ratio (LR multiplier, e.g. 0.1) and
-        # model_kwargs.kan_weight_decay_ratio (WD multiplier, e.g. 0.1).
-        self._kan_lr_ratio = float(kwargs.get("kan_lr_ratio", 1.0))
-        self._kan_weight_decay_ratio = float(kwargs.get("kan_weight_decay_ratio", 1.0))
+        # B-spline coefficients train at a reduced LR / weight decay because their
+        # gradient scales differ from linear weights; ratio 1.0 (default) is inert.
+        self._kan_lr_ratio, self._kan_weight_decay_ratio = resolve_kan_param_group_ratios(kwargs)
+        # Filled when the optimizer builds its groups; train.py stamps it into provenance.
+        self.kan_param_group_record: dict[str, Any] | None = None
 
         # Bind attention blocks now that all sub-modules are registered.
         # Must happen at the end of __init__ (not lazily in forward) so that
@@ -2986,7 +3285,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 updated += 1
         return updated
 
-    def get_kan_trust_map_telemetry(self) -> dict[str, float]:
+    def get_kan_trust_map_telemetry(self) -> dict[str, torch.Tensor]:
         """Return the most-recent KAN ADC trust-map summary statistics.
 
         Reports four values: mean trust at the central 8% of k-space (DC
@@ -3001,64 +3300,59 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             KANAdaptiveDataConsistency,
         )
 
+        # Values are 0-d device tensors (cloned, since the buffer is rewritten in
+        # place by the next forward); the training loop's fused host transfer is
+        # the only sync (#1448).
         if isinstance(self.dc_layer, KANAdaptiveDataConsistency):
-            stats = self.dc_layer._last_trust_stats.detach().tolist()
-            return {
-                "kan_trust/center": float(stats[0]),
-                "kan_trust/periphery": float(stats[1]),
-                "kan_trust/mean": float(stats[2]),
-                "kan_trust/std": float(stats[3]),
-            }
-        if isinstance(self.dc_layer, NoiseAdaptiveDataConsistency):
+            prefix = "kan_trust"
+        elif isinstance(self.dc_layer, NoiseAdaptiveDataConsistency):
             # Same [center, periphery, mean, std] trust layout; surfaced so the
             # DC shootout can watch for a blob (center≈1, periphery≈1 with a dark
             # output) vs healthy denoising (center high, periphery low).
-            stats = self.dc_layer._last_trust_stats.detach().tolist()
-            return {
-                "noise_adaptive_trust/center": float(stats[0]),
-                "noise_adaptive_trust/periphery": float(stats[1]),
-                "noise_adaptive_trust/mean": float(stats[2]),
-                "noise_adaptive_trust/std": float(stats[3]),
-            }
-        return {}
+            prefix = "noise_adaptive_trust"
+        else:
+            return {}
+        stats = self.dc_layer._last_trust_stats.detach().clone()
+        names = ("center", "periphery", "mean", "std")
+        out = {f"{prefix}/{name}": stats[i] for i, name in enumerate(names)}
+        if isinstance(self.dc_layer, WienerGainDataConsistency):
+            out["wiener_gain/alpha"] = self.dc_layer._last_gain.detach().clone()
+        return out
 
-    def get_kan_gate_telemetry(self) -> dict[str, float]:
+    def get_kan_gate_telemetry(self) -> dict[str, torch.Tensor]:
         """Aggregate the most-recent KAN gate values across all blocks.
 
         Each ``KANGatedDualDomainAttention`` instance writes its last batch's
         gate means into a 3-element ``_last_gates`` buffer ``(g_img, g_kspace,
         g_cross)``. This method averages across all blocks in the network and
-        returns a flat dict suitable for direct logging:
-
-            >>> generator.get_kan_gate_telemetry()
-            {'kan_gate/img': 0.48, 'kan_gate/kspace': 0.51, 'kan_gate/cross': 0.49,
-             'kan_gate/img_active_blocks': 7}
+        returns a flat dict of 0-d device tensors, keyed ``kan_gate/img``,
+        ``kan_gate/kspace``, ``kan_gate/cross`` and ``kan_gate/img_active_blocks``
+        (the block count). Nothing here syncs; the caller transfers them to the
+        host with the rest of its metrics, at its log interval.
 
         Returns an empty dict if no KAN attention blocks are present.
-
-        Wiring guidance: strategies or callbacks with access to a logger
-        should call this after the optimizer step (e.g. inside the
-        validation hook) and forward the values to the metrics tracker.
         """
         from spectramr.models.blocks.dual_domain_attention_kan import (
             KANGatedDualDomainAttention,
         )
 
-        sums = torch.zeros(3)
-        count = 0
-        for module in self.modules():
-            if isinstance(module, KANGatedDualDomainAttention):
-                gates = module._last_gates.detach().to(sums.device, dtype=sums.dtype)
-                sums += gates
-                count += 1
-        if count == 0:
+        gates = [
+            m._last_gates.detach().float()
+            for m in self.modules()
+            if isinstance(m, KANGatedDualDomainAttention)
+        ]
+        if not gates:
             return {}
-        means = (sums / count).tolist()
+        # Reduced on the gates' own device; a host-side accumulator forced one
+        # sync per block, and .tolist() another (#1448).
+        means = torch.stack(gates).mean(dim=0)
         return {
-            "kan_gate/img": float(means[0]),
-            "kan_gate/kspace": float(means[1]),
-            "kan_gate/cross": float(means[2]),
-            "kan_gate/img_active_blocks": int(count),
+            "kan_gate/img": means[0],
+            "kan_gate/kspace": means[1],
+            "kan_gate/cross": means[2],
+            "kan_gate/img_active_blocks": torch.full(
+                (), float(len(gates)), device=means.device
+            ),
         }
 
     def get_differential_lr_param_groups(
@@ -3066,63 +3360,37 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         base_lr: float,
         weight_decay: float,
     ) -> list[dict]:
-        """Return AdamW-style parameter groups with KAN params on a separate LR.
+        """Return AdamW-style parameter groups with the B-spline coefficients on a separate LR.
 
-        OptimizerBuilder calls this if it's defined on the model. We split
-        parameters into two groups:
-
-        * 'kan': any parameter that lives inside a ``KANLayer``,
-          ``KANGatedDualDomainAttention``, or ``KANAdaptiveDataConsistency``
-          submodule. Trained at ``base_lr * kan_lr_ratio`` and
-          ``weight_decay * kan_weight_decay_ratio``.
-        * 'main': everything else, at the unmodified ``base_lr`` /
-          ``weight_decay``.
-
-        When both ratios are 1.0 (default), this degenerates to a single
-        group equivalent to plain ``model.parameters()`` — but we still
-        return distinct groups so the optimizer state is structurally
-        consistent regardless of the ratio choice.
+        OptimizerBuilder calls this if it's defined on the model. The 'kan' group
+        holds exactly the ``spline_weight`` of every ``KANLayer`` (including those
+        inside ``KANAdaptiveDataConsistency``), trained at ``base_lr * kan_lr_ratio``
+        and ``weight_decay * kan_weight_decay_ratio``; 'main' holds everything else,
+        base weights, gates and attention projections included. The group's size and
+        fraction of the trainable model are kept on ``kan_param_group_record``.
         """
-        # Lazy imports to avoid circular dependencies at module load time.
-        from spectramr.infrastructure.physics.kan_data_consistency import (
-            KANAdaptiveDataConsistency,
+        groups, self.kan_param_group_record = build_kan_param_groups(
+            self,
+            base_lr=base_lr,
+            weight_decay=weight_decay,
+            lr_ratio=self._kan_lr_ratio,
+            weight_decay_ratio=self._kan_weight_decay_ratio,
         )
-        from spectramr.models.blocks.dual_domain_attention_kan import (
-            KANGatedDualDomainAttention,
-        )
-        from spectramr.models.blocks.kan_layer import KANLayer
-
-        kan_param_ids: set[int] = set()
-        for module in self.modules():
-            if isinstance(
-                module,
-                (KANLayer, KANGatedDualDomainAttention, KANAdaptiveDataConsistency),
-            ):
-                # Only collect params owned by *this* module (not children that
-                # are themselves KAN-tagged) to avoid double-counting; set
-                # semantics handle the dedup either way.
-                for p in module.parameters(recurse=True):
-                    if p.requires_grad:
-                        kan_param_ids.add(id(p))
-
-        kan_params = []
-        main_params = []
-        for p in self.parameters():
-            if not p.requires_grad:
-                continue
-            (kan_params if id(p) in kan_param_ids else main_params).append(p)
-
-        groups: list[dict] = []
-        if main_params:
-            groups.append({"params": main_params, "lr": base_lr, "weight_decay": weight_decay})
-        if kan_params:
+        # Scalar DC trust weights (soft lambda, Wiener beta, FSDC lambda_hf) are not
+        # regularised: decay would pull them towards distrusting the measurement.
+        dc_layer = getattr(self, "dc_layer", None)
+        trust = [
+            p
+            for p in (dc_layer.parameters() if dc_layer is not None else ())
+            if p.requires_grad and p.ndim == 0
+        ]
+        if trust:
+            trust_ids = {id(p) for p in trust}
+            for group in groups:
+                group["params"] = [p for p in group["params"] if id(p) not in trust_ids]
+            groups = [g for g in groups if g["params"]]
             groups.append(
-                {
-                    "params": kan_params,
-                    "lr": base_lr * self._kan_lr_ratio,
-                    "weight_decay": weight_decay * self._kan_weight_decay_ratio,
-                    "name": "kan",
-                }
+                {"name": "dc_trust", "params": trust, "lr": base_lr, "weight_decay": 0.0}
             )
         return groups
 
@@ -3178,16 +3446,30 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         self._current_smap_feats = None
 
     def set_current_mask(self, mask: torch.Tensor | None) -> None:
-        """Stash the acquisition mask for attention blocks that consume it.
+        """Stash the acquisition mask; ``forward`` reads it only inside :meth:`mask_scope`.
 
-        The same out-of-band route ``set_current_smaps`` takes, and for the same
-        reason: the reverse sampler re-enters ``forward(x_t, t)`` with the bare
-        k-space state and no kwargs, so a mask threaded only through the forward
-        signature reaches the training path and nothing else. ``forward`` refreshes
-        this from an explicit ``mask`` kwarg and falls back to it otherwise, so a
-        null-space block sees the same support at every reverse step.
+        The setter alone never conditions a forward: a stash that outlived the call
+        that set it would condition a later bare forward on another batch's support.
         """
         self._current_mask = mask
+
+    @contextmanager
+    def mask_scope(self, mask: torch.Tensor | None) -> Iterator[None]:
+        """Let a bare ``forward(x, t)`` read ``mask`` for the duration, then restore.
+
+        A reverse sampler or a probe re-enters ``forward`` with no kwargs, so the
+        support reaches it out of band; outside a scope a forward without ``mask=``
+        gets none. Nested scopes restore the enclosing mask and state on exit.
+        """
+        prev_mask = getattr(self, "_current_mask", None)
+        prev_active = getattr(self, "_mask_scope_active", False)
+        self.set_current_mask(mask)
+        self._mask_scope_active = True
+        try:
+            yield
+        finally:
+            self.set_current_mask(prev_mask)
+            self._mask_scope_active = prev_active
 
     def set_current_contrast_idx(self, contrast_idx: torch.Tensor | None) -> None:
         """Stash the contrast id so every reverse step is conditioned on it.
@@ -3200,56 +3482,34 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         """
         self._current_contrast_idx = contrast_idx
 
-    def _gate_complex_unet_knobs(
-        self, kwargs: dict, backbone_type: str, force_pure_kspace: bool
-    ) -> None:
-        """Refuse a complex_unet-only knob on a backbone that cannot consume it.
+    def set_current_reference(self, reference: torch.Tensor | None) -> None:
+        """Stash the source-contrast k-space so every reverse step sees it.
 
-        Both families are popped and re-injected rather than merely checked: a key
-        left in ``kwargs`` reaches ``build_backbone`` and every other backbone's
-        ``**kwargs``, where it is swallowed without a word. Each key is popped with
-        a literal string, never a loop, because ``check_model_kwargs_are_read``
-        harvests those literals as its vocabulary.
+        Same route as the smaps, mask and contrast id: the reverse sampler
+        re-enters ``forward(x_t, t)`` with no kwargs.
+        """
+        self._current_reference = reference
+
+    def _gate_complex_unet_knobs(self, kwargs: dict, backbone_type: str) -> None:
+        """Route the complex_unet-only knobs to the backbone that consumes them.
+
+        The legality of each knob is :func:`backbone_kwargs_defects`'s, checked
+        before this runs. Both families are popped and re-injected rather than left
+        in place: a key left in ``kwargs`` reaches ``build_backbone`` and every other
+        backbone's ``**kwargs``, where it is swallowed without a word. Each key is
+        popped with a literal string, never a loop, because
+        ``check_model_kwargs_are_read`` harvests those literals as its vocabulary.
         """
         feature_norm = kwargs.pop("kspace_feature_norm", "none")
         bands = kwargs.pop("radial_band_tokens_bands", 0)
         token_dim = kwargs.pop("radial_band_tokens_dim", None)
         token_max_log = kwargs.pop("radial_band_tokens_max_log", None)
-        if "radial_band_tokens_rungs" in kwargs:
-            raise ValueError(
-                "radial_band_tokens_rungs is derived from the process's timestep count, "
-                "not declared. Remove it; model_kwargs.timesteps already owns that fact."
-            )
-        unknown = sorted(k for k in kwargs if k.startswith("radial_band_tokens"))
-        if unknown:
-            raise ValueError(
-                f"Unrecognised radial band token knob(s) {unknown}. This constructor "
-                "absorbs **kwargs, so a misspelled knob runs as the control in silence."
-            )
-
-        is_complex_unet = backbone_type == "complex_unet"
-        if not is_complex_unet:
-            if str(feature_norm).lower() != "none":
-                raise ValueError(
-                    f"kspace_feature_norm={feature_norm!r} applies only to "
-                    f"backbone_type='complex_unet', not {backbone_type!r}."
-                )
-            if bands:
-                raise ValueError(
-                    f"radial_band_tokens_bands={bands} applies only to "
-                    f"backbone_type='complex_unet', not {backbone_type!r}: no other "
-                    "backbone exposes a per-up-step seam for it."
-                )
+        if backbone_type != "complex_unet":
             return
 
         kwargs["kspace_feature_norm"] = feature_norm
         if not bands:
             return
-        if not force_pure_kspace:
-            raise ValueError(
-                "radial_band_tokens_bands needs force_pure_kspace: true -- the annuli are "
-                "k-space annuli, and without it the decoder's feature maps are images."
-            )
         kwargs["radial_band_tokens_bands"] = int(bands)
         kwargs["radial_band_tokens_rungs"] = int(self.num_timesteps)
         if token_dim is not None:
@@ -3323,28 +3583,44 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
           bit-comparable.
 
         Returns:
-            Kwargs to merge into the probe's forward call. Empty when this arm
-            declares no measurement-gated mechanism, so unaffected arms keep
-            being probed exactly as before.
+            Kwargs to merge into the probe's forward call: the mask whenever the
+            backbone carries geometry planes, plus the measurement when the arm
+            declares a measurement-gated mechanism.
         """
+        # A reference arm needs its source contrast on every call; the mirrored
+        # input is deterministic and differs from x, so the concat is exercised.
+        reference: dict[str, torch.Tensor] = {}
+        if self.reference_channels:
+            mirrored = x.detach().flip(-1)
+            repeats = -(-self.reference_channels // int(x.shape[1]))
+            reference["reference"] = mirrored.repeat(1, repeats, 1, 1)[
+                :, : self.reference_channels
+            ].contiguous()
+
+        # [B, 1, H, W] — broadcasts over the channel axis, so the DC block's
+        # `mask.shape[1] > 1` re-slicing is correctly a no-op.
+        h, w = int(x.shape[-2]), int(x.shape[-1])
+        mask = torch.zeros((int(x.shape[0]), 1, h, w), dtype=torch.float32, device=x.device)
+        mask[..., :: self._PROBE_MASK_STRIDE] = 1.0
+        acs = max(1, w // 16)
+        centre = w // 2
+        mask[..., max(0, centre - acs // 2) : centre + acs // 2 + 1] = 1.0
+        # The geometry planes are built from the mask, so every v2 forward needs one.
+        geometry = {"mask": mask} if self.kspace_geometry_channels else {}
+
         if (
             self.dc_layer is None
             and self._output_kspace_clip_ratio is None
             and self._dc_passthrough_size is None
         ):
-            return {}
+            return {**reference, **geometry}
 
-        probe_kwargs: dict[str, torch.Tensor] = {"kspace_measured": x.detach().clone()}
-
+        probe_kwargs: dict[str, torch.Tensor] = {
+            "kspace_measured": x.detach().clone(),
+            **reference,
+            **geometry,
+        }
         if self.dc_layer is not None or self._dc_passthrough_size is not None:
-            # [B, 1, H, W] — broadcasts over the channel axis, so the DC block's
-            # `mask.shape[1] > 1` re-slicing is correctly a no-op.
-            h, w = int(x.shape[-2]), int(x.shape[-1])
-            mask = torch.zeros((int(x.shape[0]), 1, h, w), dtype=torch.float32, device=x.device)
-            mask[..., :: self._PROBE_MASK_STRIDE] = 1.0
-            acs = max(1, w // 16)
-            centre = w // 2
-            mask[..., max(0, centre - acs // 2) : centre + acs // 2 + 1] = 1.0
             probe_kwargs["mask"] = mask
 
         return probe_kwargs
@@ -3534,22 +3810,26 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         else:
             smaps = getattr(self, "_current_smaps", None)
 
-        # Same precedence for the acquisition mask, and for the same reason: the
-        # reverse loop re-enters with only (x, t), so an unconditional write here
-        # would blank the mask at reverse step 1 and leave a null-space attention
-        # block raising for the rest of the trajectory.
-        if kwargs.get("mask") is not None:
-            self.set_current_mask(kwargs["mask"])
-        elif getattr(self, "_current_mask", None) is not None:
+        # The stashed mask is read only inside ``mask_scope`` (``sample()`` and the
+        # probes): an explicit mask never writes it, so no batch's support can
+        # condition a later bare call.
+        if kwargs.get("mask") is None and getattr(self, "_mask_scope_active", False):
             kwargs["mask"] = self._current_mask
 
-        # And the contrast id, on the same precedence. `forward` pops it below
-        # and silently skips the embedding when it is None, so a drop here is
-        # invisible: the run trains conditioned and validates unconditioned.
-        if kwargs.get("contrast_idx") is not None:
-            self.set_current_contrast_idx(kwargs["contrast_idx"])
-        elif getattr(self, "_current_contrast_idx", None) is not None:
+        # The contrast id is read from the stash but only ``sample()`` writes it,
+        # scoped to its reverse loop: a write here outlived the training batch and
+        # conditioned every later call that carried no contrast on that batch's (#2435).
+        if (
+            kwargs.get("contrast_idx") is None
+            and getattr(self, "_current_contrast_idx", None) is not None
+        ):
             kwargs["contrast_idx"] = self._current_contrast_idx
+
+        reference = kwargs.pop("reference", None)
+        if reference is not None:
+            self.set_current_reference(reference)
+        else:
+            reference = getattr(self, "_current_reference", None)
 
         # Handle TorchIO 5D tensors (B, C, H, W, D) - process each slice
         original_shape = x.shape
@@ -3622,14 +3902,23 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # 2. UNet (Image Space Denoising)
         # 3. FFT (Image -> k-space)
         # Filter out any conflicting parameters that FourierBridgeNetwork doesn't accept
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["time", "timesteps"]}
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ["time", "timesteps", "acquired"]
+        }
 
         # Pass max_timesteps down to bridge network for scaling
         filtered_kwargs["max_timesteps"] = float(self.num_timesteps)
+        filtered_kwargs["timestep_scale"] = self._timestep_embedding_scale
 
         # Contrast conditioning: fuse contrast embedding into backbone kwargs
         contrast_idx = filtered_kwargs.pop("contrast_idx", None)
-        if contrast_idx is not None and hasattr(self, "contrast_embedding"):
+        if hasattr(self, "contrast_embedding"):
+            if contrast_idx is None:
+                raise ConfigurationError(
+                    f"This generator was built with num_contrasts={self.num_contrasts} but forward "
+                    "received no contrast_idx: it would run without its contrast embedding, "
+                    "unconditioned and without a trace. Pass contrast_idx (predict: --contrast-idx)."
+                )
             c_emb = self.contrast_embedding(contrast_idx.long().to(x.device))
             filtered_kwargs["contrast_emb"] = c_emb
 
@@ -3695,6 +3984,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             smaps_k, _ = prepare_smaps_for_kspace_conditioning(smaps_c, x, channel_dim=1)
             x = torch.cat([x, smaps_k], dim=1)
 
+        x = prepend_reference(x, reference, self.reference_channels)
+
         # [5D RESHAPE FIX] Reshape 5D to 4D
         is_volumetric_5d = x.dim() == 5
         if is_volumetric_5d:
@@ -3704,6 +3995,12 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             if timesteps is not None:
                 # Repeat timesteps for each depth slice
                 timesteps = timesteps.repeat_interleave(D_dim)
+            # The contrast embedding was built per volume above, so it follows
+            # the timesteps onto the slices or the backbone refuses the batch.
+            if filtered_kwargs.get("contrast_emb") is not None:
+                filtered_kwargs["contrast_emb"] = expand_contrast_over_slices(
+                    filtered_kwargs["contrast_emb"], B * D_dim, D_dim
+                )
 
             # Flatten 5D kwargs to 4D to match x
             for kwarg_name in ["mask", "kspace_measured", "smaps"]:
@@ -3734,6 +4031,15 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                                 k_b * k_d, k_c, k_h, k_w
                             )
 
+        geometry = self._geometry_planes(x, filtered_kwargs.get("mask"), kwargs.get("acquired"))
+        if geometry is not None and not isinstance(self.backbone, FourierBridgeNetwork):
+            # PureKSpaceUNet consumes k-space directly, so the planes join here.
+            x = torch.cat([x, self._geometry_like(geometry, x)], dim=1)
+        elif geometry is not None:
+            # The bridge appends them after its entry transform: an iFFT'd geometry
+            # plane would be a different, meaningless map.
+            filtered_kwargs["geometry"] = geometry
+
         kwargs_to_pass = filtered_kwargs.copy()
 
         diffusion_backbones = [
@@ -3746,9 +4052,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             "mamba_unet",
         ]
 
-        if self.backbone_type in diffusion_backbones or "timesteps" in str(
-            getattr(self.backbone, "forward", "").__code__.co_varnames
-        ):
+        if self.backbone_type in diffusion_backbones or _accepts_timesteps(self.backbone):
             kwargs_to_pass["timesteps"] = timesteps
 
         x_out = self.backbone(x, **kwargs_to_pass)
@@ -3760,6 +4064,11 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             _, C_out, H_out, W_out = x_out.shape
             x_out = x_out.view(B, D_dim, C_out, H_out, W_out).permute(0, 2, 3, 4, 1)
 
+        # The backbone's own estimate, before the coil projection and DC, for the
+        # debug snapshot: the pre-DC tensor already includes the projection.
+        self.last_backbone_output = x_out.detach()
+        self.last_backbone_projected = None
+
         if smaps is not None:
             # [ROBUST MULTI-COIL MAPPING FIX]
             # Verify if x_out has mathematically compatible dimensions to be projected along the physical SENSE manifold.
@@ -3769,7 +4078,17 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             smaps_c = smaps.shape[1] if torch.is_complex(smaps) else smaps.shape[1] // 2
 
             if x_out_c == smaps_c or x_out_c == 1 or smaps_c == 1:
-                x_out = self.sense_projector(x_out, smaps)
+                if self._kspace_log_scaled is None:
+                    raise ValueError(
+                        "[KSpaceColdDiffusionGenerator] smaps were passed, so the output is "
+                        "projected onto the coil subspace, but kspace_log_scaled was never "
+                        "supplied: the projection is linear-domain physics and cannot pick a "
+                        "domain (#2488). ModelBuilder injects it from data.processing; pass "
+                        "kspace_log_scaled when constructing this generator directly."
+                    )
+                x_out = self.sense_projector(x_out, smaps, log_scaled=self._kspace_log_scaled)
+                # Snapshot twin of the raw backbone: separates "unprojected view" from a real defect.
+                self.last_backbone_projected = x_out.detach()
             else:
                 logger.debug(
                     f"[KSpaceColdDiffusionGenerator] Bypassing SENSE projection: mathematical shape incompatibility "
@@ -3797,6 +4116,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     timesteps,
                     self.radial_band_gain.time_embed_dim,
                     max_timesteps=float(self.num_timesteps),
+                    scale=self._timestep_embedding_scale,
                 )
             x_out = self.radial_band_gain(x_out, gain_embedding)
 
@@ -3807,6 +4127,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # here, before either can no-op. Training-only (see the method docstring).
         self._assert_measurement_reaches_declared_mechanisms(kwargs, x_out)
 
+        # The measurement and mask the DC layer pinned, so the output clamp below leaves them alone.
+        dc_support: tuple[torch.Tensor, torch.Tensor] | None = None
         # [PHYSICS INTEGRATION] Apply Data Consistency if enabled and inputs provided
         if self.dc_layer is not None:
             mask = kwargs.get("mask")
@@ -3874,6 +4196,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     acs_mask=acs_mask,
                     is_kspace_domain=True,
                 )
+                dc_support = (measured_kspace, mask)
 
                 if not hasattr(self, "_dc_notified") or not self._dc_notified:
                     logger.info(
@@ -3892,15 +4215,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             _mask = kwargs.get("mask")
             x_out = dc_passthrough_center_patch(x_out, _measured, _mask, self._dc_passthrough_size)
 
-        # [SCALE CONTROL] Phase-preserving output magnitude bound (opt-in). Caps
-        # every predicted coefficient at ``ratio x max|measured k-space|`` per
-        # sample so the unnormalised k-space head cannot drift off-scale during
-        # training. The bound is RADIAL (|z| <= ceiling, phase exactly invariant)
-        # and the ratio is applied in PHYSICAL units even when the arm log1p-
-        # compresses k-space -- both were wrong before issue #1281. Observed lines are ≤ the measured max by construction, so
-        # only runaway predictions are clamped. Requires the measured k-space
-        # (present in training); the reverse sampler applies its own
-        # ``reverse_clip_ratio`` bound at inference.
+        # [SCALE CONTROL] A radial, phase-preserving cap at ``ratio x`` the measured reference, in
+        # physical units even under log1p (#1281), applied only where the measured k-space is passed
+        # (training). The bounded reverse loops apply ``reverse_clip_ratio`` instead; ``additive`` bounds nothing (#2428).
         if self._output_kspace_clip_ratio is not None:
             _measured = kwargs.get("kspace_measured")
             # Batch-match guard: for genuine 5D (D>1) inputs ``x_out`` is restored
@@ -3911,7 +4228,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 from spectramr.models.diffusion.kspace_process import (
                     apply_ceiling_ratio,
                     band_local_magnitude_ceiling,
+                    ceiling_binding_stats,
                     clamp_to_magnitude_ceiling,
+                    measured_write_ceiling,
                     paired_magnitude,
                 )
 
@@ -3933,6 +4252,13 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                     _ceil = apply_ceiling_ratio(
                         _ref, self._output_kspace_clip_ratio, self._kspace_log_scaled
                     )
+                if dc_support is not None and dc_support[1].dim() == x_out.dim():
+                    _dc_measured, _dc_mask = dc_support
+                    _ceil = measured_write_ceiling(
+                        _ceil, _dc_measured, _dc_mask.amax(dim=1, keepdim=True) > 0, str(self._dc_method)
+                    )
+                if self.training:
+                    self.last_clip_stats = ceiling_binding_stats(x_out, _ceil)
                 x_out = clamp_to_magnitude_ceiling(x_out, _ceil, 1e-8)
 
         # We no longer handle inverse scaling here. The model output is strictly what the backbone proposes.
@@ -3965,12 +4291,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         mask = kwargs.get("mask")
 
         if mask is None:
-            # Auto-detect mask from measurement (assume zero-filled)
-            # measurement: [B, C, H, W]
-            # mask: [B, 1, H, W]
-            # Check for non-zero values across channels
-            mag = torch.sum(torch.abs(measurement), dim=1, keepdim=True)
-            mask = (mag > 1e-6).float()
+            mask = measurement_support(measurement)
 
         # Run full sampling loop
         kspace_pred = self.sample(
@@ -4065,7 +4386,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
 
         if self.accelerator is None:
             # Fallback: no accelerator, just predict directly
-            prediction = self.forward(x_start, t)
+            prediction = self.forward(x_start, t, mask=torch.ones_like(x_start[:, :1].real))
             if isinstance(prediction, tuple):
                 prediction = prediction[0]
             loss = F.l1_loss(prediction, x_start)
@@ -4091,7 +4412,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         mask_t = torch.stack(mask_list)
 
         # 2. Restoration Prediction: x_0_hat = f(x_t, t)
-        prediction = self.forward(x_t, t)
+        prediction = self.forward(x_t, t, mask=mask_t.float())
         if isinstance(prediction, tuple):
             prediction = prediction[0]
 
@@ -4160,6 +4481,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         if _smaps_arg is None:
             _smaps_arg = kwargs.pop("sensitivity_maps", None)
         _contrast_arg = kwargs.pop("contrast_idx", None)
+        _reference_arg = kwargs.pop("reference", None)
+        _measured_lines = kwargs.pop("measured_lines", None)
         # Ensure 4D shape if 5D with singleton depth (consistency with forward)
         while measurement.dim() > 5 or (measurement.dim() == 5 and measurement.shape[-1] == 1):
             if measurement.shape[-1] == 1:
@@ -4187,17 +4510,19 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             # PhysicsInformedColdDiffusion, ignoring guidance_scale/cond_drop_prob.
             from spectramr.models.diffusion.samplers import get_sampler
 
-            # Ensure mask is provided or detected
             if mask is None:
-                # Infer mask from measurement (non-zero = sampled)
-                # measurement: [B, C, H, W]
-                mag = torch.sum(torch.abs(measurement), dim=1, keepdim=True)
-                mask = (mag > 1e-6).float()
+                mask = measurement_support(measurement)
 
             # Use configured steps or passed steps
-            steps = inference_timesteps or self._sampling_steps
+            steps = self._sampling_steps if inference_timesteps is None else inference_timesteps
 
             sampler_name = getattr(self, "_sampler_name", "cold_mri")
+            if self._forward_noise_sigma > 0 and sampler_name.lower() not in ("cold_mri", "coldmri"):
+                raise ValueError(
+                    f"forward_noise_sigma={self._forward_noise_sigma:g} re-noises the reverse "
+                    f"denoiser input, which only the cold_mri sampler runs; sampler "
+                    f"{sampler_name!r} would ignore it. Use cold_mri or set forward_noise_sigma: 0."
+                )
             sampler_kwargs = {
                 "model": self,
                 "num_timesteps": self.num_timesteps,
@@ -4218,6 +4543,14 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 sampler_kwargs["sampler_sigma"] = getattr(self, "_sampler_sigma", 0.0)
                 sampler_kwargs["sampler_seed"] = getattr(self, "_sampler_seed", None)
                 sampler_kwargs["selection_rule"] = getattr(self, "_selection_rule", "fixed")
+                sampler_kwargs["refine_alpha"] = getattr(self, "_refine_alpha", None)
+                sampler_kwargs["integrity_check"] = getattr(self, "_integrity_check", "off")
+                physics = self._reverse_physics
+                sampler_kwargs["decay_envelope"] = physics.decay_envelope
+                sampler_kwargs["projection"] = physics.projection
+                sampler_kwargs["dc_trust"] = physics.dc_trust
+                sampler_kwargs["support_radius"] = physics.support_radius
+                sampler_kwargs["reverse_dc"] = physics.reverse_dc
                 # Unlike the training-path bound this one is NOT opt-in --
                 # reverse_clip_ratio always has a value, so a ceiling is always
                 # built and the domain is always needed. Refuse rather than
@@ -4271,16 +4604,40 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                         "sampler, or set validation.sampling.ensemble_samples to 1."
                     )
 
+            # The lines each sample acquired (#2160): the reverse rungs must count R
+            # over them exactly as the forward process that built the measurement did.
+            if _measured_lines is not None:
+                if "measured_lines" not in _sample_params:
+                    raise ValueError(
+                        f"sampler {sampler_name!r} does not accept 'measured_lines': its "
+                        "reverse rungs would count R over never-acquired lines while the "
+                        "measurement was built over acquired ones."
+                    )
+                _sample_kwargs["measured_lines"] = _measured_lines
+
             _prev_smaps = getattr(self, "_current_smaps", None)
-            _prev_mask = getattr(self, "_current_mask", None)
             _prev_contrast = getattr(self, "_current_contrast_idx", None)
+            _prev_reference = getattr(self, "_current_reference", None)
+            if _reference_arg is not None:
+                self.set_current_reference(_reference_arg)
             if _smaps_arg is not None:
                 self.set_current_smaps(_smaps_arg)
             if _contrast_arg is not None:
                 self.set_current_contrast_idx(_contrast_arg)
-            self.set_current_mask(mask)
             try:
-                out = sampler.sample(measurement, mask, **_sample_kwargs)
+                with self.mask_scope(mask):
+                    out = sampler.sample(measurement, mask, **_sample_kwargs)
+                # The sampler calls forward() bare, so the centre-patch
+                # passthrough gated on ``kspace_measured`` never ran on the
+                # reverse path (#2162). It runs once here, after the sampler's
+                # last DC step, as it runs after the DC layer in training.
+                if self._dc_passthrough_size is not None and not isinstance(out, tuple):
+                    out = dc_passthrough_center_patch(
+                        out,
+                        measurement[:, -out.shape[1] :],
+                        mask if mask.shape[1] in (1, out.shape[1]) else mask[:, -out.shape[1] :],
+                        self._dc_passthrough_size,
+                    )
                 # The sampler is built per call and discarded, so what its
                 # reverse loop actually RAN has to be read off before it goes.
                 # Samplers other than cold_mri expose no such record; absent is
@@ -4289,8 +4646,95 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 return out
             finally:
                 self.set_current_smaps(_prev_smaps)
-                self.set_current_mask(_prev_mask)
                 self.set_current_contrast_idx(_prev_contrast)
+                self.set_current_reference(_prev_reference)
+
+    def _geometry_planes(
+        self, x: torch.Tensor, support: torch.Tensor | None, acquired: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """``[N, K, H, W]`` geometry planes for the backbone input ``x``, or None.
+
+        ``support`` is the ``mask`` known at this rung: the rung mask in training,
+        the current support in the reverse loops. ``acquired`` is the
+        scanner-written plane; absent means the acquisition has no line axis and
+        every bin is acquirable, the meaning ``measured_lines=None`` has in the
+        reverse process.
+        """
+        if not self.kspace_geometry_channels:
+            return None
+        if support is None:
+            raise ValueError(
+                "[KSpaceColdDiffusionGenerator] forward needs mask= (the support known at "
+                "this rung): architecture v2 conditions the backbone on it. Training passes "
+                "the rung mask and the reverse loops the current support; a bare forward "
+                "reads a stashed mask only inside mask_scope() (sample(), the probes). A "
+                "caller holding only a zero-filled measurement passes "
+                "kspace_geometry_encoding.support_forward_kwargs(model, measurement)."
+            )
+        n = x.shape[0]
+        planes = []
+        for plane in (support, acquired):
+            if plane is not None and plane.dim() == 4 and plane.shape[0] not in (1, n):
+                # A per-volume plane follows the depth flatten onto its slices.
+                if n % plane.shape[0]:
+                    raise ValueError(
+                        f"geometry plane batch {plane.shape[0]} does not divide the "
+                        f"backbone batch {n}."
+                    )
+                plane = plane.repeat_interleave(n // plane.shape[0], dim=0)
+            planes.append(plane)
+        return kspace_geometry_channels(
+            planes[0],
+            planes[1],
+            tuple(x.shape[-2:]),
+            batch=n,
+            dtype=x.real.dtype,
+            planes=self.kspace_geometry_planes,
+        )
+
+    @staticmethod
+    def _geometry_like(planes: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """The planes in ``x``'s channel layout: complex channels or (plane, 0) pairs."""
+        if torch.is_complex(x):
+            return torch.complex(planes, torch.zeros_like(planes))
+        return as_interleaved_complex(planes)
+
+    def _refuse_other_arch_version(
+        self, module: nn.Module, state_dict: dict, prefix: str, *args: Any
+    ) -> None:
+        """Raise on a checkpoint from another generator architecture version."""
+        found = state_dict.get(prefix + KSPACE_GENERATOR_ARCH_VERSION_KEY)
+        saved = 1 if found is None else int(found)
+        if saved != KSPACE_GENERATOR_ARCH_VERSION:
+            raise ConfigurationError(
+                f"Checkpoint is KSpaceColdDiffusionGenerator architecture v{saved}; this "
+                f"build is v{KSPACE_GENERATOR_ARCH_VERSION}. v2 replaced the per-real-channel "
+                "timestep FiLM with a phase-preserving per-complex-channel gain "
+                "(time_proj -> time_gain), conditioned the bottleneck, routed the contrast "
+                "embedding into the encoder, and widened every backbone input by "
+                f"{2 * KSPACE_GEOMETRY_CHANNELS} k-space geometry channels. The weights "
+                "cannot be mapped onto this architecture; retrain the arm."
+            )
+
+    def _refuse_mismatched_timestep_scale(
+        self, module: nn.Module, state_dict: dict, prefix: str, *args: Any
+    ) -> None:
+        """Raise when a checkpoint was trained under another timestep scale (#2315)."""
+        marker = prefix + _T_SCALE_MARKER_PREFIX
+        found = sorted(
+            k[len(marker):] for k in state_dict if k.startswith(marker) and "." not in k[len(marker):]
+        )
+        if len(found) > 1:
+            raise ValueError(f"Checkpoint carries more than one timestep-scale marker: {found}.")
+        saved = found[0] if found else _DEFAULT_T_SCALE
+        if saved != self._timestep_embedding_scale:
+            raise ValueError(
+                f"Checkpoint was trained with timestep_embedding_scale={saved!r} but this "
+                f"model is built with {self._timestep_embedding_scale!r}. The time "
+                "embedding codes differ, so the loaded time_mlp would condition on the "
+                "wrong rungs. Set model.model_kwargs.timestep_embedding_scale to "
+                f"{saved!r}, or start the run fresh."
+            )
 
     @property
     def last_reverse_stats(self) -> dict[str, Any] | None:
@@ -4304,7 +4748,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         validation is the last chunk and under a validation ensemble the last
         member. Both replay the same schedule -- chunks split the batch, members
         differ only in the C6 noise stream -- so the three numbers agree across
-        them and the record is not order-dependent.
+        them and the record is not order-dependent. ``decay_unfitted`` counts
+        samples, so the chunked validation loop sums it across chunks.
         """
         return self._last_reverse_stats
 
@@ -4340,7 +4785,7 @@ def create_kspace_cold_diffusion_generator(
     base_channels: int = 64,
     num_layers: int = 4,
     attention_type: str = "self",
-    num_timesteps: int = 1000,
+    num_timesteps: int | None = None,
     time_embedding_dim: int = 256,
     time_embedding_type: str = "sinusoidal",
     physics_informed: bool = True,
@@ -4382,7 +4827,7 @@ def create_complex_kspace_cold_diffusion_generator(
     base_channels: int = 64,
     num_layers: int = 4,
     attention_type: str = "self",
-    num_timesteps: int = 1000,
+    num_timesteps: int | None = None,
     time_embedding_dim: int = 256,
     time_embedding_type: str = "sinusoidal",
     physics_informed: bool = True,

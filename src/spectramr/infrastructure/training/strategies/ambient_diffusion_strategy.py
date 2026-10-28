@@ -43,6 +43,7 @@ from spectramr.infrastructure.training.builders.environment import TrainingEnvir
 from spectramr.infrastructure.training.strategies.diffusion import (
     DiffusionTrainingStrategy,
 )
+from spectramr.infrastructure.training.strategies.rng_streams import rank_seeded_generator
 from spectramr.infrastructure.training.strategies.ssdu_strategy import split_acquired_mask
 from spectramr.models.losses.ambient_consistency_loss import ambient_consistency_residual
 
@@ -89,6 +90,7 @@ class AmbientDiffusionStrategy(DiffusionTrainingStrategy):
     #: overrides DiffusionTrainingStrategy's without calling it or the computer.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
     folds_image_losses: ClassVar[bool] = False
+    checkpointed_streams: ClassVar[tuple[str, ...]] = ("_ambient_rng",)
 
     def __init__(
         self,
@@ -108,7 +110,7 @@ class AmbientDiffusionStrategy(DiffusionTrainingStrategy):
             self.ambient_weight = 1.0
             self.denoise_weight = 1.0
             seed = 0
-        self._ambient_rng = torch.Generator(device="cpu").manual_seed(seed)
+        self._ambient_rng = rank_seeded_generator(seed)
         logger.info(
             "AmbientDiffusionStrategy: theta_fraction=%.3g, ambient_weight=%.3g, "
             "denoise_weight=%.3g (source=%s)",

@@ -21,7 +21,7 @@ class PersistentHomologyLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{PH} = \\mathbb{E} \\left[ (\\chi(\\hat{y}_{>t}) - \\chi(y_{>t}))^2 \right]"""
+        \\mathcal{L}_{PH} = \\mathbb{E} \\left[ (\\chi(\\hat{y}_{>t}) - \\chi(y_{>t}))^2 \\right]"""
 
     def __init__(self, levels: int = 10):
         """__init__.
@@ -54,9 +54,10 @@ class PersistentHomologyLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Ensure range 0-1 if not already
-        if pred.max() > 1.0 or pred.min() < 0.0:
-            pred = torch.sigmoid(pred)
+        # Squash an out-of-[0, 1] prediction; the branch is taken on device
+        # (torch.where) because a Python ``if`` on a tensor syncs every step.
+        out_of_range = (pred.amax() > 1.0) | (pred.amin() < 0.0)
+        pred = torch.where(out_of_range, torch.sigmoid(pred), pred)
 
         loss = torch.zeros((), device=pred.device, dtype=pred.dtype)
 
@@ -103,8 +104,8 @@ class PersistentHomologyLoss(nn.Module):
 
         Soft approximation:
         V = sum(p)
-        E_h = sum(p[i,j] * p[i, j+1])
-        E_v = sum(p[i,j] * p[i+1, j])
+        e_h = sum(p[i,j] * p[i, j+1])
+        e_v = sum(p[i,j] * p[i+1, j])
         F = sum(p[i,j] * p[i,j+1] * p[i+1, j] * pi+1, j+1])
         """
         # Pad to avoid boundary issues
@@ -117,22 +118,22 @@ class PersistentHomologyLoss(nn.Module):
         # Horizontal neighbors (Edges)
         # p * p_right
         h_neighbors = p[..., :, :-1] * p[..., :, 1:]
-        E_h = h_neighbors.sum(dim=(-1, -2))
+        e_h = h_neighbors.sum(dim=(-1, -2))
 
         # Vertical neighbors (Edges)
         v_neighbors = p[..., :-1, :] * p[..., 1:, :]
-        E_v = v_neighbors.sum(dim=(-1, -2))
+        e_v = v_neighbors.sum(dim=(-1, -2))
 
         # Faces (2x2 squares)
         # p * p_right * p_down * p_down_right
         faces = p[..., :-1, :-1] * p[..., :-1, 1:] * p[..., 1:, :-1] * p[..., 1:, 1:]
-        F_quad = faces.sum(dim=(-1, -2))
+        f_quad = faces.sum(dim=(-1, -2))
 
-        # EC = V - E + F = V - (E_h + E_v) + F_quad
+        # EC = V - E + F = V - (e_h + e_v) + f_quad
         # Note: This formula depends on connectivity (4 vs 8).
         # For 4-connectivity (objects) and 8-connectivity (holes):
         # EC = V - E + F
 
-        ec = V - (E_h + E_v) + F_quad
+        ec = V - (e_h + e_v) + f_quad
 
         return ec

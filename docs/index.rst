@@ -66,7 +66,9 @@ what it produced.
    :caption: Results and extension
 
    run_provenance_and_logging
+   checkpointing
    reporting
+   publication_guide
    how_to/index
    plugins
    scripting_api

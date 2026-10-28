@@ -68,12 +68,6 @@ class TestPSNR:
         result = m.compute_metric(x, y)
         assert _is_finite_scalar(result)
 
-    # edge: identical inputs -> clamped to 100.0
-    def test_edge_identical_inputs(self, psnr):
-        x = _img(1, 1)
-        result = psnr.compute_metric(x, x)
-        assert result.item() == pytest.approx(100.0, abs=1e-3)
-
     # edge: all-zero target (MSE=0) -> no div-by-zero
     def test_edge_zero_target(self, psnr):
         x = torch.zeros(1, 1, 16, 16)
@@ -606,11 +600,6 @@ class TestRobustMRI_PSNR:
     @pytest.mark.parametrize("b", [1, 2])
     def test_batch_sizes(self, rpsnr, b):
         assert _is_finite_scalar(rpsnr.compute_metric(_img(b, 1), _img(b, 1, seed=50)))
-
-    def test_edge_identical_near_capped(self, rpsnr):
-        x = _img(1, 1)
-        result = rpsnr.compute_metric(x, x)
-        assert result.item() == pytest.approx(100.0, abs=0.1)
 
     def test_edge_all_zero_target_fallback(self, rpsnr):
         z = torch.zeros(1, 1, 16, 16)

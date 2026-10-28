@@ -332,3 +332,34 @@ def test_it_declares_its_own_loss_ownership() -> None:
     """
     assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is False
     assert VFConsistencyDistillationStrategy.__dict__["inline_losses"] == frozenset()
+
+
+def test_it_skips_the_channel_guard_because_it_builds_its_own_input() -> None:
+    """Both network inputs are noised copies of ``target``; the channel guard on
+    ``input_batch`` would reject the arm's ifft'd 1-channel batch at iteration 1."""
+    assert VFConsistencyDistillationStrategy.__dict__["synthesises_model_input"] is True
+
+
+def test_a_resume_rebuilds_the_ema_teacher_before_restoring_it() -> None:
+    """The teacher exists only after the first step; a fresh strategy must still load it."""
+    strat, gen = _make_strategy()
+    strat._ensure_ema_teacher(gen)
+    with torch.no_grad():
+        for p in strat._ema_teacher.parameters():
+            p.add_(1.0)
+    state = {"modules": {"_ema_teacher": strat._ema_teacher.state_dict()}}
+
+    fresh, _ = _make_strategy()
+    fresh.env = SimpleNamespace(generator=gen)
+    fresh._owned_modules, fresh._owned_wrappers = {}, {}
+    fresh.load_strategy_state_dict(state)
+    for a, b in zip(fresh._ema_teacher.parameters(), strat._ema_teacher.parameters(), strict=True):
+        assert torch.equal(a, b)
+
+
+def test_the_ema_teacher_copies_the_inner_module_of_a_wrapper() -> None:
+    """A copy of a DataParallel/DDP wrapper would save ``module.``-prefixed keys."""
+    strat, gen = _make_strategy()
+    teacher = strat._ensure_ema_teacher(nn.DataParallel(gen))
+    assert not any(k.startswith("module.") for k in teacher.state_dict())
+    strat._update_ema(nn.DataParallel(gen))

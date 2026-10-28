@@ -20,6 +20,7 @@ from spectramr.infrastructure.validation.witness.registry import (
     Tier,
     WitnessVerdict,
 )
+from spectramr.models.constants import DEFAULT_DIFFUSION_TIMESTEPS
 
 _CATEGORY = "schedule_certification"
 _DEFAULT_MATRIX = (256, 256)
@@ -35,7 +36,7 @@ _PROCESS_MEMO: BoundedLRUCache[tuple[Any, ...], Any] = BoundedLRUCache()
 
 
 # ---------------------------------------------------------------------------
-# config parsing — mirrors scripts/ci/check_acceleration_ladder_realisable.py
+# config parsing — shared with scripts/ci/check_acceleration_ladder_realisable.py (the horizon is imported from here)
 # ---------------------------------------------------------------------------
 def _is_cold_diffusion(doc: dict) -> bool:
     model = doc.get("model") or {}
@@ -45,8 +46,22 @@ def _is_cold_diffusion(doc: dict) -> bool:
     )
 
 
+def _degrades_by_mask(doc: dict) -> bool:
+    """False when ``training.diffusion.degradation`` names a forward process with no mask ladder."""
+    diffusion = (doc.get("training") or {}).get("diffusion")
+    return not (isinstance(diffusion, dict) and diffusion.get("degradation") == "rician")
+
+
 def _undersampling(doc: dict) -> dict:
     return doc.get("undersampling") or doc.get("acceleration") or {}
+
+
+def phase_encode_axis_of(doc: dict) -> int | None:
+    """``data.acquisition.phase_encode_axis``, validated by its schema, or None if undeclared."""
+    from spectramr.config.schemas.data_acquisition import DataAcquisitionSchema
+
+    block = (doc.get("data") or {}).get("acquisition")
+    return None if block is None else DataAcquisitionSchema(**block).phase_encode_axis
 
 
 def _matrix(doc: dict) -> tuple[int, int]:
@@ -60,9 +75,18 @@ def _matrix(doc: dict) -> tuple[int, int]:
 
 
 def _timesteps(doc: dict) -> int:
-    kwargs = (doc.get("model") or {}).get("model_kwargs") or {}
-    diffusion = (doc.get("training") or {}).get("diffusion") or {}
-    return int(kwargs.get("timesteps") or diffusion.get("timesteps") or 28)
+    """The horizon the generator is built with, resolved in the builder's order.
+
+    ``training.diffusion.timesteps`` is injected whenever that block exists (the schema
+    defaults it), so the ``model_kwargs`` copy only counts on an arm without the block (#2468).
+    """
+    diffusion = (doc.get("training") or {}).get("diffusion")
+    if isinstance(diffusion, dict):
+        declared = diffusion.get("timesteps", DEFAULT_DIFFUSION_TIMESTEPS)
+        if declared is not None:
+            return int(declared)
+    declared = ((doc.get("model") or {}).get("model_kwargs") or {}).get("timesteps")
+    return DEFAULT_DIFFUSION_TIMESTEPS if declared is None else int(declared)
 
 
 def build_process_from_config(doc: dict) -> Any | None:
@@ -71,9 +95,10 @@ def build_process_from_config(doc: dict) -> Any | None:
     Routed through ``AccelerationConfigSchema`` + ``resolve_undersampling_kwargs``
     exactly like the runtime generator and the ladder CI gate (issue #550:
     reading raw YAML makes the audit blind to keys the schema drops). Returns
-    ``None`` when the config is not a cold-diffusion arm.
+    ``None`` when the config is not a cold-diffusion arm, or when its forward
+    process is not a mask cascade (a Rician arm has no ladder to certify).
     """
-    if not _is_cold_diffusion(doc):
+    if not _is_cold_diffusion(doc) or not _degrades_by_mask(doc):
         return None
     from spectramr.config.schemas.acceleration import AccelerationConfigSchema
     from spectramr.models.diffusion.kspace_process import (
@@ -82,7 +107,9 @@ def build_process_from_config(doc: dict) -> Any | None:
     )
 
     accel = _undersampling(doc)
-    resolved = resolve_undersampling_kwargs(AccelerationConfigSchema(**accel))
+    resolved = resolve_undersampling_kwargs(
+        AccelerationConfigSchema(**accel), phase_encode_axis=phase_encode_axis_of(doc)
+    )
     timesteps = _timesteps(doc)
 
     # Shared rather than rebuilt. The witnesses only read the process -- the two
@@ -162,5 +189,6 @@ def _declared_certification_levels(doc: dict) -> list[dict]:
 
 __all__ = [
     "build_process_from_config",
+    "phase_encode_axis_of",
     "synthetic_spectral_prior",
 ]

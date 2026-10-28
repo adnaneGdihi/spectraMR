@@ -1,0 +1,45 @@
+# Poster defaults for spectramr reports.
+# Same column geometry as "nature"; the figure is placed scaled up on the poster,
+# so what changes is the text-to-figure and stroke-to-figure ratio, which must
+# survive a 1.5-2 m reading distance. Loaded by use_default_style("poster").
+font.family: sans-serif
+font.sans-serif: Helvetica, Arial, DejaVu Sans, Bitstream Vera Sans
+font.size: 9
+axes.labelsize: 9
+axes.titlesize: 9.5
+axes.titleweight: bold
+xtick.labelsize: 8
+ytick.labelsize: 8
+legend.fontsize: 8
+figure.titlesize: 10
+
+axes.linewidth: 0.9
+axes.edgecolor: 111111
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: False
+
+xtick.direction: out
+ytick.direction: out
+xtick.major.width: 0.9
+ytick.major.width: 0.9
+xtick.major.size: 3.5
+ytick.major.size: 3.5
+xtick.minor.visible: False
+ytick.minor.visible: False
+
+lines.linewidth: 1.8
+lines.markersize: 4.5
+errorbar.capsize: 2.5
+patch.linewidth: 0.9
+
+legend.frameon: False
+
+savefig.format: pdf
+savefig.bbox: tight
+savefig.pad_inches: 0.02
+savefig.dpi: 600
+
+axes.prop_cycle: cycler('color', ['000000', 'E69F00', '56B4E9', '009E73', 'F0E442', '0072B2', 'D55E00', 'CC79A7'])
+
+image.cmap: viridis

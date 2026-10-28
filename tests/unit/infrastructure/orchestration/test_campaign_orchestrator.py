@@ -30,6 +30,9 @@ is attempted.
 
 from __future__ import annotations
 
+import json
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -64,6 +67,19 @@ def _slurm_account(monkeypatch):
     """
     monkeypatch.setenv("SPECTRAMR_SLURM_ACCOUNT", "test_alloc")
     monkeypatch.delenv("SPECTRAMR_SLURM_MAIL_USER", raising=False)
+
+
+@pytest.fixture
+def _tmp_checkout(tmp_path: Path) -> Path:
+    """Make ``tmp_path`` a git checkout with one commit.
+
+    The array path records the checkout's HEAD beside the manifest (#2662) and
+    refuses to submit when it cannot, so ``base_dir`` must be a repository.
+    """
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q", "-b", "dev", str(tmp_path)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "base"], check=True)
+    return tmp_path
 
 
 def _write_min_experiment_yaml(path: Path) -> None:
@@ -127,12 +143,22 @@ class TestConstruction:
         # base_dir is resolved to absolute.
         assert Path(o.base_dir).is_absolute()
         assert o.dry_run is True
-        assert o.resume is True
+        assert o.resume_checkpoints is True
+        assert o.skip_handled is True
+        assert o.resume_mode == "resume"
         assert o.only == ["a", "b"]
         assert o.include == ["role=ablation"]
         assert o.exclude == ["tag.arch=mamba"]
         # SLURM backend honours the dry_run flag.
         assert o.slurm.dry_run is True
+
+    def test_fresh_and_resume_together_raise(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            CampaignOrchestrator(base_dir="/tmp", dry_run=True, resume=True, fresh=True)
+
+    def test_fresh_neither_resumes_nor_skips(self) -> None:
+        o = CampaignOrchestrator(base_dir="/tmp", dry_run=True, fresh=True)
+        assert (o.resume_checkpoints, o.skip_handled, o.resume_mode) == (False, False, "fresh")
 
     def test_default_kwargs_are_none_safe(self) -> None:
         # only/include/exclude default to empty lists, not None.
@@ -247,6 +273,7 @@ class TestSubmitCampaignParallel:
 # ── submit_campaign — array mode (ONE SLURM array job) ─────────────
 
 
+@pytest.mark.usefixtures("_tmp_checkout")
 class TestSubmitCampaignArray:
     """``execution: array`` submits the whole cohort as a single SLURM job
     array: one ``sbatch`` call → one tracked array job id, with a per-arm task
@@ -310,6 +337,39 @@ class TestSubmitCampaignArray:
         # One line per arm, in declaration order, resolved to absolute paths.
         assert len(lines) == 3
         assert [Path(ln).stem for ln in lines] == ["alpha", "beta", "gamma"]
+
+    def test_array_records_the_code_snapshot_beside_the_manifest(self, tmp_path: Path) -> None:
+        """Every arm's task checks itself against this record at start (#2662)."""
+        cfg, out_dir, _configs = self._three_arm_campaign(tmp_path)
+        o = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+        o.slurm.submit_job = lambda script, **kw: 1  # type: ignore[method-assign]
+        o.submit_campaign(str(cfg))
+
+        record = json.loads((out_dir / "array_manifest.snapshot.json").read_text())
+        head = subprocess.run(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert record["head"] == head
+        assert sorted(Path(k).stem for k in record["configs"]) == ["alpha", "beta", "gamma"]
+
+    def test_array_outside_a_checkout_refuses_to_submit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Planted: HEAD cannot be resolved, so no record and no submission."""
+        from spectramr.core.dispatch_snapshot import DispatchSnapshotError
+
+        cfg, _out_dir, _configs = self._three_arm_campaign(tmp_path)
+        (tmp_path / ".git").rename(tmp_path / "not_git")
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        o = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+        submitted: list[str] = []
+        o.slurm.submit_job = lambda script, **kw: submitted.append(script) or 1  # type: ignore[method-assign]
+        with pytest.raises(DispatchSnapshotError, match="rev-parse"):
+            o.submit_campaign(str(cfg))
+        assert submitted == []
 
     def test_array_concurrency_flows_into_directive(self, tmp_path: Path) -> None:
         configs = [tmp_path / f"{s}.yaml" for s in ("a", "b", "c", "d")]
@@ -892,3 +952,214 @@ class TestSlurmOverrides:
         default the campaign deliberately changed."""
         o = CampaignOrchestrator(dry_run=True, slurm_overrides={"gpus": "4"})
         assert set(o.slurm_overrides) == {"gpus"}
+
+
+# ── --fresh / --resume on the array path (#2542) ─────────────────────
+
+
+@pytest.mark.usefixtures("_tmp_checkout")
+class TestArrayResumeIntent:
+    """The array script must carry the submitter's resume intent, and ``--fresh``
+    must not hand a requeued link a stale checkpoint from an earlier run."""
+
+    def _campaign(self, tmp_path: Path):
+        arm = tmp_path / "alpha.yaml"
+        _write_min_experiment_yaml(arm)
+        cfg = tmp_path / "campaign.yaml"
+        out_dir = tmp_path / "camp_out"
+        _write_campaign_yaml(
+            cfg, experiment_configs=[arm], output_dir=str(out_dir), execution="array"
+        )
+        return cfg, out_dir
+
+    def _submit(self, tmp_path: Path, **flags) -> tuple[str, Path]:
+        cfg, out_dir = self._campaign(tmp_path)
+        o = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True, **flags)
+        scripts: list[str] = []
+        o.slurm.submit_job = lambda script, **kw: scripts.append(script) or 1  # type: ignore[method-assign]
+        o.submit_campaign(str(cfg))
+        return scripts[0], out_dir
+
+    def test_fresh_reaches_the_script_and_the_state(self, tmp_path: Path) -> None:
+        script, out_dir = self._submit(tmp_path, fresh=True)
+        assert 'RESUME_FLAG="--resume-off --requeue-resumes"' in script
+        state = CampaignState.load(out_dir / "campaign_state.json")
+        assert state.resume_mode == "fresh"
+
+    def test_default_spells_no_resume_flag(self, tmp_path: Path) -> None:
+        script, out_dir = self._submit(tmp_path)
+        assert 'RESUME_FLAG=""' in script
+        assert "--resume-off" not in script
+        assert CampaignState.load(out_dir / "campaign_state.json").resume_mode == "default"
+
+    def test_fresh_refuses_an_arm_with_stale_checkpoints(self, tmp_path: Path) -> None:
+        """Planted: an earlier run's checkpoint in the arm's output dir."""
+        cfg, out_dir = self._campaign(tmp_path)
+        ckpt = out_dir / "alpha" / "checkpoints"
+        ckpt.mkdir(parents=True)
+        (ckpt / "checkpoint_step_9000.pt").write_bytes(b"")
+        o = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True, fresh=True)
+        submitted: list[str] = []
+        o.slurm.submit_job = lambda script, **kw: submitted.append(script) or 1  # type: ignore[method-assign]
+        with pytest.raises(ValueError, match="already holds checkpoints"):
+            o.submit_campaign(str(cfg))
+        assert submitted == []
+
+    def test_resume_tolerates_existing_checkpoints(self, tmp_path: Path) -> None:
+        _cfg, out_dir = self._campaign(tmp_path)
+        ckpt = out_dir / "alpha" / "checkpoints"
+        ckpt.mkdir(parents=True)
+        (ckpt / "checkpoint_step_9000.pt").write_bytes(b"")
+        script, _ = self._submit(tmp_path, resume=True)
+        assert 'RESUME_FLAG="--resume"' in script
+
+
+# ── Checkpoint discovery goes through checkpointing.select ─────────
+
+
+def _v1_step(path: Path) -> Path:
+    import torch
+
+    from tests.fixtures.run_state_files import write_run_state
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return write_run_state(path, {"generator": {"w": torch.zeros(1)}}, role="step")
+
+
+def test_checkpoint_from_is_injected_as_a_run_reference() -> None:
+    """The parent's file is chosen when the child starts, not named at submission.
+    The behavioural half (a parent with no best chains through its latest step) is
+    test_slurm_backend.py::test_a_checkpoint_injection_resolves_at_job_start."""
+    import inspect
+
+    src = inspect.getsource(CampaignOrchestrator._submit_sequential)
+    assert "checkpoint_injections = {ref.inject_as: str(parent_output)}" in src
+    assert "checkpoint_injections=checkpoint_injections" in src
+    assert "best.pt" not in src
+
+
+def test_a_checkpoint_from_child_script_resolves_the_parent_run(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "exp.yaml"
+    cfg_file.write_text("x: 1\n")
+    config = CampaignConfigSchema.model_validate(
+        {
+            "name": "seq",
+            "description": "",
+            "execution": "sequential",
+            "output_dir": "out",
+            "stage_groups": [
+                {"name": "parent", "experiments": [{"name": "p1", "config": str(cfg_file)}]},
+                {
+                    "name": "child",
+                    "depends_on": ["parent"],
+                    "experiments": [
+                        {
+                            "name": "c1",
+                            "config": str(cfg_file),
+                            "checkpoint_from": {"stage": "parent", "experiment": "p1"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    campaign_dir = tmp_path / "out"
+    campaign_dir.mkdir()
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=False)
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        orch.slurm, "submit_job", lambda script, **kw: scripts.append(script) or len(scripts)
+    )
+    state = CampaignState(campaign_name="seq", campaign_dir=str(campaign_dir))
+    orch._submit_sequential(config, state, campaign_dir)
+    parent_script, child_script = scripts
+    assert "PARENT_CHECKPOINT_0" not in parent_script
+    parent_checkpoints = shlex.quote(str(campaign_dir / "p1" / "checkpoints"))
+    assert f"resolve_checkpoint {parent_checkpoints}" in child_script
+    assert '-O model.checkpoint_path=\\"\\${PARENT_CHECKPOINT_0}\\"' in child_script
+    assert "best.pt" not in child_script
+
+
+def test_completion_and_staleness_see_v1_and_pre_v1_files(tmp_path) -> None:
+    run = tmp_path / "arm"
+    _v1_step(run / "checkpoints" / "step_00000010.safetensors")
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    assert orch._has_completion_artifact(exp) is True
+    for name in ("step_00000010.safetensors", "checkpoint_epoch_0001_step_000010.pt"):
+        for p in (run / "checkpoints").iterdir():
+            p.unlink()
+        if name.startswith("step_"):
+            _v1_step(run / "checkpoints" / name)
+        else:
+            (run / "checkpoints" / name).write_bytes(b"x")
+        with pytest.raises(ValueError, match="--fresh refuses"):
+            CampaignOrchestrator._refuse_stale_checkpoints([("arm", "r", "c", "s", run)])
+
+
+def test_an_empty_or_absent_checkpoint_dir_is_neither_complete_nor_stale(tmp_path) -> None:
+    run = tmp_path / "arm"
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    assert orch._has_completion_artifact(exp) is False
+    CampaignOrchestrator._refuse_stale_checkpoints([("arm", "r", "c", "s", run)])
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "checkpoints" / "notes.txt").write_text("not a checkpoint")
+    assert orch._has_completion_artifact(exp) is False
+    CampaignOrchestrator._refuse_stale_checkpoints([("arm", "r", "c", "s", run)])
+
+
+def test_discover_results_records_the_best_else_latest_step(tmp_path) -> None:
+    run = tmp_path / "arm"
+    step = _v1_step(run / "checkpoints" / "step_00000010.pt")
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    orch._discover_results(exp)
+    assert exp.checkpoint_path == str(step)
+
+
+def test_a_run_with_only_pre_v1_files_names_them_and_the_converter(tmp_path, caplog) -> None:
+    run = tmp_path / "arm"
+    (run / "checkpoints").mkdir(parents=True)
+    for step in range(7):
+        (run / "checkpoints" / f"checkpoint_step_{step}.pt").write_bytes(b"x")
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    with caplog.at_level("WARNING"):
+        assert orch._has_completion_artifact(exp) is False
+        orch._discover_results(exp)
+    assert exp.checkpoint_path is None
+    warnings = [r.getMessage() for r in caplog.records if "pre-1.0" in r.getMessage()]
+    assert len(warnings) == 2
+    for message in warnings:
+        assert "checkpoint_step_0.pt" in message and "and 2 more" in message
+        assert f"python scripts/migrations/convert_checkpoints_v1.py {run}" in message
+
+
+def test_a_run_without_any_checkpoint_logs_no_conversion_hint(tmp_path, caplog) -> None:
+    run = tmp_path / "arm"
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    with caplog.at_level("WARNING"):
+        orch._has_completion_artifact(exp)
+        orch._discover_results(exp)
+    assert not [r for r in caplog.records if "pre-1.0" in r.getMessage()]
+
+
+def test_a_half_published_conversion_is_neither_complete_nor_failed(tmp_path) -> None:
+    """The arm's newest step may still be unpublished, so the probe raises, not guesses."""
+    from spectramr.infrastructure.checkpointing.select import (
+        CONVERSION_JOURNAL,
+        ConversionPendingError,
+    )
+
+    run = tmp_path / "arm"
+    _v1_step(run / "checkpoints" / "step_00000002.safetensors")
+    (run / "checkpoints" / CONVERSION_JOURNAL).write_text("{}")
+    orch = CampaignOrchestrator(base_dir=str(tmp_path), dry_run=True)
+    exp = ExperimentStatus(name="arm", config_path="x.yaml", output_dir=str(run))
+    with pytest.raises(ConversionPendingError, match=r"convert_checkpoints_v1\.py"):
+        orch._has_completion_artifact(exp)
+    with pytest.raises(ConversionPendingError):
+        orch._discover_results(exp)
+    assert exp.checkpoint_path is None

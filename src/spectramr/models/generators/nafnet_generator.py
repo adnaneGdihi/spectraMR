@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embedding
 from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
@@ -429,12 +430,7 @@ class NAFNetGenerator(GradCheckpointingMixin, IGenerator, nn.Module):
                     "model_kwargs.time_embedding_dim, which is the width the "
                     "generator builds contrast_embedding at."
                 )
-            if emb is None:
-                emb = contrast_emb
-            else:
-                if contrast_emb.shape[0] != emb.shape[0]:
-                    contrast_emb = contrast_emb[: emb.shape[0]]
-                emb = emb + contrast_emb
+            emb = fuse_contrast_embedding(emb, contrast_emb, owner="NAFNetGenerator")
 
         # Input
         x = self.intro(x)

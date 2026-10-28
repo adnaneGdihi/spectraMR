@@ -392,14 +392,48 @@ def _declared_list_entries(
             if weight is None and isinstance(entry, dict):
                 weight = entry.get("weight")
             enabled = getattr(entry, "enabled", None)
-            if enabled is None and isinstance(entry, dict):
-                enabled = entry.get("enabled", True)
+            if enabled is None:
+                # ``LossComponentConfig.enabled`` defaults True; a double that omits it
+                # must not read as disabled, whether it is a dict or an object.
+                enabled = entry.get("enabled", True) if isinstance(entry, dict) else True
             name = canonical_loss_name(str(raw))
             source = f"losses.{list_name}[{raw}].weight"
             found.setdefault(name, []).append(
                 (source, 1.0 if weight is None else float(weight), bool(enabled))
             )
     return found
+
+
+def declared_list_kwargs(loss_config: Any) -> dict[str, dict[str, Any]]:
+    """Per-entry ``kwargs:`` written on the list surface, keyed by entry source.
+
+    Constructor knobs such as ``comparison`` or ``profile`` change the objective but are not
+    weights, so the weight table does not carry them; the run record stamps them from here.
+    """
+    stamped: dict[str, dict[str, Any]] = {}
+    for list_name in LOSS_LISTS:
+        for entry in getattr(loss_config, list_name, None) or []:
+            if isinstance(entry, dict):
+                kwargs, raw = entry.get("kwargs"), entry.get("name")
+            else:
+                kwargs, raw = getattr(entry, "kwargs", None), getattr(entry, "name", None)
+            if kwargs and raw is not None:
+                stamped[f"losses.{list_name}[{raw}]"] = dict(kwargs)
+    return stamped
+
+
+def _reject_foreign_model(loss_config: Any) -> None:
+    """Raise when ``loss_config`` is a Pydantic model other than ``LossConfigSchema``."""
+    from pydantic import BaseModel
+
+    from spectramr.config.schemas.loss import LossConfigSchema
+
+    if isinstance(loss_config, BaseModel) and not isinstance(loss_config, LossConfigSchema):
+        raise TypeError(
+            f"build_loss_weight_table expects the `losses` block (LossConfigSchema) or "
+            f"None, got {type(loss_config).__name__}. Pass `config.losses`; any other "
+            f"model resolves to an empty table indistinguishable from a loss-free arm."
+        )
 
 
 def _agree(values: list[float]) -> bool:
@@ -420,6 +454,11 @@ def build_loss_weight_table(
 
     Never raises for an *undeclared* name — that is a lookup-time error (the caller may
     legitimately probe for a term it does not use).
+
+    Raises :class:`TypeError` for any other Pydantic model -- the whole settings object
+    or one ``losses`` sub-block -- which carries none of the surfaces walked here and so
+    would resolve to the same empty table a loss-free config does (#1978). Config
+    doubles (``SimpleNamespace``, ``MagicMock``) are not Pydantic models and pass.
     """
     if loss_config is None:
         return LossWeightTable(
@@ -427,6 +466,7 @@ def build_loss_weight_table(
             warmup_iterations=DEFAULT_WARMUP_ITERATIONS,
             warmup_losses=frozenset(),
         )
+    _reject_foreign_model(loss_config)
 
     lambdas = _declared_lambdas(loss_config)
     entries = _declared_list_entries(loss_config)
@@ -446,6 +486,8 @@ def build_loss_weight_table(
         canonical_loss_name(n)
         for n in (LEGACY_WARMUP_LOSSES if configured_warmup is None else configured_warmup)
     )
+    if configured_warmup is not None:
+        _reject_unknown_warmup_names(warmup_losses, set(lambdas) | set(entries))
 
     conflicts: list[str] = []
     specs: dict[str, LossWeightSpec] = {}
@@ -495,6 +537,27 @@ def build_loss_weight_table(
         warmup_iterations=warmup_iterations,
         warmup_losses=warmup_losses,
     )
+
+
+def _reject_unknown_warmup_names(warmup_losses: frozenset[str], declared: set[str]) -> None:
+    """Raise on a ``warmup_losses`` entry that names no loss the gate could ever hold.
+
+    The gate is a set-membership test, so a misspelt entry matches nothing and the
+    term it meant to defer trains from step 0 with no error. A name is known when the
+    registry has it, a schema ``lambda_`` field owns it, or this config declares it.
+    """
+    defaults = _schema_defaults()
+    unknown = sorted(
+        n
+        for n in warmup_losses
+        if n not in declared and n not in defaults and LossRegistry.get_loss_class(n) is None
+    )
+    if unknown:
+        raise ConfigurationError(
+            f"losses.reconstruction.warmup_losses names {unknown}, which match no registered "
+            "loss, no losses.<section>.lambda_<name> field and no declared term, so the "
+            "warm-up gate would hold nothing for them. Fix the spelling or drop the entry."
+        )
 
 
 def is_loss_configured(table: LossWeightTable, name: str) -> bool:

@@ -39,12 +39,3 @@ class UlfDpsConfig(StrictSchema):
             "(no ULF consistency) — the one-knob ablation control."
         ),
     )
-    blur_cutoff: float = Field(
-        default=0.5,
-        gt=0.0,
-        description=(
-            "Cutoff of the ULF low-pass forward operator A = ifft2c(H·fft2c(.)) used "
-            "in the DPS likelihood ||A(x_hat0) - y_ulf||^2 (smaller => more ULF "
-            "resolution loss)."
-        ),
-    )

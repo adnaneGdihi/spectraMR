@@ -513,9 +513,101 @@ def denormalize_kspace_robust(
     return data * scale
 
 
+def acs_band_rows(height: int, fraction: float, *, min_lines: int = 1) -> slice:
+    """The centred calibration band of ``fraction`` of ``height`` phase-encode lines.
+
+    The single owner of the ACS band: the ``acs`` scale domain reads it and
+    ``complementary_rep_masking`` places it in every mask, so the scale is
+    invariant to the mask only while both use this width. The width rounds, as
+    the masks always have; ``min_lines=0`` lets ``fraction=0`` mean no band.
+    Centred on the DC row ``height // 2`` that ``fft2c`` places;
+    ``(height - n) // 2`` sits one row off it for odd ``n``.
+    """
+    n = max(min_lines, round(height * fraction))
+    start = height // 2 - n // 2
+    return slice(start, start + n)
+
+
+def _kspace_patch_scale(spec: KSpaceNormalizationSpec, kspace: torch.Tensor, cd: int) -> torch.Tensor:
+    magnitude = compute_magnitude(kspace, eps=spec.eps)
+    sample = magnitude
+    # Centre patch: the spatial plane sits right after the channel axis,
+    # matching kspace_image_domain_scale rather than assuming trailing dims.
+    if spec.log_scaling and spec.center_fraction is not None and magnitude.ndim >= cd + 3:
+        sh, sw = magnitude.shape[cd + 1], magnitude.shape[cd + 2]
+        ch = max(1, int(sh * spec.center_fraction))
+        cw = max(1, int(sw * spec.center_fraction))
+        sample = magnitude.narrow(cd + 1, (sh - ch) // 2, ch).narrow(cd + 2, (sw - cw) // 2, cw)
+    return torch.clamp(robust_quantile(sample.flatten().float(), spec.percentile), min=spec.eps)
+
+
+def _image_scale(spec: KSpaceNormalizationSpec, kspace: torch.Tensor, cd: int) -> torch.Tensor:
+    return kspace_image_domain_scale(kspace, percentile=spec.percentile, channel_dim=cd, eps=spec.eps)
+
+
+def _acs_scale(spec: KSpaceNormalizationSpec, kspace: torch.Tensor, cd: int) -> torch.Tensor:
+    # Only the band every rung acquires contributes, so the fully sampled
+    # reference and any undersampled measurement of it give the same scale.
+    # The band runs along the phase-encode axis: plane dim -2 is ``cd + 1``,
+    # dim -1 is ``cd + 2`` (#2160; it was always ``cd + 1``).
+    index: list[slice] = [slice(None)] * kspace.ndim
+    assert spec.center_fraction is not None, "KSpaceNormalizationSpec rejects acs without it"
+    dim = cd + (1 if spec.phase_encode_axis == -2 else 2)
+    index[dim] = acs_band_rows(kspace.shape[dim], spec.center_fraction)
+    band = torch.zeros_like(kspace)
+    band[tuple(index)] = kspace[tuple(index)]
+    return _image_scale(spec, band, cd)
+
+
+def acs_window(height: int, width: int, fraction: float) -> tuple[slice, slice]:
+    """``(rows, cols)`` of the centred ``n x n`` calibration window, ``n = round(fraction * width)``.
+
+    The single owner of the 2-D ACS window: every 2-D repetition mask contains it
+    (``rep_mask_patterns.calibration_region``) and the ``acs_window`` scale domain
+    reads it, so that scale is the same on the reference and on any 2-D mask.
+    """
+    n = round(width * fraction)
+    r0, c0 = height // 2 - n // 2, width // 2 - n // 2
+    return slice(max(0, r0), r0 + n), slice(max(0, c0), c0 + n)
+
+
+def _acs_window_scale(spec: KSpaceNormalizationSpec, kspace: torch.Tensor, cd: int) -> torch.Tensor:
+    # The ``acs`` band is whole phase-encode lines, which a Poisson-disc or radial
+    # mask does not keep; the square window inside every 2-D mask is what it keeps.
+    assert spec.center_fraction is not None, "KSpaceNormalizationSpec rejects acs_window without it"
+    rows, cols = acs_window(kspace.shape[cd + 1], kspace.shape[cd + 2], spec.center_fraction)
+    index: list[slice] = [slice(None)] * kspace.ndim
+    index[cd + 1], index[cd + 2] = rows, cols
+    window = torch.zeros_like(kspace)
+    window[tuple(index)] = kspace[tuple(index)]
+    return _image_scale(spec, window, cd)
+
+
+_SCALE_DOMAIN_FNS = {
+    "kspace": _kspace_patch_scale,
+    "image": _image_scale,
+    "acs": _acs_scale,
+    "acs_window": _acs_window_scale,
+}
+
 #: The advertised set of scale domains. An unknown value raises rather than
 #: degrading to a default (pitfall #9).
-KSPACE_SCALE_DOMAINS = ("kspace", "image")
+KSPACE_SCALE_DOMAINS = tuple(_SCALE_DOMAIN_FNS)
+
+#: Which k-space image of a subject the scale is measured on
+#: (``data.processing.kspace_scale_reference``). ``"target"`` is the historical
+#: order, ``kspace`` then ``target`` then ``input``; ``"input"`` is what a
+#: deployed model sees, since prediction has no target. Advertised set.
+KSPACE_SCALE_REFERENCES = ("target", "input")
+
+#: The historical reference order behind ``scale_reference="target"``.
+_TARGET_FIRST_ORDER = ("kspace", "target", "input")
+
+#: The measurement as acquired, published beside an ``input`` the dataset has
+#: already recorrupted or split (``target_mode: r2r`` / ``nullspace_r2r``).
+#: Deployment sees this, not ``y + alpha*z``, so ``scale_reference="input"``
+#: measures on it. Read only for the scale, then removed so it is never served.
+MEASURED_INPUT_KEY = "input_measured"
 
 #: The five knobs :meth:`KSpaceNormalizationSpec.from_data_config` resolves, as
 #: they are spelled on ``data.processing`` today. Two were also renamed by the
@@ -628,13 +720,52 @@ class KSpaceNormalizationSpec:
     scale_domain: str = "kspace"
     center_fraction: float | None = None
     eps: float = 1e-8
+    #: ``data.acquisition.phase_encode_axis``: the plane dimension the ``acs``
+    #: band runs along. Read only by ``scale_domain='acs'``, which requires it.
+    phase_encode_axis: int | None = None
+    #: ``data.processing.kspace_scale_reference``: which subject image the
+    #: transform measures the scale on. Batch-level callers pass the tensor
+    #: themselves and do not read it.
+    scale_reference: str = "target"
 
     def __post_init__(self) -> None:
+        if self.scale_reference not in KSPACE_SCALE_REFERENCES:
+            raise ValueError(
+                f"[KSpaceNormalizationSpec] Unknown scale_reference="
+                f"{self.scale_reference!r}. Valid: {list(KSPACE_SCALE_REFERENCES)}."
+            )
         if self.scale_domain not in KSPACE_SCALE_DOMAINS:
             raise ValueError(
                 f"[KSpaceNormalizationSpec] Unknown scale_domain="
                 f"{self.scale_domain!r}. Valid: {list(KSPACE_SCALE_DOMAINS)}."
             )
+        if self.scale_domain in ("acs", "acs_window") and not (
+            self.center_fraction is not None and 0.0 < self.center_fraction <= 1.0
+        ):
+            raise ValueError(
+                f"[KSpaceNormalizationSpec] scale_domain={self.scale_domain!r} reads a centred "
+                "calibration region of center_fraction and needs a fraction in (0, 1]; got "
+                f"{self.center_fraction!r}."
+            )
+        if self.scale_domain == "acs" and self.phase_encode_axis not in (-1, -2):
+            raise ValueError(
+                "[KSpaceNormalizationSpec] scale_domain='acs' reads a band of phase-encode "
+                "lines and needs data.acquisition.phase_encode_axis (-1 or -2); got "
+                f"{self.phase_encode_axis!r}. Measure it with "
+                "scripts/physics/measure_phase_encode_axis.py (#2160)."
+            )
+
+    @property
+    def log_compressed(self) -> bool:
+        """Whether k-space leaves the data path ``log1p``-compressed.
+
+        The one answer every reader of that fact consumes (#2353). The
+        compression runs inside :meth:`normalize`, which is a no-op when the
+        spec is disabled, so ``log_scaling`` alone is a declaration that
+        ``enable_kspace_normalization: false`` leaves inert — and a reader that
+        trusted it would ``expm1`` k-space that was never compressed.
+        """
+        return self.enabled and self.log_scaling
 
     @classmethod
     def from_data_config(cls, data: Any) -> KSpaceNormalizationSpec:
@@ -682,6 +813,14 @@ class KSpaceNormalizationSpec:
         processing = (
             data.get("processing") if isinstance(data, dict) else getattr(data, "processing", None)
         )
+        acquisition = (
+            data.get("acquisition") if isinstance(data, dict) else getattr(data, "acquisition", None)
+        )
+        phase_encode_axis = (
+            acquisition.get("phase_encode_axis")
+            if isinstance(acquisition, dict)
+            else getattr(acquisition, "phase_encode_axis", None)
+        )
 
         if processing is not None:
             declared = _read_declared_knobs(
@@ -689,12 +828,22 @@ class KSpaceNormalizationSpec:
                 _PROCESSING_KNOBS,
                 nullable=("log_scaling_center_fraction",),
             )
+            # Not in _PROCESSING_KNOBS: run configs stored before the knob existed
+            # omit it, and every one of them measured on the target-first order,
+            # so absence means "target" rather than an undeclared rename.
+            reference = (
+                processing.get("kspace_scale_reference", "target")
+                if isinstance(processing, dict)
+                else getattr(processing, "kspace_scale_reference", "target")
+            )
             return cls(
                 enabled=bool(declared["enable_kspace_normalization"]),
                 percentile=float(declared["kspace_percentile"]),
                 log_scaling=bool(declared["enable_log_scaling"]),
                 scale_domain=str(declared["kspace_scale_domain"]),
                 center_fraction=declared["log_scaling_center_fraction"],
+                phase_encode_axis=phase_encode_axis,
+                scale_reference=str(reference),
             )
 
         present = [
@@ -729,36 +878,19 @@ class KSpaceNormalizationSpec:
             log_scaling=bool(get("log_scaling", False)),
             scale_domain=str(get("kspace_scale_domain", "kspace")),
             center_fraction=get("log_scaling_center_fraction", None),
+            phase_encode_axis=phase_encode_axis,
         )
 
     # -- scale ------------------------------------------------------------
 
     def compute_scale(self, kspace: torch.Tensor, *, channel_dim: int = 0) -> torch.Tensor:
-        """Robust scale for *kspace*, measured in :pyattr:`scale_domain`."""
-        if self.scale_domain == "image":
-            return kspace_image_domain_scale(
-                kspace,
-                percentile=self.percentile,
-                channel_dim=channel_dim,
-                eps=self.eps,
-            )
+        """Robust scale for *kspace*, measured in :pyattr:`scale_domain`.
 
-        magnitude = compute_magnitude(kspace, eps=self.eps)
-        sample = magnitude
-        # Centre patch: the spatial plane sits right after the channel axis,
-        # matching kspace_image_domain_scale rather than assuming trailing dims.
-        if self.log_scaling and self.center_fraction is not None:
-            cd = channel_dim % kspace.ndim
-            if magnitude.ndim >= cd + 3:
-                sh, sw = magnitude.shape[cd + 1], magnitude.shape[cd + 2]
-                ch = max(1, int(sh * self.center_fraction))
-                cw = max(1, int(sw * self.center_fraction))
-                sample = magnitude.narrow(cd + 1, (sh - ch) // 2, ch).narrow(
-                    cd + 2, (sw - cw) // 2, cw
-                )
-
-        scale = robust_quantile(sample.flatten().float(), self.percentile)
-        return torch.clamp(scale, min=self.eps)
+        ``acs`` is the image-domain scale of the centred ``center_fraction``
+        band of phase-encode lines alone, so it is the same at every rung and at
+        inference, where only the undersampled measurement exists.
+        """
+        return _SCALE_DOMAIN_FNS[self.scale_domain](self, kspace, channel_dim % kspace.ndim)
 
     # -- apply ------------------------------------------------------------
 
@@ -923,24 +1055,25 @@ class KSpaceNormalizationTransform(tio.Transform):
     Controlled by ``config.normalize_kspace = True``.
     """
 
-    # Keys that are k-space domain (will be normalized)
+    # Keys that are k-space domain (will be normalized). `input_alt` is the
+    # input's sibling repetition (`data.emit_alternate_input`) and must share its
+    # scale, or the model is graded on a second input ~20x off its training range.
     KSPACE_KEYS = {
         "kspace",
         "kspace_sub",
         "kspace_full",
         "measured_kspace",
         "input",
+        "input_alt",
         "target",
     }
 
     # Keys that are image domain (will NOT be normalized)
     IMAGE_KEYS = {"image", "mri", "gt"}
 
-    #: Where the robust scale is measured. ``"kspace"`` takes the quantile of
-    #: the k-space magnitude; ``"image"`` takes it of the coil-RSS magnitude
-    #: after ``ifft2c`` (Parseval-compliant — puts the reconstructed image at
-    #: ~unit scale). Advertised set, so an illegal YAML value raises.
-    SCALE_DOMAINS = ("kspace", "image")
+    #: Images holding a second contrast (``source_layout: separate``). They are
+    #: normalized by their own scale and never supply ``kspace_scale``.
+    SOURCE_KSPACE_KEYS = frozenset({"kspace_source"})
 
     def __init__(
         self,
@@ -949,6 +1082,8 @@ class KSpaceNormalizationTransform(tio.Transform):
         log_scaling: bool = False,
         center_fraction: float | None = None,
         scale_domain: str = "kspace",
+        phase_encode_axis: int | None = None,
+        scale_reference: str = "target",
     ) -> None:
         """__init__.
 
@@ -957,8 +1092,13 @@ class KSpaceNormalizationTransform(tio.Transform):
             eps (float): Numerical-stability floor.
             log_scaling (bool): Apply phase-preserving log1p compression.
             center_fraction (float | None): Centre patch used for the k-space
-                scale. Ignored when ``scale_domain='image'``.
-            scale_domain (str): One of :pyattr:`SCALE_DOMAINS`.
+                scale, or the phase-encode band for ``scale_domain='acs'``.
+                Ignored when ``scale_domain='image'``.
+            scale_domain (str): One of :data:`KSPACE_SCALE_DOMAINS`.
+            phase_encode_axis (int | None): The plane dimension the ``acs``
+                band runs along (``data.acquisition.phase_encode_axis``).
+            scale_reference (str): One of :data:`KSPACE_SCALE_REFERENCES`; the
+                subject image the scale is measured on.
         """
         super().__init__()
         # The spec validates scale_domain (raises on an unknown value) and owns
@@ -970,12 +1110,41 @@ class KSpaceNormalizationTransform(tio.Transform):
             scale_domain=scale_domain,
             center_fraction=center_fraction,
             eps=eps,
+            phase_encode_axis=phase_encode_axis,
+            scale_reference=scale_reference,
         )
         self.percentile = percentile
         self.eps = eps
         self.log_scaling = log_scaling
         self.center_fraction = center_fraction
         self.scale_domain = scale_domain
+        self.scale_reference = scale_reference
+
+    def _reference_key(self, subject: tio.Subject, target_images: list[str]) -> str:
+        """The subject image the scale is measured on, per ``scale_reference``.
+
+        ``"target"`` is the historical order: ``kspace`` (on a paired route, the
+        target), then ``target``, then ``input``, then the first non-source
+        k-space image. ``"input"`` takes the measurement as acquired
+        (:data:`MEASURED_INPUT_KEY`) when the dataset recorrupted ``input``, else
+        ``input``; it has no fallback, since a scale measured on anything else is
+        the train/deploy mismatch the knob exists to remove.
+        """
+        if self.spec.scale_reference == "input":
+            if MEASURED_INPUT_KEY in subject:
+                return MEASURED_INPUT_KEY
+            if "input" not in target_images:
+                raise KeyError(
+                    "[KSpaceNormalizationTransform] data.processing.kspace_scale_reference "
+                    "is 'input', but the subject carries no 'input' k-space image "
+                    f"(k-space images: {sorted(target_images)}). Serve an input or "
+                    "declare kspace_scale_reference: target."
+                )
+            return "input"
+        return next(
+            (k for k in _TARGET_FIRST_ORDER if k in target_images),
+            next(k for k in target_images if k not in self.SOURCE_KSPACE_KEYS),
+        )
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         """Normalize ONLY k-space images by magnitude percentile."""
@@ -989,14 +1158,11 @@ class KSpaceNormalizationTransform(tio.Transform):
         if not target_images:
             return subject
 
-        # 2. Calculate Global Scale
-        # derive scale from 'kspace' (fully sampled) if available,
-        # otherwise use the first available k-space tensor.
-        ref_key = next(
-            (k for k in ["kspace", "target", "input"] if k in target_images),
-            target_images[0],
-        )
+        # 2. Calculate Global Scale on the declared reference image.
+        ref_key = self._reference_key(subject, target_images)
         ref_data = subject[ref_key].data
+        if MEASURED_INPUT_KEY in subject:
+            subject.remove_image(MEASURED_INPUT_KEY)
 
         # Delegate to the SSOT resolver so the training-time scale and the
         # inference-time scale are computed by the SAME code (issue #572).
@@ -1031,7 +1197,13 @@ class KSpaceNormalizationTransform(tio.Transform):
             normed, _ = normalize_kspace_robust(
                 image.data,
                 log_scaling=self.log_scaling,
-                scale=scale,
+                # A second contrast served beside the target takes its own scale,
+                # so the target's intensities do not depend on the source's.
+                scale=(
+                    self.spec.compute_scale(image.data, channel_dim=0)
+                    if name in self.SOURCE_KSPACE_KEYS
+                    else scale
+                ),
                 channel_dim=0,
                 eps=self.eps,
             )
@@ -1051,6 +1223,21 @@ class KSpaceNormalizationTransform(tio.Transform):
         subject.update_attributes()
 
         return subject
+
+
+def consumes_measured_input(transform: Any) -> bool:
+    """Whether *transform* reads :data:`MEASURED_INPUT_KEY` for its scale.
+
+    A dataset publishes that key only when this is true, so a chain without an
+    input-referenced k-space normalizer never receives an image nothing removes.
+    Walks ``tio.Compose`` (and any ``.transforms`` list) recursively.
+    """
+    if isinstance(transform, KSpaceNormalizationTransform):
+        return transform.spec.scale_reference == "input"
+    children = getattr(transform, "transforms", None)
+    if isinstance(children, (list, tuple)):
+        return any(consumes_measured_input(child) for child in children)
+    return False
 
 
 # ---------------------------------------------------------------------------

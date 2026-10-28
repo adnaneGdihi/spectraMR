@@ -138,6 +138,15 @@ _ALLOWED: dict[str, tuple[tuple[str, str], ...]] = {
             "the dataset-backed call already passes worker_init_fn.",
         ),
     ),
+    "src/spectramr/data/builders/prefetching_queue.py": (
+        (
+            "PrefetchingQueue._get_subjects_iterable",
+            "The train queue's internal subject loader, overriding tio.Queue's own so "
+            "it takes a prefetch_factor (#2673). No worker_init_fn, as in TorchIO: "
+            "torch seeds random/numpy/torch per worker, and seed_worker would reseed "
+            "NumPy and change existing runs' augmentation draws.",
+        ),
+    ),
     "src/spectramr/data/datasets/preprocessed_dataset.py": (
         (
             "create_preprocessed_dataloader",

@@ -11,11 +11,11 @@ from spectramr.models.losses.registry import register_loss
 
 @register_loss(name="contrastive", aliases=["ContrastiveLoss"])
 class ContrastiveLoss(nn.Module):
-    """InfoNCE-style contrastive loss with temperature scaling.
+    r"""InfoNCE-style contrastive loss with temperature scaling.
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{Contrastive} = - \\mathbb{E} \\left[ \\log \frac{\\exp(sim(z_i, z_j)/\tau)}{\\sum_{k \neq i} \\exp(sim(z_i, z_k)/\tau)} \right]"""
+        \mathcal{L}_{Contrastive} = - \mathbb{E} \left[ \log \frac{\exp(sim(z_i, z_j)/\tau)}{\sum_{k \neq i} \exp(sim(z_i, z_k)/\tau)} \right]"""
 
     def __init__(self, temperature: float = 0.07):
         """Initialize contrastive loss.
@@ -29,7 +29,7 @@ class ContrastiveLoss(nn.Module):
     def forward(
         self,
         features: Float[Tensor, "B D"],
-        labels: Int[Tensor, B] | None = None,
+        labels: Int[Tensor, " B"] | None = None,  # noqa: F722
         mask: Bool[Tensor, "B B"] | None = None,
     ) -> Float[Tensor, ""]:
         """Compute InfoNCE loss.
@@ -80,24 +80,20 @@ class ContrastiveLoss(nn.Module):
             raise ValueError("Must provide labels or mask for ContrastiveLoss")
 
         # Mask out self-contrast
-        logits_mask = torch.ones_like(mask, dtype=features.dtype) - torch.eye(
-            batch_size, device=device, dtype=features.dtype
-        )
+        self_mask = torch.eye(batch_size, device=device, dtype=torch.bool)
+        logits_mask = (~self_mask).to(features.dtype)
         mask = mask * logits_mask  # Remove diagonal from positives
 
-        # Compute log_prob
-        # exp_logits: [B, B]
-        exp_logits = torch.exp(similarity_matrix) * logits_mask
-
-        # log_prob for positive pairs
-        # We want to maximize sim(i, p) for all p in P(i)
-        # Loss = -1/|P(i)| * sum_{p in P(i)} log( exp(sim(i,p)) / sum_{a in A(i)} exp(sim(i,a)) )
-
-        # Denominator: sum over all negatives and positives (except self)
-        denom = exp_logits.sum(dim=1, keepdim=True)
-
-        # Log probability
-        log_prob = similarity_matrix - torch.log(denom + 1e-9)
+        # Loss = -1/|P(i)| * sum_{p in P(i)} log( exp(sim(i,p)) / sum_{a in A(i)} exp(sim(i,a)) ),
+        # the denominator over every sample except self. It is taken as a
+        # logsumexp because exp(1/tau) overflows float32 once tau < ~0.011; the
+        # self term is excluded with the dtype's finite minimum rather than -inf
+        # so a single-sample row stays finite in value and gradient.
+        excluded = torch.finfo(similarity_matrix.dtype).min
+        log_denom = torch.logsumexp(
+            similarity_matrix.masked_fill(self_mask, excluded), dim=1, keepdim=True
+        )
+        log_prob = (similarity_matrix - log_denom).masked_fill(self_mask, 0.0)
 
         # Compute mean of log-likelihood over positive pairs
         # mask * log_prob selects relevant pairs
@@ -144,8 +140,8 @@ class CAContrastiveLoss(nn.Module):
         self,
         z_geo: Float[Tensor, "B D_geo"],
         z_phy: Float[Tensor, "B D_phy"],
-        subject_ids: Int[Tensor, B],
-        contrast_ids: Int[Tensor, B],
+        subject_ids: Int[Tensor, " B"],  # noqa: F722
+        contrast_ids: Int[Tensor, " B"],  # noqa: F722
     ) -> tuple[Float[Tensor, ""], Float[Tensor, ""], Float[Tensor, ""]]:
         """Compute disentanglement losses.
 

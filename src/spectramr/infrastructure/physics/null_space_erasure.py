@@ -96,30 +96,19 @@ class NullSpaceMarkerEraser(nn.Module):
         # Flatten to [B, N]
         Y = corrupted_image.reshape(B, N)
 
-        # M: [K, N]  →  M^H: [N, K]
-        M = self.M  # [K, N]
-        M_H = M.conj().t()  # [N, K]
-
-        # Gram matrix + regularisation: (M^H M + εI)^{-1}
-        gram = M @ M_H  # [K, K]
+        # Basis vectors as columns A = M^T [N, K]; P = A (A^H A + eps I)^-1 A^H. For a real
+        # basis this equals the earlier row-space form; for a complex one the conjugates
+        # make it a true orthogonal projector (idempotent).
+        A = self.M.t().to(Y.dtype)  # [N, K]
+        a_h = A.conj().t()  # [K, N]
+        gram = a_h @ A  # [K, K]
         gram_reg = gram + self.epsilon * torch.eye(
             gram.shape[0], device=gram.device, dtype=gram.dtype
         )
-        gram_inv = torch.linalg.inv(gram_reg)  # [K, K]
+        coeffs = torch.linalg.solve_ex(gram_reg, a_h @ Y.t())[0]  # _ex: no info-check host sync
+        y_clean = Y - (A @ coeffs).t()  # [B, N]
 
-        # Projection: P_M = M^H (M M^H + εI)^{-1} M
-        # Y_clean = Y - M^H @ gram_inv @ M @ Y^T
-        # But for efficiency with batch:
-        # coefficients = gram_inv @ M @ Y^T  → [K, B]
-        coeffs = gram_inv @ (M @ Y.t())  # [K, B]
-
-        # Projection of Y onto M: M^H @ coeffs → [N, B]
-        projection = M_H @ coeffs  # [N, B]
-
-        # Subtract projection
-        Y_clean = Y - projection.t()  # [B, N]
-
-        return Y_clean.reshape(B, *spatial)
+        return y_clean.reshape(B, *spatial)
 
 
 __all__ = ["NullSpaceMarkerEraser"]

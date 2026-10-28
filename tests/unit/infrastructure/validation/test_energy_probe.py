@@ -168,19 +168,102 @@ def test_rho_growth_flags_input_dependent_gain():
     assert growth_stable == pytest.approx(1.0, rel=1e-4)
 
 
-# ── measurement B: trajectory slicing on a toy ────────────────────────────────
-def test_measure_trajectory_slices_per_step():
-    model = _ToyGen(_Gain(1.2), n_steps=5)
-    config = SimpleNamespace(
-        model=SimpleNamespace(in_channels=2, out_channels=1, model_kwargs={}),
-        data=DataConfigStub(patch_size=[8, 8], batch_size=1),
-        training=SimpleNamespace(diffusion=SimpleNamespace(sampling_steps=5, timesteps=28)),
+# ── measurement B: trajectory on a toy with the arm's ladder (#2527) ─────────
+class _LadderGen(_ToyGen):
+    """_ToyGen plus the arm's kspace_process and a sample() that records its call."""
+
+    def __init__(self, attention: nn.Module, process, *, n_steps: int = 4) -> None:
+        super().__init__(attention, n_steps=n_steps)
+        self.kspace_process = process
+        self._current_mask = None
+        self.calls: list[dict] = []
+
+    def set_current_mask(self, mask):
+        self._current_mask = mask
+
+    def sample(self, measurement, mask=None, **kwargs):
+        self.calls.append(
+            {"measurement": measurement, "mask": mask, "stashed": self._current_mask, **kwargs}
+        )
+        return super().sample(measurement, mask=mask)
+
+
+def _traj_config(patch_size=(16, 16)):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            in_channels=2, out_channels=2, model_type="stub", model_kwargs={"timesteps": _T}
+        ),
+        data=DataConfigStub(patch_size=list(patch_size), batch_size=1),
     )
-    steps = ep.measure_trajectory_energy(model, config, device="cpu")
+
+
+def _run_traj(model, patch_size=(16, 16)):
+    kspace, mask = ep.build_trajectory_input(model, _traj_config(patch_size), "cpu", _T - 1)
+    steps = ep.measure_trajectory_energy(model, kspace, mask=mask, timestep=_T - 1)
+    return kspace, mask, steps
+
+
+def test_measure_trajectory_slices_per_step():
+    model = _LadderGen(_Gain(1.2), _process(), n_steps=5)
+    _, _, steps = _run_traj(model)
     assert len(steps) == 5  # one StepEnergy per reverse step
     assert steps[0].step == 0
     assert steps[0].max_rho == pytest.approx(1.2, rel=1e-4)
     assert all(math.isfinite(s.model_output_norm) for s in steps)
+
+
+def test_trajectory_samples_from_the_arms_own_undersampled_rung():
+    """PLANTED (#2527): red before the fix -- sample() got mask=None on a full phantom."""
+    process = _process()
+    model = _LadderGen(_Gain(1.0), process)
+    kspace, mask, _ = _run_traj(model, patch_size=(16, 16, 1))
+
+    (call,) = model.calls
+    assert call["mask"] is mask and call["stashed"] is mask
+    assert call["start_timestep"] == _T - 1
+    t = torch.full((1,), _T - 1, dtype=torch.long)
+    expected = process.cascade_batch_masks(t, (16, 16), torch.device("cpu")).float()
+    assert torch.equal(mask, expected)
+    assert 0.0 < float(mask.mean()) < 1.0, "an undersampled rung, not the fully-sampled one"
+
+    measured = call["measurement"]
+    assert measured.shape == kspace.shape == (1, 2, 16, 16, 1)
+    off = (mask == 0).unsqueeze(-1).expand_as(measured)
+    assert bool((measured[off] == 0).all()), "zero wherever the mask did not sample"
+    assert torch.equal(measured[~off], kspace[~off])
+    assert model._current_mask is None, "the stash is restored after the trajectory"
+
+
+def test_trajectory_refuses_a_missing_mask():
+    model = _LadderGen(_Gain(1.0), _process())
+    kspace, _ = ep.build_trajectory_input(model, _traj_config(), "cpu", _T - 1)
+    with pytest.raises(ValueError, match="needs the arm's acquisition mask"):
+        ep.measure_trajectory_energy(model, kspace, mask=None, timestep=_T - 1)
+    assert not model.calls
+
+
+def test_trajectory_refuses_a_fully_sampled_mask():
+    model = _LadderGen(_Gain(1.0), _process())
+    kspace, mask = ep.build_trajectory_input(model, _traj_config(), "cpu", _T - 1)
+    with pytest.raises(ValueError, match="fully-sampled point"):
+        ep.measure_trajectory_energy(model, kspace, mask=torch.ones_like(mask), timestep=_T - 1)
+    assert not model.calls
+
+
+def test_trajectory_refuses_a_model_without_a_ladder():
+    with pytest.raises(ValueError, match="no kspace_process"):
+        ep.build_trajectory_input(_ToyGen(_Gain(1.0)), _traj_config(), "cpu", _T - 1)
+
+
+def test_probe_arm_stamps_where_the_trajectory_started(monkeypatch):
+    model = _LadderGen(_Gain(1.0), _process())
+    monkeypatch.setattr(ep, "build_probe_model", lambda config, device: model)
+    report = ep.probe_arm(_traj_config(), "cpu", scales=[1.0], phase_perturb=False, trajectory=True)
+    assert report.trajectory_start_timestep == _T - 1
+    assert 0.0 < report.trajectory_sampled_fraction < 1.0
+    assert model.calls[0]["mask"] is not None, "PLANTED (#2527): the old path passed mask=None"
+    assert model.calls[0]["start_timestep"] == _T - 1
+    assert report.to_dict()["trajectory_sampled_fraction"] == report.trajectory_sampled_fraction
 
 
 # ── ranking ───────────────────────────────────────────────────────────────────
@@ -536,7 +619,10 @@ def _ceiling_arm(*, log_scaled: bool = True) -> SimpleNamespace:
     """A config shaped like the arms that could not be probed."""
     # Routed through the stub's flat->canonical map, not assigned after the
     # fact: every sub-block is frozen=True (non-negotiable 1).
-    data = DataConfigStub(patch_size=[8, 8], batch_size=1, log_scaling=log_scaled)
+    # Log compression needs k-space normalization on as well (#2353).
+    data = DataConfigStub(
+        patch_size=[8, 8], batch_size=1, log_scaling=log_scaled, normalize_kspace=True
+    )
     return SimpleNamespace(
         model=SimpleNamespace(
             model_type="_ceiling_probe_stub",
@@ -580,3 +666,155 @@ def test_build_probe_model_injects_the_acceleration_config(_registered_ceiling_g
     config = _ceiling_arm()
     model = ep.build_probe_model(config, "cpu")
     assert model.acceleration_config is config.undersampling
+
+
+@pytest.mark.parametrize(
+    ("model_kwargs", "diffusion", "expected"),
+    [({"timesteps": 29}, None, 29), ({}, SimpleNamespace(timesteps=31), 31)],
+)
+def test_the_probe_reads_the_arms_horizon(model_kwargs, diffusion, expected):
+    config = SimpleNamespace(
+        model=SimpleNamespace(model_kwargs=model_kwargs),
+        training=SimpleNamespace(diffusion=diffusion),
+    )
+    assert ep._num_timesteps(config) == expected
+
+
+def test_an_arm_without_a_horizon_raises_rather_than_probing_t_14():
+    """PLANTED: an undeclared horizon fell back to 28 and probed t = 14."""
+    config = SimpleNamespace(
+        model=SimpleNamespace(model_kwargs={}), training=SimpleNamespace(diffusion=None)
+    )
+    with pytest.raises(ValueError, match="diffusion horizon"):
+        ep._num_timesteps(config)
+
+
+# ── acquisition mask (#2145) ──────────────────────────────────────────────────
+_T = 8
+
+
+def _process():
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+    return KSpaceUndersamplingProcess(num_timesteps=_T, max_acceleration=4.0, device="cpu")
+
+
+class _NullSpaceGen(nn.Module):
+    """Refuses without a mask, as the two null-space attention blocks do."""
+
+    def __init__(self, process=None) -> None:
+        super().__init__()
+        self.kspace_process = process
+        self._current_mask = None
+        self.seen: list = []
+        self.condition_with_smaps = False
+
+    def set_current_mask(self, mask):
+        self._current_mask = mask
+
+    def forward(self, x, timesteps=None, **kwargs):
+        mask = kwargs.get("mask")
+        if mask is None:
+            mask = self._current_mask
+        if mask is None:
+            raise ValueError("NullSpaceDualDomainAttention requires `mask`")
+        self.seen.append(mask)
+        return x
+
+
+def test_probe_mask_is_the_arms_own_ladder_at_the_timestep():
+    process = _process()
+    batch = torch.zeros(2, 4, 64, 64)
+    mask = ep.build_probe_mask(_NullSpaceGen(process), batch, _T // 2)
+
+    assert mask.shape == (2, 1, 64, 64) and mask.dtype == torch.float32
+    assert set(mask.unique().tolist()) <= {0.0, 1.0}
+    assert 0.0 < float(mask.mean()) < 1.0, "an undersampled rung, not a fully-sampled one"
+    t = torch.full((2,), _T // 2, dtype=torch.long)
+    expected = process.cascade_batch_masks(t, (64, 64), torch.device("cpu")).float()
+    assert torch.equal(mask, expected)
+
+
+def test_probe_mask_is_4d_for_the_cohorts_5d_batch():
+    """patch_size [H, W, 1] yields [B, C, H, W, 1]; the blocks require [B, 1, H, W]."""
+    mask = ep.build_probe_mask(_NullSpaceGen(_process()), torch.zeros(1, 4, 64, 64, 1), 3)
+    assert mask.shape == (1, 1, 64, 64)
+
+
+def test_probe_mask_refuses_a_model_without_a_ladder():
+    with pytest.raises(ValueError, match="no kspace_process"):
+        ep.build_probe_mask(_NullSpaceGen(None), torch.zeros(1, 2, 64, 64), 3)
+
+
+def test_probe_mask_refuses_a_real_depth_axis():
+    with pytest.raises(ValueError, match="trailing axes of size 1"):
+        ep.build_probe_mask(_NullSpaceGen(_process()), torch.zeros(1, 2, 64, 64, 3), 3)
+
+
+def test_stashed_mask_restores_the_previous_stash():
+    gen = _NullSpaceGen()
+    before, held = torch.zeros(1), torch.ones(1)
+    gen.set_current_mask(before)
+    with ep.stashed_mask(gen, held):
+        assert gen._current_mask is held
+    assert gen._current_mask is before
+
+
+def test_stashed_mask_opens_the_generators_mask_scope():
+    """The k-space generator reads its stash only inside ``mask_scope``; a bare
+    ``set_current_mask`` would leave every probe forward without a mask."""
+    from spectramr.models.generators.kspace_cold_diffusion_generator import (
+        KSpaceColdDiffusionGenerator,
+    )
+
+    gen = KSpaceColdDiffusionGenerator(
+        in_channels=4,
+        out_channels=4,
+        base_channels=8,
+        num_layers=2,
+        attention_type="none",
+        use_dc=False,
+        kspace_log_scaled=False,
+        condition_with_smaps=False,
+        timesteps=4,
+        backbone_type="complex_unet",
+        force_pure_kspace=True,
+    ).eval()
+    mask = torch.zeros(1, 1, 32, 32)
+    mask[..., 12:20] = 1.0
+    x, t = torch.randn(1, 4, 32, 32), torch.tensor([1])
+    with torch.no_grad():
+        with ep.stashed_mask(gen, mask):
+            out = gen(x, timesteps=t)
+        torch.testing.assert_close(out, gen(x, timesteps=t, mask=mask))
+    assert gen._current_mask is None
+
+
+def test_stashed_mask_refuses_a_model_that_would_drop_it():
+    guard = ep.stashed_mask(nn.Identity(), torch.ones(1))
+    with pytest.raises(ValueError, match="no set_current_mask"):
+        guard.__enter__()
+
+
+def test_a_withheld_mask_still_raises():
+    """PLANTED: the null-space refusal is correct and must survive the fix."""
+    with pytest.raises(ValueError, match="requires `mask`"):
+        ep.measure_forward_energy(
+            _NullSpaceGen(), _x(), scales=[1.0], phase_perturb=False, timestep=3
+        )
+
+
+def test_probe_arm_supplies_the_mask_to_a_null_space_arm(monkeypatch):
+    """PLANTED (#2145): red before the fix -- probe_arm called model(x, t) bare."""
+    gen = _NullSpaceGen(_process())
+    monkeypatch.setattr(ep, "build_probe_model", lambda config, device: gen)
+    config = SimpleNamespace(
+        model=SimpleNamespace(
+            in_channels=4, out_channels=4, model_type="stub", model_kwargs={"timesteps": _T}
+        ),
+        data=DataConfigStub(patch_size=[64, 64, 1], batch_size=2),
+    )
+    ep.probe_arm(config, "cpu", scales=[1.0], phase_perturb=False, trajectory=False)
+
+    assert gen.seen and all(m.shape == (2, 1, 64, 64) for m in gen.seen)
+    assert gen._current_mask is None, "the stash is restored after the probe"

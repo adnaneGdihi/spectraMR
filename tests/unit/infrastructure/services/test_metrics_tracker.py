@@ -128,8 +128,7 @@ def test_the_cascade_file_is_separate_from_training_metrics(
     tracker: MetricsTracker,
 ) -> None:
     """Making `training_metrics.csv` itself tall would repeat every training
-    loss once per level, and `metrics_report_generator` reads it with
-    `pd.read_csv(..., on_bad_lines="error")`."""
+    loss once per level in a file the report aggregator reads per pass."""
     assert tracker.cascading_csv != tracker.training_csv
     tracker.log_cascading_validation(_sweep(), iteration=100, epoch=1)
     assert tracker.cascading_csv.exists()

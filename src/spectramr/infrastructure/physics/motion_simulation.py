@@ -4,8 +4,71 @@ This module provides tools for simulating physiological motion, including
 rigid body motion and elastic respiratory deformations with hysteresis.
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
+
+__all__ = [
+    "RESPIRATORY_HYSTERESIS",
+    "apply_elastic_respiratory_motion",
+    "respiratory_trace",
+    "respiratory_trace_peak",
+    "simulate_elastic_motion_ffd",
+]
+
+#: Inhale/exhale asymmetry ``a`` of the breathing trace ``cos^2(n wt / 2) exp(-a sin(wt))``.
+RESPIRATORY_HYSTERESIS = 0.2
+_BREATHS = (1, 2)
+
+
+def respiratory_trace(
+    time_points: torch.Tensor,
+    cycle_period: float,
+    hysteresis: float = RESPIRATORY_HYSTERESIS,
+    *,
+    breaths_per_cycle: int = 2,
+) -> torch.Tensor:
+    """Asymmetric breathing trace ``cos^2(n wt / 2) exp(-a sin(wt))``, ``w = 2 pi / cycle_period``.
+
+    ``n = breaths_per_cycle`` lobes per ``cycle_period``. The default 2 is the FFD simulator's
+    trace (two lobes, skewed in opposite directions); ``n = 1`` is one breath per period with a
+    consistent inhale/exhale skew. Non-negative; its maximum is :func:`respiratory_trace_peak`.
+    """
+    if breaths_per_cycle not in _BREATHS:
+        raise ValueError(f"breaths_per_cycle must be one of {_BREATHS}; got {breaths_per_cycle!r}")
+    phase = 2 * torch.pi / cycle_period * time_points
+    lobe = phase if breaths_per_cycle == 2 else phase / 2
+    return torch.cos(lobe) ** 2 * torch.exp(-hysteresis * torch.sin(phase))
+
+
+def _peak_two_lobes(a: float) -> float:
+    # d/dphi = 0 away from cos = 0: a s^2 - 2 s - a = 0, s = sin(phi).
+    s = (1.0 - math.sqrt(1.0 + a * a)) / a
+    return (1.0 - s * s) * math.exp(-a * s)
+
+
+def _peak_one_lobe(a: float) -> float:
+    # f = (1 + cos phi) / 2 exp(-a sin phi); f' = 0 is g = sin phi + a cos phi (1 + cos phi) = 0.
+    phi = -a
+    for _ in range(50):
+        g = math.sin(phi) + a * math.cos(phi) * (1.0 + math.cos(phi))
+        dg = math.cos(phi) - a * math.sin(phi) * (1.0 + 2.0 * math.cos(phi))
+        phi -= g / dg
+    return 0.5 * (1.0 + math.cos(phi)) * math.exp(-a * math.sin(phi))
+
+
+_PEAKS = {1: _peak_one_lobe, 2: _peak_two_lobes}
+
+
+def respiratory_trace_peak(
+    hysteresis: float = RESPIRATORY_HYSTERESIS, *, breaths_per_cycle: int = 2
+) -> float:
+    """Maximum of :func:`respiratory_trace` (slightly above 1 for ``hysteresis > 0``)."""
+    if breaths_per_cycle not in _PEAKS:
+        raise ValueError(f"breaths_per_cycle must be one of {_BREATHS}; got {breaths_per_cycle!r}")
+    a = float(hysteresis)
+    return 1.0 if a == 0.0 else _PEAKS[breaths_per_cycle](a)
 
 
 def simulate_elastic_motion_ffd(
@@ -38,10 +101,7 @@ def simulate_elastic_motion_ffd(
     device = volume.device
 
     # 1. Respiratory Trace (Hysteresis model)
-    omega = 2 * torch.pi / cycle_period
-    phase = omega * time_points
-    # Asymmetric breathing trace [0, 1]
-    trace = torch.cos(phase) ** 2 * torch.exp(-0.2 * torch.sin(phase))
+    trace = respiratory_trace(time_points, cycle_period)
 
     # 2. Coarse Control Points
     # Grid size for control points (ensure at least 2x2x2 for interpolation)

@@ -154,3 +154,10 @@ def test_complex_activation_gradient_flows() -> None:
     out.backward()
     assert x.grad is not None
     assert act.bias.grad is not None
+
+
+def test_complex_activation_positive_bias_adds_no_kspace_floor() -> None:
+    """A positive bias must not lift k-space bins into a flat floor (image-centre Dirac)."""
+    act = ComplexActivation(channels=1, bias_init=0.5)
+    x = torch.full((1, 2, 8, 8), 1e-3)
+    assert torch.allclose(act(x), ComplexActivation(channels=1)(x))

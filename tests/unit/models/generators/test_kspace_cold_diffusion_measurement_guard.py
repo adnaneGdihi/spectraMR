@@ -208,7 +208,8 @@ def test_the_probe_hook_is_empty_when_no_mechanism_is_declared() -> None:
     assert bare.dc_layer is None, "dc_method='none' must disable model-internal DC"
     assert bare._output_kspace_clip_ratio is None
     assert bare._dc_passthrough_size is None
-    assert bare.synthetic_forward_probe_kwargs(torch.randn(2, 8, 64, 64)) == {}
+    # No measurement: only the mask the v2 geometry planes are built from.
+    assert set(bare.synthetic_forward_probe_kwargs(torch.randn(2, 8, 64, 64))) == {"mask"}
 
 
 def test_the_probe_mask_is_sparse_so_dc_is_a_constraint_not_a_copy(generator) -> None:

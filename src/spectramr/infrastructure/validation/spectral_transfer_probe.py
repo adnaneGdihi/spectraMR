@@ -139,6 +139,7 @@ def measure_radial_transfer(
     trailing: tuple[int, ...] = (),
     timestep: int = 0,
     label: str = "",
+    mask: torch.Tensor | None = None,
 ) -> RadialTransfer:
     """Amplitude transfer per radial k-space bin, averaged over white-noise draws.
 
@@ -150,7 +151,13 @@ def measure_radial_transfer(
     per-draw ratios, because only the first has a variance that falls with
     ``repeats``. A single 256x256 draw moves ``outer_band_retention`` by about
     +/-10 %, so ``repeats`` is not decoration.
+
+    ``mask`` (``[1, 1, H, W]``) is held on the generator for every draw through
+    ``energy_probe.stashed_mask``; the input itself is not masked, because zeroing
+    white noise would change the excitation the ratios are taken against.
     """
+    from spectramr.infrastructure.validation.energy_probe import stashed_mask
+
     h, w = (size, size) if isinstance(size, int) else (int(size[0]), int(size[1]))
     if channels % 2 != 0:
         raise ValueError(
@@ -181,7 +188,7 @@ def measure_radial_transfer(
     try:
         for _ in range(repeats):
             x = torch.empty(shape, device=device, dtype=torch.float32).normal_(generator=generator)
-            with torch.no_grad():
+            with torch.no_grad(), stashed_mask(model, mask):
                 y = _forward(model, x, timestep)
             den.index_add_(0, flat_index, _plane_amplitude(x)[inside])
             num.index_add_(0, flat_index, _plane_amplitude(y)[inside])
@@ -245,6 +252,7 @@ def probe_arm(
     """
     from spectramr.infrastructure.validation.energy_probe import (
         build_probe_batch,
+        build_probe_mask,
         build_probe_model,
     )
 
@@ -255,6 +263,7 @@ def probe_arm(
             f"spectral_transfer_probe: arm batch is {tuple(template.shape)}; need "
             "[B, C, H, W(, ...)]."
         )
+    timestep = _probe_timestep(config)
     return measure_radial_transfer(
         model,
         size=(int(template.shape[2]), int(template.shape[3])),
@@ -264,6 +273,8 @@ def probe_arm(
         seed=seed,
         device=device,
         trailing=tuple(int(v) for v in template.shape[4:]),
-        timestep=_probe_timestep(config),
+        timestep=timestep,
         label=arm_name or str(getattr(getattr(config, "metadata", None), "name", "arm")),
+        # One draw per call, so the mask carries batch 1.
+        mask=build_probe_mask(model, template[:1], timestep),
     )

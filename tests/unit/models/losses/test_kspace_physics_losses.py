@@ -10,9 +10,10 @@ Note ``sobolev_frequency`` is a *separate* registered loss whose weight is
 arms' declared intent was expressible all along, just not that way.
 """
 
+import pytest
 import torch
 
-from spectramr.models.losses.kspace_physics_losses import SobolevKSpaceLoss
+from spectramr.models.losses.kspace_physics_losses import FrequencyWeightedL1Loss, SobolevKSpaceLoss
 
 
 def _expected_weight(size: int, order: float) -> torch.Tensor:
@@ -90,3 +91,142 @@ def test_forward_still_runs_and_differs_by_order():
     hi = SobolevKSpaceLoss(order=4.0)(pred, target)
     assert torch.isfinite(lo) and torch.isfinite(hi)
     assert not torch.isclose(lo, hi), "order must change the computed loss"
+
+
+class TestFrequencyWeightedL1OnAcquiredLines:
+    """Never-acquired lines are exact zeros in the target; they carried ~32 % of this map."""
+
+    def _plane(self, b=2, h=16, w=16, lo=3, hi=13):
+        plane = torch.zeros(b, 1, h, w)
+        plane[..., lo:hi] = 1.0
+        return plane
+
+    def test_padded_lines_carry_no_weight(self) -> None:
+        from spectramr.models.losses.kspace_physics_losses import FrequencyWeightedL1Loss
+
+        loss = FrequencyWeightedL1Loss(alpha=16.0)
+        target = torch.randn(2, 4, 16, 16)
+        plane = self._plane()
+        pred = target + 5.0 * (1 - plane)  # error only on the padded lines
+        assert float(loss(pred, target, acquired=plane)) == 0.0
+        # Planted: without the plane the padded error is scored.
+        assert float(loss(pred, target)) > 0.0
+
+    def test_the_mean_runs_over_the_acquired_bins(self) -> None:
+        from spectramr.models.losses.kspace_physics_losses import FrequencyWeightedL1Loss
+
+        loss = FrequencyWeightedL1Loss(alpha=0.0)  # flat map: weight 1 everywhere
+        target = torch.zeros(2, 4, 16, 16)
+        plane = self._plane()
+        pred = target + plane  # unit error on every acquired bin
+        assert float(loss(pred, target, acquired=plane)) == pytest.approx(1.0)
+
+    def test_a_depth_volume_folds_the_plane_with_it(self) -> None:
+        from spectramr.models.losses.kspace_physics_losses import FrequencyWeightedL1Loss
+
+        loss = FrequencyWeightedL1Loss(alpha=0.0)
+        target = torch.zeros(2, 4, 3, 16, 16)
+        plane = self._plane()
+        pred = target + plane[:, :, None]
+        assert float(loss(pred, target, acquired=plane)) == pytest.approx(1.0)
+
+
+def _fw_inputs(seed: int = 1234):
+    """Same draw order as the pre-change golden capture (spectral pair first, then k-space)."""
+    g = torch.Generator().manual_seed(seed)
+    torch.rand(2, 3, 64, 64, generator=g)
+    torch.rand(2, 3, 64, 64, generator=g)
+    kp = torch.randn(2, 4, 64, 64, generator=g)
+    kt = torch.randn(2, 4, 64, 64, generator=g)
+    acq = (torch.rand(2, 1, 64, 64, generator=g) > 0.3).float()
+    return kp, kt, acq
+
+
+def test_linear_profile_is_bit_identical_to_the_pre_change_loss():
+    """Golden values captured on the pre-change code; the default profile must not move."""
+    kp, kt, acq = _fw_inputs()
+    loss = FrequencyWeightedL1Loss(64, 64, alpha=8.0)
+    assert loss(kp, kt).item() == float.fromhex("0x1.21b9c20000000p+0")
+    assert loss(kp, kt, acquired=acq).item() == float.fromhex("0x1.2139a20000000p+0")
+    cp = torch.complex(kp[:, :2], kp[:, 2:])
+    ct = torch.complex(kt[:, :2], kt[:, 2:])
+    got = FrequencyWeightedL1Loss(64, 64, alpha=8.0)(cp, ct, acquired=acq).item()
+    assert got == float.fromhex("0x1.c699fc0000000p+0")
+
+
+def test_explicit_linear_profile_equals_the_default():
+    kp, kt, _ = _fw_inputs()
+    default = FrequencyWeightedL1Loss(64, 64, alpha=8.0)(kp, kt)
+    explicit = FrequencyWeightedL1Loss(64, 64, alpha=8.0, profile="linear")(kp, kt)
+    assert torch.equal(default, explicit)
+
+
+def _ring_masks(size: int, edges=(1 / 8, 1 / 4, 1 / 2, 3 / 4)):
+    y = torch.arange(size, dtype=torch.float64) - size // 2
+    rho = torch.sqrt(y[:, None] ** 2 + y[None, :] ** 2) / (size / 2)
+    ring = torch.bucketize(rho, torch.tensor(edges, dtype=torch.float64), right=True) - 1
+    n_rings = len(edges) - 1
+    return [ring == r for r in range(n_rings)], (ring < 0) | (ring >= n_rings)
+
+
+def test_ring_band_gives_each_ring_equal_total_weight_and_unit_mean():
+    loss = FrequencyWeightedL1Loss(64, 64, profile="ring_band")
+    w = loss._get_weight_map(64, 64, torch.device("cpu"), torch.float32)[0, 0].double()
+    assert w.mean().item() == pytest.approx(1.0, rel=1e-5)
+    rings, outside = _ring_masks(64)
+    totals = [w[m].sum().item() for m in rings] + [w[outside].sum().item()]
+    assert all(t == pytest.approx(totals[0], rel=1e-5) for t in totals)
+
+
+def test_ring_band_total_follows_the_declared_gains():
+    loss = FrequencyWeightedL1Loss(
+        64, 64, profile="ring_band", ring_gain=[2.0, 1.0, 1.0], ring_gain_outside=0.5
+    )
+    w = loss._get_weight_map(64, 64, torch.device("cpu"), torch.float32)[0, 0].double()
+    rings, outside = _ring_masks(64)
+    totals = [w[m].sum().item() for m in rings] + [w[outside].sum().item()]
+    assert totals[0] / totals[1] == pytest.approx(2.0, rel=1e-5)
+    assert totals[3] / totals[1] == pytest.approx(0.5, rel=1e-5)
+
+
+def test_ring_band_keeps_the_low_band_above_zero():
+    """The DC bin sits in the outside group, which must keep a non-zero weight."""
+    loss = FrequencyWeightedL1Loss(64, 64, profile="ring_band")
+    w = loss._get_weight_map(64, 64, torch.device("cpu"), torch.float32)[0, 0]
+    assert w[32, 32].item() > 0.0
+    assert torch.isfinite(w).all()
+
+
+def test_ring_band_forward_respects_the_acquired_mask():
+    kp, kt, acq = _fw_inputs()
+    loss = FrequencyWeightedL1Loss(64, 64, profile="ring_band")
+    value = loss(kp, kt, acquired=acq)
+    assert torch.isfinite(value)
+    assert value.item() > 0.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"profile": "log_bands"}, "Unknown profile"),
+        ({"profile": "ring_band", "ring_edges": [0.5, 0.25]}, "strictly increasing"),
+        ({"profile": "ring_band", "ring_gain": [1.0, 1.0]}, "one value per ring"),
+        ({"profile": "ring_band", "ring_gain": [1.0, -1.0, 1.0]}, ">= 0"),
+        (
+            {"profile": "ring_band", "ring_gain": [0.0, 0.0, 0.0], "ring_gain_outside": 0.0},
+            "positive",
+        ),
+        ({"profile": "linear", "ring_gain": [1.0, 1.0, 1.0]}, "apply only to profile"),
+    ],
+)
+def test_invalid_ring_configs_raise(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        FrequencyWeightedL1Loss(64, 64, **kwargs)
+
+
+def test_profile_is_reachable_through_the_registry_kwargs_path():
+    from spectramr.models.losses.registry import LossRegistry
+
+    loss = LossRegistry.create("frequency_weighted_l1_kspace", profile="ring_band", alpha=8.0)
+    assert loss.profile == "ring_band"
+    assert loss.ring_edges == (1 / 8, 1 / 4, 1 / 2, 3 / 4)

@@ -174,7 +174,7 @@ class AdapterCapabilities:
     side_effects: tuple[str, ...] = ()
     insertion_points: tuple[
         str, ...
-    ] = ()  # pre_model | post_model | pre_loss_pred | pre_loss_target | pre_metric
+    ] = ()  # pre_model | post_model | pre_loss_target | pre_metric
     # Workflow tagging (imaging-regime × task contract). ``None`` = unannotated
     # = "agnostic, skip the check" — see module docstring. Only tag components
     # that are genuinely regime/task-specific.
@@ -183,7 +183,7 @@ class AdapterCapabilities:
 
 
 VALID_INSERTION_POINTS: frozenset[str] = frozenset(
-    {"pre_model", "post_model", "pre_loss_pred", "pre_loss_target", "pre_metric"}
+    {"pre_model", "post_model", "pre_loss_target", "pre_metric"}
 )
 
 

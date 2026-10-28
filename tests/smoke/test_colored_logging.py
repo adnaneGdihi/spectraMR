@@ -159,7 +159,7 @@ def main():
     logger.info("  ├── logs/loss_log.csv")
     logger.info("  ├── metrics/validation_metrics.csv")
     logger.info("  ├── metrics/fake_images/")
-    logger.info("  └── checkpoints/checkpoint_best.safetensors")
+    logger.info("  └── checkpoints/best.safetensors")
 
     print()
     print("=" * 60)

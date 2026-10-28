@@ -50,6 +50,11 @@ class SpatiotemporalAdaptiveSFCReconStrategy(BaseTrainingStrategy):
     4D Beltrami solver.
     """
 
+    #: The whole objective is inline: an L1 fidelity term plus the two Beltrami
+    #: regularisers; no builder module is folded (#1768).
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset({"l1"})
+    folds_image_losses: ClassVar[bool | None] = False
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "spatiotemporal_adaptive_sfc_recon", None)
@@ -122,6 +127,11 @@ class BeltramiEPIDistortionStrategy(BaseTrainingStrategy):
         tasks=frozenset({Task.RECONSTRUCTION}),
     )
 
+    #: The objective is the simulated-EPI residual plus the mu penalty, both
+    #: inline; no builder module is folded (#1768).
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset({"beltrami_epi_residual"})
+    folds_image_losses: ClassVar[bool | None] = False
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "beltrami_epi_distortion", None)
@@ -149,6 +159,32 @@ class BeltramiEPIDistortionStrategy(BaseTrainingStrategy):
             "beltrami_epi_residual": residual.detach(),
             "beltrami_epi_mu_reg": mu_reg.detach(),
         }
+
+    @torch.no_grad()
+    def validation_step(
+        self, input_batch: torch.Tensor, target_batch: torch.Tensor, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Grade the predicted field by the EPI image it predicts.
+
+        The generator emits a field in Hz, so scoring its output against the
+        undistorted target compares incommensurable quantities (#1768). The target
+        warped by the predicted field is graded against the observed EPI instead,
+        through the registry metrics computer; there is no exact inverse warp to
+        grade a corrected image with.
+        """
+        del kwargs
+        input_batch = input_batch.to(self.device, non_blocking=True)
+        target_batch = target_batch.to(self.device, non_blocking=True)
+        self.generator_model.eval()
+        delta_b0 = self.generator_model(input_batch)
+        simulated = apply_epi_distortion(target_batch, delta_b0, t_esp=self.t_esp)
+        computer = self._get_validation_metrics_computer(self.config)
+        metrics = {
+            f"val_{name}": value
+            for name, value in computer.compute(simulated, input_batch).items()
+        }
+        metrics["val_beltrami_epi_residual"] = F.l1_loss(simulated, input_batch)
+        return metrics
 
 
 __all__ = [

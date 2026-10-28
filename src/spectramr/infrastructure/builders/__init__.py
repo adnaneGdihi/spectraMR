@@ -1,4 +1,4 @@
-"""Builder infrastructure: base classes, leaf component builders, two directors.
+"""Builder infrastructure: base classes, leaf component builders, one director.
 
 This package used to advertise a parallel pipeline stack — a
 ``TrainingPipelineDirector``/``InferencePipelineDirector`` pair under an
@@ -15,8 +15,7 @@ what that stack and the data layer actually consume:
   - Phase 0 (core): ``BuilderBase``, ``FluentBuilder``, ``DirectorBuilder``,
     ``BuilderRegistry``
   - Phase 1 (leaf): model, optimizer, data, physics and adapter builders
-  - Phase 2 (directors): ``CheckpointDirector`` (``pipelines/training_loop.py``)
-    and ``DataPipelineDirector`` (the data SSOT, ``pipelines/make.py``)
+  - Phase 2 (directors): ``DataPipelineDirector`` (the data SSOT, ``pipelines/make.py``)
 
 Loss construction is **not** here: the single owner is
 ``infrastructure/training/builders/loss_builder.py::LossBuilder``, reached
@@ -29,7 +28,6 @@ Usage::
     from spectramr.infrastructure.builders import (
         BuilderBase, FluentBuilder, DirectorBuilder, BuilderRegistry,
         GeneratorBuilder, DiscriminatorBuilder, OptimizerBuilder,
-        CheckpointDirector, CheckpointState,
     )
 """
 
@@ -38,12 +36,6 @@ from spectramr.infrastructure.builders.core.base_builder import (
     BuilderBase,
     DirectorBuilder,
     FluentBuilder,
-)
-
-# Phase 2: Directors (the two that are reachable)
-from spectramr.infrastructure.builders.directors.checkpoint_director import (
-    CheckpointDirector,
-    CheckpointState,
 )
 
 # Data builders
@@ -96,7 +88,4 @@ __all__ = [
     "MaskBuilder",
     "DataConsistencyBuilder",
     "PhysicsBuilder",
-    # Phase 2: Directors
-    "CheckpointDirector",
-    "CheckpointState",
 ]

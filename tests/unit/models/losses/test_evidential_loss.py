@@ -187,3 +187,16 @@ def test_evidential_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "evidential" in list_available()
+
+
+def test_nig_params_override_a_one_channel_mean() -> None:
+    """The strategy passes gamma as ``prediction`` and the NIG tensor as ``nig_params``."""
+    target = torch.rand(2, 1, 8, 8)
+    full = _make_evidential_pred(target + 0.1)
+    loss = EvidentialLoss(coeff=0.01)
+    torch.testing.assert_close(loss(full[:, :1], target, nig_params=full), loss(full, target))
+
+
+def test_a_one_channel_prediction_without_nig_params_raises() -> None:
+    with pytest.raises(ValueError, match="no nig_params"):
+        EvidentialLoss()(torch.rand(1, 1, 4, 4), torch.rand(1, 1, 4, 4))

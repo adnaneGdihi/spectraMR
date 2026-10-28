@@ -6,7 +6,8 @@ that also selects the checkpoint. Two witnesses:
 
 * ``held_out_test_declared`` -- advisory (INFO). An arm whose role is a
   baseline / headline / reference reports on its selection set unless it
-  declares ``data.source.test_index_path`` or ``data.enable_test_split``.
+  declares ``data.source.test_index_path`` or a config-owned test partition of a
+  paired manifest (``declares_test_set_in``, the loaders' predicate).
   Advisory now, promoted once the Tier-1 cohorts adopt the protocol (the
   ratchet every gate here follows); a warning today would fail ``--strict``
   on every baseline arm at once.
@@ -14,12 +15,19 @@ that also selects the checkpoint. Two witnesses:
   and present, no subject or file of it may appear in the training pool
   (train + validation manifests). The scan lives in
   ``spectramr.data.split_leakage.analyze_test_split_leakage`` (data SSOT).
+* ``paired_route_holdout_site`` -- ERROR. ``data.split.holdout_site`` on a
+  paired manifest raises at load (its records carry subject ids, not sites);
+  the audit refuses the arm first (``holdout_site_on_paired_route``).
 
 Registration is by import (the witness package walk).
 """
 
 from __future__ import annotations
 
+from spectramr.data.metadata.paired_partition import (
+    declares_test_set_in,
+    holdout_site_on_paired_route,
+)
 from spectramr.infrastructure.validation.witness.registry import (
     Severity,
     Stage,
@@ -35,11 +43,13 @@ __all__ = [
     "declares_held_out_test",
     "held_out_test_declared",
     "held_out_test_split_disjoint",
+    "paired_route_holdout_site",
 ]
 
 _CATEGORY = "protocol"
 _DECLARED = "held_out_test_declared"
 _DISJOINT = "held_out_test_split_disjoint"
+_PAIRED_HOLDOUT = "paired_route_holdout_site"
 
 #: ``metadata.role`` / ``metadata.tags.role`` values whose numbers are the ones
 #: a paper quotes. Ablations, variants and comparisons inherit their reference's
@@ -48,13 +58,8 @@ REPORTING_ROLES: frozenset[str] = frozenset({"baseline", "headline", "reference"
 
 
 def declares_held_out_test(data: object) -> bool:
-    """True when the raw ``data:`` block declares a held-out test set."""
-    if not isinstance(data, dict):
-        return False
-    source = data.get("source") or {}
-    if isinstance(source, dict) and source.get("test_index_path"):
-        return True
-    return bool(data.get("enable_test_split"))
+    """True when the raw ``data:`` block declares a held-out test set (the loaders' predicate)."""
+    return isinstance(data, dict) and declares_test_set_in(data)
 
 
 def _role(raw_config: dict) -> str | None:
@@ -178,4 +183,49 @@ def held_out_test_split_disjoint(subject: WitnessSubject) -> WitnessVerdict:
         category=_CATEGORY,
         stage=Stage.DECLARE,
         tier=Tier.T1,
+    )
+
+
+@register_witness(
+    _PAIRED_HOLDOUT,
+    category=_CATEGORY,
+    stage=Stage.DECLARE,
+    tiers=(Tier.T0, Tier.T1),
+    subjects=(Subject.CONFIG,),
+    severity=Severity.ERROR,
+    description="No data.split.holdout_site on a paired manifest (it raises at load)",
+    fix_hint=(
+        "Drop data.split.holdout_site and declare a config-owned subject split: "
+        "split.type random with validation_fraction (+ enable_test_split / test_split), "
+        "loso_subject with holdout_subject or loso_fold, or subjects with val_subjects / "
+        "test_subjects. The manifest stamps subject ids as '0001', not 'sub-0001'."
+    ),
+)
+def paired_route_holdout_site(subject: WitnessSubject) -> WitnessVerdict:
+    """Error when an arm declares a site holdout the paired-manifest loader refuses."""
+    data = subject.raw_config.get("data") or {}
+    if isinstance(data, dict) and holdout_site_on_paired_route(data):
+        holdout = data["split"]["holdout_site"]
+        return WitnessVerdict(
+            witness_name=_PAIRED_HOLDOUT,
+            passed=False,
+            message=(
+                f"data.split.holdout_site={holdout!r} with data.source.paired_manifest_path: "
+                "the paired route raises on holdout_site at load under every split.type "
+                "(its records carry subject ids, not sites)."
+            ),
+            severity=Severity.ERROR,
+            category=_CATEGORY,
+            stage=Stage.DECLARE,
+            tier=Tier.T0,
+            yaml_keys=("data.split.holdout_site", "data.source.paired_manifest_path"),
+        )
+    return WitnessVerdict(
+        witness_name=_PAIRED_HOLDOUT,
+        passed=True,
+        message="no holdout_site on a paired manifest",
+        severity=Severity.ERROR,
+        category=_CATEGORY,
+        stage=Stage.DECLARE,
+        tier=Tier.T0,
     )

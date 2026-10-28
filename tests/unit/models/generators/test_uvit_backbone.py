@@ -230,3 +230,29 @@ class TestForwardTimeMaxTimesteps:
                 timesteps=torch.tensor([1.0, 1.0]),
                 max_timesteps=1000.0,
             )
+
+
+@pytest.mark.parametrize("scale", ["unit_interval", "integer"])
+def test_forward_passes_the_timestep_scale_to_its_stem(scale: str) -> None:
+    """The generator sends ``timestep_scale``; a backbone that drops it keeps
+    dividing by the horizon whatever the arm declared (#2315)."""
+    from unittest import mock
+
+    import spectramr.models.generators.diffusion_transformer_stem as stem
+
+    seen: list[str] = []
+    real = stem.sinusoidal_timestep_embedding
+
+    def spy(t, dim, *, max_timesteps=None, scale="unit_interval"):
+        seen.append(scale)
+        return real(t, dim, max_timesteps=max_timesteps, scale=scale)
+
+    net = _net().eval()
+    with mock.patch.object(stem, "sinusoidal_timestep_embedding", spy), torch.no_grad():
+        net(
+            torch.randn(1, CHANNELS, SIZE, SIZE),
+            timesteps=torch.tensor([3]),
+            max_timesteps=29.0,
+            timestep_scale=scale,
+        )
+    assert seen == [scale]

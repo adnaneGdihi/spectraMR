@@ -46,6 +46,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.marker_estimators import (
     privileged_learning_loss,
 )
@@ -117,27 +119,37 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
     * ``training.privileged.beta`` (default 0.5) — distill weight
     * ``training.privileged.delta`` (default 0.1) — domain-adv weight
     * ``training.privileged.curriculum_tau0`` (default 5) — exp time-constant
-    * ``training.privileged.n_min`` (default 0) — final marker keep-fraction
-    * ``training.privileged.n_max`` (default 1) — initial marker keep-fraction
+    * ``training.privileged.min_keep_fraction`` (default 0) — final marker keep-fraction
+    * ``training.privileged.initial_keep_fraction`` (default 1) — initial marker keep-fraction
     * ``training.privileged.disc_hidden_dim`` (default 128) — disc MLP width
     """
 
+    # parallel_compat: The domain discriminator is an owned module, wrapped in __init__ and called
+    # through call_owned. The teacher is a frozen copy taken after the env broadcast, never trained.
+    parallel_compat = frozenset({"replicated"})
+
+    # Strategy-owned modules (env is frozen, so they live on self).
+    _teacher: nn.Module | None = None
+    _domain_discriminator: DomainDiscriminator | None = None
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("_domain_discriminator", OWNED_MODULE),)
+        return (*super().owned_module_declarations(config), *own)
+
     def __init__(self, env=None, **kwargs: Any) -> None:
-        super().__init__(env=env, **kwargs)
-        # Resolve curriculum parameters from config (with defaults)
-        cfg = getattr(self.config.training, "privileged", None)
+        # Read before the base __init__, which runs _setup_strategy_specific_components.
+        cfg = getattr(getattr(getattr(env, "config", None), "training", None), "privileged", None)
         self._alpha = float(getattr(cfg, "alpha", 1.0)) if cfg else 1.0
         self._beta = float(getattr(cfg, "beta", 0.5)) if cfg else 0.5
         # NOTE: no ``gamma``/hint knob — the FitNet hint term has no feature
         # seam on the model forward, so it would be an identically-zero no-op.
         self._delta = float(getattr(cfg, "delta", 0.1)) if cfg else 0.1
         self._tau0 = float(getattr(cfg, "curriculum_tau0", 5.0)) if cfg else 5.0
-        self._n_min = float(getattr(cfg, "n_min", 0.0)) if cfg else 0.0
-        self._n_max = float(getattr(cfg, "n_max", 1.0)) if cfg else 1.0
+        self._n_min = float(getattr(cfg, "min_keep_fraction", 0.0)) if cfg else 0.0
+        self._n_max = float(getattr(cfg, "initial_keep_fraction", 1.0)) if cfg else 1.0
         self._disc_hidden_dim = int(getattr(cfg, "disc_hidden_dim", 128)) if cfg else 128
-        # Strategy-owned modules (env is frozen → store on self, not env).
-        self._teacher: nn.Module | None = None
-        self._domain_discriminator: DomainDiscriminator | None = None
+        super().__init__(env=env, **kwargs)
 
     def _setup_strategy_specific_components(self) -> None:
         """Build the marker-supervised teacher and the domain discriminator.
@@ -161,7 +173,9 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
         # Teacher: frozen deep-copy of the student architecture. Marker
         # supervision flows through its privileged input at train time; it
         # is never optimized by opt_g (the loss path runs it under no_grad).
-        teacher = copy.deepcopy(student)
+        # The inner module: a copy of a DDP/DP wrapper would carry the process group and
+        # prefix every checkpoint key with ``module.``.
+        teacher = copy.deepcopy(unwrap_model(student))
         for p in teacher.parameters():
             p.requires_grad_(False)
         teacher.eval()
@@ -175,7 +189,7 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
         disc = DomainDiscriminator(feature_dim=feature_dim, hidden_dim=self._disc_hidden_dim)
         if self.device is not None:
             disc = disc.to(self.device)
-        self._domain_discriminator = disc
+        self._domain_discriminator = self.register_owned_module("_domain_discriminator", disc)
 
         # Register the discriminator's params on the generator optimizer so
         # they are actually trained (env is frozen — opt_g is the SSOT here).
@@ -342,7 +356,7 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
             # "_features", ...)`` always fell through to the prediction anyway,
             # so we discriminate on it explicitly rather than mask the dead
             # branch behind an attribute that never exists.)
-            disc_logits = disc(student_pred, lambda_=self._delta)
+            disc_logits = self.call_owned("_domain_discriminator", student_pred, lambda_=self._delta)
             disc_loss = nn.functional.binary_cross_entropy_with_logits(
                 disc_logits,
                 domain_label,

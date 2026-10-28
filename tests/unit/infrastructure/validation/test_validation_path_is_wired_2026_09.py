@@ -111,14 +111,14 @@ class TestPlantedViolations:
 class TestAgainstTheRealAdapters:
     """The detector has to separate the four adapters that actually ship."""
 
-    def test_fdb_is_the_stub_and_its_two_siblings_are_not(self):
+    def test_the_three_baselines_are_wired_and_the_base_is_the_stub(self):
         from spectramr.models.baselines._base import BaselineAdapter
-        from spectramr.models.baselines.cdiffmr import CDiffMRBaseline
-        from spectramr.models.baselines.fdb import FDBBaseline
-        from spectramr.models.baselines.shen2024 import Shen2024Baseline
+        from spectramr_baselines.cdiffmr import CDiffMRBaseline
+        from spectramr_baselines.fdb import FDBBaseline
+        from spectramr_baselines.shen2024 import Shen2024Baseline
 
         is_stub = ConfigHealthChecker._validation_sample_is_a_stub
-        assert is_stub(FDBBaseline)
+        assert not is_stub(FDBBaseline)
         assert is_stub(BaselineAdapter)
         assert not is_stub(CDiffMRBaseline)
         assert not is_stub(Shen2024Baseline)

@@ -507,6 +507,11 @@ class TestPhase9FoldTableIsTotal:
     def test_the_pinned_list_is_the_size_it_was(self) -> None:
         assert len(self.SCALARS_BEFORE_PHASE_9) == 86
 
+    def test_the_flat_reserved_cores_knob_is_folded_like_its_loader_siblings(self) -> None:
+        # Added after the phase-9 list was pinned, so it is outside the 86 above.
+        assert RENAMES["data.reserved_cores"].canonical == "data.loader.reserved_cores"
+        assert RENAMES["data.reserved_cores"].posture == RENAMES["data.num_workers"].posture
+
     @pytest.mark.parametrize("name", sorted(SCALARS_BEFORE_PHASE_9))
     def test_every_old_scalar_still_has_somewhere_to_go(self, name: str) -> None:
         from spectramr.config.schemas.data import DataConfigSchema
@@ -558,12 +563,10 @@ class TestNoDataKeyIsSilentlyDropped:
     #: pinned too: an unlisted key fails immediately even while the total falls.
     KNOWN_DROPPED_DATA_PATHS = frozenset(
         {
-            "data.augmentation.custom_transforms",
             "data.caching.dataset_type",
             "data.caching.path",
             "data.channels",
             "data.coil_sensitivity_source",
-            "data.custom_transforms",
             "data.data_type",
             "data.dataset_name",
             "data.enable_geometric_standardization",
@@ -1229,7 +1232,7 @@ _NOT_CONFIG_RECEIVERS: frozenset[tuple[str, str, str]] = frozenset(
         ("src/spectramr/pipelines/training_loop.py", "config", "metrics"),
         # `reporting.metrics`, a third block with the same leaf.
         ("src/spectramr/cli/app.py", "rep", "metrics"),
-        ("src/spectramr/pipelines/train.py", "reporting", "metrics"),
+        ("src/spectramr/infrastructure/reporting/run_hook.py", "reporting", "metrics"),
         # top-level `metrics.best_metric_name`, the checkpoint selector.
         (
             "src/spectramr/infrastructure/validation/witness/checks/validation_metric_checks.py",
@@ -1338,19 +1341,38 @@ _NOT_CONFIG_RECEIVERS: frozenset[tuple[str, str, str]] = frozenset(
             "metrics_s",
             "data_range",
         ),
+        # Receivers that are not config blocks: argparse namespaces, model and loss
+        # capabilities, the twin spec, and `metadata.tags`, which already is the
+        # canonical path. The gate keys on the leaf name alone.
+        ("src/spectramr/cli/app.py", "args", "acceleration"),
+        ("src/spectramr/cli/app.py", "args", "metrics"),
+        ("src/spectramr/cli/app.py", "args", "contrasts"),
+        ("src/spectramr/data/transforms/normalization.py", "transform", "transforms"),
+        (
+            "src/spectramr/infrastructure/inference/cold_diffusion_inference_strategy.py",
+            "unwrap_model(self.model)",
+            "num_timesteps",
+        ),
+        (
+            "src/spectramr/infrastructure/inference/predict_data_consistency.py",
+            "caps",
+            "output_domain",
+        ),
+        ("src/spectramr/infrastructure/training/builders/loss_builder.py", "caps", "domain"),
+        ("src/spectramr/infrastructure/training/snapshot_provenance.py", "transform", "transforms"),
+        (
+            "src/spectramr/infrastructure/validation/witness/checks/ood_range_checks.py",
+            "twin",
+            "acceleration",
+        ),
+        (
+            "src/spectramr/infrastructure/validation/witness/checks/strategy_override_checks.py",
+            "metadata",
+            "tags",
+        ),
         # PRE-EXISTING flat-root reads that never worked on the nested schema
         # (pitfall #1, predates the renames). Tracked separately; listed here so
         # this gate reports only NEW breakage.
-        (
-            "src/spectramr/infrastructure/reporting/advanced_reporting.py",
-            "cfg",
-            "batch_size",
-        ),
-        (
-            "src/spectramr/infrastructure/reporting/advanced_reporting.py",
-            "cfg",
-            "learning_rate",
-        ),
         ("src/spectramr/models/model_cards.py", "config", "batch_size"),
         ("src/spectramr/models/model_cards.py", "config", "learning_rate"),
     }
@@ -1514,12 +1536,13 @@ class TestPhase10FoldTableIsTotal:
 
     @pytest.mark.parametrize("name", sorted(SCALARS_BEFORE_PHASE_10))
     def test_every_old_scalar_still_has_somewhere_to_go(self, name: str) -> None:
+        from spectramr.config.schemas.removals import REMOVALS
         from spectramr.config.schemas.validation import ValidationConfigSchema
 
         still_declared = name in ValidationConfigSchema.model_fields
-        has_record = f"validation.{name}" in RENAMES
+        has_record = f"validation.{name}" in RENAMES or f"validation.{name}" in REMOVALS
         assert still_declared or has_record, (
-            f"`validation.{name}` is neither a field nor a rename record, so "
+            f"`validation.{name}` is neither a field nor a rename/removal record, so "
             "every arm that sets it now fails to load (the block is "
             "extra='forbid')."
         )
@@ -1735,7 +1758,7 @@ class TestPhase10bFoldTableIsTotal:
             "warning, a different run."
         )
 
-    def test_the_seven_blocks_are_mounted(self) -> None:
+    def test_the_nine_blocks_are_mounted(self) -> None:
         from spectramr.config.schemas.logging import LoggingConfigSchema as L
 
         blocks = {k for k, v in L.model_fields.items() if hasattr(v.annotation, "model_fields")}
@@ -1747,14 +1770,19 @@ class TestPhase10bFoldTableIsTotal:
             "tracking",
             "snapshots",
             "report_cases",
+            "distributed",
+            "progress",
         }
 
     def test_only_inert_scalars_stayed_flat(self) -> None:
         """A LIVE knob left flat would be a grouping the phase simply missed.
 
-        `log_gradients` is the one deliberate exception: it IS read, but both of
-        its group-mates (`log_weights`, `log_activations`) are inert, so there
-        is no group left to put it in.
+        `log_gradients` is a deliberate exception: it IS read, but both of its
+        group-mates (`log_weights`, `log_activations`) are inert, so there is no
+        group left to put it in. `progress_bar_enabled` and `progress_bar_no_progress`
+        are the next two (as is `progress_bar_on_warning`): they ARE read now (the progress mode resolver), but 980
+        arms declare the flat spelling, so moving them into `logging.progress` needs
+        a fold record and its pins. That is a follow-up, not this change.
         """
         import sys
 
@@ -1763,9 +1791,15 @@ class TestPhase10bFoldTableIsTotal:
 
         from spectramr.config.schemas.logging import LoggingConfigSchema as L
 
+        live_but_flat = {
+            "log_gradients",
+            "progress_bar_enabled",
+            "progress_bar_no_progress",
+            "progress_bar_on_warning",
+        }
         flat = {k for k, v in L.model_fields.items() if not hasattr(v.annotation, "model_fields")}
         unexplained = {
-            k for k in flat if f"logging.{k}" not in KNOWN_UNCONSUMED and k != "log_gradients"
+            k for k in flat if f"logging.{k}" not in KNOWN_UNCONSUMED and k not in live_but_flat
         }
         assert not unexplained, (
             f"{sorted(unexplained)} stayed flat but are not tracked as inert -- "
@@ -2487,3 +2521,11 @@ class TestNestedMount:
         from spectramr.config.schemas.renames import folded_input_paths
 
         assert folded_input_paths("training.diffusion")["num_timesteps"] == ("timesteps",)
+
+
+def test_enable_validation_augmentation_is_refused_at_load() -> None:
+    """The validation chain never augmented; the retired flag must say so, not vanish."""
+    from spectramr.config.schemas.validation import ValidationConfigSchema
+
+    with pytest.raises(ValueError, match="enable_validation_augmentation"):
+        ValidationConfigSchema(enable_validation_augmentation=False)

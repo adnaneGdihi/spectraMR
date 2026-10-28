@@ -1,7 +1,7 @@
 """VF / ULF physics test bundle (Task II.4).
 
 Covers:
-  - digital_twin_extensions.py   (apply_degradation / degrade_* functions)
+  - degradations package         (apply_degradation / degrade_* functions)
   - vf_corrections.py            (GNLUnwarpingOperator, BiasFieldCorrector,
                                    AnalyticalPSFSolver, EPINyquistGhostCorrector,
                                    SENSEGFactorCalibrator, RespiratoryBinningAverager,
@@ -80,7 +80,7 @@ def _real_image(B: int = 1, C: int = 1, H: int = _H, W: int = _W) -> torch.Tenso
 
 
 # ============================================================
-# SECTION 1: digital_twin_extensions.py
+# SECTION 1: degradations package
 # ============================================================
 
 
@@ -89,15 +89,15 @@ class TestDigitalTwinExtensionsCanary:
     """Canary — import + basic list check."""
 
     def test_import(self):
-        from spectramr.infrastructure.physics import digital_twin_extensions  # noqa: F401
+        import spectramr.infrastructure.physics.degradations  # noqa: F401
 
     def test_list_degradations_nonempty(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import list_degradations
+        from spectramr.infrastructure.physics.degradations import list_degradations
         names = list_degradations()
         assert len(names) > 0
 
     def test_apply_degradation_unknown_raises(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import apply_degradation
+        from spectramr.infrastructure.physics.degradations import apply_degradation
         x = _real_image()
         with pytest.raises(KeyError, match="Unknown degradation"):
             apply_degradation("not_a_real_degradation", x, theta=0.5)
@@ -109,25 +109,19 @@ class TestDegradeSamplingShape:
     """Sanity-shape: sampling degradations preserve shape."""
 
     def test_cartesian_undersamp_shape(self, H, W):
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_cartesian_undersampling,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_cartesian_undersampling
         x = _complex_image(B=1, C=1, H=H, W=W)
         out = degrade_cartesian_undersampling(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_variable_density_2d_shape(self, H, W):
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_variable_density_2d,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_variable_density_2d
         x = _complex_image(B=1, C=1, H=H, W=W)
         out = degrade_variable_density_2d(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_radial_undersamp_shape(self, H, W):
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_radial_undersampling,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_radial_undersampling
         x = _complex_image(B=1, C=1, H=H, W=W)
         out = degrade_radial_undersampling(x, theta=0.5, seed=0)
         assert out.shape == x.shape
@@ -139,22 +133,20 @@ class TestDegradeNoise:
 
     def test_complex_gaussian_theta_zero_identity(self):
         """theta=0 → nearly no noise."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_complex_gaussian_noise,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_complex_gaussian_noise
         x = _real_image()
         xc = torch.complex(x, torch.zeros_like(x))
         out = degrade_complex_gaussian_noise(xc, theta=0.0, seed=0)
         assert out.shape == xc.shape
 
     def test_rician_theta_zero_identity(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_rician_noise
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
         x = _real_image()
         out = degrade_rician_noise(x, theta=0.0, seed=0)
         assert torch.allclose(out, x.abs(), atol=1e-5)
 
     def test_rician_theta_one_noisy(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_rician_noise
+        from spectramr.infrastructure.physics.degradations import degrade_rician_noise
         x = _real_image()
         out = degrade_rician_noise(x, theta=1.0, seed=0)
         # Rician noise should change the image
@@ -166,73 +158,69 @@ class TestDegradeFieldEffects:
     """D8, D11, D12, D13, D17, D18, D20 field/geometric degradations."""
 
     def test_nyquist_ghost_theta_zero_unchanged(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_nyquist_ghost
+        from spectramr.infrastructure.physics.degradations import degrade_nyquist_ghost
         x = _complex_image()
         out = degrade_nyquist_ghost(x, theta=0.0)
         # theta=0 → zero phase → output should match input
         assert torch.allclose(out.abs(), x.abs(), atol=1e-5)
 
     def test_nyquist_ghost_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_nyquist_ghost
+        from spectramr.infrastructure.physics.degradations import degrade_nyquist_ghost
         x = _complex_image(B=2, C=1)
         out = degrade_nyquist_ghost(x, theta=0.5)
         assert out.shape == x.shape
 
     def test_bias_field_theta_zero_identity(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_bias_field
+        from spectramr.infrastructure.physics.degradations import degrade_bias_field
         x = _complex_image()
         out = degrade_bias_field(x, theta=0.0, seed=0)
         # theta=0 → log_b=0 → bias=1 → identity
         assert torch.allclose(out.abs(), x.abs(), atol=1e-5)
 
     def test_bias_field_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_bias_field
+        from spectramr.infrastructure.physics.degradations import degrade_bias_field
         x = _complex_image(B=2, C=1)
         out = degrade_bias_field(x, theta=0.5, seed=99)
         assert out.shape == x.shape
 
     def test_t2star_blur_theta_zero_identity(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_t2star_blur
+        from spectramr.infrastructure.physics.degradations import degrade_t2star_blur
         x = _real_image()
         out = degrade_t2star_blur(x, theta=0.0)
         assert torch.allclose(out, x.float(), atol=1e-5)
 
     def test_t2star_blur_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_t2star_blur
+        from spectramr.infrastructure.physics.degradations import degrade_t2star_blur
         x = _real_image(B=2, C=3)
         out = degrade_t2star_blur(x, theta=0.5)
         assert out.shape == x.shape
 
     def test_slice_pve_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_slice_thickness_pve,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_slice_thickness_pve
         x = _real_image(B=2, C=2)
         out = degrade_slice_thickness_pve(x, theta=0.5)
         assert out.shape == x.shape
 
     def test_coil_miscal_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            degrade_coil_sensitivity_miscal,
-        )
+        from spectramr.infrastructure.physics.degradations import degrade_coil_sensitivity_miscal
         x = _complex_image(B=2, C=1)
         out = degrade_coil_sensitivity_miscal(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_geometric_warp_theta_zero_nearidentity(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_geometric_warp
+        from spectramr.infrastructure.physics.degradations import degrade_geometric_warp
         x = _complex_image()
         out = degrade_geometric_warp(x, theta=0.0, seed=0)
         assert out.shape == x.shape
 
     def test_susceptibility_raises_bad_b0_axis(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_susceptibility
+        from spectramr.infrastructure.physics.degradations import degrade_susceptibility
         x = _complex_image()
         with pytest.raises(ValueError, match="b0_axis must be"):
             degrade_susceptibility(x, theta=0.5, b0_axis="z")
 
     def test_susceptibility_raises_bad_slice_plane(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_susceptibility
+        from spectramr.infrastructure.physics.degradations import degrade_susceptibility
         x = _complex_image()
         with pytest.raises(ValueError, match="slice_plane must be"):
             degrade_susceptibility(x, theta=0.5, slice_plane="transverse")
@@ -243,20 +231,20 @@ class TestDegradeMotion:
     """D7, pulsatile motion — shape and determinism."""
 
     def test_pulsatile_motion_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_pulsatile_motion
+        from spectramr.infrastructure.physics.degradations import degrade_pulsatile_motion
         x = _complex_image(B=2, C=1)
         out = degrade_pulsatile_motion(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_pulsatile_motion_theta_zero_near_identity(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_pulsatile_motion
+        from spectramr.infrastructure.physics.degradations import degrade_pulsatile_motion
         x = _complex_image()
         out = degrade_pulsatile_motion(x, theta=0.0, seed=0)
         # theta=0 → amp=0 → grid_sample(x, identity_grid)
         assert torch.allclose(out.abs(), x.abs(), atol=1e-4)
 
     def test_pulsatile_deterministic(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_pulsatile_motion
+        from spectramr.infrastructure.physics.degradations import degrade_pulsatile_motion
         x = _complex_image()
         out1 = degrade_pulsatile_motion(x, theta=0.5, seed=123)
         out2 = degrade_pulsatile_motion(x, theta=0.5, seed=123)
@@ -268,34 +256,32 @@ class TestDegradeWave3:
     """Wave-3 (partial Fourier, IQ ghost, stimulated echo, slice profile)."""
 
     def test_partial_fourier_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_partial_fourier
+        from spectramr.infrastructure.physics.degradations import degrade_partial_fourier
         x = _complex_image(B=1, C=1, H=16, W=16)
         out = degrade_partial_fourier(x, theta=0.5, axis="ky")
         assert out.shape == x.shape
 
     def test_partial_fourier_invalid_axis_raises(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_partial_fourier
+        from spectramr.infrastructure.physics.degradations import degrade_partial_fourier
         x = _complex_image()
         with pytest.raises(ValueError, match="axis must be"):
             degrade_partial_fourier(x, theta=0.5, axis="kz")
 
     def test_iq_ghost_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_iq_ghost
+        from spectramr.infrastructure.physics.degradations import degrade_iq_ghost
         x = _complex_image(B=2, C=1)
         out = degrade_iq_ghost(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_stimulated_echo_shape(self):
-        from spectramr.infrastructure.physics.digital_twin_extensions import degrade_stimulated_echo
+        from spectramr.infrastructure.physics.degradations import degrade_stimulated_echo
         x = _complex_image(B=1, C=1)
         out = degrade_stimulated_echo(x, theta=0.5, seed=0)
         assert out.shape == x.shape
 
     def test_slice_profile_axis_removed(self):
         """#245: D27 (slice_profile) was a byte-for-byte duplicate of D12."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            list_degradations,
-        )
+        from spectramr.infrastructure.physics.degradations import list_degradations
 
         assert "slice_profile" not in list_degradations()
 
@@ -311,7 +297,7 @@ class TestApplyDegradationRegistry:
         "partial_fourier", "iq_ghost", "stimulated_echo",
     ])
     def test_apply_degradation_runs(self, name):
-        from spectramr.infrastructure.physics.digital_twin_extensions import apply_degradation
+        from spectramr.infrastructure.physics.degradations import apply_degradation
         x = _real_image(B=1, C=1, H=16, W=16)
         out = apply_degradation(name, x, theta=0.3, seed=1)
         assert out.shape == x.shape

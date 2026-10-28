@@ -6,9 +6,9 @@ The papers' C6 corollary: the sampler must be a deterministic function of
 (pins the noise stream, reseeded per sample call), ``selection_rule``
 (only ``"fixed"`` exists; validated so nothing stochastic slips in).
 
-Both samplers are covered: ``PhysicsInformedColdDiffusion.sample`` (all three
-reverse modes) and the strategy's own reverse loop in
-``ColdDiffusionInferenceStrategy.run_inference``. Beyond same-in/same-out,
+``PhysicsInformedColdDiffusion.sample`` is covered in all three reverse modes,
+and ``ColdDiffusionInferenceStrategy.run_inference``, which reconstructs through
+it (#2067), is pinned to add no randomness of its own. Beyond same-in/same-out,
 the trust-layer-relevant invariant is asserted at σ>0: noise never touches
 the observed support, so ``x_out * obs == measurement * obs`` exactly.
 """
@@ -161,77 +161,51 @@ class TestSamplerDeterminism:
         assert (out.abs() <= ceiling + 1e-6).all()
 
 
-def _strategy(model_kwargs: dict) -> ColdDiffusionInferenceStrategy:
-    config = {
-        "training": {"diffusion": {"timesteps": 8, "sampling_steps": 4}},
-        "model": {"model_kwargs": model_kwargs},
-    }
-    return ColdDiffusionInferenceStrategy(_DeterministicStub(), torch.device("cpu"), config)
+class _SeededGenerator(torch.nn.Module):
+    """A generator whose ``sample()`` is ``PhysicsInformedColdDiffusion.sample``."""
+
+    def __init__(self, sigma: float = 0.0, seed: int | None = None) -> None:
+        super().__init__()
+        self.sampler_sigma, self.sampler_seed = sigma, seed
+        self.num_timesteps = 8
+        self._diffusion = _diffusion(
+            reverse_mode="replace_freeze", sampler_sigma=sigma, sampler_seed=seed
+        )
+
+    def sample(self, measurement, mask=None, inference_timesteps=None, **_kw):
+        return self._diffusion.sample(measurement, mask)
+
+
+def _strategy(sigma: float = 0.0, seed: int | None = None) -> ColdDiffusionInferenceStrategy:
+    config = {"training": {"diffusion": {"timesteps": 8, "sampling_steps": 4}}}
+    return ColdDiffusionInferenceStrategy(
+        _SeededGenerator(sigma, seed), torch.device("cpu"), config
+    )
 
 
 class TestStrategyDeterminism:
+    """Predict reconstructs through ``generator.sample()`` (#2067), so its C6
+    contract is the sampler's; these pin that the strategy adds no randomness."""
+
     def test_sigma_zero_is_bitwise_reproducible(self) -> None:
         measurement, mask = _inputs()
-        strategy = _strategy({})
+        strategy = _strategy()
         out1 = strategy.run_inference(measurement.clone(), mask=mask)
         out2 = strategy.run_inference(measurement.clone(), mask=mask)
         assert torch.equal(out1, out2)
 
     def test_sigma_positive_same_seed_is_bitwise_reproducible(self) -> None:
         measurement, mask = _inputs()
-        strategy = _strategy({"sampler_sigma": 0.1, "sampler_seed": 7})
+        strategy = _strategy(0.1, 7)
         out1 = strategy.run_inference(measurement.clone(), mask=mask)
         out2 = strategy.run_inference(measurement.clone(), mask=mask)
         assert torch.equal(out1, out2)
-        assert not torch.equal(
-            out1, _strategy({}).run_inference(measurement.clone(), mask=mask)
-        ), "sigma>0 must actually perturb the reconstruction"
-
-    def test_sigma_positive_different_seeds_differ(self) -> None:
-        measurement, mask = _inputs()
-        out_a = _strategy({"sampler_sigma": 0.1, "sampler_seed": 7}).run_inference(
-            measurement.clone(), mask=mask
-        )
-        out_b = _strategy({"sampler_sigma": 0.1, "sampler_seed": 8}).run_inference(
-            measurement.clone(), mask=mask
-        )
-        assert not torch.equal(out_a, out_b)
-
-    def test_noise_never_touches_the_observed_support(self) -> None:
-        measurement, mask = _inputs()
-        out = _strategy({"sampler_sigma": 0.5, "sampler_seed": 7}).run_inference(
-            measurement.clone(), mask=mask
-        )
-        obs = mask.expand_as(out)
-        assert torch.equal(out * obs, measurement * obs)
-
-    def test_sigma_positive_without_mask_noises_everywhere(self) -> None:
-        """No measurement_mask ⇒ nothing is pinned (the DC step is skipped too),
-        so the noise support is all of k-space — still seed-reproducible."""
-        measurement, _ = _inputs()
-        out1 = _strategy({"sampler_sigma": 0.1, "sampler_seed": 7}).run_inference(
-            measurement.clone()
-        )
-        out2 = _strategy({"sampler_sigma": 0.1, "sampler_seed": 7}).run_inference(
-            measurement.clone()
-        )
-        clean = _strategy({}).run_inference(measurement.clone())
-        assert torch.equal(out1, out2)
-        assert not torch.equal(out1, clean)
-
-    def test_unknown_selection_rule_raises_at_construction(self) -> None:
-        with pytest.raises(ValueError, match="selection_rule"):
-            _strategy({"selection_rule": "greedy"})
-
-    def test_negative_sigma_raises_at_construction(self) -> None:
-        with pytest.raises(ValueError, match="sampler_sigma"):
-            _strategy({"sampler_sigma": -0.1})
+        assert not torch.equal(out1, _strategy().run_inference(measurement.clone(), mask=mask))
 
     def test_sigma_positive_warns_about_exchangeability_once(self, caplog) -> None:
-        """The A9/C7 coupling: σ>0 invalidates any conformal trust calibration
-        fitted at a different σ/seed. Warned at CONSTRUCTION, not per call."""
+        """The A9/C7 coupling, read off the generator: warned at construction only."""
         with caplog.at_level(logging.WARNING):
-            strategy = _strategy({"sampler_sigma": 0.1, "sampler_seed": 7})
+            strategy = _strategy(0.1, 7)
         assert any("recalibrate" in record.message for record in caplog.records)
         caplog.clear()
         measurement, mask = _inputs()

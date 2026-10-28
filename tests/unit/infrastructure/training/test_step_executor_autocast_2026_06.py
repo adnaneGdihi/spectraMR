@@ -34,15 +34,25 @@ def test_step_executor_routes_autocast_through_amp_helper():
     assert "dtype=torch.float16" not in src
 
 
-def test_complex_fp16_helper_disables_autocast():
+def test_complex_fp16_helper_is_rejected_rather_than_disabled():
+    """A disabled context here ran the arm in fp32 while reporting fp16 (#2302)."""
+    import pytest
+
+    from spectramr.infrastructure.training.mixed_precision import (
+        AMPPrecisionUnsupportedError,
+    )
+
     cfg = MixedPrecisionConfig(
         enabled=True, precision="fp16", enable_complex_support=True
     )
-    helper = MixedPrecisionIntegrationHelper(cfg)
-    ctx = helper.get_autocast_context()
-    # Complex + fp16 → autocast disabled (a plain nullcontext), NOT an enabled
-    # fp16 autocast region.
-    assert isinstance(ctx, contextlib.nullcontext)
+    with pytest.raises(AMPPrecisionUnsupportedError):
+        MixedPrecisionIntegrationHelper(cfg, device="cpu")
+
+
+def test_disabled_amp_returns_a_null_context():
+    cfg = MixedPrecisionConfig(enabled=False, enable_complex_support=True)
+    helper = MixedPrecisionIntegrationHelper(cfg, device="cpu")
+    assert isinstance(helper.get_autocast_context(), contextlib.nullcontext)
 
 
 def test_noncomplex_fp16_helper_returns_real_autocast():

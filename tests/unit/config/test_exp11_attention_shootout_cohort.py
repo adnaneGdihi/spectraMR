@@ -1,20 +1,20 @@
 """The attention shootout's cohort-level invariants.
 
-Ten arms whose contract is that they differ in ``attention_type`` and nothing
-else that could move a metric. Two invariants, and they are invariants of
-different kinds -- one scientific, one declarative.
+Twelve arms whose contract is that they differ in ``attention_type`` (or a
+knob inside it) and nothing else that could move a metric. Two invariants, and
+they are invariants of different kinds -- one scientific, one declarative.
 
-**Effective batch size** is the scientific one, and the reason it is stated as a
-PRODUCT is the whole point. Four arms (the three KAN variants and kernelized)
-run ``batch_size: 1`` with ``accumulation_steps: 4`` while the other six run
-``2`` x ``2``. Read as raw keys that is a cohort split down the middle; read as
-the quantity the optimizer actually sees it is 4 everywhere. The four are the
-heavy arms and the 1x4 split is a memory accommodation -- two of them also
-enable gradient checkpointing -- chosen precisely to hold the optimization math
-fixed. "Standardising" those keys to match the control would equalise the YAML
-and change nothing about the experiment except to OOM the arms that needed the
-accommodation. So the assertion is on the product, which is what a confound
-would actually move.
+**Training exposure** is the scientific one, and it has two factors.
+``max_iterations`` counts micro-batches -- one ``next(data_iter)`` per
+iteration -- so the samples an arm sees are ``data.loader.batch_size x
+max_iterations``, and the optimizer and scheduler step once every
+``accumulation_steps`` iterations. Equal samples together with equal effective
+batch (``batch_size x accumulation_steps``) therefore pin equal optimizer steps,
+which is why there is no third test for them. Four arms ran ``1 x 4`` at the
+control's 70000 iterations, holding the effective batch while seeing half the
+samples and taking half the steps (#1265); the owner's 2026-10-04 decision is
+one batch size and one accumulation on every arm, which the micro-batch test
+pins, and a samples-seen budget that survives any memory fallback.
 
 Rank count is the other multiplier and no YAML can pin it: ``num_devices`` is
 overwritten from ``LOCAL_WORLD_SIZE`` by ``pipelines/distributed.py`` on any
@@ -52,6 +52,9 @@ COHORT = (
     / "attention_shootout"
 )
 CONTROL = "experiment_11_attention_none"
+#: Arms whose micro-batch is lifted for memory (job 8818221 OOM at batch 4). The samples and
+#: effective-batch tests still bind them, so they train the same 420000 samples in 105000 steps.
+MEMORY_FALLBACK = frozenset({"experiment_11_attention_kan_dual_domain_sparse"})
 
 
 def _arms() -> dict[str, TrainingSettings]:
@@ -97,25 +100,105 @@ def test_the_cohort_is_present(arms) -> None:
     assert CONTROL in arms, "the control arm is missing from the cohort"
 
 
-def test_every_arm_shares_the_control_effective_batch(arms) -> None:
-    """``batch_size x accumulation_steps`` is what the optimizer sees.
+def _exposure(cfg: TrainingSettings) -> tuple[int, int, int]:
+    """``(micro-batch, accumulation, max_iterations)`` as the run reads them.
 
-    Not ``batch_size`` alone -- see the module docstring. An arm that trades
-    micro-batch for accumulation is holding this invariant, not breaking it.
+    ``data.loader.batch_size`` is the one the DataLoader is built from;
+    ``training.batch_size`` has no reader in ``src/`` and must not stand in.
     """
-    effective = {
-        stem: cfg.data.loader.batch_size * cfg.optimization.gradient.accumulation_steps
-        for stem, cfg in arms.items()
-    }
-    control = effective[CONTROL]
-    divergent = {s: e for s, e in effective.items() if e != control}
-    assert not divergent, (
-        f"effective batch (batch_size x accumulation_steps) is {control} on the "
-        f"control but differs on {divergent}. That is a second axis in a cohort "
-        "whose contract is attention_type alone (pitfall #17) -- every reported "
-        "difference becomes unattributable. Restore the product; the split "
-        "between micro-batch and accumulation is free to differ."
+    return (
+        cfg.data.loader.batch_size,
+        cfg.optimization.gradient.accumulation_steps,
+        cfg.training.max_iterations,
     )
+
+
+def _divergent(
+    exposure: dict[str, tuple[int, int, int]], quantity, exempt: frozenset[str] = frozenset()
+) -> dict[str, object]:
+    """Arms whose ``quantity(batch, accum, iters)`` differs from the control's."""
+    control = quantity(*exposure[CONTROL])
+    return {
+        s: v for s, e in exposure.items() if s not in exempt and (v := quantity(*e)) != control
+    }
+
+
+def _samples(batch: int, _accum: int, iters: int) -> int:
+    return batch * iters
+
+
+def _effective_batch(batch: int, accum: int, _iters: int) -> int:
+    return batch * accum
+
+
+def _micro_batch(batch: int, accum: int, _iters: int) -> tuple[int, int]:
+    return (batch, accum)
+
+
+@pytest.mark.parametrize(
+    ("quantity", "what"),
+    [
+        (_samples, "samples seen (data.loader.batch_size x max_iterations)"),
+        (_effective_batch, "effective batch (batch_size x accumulation_steps)"),
+        (_micro_batch, "(batch_size, accumulation_steps)"),
+    ],
+    ids=["samples", "effective-batch", "micro-batch"],
+)
+def test_every_arm_matches_the_control_exposure(arms, quantity, what: str) -> None:
+    """Samples and effective batch are the science; the micro-batch is the
+    owner's 2026-10-04 ruling on #1265 and the one a memory fallback may lift,
+    provided the samples test stays green."""
+    exempt = MEMORY_FALLBACK if quantity is _micro_batch else frozenset()
+    divergent = _divergent({s: _exposure(c) for s, c in arms.items()}, quantity, exempt)
+    assert not divergent, (
+        f"{what} differs from the control on {divergent}. That is a second axis "
+        "in a cohort whose contract is attention_type alone (pitfall #17): "
+        "max_iterations counts micro-batches, so a smaller batch at the same "
+        "budget sees fewer samples and takes fewer optimizer steps."
+    )
+
+
+_CONTROL_EXPOSURE = (2, 2, 70000)
+
+
+@pytest.mark.parametrize(
+    ("planted", "red"),
+    [
+        ((1, 4, 70000), True),  # #1265's shape: effective batch held, samples halved
+        ((2, 2, 35000), True),  # budget cut alone
+        ((1, 4, 140000), False),  # the sample-equal memory fallback
+    ],
+    ids=["halved-batch-same-budget", "budget-alone", "sample-equal-fallback"],
+)
+def test_the_samples_rule_turns_red_on_a_planted_arm(planted, red: bool) -> None:
+    exposure = {CONTROL: _CONTROL_EXPOSURE, "planted": planted}
+    assert bool(_divergent(exposure, _samples)) is red
+
+
+def test_the_memory_exemption_lifts_only_the_micro_batch() -> None:
+    """PLANTED: an exempt arm may split 2 x 2, an unlisted one may not, and the exemption
+    never reaches the samples or effective-batch rules."""
+    split = {CONTROL: (4, 1, 105000), "x": (2, 2, 210000)}
+    assert _divergent(split, _micro_batch) == {"x": (2, 2)}
+    assert _divergent(split, _micro_batch, frozenset({"x"})) == {}
+    assert _divergent(split, _samples, frozenset({"x"})) == {}
+    short = {CONTROL: (4, 1, 105000), "x": (2, 2, 105000)}
+    assert _divergent(short, _samples) == {"x": 210000}
+    assert set(_arms()) >= MEMORY_FALLBACK
+
+
+def test_the_rule_reads_the_loader_batch_not_training_batch(tmp_path: Path) -> None:
+    """Planted on a resolved YAML: only ``data.loader.batch_size`` moves, so a
+    predicate reading the inert ``training.batch_size`` would stay green."""
+    import yaml
+
+    doc = yaml.safe_load((COHORT / f"{CONTROL}.yaml").read_text())
+    doc["data"]["loader"]["batch_size"] = 1
+    planted = tmp_path / "planted.yaml"
+    planted.write_text(yaml.safe_dump(doc))
+    control = _exposure(TrainingSettings.from_yaml(str(COHORT / f"{CONTROL}.yaml")))
+    exposure = {CONTROL: control, "planted": _exposure(TrainingSettings.from_yaml(str(planted)))}
+    assert _divergent(exposure, _samples) == {"planted": control[2]}
 
 
 def test_the_axis_under_test_actually_varies(arms) -> None:

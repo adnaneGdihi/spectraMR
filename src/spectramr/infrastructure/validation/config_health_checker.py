@@ -12,10 +12,13 @@ hand-curated ``ERRORS_GROUPED_SUMMARY.md`` does — automatically.
 import json
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from pathlib import PurePath
 from typing import Any
 
 from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS
+from spectramr.config.schemas.physics import subvoxel_input_channels
 from spectramr.config.settings import TrainingSettings
 from spectramr.domain.workflows.declaration import (
     declared_regime,
@@ -60,7 +63,10 @@ _INCOHERENT_NEX_TARGET_MODE = "complex_mean"
 #: metrics directory, and ``training.output_dir`` is read at hundreds of sites --
 #: which is what makes a disagreement between them a defect a run can act on.
 #:
-#: ``logging.identity.experiment`` looks like the seventh member and deliberately
+#: Checkpoints are not a member: they always land in ``<training.output_dir>/
+#: checkpoints``, so they cannot disagree with it (#2842).
+#:
+#: ``logging.identity.experiment`` looks like a sixth member and deliberately
 #: is not one. Nothing under ``src/`` consumes it: the only two mentions are a
 #: ``renames.py`` row and an entry in
 #: ``paired_arms_diff_paths.DEFAULT_DIFF_PATHS``, which is the allow-list of
@@ -76,7 +82,6 @@ _INCOHERENT_NEX_TARGET_MODE = "complex_mean"
 #: drift about what counts as an identity path.
 IDENTITY_PATHS: tuple[str, ...] = (
     "training.output_dir",
-    "checkpoint.checkpoint_dir",
     "logging.sinks.dir",
     "loss_logging.output_dir",
     "loss_logging.csv_path",
@@ -87,6 +92,22 @@ IDENTITY_PATHS: tuple[str, ...] = (
 #: ``training.output_dir``. ``cli/profile_paths.CONVENTION_PARTS`` already
 #: derives its copy from this module rather than becoming a second owner.
 RESULTS_PREFIX = "experiments/results/"
+
+
+def results_relative(path: str) -> str:
+    """``path`` from its ``experiments/results/`` segment on, else ``path`` unchanged.
+
+    The campaign orchestrator resolves its base dir, so a run it launches carries an
+    absolute ``<root>/experiments/results/...`` that is on-convention all the same.
+    """
+    pure = PurePath(path)
+    if not pure.is_absolute():
+        return path
+    anchor = tuple(RESULTS_PREFIX.strip("/").split("/"))
+    for i in range(len(pure.parts) - len(anchor) + 1):
+        if pure.parts[i : i + len(anchor)] == anchor:
+            return "/".join(pure.parts[i:])
+    return path
 
 #: Checks whose failure means the run CANNOT succeed, so the pipeline aborts
 #: before ``bootstrap.build_container`` instead of warning and continuing.
@@ -113,6 +134,9 @@ FATAL_HEALTH_CHECKS: frozenset[str] = frozenset(
         # the arm validated data, resolved the device and built the environment
         # before DeepSpeedUnavailableError. Nothing recovers an absent import.
         "deepspeed_extra_installed",
+        # A strategy whose own modules the parallel wrapper cannot reach: ranks
+        # diverge or read shards, and the director raises on it anyway.
+        "strategy_parallel_compat",
     }
 )
 
@@ -267,7 +291,7 @@ def _has_enabled_pre_model_adapter(adapters: Any) -> bool:
 
     The narrow form of "an adapter may bridge the data domain". Only ``pre_model`` sits
     between the dataset and the model, so only it can change what domain the model
-    receives; the other four hooks (``post_model``, ``pre_loss_pred``,
+    receives; the other three hooks (``post_model``,
     ``pre_loss_target``, ``pre_metric``) run after the model has already consumed the
     input. A step with ``enabled: false`` is declared-but-skipped and bridges nothing.
 
@@ -291,6 +315,31 @@ def _has_enabled_pre_model_adapter(adapters: Any) -> bool:
         if enabled:
             return True
     return False
+
+
+def _applies_forward_operator(loss_name: str) -> bool:
+    """Does the registered loss take an IMAGE prediction and apply ``A`` to it itself?
+
+    Declared on the class (``applies_forward_operator``), never inferred from the
+    name: an image-output arm's ``kspace_losses`` entry is unbridged unless the loss
+    says it makes the k-space it scores. An unregistered name answers no.
+    """
+    from spectramr.models.losses.registry import LossRegistry
+
+    try:
+        loss_cls = LossRegistry.get_loss_class(loss_name)
+    except Exception:  # an unknown loss is the loss-registry check's finding
+        return False
+    return bool(getattr(loss_cls, "applies_forward_operator", False))
+
+
+def _ei_anchor_scores(config: Any, loss_names: list[str]) -> bool:
+    """Does the EI strategy expand the image output through ``A`` before these losses?"""
+    from spectramr.infrastructure.training.strategies.equivariant_imaging_ops import (
+        anchor_scores_kspace_losses,
+    )
+
+    return anchor_scores_kspace_losses(config, loss_names)
 
 
 def _contrast_aware_critics(registry: dict[str, Any]) -> tuple[list[str], int]:
@@ -1408,6 +1457,20 @@ class ConfigHealthChecker:
         }
     )
 
+    @staticmethod
+    def _strategy_predicts_distribution_params(config: Any) -> bool:
+        """Whether the resolved strategy declares a distribution head (``[mean, logvar]``, ...).
+
+        The same ``predicts_distribution_params`` class flag the train-step width
+        guard and the visualization reducer read, so the audit cannot disagree with them.
+        """
+        from spectramr.infrastructure.validation.witness.checks.strategy_override_checks import (
+            _resolve,
+        )
+
+        explicit_cls, mapped_cls = _resolve(config)
+        return bool(getattr(explicit_cls or mapped_cls, "predicts_distribution_params", False))
+
     # Models whose strategy concatenates an extra reference / conditioning
     # tensor onto the input at runtime, so model.in_channels does NOT match
     # the dataset's per-sample channel count. The audit can't see the
@@ -1557,19 +1620,45 @@ class ConfigHealthChecker:
         "ConcreteMultiAcquisitionStrategy",
     )
 
-    _COMPLEX_STACKING_STRATEGY_MARKERS: tuple[str, ...] = (
-        "virtual_fiducial_strategy",
-        "motion_meta_strategy",
-        "vf_admm_strategy",
-        "ib_vf_strategy",
-        # distillation_strategy._compute_losses_impl real-stacks the digital-twin
-        # corrupted complex image (cat([corrupted.real, corrupted.imag])) AND the
-        # clean target before the blind-student generator, so a 1-channel
-        # rss_image magnitude becomes 2 model-visible channels. Missing here, the
-        # audit expected in=1 and rejected the correct in=2 for
-        # eval_c2/eval_c3/eval_c7/exp_c4 (cluster smoke 20260605, job 7095209).
-        "distillation_strategy",
-    )
+    @classmethod
+    def _strategy_bridges_kspace_to_image(cls, config: Any) -> bool:
+        """Does this arm's strategy hand its image-domain network ``A^H y``?
+
+        ``ReconstructionTrainingStrategy._prepare_generator_inputs`` applies the
+        adjoint exactly when ``needs_kspace_to_image_bridge`` says so; a strategy
+        outside that family applies nothing, and the loader's domain is what the
+        network reads.
+        """
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            needs_kspace_to_image_bridge,
+        )
+
+        strategy_cls = cls._resolve_strategy_class(config)
+        return (
+            strategy_cls is not None
+            and issubclass(strategy_cls, ReconstructionTrainingStrategy)
+            and needs_kspace_to_image_bridge(config)
+        )
+
+    @staticmethod
+    def _resolve_strategy_class(config: Any) -> type | None:
+        """The arm's strategy class, or ``None`` when it does not resolve.
+
+        Unresolvable strategies are reported by the strategy-registry check; here
+        ``None`` only withholds the strategy-dependent adjustment.
+        """
+        from spectramr.infrastructure.training.strategy_factory import (
+            TrainingStrategyFactory,
+        )
+
+        try:
+            strategy_cls = TrainingStrategyFactory().get_strategy_class(config)
+        except Exception:  # reported by check_strategy_registry
+            return None
+        return strategy_cls if isinstance(strategy_cls, type) else None
 
     # dataset_type values whose loaders materialise the image-domain key
     # (not the `kspace` key). _apply_coil_processing's RSS / SVD branches
@@ -1804,6 +1893,18 @@ class ConfigHealthChecker:
                 f"{single_contrast_channels})"
             )
 
+        # The conditional alpha-stable denoiser feeds [y, x_t, log sigma_t].
+        levy_cfg = getattr(getattr(config, "training", None), "levy_denoising", None)
+        if expected_channels is not None and levy_cfg is not None:
+            widened = levy_cfg.denoiser_in_channels(expected_channels, out_channels or 1)
+            reason = (
+                f"{reason}; widened to {widened} for the input because "
+                "training.levy_denoising feeds [y, x_t, log sigma_t] (output stays "
+                f"{single_contrast_channels})"
+            )
+            expected_channels = widened
+            input_concat_doubled = True
+
         # Multi-acquisition strategies never feed the loaded batch to the
         # generator: they SYNTHESISE an acquisition stack whose width comes from
         # ``physics.multi_acquisition``, so the coil arithmetic above describes a
@@ -1827,7 +1928,8 @@ class ConfigHealthChecker:
         ):
             if getattr(macq, "method", None) == "subvoxel_sr":
                 per_frame = 4 if getattr(macq, "marker_channels", False) else 3
-                expected = int(macq.n_frames) * per_frame
+                psf_on = bool(getattr(getattr(macq, "forward_psf", None), "enabled", False))
+                expected = subvoxel_input_channels(macq)
                 passed = in_channels == expected
                 results.append(
                     HealthCheckResult(
@@ -1837,6 +1939,7 @@ class ConfigHealthChecker:
                             f"subvoxel_sr synthesises {macq.n_frames} frames + "
                             f"{2 * macq.n_frames} shift maps"
                             + (f" + {macq.n_frames} fiducial frames" if per_frame == 4 else "")
+                            + (" + 1 forward-PSF channel" if psf_on else "")
                             + f" = {expected} channels; model.in_channels="
                             f"{in_channels}. The coil pipeline does not set this "
                             "width — the strategy does."
@@ -1868,17 +1971,12 @@ class ConfigHealthChecker:
         # turning a runtime DomainMismatch crash into an audit skip. Guarded on
         # ``expected_channels == 1`` so svd VF arms (already 2*N real) are
         # unaffected.
-        training_cfg = getattr(config, "training", None)
-        strategy_class = getattr(training_cfg, "strategy_class", None) or ""
-        if (
-            expected_channels == 1
-            and isinstance(strategy_class, str)
-            and any(marker in strategy_class for marker in self._COMPLEX_STACKING_STRATEGY_MARKERS)
-        ):
+        strategy_cls = self._resolve_strategy_class(config)
+        if expected_channels == 1 and getattr(strategy_cls, "synthesises_model_input", False):
             expected_channels = 2
             reason = (
                 f"{reason}; doubled to 2 because the training strategy "
-                f"'{strategy_class.rsplit('.', 1)[-1]}' real-stacks the complex "
+                f"'{strategy_cls.__name__}' real-stacks the complex "
                 f"magnitude (1 complex → 2 real channels) before the generator"
             )
 
@@ -1997,10 +2095,8 @@ class ConfigHealthChecker:
                     severity="error" if not in_ok else "info",
                 )
             )
-            # Also relax the out_channels check: the user's declared
-            # ``out_channels`` is the model's emitted width, which the
-            # ``pre_loss_pred`` chain will bridge back to expected for
-            # the loss. Skip the strict comparison in this branch.
+            # Also relax the out_channels check: the declared ``out_channels``
+            # is the model's emitted width, not the loss-side width.
             return results
         else:
             in_ok = in_channels == expected_channels
@@ -2028,6 +2124,19 @@ class ConfigHealthChecker:
                             f"model.out_channels={out_channels} not checked: "
                             f"model_type='{model_type}' declares its own out-channel "
                             f"semantics"
+                        ),
+                        severity="info",
+                    )
+                )
+            elif self._strategy_predicts_distribution_params(config):
+                results.append(
+                    HealthCheckResult(
+                        passed=True,
+                        check_name="domain_alignment",
+                        message=(
+                            f"model.out_channels={out_channels} not checked: the strategy "
+                            "declares a distribution head (predicts_distribution_params) "
+                            "and reduces it to the point estimate itself"
                         ),
                         severity="info",
                     )
@@ -2240,8 +2349,16 @@ class ConfigHealthChecker:
             sig_params, has_var_kwargs = {}, True
 
         if not has_var_kwargs:
+            # A strategy may read its own knobs from model_kwargs (reads_model_kwargs); those
+            # are consumed, not swallowed. A strategy that declares them names, with the
+            # model's signature, every reader, so any other key is certainly unread: an error.
+            strategy_reads = getattr(
+                self._resolve_strategy_class(config), "reads_model_kwargs", None
+            )
+            severity = "info" if strategy_reads is None else "error"
+            strategy_reads = strategy_reads or frozenset()
             for key in kwargs:
-                if key in schema or key in sig_params:
+                if key in schema or key in sig_params or key in strategy_reads:
                     continue
                 results.append(
                     HealthCheckResult(
@@ -2255,7 +2372,7 @@ class ConfigHealthChecker:
                             "filter (pitfall #16 facade knob) or a TypeError "
                             "at build."
                         ),
-                        severity="info",
+                        severity=severity,
                         category="advertised_options",
                         yaml_keys=[f"model.model_kwargs.{key}"],
                         fix_hint=(
@@ -2344,15 +2461,6 @@ class ConfigHealthChecker:
             "kspace": ("kspace_losses",),
             "complex_image": ("complex_losses",),
         }
-        # An explicit `adapters.pre_loss_pred` chain bridges any
-        # output_domain → loss-domain mismatch the user has acknowledged.
-        # Honor it here so the audit doesn't double-flag what the
-        # adapters layer already covers.
-        adapters_cfg = getattr(config, "adapters", None)
-        explicit_pre_loss = bool(
-            adapters_cfg is not None and (getattr(adapters_cfg, "pre_loss_pred", None) or [])
-        )
-
         # Anything in a non-matching list is flagged. Severity depends on
         # direction:
         # - image_losses on a kspace-output model is an ERROR (the path
@@ -2369,8 +2477,7 @@ class ConfigHealthChecker:
         #   output_domain=kspace:        image→iFFT-mag, complex→iFFT-complex
         #   output_domain=image:         complex→cast-to-complex (native-ish);
         #                                kspace is the ONLY fragile combo
-        #                                (must self-FFT or declare an explicit
-        #                                adapters.pre_loss_pred chain)
+        #                                (must self-FFT; no adapter bridges it)
         #   output_domain=complex_image: image→magnitude-extract, kspace→FFT
         # The only genuinely-unbridged combo left flagged as error is
         # (image, kspace_losses), matching the builder's own warning.
@@ -2407,24 +2514,21 @@ class ConfigHealthChecker:
             domain_of_attr = attr_name.replace("_losses", "")
             if attr_name not in compat.get(output_domain, ()):
                 names = [getattr(e, "name", "<unknown>") for e in entries]
-                auto_bridged = (output_domain, attr_name) in bridged_combos
-                # Explicit adapter chain on pre_loss_pred subsumes the
-                # auto-bridge — even directions LossBuilder doesn't
-                # natively bridge are valid when the user declares.
-                bridged = auto_bridged or explicit_pre_loss
-                severity = "info" if bridged else "error"
+                auto_bridged = (output_domain, attr_name) in bridged_combos or (
+                    (output_domain, attr_name) == ("image", "kspace_losses")
+                    and (
+                        all(_applies_forward_operator(name) for name in names)
+                        or _ei_anchor_scores(config, names)
+                    )
+                )
+                severity = "info" if auto_bridged else "error"
                 if auto_bridged:
                     message = (
                         f"losses.output_domain={output_domain!r} with "
-                        f"losses.{attr_name} ({names}): bridge is auto-inserted "
-                        "by LossBuilder per schema contract."
-                    )
-                    fix_hint = None
-                elif explicit_pre_loss:
-                    message = (
-                        f"losses.output_domain={output_domain!r} with "
-                        f"losses.{attr_name} ({names}): bridged by explicit "
-                        "adapters.pre_loss_pred chain."
+                        f"losses.{attr_name} ({names}): bridged, by LossBuilder per "
+                        "schema contract, by a loss that applies the forward "
+                        "operator to the image itself, or by the EI anchor that "
+                        "scores F S x_hat."
                     )
                     fix_hint = None
                 else:
@@ -2442,7 +2546,7 @@ class ConfigHealthChecker:
                     )
                 results.append(
                     HealthCheckResult(
-                        passed=bridged,
+                        passed=auto_bridged,
                         check_name="loss_domain_consistency",
                         message=message,
                         severity=severity,
@@ -2700,8 +2804,17 @@ class ConfigHealthChecker:
         # the inprogress sweep). We surface a coherence hint without breaking smoke
         # (avoids the "migration warning breaks configs" trap). Skip prose values.
         primary_base = _base(primary)
+        # A cascade aggregate (``val_<m>_mean``, ``_mean_partial``, ``val_<m>_vs_zf_mean``) is
+        # emitted from the configured ``<m>``; a metric whose own name ends in ``_mean`` still
+        # matches as itself.
+        aggregate_base = _re.sub(r"(_vs_zf)?_mean(_partial)?$", "", primary_base)
         is_token = (" " not in str(primary)) and ("(" not in str(primary))
-        not_emitted = bool(is_token and declared_bases and primary_base not in declared_bases)
+        not_emitted = bool(
+            is_token
+            and declared_bases
+            and primary_base not in declared_bases
+            and aggregate_base not in declared_bases
+        )
         if not_emitted:
             message = (
                 f"metadata.primary_metric={primary!r} is not in validation.metrics "
@@ -2821,6 +2934,9 @@ class ConfigHealthChecker:
         if metrics_cfg is None or model_cfg is None:
             return results
         out_channels = int(getattr(model_cfg, "out_channels", 1) or 1)
+        if self._strategy_predicts_distribution_params(config):
+            # The metrics score the point estimate, which has the target's width.
+            out_channels = int(config.data.domain.target_channels)
 
         for flag, allowed in self._METRIC_CHANNEL_CONSTRAINTS.items():
             if not bool(getattr(metrics_cfg, flag, False)):
@@ -3019,6 +3135,9 @@ class ConfigHealthChecker:
             self_contained_diffusion = (
                 "field_cold_diffusion",
                 "field_guided_diffusion",
+                "levy_diffusion",
+                "resetting_diffusion",
+                "qspace_diffusion",
             )
             if (
                 substring == "diffusion"
@@ -3941,6 +4060,180 @@ class ConfigHealthChecker:
             severity="info",
         )
 
+    def check_mask_direction_axis_declared(self, config: TrainingSettings) -> HealthCheckResult:
+        """``mask_direction: phase``/``readout`` resolves through ``data.acquisition``, at load.
+
+        The accelerator raises at build through the same owner
+        (``line_axis_for``); this reports it at audit, before a job is queued.
+        """
+        from spectramr.infrastructure.physics.line_axis import line_axis_for
+
+        name = "mask_direction_axis_declared"
+        direction = getattr(getattr(config, "undersampling", None), "mask_direction", None)
+        if direction is None:
+            return HealthCheckResult(
+                passed=True,
+                check_name=name,
+                message="undersampling.mask_direction is unset.",
+                severity="info",
+            )
+        acquisition = getattr(getattr(config, "data", None), "acquisition", None)
+        axis = getattr(acquisition, "phase_encode_axis", None)
+        try:
+            line_axis = line_axis_for(direction, axis)
+        except ValueError as exc:
+            return HealthCheckResult(
+                passed=False, check_name=name, message=str(exc), severity="error"
+            )
+        return HealthCheckResult(
+            passed=True,
+            check_name=name,
+            message=(
+                f"mask_direction={direction!r} with phase_encode_axis={axis!r} removes "
+                f"lines along line_axis={line_axis!r}."
+            ),
+            severity="info",
+        )
+
+    def check_mask_direction_is_read(self, config: TrainingSettings) -> HealthCheckResult:
+        """``mask_direction`` must reach a reader: a line-structured family or the loader (#1082).
+
+        Two components read it: the cold-diffusion process, through families that
+        consume a ``line_axis``, and the loader's line mask, which runs only when
+        ``base_acceleration`` is not 1. A bin-wise family (``random``, ``radial``,
+        ``variable_density``, ...) at base 1 reads it nowhere. The family is the one
+        the arm's process resolves, built with the direction removed so the verdict
+        does not depend on the phase-encode axis (``mask_direction_axis_declared``
+        checks that).
+        """
+        from spectramr.data.transforms.tio_physics import loader_masks_lines
+        from spectramr.infrastructure.physics.sampling import family_reads_line_axis
+        from spectramr.infrastructure.validation.witness.checks.schedule_certification_common import (
+            build_process_from_config,
+        )
+
+        name = "mask_direction_is_read"
+        accel = getattr(config, "undersampling", None)
+        direction = getattr(accel, "mask_direction", None)
+        if direction is None:
+            return HealthCheckResult(
+                passed=True, check_name=name, message="mask_direction is unset.", severity="info"
+            )
+        if loader_masks_lines(float(accel.base_acceleration)):
+            return HealthCheckResult(
+                passed=True,
+                check_name=name,
+                message=f"the loader's line mask reads mask_direction={direction!r}.",
+                severity="info",
+            )
+        doc = config.model_dump(mode="json")
+        doc["undersampling"] = {
+            k: v for k, v in (doc.get("undersampling") or {}).items() if k != "mask_direction"
+        }
+        process = build_process_from_config(doc)
+        if process is None or family_reads_line_axis(process.mask_type):
+            return HealthCheckResult(
+                passed=True,
+                check_name=name,
+                message=f"mask_direction={direction!r} reaches a line-structured mask.",
+                severity="info",
+            )
+        return HealthCheckResult(
+            passed=False,
+            check_name=name,
+            message=(
+                f"undersampling.mask_direction={direction!r} is read by nothing on this arm: "
+                f"acceleration_type={process.mask_type!r} selects bins, not lines, and at "
+                "base_acceleration 1 the loader applies no line mask. Remove the key "
+                "(#1082)."
+            ),
+            severity="error",
+        )
+
+    def check_reverse_sampling_declaration(self, config: TrainingSettings) -> HealthCheckResult:
+        """The cold-MRI reverse-loop knobs are legal together, checked at load.
+
+        The generator validates the same pair at construction, which only the
+        ``--probe`` tier reaches; without this a misdeclared arm audits clean and
+        raises when the model is built. Both checks call the sampler's own
+        validators, so the audit and the build cannot disagree.
+        """
+        name = "reverse_sampling_declaration"
+        model = getattr(config, "model", None)
+        kwargs = getattr(model, "model_kwargs", None) or {}
+        if str(getattr(model, "model_type", "")) != "kspace_cold_diffusion":
+            return HealthCheckResult(
+                passed=True,
+                check_name=name,
+                message="not a kspace_cold_diffusion arm.",
+                severity="info",
+            )
+        from spectramr.models.blocks.timestep_embedding import validate_timestep_scale
+        from spectramr.models.diffusion.kspace_process import VALID_REVERSE_MODES
+        from spectramr.models.diffusion.reverse_integrity import validate_integrity_check
+        from spectramr.models.diffusion.reverse_physics import (
+            REVERSE_PHYSICS_KEYS,
+            resolve_reverse_physics_kwargs,
+        )
+        from spectramr.models.diffusion.reverse_refine import validate_refine_alpha
+        from spectramr.models.generators.kan_param_groups import (
+            KAN_RATIO_DEFAULTS,
+            resolve_kan_param_group_ratios,
+        )
+
+        mode = str(kwargs.get("reverse_sampling_mode", "additive"))
+        try:
+            if mode not in VALID_REVERSE_MODES:
+                raise ValueError(
+                    f"Unknown reverse_sampling_mode {mode!r}. "
+                    f"Valid: {sorted(VALID_REVERSE_MODES)}."
+                )
+            validate_refine_alpha(mode, kwargs.get("reverse_refine_alpha"))
+            validate_integrity_check(kwargs.get("reverse_integrity_check"))
+            # The generator validates the scale only at build, which the no-probe tier never reaches (#2469).
+            if "timestep_embedding_scale" in kwargs:
+                validate_timestep_scale(str(kwargs["timestep_embedding_scale"]))
+            resolve_reverse_physics_kwargs(mode, str(kwargs.get("dc_method", "hard")), kwargs)
+            # The generator validates these at build only, which the no-probe tier never reaches.
+            resolve_kan_param_group_ratios(kwargs)
+        except ValueError as exc:
+            return HealthCheckResult(
+                passed=False,
+                check_name=name,
+                message=str(exc),
+                severity="error",
+                yaml_keys=[
+                    "model.model_kwargs.reverse_sampling_mode",
+                    "model.model_kwargs.reverse_refine_alpha",
+                    "model.model_kwargs.reverse_integrity_check",
+                    "model.model_kwargs.timestep_embedding_scale",
+                    "model.model_kwargs.dc_method",
+                    *(f"model.model_kwargs.{key}" for key in REVERSE_PHYSICS_KEYS.values()),
+                    *(f"model.model_kwargs.{key}" for key in KAN_RATIO_DEFAULTS),
+                ],
+            )
+        return HealthCheckResult(
+            passed=True,
+            check_name=name,
+            message=f"reverse_sampling_mode={mode!r}.",
+            severity="info",
+        )
+
+    @staticmethod
+    def _declared_mask_producers(data: object) -> tuple[str, ...]:
+        """Declared ``data.processing.transforms`` registered as producing ``mask``.
+
+        The registry's ``produces`` declaration is the evidence, not the name, so
+        a transform that stops emitting the mask stops satisfying this.
+        """
+        from spectramr.data.transforms.registry import transforms_producing
+
+        producers = set(transforms_producing("mask"))
+        entries = getattr(getattr(data, "processing", None), "transforms", None) or []
+        names = (getattr(e, "name", None) or (e.get("name") if isinstance(e, dict) else None)
+                 for e in entries)
+        return tuple(n for n in names if n in producers)
+
     def check_acceleration_present(self, config: TrainingSettings) -> HealthCheckResult:
         """k-space datasets must declare an ``acceleration:`` block (no silent 1× fallback)."""
         data = getattr(config, "data", None)
@@ -3983,6 +4276,20 @@ class ConfigHealthChecker:
                 passed=True,
                 check_name="acceleration_present",
                 message=f"k-space dataset with workflow.task={task!r}: no undersampling expected.",
+                severity="info",
+            )
+        masking = self._declared_mask_producers(data) if accel is None else ()
+        if masking:
+            # The loader undersamples through a registry transform that owns the
+            # acquisition `mask` (CoNEX's `complementary_rep_masking`); an
+            # `undersampling:` block beside it would be a second, unread owner.
+            return HealthCheckResult(
+                passed=True,
+                check_name="acceleration_present",
+                message=(
+                    f"undersampling is applied in the loader by {list(masking)} "
+                    "(data.processing.transforms), which emits the acquisition mask."
+                ),
                 severity="info",
             )
         if accel is None and not self._strategy_expects_undersampling(config):
@@ -4393,6 +4700,23 @@ class ConfigHealthChecker:
                 severity="info",
             )
 
+        # A strategy that renders physics per contrast is the consumer; the models never see it.
+        from spectramr.infrastructure.validation.inference import contrast_id_consumer
+
+        consumer = contrast_id_consumer(config)
+        if consumer:
+            return HealthCheckResult(
+                passed=True,
+                check_name="multi_contrast_model_support",
+                message=(
+                    f"contrast_idx is consumed by {consumer} (per-contrast "
+                    "physics), not by the models, which stay contrast-agnostic: "
+                    + "; ".join(problems)
+                    + "."
+                ),
+                severity="info",
+            )
+
         return HealthCheckResult(
             passed=False,
             check_name="multi_contrast_model_support",
@@ -4719,17 +5043,15 @@ class ConfigHealthChecker:
             message=(
                 f"model_type={model_type!r} declares output_domain="
                 f"{model_out!r} but losses.output_domain={loss_out!r}. "
-                "No auto-bridge for this direction; declare an explicit "
-                "adapter under `adapters.pre_loss_pred:` or fix the YAML."
+                "No auto-bridge for this direction; fix the YAML "
+                "(adapters.pre_loss_pred is retired, #1777)."
             ),
             severity="error",
             category="model_loss_output_domain",
             yaml_keys=["model.model_type", "losses.output_domain"],
             fix_hint=(
-                "Either change losses.output_domain to "
-                f"{model_out!r} (match the model), or add an "
-                "`adapters.pre_loss_pred:` chain that bridges "
-                f"{model_out!r} → {loss_out!r}."
+                "Change losses.output_domain to "
+                f"{model_out!r} (match the model)."
             ),
         )
 
@@ -5363,7 +5685,12 @@ class ConfigHealthChecker:
         disc_component = getattr(model, "discriminator_component", None)
         disc_legacy = getattr(model, "discriminator", None)
         has_discriminator = (disc_component is not None) or (disc_legacy is not None)
+        losses = getattr(config, "losses", None)
+        gan = getattr(losses, "gan", None) if losses is not None else None
+        enable_adv = getattr(gan, "enable_adversarial", False) if gan is not None else False
         if not has_discriminator:
+            if enable_adv:
+                return self._adversarial_without_discriminator(model)
             return HealthCheckResult(
                 passed=True,
                 check_name="discriminator_gan_losses",
@@ -5373,9 +5700,6 @@ class ConfigHealthChecker:
 
         # When a discriminator is declared, ``losses.gan.enable_adversarial``
         # must be truthy. Otherwise the GAN composite isn't built.
-        losses = getattr(config, "losses", None)
-        gan = getattr(losses, "gan", None) if losses is not None else None
-        enable_adv = getattr(gan, "enable_adversarial", False) if gan is not None else False
         if enable_adv:
             return HealthCheckResult(
                 passed=True,
@@ -5407,6 +5731,38 @@ class ConfigHealthChecker:
                 "``gan_loss_type``, ``disc_updates``). See "
                 "src/config/schemas/loss.py GANLossesConfig for "
                 "the full field set."
+            ),
+        )
+
+    @staticmethod
+    def _adversarial_without_discriminator(model: Any) -> HealthCheckResult:
+        """The converse of the check above: an adversarial loss with no critic to train.
+
+        ``training_mode: gan`` raises at build time; the disentangled strategies skip the
+        adversarial step instead, so an arm trained without the GAN it declared.
+        """
+        model_kwargs = getattr(model, "model_kwargs", None) or {}
+        nested = isinstance(model_kwargs, Mapping) and "discriminator_component" in model_kwargs
+        cause = (
+            "It is declared under model.model_kwargs.discriminator_component, which the "
+            "model builder never reads. "
+            if nested
+            else ""
+        )
+        return HealthCheckResult(
+            passed=False,
+            check_name="discriminator_gan_losses",
+            message=(
+                "losses.gan.enable_adversarial is true but no discriminator is declared "
+                f"under model.discriminator_component. {cause}No discriminator is built, "
+                "so the adversarial term either crashes the build or never trains."
+            ),
+            severity="error",
+            category="discriminator_gan_losses",
+            yaml_keys=["model.discriminator_component", "losses.gan.enable_adversarial"],
+            fix_hint=(
+                "Declare model.discriminator_component (name + kwargs), or set "
+                "losses.gan.enable_adversarial: false."
             ),
         )
 
@@ -5868,18 +6224,19 @@ class ConfigHealthChecker:
                 "terminal index."
             )
 
-        # 4. model.model_kwargs.timesteps == T (time-embedding max_t)
+        # 4. Both model_kwargs spellings of the horizon == T, as the builder refuses either (#2468).
         model = getattr(config, "model", None)
         if model is not None:
             mkw = dict(getattr(model, "model_kwargs", {}) or {})
-            model_T = mkw.get("timesteps")
-            if model_T is not None and int(model_T) != int(T):
-                problems.append(
-                    f"model.model_kwargs.timesteps={model_T} != "
-                    f"training.diffusion.timesteps={T} — the time-"
-                    "embedding's max_timesteps mismatch collapses all "
-                    "actually-used timesteps into a tiny embedding band."
-                )
+            for key in ("timesteps", "num_timesteps"):
+                model_t = mkw.get(key)
+                if model_t is not None and int(model_t) != int(T):
+                    problems.append(
+                        f"model.model_kwargs.{key}={model_t} != "
+                        f"training.diffusion.timesteps={T} — the time-"
+                        "embedding's max_timesteps mismatch collapses all "
+                        "actually-used timesteps into a tiny embedding band."
+                    )
 
         if not problems:
             return HealthCheckResult(
@@ -5900,6 +6257,7 @@ class ConfigHealthChecker:
                 "training.sampling_steps",
                 "training.diffusion.sampling_steps",
                 "model.model_kwargs.timesteps",
+                "model.model_kwargs.num_timesteps",
             ],
             fix_hint=(
                 f"Make every t-valued key respect "
@@ -6901,16 +7259,20 @@ class ConfigHealthChecker:
         arm's headline numbers was not an error -- it was a column that never
         appeared. That is the same shape as #2116, one layer up: the name is
         accepted, nothing computes it, and the run reports success.
+
+        **The surfaces follow different rules.** ``metrics.compute`` must be
+        registered. ``validation.scoring.compute`` may also name a key the
+        strategy writes itself (``val_loss`` when its validation path writes it,
+        or a name in the strategy's ``capabilities.emitted_metrics``). That rule belongs to
+        :func:`spectramr.core.metrics.validation_names.partition_validation_compute`,
+        the predicate the runtime applies, so the audit cannot reject a name the
+        run produces (#2819). The audit is stricter in one respect: it errors on
+        an unowned name even when the strategy has declared no emitted set.
         """
         metrics_compute = getattr(getattr(config, "metrics", None), "compute", None) or []
         scoring = getattr(getattr(config, "validation", None), "scoring", None)
         scoring_compute = getattr(scoring, "compute", None) or []
-        #: ``(surface, name)`` so the error names the key the reader has to edit.
-        declared_by_surface = [
-            *(("metrics.compute", n) for n in metrics_compute),
-            *(("validation.scoring.compute", n) for n in scoring_compute),
-        ]
-        declared = [n for _, n in declared_by_surface]
+        declared = [*metrics_compute, *scoring_compute]
         if not declared:
             return HealthCheckResult(
                 passed=True,
@@ -6930,26 +7292,51 @@ class ConfigHealthChecker:
                 message=f"MetricsRegistry not importable; skipping ({e}).",
                 severity="info",
             )
-        known = {k.lower() for k in getattr(MetricsRegistry, "_metrics", {})}
-        known |= {k.lower() for k in getattr(MetricsRegistry, "_aliases", {})}
-        unknown = [(s_, n) for s_, n in declared_by_surface if str(n).lower() not in known]
+        from spectramr.core.metrics.validation_names import partition_validation_compute
+        from spectramr.infrastructure.validation.witness.checks.validation_metric_checks import (
+            validation_owners_for,
+        )
+
+        #: ``(surface, name)`` so the error names the key the reader has to edit.
+        unknown = [
+            ("metrics.compute", n) for n in metrics_compute if not MetricsRegistry.is_registered(n)
+        ]
+        strategy_name = None
+        if scoring_compute:
+            emitted, universal, strategy_name = validation_owners_for(config)
+            _, unowned = partition_validation_compute(
+                scoring_compute, emitted, MetricsRegistry.is_registered, universal=universal
+            )
+            unknown += [("validation.scoring.compute", n) for n in unowned]
         if not unknown:
-            surfaces = sorted({s_ for s_, _ in declared_by_surface})
+            surfaces = [
+                s_
+                for s_, names in (
+                    ("metrics.compute", metrics_compute),
+                    ("validation.scoring.compute", scoring_compute),
+                )
+                if names
+            ]
             return HealthCheckResult(
                 passed=True,
                 check_name="metric_names_are_registered",
                 message=(
-                    f"all {len(declared)} declared metric(s) are registered "
+                    f"all {len(declared)} declared metric(s) are registered or emitted "
                     f"({', '.join(surfaces)})."
                 ),
                 severity="info",
             )
         offending = sorted({s_ for s_, _ in unknown})
+        owner = (
+            f"; for validation.scoring.compute, nor emitted by {strategy_name}'s validation path"
+            if strategy_name is not None
+            else ""
+        )
         return HealthCheckResult(
             passed=False,
             check_name="metric_names_are_registered",
             message=(
-                f"{len(unknown)} unregistered metric(s): "
+                f"{len(unknown)} unregistered metric(s){owner}: "
                 f"{[f'{s_}: {n}' for s_, n in unknown]}. The run would report "
                 "success while never computing them."
             ),
@@ -6957,9 +7344,10 @@ class ConfigHealthChecker:
             category="metrics_misconfiguration",
             yaml_keys=offending,
             fix_hint=(
-                "Use a registered name (or a registered alias). "
-                f"{len(known)} names are available; `MetricsRegistry.list_available()` "
-                "enumerates them."
+                "Use a registered name (or a registered alias); "
+                "`MetricsRegistry.list_available()` enumerates them. On "
+                "validation.scoring.compute, a key the strategy's validation_step writes "
+                "is legal once it is declared in capabilities.emitted_metrics."
             ),
         )
 
@@ -7828,6 +8216,19 @@ class ConfigHealthChecker:
             )
 
         consumed_set = set(consumed) if isinstance(consumed, tuple) else {consumed}
+        if "image" in consumed_set and self._strategy_bridges_kspace_to_image(config):
+            # The strategy applies A^H before the network (#2296), so the network
+            # reads an image whatever the loader materialises.
+            return HealthCheckResult(
+                passed=True,
+                check_name="workflow_dataset_signal_domain",
+                message=(
+                    f"model input_domain {sorted(consumed_set)} is reached from "
+                    f"dataset_type={dataset_type!r} ({sorted(produced)}) through the "
+                    "reconstruction strategy's k-space -> image adjoint."
+                ),
+                severity="info",
+            )
         if consumed_set & set(produced):
             return HealthCheckResult(
                 passed=True,
@@ -9009,6 +9410,129 @@ class ConfigHealthChecker:
             fix_hint="pip install -e '.[deepspeed]'",
         )
 
+    def check_strategy_parallel_compat(
+        self,
+        config: TrainingSettings,
+    ) -> HealthCheckResult:
+        """The training strategy must have declared the parallel backend it runs under.
+
+        The same verdict ``TrainingEnvironmentDirector`` enforces at build time,
+        surfaced by ``audit`` so a refused arm is caught before it is submitted.
+        An undeclared strategy on a *replicated* backend is informational: it is
+        how most arms run today and cannot be a warning without failing every
+        ``--strict`` audit of them.
+        """
+        check_name = "strategy_parallel_compat"
+        parallel = getattr(config, "parallel", None)
+        strategy = getattr(parallel, "strategy", "none") if parallel else "none"
+        if strategy == "none":
+            return HealthCheckResult(True, check_name, "single-process; n/a.", "info")
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.infrastructure.distributed.strategy_compat import (
+            check_strategy_for_parallel,
+        )
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        try:
+            strategy_cls = TrainingStrategyFactory().get_strategy_class(config)
+        except ConfigurationError as exc:
+            return HealthCheckResult(
+                True, check_name, f"strategy unresolved ({exc}); n/a.", "info"
+            )
+        verdict = check_strategy_for_parallel(config, strategy_cls)
+        if verdict.refused:
+            return HealthCheckResult(
+                False,
+                check_name,
+                verdict.message,
+                "error",
+                category="strategy_parallel_incompatible",
+                yaml_keys=["parallel.strategy", "training.training_mode"],
+                fix_hint=(
+                    "Use parallel.strategy: none (or a backend the strategy declares), "
+                    "or audit the strategy and declare parallel_compat on the class."
+                ),
+            )
+        return HealthCheckResult(True, check_name, verdict.message, "info")
+
+    def check_context_metrics_routed(self, config: TrainingSettings) -> HealthCheckResult:
+        """A configured metric that needs context must be on a strategy that supplies it.
+
+        ``sense_psnr``, ``rep_variance`` and the other context metrics raise without their
+        maps / measurement. Only the shared validation path and diffusion's trust
+        functionals build that context (#2703); on any other strategy the metric raises in
+        the validation step, and ``gan.py`` swallows it into a warning that drops every
+        validation metric of the run.
+        """
+        check_name = "context_metrics_routed"
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+        from spectramr.infrastructure.validation.context_metric_routing import (
+            configured_metric_names,
+            configured_output_transform,
+            unrouted_context_metrics,
+            unrouted_output_transform,
+        )
+
+        try:
+            strategy_cls = TrainingStrategyFactory().get_strategy_class(config)
+        except ConfigurationError as exc:
+            return HealthCheckResult(True, check_name, f"strategy unresolved ({exc}); n/a.", "info")
+        unrouted = unrouted_context_metrics(strategy_cls, configured_metric_names(config))
+        transform = unrouted_output_transform(strategy_cls, configured_output_transform(config))
+        if not unrouted and transform is None:
+            return HealthCheckResult(True, check_name, "no unrouted context metric.", "info")
+        needs = [f"metric(s) {sorted(unrouted)}"] if unrouted else []
+        keys = ["validation.scoring.compute"] if unrouted else []
+        if transform is not None:
+            needs.append(f"output_transform {transform!r}")
+            keys.append("validation.scoring.output_transform")
+        return HealthCheckResult(
+            False,
+            check_name,
+            f"{strategy_cls.__name__} never supplies the context that {' and '.join(needs)} "
+            "need, so each raises in the validation step instead of producing a result.",
+            "error",
+            category="metric_context_unrouted",
+            yaml_keys=[*keys, "training.training_mode"],
+            fix_hint=(
+                "Drop the metric or the output_transform, or use a strategy on the shared "
+                "validation path (e.g. reconstruction)."
+            ),
+        )
+
+    def check_selection_rule_metrics_declared(self, config: TrainingSettings) -> HealthCheckResult:
+        """A selection rule composes ring and guard metrics that the arm must compute.
+
+        ``validation.selection.rule`` other than ``none`` reads the ring NRMSE, power ratio
+        and target SNR and the 8x fabrication and nse_hall guards. An arm that does not list
+        them in ``validation.scoring.compute`` gets no composite, so its early stopping and
+        best-checkpoint selection would name a key that is never stamped.
+        """
+        check_name = "selection_rule_metrics_declared"
+        from spectramr.config.schemas.enums import SelectionRule
+        from spectramr.infrastructure.training.strategies.selection_rules import required_metrics
+
+        validation = getattr(config, "validation", None)
+        rule = getattr(getattr(validation, "selection", None), "rule", SelectionRule.NONE)
+        if SelectionRule(rule) is SelectionRule.NONE:
+            return HealthCheckResult(True, check_name, "no selection rule declared.", "info")
+        compute = getattr(getattr(validation, "scoring", None), "compute", None)
+        declared = set(compute) if isinstance(compute, list) else set()
+        missing = sorted(set(required_metrics(rule)) - declared)
+        if not missing:
+            return HealthCheckResult(True, check_name, f"selection rule {rule} metrics declared.", "info")
+        return HealthCheckResult(
+            False,
+            check_name,
+            f"validation.selection.rule={rule} needs {missing} in validation.scoring.compute; "
+            "without them the composite is never stamped.",
+            "error",
+            category="selection_rule_unmet",
+            yaml_keys=["validation.selection.rule", "validation.scoring.compute"],
+            fix_hint="List the missing metrics in validation.scoring.compute, or set rule to none.",
+        )
+
     def check_deepspeed_topology_coherent(
         self,
         config: TrainingSettings,
@@ -9080,6 +9604,73 @@ class ConfigHealthChecker:
             True,
             check_name,
             f"zero_stage={stage} is coherent with the declared offloading.",
+            "info",
+        )
+
+    def check_deepspeed_optimizer_supported(
+        self,
+        config: TrainingSettings,
+    ) -> HealthCheckResult:
+        """The built optimizer must be one DeepSpeed accepts under this ZeRO setup.
+
+        ``deepspeed.initialize`` asserts on an unsupported client optimizer at
+        ``zero_stage >= 1`` and raises on any client optimizer other than
+        DeepSpeedCPUAdam / DeepSpeedCPULion under ``offload_optimizer``. Both fire
+        inside the engine, after the model, data and physics are built; this
+        reports them at audit time. The rules live in
+        :mod:`spectramr.infrastructure.distributed.deepspeed_backend.optimizer_support`.
+        """
+        check_name = "deepspeed_optimizer_supported"
+        parallel = getattr(config, "parallel", None)
+        strategy = getattr(parallel, "strategy", "none") if parallel else "none"
+        if strategy != "deepspeed":
+            return HealthCheckResult(
+                True, check_name, f"strategy={strategy!r} is not deepspeed; n/a.", "info"
+            )
+        ds = getattr(parallel, "deepspeed", None)
+        stage = getattr(ds, "zero_stage", 0) if ds else 0
+        offload = getattr(ds, "offload_optimizer", "none") if ds else "none"
+        optimization = getattr(config, "optimization", None)
+        declared = getattr(optimization, "optimizer", None)
+        name = str(getattr(declared, "type", "") or "").strip().lower()
+        from spectramr.infrastructure.distributed.deepspeed_backend.optimizer_support import (
+            zero_optimizer_problems,
+        )
+        from spectramr.infrastructure.training.optimizer_registry import OptimizerRegistry
+
+        optimizer_cls = OptimizerRegistry.get(name) if name else None
+        if optimizer_cls is None:
+            return HealthCheckResult(
+                True,
+                check_name,
+                f"optimizer {name!r} does not resolve; check_optimizer_registered owns that.",
+                "info",
+            )
+        problems = zero_optimizer_problems(
+            optimizer_cls, zero_stage=stage, offload_optimizer=offload
+        )
+        if problems:
+            return HealthCheckResult(
+                False,
+                check_name,
+                "DeepSpeed would refuse this optimizer: " + " ".join(problems),
+                "error",
+                category="deepspeed_optimizer_unsupported",
+                yaml_keys=[
+                    "optimization.optimizer.type",
+                    "parallel.deepspeed.zero_stage",
+                    "parallel.deepspeed.offload_optimizer",
+                ],
+                fix_hint=(
+                    "Use adam / adamw / adagrad, and for optimizer offload remove "
+                    "offload_optimizer (this repo builds torch optimizers, not DeepSpeedCPUAdam)."
+                ),
+            )
+        return HealthCheckResult(
+            True,
+            check_name,
+            f"{optimizer_cls.__name__} is accepted at zero_stage={stage}, "
+            f"offload_optimizer={offload!r}.",
             "info",
         )
 
@@ -9656,8 +10247,8 @@ class ConfigHealthChecker:
         fsdp_bf16 = bool(getattr(fsdp, "enabled", False)) and (
             getattr(fsdp, "mixed_precision", None) == "bf16"
         )
-        # FSDP's sub-block defaults to bf16, so most sharded arms never declared
-        # it -- but the policy still applies, and only when sharding is on.
+        # FSDP's own override applies only when sharding is on; the global bf16 above
+        # already covers an FSDP arm that follows optimization.precision.
         if not ((enabled and resolved == "bf16") or fsdp_bf16):
             return HealthCheckResult(
                 True, check_name, "bf16 is not the resolved AMP dtype; n/a.", "info"
@@ -9851,6 +10442,26 @@ class ConfigHealthChecker:
                 "info",
             )
 
+        # A GAN often pairs a real-valued model with one that works on k-space.
+        # ``apply_to`` names the models that are compiled, so the others stay eager and
+        # nothing is claimed about them. The arm-level signals cannot say WHICH model is
+        # complex, so naming a subset is the user's assertion that the compiled ones are
+        # real-valued -- except where the registry says the generator itself is complex.
+        apply_to = list(getattr(compile_cfg, "apply_to", None) or []) if torch_compile else []
+        generator_is_complex = any(sig.startswith("model.capabilities") for sig in signals)
+        if apply_to and not ("generator" in apply_to and generator_is_complex):
+            return HealthCheckResult(
+                True,
+                check_name,
+                f"optimization.compile.apply_to={apply_to} compiles only those models on an "
+                f"arm with k-space signals ({', '.join(signals)}); the others stay eager. "
+                "Confirm the compiled models never see complex tensors.",
+                "info",
+                category="compile_with_complex_model",
+                yaml_keys=["optimization.compile.apply_to"],
+                always_report=True,
+            )
+
         if bool(getattr(compile_cfg, "allow_complex", False)):
             # The opt-out the docstring above anticipated. It is only reachable
             # WITH `regional` -- the schema refuses the pair otherwise -- because
@@ -9910,70 +10521,34 @@ class ConfigHealthChecker:
             ),
         )
 
-    def check_deepspeed_consolidated_best_checkpoint(
-        self,
-        config: TrainingSettings,
-    ) -> HealthCheckResult:
-        """``save_consolidated_best: false`` makes the run resume-only.
-
-        DeepSpeed writes a sharded tag DIRECTORY, not a single file. Without the
-        consolidated copy, ``discover_best_checkpoint``, campaign evaluation and
-        ``spectramr infer`` all find nothing -- at the end of the run.
-        """
-        check_name = "deepspeed_consolidated_best_checkpoint"
-        parallel = getattr(config, "parallel", None)
-        strategy = getattr(parallel, "strategy", "none") if parallel else "none"
-        if strategy != "deepspeed":
-            return HealthCheckResult(
-                True,
-                check_name,
-                f"strategy={strategy!r} is not deepspeed; n/a.",
-                "info",
-            )
-        if parallel.deepspeed.save_consolidated_best:
-            return HealthCheckResult(
-                True,
-                check_name,
-                "A consolidated checkpoint_best will be written.",
-                "info",
-            )
-        return HealthCheckResult(
-            False,
-            check_name,
-            "parallel.deepspeed.save_consolidated_best=false: this run will be "
-            "RESUME-ONLY. Inference and campaign evaluation read a single-file "
-            "checkpoint and will find none.",
-            "warning",
-            category="deepspeed_consolidated_best_checkpoint",
-            yaml_keys=["parallel.deepspeed.save_consolidated_best"],
-            fix_hint="Leave save_consolidated_best: true unless the run is purely "
-            "a resume experiment.",
-        )
-
     def check_mamba_models_require_mamba_ssm(
         self,
         config: TrainingSettings,
     ) -> HealthCheckResult:
-        """Mamba-family models REQUIRE the official ``mamba_ssm`` kernel.
+        """Models that build a ``MambaBlock`` or import ``mamba_ssm`` need the kernel.
 
-        A ``model_type`` containing ``mamba`` routes through
-        :class:`~spectramr.models.blocks.mamba_block.MambaBlock`, which fails loud
-        at construction without the selective-scan kernel — the Gated-Conv+GRU
-        fallback is NOT an SSM (pitfall #9 / #16). This catches the missing
-        dependency at audit time instead of the first train step, mirroring
-        MambaBlock's runtime behaviour: absent kernel → error; absent kernel +
-        ``SPECTRAMR_ALLOW_MAMBA_FALLBACK`` opt-in → warning (the run silently
-        trains a non-SSM GRU).
+        The route comes from the static scan of the registered class, so
+        ``tall_sr`` is covered without Mamba in its name. The ``mamba`` label
+        stays a trigger: its stand-ins build no kernel, and dropping it would
+        un-gate them silently (pitfall #16).
         """
+        from spectramr.infrastructure.validation.mamba_kernel_scan import (
+            mamba_kernel_route,
+        )
         from spectramr.models.blocks import mamba_block
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import MODEL_REGISTRY
 
         check_name = "mamba_models_require_mamba_ssm"
         model_type = str(getattr(getattr(config, "model", None), "model_type", "") or "")
-        if "mamba" not in model_type.lower():
+        populate_model_registry()
+        registered = MODEL_REGISTRY.get(model_type)
+        route = mamba_kernel_route(registered["class"]) if registered else None
+        if "mamba" not in model_type.lower() and route is None:
             return HealthCheckResult(
                 True,
                 check_name,
-                f"model_type={model_type!r} is not a Mamba-family model.",
+                f"model_type={model_type!r} does not construct a MambaBlock.",
                 "info",
             )
         if mamba_block._mamba_ssm_importable():
@@ -9996,7 +10571,8 @@ class ConfigHealthChecker:
                 False,
                 check_name,
                 (
-                    f"model_type={model_type!r} is a Mamba model but mamba_ssm is "
+                    f"model_type={model_type!r} needs the mamba_ssm kernel (Mamba-labelled "
+                    "or builds a MambaBlock) but mamba_ssm is "
                     "not importable AND SPECTRAMR_ALLOW_MAMBA_FALLBACK is set: the run "
                     "will train a Gated-Conv+GRU approximation, NOT a true SSM — "
                     "results are not scientifically 'Mamba' (pitfall #16)."
@@ -10010,7 +10586,8 @@ class ConfigHealthChecker:
             False,
             check_name,
             (
-                f"model_type={model_type!r} is a Mamba model but the official "
+                f"model_type={model_type!r} needs the mamba_ssm kernel (Mamba-labelled "
+                "or builds a MambaBlock) but the official "
                 "mamba_ssm selective-scan kernel is not importable — MambaBlock "
                 "raises at construction (the GRU fallback is disabled by default)."
             ),
@@ -10683,6 +11260,7 @@ class ConfigHealthChecker:
         "magnitude_from_complex": (lambda c: max(c // 2, 1) if c % 2 == 0 else c),
         "real_imag_interleave_to_complex": (lambda c: max(c // 2, 1) if c % 2 == 0 else c),
         "complex_to_real_imag_interleave": (lambda c: c * 2),
+        "kspace_to_real_imag_interleave": (lambda c: c * 2),
         # F-FFT-ADAPTER-CHANNEL-EFFECT / 2026-05-20 — the FFT pair is
         # channel-preserving (the spatial transform doesn't change C).
         # Round 8j's FNO YAML wires ``pre_model: [fft_image_to_kspace,
@@ -11026,7 +11604,7 @@ class ConfigHealthChecker:
                     "auto-discover under this prefix."
                 ),
             )
-        path = str(output_dir)
+        path = results_relative(str(output_dir))
         for bad in self._OUTPUT_DIR_DEPRECATED_PREFIXES:
             if path.startswith(bad):
                 return HealthCheckResult(
@@ -11105,25 +11683,9 @@ class ConfigHealthChecker:
         knowledge and is owned by ``scripts/ci/check_identity_paths_unique.py``.
 
         **Scope.** Only values under ``experiments/results/`` are compared. A
-        path left CWD-relative is a different defect with its own issue: over
-        660 corpus arms, ``checkpoint.checkpoint_dir`` resolves on-convention
-        for 384, inherits the ``./checkpoints`` default for 201 and is declared
-        off-convention for 75 -- so 276 name no experiment at all there, and
-        227 resolve to the exact literal ``./checkpoints``. Folding that in
-        would fire on 42% of the corpus and get this check baselined and
-        ignored.
-
-        **What ``checkpoint.checkpoint_dir`` is, precisely.** It is not the
-        happy-path checkpoint destination, and this check does not claim it is.
-        ``CheckpointDirector`` -- the primary writer, at every save site in
-        :mod:`spectramr.pipelines.training_loop` -- derives its directory from
-        ``training.output_dir`` and never reads this key. The key is read by
-        ``CheckpointService``, which the loop reaches only from the
-        ``except Exception as director_err`` branch guarding the epoch save,
-        and by ``CheckpointService.__init__``, which ``mkdir``s it on every run
-        of every arm. So a disagreement here is a real split -- the directory
-        is created, and it is where a checkpoint lands the moment the director
-        raises -- but the bulk of a healthy run follows ``training.output_dir``.
+        path left CWD-relative is a different defect with its own issue, and
+        folding it in would fire on much of the corpus and get this check
+        baselined and ignored.
 
         Severity is ``warning``: the arm trains, so this is not fatal, but
         ``audit`` is ``--strict`` and warnings exit 2 (non-negotiable 4).
@@ -11134,7 +11696,7 @@ class ConfigHealthChecker:
             value = self._resolve_dotted(config, tuple(dotted.split(".")))
             if value is None:
                 continue
-            text = str(value).strip()
+            text = results_relative(str(value).strip())
             if not text.startswith(RESULTS_PREFIX):
                 continue
             rest = text[len(RESULTS_PREFIX) :].strip("/")
@@ -11427,61 +11989,6 @@ class ConfigHealthChecker:
             )
         return HealthCheckResult(True, check_name, "field_strength_conditioning enabled.", "info")
 
-    def check_corruption_calibration_requires_tissue_prior(
-        self, config: TrainingSettings
-    ) -> HealthCheckResult:
-        """PMPS Phase-2: corruption calibration needs a tissue-prior checkpoint."""
-        check_name = "corruption_calibration_requires_tissue_prior"
-        if self._training_mode(config) != "corruption_calibration":
-            return HealthCheckResult(True, check_name, "not corruption_calibration.", "info")
-        ckpt = getattr(config.training, "tissue_prior_checkpoint", None)
-        if ckpt is None:
-            return HealthCheckResult(
-                False,
-                check_name,
-                (
-                    "training.tissue_prior_checkpoint is unset. Phase-2 "
-                    "MMD calibration cannot run without the frozen prior "
-                    "from Phase 1."
-                ),
-                "error",
-                category="silent_fallback",
-                yaml_keys=["training.tissue_prior_checkpoint"],
-                fix_hint=(
-                    "Point training.tissue_prior_checkpoint at the "
-                    "checkpoint emitted by stage_a_tissue_prior_pretrain.yaml."
-                ),
-            )
-        return HealthCheckResult(True, check_name, "tissue_prior_checkpoint configured.", "info")
-
-    def check_paired_synthesis_requires_prior_and_calibration(
-        self, config: TrainingSettings
-    ) -> HealthCheckResult:
-        """PMPS Phase-3: synthesis needs BOTH the prior and the calibration checkpoint."""
-        check_name = "paired_synthesis_requires_prior_and_calibration"
-        if self._training_mode(config) != "paired_synthesis":
-            return HealthCheckResult(True, check_name, "not paired_synthesis.", "info")
-        training = config.training
-        missing = []
-        if getattr(training, "tissue_prior_checkpoint", None) is None:
-            missing.append("training.tissue_prior_checkpoint")
-        if getattr(training, "corruption_calibration_checkpoint", None) is None:
-            missing.append("training.corruption_calibration_checkpoint")
-        if missing:
-            return HealthCheckResult(
-                False,
-                check_name,
-                (
-                    f"Phase-3 paired synthesis requires both prior and "
-                    f"corruption-calibration checkpoints. Missing: "
-                    f"{', '.join(missing)}."
-                ),
-                "error",
-                category="silent_fallback",
-                yaml_keys=missing,
-            )
-        return HealthCheckResult(True, check_name, "both checkpoints configured.", "info")
-
     def check_data_efficiency_harness_settings_well_formed(
         self, config: TrainingSettings
     ) -> HealthCheckResult:
@@ -11518,6 +12025,28 @@ class ConfigHealthChecker:
             check_name,
             f"{len(settings)} settings configured; manifests present.",
             "info",
+        )
+
+    def check_hardware_warp_pose_spread(self, config: TrainingSettings) -> HealthCheckResult:
+        """Hardware-warp calibration: the repeat-session pose set identifies every degree.
+
+        The verdict lives in :mod:`~spectramr.infrastructure.validation.hardware_warp_pose_spread`;
+        this method owns the emitted name so the check-names ledger sees it.
+        """
+        from spectramr.infrastructure.validation.hardware_warp_pose_spread import (
+            pose_spread_verdict,
+        )
+
+        check_name = "hardware_warp_pose_spread"
+        verdict = pose_spread_verdict(config)
+        return HealthCheckResult(
+            verdict.passed,
+            check_name,
+            verdict.message,
+            verdict.severity,
+            category="physics_contract",
+            yaml_keys=verdict.yaml_keys,
+            fix_hint=verdict.fix_hint,
         )
 
     # ----------------------------------------------------------------
@@ -12007,23 +12536,18 @@ class ConfigHealthChecker:
         """Collect (yaml_key, path) for every declared checkpoint / basis / template."""
         out: list[tuple[str, str]] = []
         candidates = (
-            ("checkpoint.resume_from", ("checkpoint", "resume_from")),
+            (
+                "training.distillation.teacher_checkpoint",
+                ("training", "distillation", "teacher_checkpoint"),
+            ),
             ("model.checkpoint_path", ("model", "checkpoint_path")),
             (
                 "certification.conformal.marker_basis_path",
                 ("certification", "conformal", "marker_basis_path"),
             ),
             (
-                "certification.conformal.pretrained_reconstructor_checkpoint",
-                ("certification", "conformal", "pretrained_reconstructor_checkpoint"),
-            ),
-            (
                 "training.twin_dps.marker_template_path",
                 ("training", "twin_dps", "marker_template_path"),
-            ),
-            (
-                "training.twin_dps.pretrained_score_checkpoint",
-                ("training", "twin_dps", "pretrained_score_checkpoint"),
             ),
         )
         for key, chain in candidates:
@@ -12150,7 +12674,7 @@ class ConfigHealthChecker:
             artefact_roots = ("experiments/active/", "experiments/results/")
 
             def _is_checkpoint_key(key: str) -> bool:
-                return "checkpoint" in key or "resume_from" in key
+                return "checkpoint" in key
 
             def _is_artefact_rooted(path: str) -> bool:
                 norm = path.replace("\\", "/").lstrip("./")
@@ -12750,6 +13274,24 @@ class ConfigHealthChecker:
         training_mode = str(getattr(training, "training_mode", "") or "").lower()
         return training_mode in {"equivariant_imaging", "robust_ei"}
 
+    @staticmethod
+    def _complementary_mask_acceleration(config: "TrainingSettings") -> float | None:
+        """R of a declared ``complementary_rep_masking``, as the transform resolves it.
+
+        Built through the registry so an omitted ``acceleration`` reads the
+        transform's own default rather than a copy of it here. ``None`` when the
+        transform is not declared.
+        """
+        from spectramr.data.transforms.registry import build_transform
+
+        data = getattr(config, "data", None)
+        entries = getattr(getattr(data, "processing", None), "transforms", None) or []
+        for entry in entries:
+            if getattr(entry, "name", None) == "complementary_rep_masking":
+                kwargs = entry.resolved_kwargs()
+                return float(build_transform("complementary_rep_masking", **kwargs).acceleration)
+        return None
+
     def check_ei_sensing_margin(self, config: "TrainingSettings") -> HealthCheckResult:
         """Equivariant Imaging identifiability gate (Tachella sensing theorems).
 
@@ -12759,6 +13301,11 @@ class ConfigHealthChecker:
         inside the measured subspace, and EI adds nothing (the numeric
         ``sensing_margin`` -> 0). This is the static, config-level guard; the
         Tier-2 ``ei_forward_probe`` computes the margin numerically.
+
+        On the M4Raw repetition route the mask is ``complementary_rep_masking``,
+        and the schema defaults of ``undersampling``/``compressed_sensing`` are
+        not read there; reading them made the gate pass whatever the mask was.
+        When that transform is declared, its rate is the only one consulted.
         """
         check_name = "ei_sensing_margin"
         if not self._is_equivariant_imaging_arm(config):
@@ -12768,12 +13315,21 @@ class ConfigHealthChecker:
                 "Not an Equivariant Imaging arm — not applicable.",
                 "info",
             )
-        physics = getattr(config, "physics", None)
-        cs = getattr(physics, "compressed_sensing", None)
-        accel = getattr(config, "undersampling", None)
-        cs_factor = getattr(cs, "acceleration_factor", None)
-        base_accel = getattr(accel, "base_acceleration", None)
-        rates = [r for r in (cs_factor, base_accel) if isinstance(r, (int, float))]
+        mask_rate = self._complementary_mask_acceleration(config)
+        if mask_rate is not None:
+            rates = [mask_rate]
+            yaml_keys = ["data.processing.transforms[complementary_rep_masking].acceleration"]
+        else:
+            physics = getattr(config, "physics", None)
+            cs = getattr(physics, "compressed_sensing", None)
+            accel = getattr(config, "undersampling", None)
+            cs_factor = getattr(cs, "acceleration_factor", None)
+            base_accel = getattr(accel, "base_acceleration", None)
+            rates = [r for r in (cs_factor, base_accel) if isinstance(r, (int, float))]
+            yaml_keys = [
+                "physics.compressed_sensing.acceleration_factor",
+                "acceleration.base_acceleration",
+            ]
         undersampled = any(r > 1.0 for r in rates)
         if undersampled:
             return HealthCheckResult(
@@ -12796,12 +13352,9 @@ class ConfigHealthChecker:
             ),
             "error",
             category="equivariant_imaging",
-            yaml_keys=[
-                "physics.compressed_sensing.acceleration_factor",
-                "acceleration.base_acceleration",
-            ],
+            yaml_keys=yaml_keys,
             fix_hint=(
-                "Undersample the acquisition (acceleration_factor > 1) so the "
+                "Undersample the acquisition (acceleration > 1) so the "
                 "forward operator breaks the chosen group symmetry."
             ),
         )
@@ -13506,7 +14059,7 @@ class ConfigHealthChecker:
                 return dl.get(name, default)
             return getattr(dl, name, default)
 
-        n_pools = int(_get("n_pools", 1) or 1)
+        n_pools = int(_get("num_pools", 1) or 1)
         fields = tuple(_get("fields_present", ()) or ())
         distinct = len({float(b) for b in fields})
         required = 2 * n_pools + 1
@@ -13516,20 +14069,20 @@ class ConfigHealthChecker:
                 passed=identifiable,
                 check_name="dispersion_identifiability",
                 message=(
-                    f"n_pools={n_pools} needs M >= {required} distinct fields; "
+                    f"num_pools={n_pools} needs M >= {required} distinct fields; "
                     f"fields_present supplies {distinct}."
                 ),
                 severity="info" if identifiable else "error",
                 category="dispersion_bloch_ae",
                 yaml_keys=[
-                    "training.dispersion_bloch_ae.n_pools",
+                    "training.dispersion_bloch_ae.num_pools",
                     "training.dispersion_bloch_ae.fields_present",
                 ],
                 fix_hint=(
                     None
                     if identifiable
                     else (
-                        f"Reduce n_pools to {max(1, (distinct - 1) // 2)} or add "
+                        f"Reduce num_pools to {max(1, (distinct - 1) // 2)} or add "
                         f"fields so fields_present names >= {required} distinct B0 values."
                     )
                 ),
@@ -13943,7 +14496,7 @@ class ConfigHealthChecker:
         val = getattr(config, "validation", None)
         raw = list(val.scoring.compute or []) if val is not None else []
         names = {str(m).lower() for m in raw}
-        if not names or em.TORCHMETRICS_AVAILABLE:
+        if not names or em.torchmetrics_available():
             return [HealthCheckResult(True, check_name, "metric backends available.", "info")]
 
         # torchmetrics missing: these torchmetrics-only metrics have no fallback.
@@ -14401,6 +14954,9 @@ class ConfigHealthChecker:
         report.results.append(self.check_pde_synthetic_datasets(config))
         report.results.append(self.check_acceleration_present(config))
         report.results.append(self.check_reveal_attribution_preconditions(config))
+        report.results.append(self.check_mask_direction_axis_declared(config))
+        report.results.append(self.check_mask_direction_is_read(config))
+        report.results.append(self.check_reverse_sampling_declaration(config))
         report.results.append(self.check_acs_within_center_band(config))
         report.results.extend(self.check_nr_metrics_research_mode(config))
         report.results.append(self.check_val_batch_size(config))
@@ -14497,6 +15053,10 @@ class ConfigHealthChecker:
         report.results.append(self.check_bf16_requires_ampere(config))
         report.results.append(self.check_compile_with_complex_model(config))
         report.results.append(self.check_deepspeed_topology_coherent(config))
+        report.results.append(self.check_strategy_parallel_compat(config))
+        report.results.append(self.check_context_metrics_routed(config))
+        report.results.append(self.check_selection_rule_metrics_declared(config))
+        report.results.append(self.check_deepspeed_optimizer_supported(config))
         # The world-size axis of the same question: a stage that owns the state
         # still shards it across nobody at one rank, and pays the bucket/hook
         # cost to do so. Advisory (info) by construction -- num_devices is a
@@ -14506,7 +15066,6 @@ class ConfigHealthChecker:
         report.results.append(self.check_zenflow_accumulation_conflict(config))
         report.results.append(self.check_deepcompile_supported(config))
         report.results.append(self.check_optimizer_registered(config))
-        report.results.append(self.check_deepspeed_consolidated_best_checkpoint(config))
         # F7 (round 4 2026-05-17): surface check_domain_alignment blind
         # spots as warnings so --strict mode can hard-gate configs that
         # would otherwise crash at the first training batch with
@@ -14557,9 +15116,8 @@ class ConfigHealthChecker:
         report.results.append(
             self.check_tissue_diffusion_pretrain_requires_field_strength_conditioning(config)
         )
-        report.results.append(self.check_corruption_calibration_requires_tissue_prior(config))
-        report.results.append(self.check_paired_synthesis_requires_prior_and_calibration(config))
         report.results.append(self.check_data_efficiency_harness_settings_well_formed(config))
+        report.results.append(self.check_hardware_warp_pose_spread(config))
         # Phase-1 (VF-Residual conformal) Tier-1 checks.
         report.results.append(self.check_vf_residual_marker_matrix_well_conditioned(config))
         report.results.append(self.check_vf_residual_exchangeability_precondition(config))

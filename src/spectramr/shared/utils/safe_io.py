@@ -8,6 +8,7 @@ weights_only when available (PyTorch >= 2.1).
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -58,42 +59,41 @@ def safe_torch_load(
     return torch.load(normalized, **kwargs)
 
 
-def atomic_save_torch(obj: Any, filepath: str | os.PathLike[str]) -> None:
-    """Save a torch payload atomically.
+def atomic_publish(filepath: str | os.PathLike[str], write: Callable[[str], None]) -> None:
+    """Publish a file atomically: ``write`` fills a temp file, then it is renamed over.
 
-    ``torch.save`` writes in place. A run killed by SIGKILL, a wall-clock limit
-    or an OOM mid-write leaves a truncated file that still passes every
-    existence check and only fails at ``torch.load``, usually days later when
-    the run is being resumed or graded. Writing to a temp file in the same
-    directory and ``os.replace``-ing it makes the publish atomic on POSIX: a
-    reader sees either the previous checkpoint or the new one, never a
-    half-written one.
+    A writer killed mid-write (SIGKILL, wall-clock limit, OOM) would otherwise leave a
+    truncated file that passes every existence check and fails only when read, often
+    days later. The rename is atomic on POSIX within one filesystem, so a reader sees
+    the previous file or the new one, never half of one.
 
     Args:
-        obj: Any object ``torch.save`` accepts.
         filepath: Target path. Its parent is created if missing.
+        write: Called with the temp path; must write the complete file there.
 
     Raises:
-        Exception: Whatever ``torch.save`` raised, after the temp file is
-            removed. The destination is left untouched in that case.
+        Exception: Whatever ``write`` raised, after the temp file is removed.
     """
     import tempfile
     from pathlib import Path
 
     path = Path(filepath)
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp_name = None
     try:
-        with tempfile.NamedTemporaryFile(dir=str(parent), delete=False, suffix=".tmp") as tf:
+        with tempfile.NamedTemporaryFile(dir=str(path.parent), delete=False, suffix=".tmp") as tf:
             temp_name = tf.name
-        torch.save(obj, temp_name)
+        write(temp_name)
         os.replace(temp_name, path)
     except Exception:
         if temp_name and os.path.exists(temp_name):
             os.remove(temp_name)
         raise
+
+
+def atomic_save_torch(obj: Any, filepath: str | os.PathLike[str]) -> None:
+    """``torch.save`` through :func:`atomic_publish`."""
+    atomic_publish(filepath, lambda temp: torch.save(obj, temp))
 
 
 def atomic_save_json(data: Any, filepath: str | os.PathLike[str]) -> None:

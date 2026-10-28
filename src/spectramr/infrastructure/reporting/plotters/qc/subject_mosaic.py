@@ -60,7 +60,7 @@ def make(
     if not cases:
         return None
     cases = list(cases)[:_MAX_CASES]
-    use_default_style("nature")
+    use_default_style()
     n = len(cases)
     col_titles = ["Prediction + mask", "Target", "Error", "Background"]
     fig, axes = plt.subplots(n, 4, figsize=(column_width("double"), 1.15 * n + 0.4), squeeze=False)
@@ -92,7 +92,6 @@ def make(
         )
         if txt:
             axes[r][2].set_xlabel(txt, fontsize=4)
-    fig.suptitle("Per-subject QC mosaic", fontsize=8)
     fig.subplots_adjust(left=0.06, right=0.98, top=0.92, bottom=0.05, wspace=0.05, hspace=0.22)
     if metadata is not None:
         stamp_figure(fig, metadata)

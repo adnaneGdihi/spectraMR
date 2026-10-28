@@ -124,8 +124,8 @@ class TestStageOrdering:
         import inspect
 
         plugin = resolve_parallel_strategy("ddp")
-        assert "DistributedDataParallel" in inspect.getsource(plugin.adopt)
-        assert "DistributedDataParallel" not in inspect.getsource(plugin.prepare_models)
+        assert "wrap_with_ddp" in inspect.getsource(plugin.adopt)
+        assert "wrap_with_ddp" not in inspect.getsource(plugin.prepare_models)
 
     def test_only_process_group_strategies_substitute_samplers(self) -> None:
         loaders = {"train": object(), "val": object()}

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spectramr-baselines"
+version = "0.1.0"
+description = "Prior-method k-space reconstruction baselines (CDiffMR, FDB, Shen 2024) as spectramr plugins"
+requires-python = ">=3.12"
+# The Shen 2024 upstream imports fastmri at module level for its FFTs and coil combine.
+dependencies = ["spectramr", "torch", "fastmri==0.3.0"]
+
+# Importing a module fires its @register_model; the arms also name these modules in
+# `plugins.paths`, so an uninstalled checkout with the src/ directory on sys.path works too.
+[project.entry-points."spectramr.models"]
+cdiffmr = "spectramr_baselines.cdiffmr"
+fdb = "spectramr_baselines.fdb"
+shen2024 = "spectramr_baselines.shen2024"
+
+[project.entry-points."spectramr.strategies"]
+upstream_process = "spectramr_baselines.strategy.UpstreamProcessStrategy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spectramr_baselines"]

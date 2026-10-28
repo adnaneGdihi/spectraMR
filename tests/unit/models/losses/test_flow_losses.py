@@ -56,3 +56,11 @@ def test_unwrap_penalty_only_beyond_venc() -> None:
     assert loss(within).item() == 0.0
     beyond = torch.full((4,), 15.0)
     assert loss(beyond).item() > 0.0
+
+
+def test_phase_contrast_velocity_rejects_an_unknown_norm() -> None:
+    """``p`` other than 1 or 2 used to fall through to the L2 branch silently."""
+    import pytest
+
+    with pytest.raises(ValueError, match="p must be"):
+        PhaseContrastVelocityLoss(venc=1.0, p=3)

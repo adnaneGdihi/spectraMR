@@ -324,6 +324,9 @@ class Diffusion:
 
         Computes mean and variance, then samples:
         x_{t-1} = 1/sqrt(alpha_t) * (x_t - (1-alpha_t)/sqrt(1-alpha_bar_t) * epsilon) + sigma_t * z
+
+        ``t_index`` is the integer timestep, not a loop counter: the noise term is dropped
+        only when it is 0, the final step (#482).
         """
         # Ensure inputs are on correct device
         x = x.to(self.device)

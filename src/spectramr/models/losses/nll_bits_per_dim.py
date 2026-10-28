@@ -62,7 +62,12 @@ class NLLBitsPerDim(nn.Module):
 
     def forward(
         self,
-        model_output: torch.Tensor | tuple | list | dict,
+        model_output: (
+            torch.Tensor
+            | tuple[torch.Tensor, torch.Tensor]
+            | list[torch.Tensor]
+            | dict[str, torch.Tensor]
+        ),
         num_dims: int | None = None,
     ) -> torch.Tensor:
         """Compute bits-per-dimension from a likelihood.
@@ -102,6 +107,9 @@ class NLLBitsPerDim(nn.Module):
 
         if num_dims is None:
             raise ValueError("num_dims is required when passing a bare log_prob tensor")
+        # A (pred, target) call lands the target tensor here; it must not broadcast.
+        if isinstance(num_dims, bool) or not isinstance(num_dims, int) or num_dims < 1:
+            raise TypeError(f"num_dims must be a positive int, got {num_dims!r}")
 
         bpd = -log_prob / (num_dims * _LN2)
         if self.reduction == "mean":

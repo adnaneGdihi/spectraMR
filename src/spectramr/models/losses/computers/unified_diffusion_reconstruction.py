@@ -9,12 +9,16 @@ Handles diffusion-specific loss computation including:
 
 import logging
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
 from spectramr.core.coil_map_names import kwargs_accepted_by
-from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.computers.base import (
+    DEFAULT_LOSS_DEVICE,
+    BaseLossComputer,
+    LossOutput,
+)
 from spectramr.models.losses.weights import is_loss_configured
 
 logger = logging.getLogger(__name__)
@@ -41,17 +45,18 @@ _PRED_DICT_KEYS = (
     "samples",
     "reconstruction",
     "denoised",
+    "target",  # the target side's canonical key
 )
 
 
-def _unwrap_tensor_arg(name: str, value: Any) -> torch.Tensor:
+def _unwrap_tensor_arg(name: str, value: Any) -> Any:
     """Coerce a model output / target into a Tensor.
 
     Some generators (latent diffusion, cold diffusion, multi-head VAEs)
     return a ``dict`` of outputs (e.g. ``{"pred": ..., "aux": ...}``).
     The loss layer expects a single tensor — we unwrap the dict by
-    picking the first known-prediction key, falling back to the first
-    tensor-valued entry. Tuples / lists are unwrapped to their first
+    picking the first known-prediction key, and raise when no probed key
+    holds a tensor. Tuples / lists are unwrapped to their first
     element. Anything else is returned unchanged so the downstream
     ``isinstance`` check still flags it.
 
@@ -69,24 +74,20 @@ def _unwrap_tensor_arg(name: str, value: Any) -> torch.Tensor:
     if isinstance(value, dict):
         for key in _PRED_DICT_KEYS:
             if key in value and isinstance(value[key], torch.Tensor):
-                return value[key]
-        for v in value.values():
-            if isinstance(v, torch.Tensor):
-                return v
+                found: torch.Tensor = value[key]
+                return found
         raise TypeError(
-            f"[loss] {name} arrived as dict with no tensor entry "
-            f"(keys={list(value.keys())[:8]}). Update the strategy to "
-            "unwrap the model output before calling the loss computer "
-            "— see ``_unwrap_tensor_arg`` for the probed keys."
+            f"[loss] {name} arrived as dict with no known prediction key "
+            f"(keys={list(value.keys())[:8]}). A tissue-parameter or multi-head output "
+            "must be rendered or unwrapped by its strategy before the loss computer; "
+            f"probed keys: {_PRED_DICT_KEYS}."
         )
     if isinstance(value, (tuple, list)) and value:
         return _unwrap_tensor_arg(name, value[0])
     return value
 
 
-def _call_safe_loss(
-    loss_fn: Any, pred: torch.Tensor, target: torch.Tensor, **kwargs
-) -> torch.Tensor:
+def _call_safe_loss(loss_fn: Any, pred: Any, target: Any, **kwargs: Any) -> Any:
     """Invoke ``loss_fn`` with the kwargs its signature accepts, coil maps reconciled.
 
     The filter is ``kwargs_accepted_by``, shared with ``DifferentiableFourierBridge``:
@@ -115,8 +116,58 @@ def _get_config_value(obj: Any, path: str, default: Any = None) -> Any:
         return default
 
 
-def _complex_safe_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+#: Component key under which both computers report their substitution count.
+NONFINITE_SUBSTITUTIONS_KEY = "loss_nonfinite_substitutions"
+
+
+class NonFiniteSubstitutionCounter:
+    """Run total of non-finite losses that ``nan_to_num`` replaced, kept on device.
+
+    The substitution itself is #2281's open decision; this keeps it from being
+    silent. The count stays a device tensor so the step pays no host read, and it
+    reaches ``training_metrics.csv`` through the loss components the loop already
+    reads at its logging cadence. A cumulative total, because the loop samples the
+    components only every ``logging.intervals.log`` steps.
+    Only a loss that requires grad is counted: that is a substitution training
+    backpropagates through, and validation runs under ``no_grad``.
+    """
+
+    def __init__(self) -> None:
+        self._total: torch.Tensor | None = None
+
+    def observe(self, loss: torch.Tensor) -> None:
+        if not loss.requires_grad:
+            return
+        bad = (~torch.isfinite(loss.detach())).sum().to(torch.float32)
+        if self._total is None or self._total.device != bad.device:
+            self._total = bad
+        else:
+            self._total = self._total + bad
+
+    @property
+    def total(self) -> torch.Tensor | None:
+        return self._total
+
+    def report_into(self, components: dict[str, torch.Tensor], like: torch.Tensor) -> None:
+        """Add the count AFTER stacking, so it is logged but never summed into a loss.
+
+        Stamped on every call, as a zero on ``like``'s device until the first
+        substitution, so a strategy that declares the column never leaves it empty.
+        """
+        if self._total is None:
+            self._total = torch.zeros((), dtype=torch.float32, device=like.device)
+        components[NONFINITE_SUBSTITUTIONS_KEY] = self._total
+
+
+def _complex_safe_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    counter: NonFiniteSubstitutionCounter | None = None,
+) -> torch.Tensor:
     """Compute MSE loss safely handling complex tensors.
+
+    A non-finite result is replaced by ``nan_to_num`` and, when ``counter`` is
+    given, counted on device (see :class:`NonFiniteSubstitutionCounter`).
 
     Handles:
     - One or both tensors being complex
@@ -182,16 +233,24 @@ def _complex_safe_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
             )
 
     loss = torch.nn.functional.mse_loss(pred, target)
-    if torch.isnan(loss) or torch.isinf(loss):
-        logger.warning(
-            f"[MSE Loss] NaN/Inf detected! pred NaN: {pred.isnan().any()}, target NaN: {target.isnan().any()}"
-        )
-        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-    return loss
+    # Unconditional: nan_to_num is the identity on a finite loss, so the value and
+    # gradient match the old ``if isnan/isinf`` branch without its per-step host
+    # read (#2546). Whether to substitute at all is #2281's decision; ``counter``
+    # is what keeps the substitution visible.
+    if counter is not None:
+        counter.observe(loss)
+    return torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
-def _complex_safe_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _complex_safe_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    counter: NonFiniteSubstitutionCounter | None = None,
+) -> torch.Tensor:
     """Compute L1 loss safely handling complex tensors.
+
+    A non-finite result is replaced by ``nan_to_num`` and, when ``counter`` is
+    given, counted on device (see :class:`NonFiniteSubstitutionCounter`).
 
     Handles:
     - One or both tensors being complex
@@ -256,12 +315,13 @@ def _complex_safe_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
             )
 
     loss = torch.nn.functional.l1_loss(pred, target)
-    if torch.isnan(loss) or torch.isinf(loss):
-        logger.warning(
-            f"[L1 Loss] NaN/Inf detected! pred NaN: {pred.isnan().any()}, target NaN: {target.isnan().any()}"
-        )
-        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-    return loss
+    # Unconditional: nan_to_num is the identity on a finite loss, so the value and
+    # gradient match the old ``if isnan/isinf`` branch without its per-step host
+    # read (#2546). Whether to substitute at all is #2281's decision; ``counter``
+    # is what keeps the substitution visible.
+    if counter is not None:
+        counter.observe(loss)
+    return torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 class UnifiedDiffusionLossComputer(BaseLossComputer):
@@ -273,23 +333,27 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
     - Velocity prediction (predict velocity)
     """
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    stamped_component_keys: ClassVar[frozenset[str]] = frozenset({NONFINITE_SUBSTITUTIONS_KEY})
+
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize diffusion loss computer.
 
         Args:
             config: Configuration with diffusion settings
             device: Compute device
         """
-        self.diffusion_loss_fn = None
-        self.reconstruction_loss_fn = None
-        self.adversarial_loss_fn = None
-        self.discriminator = None
+        self.diffusion_loss_fn: torch.nn.Module | None = None
+        self.reconstruction_loss_fn: torch.nn.Module | None = None
+        # Duck-typed: the GAN loss library object exposing ``compute_generator_loss``.
+        self.adversarial_loss_fn: Any = None
+        self.discriminator: torch.nn.Module | None = None
         # Registry name of the loss `_initialize_losses` auto-wired into the
         # `reconstruction` slot (None when it was injected externally). Lets
         # `compute()` skip the slot when the SAME term arrives via losses_dict
         # — otherwise complex_l1 is computed twice (once as `reconstruction`
         # at weight 1.0, once as `complex_l1` at its configured lambda).
         self._recon_fallback_name: str | None = None
+        self._nonfinite = NonFiniteSubstitutionCounter()
 
         super().__init__(config, device)
 
@@ -311,12 +375,11 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                 self._recon_fallback_name = "complex_l1"
 
             # Check for L1 (reconstruction) if complex not used
-            if self.reconstruction_loss_fn is None:
-                if is_loss_configured(self._weight_table, "l1"):
-                    from spectramr.models.losses.registry import create_loss
+            if self.reconstruction_loss_fn is None and is_loss_configured(self._weight_table, "l1"):
+                from spectramr.models.losses.registry import create_loss
 
-                    self.reconstruction_loss_fn = create_loss("l1").to(self.device)
-                    self._recon_fallback_name = "l1"
+                self.reconstruction_loss_fn = create_loss("l1").to(self.device)
+                self._recon_fallback_name = "l1"
 
             # Check for diffusion specific loss
             if self.diffusion_loss_fn is None:
@@ -443,8 +506,10 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
         Returns:
             LossOutput with total loss and components
         """
-        device = target.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
+        # Weight overrides for the stack: a term that arrives pre-weighted is
+        # stacked at 1.0 so its lambda is applied once.
+        preweighted: dict[str, float] = {}
 
         logger.debug(f"STDOUT: LossComputer Compute. Pred: {pred.shape}, Target: {target.shape}")
 
@@ -455,7 +520,7 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                 diffusion_loss = _call_safe_loss(self.diffusion_loss_fn, pred, target, **kwargs)
             else:
                 # Fallback: MSE loss
-                diffusion_loss = _complex_safe_mse(pred, target)
+                diffusion_loss = _complex_safe_mse(pred, target, counter=self._nonfinite)
             components["diffusion"] = diffusion_loss
 
         # 2. RECONSTRUCTION LOSS (optional, at specific timesteps)
@@ -544,6 +609,9 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                 components["adversarial"] = adv
             else:
                 components["adversarial"] = g_adv * lambda_adv
+            # Both branches already carry ``lambda_adv``; stacked at its own weight
+            # the term would train at ``lambda_adv**2``.
+            preweighted["adversarial"] = 1.0
 
         # 4. DYNAMIC COMPONENT LOSSES (from LossBuilder)
         if losses_dict:
@@ -641,7 +709,10 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                     raise
 
         # 5. COMPUTE TOTAL LOSS
-        total = self._stack_components(components, epoch=epoch, iteration=iteration)
+        total = self._stack_components(
+            components, weights=preweighted, epoch=epoch, iteration=iteration
+        )
+        self._nonfinite.report_into(components, like=total)
 
         return LossOutput(total=total, components=components, metrics={})
 
@@ -666,14 +737,13 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
         Returns:
             LossOutput
         """
-        device = target.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
 
         # Main diffusion loss - compute for all timesteps
         if self.diffusion_loss_fn:
             loss = self.diffusion_loss_fn(pred, target)
         else:
-            loss = _complex_safe_mse(pred, target)
+            loss = _complex_safe_mse(pred, target, counter=self._nonfinite)
 
         components["diffusion_forward"] = loss
 
@@ -691,6 +761,7 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                 loss = (loss.mean(dim=(1, 2, 3)) * weights).mean()
 
         total = loss * self._get_loss_weight("diffusion", epoch, iteration)
+        self._nonfinite.report_into(components, like=total)
 
         return LossOutput(total=total, components=components, metrics={})
 
@@ -727,11 +798,14 @@ class UnifiedReconstructionLossComputer(BaseLossComputer):
     Used for standard reconstruction models without diffusion.
     """
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    stamped_component_keys: ClassVar[frozenset[str]] = frozenset({NONFINITE_SUBSTITUTIONS_KEY})
+
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize reconstruction loss computer."""
-        self.l1_loss_fn = None
-        self.l2_loss_fn = None
-        self.perceptual_loss_fn = None
+        self.l1_loss_fn: torch.nn.Module | None = None
+        self.l2_loss_fn: torch.nn.Module | None = None
+        self.perceptual_loss_fn: torch.nn.Module | None = None
+        self._nonfinite = NonFiniteSubstitutionCounter()
 
         super().__init__(config, device)
 
@@ -760,19 +834,18 @@ class UnifiedReconstructionLossComputer(BaseLossComputer):
         Returns:
             LossOutput with total loss and components
         """
-        device = target.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
 
         # 1. L1 LOSS
         lambda_l1 = self._get_loss_weight("l1", epoch, iteration)
         if lambda_l1 > 0:
-            l1_loss = _complex_safe_l1(pred, target)
+            l1_loss = _complex_safe_l1(pred, target, counter=self._nonfinite)
             components["l1"] = l1_loss
 
         # 2. L2 LOSS
         lambda_l2 = self._get_loss_weight("l2", epoch, iteration)
         if lambda_l2 > 0:
-            l2_loss = _complex_safe_mse(pred, target)
+            l2_loss = _complex_safe_mse(pred, target, counter=self._nonfinite)
             components["l2"] = l2_loss
 
         # 3. PERCEPTUAL LOSS
@@ -845,9 +918,15 @@ class UnifiedReconstructionLossComputer(BaseLossComputer):
                         f"failure)."
                     ) from e
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to compute loss '{loss_name}': {type(e).__name__}: {e!s}"
-                    )
+                    # Any other failure drops the term from the gradient while the run
+                    # stays green (a coil-map barrier that errors trains the arm as its
+                    # control), so it raises too.
+                    raise RuntimeError(
+                        f"Loss '{loss_name}' failed during "
+                        f"_compute_declarative_losses_with_warmup: {type(e).__name__}: {e}. "
+                        "A declared loss that cannot be computed would otherwise be dropped "
+                        "from the objective in silence (CLAUDE.md pitfall #9)."
+                    ) from e
 
         # F-LOSSFAIL / 2026-05-20 — if NO loss component succeeded, the
         # total is a disconnected zero with no upstream graph; training
@@ -872,11 +951,14 @@ class UnifiedReconstructionLossComputer(BaseLossComputer):
 
         # Compute total
         total = self._stack_components(components, epoch=epoch, iteration=iteration)
+        self._nonfinite.report_into(components, like=total)
 
         return LossOutput(total=total, components=components, metrics={})
 
 
 __all__ = [
+    "NONFINITE_SUBSTITUTIONS_KEY",
+    "NonFiniteSubstitutionCounter",
     "UnifiedDiffusionLossComputer",
     "UnifiedReconstructionLossComputer",
 ]

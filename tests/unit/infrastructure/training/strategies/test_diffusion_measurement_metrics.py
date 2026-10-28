@@ -96,7 +96,7 @@ def _batch(fill: float = 1.0, h: int = 16, w: int = 16):
 def test_the_shipped_configured_set_intersects_to_nothing() -> None:
     """PLANTED: what every arm in the cohort got. Not NaN -- nothing at all."""
     pred, target, _, mask = _batch(fill=0.0)
-    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask)
+    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask, pred_kspace=pred)
     out = _computer(_SHIPPED_SCORING_COMPUTE).compute(pred, target, only=WANTED, context=ctx)
     assert out == {}, (
         "an arm whose validation.scoring.compute omits these names must get NOTHING "
@@ -109,14 +109,14 @@ def test_the_shipped_configured_set_intersects_to_nothing() -> None:
 def test_the_widened_set_scores_on_the_context() -> None:
     """The fires-test: every declared name resolves to a finite number."""
     pred, target, _, mask = _batch(fill=0.0)
-    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask)
+    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask, pred_kspace=pred)
     out = _computer([*_SHIPPED_SCORING_COMPUTE, *WANTED]).compute(
         pred, target, only=WANTED, context=ctx
     )
     assert set(out) == set(WANTED)
     assert all(math.isfinite(v) for v in out.values()), out
-    # The do-nothing signature, on a literally zero-filled reconstruction.
-    assert out["ndcr"] == pytest.approx(0.0, abs=1e-5)
+    # The do-nothing signature, on a literally zero-filled reconstruction. ndcr is not
+    # in it once the seam hands over pred_kspace: it then reads the coil k-space, not the image.
     assert out["eta_null"] == pytest.approx(0.0, abs=1e-5)
     assert out["nse_hall"] == pytest.approx(1.0, abs=1e-3)
     assert out["null_band_energy_deficit"] == pytest.approx(1.0, abs=1e-5)
@@ -142,7 +142,7 @@ def test_the_measurement_aware_pass_owns_its_keys() -> None:
     """
     pred, target, _, mask = _batch(fill=0.0)
     computer = _computer([*_SHIPPED_SCORING_COMPUTE, *WANTED])
-    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask)
+    ctx = MetricContext(mask=mask, y_kspace=fft2c(target) * mask, pred_kspace=pred)
 
     context_free = dict(computer.compute(pred, target))
     measurement_aware = dict(computer.compute(pred, target, only=WANTED, context=ctx))
@@ -213,8 +213,9 @@ def test_the_seam_uses_the_declared_mask_rather_than_the_measurement_support() -
     _host()._measurement_aware_metrics(
         _interleaved(pred), _interleaved(target), _interleaved(measured), spy, declared
     )
-    (call,) = spy.calls
+    call = spy.calls[0]
     assert torch.equal(call["context"].mask, declared.to(torch.float32))
+    assert torch.equal(spy.calls[1]["context"].mask, call["context"].mask)
 
     spy_inferred = _SpyComputer()
     _host()._measurement_aware_metrics(
@@ -253,9 +254,62 @@ def test_the_seam_passes_complex_images_and_the_acquired_kspace() -> None:
         _interleaved(pred), _interleaved(target), _interleaved(measured), spy, mask
     )
     assert set(out) == set(WANTED)
-    (call,) = spy.calls
-    assert call["only"] == tuple(WANTED)
+    call, k_call = spy.calls
+    image_wanted = tuple(n for n in WANTED if n not in DiffusionTrainingStrategy._K_SPACE_METRICS)
+    assert call["only"] == image_wanted
+    # The acquired / unacquired bins are scored on the per-coil k-space, not the image.
+    assert k_call["only"] == DiffusionTrainingStrategy._K_SPACE_METRICS
+    assert k_call["pred"].shape == (1, 1, 16, 16) and torch.is_complex(k_call["pred"])
     ctx = call["context"]
     assert isinstance(ctx, MetricContext)
     assert torch.is_complex(ctx.y_kspace) and ctx.y_kspace.shape == (1, 1, 16, 16)
     assert torch.is_complex(call["pred"]) and call["pred"].shape == (1, 1, 16, 16)
+
+
+def test_the_seam_hands_ndcr_the_prediction_kspace_before_the_coil_combine() -> None:
+    """``pred_kspace`` keeps every coil, so ndcr's residual is not floored (#2316)."""
+    torch.manual_seed(0)
+    k = torch.randn(2, 4, 8, 8, dtype=torch.complex64)
+    # The model layout: [r0, i0, r1, i1, ...] per coil.
+    stacked = torch.stack([k.real, k.imag], dim=2).flatten(1, 2)
+    host = _host()
+    host._select_batch_compatible_smaps = lambda batch: torch.full((2, 4, 8, 8), 0.5, dtype=torch.complex64)
+    spy = _SpyComputer()
+    host._measurement_aware_metrics(stacked, stacked, stacked, spy, torch.ones(2, 1, 8, 8))
+    ctx = spy.calls[0]["context"]
+    assert ctx.pred_kspace.shape == ctx.y_kspace.shape == (2, 4, 8, 8)
+    assert torch.equal(ctx.pred_kspace, k)
+    assert spy.calls[0]["pred"].shape == (2, 1, 8, 8)
+
+
+def test_the_acquired_bin_metrics_are_scored_on_the_per_coil_kspace_not_the_images() -> None:
+    """PLANTED: a hard-DC output through the real seam and the real computer.
+
+    Two coils, acquired bins carry the noisy measurement, unacquired are exact. The
+    image-domain pass would smear the noise over every k-space bin of the combined
+    image; the k-space pass must put all of it on the acquired bins.
+    """
+    from spectramr.core.metrics.acquired_bin_error import ACQUIRED_NAME, UNACQUIRED_NAME
+
+    torch.manual_seed(1)
+    coils, h, w = 2, 16, 16
+    target = torch.randn(1, coils, h, w, dtype=torch.complex64)
+    mask = torch.zeros(1, 1, h, w)
+    mask[..., ::2] = 1.0
+    noise = 0.3 * torch.randn(1, coils, h, w, dtype=torch.complex64)
+    pred = torch.where(mask > 0, target + noise, target)
+
+    def stack(k: torch.Tensor) -> torch.Tensor:
+        return torch.stack([k.real, k.imag], dim=2).flatten(1, 2)
+
+    host = _host()
+    host._select_batch_compatible_smaps = lambda batch: torch.full(
+        (1, coils, h, w), 0.5, dtype=torch.complex64
+    )
+    out = host._measurement_aware_metrics(
+        stack(pred), stack(target), stack(pred), _computer([ACQUIRED_NAME, UNACQUIRED_NAME]), mask
+    )
+    sel = (mask > 0).expand_as(target)
+    expected = float((noise[sel].abs().pow(2).sum() / target[sel].abs().pow(2).sum()).sqrt())
+    assert out[ACQUIRED_NAME] == pytest.approx(expected, rel=1e-4)
+    assert out[UNACQUIRED_NAME] == pytest.approx(0.0, abs=1e-5)

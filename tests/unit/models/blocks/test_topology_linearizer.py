@@ -311,3 +311,26 @@ class TestTrajectoryRegistry:
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown trajectory"):
             create_trajectory("nonexistent")
+
+
+
+@pytest.mark.parametrize(
+    ("fine_hw", "coarse_hw"),
+    [
+        ((256, 256), (128, 128)),
+        ((64, 64), (32, 32)),
+        ((48, 64), (24, 32)),
+        ((66, 60), (33, 30)),
+        ((40, 24), (20, 12)),
+        ((100, 100), (50, 50)),
+    ],
+)
+def test_hilbert_2d_rect_children_of_a_coarse_token_are_contiguous(fine_hw, coarse_hw):
+    """Fine token j sits under coarse token j // 4 (hm_02/03/04 rely on this)."""
+    fine_perm = _rect_hilbert_2d_indices(*fine_hw)
+    coarse_perm = _rect_hilbert_2d_indices(*coarse_hw)
+    coarse_pos = np.empty_like(coarse_perm)
+    coarse_pos[coarse_perm] = np.arange(coarse_perm.size)
+    rows, cols = np.divmod(fine_perm, fine_hw[1])
+    parent = coarse_pos[(rows // 2) * coarse_hw[1] + cols // 2]
+    np.testing.assert_array_equal(parent, np.arange(fine_perm.size) // 4)

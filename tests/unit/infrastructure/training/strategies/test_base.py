@@ -8,6 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from spectramr.config.schemas.data import DataProcessingConfigSchema  # noqa: E402
 from spectramr.infrastructure.training.strategies.base import (  # noqa: E402
     BaseTrainingStrategy,
 )
@@ -21,7 +22,7 @@ def test_get_last_metrics_on_a_strategy_that_published_nothing(empty_metrics_is_
     empty_metrics_is_safe(BaseTrainingStrategy.get_last_metrics)
 
 
-def _capture_snapshot_kwargs(monkeypatch, tmp_path, tensors, **call_kwargs):
+def _capture_snapshot_kwargs(monkeypatch, tmp_path, tensors, domains=(True, True), **call_kwargs):
     """Drive `BaseTrainingStrategy.save_debug_snapshot` and return what it forwarded.
 
     Everything the method touches is stubbed onto a bare instance: it resolves
@@ -40,16 +41,16 @@ def _capture_snapshot_kwargs(monkeypatch, tmp_path, tensors, **call_kwargs):
         return None
 
     monkeypatch.setattr(ds, "save_debug_snapshot", _fake_save)
-    # The config SSOT declares this arm's tensors to be k-space; that declaration
-    # is what turns on the authoritative (veto-bypassing) key set.
-    monkeypatch.setattr(di, "needs_ifft_for_visualization", lambda _cfg: (True, True))
+    # ``domains`` is the config SSOT's (predictions, targets) k-space declaration;
+    # the targets half is what turns on the authoritative (veto-bypassing) key set.
+    monkeypatch.setattr(di, "needs_ifft_for_visualization", lambda _cfg: domains)
 
     strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
     strategy.env = SimpleNamespace(run_output_dir=str(tmp_path))
     strategy.config = SimpleNamespace(
         training=SimpleNamespace(output_dir=str(tmp_path)),
         logging=None,
-        data=SimpleNamespace(processing=SimpleNamespace(enable_log_scaling=False)),
+        data=SimpleNamespace(processing=DataProcessingConfigSchema()),
     )
     strategy._model_output_snapshot_done = False
     BaseTrainingStrategy.save_debug_snapshot(strategy, tensors, **call_kwargs)
@@ -89,6 +90,36 @@ def test_cold_diffusion_degraded_keys_bypass_the_spectrum_veto(monkeypatch, tmp_
     # kept the hazard invisible: only a synthetic tensor dict like this one
     # puts it in scope at all.
     assert "noisy_images" not in seen["authoritative_kspace_keys"]
+
+
+def _model_output_snapshot(monkeypatch, tmp_path, domains, **call_kwargs):
+    tensors = {name: torch.zeros(1, 2, 4, 4) for name in ("model_output", "target", "input")}
+    return _capture_snapshot_kwargs(
+        monkeypatch, tmp_path, tensors, domains=domains, step=1, tag="model_output", **call_kwargs
+    )
+
+
+def test_image_emitting_model_output_is_not_marked_kspace(monkeypatch, tmp_path):
+    """An image network on a k-space loader (EI ``standard_unet``, SSDU
+    ``unrolled_reconstruction``) must not have its output IFFT'd into a crosshair."""
+    seen = _model_output_snapshot(monkeypatch, tmp_path, (False, True))
+    assert "model_output" not in seen["authoritative_kspace_keys"]
+    assert "model_output" not in seen["in_kspace_keys"]
+    assert {"target", "input"} <= seen["authoritative_kspace_keys"]
+
+
+def test_image_emitting_model_output_overrides_a_caller_kspace_claim(monkeypatch, tmp_path):
+    seen = _model_output_snapshot(
+        monkeypatch, tmp_path, (False, True), in_kspace_keys={"model_output"}
+    )
+    assert "model_output" not in seen["in_kspace_keys"]
+
+
+def test_kspace_emitting_model_output_bypasses_the_spectrum_veto(monkeypatch, tmp_path):
+    """A k-space network (CONEX / Rep-EI ``complex_unet``) still gets its output IFFT'd."""
+    seen = _model_output_snapshot(monkeypatch, tmp_path, (True, True))
+    assert "model_output" in seen["authoritative_kspace_keys"]
+    assert "model_output" in seen["in_kspace_keys"]
 
 
 def test_extra_context_reaches_the_snapshot_writer(monkeypatch, tmp_path):
@@ -138,6 +169,32 @@ class TestCanonicalKeyContract:
         extra = BaseTrainingStrategy._first_steps_extra(strategy, epoch=0)
         assert extra["prepared_equals_model_input"] is False
         assert extra["model_input_snapshot_tag"] == "diffusion_step"
+
+    def test_the_first_steps_snapshot_records_the_realised_acceleration(self, tmp_path) -> None:
+        """#2382: a declared R4 mask realises R 3.241 at 256 lines, and the
+        snapshot must carry the realised value off the batch the loader built."""
+        tio = pytest.importorskip("torchio")
+        from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+        from spectramr.infrastructure.training.debug_snapshot import _resolve_deferred_extra
+
+        subjects = [
+            tio.Subject(kspace=tio.ScalarImage(tensor=torch.randn(2, 256, 4, 1))) for _ in range(2)
+        ]
+        dataset = tio.SubjectsDataset(
+            subjects, transform=PhysicsInformedMasking(acceleration=4, center_fraction=0.08)
+        )
+        batch = next(iter(tio.SubjectsLoader(dataset, batch_size=2)))
+
+        strategy = _bare_strategy(tmp_path)
+        extra = BaseTrainingStrategy._first_steps_extra(strategy, epoch=0, batch=batch)
+        assert _resolve_deferred_extra(extra)["realised_acceleration"] == 3.241
+
+    def test_train_step_hands_its_batch_to_the_first_steps_extra(self) -> None:
+        """Wiring: the record is inert unless the production step passes the batch."""
+        import inspect
+
+        source = inspect.getsource(BaseTrainingStrategy.train_step)
+        assert "_first_steps_extra(epoch, batch=batch)" in source
 
     def test_the_diffusion_family_declares_the_carve_out(self) -> None:
         """Pins the contract at the class that needs it: `q_sample` degrades
@@ -207,6 +264,43 @@ class TestProvenanceIsBuiltOncePerStrategy:
         assert calls["n"] == 1
 
 
+class TestStrategyMaskGeneratorReachesTheSnapshot:
+    """The strategy's ``KSpaceMaskGenerator`` resolves the mask family itself, so
+    the production snapshot must carry its record, not only the builder."""
+
+    def _write(self, tmp_path, *, pattern=None):
+        import json
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
+
+        strategy = _bare_strategy(tmp_path, data_loaders={}, generator=None)
+        strategy.config = SimpleNamespace(
+            training=SimpleNamespace(output_dir=str(tmp_path)),
+            logging=None,
+            data=SimpleNamespace(processing=DataProcessingConfigSchema()),
+        )
+        strategy._model_output_snapshot_done = False
+        strategy.mask_generator = KSpaceMaskGenerator(
+            num_timesteps=8, default_pattern="variable_density", accelerator_kwargs={"seed": 5}
+        )
+        if pattern is not None:
+            strategy._snapshot_mask_pattern = lambda: pattern
+        BaseTrainingStrategy.save_debug_snapshot(
+            strategy, {"input_raw": torch.rand(1, 1, 8, 8)}, step=0, tag="first_steps"
+        )
+        (snap,) = Path(tmp_path).rglob("snapshot.json")
+        return json.loads(snap.read_text())["provenance"]["applied"]["mask_generator"]
+
+    def test_the_written_snapshot_names_the_family_the_strategy_used(self, tmp_path) -> None:
+        record = self._write(tmp_path)
+        assert record["family"] == "variable_density"
+        assert record["mask_seed"] == 5
+
+    def test_a_per_call_pattern_replaces_the_generator_default(self, tmp_path) -> None:
+        assert self._write(tmp_path, pattern="random")["family"] == "random_cartesian"
+
+
 class TestProvenanceNamesTheSplitItCameFrom:
     """`source` exists so a val snapshot cannot claim the train augmentation
     chain — they are built by *different* `tio.Compose` objects. A single
@@ -221,7 +315,7 @@ class TestProvenanceNamesTheSplitItCameFrom:
 
         seen = []
 
-        def _record(_config, *, dataset=None, model=None, source="train"):
+        def _record(_config, *, dataset=None, model=None, source="train", **_):
             seen.append((source, dataset))
             return {"source": source}
 
@@ -434,7 +528,7 @@ class TestDeclaredLossKeysAreDerived:
         arm — which declares its objective in `kspace_losses`/`image_losses` —
         produced an EMPTY set and guaranteed no CSV column at all."""
         keys = sense_bridge_strategy._declared_loss_keys
-        assert {"complex_l1", "log_spectral", "sense_adjoint_l1", "hfen"} <= keys
+        assert {"complex_l1", "sobolev_kspace", "sense_adjoint_l1", "hfen"} <= keys
 
     def test_builder_owned_losses_are_not_this_strategys_job(self, sense_bridge_strategy) -> None:
         """Subtracting the builder skip set is what stops a per-step phantom
@@ -580,3 +674,129 @@ class TestZeroFillAndReporting:
         losses = {"g_total_loss": torch.zeros(())}
         assert strategy._ensure_declared_losses_present(losses, iteration=0) == frozenset()
         assert list(losses) == ["g_total_loss"]
+
+
+# --- channel guard: who builds the model input (#2240) ----------------------
+
+
+def _guarded_train_step(cls, *, strategy_class: str | None, in_channels: int = 2):
+    """Drive ``train_step`` far enough to hit the channel guard, return its error."""
+    import types
+
+    import torch
+    from torch import nn
+
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    assert issubclass(cls, ReconstructionTrainingStrategy)
+    st = object.__new__(cls)
+    st.config = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            model_type="configurable_unet", in_channels=in_channels, out_channels=2
+        ),
+        training=types.SimpleNamespace(strategy_class=strategy_class),
+    )
+    st.adapter_chains = {}
+    st.env = types.SimpleNamespace(
+        discriminator=None, generator=nn.Conv2d(2, 2, 1), opt_g=None
+    )
+    st._prepare_model_input = lambda x: x
+    st.device = torch.device("cpu")
+    inp = torch.rand(1, 8, 8, 8)  # 4 coils real-stacked: 8 channels against in_channels=2
+    tgt = torch.rand(1, 2, 8, 8)
+    try:
+        st.train_step((inp, tgt), epoch=0, input_batch=inp, target_batch=tgt, iteration=1)
+    except ValueError as exc:
+        return exc
+    return None
+
+
+def _is_domain_mismatch(exc: BaseException | None) -> bool:
+    return isinstance(exc, ValueError) and "DomainMismatch" in str(exc)
+
+
+def test_channel_guard_raises_for_a_strategy_that_passes_the_batch_through():
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    assert _is_domain_mismatch(
+        _guarded_train_step(ReconstructionTrainingStrategy, strategy_class=None)
+    )
+
+
+def test_channel_guard_defers_to_the_strategy_capability_not_the_config_string():
+    """The skip is keyed on the class, so an arm that names its strategy only by
+    ``training_mode`` (``strategy_class`` unset) is not rejected."""
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    class _OwnInput(ReconstructionTrainingStrategy):
+        synthesises_model_input = True
+
+    assert _guarded_train_step(_OwnInput, strategy_class=None) is None
+
+
+def test_a_marker_substring_in_strategy_class_no_longer_skips_the_guard():
+    """Planted violation for the retired substring allow-list: naming a VF module
+    in the config string must not switch the guard off for a pass-through class."""
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    exc = _guarded_train_step(
+        ReconstructionTrainingStrategy,
+        strategy_class="x.virtual_fiducial_strategy.ConcreteVirtualFiducialStrategy",
+    )
+    assert _is_domain_mismatch(exc)
+
+
+@pytest.mark.parametrize(
+    ("module", "cls_name"),
+    [
+        ("virtual_fiducial_strategy", "ConcreteVirtualFiducialStrategy"),
+        ("ib_vf_strategy", "IBVFTrainingStrategy"),
+        ("motion_meta_strategy", "ConcreteMotionMetaTrainingStrategy"),
+        ("vf_admm_strategy", "ConcreteVFADMMStrategy"),
+        ("distillation_strategy", "ConcreteDistillationStrategy"),
+        ("vf_consistency_distillation_strategy", "VFConsistencyDistillationStrategy"),
+    ],
+)
+def test_strategies_that_synthesise_their_input_declare_it(module, cls_name):
+    import importlib
+
+    mod = importlib.import_module(f"spectramr.infrastructure.training.strategies.{module}")
+    assert getattr(mod, cls_name).synthesises_model_input is True
+
+
+def test_every_class_the_retired_substrings_matched_declares_the_capability():
+    """The retired allow-list matched by substring, so it also covered classes it
+    never named (``distillation_strategy`` is inside
+    ``vf_consistency_distillation_strategy``); each of those must now declare it."""
+    import importlib
+
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    retired = (
+        "virtual_fiducial_strategy",
+        "motion_meta_strategy",
+        "vf_admm_strategy",
+        "ib_vf_strategy",
+        "distillation_strategy",
+    )
+    matched = {
+        path
+        for path in TrainingStrategyFactory.STRATEGY_CLASS_PATHS.values()
+        if any(m in path for m in retired)
+    }
+    assert matched
+    undeclared = []
+    for path in sorted(matched):
+        module, _, name = path.rpartition(".")
+        cls = getattr(importlib.import_module(module), name)
+        if not cls.synthesises_model_input:
+            undeclared.append(path)
+    assert not undeclared, undeclared

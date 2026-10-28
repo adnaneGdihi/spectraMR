@@ -447,6 +447,72 @@ def _folds(pairs: list[tuple[str, str]], reason: str) -> list[RenameRecord]:
 #: Every retired config key. Keyed by dotted legacy path.
 RENAMES: dict[str, RenameRecord] = _index(
     [
+        # Naming convention (tests/unit/config/test_naming_convention.py).
+        RenameRecord(
+            legacy="training.ulf_map.data_weight_ratio",
+            canonical="training.ulf_map.relative_data_weight",
+            since="2026-10-25",
+            reason="It is w / rho, an unbounded scale rather than a fraction in [0, 1].",
+            mount="training.ulf_map",
+        ),
+        RenameRecord(
+            legacy="training.privileged.n_min",
+            canonical="training.privileged.min_keep_fraction",
+            since="2026-10-25",
+            reason="It is the floor of the marker keep-fraction, not a count.",
+            mount="training.privileged",
+        ),
+        RenameRecord(
+            legacy="training.privileged.n_max",
+            canonical="training.privileged.initial_keep_fraction",
+            since="2026-10-25",
+            reason="It is the marker keep-fraction at epoch 0, not a count.",
+            mount="training.privileged",
+        ),
+        RenameRecord(
+            legacy="training.dispersion_bloch_ae.n_pools",
+            canonical="training.dispersion_bloch_ae.num_pools",
+            since="2026-10-25",
+            reason="Counts are `num_<thing>`.",
+            mount="training.dispersion_bloch_ae",
+        ),
+        RenameRecord(
+            legacy="training.bloch_equivariant_translation.use_bloch_checkpoint",
+            canonical="training.bloch_equivariant_translation.enable_bloch_checkpoint",
+            since="2026-10-25",
+            reason="Boolean switches are `enable_<thing>`.",
+            mount="training.bloch_equivariant_translation",
+        ),
+        RenameRecord(
+            legacy="training.riemannian_bloch_diffusion.use_bloch_checkpoint",
+            canonical="training.riemannian_bloch_diffusion.enable_bloch_checkpoint",
+            since="2026-10-25",
+            reason="Boolean switches are `enable_<thing>`.",
+            mount="training.riemannian_bloch_diffusion",
+        ),
+        # Never read: `data` is extra='ignore', so the list was dropped and the
+        # synthetic arms ran without their simulator. Registered names only.
+        RenameRecord(
+            legacy="data.custom_transforms",
+            canonical="data.processing.transforms",
+            since="2026-10-22",
+            reason=(
+                "Nothing read `data.custom_transforms`, so its entries were discarded "
+                "without error. Declare the transform under `data.processing.transforms` "
+                "by its registered name; a dotted `module:` path is never resolved."
+            ),
+        ),
+        RenameRecord(
+            legacy="data.augmentation.custom_transforms",
+            canonical="data.processing.transforms",
+            since="2026-10-22",
+            reason=(
+                "Nothing read `data.augmentation.custom_transforms`, so its entries were "
+                "discarded without error. Declare the transform under "
+                "`data.processing.transforms` by its registered name."
+            ),
+            mount="data.augmentation",
+        ),
         RenameRecord(
             legacy="training.scattering_besov.lambda_l1",
             canonical="losses.image_losses",
@@ -871,6 +937,7 @@ RENAMES: dict[str, RenameRecord] = _index(
                 ("data.num_workers", "data.loader.num_workers"),
                 ("data.persistent_workers", "data.loader.persistent_workers"),
                 ("data.prefetch_factor", "data.loader.prefetch_factor"),
+                ("data.reserved_cores", "data.loader.reserved_cores"),
                 ("data.pin_memory", "data.loader.pin_memory"),
                 ("data.max_prefetch", "data.loader.prefetch_factor"),
             ],
@@ -1563,6 +1630,13 @@ RENAMES: dict[str, RenameRecord] = _index(
                 "(#421)."
             ),
         ),
+        RenameRecord(
+            legacy="training.quality_matching.use_acquisition_prior",
+            canonical="training.quality_matching.enable_acquisition_prior",
+            since="2026-10-25",
+            reason="Boolean switches are `enable_<thing>` (test_naming_convention).",
+            mount="training.quality_matching",
+        ),
     ]
 )
 
@@ -1571,7 +1645,7 @@ def renames_for_block(
     block: str,
     table: dict[str, RenameRecord] | None = None,
     posture: Posture | None = None,
-):
+) -> dict[str, RenameRecord]:
     """Every record whose legacy key lived under ``block``.
 
     ``posture`` narrows to one kind; the two validators below each take only
@@ -1836,7 +1910,11 @@ def override_knob(
     return previous
 
 
-def reject_renamed_keys(block: str, table: dict[str, RenameRecord] | None = None) -> Any:
+def reject_renamed_keys(
+    block: str,
+    table: dict[str, RenameRecord] | None = None,
+    removals: dict[str, Any] | None = None,
+) -> Any:
     """Build a ``mode="before"`` validator that raises on any retired key.
 
     ``table`` is injectable so the mechanism can be unit-tested without adding a
@@ -1848,8 +1926,18 @@ def reject_renamed_keys(block: str, table: dict[str, RenameRecord] | None = None
     permitted") does not tell the author what to write instead.
 
     Only ``posture="raise"`` records are handled; see :func:`fold_renamed_keys`.
+    Keys removed outright (:mod:`removals`) are refused by the same validator, so
+    one mount serves both. An injected ``table`` stands alone unless ``removals``
+    is injected too.
     """
-    retired = renames_for_block(block, table, posture="raise")
+    from .removals import REMOVALS, removals_for_block
+
+    if removals is None:
+        removals = REMOVALS if table is None else {}
+    retired: dict[str, Any] = {
+        **renames_for_block(block, table, posture="raise"),
+        **removals_for_block(block, removals),
+    }
 
     def _validator(_cls: type, data: Any) -> Any:
         if not isinstance(data, dict) or not retired:
@@ -1865,8 +1953,8 @@ def reject_renamed_keys(block: str, table: dict[str, RenameRecord] | None = None
     # the RESOLVED record dict, so a mount serving zero records is
     # indistinguishable at runtime from no mount at all -- which is exactly the
     # defect `rename_mounts.audit_mounts` exists to find. Stamp it.
-    _validator.__rename_block__ = block
-    _validator.__rename_posture__ = "raise"
+    _validator.__dict__["__rename_block__"] = block
+    _validator.__dict__["__rename_posture__"] = "raise"
     return _validator
 
 
@@ -1972,8 +2060,8 @@ def fold_renamed_keys(block: str, table: dict[str, RenameRecord] | None = None) 
     # Mirrors :func:`reject_renamed_keys`: the closure carries `block`, but
     # relying on a freevar NAME is exactly the source-text coupling this
     # stamp removes. Both builders advertise themselves the same way.
-    _validator.__rename_block__ = block
-    _validator.__rename_posture__ = "fold"
+    _validator.__dict__["__rename_block__"] = block
+    _validator.__dict__["__rename_posture__"] = "fold"
     return _validator
 
 

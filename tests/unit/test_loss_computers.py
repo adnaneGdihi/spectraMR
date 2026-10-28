@@ -542,13 +542,10 @@ class TestUnifiedReconstructionLossComputer:
             )
 
     def test_all_losses_failing_raises_not_silent_zero(self) -> None:
-        """F-LOSSFAIL / 2026-05-20 — if every declared loss errors out
-        (or none was wired), the previous behaviour returned a zero leaf
-        with no upstream graph. Now a RuntimeError surfaces.
+        """F-LOSSFAIL / 2026-05-20: a step must never return a zero leaf with no graph.
 
-        The construct: a non-ValueError exception (kept as a warning per
-        the fix) + the explicit L1/L2 paths gated off. Nothing populates
-        ``components``; the post-loop guard fires.
+        A failing declared loss now raises at the loss itself, naming it, before the
+        post-loop guard; with nothing wired at all, the guard still fires.
         """
 
         class _RuntimeErrorLoss(torch.nn.Module):
@@ -564,9 +561,7 @@ class TestUnifiedReconstructionLossComputer:
         pred = torch.randn(2, 1, 16, 16, requires_grad=True)
         target = torch.randn(2, 1, 16, 16)
 
-        with pytest.raises(
-            RuntimeError, match=r"empty.*disconnected zero|All declared losses failed"
-        ):
+        with pytest.raises(RuntimeError, match=r"Loss 'aux' failed.*transient backbone"):
             computer.compute(
                 pred=pred,
                 target=target,
@@ -574,6 +569,10 @@ class TestUnifiedReconstructionLossComputer:
                 iteration=2000,
                 losses_dict={"aux": _RuntimeErrorLoss()},
             )
+        with pytest.raises(
+            RuntimeError, match=r"empty.*disconnected zero|All declared losses failed"
+        ):
+            computer.compute(pred=pred, target=target, epoch=0, iteration=2000, losses_dict={})
 
 
 # ============================================================================

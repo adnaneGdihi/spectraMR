@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from spectramr.config.schemas.enums import ArtifactOrigin
-from spectramr.infrastructure.physics.digital_twin_extensions import (
+from spectramr.infrastructure.physics.degradations import (
     DEGRADATION_REGISTRY,
     get_degradation_origin,
     list_degradations,

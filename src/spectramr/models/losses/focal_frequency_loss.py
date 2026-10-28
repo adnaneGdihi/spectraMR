@@ -21,12 +21,16 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from spectramr.infrastructure.physics.fft_ops import _to_complex, fft2c
 from spectramr.models.losses.registry import register_loss
+
+_WEIGHT_MODES = ("radial", "parabolic")
 
 
 def _build_radial_weight(
@@ -87,6 +91,8 @@ class FocalFrequencyLoss(nn.Module):
             mode: "radial" or "parabolic".
         """
         super().__init__()
+        if mode not in _WEIGHT_MODES:
+            raise ValueError(f"mode must be one of {_WEIGHT_MODES}, got {mode!r}")
         self.alpha = alpha
         self.mode = mode
         # Cache weight matrix per spatial size to avoid recomputation
@@ -106,7 +112,7 @@ class FocalFrequencyLoss(nn.Module):
             self._cached_size = (h, w)
         return self._cached_weight.to(device)
 
-    def forward(self, pred: Tensor, target: Tensor, **kwargs) -> Tensor:
+    def forward(self, pred: Tensor, target: Tensor, **kwargs: Any) -> Tensor:
         """Compute the Focal Frequency Loss.
 
         Args:

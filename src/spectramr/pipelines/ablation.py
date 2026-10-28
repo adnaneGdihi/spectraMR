@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from spectramr.config.settings import TrainingSettings
+from spectramr.infrastructure.logging.log_policy import apply_logging_config
 from spectramr.infrastructure.training.builders import DataBuilder
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,10 @@ def train_and_score(config: TrainingSettings, device: str | None = None) -> dict
     )
 
     result = run_training_pipeline(config, device=device)
-    if isinstance(result, dict) and not result.get("success", True):
-        return {"success": False, "error": result.get("error", "training failed")}
+    # Only an explicit True is success; an absent flag is unknown (#181).
+    if not (isinstance(result, dict) and result.get("success") is True):
+        error = result.get("error") if isinstance(result, dict) else None
+        return {"success": False, "error": error or "training reported no success flag"}
 
     # Read validation metrics from where run_training_pipeline actually writes
     # them: <training.output_dir>/logs/validation_metrics.csv.
@@ -102,7 +105,8 @@ def train_and_score(config: TrainingSettings, device: str | None = None) -> dict
             csv_path,
         )
     metrics["success"] = True  # type: ignore[assignment]
-    if isinstance(result, dict) and "final_loss" in result:
+    # final_loss is None when the run recorded no g_total_loss; omit it like any missing metric.
+    if isinstance(result, dict) and result.get("final_loss") is not None:
         metrics["final_loss"] = float(result["final_loss"])
     return metrics
 
@@ -120,6 +124,7 @@ def run_ablation_pipeline(config_path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Configuration not found: {config_path}")
 
     settings = TrainingSettings.from_yaml(str(config_path))
+    apply_logging_config(settings.logging)
     data_builder = DataBuilder(settings)
 
     results: dict[str, Any] = {
@@ -257,6 +262,7 @@ def run_ablation_study(
         raise FileNotFoundError(f"Configuration not found: {config_path}")
 
     base_config = TrainingSettings.from_yaml(str(config_path))
+    apply_logging_config(base_config.logging)
     logger.info(f"Loaded baseline config from {config_path}")
 
     # Evaluate baseline. Give the baseline its OWN output dir so it does not

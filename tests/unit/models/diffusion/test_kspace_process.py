@@ -10,8 +10,13 @@ import pytest
 import torch
 
 from spectramr.models.diffusion.kspace_process import (
+    DEFAULT_SAMPLING_STEPS,
+    VALID_REVERSE_MODES,
     KSpaceUndersamplingProcess,
     PhysicsInformedColdDiffusion,
+    measured_write_ceiling,
+    paired_magnitude,
+    resolve_sampling_steps,
 )
 
 
@@ -194,80 +199,6 @@ class TestKSpaceUndersamplingProcess:
         )
 
 
-class TestPriorChannelRange:
-    """Pin the cross-contrast prior behaviour: q_sample must keep the
-    declared channel range fully sampled while still degrading the rest.
-
-    Motivated by ``experiment_cross_contrast_kspace_diffusion.yaml`` where
-    the M4Raw loader concatenates ``[T1 || T2/FLAIR]`` along the coil axis
-    and the metadata claims "T1 fully sampled prior". Without this
-    parameter the broadcast mask multiplied every channel uniformly and
-    T1 was as undersampled as T2.
-    """
-
-    def test_invalid_range_rejected(self) -> None:
-        with pytest.raises(ValueError):
-            KSpaceUndersamplingProcess(num_timesteps=100, prior_channel_range=(5, 5))
-        with pytest.raises(ValueError):
-            KSpaceUndersamplingProcess(num_timesteps=100, prior_channel_range=(-1, 4))
-
-    def test_out_of_bounds_raises_in_q_sample(self) -> None:
-        proc = KSpaceUndersamplingProcess(
-            num_timesteps=100,
-            prior_channel_range=(0, 10),
-        )
-        with pytest.raises(ValueError):
-            proc.q_sample(torch.randn(1, 4, 16, 16), torch.tensor([50]))
-
-    def test_prior_channels_unchanged_at_max_t(self) -> None:
-        """Even at t=T-1 (max undersampling) the prior channels must
-        equal the input exactly — only the non-prior channels are
-        degraded."""
-        proc = KSpaceUndersamplingProcess(
-            num_timesteps=100,
-            max_acceleration=8.0,
-            center_fraction=0.08,
-            mask_type="variable_density",
-            seed=42,
-            # 8-channel tensor: first 4 = T1 (prior), last 4 = T2 (target).
-            prior_channel_range=(0, 4),
-        )
-        x_start = torch.randn(2, 8, 32, 32)
-        t = torch.tensor([99, 99])
-
-        x_t, mask = proc.q_sample(x_start, t)
-
-        # Prior channels: bit-exact preservation.
-        assert torch.equal(x_t[:, :4], x_start[:, :4])
-        # Non-prior channels: should be at least partially zeroed by the
-        # mask (max acceleration, so most rows are dropped).
-        non_prior_changed = not torch.allclose(x_t[:, 4:], x_start[:, 4:])
-        assert (
-            non_prior_changed
-        ), "Non-prior channels must be degraded at max undersampling"
-        # Mask shape unchanged.
-        assert mask.shape == (2, 1, 32, 32)
-
-    def test_no_prior_range_is_legacy_behaviour(self) -> None:
-        """Without ``prior_channel_range`` every channel is degraded
-        uniformly — i.e. behaviour is identical to before the patch."""
-        proc_legacy = KSpaceUndersamplingProcess(
-            num_timesteps=100,
-            max_acceleration=8.0,
-            center_fraction=0.08,
-            mask_type="variable_density",
-            seed=42,
-        )
-        x_start = torch.randn(1, 4, 32, 32)
-        t = torch.tensor([99])
-        x_t, _ = proc_legacy.q_sample(x_start, t)
-        # With acceleration > 1 the broadcast mask zeros most rows on
-        # every channel — pin that none of the channels is bit-exact to
-        # the input (any of the 4 may differ).
-        any_degraded = not torch.equal(x_t, x_start)
-        assert any_degraded, "Legacy q_sample must still degrade x_start"
-
-
 class TestPhysicsInformedColdDiffusion:
     """Unit tests for PhysicsInformedColdDiffusion."""
 
@@ -276,7 +207,7 @@ class TestPhysicsInformedColdDiffusion:
         """Simple identity model for testing."""
 
         class MockModel(torch.nn.Module):
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return x  # Identity
 
         return MockModel()
@@ -310,6 +241,21 @@ class TestPhysicsInformedColdDiffusion:
         assert torch.allclose(
             x_out * mask_expanded, measurement * mask_expanded
         ), "Hard DC should preserve measured values"
+
+    def test_p_sample_is_final_flag_matches_the_tensor_check(
+        self, diffusion: PhysicsInformedColdDiffusion
+    ) -> None:
+        """``is_final`` from the caller's int equals reading ``t.min() <= 0`` off the tensor."""
+        B, C, H, W = 2, 2, 32, 32
+        torch.manual_seed(0)
+        measurement = torch.randn(B, C, H, W)
+        mask = torch.zeros(B, 1, H, W)
+        mask[:, :, :, 10:20] = 1.0
+        x_t = torch.randn(B, C, H, W)
+        t = torch.tensor([0, 0])
+        inferred = diffusion.p_sample(x_t, t, measurement, mask)
+        declared = diffusion.p_sample(x_t, t, measurement, mask, is_final=True)
+        assert torch.equal(inferred, declared)
 
     def test_sample_loop(self, diffusion: PhysicsInformedColdDiffusion) -> None:
         """Test full sampling loop completes."""
@@ -432,7 +378,7 @@ class TestSamplerScheduleReuse:
                     seed=42,
                 )
 
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return x
 
         return GenLike()
@@ -478,7 +424,7 @@ class TestSamplerScheduleReuse:
         """A model exposing no ``kspace_process`` keeps the legacy construct path."""
 
         class Bare(torch.nn.Module):
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return x
 
         diffusion = PhysicsInformedColdDiffusion(
@@ -642,7 +588,7 @@ class TestReverseModeReplaceFreeze:
         """
 
         class HugeModel(torch.nn.Module):
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return torch.full_like(x, 100.0)
 
         return HugeModel()
@@ -722,7 +668,7 @@ class TestReverseModeReplaceFreeze:
         torch.manual_seed(2)
 
         class ConstModel(torch.nn.Module):
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return torch.full_like(x, 3.0)
 
         diff = self._make(ConstModel(), "replace_freeze")
@@ -791,7 +737,7 @@ class TestReverseModeReplaceFreeze:
                 # ``KSpaceColdDiffusionGenerator`` builds for that method.
                 self.dc_layer = SoftDataConsistency(lambda_init=0.5)
 
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return torch.full_like(x, 3.0)
 
         diff = PhysicsInformedColdDiffusion(
@@ -883,7 +829,7 @@ class TestReverseModeReplaceFreeze:
                 super().__init__()
                 self.dc_layer = SoftDataConsistency(lambda_init=lambda_init)
 
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return torch.full_like(x, value)
 
         return ConstModel()
@@ -997,7 +943,7 @@ class TestReverseModeReplaceFreeze:
                 super().__init__()
                 self.dc_layer = NoiseAdaptiveDataConsistency(beta=1.0)
 
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return torch.full_like(x, 3.0)
 
         measurement, mask = self._band()
@@ -1127,7 +1073,7 @@ class TestReverseInputLabelPairing:
             self.kspace_process = process
             self.calls: list[tuple[int, torch.Tensor]] = []
 
-        def forward(self, x, t):
+        def forward(self, x, t, **_kw):
             from spectramr.models.diffusion.kspace_process import paired_magnitude
 
             support = (paired_magnitude(x) > 1e-8).float()
@@ -1138,22 +1084,7 @@ class TestReverseInputLabelPairing:
         "mode",
         [
             "replace_freeze_dc",
-            pytest.param(
-                "replace_freeze_dc_t0",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason=(
-                        "finding 4 / #2067 step 2: CURRENT_STEP_KEYED_REVERSE_MODES "
-                        "keys the reveal off schedule[i] instead of schedule[i+1], so "
-                        "every executed call's input support lags its own label by "
-                        "one schedule index (worst at the terminal t=0 call, whose "
-                        "input is not fully sampled). Structural tension against "
-                        "test_reverse_stats.py's pinned head-skip/equal-call-count "
-                        "contract -- see the task report for the two candidate "
-                        "fixes and which pinned assertion each one breaks."
-                    ),
-                ),
-            ),
+            "replace_freeze_dc_t0",
         ],
     )
     def test_executed_calls_input_support_matches_their_own_label(self, mode):
@@ -1182,88 +1113,82 @@ class TestReverseInputLabelPairing:
             )
 
 
-class TestPriorChannelRangeReversePath:
-    """Finding 7: the reverse loop derives its observed support from the
-    single-channel sampling mask alone (``obs = (mask > 0).float()``,
-    ``_sample_replace_freeze_dc`` / ``_sample_replace_freeze``), so it has no
-    way to know ``prior_channel_range`` channels are meant to stay measured.
+class TestReverseCallsCarryTheCurrentSupport:
+    """Training feeds the network the rung mask ``M_t`` beside ``x_t``; every reverse
+    call must therefore pass the support its state actually has, not the head's
+    observation mask (which the generator used to reuse from its stash)."""
 
-    Demonstrated with a measurement ``q_sample`` ITSELF produced, so this is
-    not an artefact of building the measurement wrong: even a measurement
-    q_sample legitimately marks fully-sampled on the prior channels gets those
-    bins overwritten by the model's own prediction during ``sample()``.
+    class _KwargRecorder(torch.nn.Module):
+        def __init__(self, process):
+            super().__init__()
+            self.kspace_process = process
+            self.calls: list[tuple[torch.Tensor, dict]] = []
 
-    BLOCKED, not fixed here: making ``_sample_replace_freeze_dc`` /
-    ``_sample_replace_freeze`` honour ``prior_channel_range`` in isolation
-    would be actively harmful in production. The real validation measurement
-    is built by ``diffusion.py``'s ``_apply_masking_and_verify`` (outside this
-    file's scope) as a uniform ``input_batch * mask`` with no channel
-    carve-out, so there the prior arrives genuinely undersampled -- treating
-    it as trusted would hard-pin ``dc_method='hard'`` to the undersampled
-    zeros instead of letting the model predict them, which is WORSE than
-    today. Both sites must change together; tracked for a coordinated fix.
-    """
+        def forward(self, x, t, **kw):
+            self.calls.append((x.clone(), kw))
+            return torch.ones_like(x)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "finding 7: the reverse loop's obs support ignores "
-            "prior_channel_range and overwrites a fully-sampled prior with "
-            "the model's own prediction. A same-file fix is blocked: it would "
-            "be harmful without a paired fix to diffusion.py's "
-            "_apply_masking_and_verify, which is outside this file's scope "
-            "-- see the task report."
-        ),
-    )
-    def test_reverse_loop_overwrites_a_fully_sampled_prior(self):
-        process = KSpaceUndersamplingProcess(
-            num_timesteps=4,
-            max_acceleration=4.0,
-            center_fraction=0.125,
-            prior_channel_range=(0, 2),
-        )
-
-        class PriorModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.kspace_process = process
-
-            def forward(self, x, t):
-                return torch.full_like(x, -999.0)
-
-        x0 = torch.ones(1, 4, 16, 16)
-        t = torch.full((1,), 3, dtype=torch.long)
-        measurement, mask = process.q_sample(x0, t)
-        assert bool((measurement[:, 0:2] == 1.0).all()), (
-            "q_sample itself must mark the prior fully sampled -- what "
-            "follows is about what the reverse loop does with that, not "
-            "about how the measurement was built"
-        )
-
+    @staticmethod
+    def _run(mode: str):
+        process = TestReverseInputLabelPairing._ladder()
+        model = TestReverseCallsCarryTheCurrentSupport._KwargRecorder(process)
+        knob = {"reveal_refine_dc": {"refine_alpha": 0.5}, "support_ordered_dc": {"support_radius": 2}}
         sampler = PhysicsInformedColdDiffusion(
-            model=PriorModel(),
-            num_timesteps=4,
-            reverse_mode="replace_freeze_dc",
-            sampling_steps=4,
+            model=model,
+            num_timesteps=29,
+            max_acceleration=32.0,
             dc_method="hard",
+            reverse_mode=mode,
+            sampling_steps=8,
             kspace_log_scaled=False,
-        ).eval()
-        out = sampler.sample(measurement=measurement, mask=mask, start_timestep=3)
-
-        overwritten = int((out[:, 0:2] != 1.0).sum())
-        assert overwritten == 0, (
-            f"{overwritten} of {out[:, 0:2].numel()} fully-sampled prior "
-            "coefficients were overwritten by the model's own prediction"
+            **knob.get(mode, {}),
         )
+        torch.manual_seed(0)
+        x = torch.randn(1, 2, 64, 64)
+        _, mask = process.q_sample(x, torch.full((1,), 6, dtype=torch.long))
+        sampler.sample(x * mask, mask, start_timestep=6)
+        return model.calls, mask
 
+    @pytest.mark.parametrize("mode", sorted(VALID_REVERSE_MODES))
+    def test_every_call_passes_a_support_covering_its_input(self, mode):
+        calls, obs = self._run(mode)
+        assert calls, "no model call was made"
+        for x, kw in calls:
+            support = kw["mask"]
+            assert support.shape == (1, 1, 64, 64)
+            known = (paired_magnitude(x) > 1e-8).float()
+            assert torch.all(support >= known), "a nonzero input bin lies outside the passed support"
+            assert torch.all(support >= obs), "the observed support was dropped"
+            assert "acquired" in kw and kw["acquired"] is None, "no measured_lines were declared"
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    @pytest.mark.parametrize("mode", sorted(VALID_REVERSE_MODES - {"single_call_dc"}))
+    def test_the_support_grows_past_the_observation_mask(self, mode):
+        """PLANTED: passing the stored observation mask on every call fails this."""
+        calls, obs = self._run(mode)
+        assert len(calls) > 1
+        assert float(calls[-1][1]["mask"].sum()) > float(obs.sum())
 
+    def test_the_acquired_plane_comes_from_the_measured_lines(self):
+        from spectramr.models.diffusion.acquired_line_budget import lines_to_plane
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
 
-# ---------------------------------------------------------------------------
-# Acceleration-ladder realisability (issue #534)
-# ---------------------------------------------------------------------------
+        process = phantom.process()
+        assert process.line_dim is not None, "the phantom ladder is line-structured"
+        model = self._KwargRecorder(process)
+        sampler = PhysicsInformedColdDiffusion(
+            model=model, num_timesteps=phantom.T, max_acceleration=8.0, kspace_log_scaled=False
+        )
+        lines = torch.zeros(1, 64, dtype=torch.bool)
+        lines[:, 8:56] = True
+        sampler.measured_lines = lines
+        support = torch.zeros(1, 2, 64, 64)
+        support[:, :, 30:34, :] = 1.0
+        sampler.denoise(torch.randn(1, 2, 64, 64), torch.tensor([3]), support)
+        kw = model.calls[0][1]
+        expected = lines_to_plane(lines, (64, 64), process.line_dim)
+        torch.testing.assert_close(kw["acquired"], expected)
+        assert kw["mask"].shape == (1, 1, 64, 64), "a per-channel support is reduced to a plane"
+        assert torch.equal(kw["mask"], support[:, :1])
 
 
 def _exp11_process(min_center_fraction):
@@ -1283,6 +1208,28 @@ def _exp11_process(min_center_fraction):
     )
 
 
+class TestMaskFollowsTheServedPatch:
+    """The mask is drawn at the batch's matrix, so a fastMRI 320 patch gets a 320 mask."""
+
+    @pytest.mark.parametrize("order", [(256, 320), (320, 256)])
+    def test_one_process_serves_two_matrices_without_reusing_a_table(self, order):
+        process = _exp11_process(0.02)
+        t = torch.tensor([12, 24])
+        for n in order:
+            _x_t, masks = process.q_sample(torch.randn(2, 8, n, n), t)
+            assert masks.shape == (2, 1, n, n)
+
+    def test_the_ladder_is_realised_at_320_as_declared(self):
+        """Phase-encode lines scale with the matrix; R is a fraction, not a line count."""
+        at = {
+            n: {t: (eff, kept) for t, _nom, eff, kept in _exp11_process(0.02).describe_ladder((n, n))}
+            for n in (256, 320)
+        }
+        for t in (0, 12, 24):
+            assert at[320][t][1] > at[256][t][1]
+            assert at[320][t][0] == pytest.approx(at[256][t][0], rel=0.1)
+
+
 class TestMinCenterFractionIsForwarded:
     """``min_center_fraction`` was stored on the process and never forwarded."""
 
@@ -1292,14 +1239,14 @@ class TestMinCenterFractionIsForwarded:
         assert inner.min_center_fraction == 0.02
 
     def test_static_acs_caps_the_ladder_at_12x(self):
-        """center_fraction == min_center_fraction: the bug the cohort shipped with.
+        """No declared floor, so the ACS stays at center_fraction: the bug the cohort shipped with.
 
         An always-sampled 8% ACS IS the whole budget at R=12.5, so the declared
         32x rung realises ~12x and R=16/32 become the same mask.
         """
         ladder = {
             t: eff
-            for t, _nom, eff, _kept in _exp11_process(0.08).describe_ladder((256, 256))
+            for t, _nom, eff, _kept in _exp11_process(None).describe_ladder((256, 256))
         }
         assert ladder[24] == pytest.approx(12.19, abs=0.1)
         assert ladder[20] == pytest.approx(ladder[24], abs=1e-6)
@@ -1315,7 +1262,7 @@ class TestMinCenterFractionIsForwarded:
 
 class TestDeclaredLadderDefects:
     def test_static_acs_is_reported(self):
-        defects = _exp11_process(0.08).declared_ladder_defects((256, 256))
+        defects = _exp11_process(None).declared_ladder_defects((256, 256))
         assert defects
         assert any("R=32" in d for d in defects)
         assert any("same" in d for d in defects)
@@ -1326,7 +1273,7 @@ class TestDeclaredLadderDefects:
     def test_assert_raises_only_when_defective(self):
         _exp11_process(0.02).assert_ladder_realisable((256, 256))  # no raise
         with pytest.raises(ValueError, match="not realisable"):
-            _exp11_process(0.08).assert_ladder_realisable((256, 256))
+            _exp11_process(None).assert_ladder_realisable((256, 256))
 
     def test_continuous_schedule_is_out_of_scope(self):
         """A continuous schedule MUST have duplicate masks by pigeonhole.
@@ -1367,7 +1314,7 @@ class _CountingStub(torch.nn.Module):
         self.kspace_process = process
         self.calls: list[int] = []
 
-    def forward(self, x, t):
+    def forward(self, x, t, **_kw):
         self.calls.append(int(t[0]))
         return x * (1.0 + 0.01 * int(t[0])) + 0.001 * int(t[0])
 
@@ -1415,15 +1362,25 @@ def _r2_measurement(process):
 
 class TestInertStepSkipping:
     @pytest.mark.parametrize("mode", ["replace_freeze_dc", "replace_freeze"])
-    def test_skipping_does_not_change_the_output(self, mode):
+    def test_skipping_does_not_change_the_output(self, mode, monkeypatch):
         """The load-bearing property: a skipped step must be a PURE no-op."""
+        import dataclasses
+
+        from spectramr.models.diffusion import kspace_process as kp
+
         sampler, model, process = _sampler(0.02, mode)
         measurement, mask = _r2_measurement(process)
         with_skip = sampler.sample(measurement, mask)
         calls_with_skip = len(model.calls)
 
+        planned = kp.plan_reveals
+
+        def never_inert(*args, **kwargs):
+            plan = planned(*args, **kwargs)
+            return dataclasses.replace(plan, active=(True,) * len(plan.active))
+
+        monkeypatch.setattr(kp, "plan_reveals", never_inert)
         full_sampler, full_model, _ = _sampler(0.02, mode)
-        full_sampler._step_reveals_anything = lambda *a, **k: True
         without_skip = full_sampler.sample(measurement, mask)
 
         assert torch.equal(with_skip, without_skip)
@@ -1435,7 +1392,7 @@ class TestInertStepSkipping:
         The reconstruction was a single-shot fill wearing a 20-step trajectory's
         clothes.
         """
-        sampler, model, process = _sampler(0.08)
+        sampler, model, process = _sampler(None)
         measurement, mask = _r2_measurement(process)
         sampler.sample(measurement, mask)
         assert len(model.calls) == 2
@@ -1759,7 +1716,7 @@ class TestClipReferenceWiring:
                 super().__init__()
                 self.kspace_process = process
 
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 # DC-peak-magnitude junk everywhere, the divergence signature
                 return torch.full_like(x, float(x.abs().max()))
 
@@ -1991,6 +1948,47 @@ class TestResolveUndersamplingKwargs:
         )
         assert resolved["schedule_kwargs"]["density_power"] == 4.0
 
+    def test_declared_schedule_power_reaches_the_built_ramp(self):
+        """``undersampling.schedule_power`` was read nowhere: a declared 0.5 ran
+        the accelerator's own 2.0, so the ramp was convex while the YAML said
+        concave. Asserted on the BUILT accelerator, where the curve is computed."""
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+        from spectramr.models.diffusion.kspace_process import (
+            KSpaceUndersamplingProcess,
+            resolve_undersampling_kwargs,
+        )
+
+        cfg = AccelerationConfigSchema(
+            **self._accel_block(schedule_type="power_law", base_acceleration=1.0, schedule_power=0.5)
+        )
+        process = KSpaceUndersamplingProcess(num_timesteps=29, **resolve_undersampling_kwargs(cfg))
+        accel = process.mask_generator._get_accelerator(process.mask_type)
+        accel = getattr(accel, "accelerator", accel)
+        assert accel.schedule_power == 0.5
+        # t=1 of 28 under R = 1 + 31 * (1/28) ** 0.5; the dropped knob gave 1.04.
+        assert accel.get_acceleration_factor(1) == pytest.approx(1.0 + 31.0 * (1 / 28) ** 0.5)
+
+    def test_undeclared_schedule_power_is_not_forwarded(self):
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+        from spectramr.models.diffusion.kspace_process import (
+            resolve_undersampling_kwargs,
+        )
+
+        cfg = AccelerationConfigSchema(**self._accel_block(schedule_type="power_law"))
+        assert "schedule_power" not in resolve_undersampling_kwargs(cfg)["schedule_kwargs"]
+
+    def test_schedule_power_declared_twice_with_different_values_raises(self):
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+        from spectramr.models.diffusion.kspace_process import (
+            resolve_undersampling_kwargs,
+        )
+
+        cfg = AccelerationConfigSchema(
+            **self._accel_block(schedule_type="power_law", schedule_power=0.5)
+        )
+        with pytest.raises(ValueError, match="schedule_power"):
+            resolve_undersampling_kwargs(cfg, {"schedule_kwargs": {"schedule_power": 3.0}})
+
     def test_dropping_the_key_collapses_the_ladder(self):
         """Pin the cost, so a future ``extra="ignore"`` drop fails loudly here."""
         from spectramr.models.diffusion.kspace_process import (
@@ -2037,6 +2035,7 @@ class TestDynamicMaskBypassesNestingEnforcement:
             schedule_type="step",
             schedule_kwargs={"acceleration_range": [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]},
             mask_direction="phase",
+            phase_encode_axis=-1,
             enable_dynamic_mask=True,
             enforce_nested=enforce,
         )
@@ -2295,7 +2294,7 @@ class TestDeclaredLadderDefectStringsAreStable:
     """
 
     def test_exp11_static_acs_defect_strings_are_byte_identical(self):
-        assert _exp11_process(0.08).declared_ladder_defects((256, 256)) == [
+        assert _exp11_process(None).declared_ladder_defects((256, 256)) == [
             "declared rung R=32 realises R=12.19 at t=24 (off by 62% > 25%)",
             "declared rungs R=[16.0, 32.0] all realise the same 5376-bin mask "
             "(5376 of 65536 bins)",
@@ -2309,7 +2308,7 @@ class TestSamplerDeterminismValidation:
     @staticmethod
     def _build(**kwargs):
         class _Identity(torch.nn.Module):
-            def forward(self, x, t):
+            def forward(self, x, t, **_kw):
                 return x
 
         return PhysicsInformedColdDiffusion(
@@ -2381,7 +2380,7 @@ class TestAcceleratorKwargsTranslation:
             accelerator_kwargs_from_config,
         )
 
-        pattern, kwargs = accelerator_kwargs_from_config(self.ARM)
+        pattern, kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         assert pattern == "density_nested"
         accelerator = create_kspace_accelerator(
             acceleration_type=pattern, num_timesteps=28, **kwargs
@@ -2399,7 +2398,7 @@ class TestAcceleratorKwargsTranslation:
             accelerator_kwargs_from_config,
         )
 
-        _, kwargs = accelerator_kwargs_from_config(self.ARM)
+        _, kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         assert kwargs["seed"] == 42
         assert "mask_seed" not in kwargs
 
@@ -2409,7 +2408,7 @@ class TestAcceleratorKwargsTranslation:
             accelerator_kwargs_from_config,
         )
 
-        _, kwargs = accelerator_kwargs_from_config(self.ARM)
+        _, kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         # Names the accelerator does not read, present in every ``model_dump()``.
         for junk in (
             "mixed_precision",
@@ -2429,7 +2428,7 @@ class TestAcceleratorKwargsTranslation:
             accelerator_kwargs_from_config,
         )
 
-        _, kwargs = accelerator_kwargs_from_config(self.ARM)
+        _, kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         assert kwargs["acceleration_schedule"] == "step"
         assert "schedule_type" not in kwargs
 
@@ -2439,7 +2438,7 @@ class TestAcceleratorKwargsTranslation:
             accelerator_kwargs_from_config,
         )
 
-        _, kwargs = accelerator_kwargs_from_config(self.ARM)
+        _, kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         assert kwargs["density_power"] == 1.6
         assert kwargs["acceleration_range"] == [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]
         assert "schedule_kwargs" not in kwargs
@@ -2454,17 +2453,40 @@ class TestAcceleratorKwargsTranslation:
         _, kwargs = accelerator_kwargs_from_config(arm)
         assert "mask_direction" not in kwargs
 
-    def test_min_center_fraction_defaults_to_center_fraction(self) -> None:
-        """Unforwarded, it collapsed every rung above R≈12 onto one mask (#534)."""
+    def test_an_undeclared_floor_is_forwarded_as_none(self) -> None:
+        """The accelerator owns the "core is ``center_fraction``" default, not this map.
+
+        Substituting ``center_fraction`` here turned every undeclared floor into a
+        declared one, so the accelerators' build-time floor check refused the
+        library default (0.0325) at 32x on every family (#2516).
+        """
+        from spectramr.infrastructure.physics.sampling import create_kspace_accelerator
         from spectramr.models.diffusion.kspace_process import build_accelerator_kwargs
 
         kwargs = build_accelerator_kwargs(
             max_acceleration=32.0,
             base_acceleration=2.0,
-            center_fraction=0.08,
+            center_fraction=0.0325,
             min_center_fraction=None,
         )
-        assert kwargs["min_center_fraction"] == 0.08
+        assert kwargs["min_center_fraction"] is None
+        for pattern in ("variable_density", "density_nested", "nested", "random_cartesian"):
+            create_kspace_accelerator(pattern, num_timesteps=28, **kwargs)
+
+    def test_planted_mirrored_floor_refuses_the_default(self) -> None:
+        """What the forwarding used to do: the same default becomes an unreachable floor."""
+        from spectramr.infrastructure.physics.sampling import create_kspace_accelerator
+        from spectramr.models.diffusion.kspace_process import build_accelerator_kwargs
+
+        kwargs = build_accelerator_kwargs(
+            max_acceleration=32.0,
+            base_acceleration=2.0,
+            center_fraction=0.0325,
+            min_center_fraction=None,
+        )
+        kwargs["min_center_fraction"] = kwargs["center_fraction"]
+        with pytest.raises(ValueError, match="exceeds the sampling budget"):
+            create_kspace_accelerator("variable_density", num_timesteps=28, **kwargs)
 
     def test_process_and_strategy_paths_agree(self) -> None:
         """The regression that stops the two paths drifting apart again.
@@ -2479,9 +2501,9 @@ class TestAcceleratorKwargsTranslation:
             resolve_undersampling_kwargs,
         )
 
-        _, strategy_kwargs = accelerator_kwargs_from_config(self.ARM)
+        _, strategy_kwargs = accelerator_kwargs_from_config(self.ARM, phase_encode_axis=-1)
         process = KSpaceUndersamplingProcess(
-            num_timesteps=28, **resolve_undersampling_kwargs(self.ARM)
+            num_timesteps=28, **resolve_undersampling_kwargs(self.ARM, phase_encode_axis=-1)
         )
         assert process.mask_generator._accelerator_kwargs == strategy_kwargs
 
@@ -2619,7 +2641,7 @@ class TestReverseTrajectoryStartTimestep:
             self.dc_layer = SoftDataConsistency(lambda_init=1.0)
             self.seen: list[int] = []
 
-        def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        def forward(self, x: torch.Tensor, t: torch.Tensor, **_kw: object) -> torch.Tensor:
             self.seen.append(int(t[0]))
             return x * 0.5 + float(t[0]) * 0.01
 
@@ -2903,12 +2925,8 @@ class TestIdentityRungResolution:
     def test_a_declared_false_beats_an_override_saying_true(self) -> None:
         """The falsy-``or`` reversion, pinned.
 
-        Every numeric key beside this one chains with ``or`` for backwards
-        compatibility, and ``False or True`` is ``True`` -- so "tidying" this
-        read into the surrounding idiom would silently switch the rung ON for
-        an arm that turned it off, with no other test in this file going red.
-        The source comment at the read claims this property; nothing executed
-        it until here.
+        ``False or True`` is ``True``, so reading this key with an ``or`` chain
+        would silently switch the rung ON for an arm that turned it off.
 
         The second half is what makes the first half discriminating: a resolver
         that ignored ``overrides`` altogether would satisfy "declared False
@@ -2924,6 +2942,63 @@ class TestIdentityRungResolution:
         # Absent on the arm -> the override is the live source of the value.
         from_override = resolve_undersampling_kwargs({}, {"train_identity_rung": True})
         assert from_override["train_identity_rung"] is True
+
+
+# Falsy-but-legal declarations survive resolution (issue #690). Each row is
+# (config key, override key, resolved key, falsy value, fallback when absent).
+_FALSY_LEGAL = [
+    ("mask_seed", "seed", "seed", 0, 42),
+    ("center_fraction", "center_fraction", "center_fraction", 0.0, 0.0325),
+    ("min_center_fraction", "min_center_fraction", "min_center_fraction", 0.0, None),
+]
+
+
+def _legacy_or_resolve(accel: dict, over: dict, key: str, over_key: str, default):
+    """The pre-#690 ``or`` chain, kept only to show the test discriminates."""
+    return accel.get(key) or over.get(over_key, default)
+
+
+class TestFalsyDeclarationsSurviveResolution:
+    @pytest.mark.parametrize(("key", "over_key", "out_key", "value", "fallback"), _FALSY_LEGAL)
+    def test_declared_on_the_config(self, key, over_key, out_key, value, fallback) -> None:
+        from spectramr.models.diffusion.kspace_process import resolve_undersampling_kwargs
+
+        assert resolve_undersampling_kwargs({key: value})[out_key] == value
+        assert resolve_undersampling_kwargs({key: value})[out_key] is not None
+
+    @pytest.mark.parametrize(("key", "over_key", "out_key", "value", "fallback"), _FALSY_LEGAL)
+    def test_declared_on_the_overrides(self, key, over_key, out_key, value, fallback) -> None:
+        from spectramr.models.diffusion.kspace_process import resolve_undersampling_kwargs
+
+        assert resolve_undersampling_kwargs({}, {over_key: value})[out_key] == value
+
+    @pytest.mark.parametrize(("key", "over_key", "out_key", "value", "fallback"), _FALSY_LEGAL)
+    def test_absent_still_falls_back(self, key, over_key, out_key, value, fallback) -> None:
+        from spectramr.models.diffusion.kspace_process import resolve_undersampling_kwargs
+
+        assert resolve_undersampling_kwargs({})[out_key] == fallback
+
+    @pytest.mark.parametrize(("key", "over_key", "out_key", "value", "fallback"), _FALSY_LEGAL)
+    def test_planted_or_chain_discards_the_declaration(
+        self, key, over_key, out_key, value, fallback
+    ) -> None:
+        legacy = _legacy_or_resolve({key: value}, {}, key, over_key, fallback)
+        assert legacy == fallback
+        assert legacy != value
+
+    def test_seed_zero_reaches_the_accelerator(self) -> None:
+        """Through the schema, so a model_dump carrying every default is exercised."""
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+        from spectramr.models.diffusion.kspace_process import resolve_undersampling_kwargs
+
+        resolved = resolve_undersampling_kwargs(
+            AccelerationConfigSchema(mask_seed=0, center_fraction=0.0, min_center_fraction=0.0)
+        )
+        assert (resolved["seed"], resolved["center_fraction"], resolved["min_center_fraction"]) == (
+            0,
+            0.0,
+            0.0,
+        )
 
 
 def _stochastic_sampler(sigma: float, seed: int | None = 7):
@@ -3082,3 +3157,520 @@ def test_mask_at_names_the_device_explicitly_not_by_accident():
         f"mask_at builds its timestep index as `{rendered}` with no device, so it "
         "lands on CPU and misses the memoised mask table on every call"
     )
+
+
+@pytest.mark.unit
+def test_every_reverse_mode_has_exactly_one_loop():
+    """``VALID_REVERSE_MODES`` is what the build validates against and
+    ``_REVERSE_LOOPS`` is what ``sample`` dispatches on; a mode in one and not the
+    other passes the build and raises at the first validation."""
+    from spectramr.models.diffusion.kspace_process import _REVERSE_LOOPS, VALID_REVERSE_MODES
+
+    assert set(_REVERSE_LOOPS) == set(VALID_REVERSE_MODES)
+
+
+@pytest.mark.unit
+def test_sample_refuses_a_mode_with_no_loop():
+    """PLANTED: a mode that slipped past the constructor must raise, not fall
+    through to a default loop (non-negotiable 3)."""
+    from spectramr.models.diffusion.kspace_process import (
+        KSpaceUndersamplingProcess,
+        PhysicsInformedColdDiffusion,
+    )
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.kspace_process = KSpaceUndersamplingProcess(
+                num_timesteps=4, max_acceleration=4.0, center_fraction=0.08
+            )
+
+        def forward(self, x, t, **_kw):
+            return x
+
+    sampler = PhysicsInformedColdDiffusion(
+        model=_Model(),
+        num_timesteps=4,
+        reverse_mode="replace_freeze_dc",
+        kspace_log_scaled=False,
+    )
+    sampler.reverse_mode = "unregistered"
+    with pytest.raises(ValueError, match="has no reverse loop"):
+        sampler.sample(torch.zeros(1, 2, 16, 16), torch.ones(1, 1, 16, 16))
+
+
+def test_prior_channel_range_is_no_longer_a_process_knob() -> None:
+    """The source contrast left the diffusion state (#2452); the knob went with it."""
+    with pytest.raises(TypeError):
+        KSpaceUndersamplingProcess(num_timesteps=4, prior_channel_range=(0, 2))
+
+
+class TestResolveSamplingSteps:
+    """One step-count rule for the generator, the sampler and predict (#566, #1176)."""
+
+    @pytest.mark.parametrize(("horizon", "expected"), [(29, 29), (1000, DEFAULT_SAMPLING_STEPS)])
+    def test_an_undeclared_count_is_the_capped_default_and_is_logged(self, horizon, expected, caplog):
+        """PLANTED (#1176): ``None or num_timesteps`` ran all 1000 steps and said nothing."""
+        with caplog.at_level("WARNING"):
+            assert resolve_sampling_steps(None, horizon) == expected
+        assert "No sampling_steps declared" in caplog.text
+
+    @pytest.mark.parametrize("declared", [0, -3, True, 2.5])
+    def test_an_unusable_count_raises_rather_than_falling_back(self, declared):
+        """PLANTED (#1176): ``or`` turned an explicit 0 into the full horizon."""
+        with pytest.raises(ValueError, match="sampling_steps must be an integer >= 1"):
+            resolve_sampling_steps(declared, 29)
+
+    def test_a_declared_count_is_kept(self):
+        assert resolve_sampling_steps(20, 29) == 20
+
+
+class TestMeasuredWriteCeiling:
+    """No clamp after data consistency rewrites an acquired coefficient (#2310)."""
+
+    def _inputs(self):
+        measurement = torch.zeros(1, 2, 2, 2)
+        measurement[0, 0, 0, 0] = 5.0  # measured, above the ceiling
+        measured = torch.tensor([[[[True, False], [False, False]]]])
+        return torch.full((1, 1, 2, 2), 1.0), measurement, measured
+
+    def test_hard_dc_leaves_measured_bins_unbounded(self):
+        ceil, measurement, measured = self._inputs()
+        write = measured_write_ceiling(ceil, measurement, measured, "hard")
+        assert torch.isinf(write[measured]).all()
+        assert torch.equal(write[~measured], ceil[~measured])
+
+    def test_a_blend_admits_the_measurement_itself(self):
+        ceil, measurement, measured = self._inputs()
+        write = measured_write_ceiling(ceil, measurement, measured, "soft")
+        assert float(write[measured].min()) == float(paired_magnitude(measurement)[measured].min())
+
+    def test_the_legacy_freeze_loop_keeps_an_outer_band_pinned(self):
+        """PLANTED: ``replace_freeze`` hard-pins, then clamped the whole plane."""
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
+
+        out, meas, acquired = phantom.band_local_outlier_run("replace_freeze")
+        assert torch.equal(out * acquired, meas)
+
+    def test_the_freeze_dc_loop_keeps_an_outer_band_pinned(self):
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
+
+        out, meas, acquired = phantom.band_local_outlier_run("replace_freeze_dc")
+        assert torch.equal(out * acquired, meas)
+
+
+class TestAnUnboundedCeilingTrains:
+    """The training-forward clamp under hard DC: ``+inf`` on the measured rows."""
+
+    def _arm(self):
+        """Two interleaved coils, whole phase-encode rows measured, a ``[B, 1, H, W]`` ceiling."""
+        gen = torch.Generator().manual_seed(0)
+        x = torch.randn(2, 4, 16, 16, generator=gen)
+        measurement = torch.randn(2, 4, 16, 16, generator=gen)
+        measured = torch.zeros(2, 1, 16, 16, dtype=torch.bool)
+        measured[..., ::3, :] = True
+        ceil = torch.rand(2, 1, 16, 16, generator=gen) + 0.2
+        return x, measurement, measured, ceil
+
+    def test_hard_dc_bins_backpropagate_finite_gradients(self):
+        """PLANTED: ``inf / modulus`` put NaN on every measured coefficient's gradient,
+        and every hard-DC arm with ``output_kspace_clip_ratio`` diverged at the first
+        optimizer step (dispatch 8718242)."""
+        from spectramr.models.diffusion.kspace_process import clamp_to_magnitude_ceiling
+
+        x, measurement, measured, ceil = self._arm()
+        x.requires_grad_(True)
+        write = measured_write_ceiling(ceil, measurement, measured, "hard")
+        clamp_to_magnitude_ceiling(x, write).square().sum().backward()
+        assert bool(torch.isfinite(x.grad).all())
+
+    def test_an_unbounded_coefficient_passes_through_with_its_own_gradient(self):
+        from spectramr.models.diffusion.kspace_process import clamp_to_magnitude_ceiling
+
+        x, *_ = self._arm()
+        x.requires_grad_(True)
+        out = clamp_to_magnitude_ceiling(x, torch.full((2, 1, 16, 16), float("inf")))
+        out.square().sum().backward()
+        assert torch.equal(out, x)
+        assert torch.equal(x.grad, 2 * x.detach())
+
+    def test_a_nan_ceiling_is_not_read_as_unbounded(self):
+        """Only ``+inf`` exempts a coefficient; a corrupted ceiling stays visible."""
+        from spectramr.models.diffusion.kspace_process import clamp_to_magnitude_ceiling
+
+        x, *_ = self._arm()
+        out = clamp_to_magnitude_ceiling(x, torch.full((2, 1, 16, 16), float("nan")))
+        assert bool(torch.isnan(out).all())
+
+    def test_a_finite_ceiling_keeps_the_unguarded_clamp_exactly(self):
+        """Forward and backward match ``(ceiling / modulus).clamp(max=1)`` bit for bit."""
+        from spectramr.models.diffusion.kspace_process import (
+            clamp_to_magnitude_ceiling,
+            paired_squared_magnitude,
+        )
+
+        x, _, _, ceil = self._arm()
+        guarded = x.clone().requires_grad_(True)
+        reference = x.clone().requires_grad_(True)
+        out = clamp_to_magnitude_ceiling(guarded, ceil)
+        modulus = torch.sqrt(paired_squared_magnitude(reference).clamp_min(1e-16))
+        expected = reference * (ceil / modulus).clamp(max=1.0).repeat_interleave(2, dim=-3)
+        out.square().sum().backward()
+        expected.square().sum().backward()
+        assert torch.equal(out, expected)
+        assert torch.equal(guarded.grad, reference.grad)
+
+
+class TestAdditiveStepsToTheNextScheduledLevel:
+    """Bansal's update restores to the NEXT scheduled level, not ``t - 1``."""
+
+    T = 32
+
+    def _run(self, steps, mask_arg=True):
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
+
+        proc = KSpaceUndersamplingProcess(
+            num_timesteps=self.T, base_acceleration=1.0, max_acceleration=8.0,
+            center_fraction=0.08, mask_type="density_nested", mask_direction="phase",
+            phase_encode_axis=-2, enforce_nested=True, train_identity_rung=False, seed=42,
+        )
+        target = phantom.kspace()
+        mask = proc.mask_at(self.T - 1, (phantom.H, phantom.W)).reshape(1, 1, phantom.H, phantom.W)
+        mask = mask.float().expand(2, 1, phantom.H, phantom.W)
+        sampler = phantom.sampler(
+            phantom.Oracle(target, proc), "additive", num_timesteps=self.T, sampling_steps=steps
+        )
+        out = sampler.sample(target * mask, mask if mask_arg else None)
+        return out, target, sampler
+
+    @pytest.mark.parametrize("steps", [4, 8])
+    def test_a_strided_schedule_writes_every_coefficient(self, steps):
+        """PLANTED: at floor 1, ``t - 1`` left 53 % (8 steps) to 62 % (4 steps) of k-space
+        unwritten even under an oracle model."""
+        out, target, sampler = self._run(steps)
+        assert sampler.last_schedule[-1] == 1
+        assert torch.allclose(out, target)
+
+    def test_the_unstrided_schedule_is_unchanged(self):
+        out, target, sampler = self._run(self.T)
+        assert sampler.last_schedule == list(range(self.T - 1, 0, -1))
+        assert torch.allclose(out, target)
+
+    def test_no_mask_falls_back_to_the_measured_support(self):
+        """PLANTED: ``x * (1.0 - None)`` raised TypeError; the freeze loops already fell back."""
+        out, target, _ = self._run(8, mask_arg=False)
+        assert torch.allclose(out, target)
+
+
+class TestReverseLoopsReadTheFixedCascade:
+    """PLANTED (#2471): every reverse loop took its reveals from ``q_sample``, whose train-mode branch
+    draws the dynamic training masks, so the reconstruction changed with the module's mode."""
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["additive", "replace_freeze", "replace_freeze_dc", "replace_freeze_dc_t0", "reveal_refine_dc"],
+    )
+    def test_train_mode_reconstructs_what_eval_mode_does(self, mode):
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
+
+        outs, _ = phantom.module_mode_runs(mode)
+        assert all(torch.equal(out, outs[0]) for out in outs[1:])
+
+    def test_cascade_batch_masks_are_the_eval_draw_and_not_the_training_draw(self):
+        from tests.unit.models.diffusion import _reverse_phantom as phantom
+
+        proc = phantom.process(dynamic=True)
+        x = phantom.kspace(batch=4)
+        t = torch.full((4,), 4, dtype=torch.long)
+        cascade = proc.cascade_batch_masks(t, (phantom.H, phantom.W), x.device)
+        assert torch.equal(proc.eval().q_sample(x, t)[1], cascade)
+        # Training keeps its augmentation: the dynamic draw is not the cascade.
+        assert not torch.equal(proc.train().q_sample(x, t)[1], cascade)
+
+
+def test_ceiling_binding_stats_counts_only_bounded_coefficients_over_the_ceiling():
+    from spectramr.models.diffusion.kspace_process import ceiling_binding_stats
+
+    x = torch.zeros(1, 2, 2, 2)  # one complex coil, 4 coefficients, real part only
+    x[0, 0] = torch.tensor([[3.0, 0.5], [2.0, 0.1]])
+    ceiling = torch.tensor([[[[1.0, 1.0], [float("inf"), 1.0]]]])
+    frac, over = ceiling_binding_stats(x, ceiling)
+    # Bounded: three coefficients; over the ceiling among them: only |3|.
+    assert float(frac) == pytest.approx(1 / 3)
+    assert float(over) == pytest.approx(3.0)
+
+
+def test_ceiling_binding_stats_reports_no_binding_as_overshoot_one():
+    from spectramr.models.diffusion.kspace_process import ceiling_binding_stats
+
+    x = torch.full((1, 2, 4, 4), 0.1)
+    frac, over = ceiling_binding_stats(x, torch.ones(1, 1, 1, 1))
+    assert float(frac) == 0.0 and float(over) == 1.0
+    assert frac.dim() == 0 and not frac.requires_grad
+
+
+def test_the_generator_records_the_clamp_statistics_in_training_only():
+    """Wiring pin: the stats are taken from the tensor about to be clamped, in training."""
+    import inspect
+
+    from spectramr.models.generators.kspace_cold_diffusion_generator import (
+        KSpaceColdDiffusionGenerator,
+    )
+
+    src = inspect.getsource(KSpaceColdDiffusionGenerator.forward)
+    stats = src.index("self.last_clip_stats = ceiling_binding_stats(x_out, _ceil)")
+    clamp = src.index("x_out = clamp_to_magnitude_ceiling(x_out, _ceil, 1e-8)")
+    assert stats < clamp
+    assert "if self.training:" in src[stats - 80 : stats]
+
+
+@pytest.mark.parametrize("mode", ["replace_freeze_dc", "additive_normalized", "support_ordered_dc"])
+def test_a_noise_only_slice_runs_the_decay_bounded_loop_to_the_end(mode):
+    """A slice no envelope can be fitted to finishes its loop and is counted, so it
+    no longer drops the validation batch it shares with a fitted slice."""
+    from tests.unit.models.diffusion import _reverse_phantom as P
+
+    proc = P.process(8.0)
+    target = P.kspace()
+    mask = P.mask(proc)
+    noise = 1e-3 * torch.randn(target[1:].shape, generator=torch.Generator().manual_seed(5))
+    target = torch.cat([target[:1], noise])
+    extra = {"support_radius": 2} if mode == "support_ordered_dc" else {}
+    sampler = P.sampler(P.Oracle(target, proc), mode, decay_envelope="per_sample", **extra)
+    out = sampler.sample(target * mask, mask, start_timestep=P.HEAD)
+    assert bool(torch.isfinite(out).all())
+    assert sampler.reverse_stats["decay_unfitted"] == 1
+
+
+class TestDynamicMaskHostReads:
+    """The dynamic-mask loop must not read the batch back to the host per sample (#1241).
+
+    Each ``.item()`` or scalar cast on a CUDA tensor drains the queue. The accelerators
+    take host ints, so one transfer per call is the floor; the shape guarded here is a
+    read inside this module that scales with the batch. Family internals in
+    ``sampling.py`` are out of this test's scope.
+    """
+
+    _SCALAR_READS = ("item", "__int__", "__float__", "__bool__", "__index__")
+    _OWN_FILES = ("kspace_process.py", "acquired_line_budget.py")
+
+    @staticmethod
+    def _process():
+        return KSpaceUndersamplingProcess(
+            num_timesteps=6,
+            max_acceleration=32.0,
+            base_acceleration=1.0,
+            center_fraction=0.08,
+            min_center_fraction=0.02,
+            mask_type="density_nested",
+            seed=42,
+            schedule_type="step",
+            schedule_kwargs={"acceleration_range": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]},
+            mask_direction="phase",
+            phase_encode_axis=-1,
+            enable_dynamic_mask=True,
+            enforce_nested=True,
+        ).train()
+
+    @staticmethod
+    def _batch(b: int, partial: bool) -> torch.Tensor:
+        x = torch.randn(b, 2, 16, 32)
+        if partial:
+            x[..., :4] = 0
+            x[..., -4:] = 0
+        return x
+
+    def _patch(self, monkeypatch, record) -> None:
+        """Route every scalar read and ``tolist`` through ``record(name, caller_file)``."""
+        import sys
+
+        for name in (*self._SCALAR_READS, "tolist"):
+            original = getattr(torch.Tensor, name)
+
+            def read(tensor, *args, _name=name, _original=original, **kwargs):
+                record(_name, sys._getframe(1).f_code.co_filename)
+                return _original(tensor, *args, **kwargs)
+
+            monkeypatch.setattr(torch.Tensor, name, read)
+
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_no_scalar_read_in_the_loop(self, monkeypatch, partial) -> None:
+        """Red on the per-sample loop: ``int(timesteps[i].item())`` raises here."""
+        process = self._process()
+        x = self._batch(4, partial)
+        t = torch.tensor([1, 2, 3, 5])
+        process.q_sample(x, t)  # the first-batch gates read the host once, outside the loop
+
+        def record(name: str, caller: str) -> None:
+            if name in self._SCALAR_READS and caller.endswith(self._OWN_FILES):
+                raise AssertionError(f"per-sample host read {name} in {caller}")
+
+        self._patch(monkeypatch, record)
+        _, masks = process.q_sample(x, t)
+        assert masks.shape == (4, 1, 16, 32)
+
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_host_transfers_do_not_scale_with_the_batch(self, monkeypatch, partial) -> None:
+        def transfers(b: int) -> int:
+            process = self._process()
+            x = self._batch(b, partial)
+            t = torch.arange(1, b + 1) % 6
+            process.q_sample(x, t)
+            calls: list[str] = []
+
+            def record(name: str, caller: str) -> None:
+                if caller.endswith(self._OWN_FILES):
+                    calls.append(name)
+
+            with monkeypatch.context() as m:
+                self._patch(m, record)
+                process.q_sample(x, t)
+            return len(calls)
+
+        assert transfers(1) == transfers(4)
+
+
+class _MixingStub(_CountingStub):
+    """Like ``_CountingStub`` but every bin also sees the plane mean, so lines interact."""
+
+    def forward(self, x, t, **_kw):
+        return super().forward(x, t) + 0.05 * x.mean(dim=(-2, -1), keepdim=True)
+
+
+class TestReverseDcUnconstrained:
+    """``reverse_dc='unconstrained'`` stops the per-step measured-line DC of ``replace_freeze_dc``."""
+
+    @staticmethod
+    def _freeze_dc(reverse_dc: str, integrity_check: str = "off"):
+        from spectramr.models.diffusion.kspace_process import (
+            KSpaceUndersamplingProcess,
+            PhysicsInformedColdDiffusion,
+        )
+
+        process = KSpaceUndersamplingProcess(
+            num_timesteps=28,
+            max_acceleration=32.0,
+            base_acceleration=2.0,
+            center_fraction=0.08,
+            min_center_fraction=0.02,
+            mask_type="equispaced",
+            seed=42,
+            schedule_type="step",
+            schedule_kwargs={"acceleration_range": [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]},
+        )
+        process.eval()
+        sampler = PhysicsInformedColdDiffusion(
+            _MixingStub(process).eval(),
+            num_timesteps=28,
+            dc_method="hard",
+            sampling_steps=6,
+            reverse_mode="replace_freeze_dc",
+            reverse_clip_ratio=50.0,
+            integrity_check=integrity_check,
+            reverse_dc=reverse_dc,
+            kspace_log_scaled=False,
+        )
+        return sampler, process
+
+    def test_the_control_drifts_on_measured_lines_and_the_trajectory_follows(self):
+        pinned, process = self._freeze_dc("per_step")
+        free, _ = self._freeze_dc("unconstrained")
+        measurement, mask = _r2_measurement(process)
+        observed = mask > 0
+        out_pinned = pinned.sample(measurement, mask)
+        out_free = free.sample(measurement, mask)
+        assert torch.equal(out_pinned[observed], measurement[observed])
+        assert not torch.allclose(out_free[observed], measurement[observed])
+        # The model's later inputs differ, so the lines it reveals differ too.
+        assert not torch.allclose(out_pinned[~observed], out_free[~observed])
+        assert free.last_skipped_steps == 0
+
+    def test_the_integrity_check_does_not_demand_a_pin_the_control_dropped(self):
+        sampler, process = self._freeze_dc("unconstrained", integrity_check="raise")
+        measurement, mask = _r2_measurement(process)
+        sampler.sample(measurement, mask)
+
+    @pytest.mark.parametrize("mode", ["additive", "replace_freeze"])
+    def test_loops_where_it_would_not_change_the_trajectory_refuse_it(self, mode):
+        from spectramr.models.diffusion.kspace_process import PhysicsInformedColdDiffusion
+
+        with pytest.raises(ValueError, match="reverse_dc='unconstrained'"):
+            PhysicsInformedColdDiffusion(
+                _CountingStub(None),
+                num_timesteps=28,
+                reverse_mode=mode,
+                reverse_dc="unconstrained",
+                kspace_log_scaled=False,
+            )
+
+
+class TestSamplerAppliesTheLayerOffSupportAsTrainingDoes:
+    """The learned DC layer writes off the measured support under Wiener gain.
+
+    Training applies the full layer output, so unmeasured bins hold ``alpha * k``
+    (``WienerGainDataConsistency``). The sampler used to keep only the observed
+    support of that output and the raw ``k`` elsewhere, so the trajectory was
+    supervised on ``alpha * k`` but sampled ``k``. Under every other layer the
+    off-support output equals its input bit-for-bit, so only Wiener moves.
+    """
+
+    class _FixedField(torch.nn.Module):
+        def __init__(self, field):
+            super().__init__()
+            from spectramr.infrastructure.physics.wiener_gain_dc import (
+                WienerGainDataConsistency,
+            )
+
+            self.field = field
+            self.dc_layer = WienerGainDataConsistency(
+                log_scaled=False, beta=0.5, learnable_beta=False
+            )
+
+        def forward(self, x, t, **_kw):
+            return self.field.expand_as(x).clone()
+
+    @staticmethod
+    def _sample(dc_method: str):
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+        torch.manual_seed(0)
+        process = KSpaceUndersamplingProcess(
+            num_timesteps=8,
+            max_acceleration=4.0,
+            base_acceleration=1.0,
+            mask_type="variable_density",
+            seed=42,
+            train_identity_rung=True,
+            device="cpu",
+        )
+        field = torch.randn(1, 2, 32, 32)
+        model = TestSamplerAppliesTheLayerOffSupportAsTrainingDoes._FixedField(field)
+        sampler = PhysicsInformedColdDiffusion(
+            model=model,
+            num_timesteps=8,
+            max_acceleration=4.0,
+            dc_method=dc_method,
+            reverse_mode="replace_freeze_dc",
+            reverse_clip_ratio=1e6,
+            sampling_steps=4,
+            kspace_log_scaled=False,
+        )
+        x = torch.randn(1, 2, 32, 32)
+        _, mask = process.q_sample(x, torch.full((1,), 6, dtype=torch.long))
+        measurement = 1.5 * field * mask
+        out = sampler.sample(measurement, mask, start_timestep=6)
+        return out, field, mask, model.dc_layer
+
+    def test_wiener_unmeasured_bins_hold_alpha_times_the_prediction(self):
+        out, field, mask, layer = self._sample("wiener_gain")
+        unmeasured = mask.expand_as(out) == 0
+        gain = float(layer._last_gain)
+        assert gain != pytest.approx(1.0)
+        torch.testing.assert_close(
+            out[unmeasured], gain * field.expand_as(out)[unmeasured], rtol=1e-5, atol=1e-5
+        )
+
+    def test_hard_dc_unmeasured_bins_are_the_raw_prediction(self):
+        out, field, mask, _ = self._sample("hard")
+        unmeasured = mask.expand_as(out) == 0
+        assert torch.equal(out[unmeasured], field.expand_as(out)[unmeasured])

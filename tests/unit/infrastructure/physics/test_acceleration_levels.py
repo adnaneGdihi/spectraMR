@@ -32,6 +32,21 @@ NONCARTESIAN_TYPES = {"radial", "golden_angle", "spiral"}
 CARTESIAN_TYPES = set(_ACCELERATOR_REGISTRY.keys()) - EXCLUDED_TYPES - NONCARTESIAN_TYPES
 
 
+def _horizon(accel_type: str) -> int:
+    """Ramp length for a target-R check at the last rung.
+
+    A 1000-step linear ramp from R=1 has rungs at R~1.001, which a trajectory family
+    refuses at build (no rasterised trajectory covers more than ~79% of the grid,
+    #612). Two rungs -- the identity and the target -- test the same final mask.
+    """
+    return 2 if accel_type in NONCARTESIAN_TYPES else 1000
+
+
+def _property_horizon(accel_type: str) -> int:
+    """Ramp length for the structural checks; four rungs keep every R >= 2 above 1."""
+    return 4 if accel_type in NONCARTESIAN_TYPES else 1000
+
+
 class TestAccelerationTargetsBasic:
     """Test all mask types hit x2, x4, x8 within 10% tolerance."""
 
@@ -44,13 +59,13 @@ class TestAccelerationTargetsBasic:
     def test_acceleration_x2_x4_x8(self, accel_type: str, target: int) -> None:
         """Verify mask achieves target acceleration within 10%."""
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_horizon(accel_type),
             acceleration_type=accel_type,
             max_acceleration=float(target),
             base_acceleration=1.0,
         )
         mask = accel.get_acceleration_mask(
-            kspace_shape=(1, H, W), timestep=999, device=DEVICE,
+            kspace_shape=(1, H, W), timestep=_horizon(accel_type) - 1, device=DEVICE,
         )
         frac = mask.float().sum().item() / (H * W)
         actual_accel = 1.0 / frac if frac > 0 else float("inf")
@@ -115,13 +130,13 @@ class TestNonCartesianAcceleration:
     ) -> None:
         """Non-Cartesian types should hit x2-x8 within 15%."""
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_horizon(noncartesian_type),
             acceleration_type=noncartesian_type,
             max_acceleration=float(target),
             base_acceleration=1.0,
         )
         mask = accel.get_acceleration_mask(
-            kspace_shape=(1, H, W), timestep=999, device=DEVICE,
+            kspace_shape=(1, H, W), timestep=_horizon(noncartesian_type) - 1, device=DEVICE,
         )
         frac = mask.float().sum().item() / (H * W)
         actual_accel = 1.0 / frac if frac > 0 else float("inf")
@@ -139,13 +154,13 @@ class TestNonCartesianAcceleration:
     ) -> None:
         """Non-Cartesian types should scale to x16/x32 within 30%."""
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_horizon(noncartesian_type),
             acceleration_type=noncartesian_type,
             max_acceleration=float(target),
             base_acceleration=1.0,
         )
         mask = accel.get_acceleration_mask(
-            kspace_shape=(1, H, W), timestep=999, device=DEVICE,
+            kspace_shape=(1, H, W), timestep=_horizon(noncartesian_type) - 1, device=DEVICE,
         )
         frac = mask.float().sum().item() / (H * W)
         actual_accel = 1.0 / frac if frac > 0 else float("inf")
@@ -171,12 +186,12 @@ class TestMaskProperties:
         """Mask should match requested k-space shape."""
         shape = (1, H, W)
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_property_horizon(accel_type),
             acceleration_type=accel_type,
             max_acceleration=4.0,
         )
         mask = accel.get_acceleration_mask(
-            kspace_shape=shape, timestep=500, device=DEVICE,
+            kspace_shape=shape, timestep=_property_horizon(accel_type) // 2, device=DEVICE,
         )
         assert mask.shape[-2:] == (H, W), (
             f"{accel_type}: expected shape (*, {H}, {W}), got {mask.shape}"
@@ -185,12 +200,12 @@ class TestMaskProperties:
     def test_mask_is_binary(self, accel_type: str) -> None:
         """Mask should only contain 0s and 1s."""
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_property_horizon(accel_type),
             acceleration_type=accel_type,
             max_acceleration=4.0,
         )
         mask = accel.get_acceleration_mask(
-            kspace_shape=(1, H, W), timestep=500, device=DEVICE,
+            kspace_shape=(1, H, W), timestep=_property_horizon(accel_type) // 2, device=DEVICE,
         )
         unique = mask.unique()
         assert all(v in (0, 1, True, False) for v in unique.tolist()), (
@@ -200,13 +215,13 @@ class TestMaskProperties:
     def test_monotonic_degradation(self, accel_type: str) -> None:
         """Higher timesteps should yield sparser masks (fewer sampled points)."""
         accel = ColdDiffusionAccelerator(
-            num_timesteps=1000,
+            num_timesteps=_property_horizon(accel_type),
             acceleration_type=accel_type,
             max_acceleration=8.0,
             base_acceleration=1.0,
         )
-        t_low = 100
-        t_high = 900
+        t_low = _property_horizon(accel_type) // 10
+        t_high = _property_horizon(accel_type) * 9 // 10
         mask_low = accel.get_acceleration_mask(
             kspace_shape=(1, H, W), timestep=t_low, device=DEVICE,
         )

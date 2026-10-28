@@ -35,6 +35,8 @@ class WorkerDecision:
     cpus_per_rank: int | None  # the share this rank may use, when known
     clamped: bool  # True only when `workers < declared`
     reason: str
+    reserved_cores: int  # cores withheld from the share for the main process
+    persistent: bool = False  # whether the DataLoader keeps its workers alive
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -46,6 +48,7 @@ def clamp_worker_count(
     *,
     role: str = "train",
     log: bool = True,
+    reserved_cores: int,
 ) -> WorkerDecision:
     """Clamp a declared worker count DOWN to this rank's CPU share.
 
@@ -53,7 +56,8 @@ def clamp_worker_count(
     ever return a number ``<= declared``, which is what makes it safe to apply
     everywhere: an arm that already fits its allocation is untouched, so the
     ``# OOM fix`` arms that deliberately lowered ``num_workers`` keep the value
-    they chose, and a single-rank run whose workers fit its cores is unchanged.
+    they chose, and a single-rank run whose workers fit its cores minus
+    ``reserved_cores`` is unchanged.
 
     What it fixes: ``num_workers`` was a flat read of the YAML with no topology
     term, so N ranks on one node each spawned the full count — ``num_workers: 8``
@@ -67,6 +71,9 @@ def clamp_worker_count(
         log: Emit the clamp / unknown-CPU log lines. ``False`` for the
             provenance re-derivation, which asks the same question a second
             time in order to record the answer and must not narrate it twice.
+        reserved_cores: Cores per rank kept back for the main process and its
+            helper threads (``data.loader.reserved_cores``); the share is
+            ``max(1, cpus_per_rank - reserved_cores)``. Negative raises.
 
     Returns:
         The :class:`WorkerDecision`. ``workers`` is ``0`` iff ``declared`` is
@@ -76,6 +83,8 @@ def clamp_worker_count(
         ``num_workers=0 + persistent_workers=True`` combination that torch
         raises on unreachable by construction.
     """
+    if reserved_cores < 0:
+        raise ValueError(f"reserved_cores must be >= 0, got {reserved_cores}")
     declared = int(declared or 0)
     if declared <= 0:
         return WorkerDecision(
@@ -84,6 +93,7 @@ def clamp_worker_count(
             cpus_per_rank=None,
             clamped=False,
             reason="declared-serial",
+            reserved_cores=reserved_cores,
         )
 
     if topology.cpus_on_node is None:
@@ -109,23 +119,29 @@ def clamp_worker_count(
             cpus_per_rank=None,
             clamped=False,
             reason="cpus-unknown",
+            reserved_cores=reserved_cores,
         )
 
     share = topology.cpus_per_rank
-    workers = max(1, min(declared, share))
+    # The reserve is per rank: the main process needs its own core whatever the
+    # share, and `max(1, ...)` keeps a small allocation from clamping to zero.
+    usable = max(1, share - reserved_cores)
+    workers = max(1, min(declared, usable))
     if log and workers < declared and topology.is_local_rank_zero:
         # Log once per NODE: the condition is about that node's cores, and every
         # local rank would otherwise print the identical line.
         logger.warning(
             "[TOPOLOGY] %s num_workers %d -> %d: %s usable cores on this node "
-            "shared by %d local rank(s) = %d per rank. The declared value is a "
-            "ceiling; lower it in the config to make this permanent.",
+            "shared by %d local rank(s) = %d per rank, minus %d reserved for the "
+            "main process. The declared value is a ceiling; lower it in the "
+            "config to make this permanent.",
             role,
             declared,
             workers,
             topology.cpus_on_node,
             topology.local_world_size,
             share,
+            reserved_cores,
         )
     return WorkerDecision(
         workers=workers,
@@ -133,4 +149,5 @@ def clamp_worker_count(
         cpus_per_rank=share,
         clamped=workers < declared,
         reason="clamped-to-cpu-share" if workers < declared else "fits-allocation",
+        reserved_cores=reserved_cores,
     )

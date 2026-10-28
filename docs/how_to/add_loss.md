@@ -145,18 +145,9 @@ to list `latent` in their `compatible_with`).
 
 ### Option C — explicit adapter
 
-If your model outputs k-space but the loss expects image, declare the
-bridge explicitly:
-
-```yaml
-adapters:
-  pre_loss_pred:
-    - {name: ifft_kspace_to_image}
-    - {name: magnitude_from_complex}
-  pre_loss_target:
-    - {name: ifft_kspace_to_image}
-    - {name: magnitude_from_complex}
-```
+If your model outputs k-space but the loss expects image, make the loss list
+match the model's output domain. The former `adapters.pre_loss_pred:` hook is
+retired (#1777) and no adapter bridges that gap.
 
 The adapter chain runs before each loss is computed. See
 `src/spectramr/data/adapters/registry.py` for the available bridges.

@@ -24,10 +24,9 @@ reduction:
 The wrapper is composable: it accepts an *underlying* loss instance
 (L1, L2, SSIM, perceptual, ...) and reduces *no further* than the
 existing per-voxel pattern, so any loss whose ``forward`` returns the
-unreduced ``(B, C, H, W)`` map is supported. Losses that aggregate
-internally (e.g. SSIM with reduction='mean') are supported by setting
-``reduction_aware=False`` — in that case the wrapper falls back to a
-post-hoc scaling by the *global* lesion fraction.
+unreduced ``(B, C, H, W)`` map is supported. A base that aggregates
+internally (e.g. SSIM with reduction='mean') is rejected with a
+``ValueError``: there is no per-voxel map to weight.
 
 The lesion mask is supplied via the loss ``context`` dict under the key
 ``lesion_mask`` — same convention as
@@ -49,6 +48,7 @@ References
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -105,6 +105,8 @@ class LesionWeightedLoss(nn.Module):
         self.boost = boost
         self.soft_mask = soft_mask
         self.require_mask = require_mask
+        self._base_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        self.base_module: nn.Module | None
         if isinstance(base, str):
             if base not in _BASE_LOSS_FNS:
                 raise ValueError(
@@ -113,7 +115,7 @@ class LesionWeightedLoss(nn.Module):
                 )
             self.base_name = base
             self._base_fn = _BASE_LOSS_FNS[base]
-            self.base_module: nn.Module | None = None
+            self.base_module = None
         else:
             self.base_name = type(base).__name__
             self._base_fn = None
@@ -123,13 +125,15 @@ class LesionWeightedLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
-        **kwargs,
+        context: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
+        per_voxel: torch.Tensor
         if self._base_fn is not None:
             per_voxel = self._base_fn(prediction, target)
         else:
-            per_voxel = self.base_module(prediction, target)  # type: ignore[misc]
+            assert self.base_module is not None
+            per_voxel = self.base_module(prediction, target)
         if per_voxel.shape != prediction.shape:
             raise ValueError(
                 f"base loss returned shape {tuple(per_voxel.shape)} but "
@@ -137,7 +141,7 @@ class LesionWeightedLoss(nn.Module):
                 "LesionWeightedLoss requires a per-voxel base."
             )
 
-        mask = None if context is None else context.get("lesion_mask")
+        mask: torch.Tensor | None = None if context is None else context.get("lesion_mask")
         if mask is None:
             if self.require_mask:
                 raise ValueError(
@@ -157,5 +161,7 @@ class LesionWeightedLoss(nn.Module):
                 f"prediction spatial shape {tuple(prediction.shape[-2:])}."
             )
 
-        weights = 1.0 + self.boost * mask  # broadcasts across channel dim
+        # Expand the (B, 1, H, W) map to the per-voxel shape so the denominator
+        # counts every channel the numerator sums, keeping boost=0 equal to the mean.
+        weights = (1.0 + self.boost * mask).expand_as(per_voxel)
         return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)

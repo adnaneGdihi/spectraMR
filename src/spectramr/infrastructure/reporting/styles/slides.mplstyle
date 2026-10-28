@@ -1,0 +1,44 @@
+# Slide-deck defaults for spectramr reports.
+# Same column geometry as "nature" (a "double" figure fills a 16:9 content area
+# when scaled); larger relative text, heavy strokes and a light y-grid so values
+# can be read off a projector. Loaded by use_default_style("slides").
+font.family: sans-serif
+font.sans-serif: Helvetica, Arial, DejaVu Sans, Bitstream Vera Sans
+font.size: 8.5
+axes.labelsize: 8.5
+axes.titlesize: 9
+xtick.labelsize: 7.5
+ytick.labelsize: 7.5
+legend.fontsize: 7.5
+figure.titlesize: 9.5
+
+axes.linewidth: 0.8
+axes.edgecolor: 222222
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: True
+axes.grid.axis: y
+grid.color: e3e3e3
+grid.linewidth: 0.5
+
+xtick.direction: out
+ytick.direction: out
+xtick.major.width: 0.8
+ytick.major.width: 0.8
+xtick.major.size: 3
+ytick.major.size: 3
+
+lines.linewidth: 1.6
+lines.markersize: 4.0
+errorbar.capsize: 2.0
+
+legend.frameon: False
+
+savefig.format: png
+savefig.bbox: tight
+savefig.pad_inches: 0.03
+savefig.dpi: 300
+
+axes.prop_cycle: cycler('color', ['000000', 'E69F00', '56B4E9', '009E73', 'F0E442', '0072B2', 'D55E00', 'CC79A7'])
+
+image.cmap: viridis

@@ -253,9 +253,6 @@ and it completes in well under a minute on one GPU.
      compute: [psnr, ssim]
      train_metric_interval: 6
 
-   checkpoint:
-     checkpoint_dir: experiments/results/my_first_run/checkpoints
-
 What these keys do
 ------------------
 
@@ -351,11 +348,6 @@ What these keys do
    inside your iteration budget — the pipeline says so explicitly when it is
    not.
 
-``checkpoint.checkpoint_dir``
-   Keeps checkpoints inside the run directory. Without it they are written to
-   ``./checkpoints``, outside the run, where an artifact bundle will not collect
-   them.
-
 Every key, with its default and its type, is in
 :doc:`config_schema_reference`.
 
@@ -381,7 +373,7 @@ A clean run ends like this:
 .. code-block:: text
 
    ✅ [strategy_class_matches_training_mode] strategy_class and training_mode agree
-   ✅ [validation_metric_names_resolve] all 1 validation/selector name(s) resolve (strategy ReconstructionTrainingStrategy)
+   ✅ [validation_metric_names_resolve] all 1 selector name(s) resolve (strategy ReconstructionTrainingStrategy)
    ✅ [tier2_probe_accelerated] Tier-2 probe runs accelerated on cuda (source=run.device).
    ✅ [tier2_probe] complex_unet: forward (1, 2, 256, 256) -> (1, 2, 256, 256) + backward OK on cuda.
 
@@ -471,8 +463,8 @@ The run finishes with a summary line, and everything it produced lands under
 ``training.output_dir``:
 
 =========================  ==================================================
-``checkpoints/``           ``checkpoint_epoch_<E>_step_<S>.pt``; a
-                           ``checkpoint_best.pt`` appears once more than one
+``checkpoints/``           ``step_<NNNNNNNN>.safetensors``; a
+                           ``best.safetensors`` appears once more than one
                            validation event has been scored
 ``logs/``                  ``training_metrics.csv`` and
                            ``validation_metrics.csv``
@@ -535,12 +527,12 @@ Predict with the trained model
 .. code-block:: bash
 
    spectramr infer \
-       --checkpoint experiments/results/my_first_run/checkpoints/checkpoint_epoch_<E>_step_<S>.pt \
+       --checkpoint experiments/results/my_first_run/checkpoints/step_<NNNNNNNN>.safetensors \
        --input <directory of input volumes> \
        --output output/my_first_run
 
 ``ls`` the ``checkpoints/`` directory and substitute the file you want.
-A ``checkpoint_best.pt`` is written there instead once more than one
+A ``best.safetensors`` is written there too once more than one
 validation event has been scored.
 
 ``--config`` is optional here: the checkpoint's run directory carries

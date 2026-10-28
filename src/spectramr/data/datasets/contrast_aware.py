@@ -19,6 +19,9 @@ from typing import Literal
 import torch
 import torchio as tio
 
+from spectramr.data.batch_types import TargetlessSampleError
+from spectramr.data.datasets.field_strength_pair import stamp_field_strength_pair
+
 logger = logging.getLogger(__name__)
 
 from spectramr.data.transforms.mri_transforms import ULFNoiseGate
@@ -419,6 +422,7 @@ class ContrastAwarePairedDataset(torch.utils.data.Dataset):
         max_skip_attempts: int = 10,
         bidirectional_mode: str = "ulf_to_hf",
         allow_unpaired: bool = False,
+        expose_field_strength_pair: bool = False,
     ):
         """Initialize contrast-aware paired dataset.
 
@@ -436,9 +440,9 @@ class ContrastAwarePairedDataset(torch.utils.data.Dataset):
                 When ``'hf_to_ulf'``, the builder swaps primary/target paths so
                 that HF volumes become the network input.
             allow_unpaired: When True, samples without a ``target_path`` are
-                included as inference-only subjects (no ``'target'`` key).
-                Should be True for validation splits where unpaired ULF subjects
-                exist.
+                included as inference-only subjects (no ``'target'`` key,
+                ``has_target`` False). When False, such a record raises
+                :class:`TargetlessSampleError`.
         """
         self.index = index
         self.transform = transform
@@ -468,6 +472,7 @@ class ContrastAwarePairedDataset(torch.utils.data.Dataset):
                 "dataset_type: nifti_paired."
             )
         self._swap = bidirectional_mode == "hf_to_ulf"
+        self.expose_field_strength_pair = expose_field_strength_pair
 
         # Track skipped samples
         self._skipped_indices = set()
@@ -520,13 +525,19 @@ class ContrastAwarePairedDataset(torch.utils.data.Dataset):
 
         record = self.index[idx]
 
-        # Skip unpaired records if allow_unpaired is False (belt-and-suspenders)
+        # The index builder owns admission; a target-less record here is its defect, never resampled.
         if not self.allow_unpaired and not record.get("target_path"):
-            next_idx = (idx + 1) % len(self)
-            return self.__getitem__(next_idx, _attempt + 1)
+            raise TargetlessSampleError(
+                f"ContrastAwarePairedDataset record {record.get('file_id', idx)!r} has no "
+                "target_path but this split is paired (allow_unpaired=False): the index "
+                "builder admitted an unpaired record into it."
+            )
 
         # Build subject with contrast-aware normalization (+ optional swap)
         subject = self.builder.build(record, swap=self._swap)
+        subject["has_target"] = torch.tensor("target" in subject)
+        if self.expose_field_strength_pair:
+            stamp_field_strength_pair(subject, record, record, swap=self._swap)
 
         # [CRITICAL] Check for NaN in loaded subject BEFORE transforms
         if self.skip_nan_samples:

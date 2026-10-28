@@ -143,9 +143,7 @@ def line_indices(mask: Tensor, axis: str) -> list[int]:
 #: plausible number describing a partition the loop never produced. It is also
 #: the constructor default, so the exclusion has to be explicit rather than
 #: assumed from the corpus.
-PARTITIONED_REVERSE_MODES: frozenset[str] = frozenset(
-    {"replace_freeze", "replace_freeze_dc", "replace_freeze_dc_t0"}
-)
+PARTITIONED_REVERSE_MODES: frozenset[str] = frozenset({"replace_freeze", "replace_freeze_dc"})
 
 
 def reveal_partition(next_masks: Sequence[Tensor], observed: Tensor) -> list[Tensor]:
@@ -156,12 +154,12 @@ def reveal_partition(next_masks: Sequence[Tensor], observed: Tensor) -> list[Ten
     ``i`` reveals its keying mask minus what is already committed and minus the
     observed support, and the terminal step takes every remaining unobserved
     coefficient. The caller supplies the masks, because which rung keys a step
-    is the reverse mode's decision (``CURRENT_STEP_KEYED_REVERSE_MODES``). Derived from the schedule's masks rather than from a
+    is the reverse mode's decision. Derived from the schedule's masks rather than from a
     sampled trajectory, so it costs ``n`` mask evaluations and no model calls.
 
     An empty plane is meaningful, not a gap: it is a step that reveals nothing,
     which under ``dc_method='hard'`` is exactly the step
-    ``_step_reveals_anything`` skips. Keeping it preserves the index alignment
+    ``RevealPlan.active`` marks inert and skips. Keeping it preserves the index alignment
     with the timestep schedule.
 
     Args:

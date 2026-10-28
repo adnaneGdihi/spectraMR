@@ -33,6 +33,9 @@ from spectramr.infrastructure.physics.data_consistency import (  # noqa: E402
 from spectramr.infrastructure.physics.kan_data_consistency import (  # noqa: E402
     KANAdaptiveDataConsistency,
 )
+from spectramr.infrastructure.physics.wiener_gain_dc import (  # noqa: E402
+    WienerGainDataConsistency,
+)
 
 
 def _layers() -> dict[str, torch.nn.Module]:
@@ -45,6 +48,7 @@ def _layers() -> dict[str, torch.nn.Module]:
         "target_aware_fsdc": TargetAwareFSDC(target_channels=2, center_fraction=0.08),
         "simple": SimpleDataConsistency(method="simple", weight=0.5),
         "kan_adaptive": KANAdaptiveDataConsistency(),
+        "wiener_gain": WienerGainDataConsistency(log_scaled=False, beta=0.5),
     }
 
 

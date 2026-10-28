@@ -79,3 +79,19 @@ def test_learning_curves_all_zero_metric_no_log_warning(tmp_path):
                                    metrics=["val_loss"], log_y=True,
                                    band=False, formats=("pdf",), dpi=150)
     assert res is not None and res.exists()
+
+def test_each_method_reaches_its_panel_under_its_own_names():
+    from spectramr.infrastructure.reporting.metric_names import annotate_frame
+    from spectramr.infrastructure.reporting.plotters._curve_panels import default_panels
+
+    rows = []
+    for step in (10, 20):
+        rows += [
+            {"method": "a", "run_id": "a", "split": "val", "step": step, "metric": "val_psnr", "value": 20.0},
+            {"method": "b", "run_id": "b", "split": "val", "step": step, "metric": "val_psnr_mean", "value": 21.0},
+            {"method": "a", "run_id": "a", "split": "train", "step": step, "metric": "loss", "value": 0.5},
+            {"method": "b", "run_id": "b", "split": "train", "step": step, "metric": "g_total_loss", "value": 0.4},
+        ]
+    panels = {p.title: p for p in default_panels(annotate_frame(pd.DataFrame(rows)))}
+    assert set(panels["psnr"].val["method"]) == {"a", "b"}
+    assert set(panels["loss"].train["method"]) == {"a", "b"}

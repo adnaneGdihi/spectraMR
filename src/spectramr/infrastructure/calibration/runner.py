@@ -32,6 +32,8 @@ from typing import Any
 
 import torch
 
+from spectramr.models.blocks.kspace_geometry_encoding import support_forward_kwargs
+
 from .conformal import ConformalCalibrator
 
 logger = logging.getLogger(__name__)
@@ -138,8 +140,18 @@ class ConformalCalibrationRunner:
             inputs, target = self._unpack(batch)
             inputs = _to_device(inputs, self._device)
             target = target.to(self._device)
-            pred = self._model(inputs)
+            pred = self._predict(inputs)
             yield pred, target
+
+    def _predict(self, inputs: Any) -> Any:
+        """``model(inputs)``, with the measurement's support for a geometry-plane model.
+
+        Such a model raises without ``mask=``; the calibration batch carries only
+        the zero-filled measurement, so its non-zero support is the observation mask.
+        """
+        if not isinstance(inputs, torch.Tensor):
+            return self._model(inputs)
+        return self._model(inputs, **support_forward_kwargs(self._model, inputs))
 
     def _compute_empirical_coverage(self, test_loader: Iterable[Any]) -> float:
         """Average per-batch coverage on the held-out test loader."""
@@ -149,7 +161,7 @@ class ConformalCalibrationRunner:
                 inputs, target = self._unpack(batch)
                 inputs = _to_device(inputs, self._device)
                 target = target.to(self._device)
-                pred = self._model(inputs)
+                pred = self._predict(inputs)
                 coverages.append(self._calibrator.empirical_coverage(pred, target))
         if not coverages:
             return 0.0

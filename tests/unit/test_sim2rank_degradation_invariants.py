@@ -1,4 +1,4 @@
-"""Invariants every degradation axis must satisfy, checked on all 31 at once.
+"""Invariants every degradation axis must satisfy, checked on every registered axis at once.
 
 These are *cross-axis* contracts, deliberately separate from the per-axis physics
 assertions in ``tests/unit/infrastructure/physics/test_digital_twin_extensions.py``.
@@ -46,13 +46,26 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (  # noqa: E402
+from spectramr.infrastructure.physics.degradations import (  # noqa: E402
     DEGRADATION_REGISTRY,
+    AcquisitionGeometry,
+    AcquisitionMode,
     apply_degradation,
     is_phase_only,
 )
+from spectramr.infrastructure.physics.degradations.declarations import (  # noqa: E402
+    DECLARED_PHYSICAL_FOV_MM,
+)
+from spectramr.infrastructure.physics.degradations.registry_queries import (  # noqa: E402
+    requirement_free_degradations,
+    slice_capable_degradations,
+)
 
-ALL_AXES = sorted(DEGRADATION_REGISTRY)
+# This harness feeds a single-coil 2-D phantom: volume-only and multi-coil axes are covered by
+# their own mode-rejection and coil-stack tests under degradations/catalogue/.
+ALL_AXES = sorted(
+    set(slice_capable_degradations()) & set(requirement_free_degradations())
+)
 
 #: Severity grid sim2rank actually sweeps: ``theta in [1/T, 1]``.
 THETA_GRID = np.linspace(0.125, 1.0, 8)
@@ -95,12 +108,23 @@ def _severity(
     return float(((a - b).abs() ** 2).sum() / denom)
 
 
+def _geometry(axis: str, x: torch.Tensor) -> AcquisitionGeometry | None:
+    """A declared FOV-dependent axis is measured on a phantom of its physical size."""
+    fov = DECLARED_PHYSICAL_FOV_MM.get(axis)
+    if fov is None:
+        return None
+    voxel = (5.0, fov / x.shape[-2], fov / x.shape[-1])
+    return AcquisitionGeometry(mode=AcquisitionMode.SLICE_2D, voxel_mm=voxel)
+
+
 def _severity_curve(axis: str, *, seed: int, scale: float = 1.0) -> list[float]:
     x = _phantom() * scale
-    po = is_phase_only(axis)
+    po, geometry = is_phase_only(axis), _geometry(axis, x)
     return [
         _severity(
-            x, apply_degradation(axis, x.clone(), float(t), seed=seed), phase_only=po
+            x,
+            apply_degradation(axis, x.clone(), float(t), seed=seed, geometry=geometry),
+            phase_only=po,
         )
         for t in THETA_GRID
     ]
@@ -158,10 +182,7 @@ def test_only_a_declared_magnitude_operator_may_discard_phase(axis: str) -> None
     Pinned as a set equality, not a per-axis exemption, so *adding* a phase-dropping
     axis fails here rather than being discovered in a reconstruction three layers up.
     """
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
-        MAGNITUDE,
-        affected_components,
-    )
+    from spectramr.infrastructure.physics.degradations import MAGNITUDE, affected_components
 
     out = apply_degradation(axis, _phantom().clone(), 0.5, seed=0)
     if axis in _MAGNITUDE_VALUED_AXES:
@@ -368,9 +389,9 @@ def test_declared_severity_params_resolve_and_are_finite(axis: str) -> None:
     ``DegradationSpec.severity``; an axis whose ``value_at`` returns NaN, or whose
     endpoints coincide, renders a flat curve that says nothing about the physics.
     """
-    from spectramr.infrastructure.physics.digital_twin_extensions import _SEVERITY
+    from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
-    spec = _SEVERITY[axis]
+    spec = DEGRADATION_REGISTRY[axis].severity
     assert spec.params, f"{axis} declares no physical severity parameter"
     for param in spec.params:
         lo, hi = param.value_at(0.0), param.value_at(1.0)

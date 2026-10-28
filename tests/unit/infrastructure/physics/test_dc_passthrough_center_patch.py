@@ -88,7 +88,7 @@ def test_none_measured_is_noop():
 def test_cross_contrast_channel_alignment():
     """For cross-contrast layouts, ``measured`` carries source+target
     while ``x_out`` is target-only. The helper must align to LAST C
-    channels (matching the convention in `_slice_to_target_contrast_single`)."""
+    channels."""
     # x_out has 4 channels (target); measured has 8 (source||target)
     x_out = torch.zeros(1, 4, 8, 8, dtype=torch.complex64)
     measured = torch.zeros(1, 8, 8, 8, dtype=torch.complex64)

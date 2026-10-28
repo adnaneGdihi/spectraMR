@@ -170,3 +170,14 @@ def test_disabling_both_terms_raises() -> None:
     """A guard that is identically zero is a declared mechanism that cannot fire."""
     with pytest.raises(ValueError, match="cannot fire"):
         JacobianAnatomyLoss(fold_weight=0.0, volume_weight=0.0)
+
+
+def test_zero_signal_pixels_in_a_multichannel_input_keep_the_gradient_finite() -> None:
+    """RSS over channels is sqrt(0) at an all-zero pixel, whose derivative is infinite."""
+    torch.manual_seed(0)
+    pred = torch.rand(1, 2, 24, 24)
+    pred[:, :, :6, :] = 0.0
+    pred.requires_grad_(True)
+    JacobianAnatomyLoss()(pred, torch.rand(1, 2, 24, 24)).backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()

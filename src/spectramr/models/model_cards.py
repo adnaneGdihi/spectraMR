@@ -7,6 +7,7 @@ including performance metrics, training details, and usage guidelines.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ import torch
 import yaml
 
 from spectramr.shared.utils.safe_io import safe_torch_load
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

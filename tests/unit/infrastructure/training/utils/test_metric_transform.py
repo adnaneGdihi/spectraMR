@@ -12,6 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from spectramr.infrastructure.training.utils.metric_transform import (
     IMPLEMENTED_METRIC_TRANSFORMS,
@@ -354,3 +355,51 @@ class TestCorpusResolves:
             canonical_metric_transform(raw) for _, _, raw in self._undispatchable()
         } - self.DEAD_SPELLINGS
         assert not novel, f"unknown transform spellings appeared: {sorted(novel)}"
+
+
+class TestTheAsymmetricTargetTransform:
+    """``ifft_target_magnitude``: an image prediction against a k-space target (#2325)."""
+
+    @staticmethod
+    def _blob_kspace(coils: int = 2, size: int = 32) -> tuple[torch.Tensor, tuple[int, int]]:
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        image = torch.zeros(1, coils, size, size, dtype=torch.complex64)
+        peak = (size // 4, 3 * size // 4)
+        image[:, :, peak[0], peak[1]] = 1.0 + 0.5j
+        kspace = fft2c(image)
+        interleaved = torch.empty(1, 2 * coils, size, size)
+        interleaved[:, 0::2], interleaved[:, 1::2] = kspace.real, kspace.imag
+        return interleaved, peak
+
+    def test_the_target_returns_to_the_image_where_its_peak_is(self):
+        from spectramr.infrastructure.training.utils.metric_transform import kspace_rss_magnitude
+
+        kspace, peak = self._blob_kspace()
+        image = kspace_rss_magnitude(kspace)
+        assert image.shape == (1, 1, 32, 32)
+        flat = int(image.reshape(-1).argmax())
+        assert (flat // 32, flat % 32) == peak
+
+    def test_the_prediction_keeps_its_own_domain(self):
+        from spectramr.infrastructure.training.utils.metric_transform import image_magnitude
+
+        pred = torch.tensor([[[[3.0]], [[4.0]]]])
+        assert torch.allclose(image_magnitude(pred), torch.tensor([[[[5.0]]]]))
+
+    def test_an_uninterleavable_target_raises(self):
+        from spectramr.infrastructure.training.utils.metric_transform import kspace_rss_magnitude
+
+        with pytest.raises(ValueError, match="interleaved"):
+            kspace_rss_magnitude(torch.randn(1, 3, 8, 8))
+
+    def test_it_is_dispatchable(self):
+        assert "ifft_target_magnitude" in IMPLEMENTED_METRIC_TRANSFORMS
+
+
+def test_sense_magnitude_is_dispatchable() -> None:
+    """Its dispatcher branch is exercised in ``test_metrics_mixin``; a name in the
+    set with no branch would pass ``is_implemented`` and return the tensors raw."""
+    assert "sense_magnitude" in IMPLEMENTED_METRIC_TRANSFORMS
+    resolution = resolve_metric_transform(caller_override="SENSE_magnitude")
+    assert resolution.name == "sense_magnitude" and resolution.is_implemented

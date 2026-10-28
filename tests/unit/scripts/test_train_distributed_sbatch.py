@@ -526,3 +526,12 @@ def test_the_repo_still_has_the_launcher_where_the_docs_say() -> None:
     # (skip); a launcher that MOVED is the defect this test exists for, and it
     # must still fail loudly in any tree that is not the export.
     assert os.access(require_repo_file(_SBATCH_REL), os.R_OK)
+
+
+def test_the_default_request_pins_no_gpu_type() -> None:
+    """The clusters mix Ada and V100 nodes, and a gres type name is cluster-specific:
+    ``--gres=gpu:ada:1`` was rejected outright on a V100-only one."""
+    text = Path("scripts/training/train_distributed.sbatch").read_text()
+    directives = [line for line in text.splitlines() if line.startswith("#SBATCH")]
+    assert "#SBATCH --gpus=1" in directives
+    assert not [d for d in directives if "--gres=" in d]

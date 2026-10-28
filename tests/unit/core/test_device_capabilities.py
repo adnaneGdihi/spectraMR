@@ -217,3 +217,30 @@ class TestProbeFallsBackToTheDeclaredTarget:
         from spectramr.core.device_capabilities import probe_device_capabilities
 
         assert isinstance(probe_device_capabilities("cpu", environ={}), DeviceCapabilities)
+
+
+class TestCapabilityOfDevice:
+    """The DeepCompile / torch.compile GPU-family gate reads this rank's device."""
+
+    def test_a_cpu_device_has_no_capability(self):
+        from spectramr.core.device_capabilities import capability_of_device
+
+        assert capability_of_device("cpu") is None
+
+    def test_the_device_index_is_probed_not_index_zero(self, monkeypatch):
+        """On a multi-rank node index 0 is rank 0's GPU, not this rank's."""
+        import torch
+
+        import spectramr.core.device_capabilities as mod
+
+        seen = []
+        monkeypatch.setattr(mod, "_probe_capability", lambda index: seen.append(index) or (6, 0))
+        assert mod.capability_of_device(torch.device("cuda", 3)) == (6, 0)
+        assert mod.capability_of_device("cuda:2") == (6, 0)
+        assert seen == [3, 2]
+
+    def test_a_p100_record_has_no_compile_backend(self):
+        """Provenance and the decision use one rule: sm_60 cannot compile."""
+        caps = build_capabilities("cuda", (6, 0), triton=True, source="probe")
+        assert caps.compile_backend is None
+        assert "compile_backend" in caps.incomplete

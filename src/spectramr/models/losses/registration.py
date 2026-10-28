@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,65 +19,48 @@ class LocalCrossCorrelationLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{LCC} = - \\mathbb{E} \\left[ \frac{\text{Cov}(\\hat{y}, y)^2}{\text{Var}(\\hat{y}) \text{Var}(y) + \\epsilon} \right]"""
+        \\mathcal{L}_{LCC} = - \\mathbb{E} \\left[ \\frac{\\text{Cov}(\\hat{y}, y)^2}{\\text{Var}(\\hat{y}) \\text{Var}(y) + \\epsilon} \\right]"""
 
-    def __init__(self, kernel_size=9):
+    def __init__(self, kernel_size: int = 9) -> None:
         """__init__.
 
         Args:
-            kernel_size (Any): Description.
+            kernel_size: Side of the square local window.
         """
         super().__init__()
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
 
-    def forward(self, I, J):
-        # I: Corrected 64mT, J: Target 3T
-        # Window filtering
-        """forward.
+    def forward(
+        self, prediction: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        """Negative mean local NCC^2 between ``prediction`` and ``target``.
 
         Args:
-            I (Any): Description.
-            J (Any): Description.
-        Returns:
-            Any: Description.
+            prediction: ``(B, C, H, W)`` image (e.g. the corrected 64 mT scan).
+            target: ``(B, C, H, W)`` reference (e.g. the 3 T scan).
 
-        forward method for LocalCrossCorrelationLoss.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            I (torch.Tensor, shape (B, C, H, W) [inferred]): Expected input tensor.
-            J (torch.Tensor, shape (B, C, H, W) [inferred]): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor with shape matching the operation.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        win = torch.ones(1, 1, self.kernel_size, self.kernel_size).to(I.device) / (
-            self.kernel_size**2
+        Each channel is windowed independently (depthwise conv) and the local
+        statistics are averaged over channels, so ``C > 1`` is supported.
+        """
+        channels = prediction.shape[1]
+        k = self.kernel_size
+        win = torch.full(
+            (channels, 1, k, k), 1.0 / (k * k), device=prediction.device, dtype=prediction.dtype
         )
 
-        I2 = I * I
-        J2 = J * J
-        IJ = I * J
+        def _local_mean(x: torch.Tensor) -> torch.Tensor:
+            return F.conv2d(x, win, padding=self.padding, groups=channels)
 
-        I_sum = F.conv2d(I, win, padding=self.padding)
-        J_sum = F.conv2d(J, win, padding=self.padding)
-        I2_sum = F.conv2d(I2, win, padding=self.padding)
-        J2_sum = F.conv2d(J2, win, padding=self.padding)
-        IJ_sum = F.conv2d(IJ, win, padding=self.padding)
+        mean_p = _local_mean(prediction)
+        mean_t = _local_mean(target)
+        cross = _local_mean(prediction * target) - mean_p * mean_t
+        # Var = E[X^2] - E[X]^2 can dip a few ULP below zero; clamp so the
+        # denominator cannot flip sign near flat regions.
+        var_p = (_local_mean(prediction * prediction) - mean_p * mean_p).clamp_min(0.0)
+        var_t = (_local_mean(target * target) - mean_t * mean_t).clamp_min(0.0)
 
-        cross = IJ_sum - I_sum * J_sum
-        # Var = E[X^2] - E[X]^2 is non-negative analytically, but can dip a few
-        # ULP below zero from float round-off. Clamp so the denominator cannot
-        # flip sign (a negative I_var with positive J_var would make the loss
-        # explode / go NaN near flat regions).
-        I_var = (I2_sum - I_sum * I_sum).clamp_min(0.0)
-        J_var = (J2_sum - J_sum * J_sum).clamp_min(0.0)
-
-        cc = cross * cross / (I_var * J_var + 1e-5)
+        cc = cross * cross / (var_p * var_t + 1e-5)
         return -1.0 * torch.mean(cc)
 
 
@@ -85,28 +70,18 @@ class SmoothnessLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{Smoothness} = \frac{1}{2} (\\mathbb{E}[|\nabla_x v|] + \\mathbb{E}[|\nabla_y v|])"""
+        \\mathcal{L}_{Smoothness} = \\frac{1}{2} (\\mathbb{E}[|\nabla_x v|] + \\mathbb{E}[|\nabla_y v|])"""
 
-    def forward(self, flow):
-        """forward.
-
-        Args:
-            flow (Any): Description.
-        Returns:
-            Any: Description.
-
-        forward method for SmoothnessLoss.
-
-        Executes PyTorch tensor operations.
+    def forward(
+        self, flow: torch.Tensor, target: torch.Tensor | None = None, **kwargs: Any
+    ) -> torch.Tensor:
+        """Mean absolute first difference of ``flow`` along H and W.
 
         Args:
-            flow (torch.Tensor, shape (B, C, H, W) [inferred]): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor with shape matching the operation.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+            flow: ``(B, C, H, W)`` deformation / B0 field.
+            target: Unused; accepted so the registry's ``loss(prediction, target)``
+                call reaches the regulariser instead of raising ``TypeError``.
+        """
         dy = torch.abs(flow[:, :, 1:, :] - flow[:, :, :-1, :])
         dx = torch.abs(flow[:, :, :, 1:] - flow[:, :, :, :-1])
         return (torch.mean(dx) + torch.mean(dy)) / 2.0

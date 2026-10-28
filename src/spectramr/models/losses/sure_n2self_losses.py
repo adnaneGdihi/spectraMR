@@ -32,9 +32,10 @@ References:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from spectramr.models.losses.registry import register_loss
 
@@ -74,7 +75,7 @@ class SURELoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
@@ -88,7 +89,6 @@ class SURELoss(nn.Module):
         if not callable(model):
             raise TypeError("context['model'] must be a callable / nn.Module.")
         sigma2 = self.sigma * self.sigma
-        N = float(prediction.numel() / prediction.shape[0])
         # Data-fit term
         residual = (prediction - y).pow(2).mean()
         residual_total = residual - sigma2  # subtract Nσ²/N = σ² (since we mean over N)
@@ -107,7 +107,7 @@ class SURELoss(nn.Module):
                 b = torch.randint_like(y, 0, 2).mul_(2).sub_(1).to(y.dtype)
             else:
                 b = torch.randn_like(y)
-            pert = model(y + self.epsilon * b)
+            pert: Any = model(y + self.epsilon * b)
             if isinstance(pert, dict):
                 pert = pert.get("output", pert.get("reconstruction"))
                 if pert is None:
@@ -117,7 +117,8 @@ class SURELoss(nn.Module):
             div_sample = (b * (pert - prediction)).mean() / self.epsilon
             div = div + div_sample
         div = div / self.n_samples
-        return residual_total + 2.0 * sigma2 * div
+        out: torch.Tensor = residual_total + 2.0 * sigma2 * div
+        return out
 
 
 @register_loss(
@@ -148,19 +149,23 @@ class Noise2SelfLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None or "j_mask" not in context:
             raise ValueError("Noise2SelfLoss requires context['j_mask'].")
-        mask = context["j_mask"].to(prediction.dtype)
+        real_dtype = prediction.real.dtype if prediction.is_complex() else prediction.dtype
+        mask = context["j_mask"].to(real_dtype)
         while mask.dim() < prediction.dim():
             mask = mask.unsqueeze(0)
-        denom = mask.sum().clamp_min(1.0)
         diff = prediction - target
-        if self.norm == "l1":
-            return (mask * diff.abs()).sum() / denom
-        return (mask * diff.pow(2)).sum() / denom
+        per_element = diff.abs() if self.norm == "l1" else diff.abs().pow(2)
+        # Count the masked ELEMENTS, not the mask's own pixels: a shared [H, W]
+        # J-mask broadcasts over B and C, and dividing by its pixel count alone
+        # scales the loss with the batch size.
+        denom = mask.expand_as(per_element).sum().clamp_min(1.0)
+        out: torch.Tensor = (mask * per_element).sum() / denom
+        return out
 
 
 @register_loss(
@@ -238,7 +243,7 @@ class GSUREKspaceLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         sigma2 = self.sigma * self.sigma
@@ -253,7 +258,3 @@ class GSUREKspaceLoss(nn.Module):
         floor = 2.0 * self.n_coils * sigma2
         nu_hat = torch.sqrt(torch.relu(m * m - floor))
         return 0.5 * (nu - nu_hat).pow(2).mean() / sigma2
-
-
-# Mark F as used to avoid import-removal lints.
-_ = F

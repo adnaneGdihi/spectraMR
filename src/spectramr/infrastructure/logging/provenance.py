@@ -39,6 +39,7 @@ import re
 import socket
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -361,7 +362,14 @@ def count_parameters(model: Any) -> dict[str, Any]:
 
     ``size_mb`` uses each parameter's real ``element_size()`` so mixed-dtype
     models report honestly. Empty dict on any error (e.g. ``model is None``).
+
+    A model whose optimizer groups put its B-spline coefficients on a separate LR
+    also carries the group's record (size, fraction of trainable, ratios) under
+    ``kan_param_group``; it is filled when the optimizer is built (#2105).
     """
+    from spectramr.core.module_utils import unwrap_model
+    from spectramr.models.generators.kan_param_groups import KAN_PARAM_GROUP_PROVENANCE_KEY
+
     try:
         total = 0
         trainable = 0
@@ -374,12 +382,30 @@ def count_parameters(model: Any) -> dict[str, Any]:
                 trainable += n
     except Exception:  # never block training on a parameter count
         return {}
-    return {
+    record: dict[str, Any] = {
         "total": total,
         "trainable": trainable,
         "frozen": total - trainable,
         "size_mb": round(n_bytes / 1024**2, 2),
     }
+    # A parameter-free solver's knobs are its whole configuration (non-negotiable 8).
+    solver = getattr(unwrap_model(model), "solver_record", None)
+    if solver is not None:
+        record["solver"] = dict(solver)
+    kan_group = getattr(unwrap_model(model), "kan_param_group_record", None)
+    if kan_group is not None:
+        record[KAN_PARAM_GROUP_PROVENANCE_KEY] = dict(kan_group)
+    return record
+
+
+def data_split_provenance(pipeline: Any) -> dict[str, Any] | None:
+    """The applied train/val/test partition the data pipeline recorded, or ``None``.
+
+    ``DataPipelineDirector.split_provenance`` (subject ids, record counts and the
+    manifest sha256) is the one owner; this only copies it onto the run record.
+    """
+    stamp = getattr(pipeline, "data_split", None)
+    return dict(stamp) if stamp else None
 
 
 # How far ``describe_dataloader`` will unwrap a dataset looking for the
@@ -889,18 +915,11 @@ def collect_run_provenance(
     # resolved so a run's LR trajectory is reconstructible from provenance alone.
     try:
         from spectramr.infrastructure.training.scheduler_resolution import (
-            resolve_scheduler_spec,
+            resolved_schedule_record,
         )
 
-        opt_cfg = getattr(config, "optimization", None)
-        if opt_cfg is not None:
-            spec = resolve_scheduler_spec(
-                opt_cfg,
-                max_iterations=getattr(getattr(config, "training", None), "max_iterations", None),
-            )
-            record["lr_schedule"] = (
-                spec.as_provenance() if spec is not None else {"scheduler": None}
-            )
+        if getattr(config, "optimization", None) is not None:
+            record["lr_schedule"] = resolved_schedule_record(config)
     except Exception:  # provenance never BLOCKS training; surfaced, not swallowed.
         _logger.debug("scheduler provenance capture failed", exc_info=True)
     # Cold-diffusion supervision regime (pitfall #15c). Both knobs change what the
@@ -930,11 +949,13 @@ def collect_run_provenance(
     # having no caller outside a unit test -- the advertised-but-unwired shape
     # pitfall #16 is about, in the mechanism meant to enforce pitfall #15.
     try:
-        from spectramr.models.losses.weights import build_loss_weight_table
+        from spectramr.models.losses.weights import build_loss_weight_table, declared_list_kwargs
 
         losses_cfg = getattr(config, "losses", None)
         if losses_cfg is not None:
             record["losses"] = build_loss_weight_table(losses_cfg).provenance()
+            # Entry kwargs (e.g. comparison, profile) change the objective without moving a weight.
+            record["losses"]["entry_kwargs"] = declared_list_kwargs(losses_cfg)
     except Exception:  # provenance never BLOCKS training; surfaced, not swallowed.
         _logger.debug("loss-weight provenance capture failed", exc_info=True)
     # Launcher resources (pitfall #15c — when started via ``spectramr launch`` the
@@ -949,6 +970,15 @@ def collect_run_provenance(
             record["launch"] = launch
     except Exception:  # never BLOCKS training; failure surfaced, not swallowed.
         _logger.debug("launch provenance capture failed", exc_info=True)
+    # Whether this array task ran the code and config it was submitted with (#2662).
+    try:
+        from spectramr.core.dispatch_snapshot import resolve_dispatch_snapshot_provenance
+
+        dispatch = resolve_dispatch_snapshot_provenance()
+        if dispatch:
+            record["dispatch_snapshot"] = dispatch
+    except Exception:
+        _logger.warning("dispatch snapshot provenance capture failed", exc_info=True)
     # Run topology (issue: multi-GPU slower than single-GPU). Records the shape
     # the run ACTUALLY had -- ranks, nodes, per-rank CPU share -- plus a
     # ``sources`` map naming the env var each field came from, so a surprising
@@ -1004,17 +1034,36 @@ def worker_provenance(config: Any, topology: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     data_cfg = getattr(config, "data", None)
     if data_cfg is not None:
+        reserved = int(getattr(getattr(data_cfg, "loader", None), "reserved_cores", 0))
         declared = getattr(getattr(data_cfg, "loader", None), "num_workers", None)
         if declared is not None:
-            out["train"] = clamp_worker_count(
-                int(declared), topology, role="train", log=False
+            train = clamp_worker_count(
+                int(declared),
+                topology,
+                role="train",
+                log=False,
+                reserved_cores=reserved,
+            )
+            # Mirrors the director's per-loader rule: torch rejects persistence
+            # with zero workers, so it is the knob AND a non-serial count.
+            persist = bool(getattr(data_cfg.loader, "persistent_workers", False))
+            out["train"] = replace(
+                train, persistent=persist and train.workers > 0
             ).to_dict()
     val_cfg = getattr(config, "validation", None)
-    if val_cfg is not None:
+    if val_cfg is not None and data_cfg is not None:
         declared = getattr(getattr(val_cfg, "loader", None), "num_workers", None)
         if declared is not None:
-            out["val"] = clamp_worker_count(
-                int(declared), topology, role="val", log=False
+            val = clamp_worker_count(
+                int(declared),
+                topology,
+                role="val",
+                log=False,
+                reserved_cores=reserved,
+            )
+            persist = bool(getattr(data_cfg.loader, "persistent_workers", False))
+            out["val"] = replace(
+                val, persistent=persist and val.workers > 0
             ).to_dict()
     return out
 
@@ -1445,6 +1494,7 @@ __all__ = [
     "config_fingerprint",
     "count_parameters",
     "cpu_resources",
+    "data_split_provenance",
     "describe_dataloader",
     "effective_batch_size",
     "format_parallel_line",

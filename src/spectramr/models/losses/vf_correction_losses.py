@@ -12,7 +12,7 @@ import logging
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as _F
+import torch.nn.functional as F
 
 from spectramr.models.losses.registry import register_loss
 
@@ -79,11 +79,11 @@ class GNLConsistencyLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if marker_mask is None or marker_prior is None:
-            return _F.l1_loss(prediction, target)
+            return F.l1_loss(prediction, target)
 
         pred_marker = prediction * marker_mask
         prior_expanded = (marker_prior * marker_mask).expand_as(pred_marker)
-        return self.lambda_gnl * _F.mse_loss(pred_marker, prior_expanded)
+        return self.lambda_gnl * F.mse_loss(pred_marker, prior_expanded)
 
 
 # ======================================================================
@@ -143,7 +143,7 @@ class GhostSuppressionLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if marker_mask is None:
-            return _F.l1_loss(prediction, target)
+            return F.l1_loss(prediction, target)
 
         H = prediction.shape[-2]
         ghost_mask = torch.roll(marker_mask, H // 2, dims=-2)
@@ -220,32 +220,35 @@ class SuperResolutionConsistencyLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if lr_frames is None or shifts is None:
-            return _F.l1_loss(prediction, target)
+            return F.l1_loss(prediction, target)
 
-        N = lr_frames.shape[0]
+        num_frames = lr_frames.shape[0]
         s = self.upscale_factor
         total_loss = torch.tensor(0.0, device=prediction.device)
+        height, width = prediction.shape[-2], prediction.shape[-1]
+        grid_y = torch.linspace(-1, 1, height, device=prediction.device, dtype=prediction.dtype)
+        grid_x = torch.linspace(-1, 1, width, device=prediction.device, dtype=prediction.dtype)
+        base_y, base_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        # With align_corners=True one HR pixel spans 2 / (size - 1) normalised units.
+        step_y = 2.0 / max(height - 1, 1)
+        step_x = 2.0 / max(width - 1, 1)
 
-        for n in range(N):
-            _, C, H, W = prediction.shape
-            grid_y = torch.linspace(-1, 1, H, device=prediction.device)
-            grid_x = torch.linspace(-1, 1, W, device=prediction.device)
-            gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
-            gx = gx + shifts[n, 1] * 2.0 / W
-            gy = gy + shifts[n, 0] * 2.0 / H
+        for n in range(num_frames):
+            gx = base_x + shifts[n, 1] * step_x
+            gy = base_y + shifts[n, 0] * step_y
             grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
 
-            shifted = _F.grid_sample(
+            shifted = F.grid_sample(
                 prediction,
                 grid,
                 mode="bilinear",
                 padding_mode="border",
                 align_corners=True,
             )
-            simulated_lr = _F.avg_pool2d(shifted, kernel_size=s, stride=s)
-            total_loss = total_loss + _F.l1_loss(simulated_lr, lr_frames[n : n + 1])
+            simulated_lr = F.avg_pool2d(shifted, kernel_size=s, stride=s)
+            total_loss = total_loss + F.l1_loss(simulated_lr, lr_frames[n : n + 1])
 
-        return self.lambda_sr * total_loss / N
+        return self.lambda_sr * total_loss / num_frames
 
 
 __all__ = [

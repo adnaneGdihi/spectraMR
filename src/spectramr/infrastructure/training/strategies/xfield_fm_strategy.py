@@ -22,6 +22,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
+
+from .owned_param_groups import add_owned_param_group
 from .reconstruction import ReconstructionTrainingStrategy
 
 logger = logging.getLogger(__name__)
@@ -61,16 +65,30 @@ class _FieldHypernet(nn.Module):
 class XFieldFMStrategy(ReconstructionTrainingStrategy):
     """Cross-field reconstruction with hypernet-driven B0 conditioning."""
 
+    # parallel_compat: The hypernet is a bare group on opt_g, refused under ddp. It is built,
+    # and run, only for a batch that carries field_strength, so whether a rank enters the DDP
+    # construction or forward depends on its batch.
+    parallel_compat = frozenset({"replicated"})
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._hypernet: _FieldHypernet | None = None
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("_hypernet", OWNED_PARAM_GROUP))
 
     def _ensure_hypernet(self, n_channels: int, device: torch.device) -> _FieldHypernet:
         if self._hypernet is None or self._hypernet.n_channels != n_channels:
             self._hypernet = _FieldHypernet(n_channels=n_channels).to(device)
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
-                opt.add_param_group({"params": list(self._hypernet.parameters()), "lr": 1e-4})
+                add_owned_param_group(
+                    self,
+                    opt,
+                    {"params": list(self._hypernet.parameters()), "lr": 1e-4},
+                    owner="its field hypernet",
+                )
             logger.info("[xfield_fm] hypernet attached (channels=%d)", n_channels)
         return self._hypernet
 
@@ -93,8 +111,8 @@ class XFieldFMStrategy(ReconstructionTrainingStrategy):
             return lr_image, forward_kwargs
 
         field = batch["field_strength"]
-        # Native path: generator advertises field_strength kwarg.
-        gen = getattr(self.env, "generator", None)
+        # Native path: generator advertises field_strength kwarg. A dp wrapper hides both reads.
+        gen = unwrap_model(getattr(self.env, "generator", None))
         if gen is not None and self._generator_takes_kwarg(gen, "field_strength"):
             forward_kwargs["field_strength"] = field
             return lr_image, forward_kwargs
@@ -102,8 +120,8 @@ class XFieldFMStrategy(ReconstructionTrainingStrategy):
         # Hypernet path: emit (γ, β) modulation conditioned on B0.
         device = field.device
         n_channels = getattr(gen, "out_channels", None) or 16
-        h = self._ensure_hypernet(n_channels, device)
-        modulation = h(field.float())
+        self._ensure_hypernet(n_channels, device)
+        modulation = self._hypernet(field.float())
         forward_kwargs["hypernet_context"] = field.float()
         forward_kwargs["hypernet_modulation"] = modulation
         return lr_image, forward_kwargs

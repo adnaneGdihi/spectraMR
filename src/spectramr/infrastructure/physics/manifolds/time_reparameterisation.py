@@ -95,9 +95,7 @@ def apply_time_reparam(signal: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     expand = idx_floor.unsqueeze(-1).expand(*idx_floor.shape, 1)
     while expand.dim() < signal.dim():
         expand = expand.unsqueeze(0)
-    left = signal.gather(
-        -1, idx_floor.expand_as(signal[..., :1].expand(-1, T)) if False else idx_floor
-    )
+    left = signal.gather(-1, idx_floor)
     right = signal.gather(-1, (idx_floor + 1).clamp(0, T - 1))
     return (1.0 - frac.squeeze(-1)) * left + frac.squeeze(-1) * right
 

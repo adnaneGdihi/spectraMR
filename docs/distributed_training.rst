@@ -140,6 +140,34 @@ Whether the guard was armed or waived is stamped into provenance as
 ``parallel.declared_allow_idle_devices``, so a 1-rank record on a 4-GPU
 allocation can be told apart from a run made before the check existed.
 
+Collective timeout and rank resolution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``parallel.timeout_seconds`` is passed to ``init_process_group`` (``null`` keeps
+torch's backend default) and stamped into provenance. It is how long peers wait on
+a rank that raised before a collective: the survivors block until it expires, so a
+shorter value turns a silent hang into an error sooner. Raise it only if
+rank-0-only validation or checkpointing legitimately takes longer.
+
+When ``RANK`` is unset but ``WORLD_SIZE`` is declared (a hand-rolled ``srun``
+without ``torchrun``), the rank is read from ``SLURM_PROCID``. Without a declared
+``WORLD_SIZE`` it is not, because ``srun -n N`` then runs N independent jobs.
+
+Under DDP/FSDP/DeepSpeed each loader is rebuilt around a ``DistributedSampler``.
+The rewrap keeps the source loader's generator, timeout, multiprocessing context
+and pin-memory device, refuses a loader built with a custom ``batch_sampler``, and
+logs a warning when it replaces a custom sampler.
+
+The one custom sampler it does not replace is the MRIxFields
+``VolumeBlockedSliceSampler``, whose volume-blocked order is what keeps slice
+expansion affordable. Each rank gets a **static share of the containers**: those
+that share a volume stay together, so a volume is decoded on one rank rather than
+on all of them, and the components are placed greedily to balance sample counts.
+With fewer components than ranks it falls back to splitting single containers. Every
+rank is padded to the longest share by repeating its own samples (as
+``DistributedSampler`` does), because FSDP and ZeRO-3 forwards are collectives and
+ranks that disagree on batch count would hang. More ranks than containers is refused.
+
 Reading what a run actually got
 -------------------------------
 
@@ -165,10 +193,10 @@ block reading ``dtype: bfloat16`` under ``enabled: false`` runs fp32 and
 printing the dtype alone would misreport it.
 
 Emitted from ``log_startup_summary`` (``infrastructure/logging/provenance.py``)
-**before** the container is built, because ``LoggingService.setup`` pushes
-``logging.sinks.level`` onto the root logger, every existing logger and every
-handler -- so on an arm setting ``level: warning`` this is the last point an
-INFO line reaches the console. The same facts are stamped into the provenance
+**before** the container is built, so the summary is printed at the level the
+entry point and the config resolved (see *Console-logging configuration* in
+:doc:`run_provenance_and_logging`); on an arm setting ``level: warning`` it is
+suppressed like every other INFO line. The same facts are stamped into the provenance
 record under ``parallel``, so ``provenance.json`` carries them for runs read
 after the fact.
 
@@ -217,6 +245,12 @@ own ``model.clip_grad_norm_()``, which all-reduces the squared norms first. The
 strategy supplies it, because the strategy is what knows how the model was
 wrapped.
 
+The training loop clips through the strategy's ``_clip_and_log_gradients`` hook,
+which ``AMPPolicy`` prefers to ``policy.clip_gradients``. That hook therefore
+owns the choice too: ``_compute_gradient_norm`` calls the model's own
+``clip_grad_norm_`` when it has one (an FSDP root) and the plain utility
+otherwise.
+
 Installing the step policy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -253,7 +287,6 @@ DeepSpeed
        enabled: true
        zero_stage: 2              # 0 | 1 | 2 | 3
        offload_optimizer: 'none'  # none | cpu | nvme
-       save_consolidated_best: true
 
 Install the extra first (it is deliberately excluded from ``[all]``):
 
@@ -289,6 +322,20 @@ ds_config key                           source
 ``fp16`` / ``bf16``                     ``resolve_amp_precision(...)``
 ``optimizer`` / ``scheduler``           absent -- the engine adopts the built ones
 ======================================  ==========================================
+
+The engine steps the scheduler it adopted, at every accumulation boundary.
+``DeepSpeedStepPolicy.owns_lr_scheduler`` is ``True`` so the training loop does
+not step it a second time; without it the schedule decays at twice the
+configured rate and the run still looks healthy.
+
+**Optimizers under ZeRO.** The engine adopts the optimizer this repo built, and it
+refuses some from *inside* ``deepspeed.initialize``: at ``zero_stage >= 1`` anything
+outside Adam, AdamW and Adagrad (and DeepSpeed's own fused variants) asserts, and
+any ``offload_optimizer`` other than ``none`` raises unless the optimizer is
+``DeepSpeedCPUAdam`` or ``DeepSpeedCPULion``, which this repo does not build. The
+audit reports both as ``deepspeed_optimizer_supported`` so they fail before
+cluster time is spent. ``round_robin_gradients`` is a stage-2 option and is
+refused elsewhere rather than advertised and ignored.
 
 ZeRO-3, DeepCompile and ZenFlow
 -------------------------------
@@ -384,6 +431,55 @@ backend refuses more than one optimizer unless
 for complex+fp16 because there is no ``complex16``. DeepSpeed casts weights to
 half from *inside* the engine, where that guard cannot see it. The audit makes
 this an error; use ``bfloat16``.
+
+Which training strategies run under which backend
+-------------------------------------------------
+
+The parallel wrapper only reaches what is in ``env.models``, and the training
+strategy is built *after* it. A strategy that owns a module outside that dict
+(CycleGAN's second generator, JEPA's predictor), adds a parameter group after the
+optimizer was adopted, or calls a non-forward method on the generator is
+therefore not parallelised the way the config says. Under DDP or ZeRO-0..2 the
+ranks train different copies and nothing errors; under FSDP or ZeRO-3 the call
+reads a shard.
+
+``BaseTrainingStrategy.parallel_compat`` declares the answer, as a subset of two
+tokens (:mod:`spectramr.infrastructure.distributed.strategy_compat`):
+
+.. list-table::
+   :header-rows: 1
+
+   * - Token
+     - Backends
+   * - ``"replicated"``
+     - ``dp``, ``ddp``, DeepSpeed ``zero_stage`` 0-2
+   * - ``"sharded"``
+     - ``fsdp``, DeepSpeed ``zero_stage`` 3
+
+``None`` (the default) is *undeclared*. An undeclared strategy is refused on a
+sharded backend and runs, with an info line, on a replicated one. ``frozenset()``
+means single-process only. A restriction is inherited by subclasses; a
+permission is not, so a subclass redeclares rather than borrowing its parent's
+audit.
+
+The gate runs twice: ``TrainingEnvironmentDirector`` raises before any model is
+built, and ``spectramr audit`` reports it as ``strategy_parallel_compat`` so the
+arm is caught before it is submitted. Currently refused for every parallel
+backend: CycleGAN, CUT, StarGAN v2, JEPA, multi-contrast contrastive, distillation,
+privileged learning, VF consistency distillation, and the strategies that train
+parameters they create themselves and add to ``opt_g`` after the wrap (LOUPE, SCAS,
+PILOT, MRI-SLAM, IB-VF, SpinSDE, XField-FM, Universal, TTO, Teichmuller, Adaptive
+SFC-HSSC, Beltrami, CoordKSpaceGen, CycleBloch, FieldProbeCoupled, GIRFAware,
+Disentangled, PhysicsEquivariantSSL and the multi-stage pipeline). Under DDP each rank
+would train its own copy of those parameters, and DeepSpeed's ZeRO optimizers have no
+``add_param_group`` at all, so the arm would crash on the first step. Reconstruction
+declares both tokens; diffusion declares ``replicated``.
+
+A strategy whose owned parameters exist only under some configuration
+(``model.conditioning.enabled`` via the conditioning mixin, ``uncertainty.enabled`` in
+GeoMamba-ULF, ``uncertainty_weighting`` in the one-shot multi-parameter strategy) is
+left undeclared: the declaration is per class, so the audit cannot tell the two cases
+apart yet.
 
 Compilation is placed per strategy
 ----------------------------------
@@ -575,11 +671,33 @@ and loads with ``strict=True``, so a wrapped checkpoint raises there -- and unde
 nothing, loads nothing, and reports success, so a randomly-initialised model
 produces metrics that read as a bad arm.
 
-DeepSpeed writes a sharded tag *directory*. With
-``save_consolidated_best: true`` (the default) rank 0 additionally writes a
-single-file ``checkpoint_best.pt``, so ``discover_best_checkpoint``, campaign
-evaluation and ``spectramr infer`` keep working without understanding ZeRO shards.
-Turning it off makes the run resume-only, and the audit warns.
+Under FSDP the keys are the smaller problem. ``unwrap_model(generator).state_dict()``
+is the inner module's flat shard views -- a ``(54,)`` slice where an ``(8, 8)``
+weight belongs -- even inside ``FSDP.state_dict_type``, and
+``optimizer.state_dict()`` holds one rank's slice of the Adam moments. Both are
+therefore read through the checkpoint adapter's ``state_io``
+(:mod:`spectramr.infrastructure.distributed.state_io`): the model is gathered on
+the FSDP **root**, and the optimizer goes through ``FSDP.optim_state_dict`` on
+save and ``optim_state_dict_to_load`` on resume. Every one of those calls is
+collective, so every rank enters them in the same order; ``rank0_only`` decides
+who receives the result, never who participates.
+
+Every checkpoint records the topology it was written at (``world_size`` and
+``parallel.strategy``), and a resume at a **different world size is refused**.
+``training.max_iterations`` is a per-rank bound and the LR schedule is indexed by
+iteration, so the same ``global_step`` at 4 ranks has seen 4x the samples it had at 1,
+and the data epoch and shuffle seed (derived from the per-rank loader length) no longer
+line up with what was saved. Set ``checkpoint.allow_world_size_change: true`` to accept
+that deliberately; it is logged as a warning. A checkpoint without the record predates it
+and is accepted, because its world size is unknown rather than different. For DeepSpeed
+the check runs after the sharded restore, which has its own partition-count refusal.
+
+The recorded ``parallel.strategy`` is checked too. ``none``, ``dp`` and ``ddp`` write
+interchangeable checkpoints, but an FSDP checkpoint carries unsharded optimizer state keyed
+by parameter name and a DeepSpeed one carries sharded per-rank state, so a resume that
+swaps in or out of ``fsdp`` or ``deepspeed`` is refused unless
+``checkpoint.allow_parallel_strategy_change: true`` (the weights load; the optimizer state
+may not).
 
 EMA under a wrapper
 -------------------
@@ -598,6 +716,14 @@ advances, and a checkpoint is still written, so every observable stays healthy
 while the shadow holds its random initialisation forever. Measured against a real
 DeepSpeed engine: shadow ``0.weight`` against engine ``module.0.weight``, overlap
 zero, on 75 arms (#2172).
+
+Under FSDP the live generator holds shards, so a key-matched blend also needs
+whole tensors. The loop therefore wraps the update in ``state_io.full_params``
+(``summon_full_params``, which costs an all-gather per EMA update; raise
+``ema.update_frequency`` to amortise it), and validation installs the shadow
+through ``state_io.swap_in``, which loads it the way a checkpoint is loaded and
+restores the live weights on exit. ``summon_full_params`` cannot be held across a
+validation forward, which is why the swap does not use it.
 
 Three consequences worth knowing:
 
@@ -618,39 +744,39 @@ Three consequences worth knowing:
   shape changed mid-forward — raises rather than leaving training on a blend of
   trained and shadow weights.
 
-Reading a consolidated checkpoint back
---------------------------------------
+Checkpoints under DeepSpeed
+---------------------------
 
-That consolidated file is **not** the generic payload. ``save_best`` writes the
-tag directory, calls ``save_16bit_model``, and then *returns* -- so
-``checkpoint_best.pt`` is a bare parameter-keyed ``state_dict`` with no
-``generator``, ``optimizer_g``, ``ema_state`` or ``counter_state`` key. Only
-``save`` writes both artifacts, which is why periodic checkpoints carry that
-metadata and the best checkpoint does not.
+Every save writes two things. The engine's sharded tag directory goes to
+``checkpoints/deepspeed/<model>/step_NNNNNNNN`` (or ``.../best``), and resume reads
+it, so ZeRO optimizer partitions survive. The RunState file beside it,
+``checkpoints/step_NNNNNNNN.<format>`` or ``best.<format>``, carries gathered
+weights: at ZeRO-3 they are consolidated on rank 0 in 16-bit precision, a
+collective every rank enters. Inference, campaign evaluation and warm-starts read
+that file and never need DeepSpeed. The best file carries the EMA shadow at stages
+0-2; at stage 3 the shadow is partitioned and is not saved, and
+``restore_best_weights`` refuses rather than pair the best weights with the last
+EMA.
 
-Restoring it therefore requires the strategy that wrote it.
-:meth:`~spectramr.infrastructure.builders.directors.checkpoint_director.CheckpointDirector.load_from`
-reads the sharded tag directory through the adapter and skips the generic parse
-when the file has no ``generator`` key, and
-:meth:`~spectramr.infrastructure.builders.directors.checkpoint_director.CheckpointDirector.with_parallel_runtime`
-is what supplies that adapter. **A director built without it resolves**
-``DefaultCheckpointAdapter`` **and cannot read any sharded strategy's
-checkpoint** -- which is how ``early_stopping.restore_best_weights`` fails a
-finished DeepSpeed run with ``KeyError('generator')``, discarding the best
-weights while they sit on disk. Every director that saves *or* loads must be
-handed the run's ``ParallelRuntime``.
+``--resume`` goes through :func:`spectramr.infrastructure.checkpointing.resume.resume`,
+which reads both artifacts. It loads the tag directory named by the file's
+``meta.native_tag`` first; the adapter reports which model keys it restored, and
+the weights and optimizer state of exactly those keys are skipped in the RunState
+file. Every other part is still restored from the file: the EMA shadow, the
+scaler, early-stopping state, RNG streams, the LR schedulers and any model that is
+not an engine, such as a plain discriminator beside an engine-wrapped generator.
+Re-loading a handled key would hand the ZeRO stage 1/2 optimizer a dict where it
+indexes a per-rank list, which raised
+``KeyError: 0`` on every resume (#2482). At world size above 1 it would also
+overwrite each rank's optimizer partition with the writer rank's (#1309). The
+schedulers stay on the generic path because the engine restores only a
+scheduler it owns, and a second load of replicated scheduler state changes
+nothing.
 
-Three consequences worth stating. The tag directory is the only source of ZeRO
-optimizer state, so a missing tag is a failed restore and raises rather than
-falling back to the consolidated weights. EMA shadow weights survive neither
-artifact, because ``adopt`` wraps only the generator and discriminator, so
-``ema_state`` reaches the generic payload that ``save_best`` never writes. And
-the tag's ``client_state`` is the only source of the run POSITION -- both writers
-record ``epoch`` and ``global_step`` on every save, so a tag missing them was
-written by another tool or an older version, and ``load_from`` raises instead of
-restoring at epoch 0. That absence cannot be detected by its value: 0 is also a
-legitimate position, so a defaulted read would reset the LR schedule and the
-early-stopping counter of a week-long run while reporting a successful restore.
+At ZeRO stage 3 with EMA enabled, ``--resume`` refuses before loading anything: the
+step file carries only rank 0's partition of the shadow, and loading it would give
+every rank that partition. :doc:`checkpointing` ("ZeRO-3 with EMA") says what to do
+instead.
 
 Who participates vs who writes
 ------------------------------
@@ -686,11 +812,25 @@ files that pass every existence check).
 It is one variable rather than four edited conditions so that the *fifth*
 checkpoint call site inherits the answer instead of silently reintroducing the
 hang. A test walks the loop's AST and fails if any block containing a
-``CheckpointDirector`` gates on ``is_main_process`` alone.
+checkpoint save gates on ``is_main_process`` alone.
 
 ``broadcast_object`` synchronises decisions that must agree across ranks -- the
 early-stopping verdict and the best-checkpoint path -- so ranks cannot diverge
 on whether to stop.
+
+FSDP precision
+--------------
+
+``fsdp.mixed_precision`` is ``bf16`` (default), ``fp16`` or ``null``. ``fp16`` is
+**refused** at config load: it needs a ``ShardedGradScaler``, and the loop builds a
+plain ``GradScaler`` whose per-rank overflow decisions would let shards disagree
+on skipping a step. ``bf16`` needs Ampere or newer; V100 nodes should use ``null``.
+
+Gradients are reduced in ``float32`` and module buffers (BatchNorm running
+statistics) are kept in ``float32``, whatever ``mixed_precision`` is.
+``fsdp.reduce_dtype: match_param`` and ``fsdp.buffer_dtype: match_param`` restore
+the all-half policy, which halves the reduce-scatter traffic and loses gradient
+precision. Both are stamped into the run's provenance.
 
 Reference arms
 --------------

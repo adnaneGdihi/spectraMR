@@ -55,6 +55,7 @@ def _cfg(
     validation_split: float = 0.1,
     holdout_site: str | None = None,
     split_strategy: str = "manifest",
+    dataset_type: str | None = None,
 ) -> Any:
     # The SHARED stub, not a hand-rolled namespace. This one had been migrated
     # for `data.split.*` but not for `data.source.*`, so every reader of
@@ -64,6 +65,7 @@ def _cfg(
     # a hand-written shape does.
     return SimpleNamespace(
         data=DataConfigStub(
+            dataset_type=dataset_type,
             index_path=index_path,
             validation_index_path=validation_index_path,
             split=SimpleNamespace(
@@ -156,9 +158,10 @@ def test_explicit_manifest_absent_files_skipped(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # single-index random — support the random strategy
 # --------------------------------------------------------------------------- #
-def test_single_index_subject_straddle_is_leak(tmp_path: Path) -> None:
-    # split_index holds out the LAST n_val records. A subject whose records
-    # straddle that boundary leaks across train/val.
+def test_single_index_keeps_a_straddling_subject_on_one_side(tmp_path: Path) -> None:
+    # A by-file split held out the LAST n_val records, so s2 landed on both sides
+    # (the 49-subject leak on the fastMRI knee HSSC arms). The split is grouped
+    # on the subject now, and the audit replays that split.
     idx = tmp_path / "idx.json"
     recs = [
         _rec("s0", field=1.5),
@@ -170,9 +173,41 @@ def test_single_index_subject_straddle_is_leak(tmp_path: Path) -> None:
     rep = analyze_split_leakage(
         _cfg(index_path=str(idx), validation_split=0.25, split_strategy="random")
     )
-    assert rep.status == "leak"
+    assert rep.status == "clean"
     assert rep.mode == "single_index"
-    assert "s2" in rep.overlap
+
+
+def test_a_self_indexed_creator_keeps_a_straddling_subject_on_one_side(
+    tmp_path: Path,
+) -> None:
+    # npy_slice builds and splits its own index; it now groups on the subject too,
+    # and the audit replays that split.
+    idx = tmp_path / "idx.json"
+    recs = [
+        _rec("s0", field=1.5),
+        _rec("s1", field=1.5),
+        _rec("s2", field=1.5),
+        _rec("s2", field=3.0),
+    ]
+    _write_manifest(idx, recs)
+    rep = analyze_split_leakage(
+        _cfg(
+            index_path=str(idx),
+            validation_split=0.25,
+            split_strategy="random",
+            dataset_type="npy_slice",
+        )
+    )
+    assert rep.status == "clean"
+
+
+def test_single_index_with_one_subject_is_skipped_not_raised(tmp_path: Path) -> None:
+    idx = tmp_path / "idx.json"
+    _write_manifest(idx, [_rec("s0"), _rec("s0", field=3.0)])
+    rep = analyze_split_leakage(
+        _cfg(index_path=str(idx), validation_split=0.2, split_strategy="random")
+    )
+    assert rep.status == "skipped"
 
 
 def test_single_index_clean_when_subjects_contiguous(tmp_path: Path) -> None:
@@ -367,3 +402,61 @@ def test_held_out_absent_manifest_is_skipped(tmp_path: Path) -> None:
         _held_out_cfg(str(train), None, str(tmp_path / "missing.json"))
     )
     assert rep.status == "skipped" and "not present locally" in rep.detail
+
+
+def _scan(subject: str, ses: str) -> dict:
+    return {
+        "subject_id": subject,
+        "primary_path": f"/data/sub-{subject}/ses-{ses}/anat/input.nii.gz",
+        "file_id": f"sub-{subject}_ses-{ses}",
+    }
+
+
+def test_partition_leakage_clean_when_subjects_are_disjoint():
+    from spectramr.data.split_leakage import partition_leakage_report
+
+    report = partition_leakage_report(
+        [_scan("01", "01"), _scan("01", "02")],
+        [_scan("02", "01"), _scan("02", "02")],
+        [_scan("03", "01")],
+    )
+    assert report.status == "clean"
+
+
+def test_partition_leakage_flags_subject_in_two_splits():
+    from spectramr.data.split_leakage import partition_leakage_report
+
+    report = partition_leakage_report(
+        [_scan("01", "01"), _scan("02", "01")],
+        [_scan("02", "02")],
+        [_scan("03", "01")],
+    )
+    assert report.status == "leak"
+    assert "02" in report.overlap
+
+
+def test_partition_leakage_flags_repeat_scan_straddling_the_boundary():
+    """ses-01 in train and ses-02 in validation are different files of one subject."""
+    from spectramr.data.split_leakage import partition_leakage_report
+
+    report = partition_leakage_report(
+        [_scan("05", "01"), _scan("06", "01")],
+        [_scan("05", "02")],
+        [_scan("07", "01")],
+    )
+    assert report.status == "leak"
+    assert report.key_kind == "subject"
+    assert "05" in report.overlap
+
+
+def test_partition_leakage_flags_test_overlapping_validation():
+    from spectramr.data.split_leakage import partition_leakage_report
+
+    report = partition_leakage_report(
+        [_scan("01", "01")],
+        [_scan("07", "01")],
+        [_scan("07", "02")],
+    )
+    assert report.status == "leak"
+    assert "held-out test" in report.detail
+    assert "07" in report.overlap

@@ -2,7 +2,7 @@
 
 Tests cover the documented contracts of each cheaply-constructable IService
 implementation:
-  - LoggingService / ComprehensiveLoggingService
+  - LoggingService
   - MetricsTracker
   - EarlyStoppingService
   - IterationCounterService
@@ -11,7 +11,7 @@ implementation:
   - RDPAccountant (pure class, no IO)
 
 Services requiring real cluster IO, GPU, or heavy third-party deps (e.g.
-checkpoint_service with real filesystem checkpoints, coil_sensitivity_service
+the checkpoint store with real filesystem checkpoints, coil_sensitivity_service
 needing CUDA, pipeline_execution_service with full DI) are skipped with an
 explicit reason.
 """
@@ -270,7 +270,7 @@ def _make_es_config(**kwargs):
     """Build a minimal EarlyStoppingConfigSchema."""
     from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
 
-    defaults = dict(enabled=True, patience=3, metric="val_loss", min_delta=0.0, check_interval=1)
+    defaults = {"enabled": True, "patience": 3, "metric": "val_loss", "min_delta": 0.0}
     defaults.update(kwargs)
     return EarlyStoppingConfigSchema(**defaults)
 
@@ -412,16 +412,6 @@ class TestEarlyStoppingService:
             "should_stop",
         ):
             assert key in state, f"missing state key: {key}"
-
-    @pytest.mark.unit
-    def test_should_check_interval(self) -> None:
-        from spectramr.infrastructure.services.early_stopping import EarlyStoppingService
-
-        cfg = _make_es_config(enabled=True, check_interval=100)
-        svc = EarlyStoppingService(cfg)
-        assert svc.should_check(100)
-        assert not svc.should_check(99)
-        assert not svc.should_check(0)
 
 
 # ---------------------------------------------------------------------------

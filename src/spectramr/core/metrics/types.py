@@ -149,20 +149,25 @@ class ValidationMetricsConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "ValidationMetricsConfig":
-        """Create from dictionary config."""
-        if d is None:
-            # Default configuration
+        """Create from dictionary config.
+
+        Only an undeclared metric set gets the PSNR/SSIM/MSE default: ``d`` is
+        ``None`` or carries no ``metrics`` value. A declared set is taken as
+        written, so an empty one builds a computer with no metrics (#2839).
+        """
+        if d is None or d.get("metrics") is None:
             return cls(
                 metrics=[
                     MetricSpec.from_name("psnr"),
                     MetricSpec.from_name("ssim"),
                     MetricSpec.from_name("mse"),
                 ],
-                primary_metric="psnr",
+                primary_metric=(d or {}).get("primary_metric", "psnr"),
+                compute_all_available=(d or {}).get("compute_all_available", False),
             )
 
         metrics = []
-        metrics_config = d.get("metrics", [])
+        metrics_config = d["metrics"]
 
         if isinstance(metrics_config, dict):
             # Handler for dict of booleans: {"psnr": True, "ssim": False}
@@ -178,14 +183,6 @@ class ValidationMetricsConfig:
                 elif isinstance(m, dict):
                     # Full metric spec: {"name": "psnr", "weight": 2.0}
                     metrics.append(MetricSpec.from_dict(m))
-
-        # If no metrics specified, use defaults
-        if not metrics:
-            metrics = [
-                MetricSpec.from_name("psnr"),
-                MetricSpec.from_name("ssim"),
-                MetricSpec.from_name("mse"),
-            ]
 
         return cls(
             metrics=metrics,

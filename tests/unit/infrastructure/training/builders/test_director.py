@@ -214,3 +214,46 @@ class TestCompileIsPlacedNotFixed:
         )
 
         assert "compile" in {f.name for f in dataclasses.fields(TrainingEnvironment)}
+
+
+class TestParallelCompatGate:
+    """A refused strategy x backend fails before any model is built."""
+
+    @staticmethod
+    def _director(mode: str, strategy: str) -> TrainingEnvironmentDirector:
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.base import ParallelismConfigSchema
+
+        director = object.__new__(TrainingEnvironmentDirector)
+        director._config = SimpleNamespace(
+            parallel=ParallelismConfigSchema(strategy=strategy),
+            training=SimpleNamespace(strategy_class=None, training_mode=mode),
+        )
+        director._device = torch.device("cpu")
+        return director
+
+    def test_planted_owned_module_strategy_is_refused(self) -> None:
+        import pytest
+
+        with pytest.raises(RuntimeError, match="MRISLAMStrategy"):
+            self._director("mri_slam", "ddp")._enforce_parallel_compat()
+
+    def test_single_process_is_never_gated(self) -> None:
+        self._director("mri_slam", "none")._enforce_parallel_compat()
+
+    def test_an_unresolvable_strategy_is_left_to_create_strategy(self) -> None:
+        self._director("no_such_strategy", "ddp")._enforce_parallel_compat()
+
+    def test_build_environment_refuses_before_building_any_model(self) -> None:
+        import pytest
+
+        director = self._director("mri_slam", "ddp")
+        with (
+            patch(
+                "spectramr.infrastructure.training.builders.director.ModelBuilder"
+            ) as model_builder,
+            pytest.raises(RuntimeError, match="parallel_compat"),
+        ):
+            director.build_environment()
+        model_builder.assert_not_called()

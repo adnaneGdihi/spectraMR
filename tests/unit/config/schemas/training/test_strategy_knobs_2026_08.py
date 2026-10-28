@@ -91,8 +91,8 @@ STRATEGY_FALLBACKS = [
     ("privileged", "beta", 0.5),
     ("privileged", "delta", 0.1),
     ("privileged", "curriculum_tau0", 5.0),
-    ("privileged", "n_min", 0.0),
-    ("privileged", "n_max", 1.0),
+    ("privileged", "min_keep_fraction", 0.0),
+    ("privileged", "initial_keep_fraction", 1.0),
     ("privileged", "disc_hidden_dim", 128),
     ("dtn2s", "receptive_window", 8),
 ]

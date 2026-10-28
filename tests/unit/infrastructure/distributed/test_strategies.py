@@ -26,13 +26,13 @@ from spectramr.infrastructure.distributed.strategies import (
 )
 
 
-def _ctx(*, save_consolidated_best: bool = True, world_size: int = 1):
+def _ctx(*, world_size: int = 1):
     return SimpleNamespace(
         config=None,
         device="cpu",
         world_size=world_size,
         parallel=SimpleNamespace(
-            deepspeed=SimpleNamespace(save_consolidated_best=save_consolidated_best),
+            deepspeed=SimpleNamespace(),
             sync_batch_norm=False,
         ),
     )
@@ -64,35 +64,21 @@ class TestCheckpointAdapterPerStrategy:
             assert plugin.checkpoint_adapter(_ctx()).requires_all_ranks is True
 
 
-class TestSaveConsolidatedBestIsRead:
-    """The knob is read HERE and nowhere else (pitfall #15).
-
-    ``build_deepspeed_config`` correctly omits it -- it is a spectramr concern,
-    not a DeepSpeed key -- so anything reconstructing the adapter from the
-    rendered ds_config in provenance would silently see the default and the
-    knob would be validated, stamped, and inert.
-    """
-
-    def test_true_propagates(self) -> None:
-        adapter = DeepSpeedStrategy().checkpoint_adapter(
-            _ctx(save_consolidated_best=True)
-        )
-        assert adapter.save_consolidated_best is True
-
-    def test_false_propagates(self) -> None:
-        adapter = DeepSpeedStrategy().checkpoint_adapter(
-            _ctx(save_consolidated_best=False)
-        )
-        assert adapter.save_consolidated_best is False
+class TestTheRetiredKnobStaysOut:
+    """The knob is retired; it must not come back as a DeepSpeed key either."""
 
     def test_it_is_not_a_deepspeed_config_key(self) -> None:
-        """If it ever became one, provenance would carry it and the reader
-        above could quietly move -- back to reading a default."""
+        """If it came back as one, the rendered ds_config would carry a key nothing reads."""
         from spectramr.infrastructure.distributed.deepspeed_backend.config_builder import (
             DERIVED_KEYS,
         )
 
         assert "save_consolidated_best" not in DERIVED_KEYS
+
+    def test_the_adapter_takes_no_knob(self) -> None:
+        adapter = DeepSpeedStrategy().checkpoint_adapter(_ctx())
+        assert isinstance(adapter, DeepSpeedCheckpointAdapter)
+        assert not hasattr(adapter, "save_consolidated_best")
 
 
 class TestWrapOrderingIsEncoded:
@@ -185,3 +171,32 @@ def test_the_flag_agrees_with_the_require_process_group_call_sites():
         f"drift: classes calling _require_process_group={sorted(callers)} but "
         f"classes setting requires_process_group=True={sorted(flagged)}"
     )
+
+
+class TestTimeoutSeconds:
+    """``parallel.timeout_seconds`` is read by setup_distributed and stamped here."""
+
+    def test_default_is_null_so_torchs_backend_default_applies(self):
+        from spectramr.config.schemas.base import ParallelismConfigSchema
+
+        assert ParallelismConfigSchema().timeout_seconds is None
+
+    def test_non_positive_timeout_is_refused(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from spectramr.config.schemas.base import ParallelismConfigSchema
+
+        with pytest.raises(ValidationError):
+            ParallelismConfigSchema(timeout_seconds=0)
+
+    def test_every_strategy_stamps_the_timeout_into_provenance(self):
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.base import ParallelismConfigSchema
+        from spectramr.infrastructure.distributed.strategies import NoParallelStrategy
+
+        ctx = SimpleNamespace(
+            parallel=ParallelismConfigSchema(timeout_seconds=120), world_size=2
+        )
+        assert NoParallelStrategy().provenance(ctx)["timeout_seconds"] == 120

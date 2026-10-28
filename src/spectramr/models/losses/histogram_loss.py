@@ -10,7 +10,7 @@ class HistogramConsistencyLoss(nn.Module):
 
     **DOMAIN**: IMAGE-SPACE ONLY
     **Input**: [B, 1, H, W] or [B, C, H, W] image-space intensity
-    **3D Support**: Yes (per-slice histogram)
+    **3D Support**: Yes (one histogram per sample, over all channels and voxels)
 
     Computes distance between intensity histograms using kernel density estimation
     (soft-binning) to ensure differentiability. Earth Mover's Distance approximation.
@@ -28,15 +28,17 @@ class HistogramConsistencyLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{Histogram} = \\| \text{CDF}(\\hat{y}) - \text{CDF}(y) \\|_1"""
+        \\mathcal{L}_{Histogram} = \\| \\text{CDF}(\\hat{y}) - \\text{CDF}(y) \\|_1"""
+
+    bin_centers: torch.Tensor
 
     def __init__(
         self,
         bins: int = 100,
         min_val: float = 0.0,
         max_val: float = 1.0,
-        sigma: float = None,
-    ):
+        sigma: float | None = None,
+    ) -> None:
         """__init__.
 
         Args:

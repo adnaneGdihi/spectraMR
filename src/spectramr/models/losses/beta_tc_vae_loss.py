@@ -33,6 +33,7 @@ Reference:
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -61,6 +62,27 @@ def _log_density_gaussian(x: Tensor, mu: Tensor, logvar: Tensor) -> Tensor:
     norm = -0.5 * (math.log(2 * math.pi) + logvar)
     log_density = norm - 0.5 * ((x - mu).pow(2) * torch.exp(-logvar))
     return log_density
+
+
+def _log_importance_weights(
+    batch_size: int, dataset_size: int, device: torch.device, dtype: torch.dtype
+) -> Tensor:
+    r"""Log-weights :math:`\log w_{ij}` of :math:`q(z_i)\approx\sum_j w_{ij}\,q(z_i\mid x_j)`.
+
+    Of the :math:`N` terms of :math:`q(z_i)=\frac1N\sum_n q(z_i\mid x_n)`, the one
+    for :math:`x_i` is present exactly (weight :math:`1/N`); the other :math:`N-1`
+    are represented by the :math:`B-1` remaining batch members, each weighted
+    :math:`(N-1)/(N(B-1))`. Every row sums to one; :math:`N=B` gives the uniform
+    minibatch mixture.
+    """
+    if batch_size < 2:
+        return torch.full(
+            (batch_size, batch_size), -math.log(dataset_size), device=device, dtype=dtype
+        )
+    off_diag = (dataset_size - 1) / (dataset_size * (batch_size - 1))
+    weights = torch.full((batch_size, batch_size), off_diag, device=device, dtype=dtype)
+    weights.fill_diagonal_(1.0 / dataset_size)
+    return weights.log()
 
 
 @register_loss(
@@ -117,7 +139,7 @@ class BetaTCVAELoss(nn.Module):
         z: Tensor,
         mu: Tensor,
         log_var: Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> Tensor:
         """Compute β-TCVAE loss.
 
@@ -129,7 +151,7 @@ class BetaTCVAELoss(nn.Module):
         Returns:
             Scalar loss value.
         """
-        B, D = z.shape
+        B = z.shape[0]
         N = self.dataset_size if self.dataset_size is not None else B
 
         # ── 1. log q(z|x) — log-density of z under the individual posteriors
@@ -149,14 +171,9 @@ class BetaTCVAELoss(nn.Module):
         log_qz_given_xj = _log_density_gaussian(_z, _mu, _logvar)
         # (B, B, D)
 
-        # Stratification weight from minibatch-weighted sampling
-        # (Appendix D of Chen et al. 2018)
-        # A diagonal entry [i,i] is weighted by (N-1), off-diag by 1.
-        strat_weight = (N - 1) / (B - 1) if B > 1 else 1.0
-        log_importance = torch.zeros(B, B, device=z.device)
-        log_importance.fill_(1.0 / N)
-        log_importance.fill_diagonal_(strat_weight / N)
-        log_importance = log_importance.log()
+        log_importance = _log_importance_weights(
+            B, N, z.device, torch.promote_types(z.dtype, torch.float32)
+        )
 
         # log q(z) — sum over D, logsumexp over batch dimension
         log_qz = torch.logsumexp(log_qz_given_xj.sum(dim=2) + log_importance, dim=1)

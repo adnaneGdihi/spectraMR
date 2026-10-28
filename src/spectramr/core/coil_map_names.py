@@ -28,6 +28,7 @@ from typing import Any
 __all__ = [
     "CANONICAL_COIL_MAP_KEY",
     "COIL_MAP_ALIASES",
+    "REFERENCE_MAPS_KEY",
     "coil_map_kwargs_for",
     "kwargs_accepted_by",
 ]
@@ -44,6 +45,12 @@ COIL_MAP_ALIASES: tuple[str, ...] = (
 
 #: The one the rest of the framework normalises onto.
 CANONICAL_COIL_MAP_KEY = COIL_MAP_ALIASES[0]
+
+#: Scoring-only maps (#2664): the all-repetitions store, published on the
+#: validation split for the SENSE image metrics. Deliberately NOT an alias above,
+#: so nothing that resolves coil maps by alias (operators, losses, the model's
+#: inputs) can pick it up; those maps contain the leave-one-out reference (#2510).
+REFERENCE_MAPS_KEY = "reference_sensitivity_complex"
 
 
 def coil_map_kwargs_for(

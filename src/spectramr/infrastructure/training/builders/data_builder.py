@@ -61,6 +61,8 @@ class DataBuilder(Builder):
         config = ctx.config
         self._config = config
         self._loaders: dict[str, Any] = {}
+        #: The partition stamp of the train/val build, copied from its director.
+        self.split_provenance: dict[str, Any] = {}
 
     def build_train_val_loaders(self) -> DataBuilder:
         """Create train and validation data loaders.
@@ -135,6 +137,7 @@ class DataBuilder(Builder):
                     val_batch_size=_val_bs,
                 )
 
+            self.split_provenance = dict(director.split_provenance)
             if train_loader is not None:
                 self._loaders["train"] = train_loader
             if val_loader is not None:
@@ -150,24 +153,23 @@ class DataBuilder(Builder):
         return self
 
     def build_test_loader(self) -> DataBuilder:
-        """Create test loader if configuration provides test data.
+        """Create the held-out test loader when ``data.source.test_index_path`` is declared.
 
         Returns:
             self: Enables fluent chaining
         """
-        data_config = self._config.data if hasattr(self._config, "data") else None
+        from spectramr.infrastructure.builders.directors.test_split import (
+            build_test_loader,
+            declares_test_set,
+        )
 
-        if data_config is None:
+        if not declares_test_set(self._config):
             return self
-
-        test_manifest = data_config.test_manifest if hasattr(data_config, "test_manifest") else None
-        if not test_manifest:
-            return self
-
-        # Test dataloader creation is pending full migration to DataPipelineDirector.
-        # Previously handled nominally by ConsolidatedDatasetFactory, which is now deprecated.
-        logger.warning("build_test_loader is not currently supported by DataPipelineDirector.")
-
+        self._loaders["test"] = build_test_loader(
+            self._config,
+            num_workers=int(getattr(self._config.data.loader, "num_workers", 0) or 0),
+            persistent_workers=False,
+        )
         return self
 
     def build_inference_loader(
@@ -206,35 +208,13 @@ class DataBuilder(Builder):
         ]
 
         # Create transforms (validation mode = no augmentation)
-        class ConfigProxy:
-            """Proxy for TorchIOTransformConfig.from_training_config requirement."""
-
-            def __init__(self, data_conf, accel_conf):
-                """__init__.
-
-                Args:
-                    data_conf (Any): Description.
-                    accel_conf (Any): Description.
-                """
-                self._data = data_conf
-                # The block is `undersampling:` since phase 11. The attribute
-                # name here IS the proxy's contract with
-                # `TorchIOTransformConfig.from_training_config`, which reads
-                # `config.undersampling` -- `__getattr__` would otherwise
-                # delegate it to the DATA config and raise.
-                self.undersampling = accel_conf
-
-            def __getattr__(self, name):
-                """Delegate everything except the block we carry explicitly."""
-                if name == "undersampling":
-                    return self.undersampling
-                return getattr(self._data, name)
-
-        acceleration_config = (
-            self._config.undersampling if hasattr(self._config, "undersampling") else None
-        )
-        proxy_config = ConfigProxy(data_config, acceleration_config)
-        torchio_config = TorchIOTransformConfig.from_training_config(proxy_config)
+        torchio_config = TorchIOTransformConfig.from_settings(self._config)
+        if torchio_config.digital_twin_apply:
+            raise ValueError(
+                "physics.digital_twin.apply_as_transform puts a synthetic degradation in "
+                "the val chain; inference serves real acquisitions, so it would degrade "
+                "them. Turn the flag off for inference."
+            )
         val_transforms = TorchIOTransformBuilder.build_val_transforms(torchio_config)
 
         # Create dataset based on dataset_type
@@ -268,6 +248,7 @@ class DataBuilder(Builder):
                 transform=val_transforms,
                 verify_contrast=False,
                 skip_nan_samples=True,
+                allow_unpaired=True,  # inference records carry no target_path
             )
         else:
             inference_ds = UniversalMRIDataset(
@@ -296,7 +277,10 @@ class DataBuilder(Builder):
         # call to the shared clamp rather than inheriting the director's. Same
         # ceiling semantics: never raised, a declared 0 passes through.
         num_workers = clamp_worker_count(
-            num_workers, resolve_run_topology(), role="inference"
+            num_workers,
+            resolve_run_topology(),
+            role="inference",
+            reserved_cores=data_config.loader.reserved_cores,
         ).workers
         # Constructed through the leaf DataLoaderBuilder, not `DataLoader(...)`
         # here: one construction site (data.md SSOT, enforced by
@@ -311,7 +295,9 @@ class DataBuilder(Builder):
         #
         # prefetch_factor / persistent_workers were hardcoded 2 / True (#194).
         # `persistent_workers=True` was the worse of the two: it holds a worker
-        # pool open across a single-pass walk that never repeats.
+        # pool open across a single-pass walk that never repeats. It stays
+        # False here even though `data.loader.persistent_workers` now defaults
+        # to True for training.
         inference_loader = (
             DataLoaderBuilder(self._config, dataset=inference_ds)
             .with_batch_size(effective_batch_size)
@@ -322,7 +308,7 @@ class DataBuilder(Builder):
             .with_shuffle(False)
             .with_collate_fn(collate_strategy.collate)
             .with_prefetch_factor(data_config.loader.prefetch_factor)
-            .with_persistent_workers(data_config.loader.persistent_workers)
+            .with_persistent_workers(False)
             .build()
         )
 

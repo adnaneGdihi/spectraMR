@@ -4,7 +4,7 @@ Tests end-to-end training with:
 - Real configuration loading (TrainingSettings.from_yaml)
 - Actual training strategies (GAN, Diffusion, VAE, Reconstruction)
 - Real data loaders with physics transforms
-- Checkpoint saving/loading via CheckpointService
+- Checkpoint saving/loading via CheckpointStore
 - Validation metrics computation
 - DI container initialization
 
@@ -252,6 +252,9 @@ class TestFullTrainingIntegration:
 
         checkpoint_service = resolve_service(ICheckpointService)
         assert checkpoint_service is not None
+        from spectramr.infrastructure.checkpointing.facade import CheckpointStore
+
+        assert isinstance(checkpoint_service, CheckpointStore)
 
         # NOTE: Full strategy testing requires running actual training pipeline
         # This test validates config loading and DI container setup

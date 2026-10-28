@@ -74,6 +74,28 @@ def test_count_parameters_fail_open_on_none():
     assert prov.count_parameters(None) == {}
 
 
+def test_count_parameters_stamps_the_kan_group_through_a_wrapper():
+    """#2105: the spline group's size and fraction reach provenance, past a DDP-style wrapper."""
+    import torch.nn as nn
+
+    from spectramr.models.generators.kan_param_groups import build_kan_param_groups
+
+    inner = nn.Linear(2, 2)
+    _, inner.kan_param_group_record = build_kan_param_groups(
+        inner, base_lr=1e-3, weight_decay=0.0, lr_ratio=0.1, weight_decay_ratio=0.1
+    )
+
+    class _Wrapper(nn.Module):
+        def __init__(self, module: nn.Module) -> None:
+            super().__init__()
+            self.module = module
+
+    counts = prov.count_parameters(_Wrapper(inner))
+    assert counts["kan_param_group"]["n_params"] == 0
+    assert counts["kan_param_group"]["kan_lr_ratio"] == 0.1
+    assert "kan_param_group" not in prov.count_parameters(nn.Linear(2, 2))
+
+
 # --------------------------------------------------------------------------- #
 # config fingerprint + effective batch
 # --------------------------------------------------------------------------- #
@@ -324,6 +346,12 @@ class TestTheLossObjectiveIsStamped:
         resolved = self._record()["losses"]["resolved"]
         assert resolved["pre_dc_kspace"]["source"].endswith("lambda_pre_dc_kspace")
         assert "kspace_losses[" in resolved["complex_l1"]["source"]
+
+    def test_entry_kwargs_are_stamped_beside_the_weights(self):
+        """A list entry's constructor knobs change the objective without moving a
+        weight, so the weight table cannot show them; the record carries them too."""
+        entry_kwargs = self._record()["losses"]["entry_kwargs"]
+        assert entry_kwargs["losses.image_losses[spectral_radial_prior]"]["n_bins"] == 32
 
     def test_provenance_never_blocks_the_run(self, monkeypatch):
         """A capture failure is logged, not raised -- the record is a by-product

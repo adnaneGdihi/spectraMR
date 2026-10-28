@@ -155,6 +155,7 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
         log_scaling: bool = False,
         contrast_map: dict[str, int] | None = None,
         target_field_strength: float | None = None,
+        image_domain_crop_or_pad: tuple[int, int] | None = None,
     ):
         """
         Initialize Universal MRI Dataset.
@@ -186,6 +187,9 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
                 field_conditioned_inr, generative_refiner, ulf_redegrad_tta) run on
                 the paired-ULF data instead of raising. A non-positive value
                 raises (pitfall #9).
+            image_domain_crop_or_pad: Optional ``(height, width)`` the k-space is
+                resized to through its image before coil processing
+                (``data.processing.image_domain_crop_or_pad``).
         """
         self.index = index
         self.io = IOStrategyFactory.get(io_strategy)
@@ -223,6 +227,7 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
             num_virtual_coils=num_virtual_coils,
             svd_calibration_lines=svd_calibration_lines,
             coil_processing=coil_processing,
+            image_domain_crop_or_pad=image_domain_crop_or_pad,
         )
 
     def __len__(self) -> int:
@@ -249,10 +254,16 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
 
         # Use FastMRISubjectBuilder to handle all complex logic
         subject = self.subject_builder.build(record)
+        # Every sample is stamped so default collation keeps the key in any batch
+        # order; the loop refuses a batch holding a target-less sample.
+        subject["has_target"] = torch.tensor(record.get("pairing_status") != "unpaired_ulf")
 
         # Add metadata
         subject["path"] = str(record["primary_path"])
         subject["file_id"] = record.get("file_id", Path(record["primary_path"]).stem)
+        # Subject identity for subject-level consumers (held-out conformal calibration).
+        if record.get("subject_id") is not None:
+            subject["subject_id"] = str(record["subject_id"])
 
         # Stamp the contrast index so downstream FiLM / contrast-guidance fires
         # (raises on an unmapped contrast — never silently stamps 0). Absent map

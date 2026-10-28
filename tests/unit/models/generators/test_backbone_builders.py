@@ -6,6 +6,8 @@ here is as much about what does NOT grow as about what builds (non-negotiable 6)
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn as nn
@@ -17,6 +19,7 @@ from spectramr.models.generators.backbone_builders import (
     register_backbone,
     registered_backbone_names,
 )
+from spectramr.models.generators.kspace_line_tokens import LINE_BACKBONES
 
 NEW = ["dit", "uvit", "u_vit", "hat", "diffit"]
 
@@ -113,7 +116,11 @@ def test_a_none_valued_kwarg_falls_back_to_the_default() -> None:
 
 def test_every_registered_builder_returns_a_module() -> None:
     for name in registered_backbone_names():
-        assert isinstance(BACKBONE_BUILDERS[name](_ctx()), nn.Module)
+        # reference_guided_unet fuses a reference in image space (and needs reference + target
+        # channels); the line backbones are k-space only.
+        ctx = _ctx("kspace" if name in LINE_BACKBONES else "image", reference_channels=4)
+        ctx = dataclasses.replace(ctx, in_channels=12) if name == "reference_guided_unet" else ctx
+        assert isinstance(BACKBONE_BUILDERS[name](ctx), nn.Module)
 
 
 def test_contrast_emb_dim_defaults_to_none_and_does_not_disturb_existing_arms() -> None:
@@ -141,3 +148,37 @@ def test_contrast_emb_dim_reaches_every_new_backbone(name: str) -> None:
     net = build_backbone(name, ctx)
     assert net.contrast_proj is not None
     assert net.contrast_proj.in_features == 256
+
+
+def test_reference_guided_unet_builds_in_image_space_with_a_reference() -> None:
+    ctx = BackboneBuildContext(
+        in_channels=24,
+        out_channels=8,
+        features=(16, 32),
+        img_size=(16, 16),
+        feature_domain="image",
+        kwargs={"reference_channels": 8, "levels": 2},
+    )
+    net = build_backbone("reference_guided_unet", ctx)
+    assert net(torch.randn(1, 24, 16, 16), timesteps=torch.zeros(1)).shape == (1, 8, 16, 16)
+
+
+@pytest.mark.parametrize(
+    ("domain", "kwargs", "match"),
+    [
+        ("kspace", {"reference_channels": 8}, "force_pure_kspace"),
+        ("image", {}, "reference_channels"),
+    ],
+    ids=["k-space-domain", "no-reference"],
+)
+def test_reference_guided_unet_refuses_what_it_cannot_honour(domain, kwargs, match) -> None:
+    ctx = BackboneBuildContext(
+        in_channels=24,
+        out_channels=8,
+        features=(16, 32),
+        img_size=(16, 16),
+        feature_domain=domain,
+        kwargs=kwargs,
+    )
+    with pytest.raises(ValueError, match=match):
+        build_backbone("reference_guided_unet", ctx)

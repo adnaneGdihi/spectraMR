@@ -174,16 +174,56 @@ def test_launcher_allows_requeue_and_appends_its_log(rel: str) -> None:
     assert "#SBATCH --open-mode=append" in text
 
 
+def _derivation_error(text: str) -> str | None:
+    """Why a launcher would not hand the run its deadline, or None."""
+    executable = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    if "scripts/common/wall_clock.sh" not in executable:
+        return "does not source scripts/common/wall_clock.sh"
+    if "derive_wall_clock_deadline" not in executable:
+        return "never calls derive_wall_clock_deadline"
+    if "squeue" in executable:
+        return "re-derives the deadline instead of delegating"
+    return None
+
+
 @pytest.mark.parametrize("rel", _LAUNCHERS, ids=lambda p: Path(p).stem)
 @pytest.mark.unit
 def test_launcher_delegates_to_the_one_derivation(rel: str) -> None:
     """A second copy of the derivation is the shape non-negotiable 17 forbids."""
-    text = require_repo_file(rel).read_text()
-    executable = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    error = _derivation_error(require_repo_file(rel).read_text())
+    assert error is None, error
 
-    assert "scripts/common/wall_clock.sh" in executable
-    assert "derive_wall_clock_deadline" in executable
-    assert "squeue" not in executable, "the launcher re-derives instead of delegating"
+
+def _generated_scripts() -> dict[str, str]:
+    """The two scripts the campaign orchestrator renders, per arm and per array."""
+    from spectramr.infrastructure.orchestration.slurm_backend import SLURMBackend
+
+    return {
+        "per_arm": SLURMBackend.generate_job_script(
+            experiment_name="e", config_path="/cfg.yaml", output_dir="/out", base_dir="/repo"
+        ),
+        "array": SLURMBackend.generate_array_job_script(
+            "/repo/manifest.txt", 3, "/repo/out", "/repo", fresh=True
+        ),
+    }
+
+
+@pytest.mark.parametrize("kind", ["per_arm", "array"])
+@pytest.mark.unit
+def test_generated_scripts_hand_the_run_its_deadline(kind: str, monkeypatch) -> None:
+    """The array script had no deadline (2026-10-09), so a campaign task never yielded:
+    at 48 h it was killed at TIMEOUT, which ``--requeue`` does not cover."""
+    monkeypatch.setenv("SPECTRAMR_SLURM_ACCOUNT", "acct")
+    error = _derivation_error(_generated_scripts()[kind])
+    assert error is None, f"{kind}: {error}"
+
+
+@pytest.mark.unit
+def test_the_derivation_check_rejects_a_planted_launcher() -> None:
+    planted = "#!/bin/bash\n#SBATCH --requeue\npython -m spectramr.cli.manifest_dispatch --prod\n"
+    assert _derivation_error(planted) == "does not source scripts/common/wall_clock.sh"
+    copied = 'source "scripts/common/wall_clock.sh"\nEND=$(squeue -h -j $J -o %e)\n'
+    assert _derivation_error(copied) == "never calls derive_wall_clock_deadline"
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +356,50 @@ def test_a_yield_without_resume_refuses_to_requeue(monkeypatch, tmp_path, capsys
 
 
 @pytest.mark.unit
+def test_a_fresh_first_link_whose_requeue_resumes_is_requeued(monkeypatch, tmp_path) -> None:
+    """``campaign submit --fresh`` (#2542): link 0 runs ``--resume-off
+    --requeue-resumes`` and its script spells ``--resume`` on every requeued
+    link, so the yield continues rather than loops. The test above is the
+    planted counterpart: without the flag the same yield is refused.
+    """
+    from spectramr.cli import manifest_dispatch as md
+
+    cfg = tmp_path / "arm.yaml"
+    cfg.write_text("training:\n  output_dir: /tmp/x\nparallel:\n  strategy: none\n")
+    launched: list[list[str]] = []
+    requeued: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if any("spectramr.cli" in str(a) for a in argv):
+            launched.append([str(a) for a in argv])
+            Path(os.environ[md.SPECTRAMR_WALL_CLOCK_MARKER]).write_text("{}")
+            return subprocess.CompletedProcess(argv, 0)
+        requeued.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(md.subprocess, "run", fake_run)
+    monkeypatch.setenv("SLURM_JOB_ID", "778")
+    man = tmp_path / "m.txt"
+    man.write_text(str(cfg) + "\n")
+
+    rc = md._dispatch(
+        manifest=str(man),
+        index=0,
+        train_iters=None,
+        resume=False,
+        no_audit=True,
+        dispatch_dir=str(tmp_path / "d"),
+        dry_run=False,
+        prod=True,
+        requeue_resumes=True,
+    )
+
+    assert rc == 0
+    assert "--resume" not in launched[0], "the fresh first link must not resume"
+    assert requeued == [["scontrol", "requeue", "778"]]
+
+
+@pytest.mark.unit
 def test_prod_implies_resume() -> None:
     """A production arm does not fit in one 120h allocation, so a production run
     is a chain by definition and every link must continue the last."""
@@ -324,8 +408,10 @@ def test_prod_implies_resume() -> None:
     from spectramr.cli import manifest_dispatch as md
 
     src = inspect.getsource(md._dispatch)
-    prod_at = src.index('print("[MODE] PROD')
-    assert "resume = True" in src[prod_at : prod_at + 700]
+    # Bounded by the next mode branch rather than a character count, which the
+    # rationale comment inside the block outgrew.
+    prod_block = src[src.index('print("[MODE] PROD') : src.index("elif train_iters is not None")]
+    assert "resume = True" in prod_block
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +615,57 @@ def test_the_distributed_verb_forwards_the_resume_spelling_untouched() -> None:
     src = inspect.getsource(distributed)
     assert "resume_path=resume_path" in src
     assert '"auto"' not in src, "the distributed path is re-interpreting the spelling"
+
+
+class TestYieldNeedsACleanExit:
+    """The marker alone is not a yield: a crash after rank 0 wrote it must not requeue."""
+
+    @staticmethod
+    def _run(tmp_path: Path, monkeypatch, *, train_rc: int, write_marker: bool):
+        from spectramr.cli import manifest_dispatch as md
+        from spectramr.core.env_names import SPECTRAMR_WALL_CLOCK_MARKER
+
+        cfg = tmp_path / "arm.yaml"
+        cfg.write_text("training:\n  max_iterations: 5\n")
+        manifest = tmp_path / "m.txt"
+        manifest.write_text(str(cfg) + "\n")
+        requeued: list[Path] = []
+
+        def fake_run(cmd, **kwargs):
+            if "train" in " ".join(cmd) and write_marker:
+                Path(os.environ[SPECTRAMR_WALL_CLOCK_MARKER]).write_text("{}")
+
+            class _R:
+                returncode = train_rc if "train" in " ".join(cmd) else 0
+
+            return _R()
+
+        monkeypatch.setattr(md.subprocess, "run", fake_run)
+        monkeypatch.setattr(md, "requeue_this_task", lambda m: requeued.append(m) or True)
+        rc = md._dispatch(
+            manifest=str(manifest),
+            index=0,
+            train_iters=None,
+            resume=True,
+            no_audit=True,
+            dispatch_dir=str(tmp_path / "d"),
+            dry_run=False,
+        )
+        return rc, requeued
+
+    def test_a_clean_exit_with_a_marker_requeues(self, tmp_path, monkeypatch) -> None:
+        rc, requeued = self._run(tmp_path, monkeypatch, train_rc=0, write_marker=True)
+        assert rc == 0 and len(requeued) == 1
+
+    def test_planted_nonzero_exit_with_a_marker_is_not_a_yield(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """A rank-0 crash after the marker would otherwise requeue a broken run forever."""
+        rc, requeued = self._run(tmp_path, monkeypatch, train_rc=7, write_marker=True)
+        assert rc == 7
+        assert requeued == []
+        assert "did not yield cleanly" in capsys.readouterr().err
+
+    def test_no_marker_returns_the_training_exit_code(self, tmp_path, monkeypatch) -> None:
+        rc, requeued = self._run(tmp_path, monkeypatch, train_rc=3, write_marker=False)
+        assert rc == 3 and requeued == []

@@ -95,12 +95,13 @@ def test_recorded_keys_are_dotted_config_paths():
             assert " " not in key, f"{arm} recorded a key containing a space: {key!r}"
 
 
-@pytest.mark.parametrize("known_defect", ["data.volume_format", "checkpoint.save_dir"])
+@pytest.mark.parametrize("known_defect", ["data.volume_format", "checkpoint.save_best"])
 def test_the_canonical_defects_are_recorded(known_defect):
-    """Anti-vacuity, and a live cross-check against the issues that own them.
+    """Anti-vacuity, and a live cross-check against the debt the baseline records.
 
-    ``checkpoint.save_dir`` is #1061 and ``data.volume_format`` is part of
-    #1012. If either stops appearing, either the debt was genuinely paid — in
+    ``data.volume_format`` is part of #1012; ``checkpoint.save_best`` took the
+    place of ``checkpoint.save_dir`` (#1061) when that key was retired and
+    drained (#2842). If either stops appearing, either the debt was genuinely paid — in
     which case the baseline must be regenerated — or the resolver broke and the
     sweep has gone blind, which looks identical from a green suite.
     """

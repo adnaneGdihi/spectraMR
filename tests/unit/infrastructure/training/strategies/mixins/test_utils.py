@@ -146,3 +146,51 @@ def test_scoring_leaf_reads_a_dict_shaped_scoring_block():
 def test_scoring_leaf_returns_the_default_when_neither_spelling_resolves():
     assert u._scoring_leaf(_Block(), "output_transform", "fallback") == "fallback"
     assert u._scoring_leaf(None, "output_transform") is None
+
+
+class TestMaskedMeasurement:
+    """``masked_measurement`` is the one definition of the measurement the generator is handed."""
+
+    def test_a_one_channel_mask_is_tiled_over_the_coil_channels(self):
+        x = torch.randn(2, 8, 4, 4)
+        mask = (torch.rand(2, 1, 4, 4) > 0.5).float()
+        out = u.masked_measurement(x, mask)
+        assert out.shape == x.shape
+        assert torch.equal(out, x * mask)
+        assert (out[:, :, mask[0, 0] == 0] == 0).all() or (out[mask.expand_as(x) == 0] == 0).all()
+
+    def test_unacquired_bins_are_exactly_zero(self):
+        x = torch.ones(1, 4, 2, 2)
+        mask = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
+        out = u.masked_measurement(x, mask)
+        assert out[0, :, 0, 1].eq(0).all() and out[0, :, 1, 0].eq(0).all()
+        assert out[0, :, 0, 0].eq(1).all()
+
+    def test_a_mask_with_more_channels_tiles_the_input(self):
+        x = torch.randn(1, 1, 3, 3)
+        mask = torch.ones(1, 4, 3, 3)
+        assert u.masked_measurement(x, mask).shape == (1, 4, 3, 3)
+
+
+class TestReduceOnDevice:
+    """One owner of the loss-to-scalar reduction, shared by ``_handle_anomalies``
+    (which stays on the device) and ``_convert_metrics_to_floats`` (which then
+    transfers once)."""
+
+    def test_a_vector_is_mean_reduced_and_stays_a_tensor(self):
+        out = u.reduce_on_device("l1", torch.tensor([1.0, 3.0]))
+        assert isinstance(out, torch.Tensor) and out.shape == ()
+        assert out.item() == 2.0
+
+    def test_complex_takes_the_real_part(self):
+        assert u.reduce_on_device("z", torch.tensor(1 + 2j)).item() == 1.0
+        assert u.reduce_on_device("z", 3 + 4j) == 3.0
+
+    def test_python_numbers_become_floats(self):
+        assert u.reduce_on_device("n", 2) == 2.0 and isinstance(u.reduce_on_device("n", 2), float)
+
+    def test_an_unconvertible_value_raises_typeerror(self):
+        import pytest
+
+        with pytest.raises(TypeError, match="Cannot convert metric 's'"):
+            u.reduce_on_device("s", "text")

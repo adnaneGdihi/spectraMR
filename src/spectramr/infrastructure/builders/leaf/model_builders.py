@@ -20,6 +20,7 @@ from spectramr.infrastructure.builders.core import FluentBuilder
 from spectramr.infrastructure.builders.generator_kwargs import (
     apply_model_field_sweep,
 )
+from spectramr.infrastructure.checkpointing.restore import weights
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +190,7 @@ class GeneratorBuilder(FluentBuilder[nn.Module]):
 
             # Load checkpoint if specified
             if self._checkpoint_path:
-                state_dict = torch.load(self._checkpoint_path, map_location=self._device)
-                generator.load_state_dict(state_dict)
+                weights(self._checkpoint_path, "generator", generator, policy="exact")
                 logger.info(f"Loaded generator checkpoint from {self._checkpoint_path}")
 
             # Move to device
@@ -342,8 +342,7 @@ class DiscriminatorBuilder(FluentBuilder[nn.Module]):
 
             # Load checkpoint if specified
             if self._checkpoint_path:
-                state_dict = torch.load(self._checkpoint_path, map_location=self._device)
-                discriminator.load_state_dict(state_dict)
+                weights(self._checkpoint_path, "discriminator", discriminator, policy="exact")
                 logger.info(f"Loaded discriminator checkpoint from {self._checkpoint_path}")
 
             # Move to device

@@ -17,8 +17,12 @@ Two properties follow from the sign, and both matter operationally:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import overload
+
 import torch
 from torch.optim import Optimizer
+from torch.optim.optimizer import ParamsT
 
 from spectramr.infrastructure.training.optimizer_registry import register_optimizer
 
@@ -41,7 +45,7 @@ class Lion(Optimizer):
 
     def __init__(
         self,
-        params,
+        params: ParamsT,
         lr: float = 1e-4,
         betas: tuple[float, float] = (0.9, 0.99),
         weight_decay: float = 0.0,
@@ -57,42 +61,65 @@ class Lion(Optimizer):
 
         super().__init__(params, {"lr": lr, "betas": betas, "weight_decay": weight_decay})
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss: float | None = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            lr = group["lr"]
-            wd = group["weight_decay"]
+        with torch.no_grad():
+            for group in self.param_groups:
+                beta1, beta2 = group["betas"]
+                lr = group["lr"]
+                wd = group["weight_decay"]
 
-            for p in group["params"]:
-                if p.grad is None:
+                params: list[torch.Tensor] = []
+                grads: list[torch.Tensor] = []
+                exp_avgs: list[torch.Tensor] = []
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.is_sparse:
+                        raise RuntimeError("Lion does not support sparse gradients")
+                    # A complex parameter is optimised as its (real, imag) pair, as
+                    # torch.optim does; sign_() is undefined on a complex tensor.
+                    param = torch.view_as_real(p) if p.is_complex() else p
+                    if grad.is_complex():
+                        grad = torch.view_as_real(grad)
+
+                    state = self.state[p]
+                    if not state:
+                        state["exp_avg"] = torch.zeros_like(param)
+                    params.append(param)
+                    grads.append(grad)
+                    exp_avgs.append(state["exp_avg"])
+
+                if not params:
                     continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("Lion does not support sparse gradients")
 
-                state = self.state[p]
-                if not state:
-                    state["exp_avg"] = torch.zeros_like(p)
-                exp_avg = state["exp_avg"]
-
+                # One multi-tensor kernel per op instead of ~5 launches per parameter.
                 # Decoupled decay first, so the sign below is taken on the
                 # gradient signal alone rather than on signal + decay.
                 if wd != 0:
-                    p.mul_(1 - lr * wd)
+                    torch._foreach_mul_(params, 1 - lr * wd)
 
-                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1).sign_()
-                p.add_(update, alpha=-lr)
+                update = torch._foreach_mul(exp_avgs, beta1)
+                torch._foreach_add_(update, grads, alpha=1 - beta1)
+                torch._foreach_sign_(update)
+                torch._foreach_add_(params, update, alpha=-lr)
 
                 # Buffer update uses beta2 and the CURRENT gradient — note this
                 # happens after the step, and with a different beta than the
                 # update above. Collapsing the two betas is the usual way this
                 # optimizer gets reimplemented wrongly.
-                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+                torch._foreach_mul_(exp_avgs, beta2)
+                torch._foreach_add_(exp_avgs, grads, alpha=1 - beta2)
 
         return loss

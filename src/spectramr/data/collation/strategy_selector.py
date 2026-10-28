@@ -16,6 +16,55 @@ logger = logging.getLogger(__name__)
 __all__ = ["CollationStrategySelector"]
 
 
+def _image_kwargs(config, enable_slab_mode, patch_size) -> dict:
+    kwargs = {
+        "padding_mode": config.padding_mode,
+        "padding_value": config.padding_value,
+        "allow_variable_shapes": config.allow_variable_shapes,
+    }
+    # Auto-derive squeeze_depth if not specified by user
+    if config.squeeze_depth_dim is None:
+        # Squeeze depth dimension if patch_size[-1] == 1 (2D data)
+        squeeze_depth = patch_size[-1] == 1 if patch_size and len(patch_size) == 3 else False
+    else:
+        # User explicitly specified squeeze behavior
+        squeeze_depth = config.squeeze_depth_dim
+    kwargs["squeeze_depth_dim"] = squeeze_depth
+    # ImageCollateStrategy uses this in the final NaN check; forward the wired YAML knob
+    # (collation.validate_nans) so validate_nans=False passes NaNs through unchanged
+    # instead of replacing them with zeros.
+    kwargs["validate_nans"] = config.validate_nans
+    return kwargs
+
+
+def _slab_kwargs(config, enable_slab_mode, patch_size) -> dict:
+    # SlabCollateStrategy fixes both itself (pads to the batch's shape and keeps depth for
+    # its own flatten), so passing them raised "multiple values" at loader build. A config
+    # that asks for the opposite is refused rather than ignored.
+    if config.allow_variable_shapes:
+        raise ValueError(
+            "collation.allow_variable_shapes=true is not supported by the 'slab' "
+            "strategy, which always pads to the batch's shape."
+        )
+    if config.squeeze_depth_dim:
+        raise ValueError(
+            "collation.squeeze_depth_dim=true is not supported by the 'slab' "
+            "strategy, which keeps depth for its own channel flatten."
+        )
+    kwargs = {"padding_mode": config.padding_mode, "padding_value": config.padding_value}
+    if enable_slab_mode:
+        # Was the literal "middle" -- an advertised three-value knob (middle/flatten/keep)
+        # with no config route, so no arm could pick (B6). Default unchanged.
+        kwargs["target_mode"] = config.slab_target_mode
+        kwargs["flat_input"] = True  # Flatten depth to channels
+    kwargs["validate_nans"] = config.validate_nans
+    return kwargs
+
+
+#: Strategy name -> the builder of its ``__init__`` kwargs. A strategy not listed takes none.
+_STRATEGY_KWARGS = {"image": _image_kwargs, "slab": _slab_kwargs}
+
+
 class CollationStrategySelector:
     """Centralized selector for collation strategy based on user config and data type.
 
@@ -354,40 +403,7 @@ class CollationStrategySelector:
                 'validate_nans': True,
             }
         """
-        kwargs = {}
-
-        # Common parameters for ImageCollateStrategy and SlabCollateStrategy
-        if strategy in ("image", "slab"):
-            kwargs["padding_mode"] = config.padding_mode
-            kwargs["padding_value"] = config.padding_value
-            kwargs["allow_variable_shapes"] = config.allow_variable_shapes
-
-            # Auto-derive squeeze_depth if not specified by user
-            if config.squeeze_depth_dim is None:
-                # Squeeze depth dimension if patch_size[-1] == 1 (2D data)
-                squeeze_depth = (
-                    patch_size[-1] == 1 if patch_size and len(patch_size) == 3 else False
-                )
-            else:
-                # User explicitly specified squeeze behavior
-                squeeze_depth = config.squeeze_depth_dim
-
-            kwargs["squeeze_depth_dim"] = squeeze_depth
-
-        # Slab-specific parameters
-        if strategy == "slab" and enable_slab_mode:
-            # Was the literal "middle" — an advertised three-value knob
-            # (middle/flatten/keep) with no config route, so no arm could pick
-            # (B6). Default unchanged, so no existing run moves.
-            kwargs["target_mode"] = config.slab_target_mode
-            kwargs["flat_input"] = True  # Flatten depth to channels
-
-        # NaN validation flag (applies to all strategies that support it)
-        # Note: Not all strategies accept this parameter, but image/slab do
-        if strategy in ("image", "slab"):
-            # ImageCollateStrategy uses this in the final NaN check; forward the
-            # wired YAML knob (collation.validate_nans) so validate_nans=False
-            # passes NaNs through unchanged instead of replacing them with zeros.
-            kwargs["validate_nans"] = config.validate_nans
-
-        return kwargs
+        build = _STRATEGY_KWARGS.get(strategy)
+        if build is None:
+            return {}
+        return build(config, enable_slab_mode, patch_size)

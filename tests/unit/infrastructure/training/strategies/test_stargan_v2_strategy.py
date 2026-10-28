@@ -78,6 +78,7 @@ def _make_strategy(
     and folds the strategy-owned mapping-network + style-encoder into ``opt_g``.
     """
     strat = StarGANv2TrainingStrategy.__new__(StarGANv2TrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = config
     gen = disc = opt_g = opt_d = None
     if wire_optimizers:
@@ -243,6 +244,7 @@ def test_setup_models_amp_configures_owned_nets(
     """I2: the strategy-owned mapping-network + style-encoder (built after the base
     ``__init__`` AMP pass) must themselves be AMP-configured in ``setup_models``."""
     strat = StarGANv2TrainingStrategy.__new__(StarGANv2TrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = minimal_stargan_config
     strat.env = types.SimpleNamespace(
         generator=None,
@@ -274,7 +276,7 @@ def test_g_closure_exposes_plain_metric_names(
     assert {"style", "diversity", "cycle", "adv_g", "g_total_loss"} <= set(metrics)
     assert "d_total_loss" in metrics
     assert all(
-        isinstance(metrics[k], float)
+        isinstance(metrics[k], torch.Tensor) and metrics[k].ndim == 0
         for k in ("style", "diversity", "cycle", "g_total_loss")
     )
 

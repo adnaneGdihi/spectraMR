@@ -97,6 +97,17 @@ SPECTRAMR_WALL_CLOCK_MARGIN_S = "SPECTRAMR_WALL_CLOCK_MARGIN_S"
 #: chooses it and the run obeys, so the two cannot disagree about where to look
 #: (non-negotiable 17). Unset falls back to ``<run_dir>/WALL_CLOCK_YIELD``.
 SPECTRAMR_WALL_CLOCK_MARKER = "SPECTRAMR_WALL_CLOCK_MARKER"
+#: ``1`` lets an array task start although its HEAD or config differs from the
+#: submit-time snapshot (#2662); unset or ``0`` raises. Any other value raises.
+#: Rides ``sbatch --export=ALL``, so it is decided when the array is submitted.
+SPECTRAMR_DISPATCH_ALLOW_DRIFT = "SPECTRAMR_DISPATCH_ALLOW_DRIFT"
+#: The branch array runs follow; unset means ``dev``, the only branch runs come from.
+#: It exists for test fixtures whose checkout is a feature branch; never set it on a
+#: cluster. Read by ``dispatch_git.run_branch`` and recorded in the snapshot.
+SPECTRAMR_DISPATCH_RUN_BRANCH = "SPECTRAMR_DISPATCH_RUN_BRANCH"
+#: Path of the per-task snapshot verdict the dispatcher writes and the run stamps
+#: into provenance. The DISPATCHER sets it; setting it by hand falsifies the record.
+SPECTRAMR_DISPATCH_SNAPSHOT_RECORD = "SPECTRAMR_DISPATCH_SNAPSHOT_RECORD"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. CUDA / PyTorch tuning
@@ -126,6 +137,9 @@ TORCH_CUDA_EAGER_CACHE_MANAGER = "TORCH_CUDA_EAGER_CACHE_MANAGER"
 OMP_NUM_THREADS = "OMP_NUM_THREADS"
 MKL_NUM_THREADS = "MKL_NUM_THREADS"
 OPENBLAS_NUM_THREADS = "OPENBLAS_NUM_THREADS"
+#: CPU threads ``spectramr train`` gives OpenMP, MKL, OpenBLAS and torch. ``main.py``
+#: overwrites the three variables above, so this is the one knob.
+SPECTRAMR_CPU_THREADS = "SPECTRAMR_CPU_THREADS"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Distributed training (set by torchrun / launchers)
@@ -155,6 +169,10 @@ SPECTRAMR_DEBUG = "SPECTRAMR_DEBUG"
 #: Suppress the CLI startup notice. Same bare-truthiness read as
 #: ``SPECTRAMR_DEBUG`` above: ``SPECTRAMR_QUIET=0`` is quiet. Unset to turn off.
 SPECTRAMR_QUIET = "SPECTRAMR_QUIET"
+#: Log level for the whole process (``debug|info|warning|error|critical``). Beats
+#: the config's ``logging.sinks.level``; ``--log-level`` beats this. An unknown
+#: value raises at CLI entry.
+SPECTRAMR_LOG_LEVEL = "SPECTRAMR_LOG_LEVEL"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Filesystem
@@ -251,8 +269,12 @@ __all__ = [
     "SPECTRAMR_WALL_CLOCK_DEADLINE",
     "SPECTRAMR_WALL_CLOCK_MARGIN_S",
     "SPECTRAMR_WALL_CLOCK_MARKER",
+    "SPECTRAMR_DISPATCH_ALLOW_DRIFT",
+    "SPECTRAMR_DISPATCH_RUN_BRANCH",
+    "SPECTRAMR_DISPATCH_SNAPSHOT_RECORD",
     "SPECTRAMR_LEGACY_ABS_PREFIXES",
     "SPECTRAMR_LEGACY_CLUSTER_PREFIX",
+    "SPECTRAMR_LOG_LEVEL",
     "SPECTRAMR_NO_GPU_PROBE",
     "SPECTRAMR_TARGET_COMPUTE_CAPABILITY",
     "SPECTRAMR_PLUGINS",
@@ -265,6 +287,7 @@ __all__ = [
     "NO_COLOR",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
+    "SPECTRAMR_CPU_THREADS",
     "PROJECT_ROOT",
     "PYTHONHASHSEED",
     "PYTORCH_CUDA_ALLOC_CONF",

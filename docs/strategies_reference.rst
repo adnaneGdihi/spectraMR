@@ -57,6 +57,45 @@ sharpness terms on top. Do **not** also list the strategy's inline term (e.g.
 ``l1``) in the declarative block, or it double-counts.
 
 
+Random streams across ranks and resumes
+=======================================
+
+A strategy whose training step draws from its own ``torch.Generator`` (the SSDU
+and ambient-diffusion splits, the EI group draw, the physics-equivariant SSL
+operator draw) builds it with
+:func:`~spectramr.infrastructure.training.strategies.rng_streams.rank_seeded_generator`,
+which seeds ``seed + rank`` so data-parallel ranks draw different elements, and
+names the attribute in the ``checkpointed_streams`` class tuple. The base
+``strategy_state_dict`` then saves that stream under ``generators`` and
+``load_strategy_state_dict`` restores it: rank 0 resumes its saved state exactly,
+and every other rank reseeds from it plus its rank. Streams are declared, not
+discovered, because a generator that is reseeded on every call (a seeded
+validation draw) or built lazily after the first checkpoint must not be saved.
+
+
+Modules sized by the first forward
+==================================
+
+A strategy-owned module whose shape depends on the data cannot be built in
+``__init__``. The physics-equivariant SSL projection maps the encoder's flattened
+output, ``out_channels × H × W``, to ``latent_dim``, so its input width is known
+only after the first batch. Such a module is added to ``opt_g`` as a new param
+group when it is built. On resume, the base ``load_strategy_state_dict`` first
+calls the strategy's ``_materialize_owned_state`` hook, which rebuilds each such
+module from its saved weights' shape and registers the same group again, in the
+order training added it. ``checkpointing.resume`` restores strategy state
+**before** any optimizer state, so the saved ``opt_g`` state finds the same param
+groups in the same order. The PE-SSL projection, the LOUPE mask logits, the JEPA
+predictor and target encoder and the multi-contrast momentum encoder are rebuilt
+this way.
+
+After the hook has run, the base restore raises on any saved module or parameter
+that has no live attribute of the same kind, before it restores anything. A
+strategy that renames an owned module, or builds one lazily without rebuilding it
+in the hook, therefore fails the resume instead of continuing from freshly
+initialised weights.
+
+
 The lifecycle contract
 ======================
 
@@ -210,7 +249,9 @@ All strategies compose shared behavior via ISP-compliant mixins:
    * - ``AdversarialMixin``
      - Discriminator forward/backward, gradient penalty computation
    * - ``ReconstructionMixin``
-     - Supervised image loss computation (L1, SSIM, perceptual, etc.)
+     - Batch-context assembly (``_prepare_batch_context_reconstruction``), implicit-model
+       detection and coordinate grids. Generator input preparation is owned by
+       ``ReconstructionTrainingStrategy._prepare_generator_inputs``, not the mixin.
    * - ``ValidationMixin``
      - Validation step orchestration, image saving
    * - ``ModelValidationMixin``
@@ -374,7 +415,17 @@ skip discriminator or generator steps to prevent mode collapse.
            loss_type: hinge      # vanilla | lsgan | hinge | wgan
      gan:
        disc_updates: 2           # canonical home for "D updates per G step"
+       disc_update_interval: 1   # update D only every N-th iteration (disc_updates times); 1 = every step
        gan_loss_type: wgan-gp    # see GANLossesConfig in src/spectramr/config/schemas/loss.py
+
+``disc_updates`` and ``disc_update_interval`` are read in one place,
+``mixins/adversarial._resolve_disc_updates``, by the GAN, diffusion,
+adversarial-mixin and disentangled strategies alike.
+
+The WGAN-GP gradient penalty constrains the critic's per-sample score, which is the mean
+over a patch critic's output map and is the value ``WGANLoss`` scores. The critic's
+Wasserstein terms arrive scaled by ``lambda_adv`` but the penalty does not, so the
+penalty-to-critic ratio inside the critic loss is ``lambda_gp / lambda_adv``.
 
 
 DiffusionTrainingStrategy
@@ -918,6 +969,58 @@ DisentangledTrainingStrategy
 
 Content codes from the same anatomy should match; style codes from different
 contrasts should diverge.
+
+**Validation readings of the factorisation.** MSE cannot show that the codes separate: a
+decoder that ignores the style reconstructs as well. When the batches carry
+``contrast_idx`` (the M4Raw multi-contrast route), ``finalize_validation`` adds four keys to
+the validation row; a pass that saw fewer than two contrasts raises instead of reporting.
+
+* ``val_style_contrast_acc`` (high is good) — held-out accuracy of a ridge probe predicting
+  the contrast from the style code; ``val_style_contrast_chance`` is the constant predictor.
+* ``val_content_contrast_leak`` (low is good) — the same probe on the content code, minus
+  chance.
+* ``val_swap_content_distance`` and ``val_swap_style_distance`` (0 is a clean swap) — decode
+  row *i*'s content with row *j*'s style, render, and encode again: the relative error of
+  the recovered content against *i*'s and of the recovered style against *j*'s. At most 12
+  ordered pairs of different contrasts are decoded per pass.
+
+The probes train on the first half of the subjects and test on the rest, using the batch's
+``subject_id``, so no volume is on both sides (a probe that has seen a volume recognises it
+and reads its label back: a fingerprint, not a contrast). ``val_probe_split_by_subject`` is
+1 when that split was used; 0 means the batches carried no subject id and the probes fell
+back to the first and second half of the rows, which is subject-disjoint only if the
+validation order is by subject. The arithmetic is in ``spectramr.core.metrics.disentanglement``;
+they are not ``MetricsRegistry`` entries because the registry contract is a
+``(pred, target)`` image pair.
+
+**Echo-train render and its protocol.** For spin-echo and inversion-recovery rows
+(``model_kwargs.bloch_sequence_by_contrast``) the tissue maps are rendered as an echo train
+of 16 echoes read at the middle one. ``model_kwargs.bloch_protocol_by_contrast`` declares the
+acquisition each contrast was scanned with, in ms::
+
+   bloch_protocol_by_contrast:
+     T1: {TR: 500.0, TE: 18.4}
+     FLAIR: {TR: 7500.0, TE: 98.0, TI: 1655.0}
+
+The render then spaces the train at ``TE / 8`` per row and weights the signal by
+``1 - exp(-TR/T1)`` (spin echo) or ``|1 - 2 exp(-TI/T1) + exp(-TR/T1)|`` (inversion recovery),
+so contrasts render as they were scanned. With a declared protocol the protocol owns the contrast: the tissue-map render takes no
+style code, so the swap is row *i*'s content under row *j*'s protocol, and only the content
+readings (``val_content_contrast_leak``, ``val_swap_content_distance``) are reported; the
+style readings would describe the encoder alone. The susceptibility (``chi``) dephasing term
+``exp(-R2' TE)`` acts on gradient-echo rows only: a spin echo refocuses static dephasing.
+These replace the style code's predicted TR/TE/TI,
+which no data term constrains and which would trade off against the tissue maps. Every
+declared contrast needs an entry, ``TI`` belongs to inversion-recovery contrasts only, and
+rows without an echo-train render raise. Without the key the render keeps its protocol-free
+defaults (one 10 ms echo train for every row), which is what arms that predate it were
+trained with.
+
+**FNO-EPG surrogate.** ``use_fno_epg: true`` renders through a Fourier-neural-operator
+surrogate of the analytic EPG. It needs ``model_kwargs.fno_epg_weights``, a file written by
+``scripts/physics/pretrain_fno_epg.py`` (fitted over T1, T2, B1+ and echo spacing, scored on
+held-out voxels, refused above ``--max-mae``); a default-initialised surrogate is a random
+function and the strategy does not build one. It is loaded frozen.
 
 
 DisentangledVAETrainingStrategy
@@ -1567,7 +1670,7 @@ keeping :math:`\partial T_1/\partial B_0 \ge 0`.
 **Config:** ``training.dispersion_bloch_ae``
 (``TrainingConfigDispersionBlochAE``). Identifiability is a hard constraint:
 Tier-1 ``dispersion_identifiability`` **errors** when
-``2*n_pools + 1 > len(fields_present)``, and the model constructor raises on the
+``2*num_pools + 1 > len(fields_present)``, and the model constructor raises on the
 same condition, because an under-determined fit converges to a meaningless
 latent rather than failing visibly.
 
@@ -1766,19 +1869,39 @@ list. The strategy raises if no ``ssdu`` / ``multi_mask_ssdu`` loss is wired
    without fully sampled reference data," *MRM* 84(6), 2020.
 
 **Robust SSDU (Noisier2Noise).** The ``robust_ssdu`` key selects the same
-strategy with ``ssdu.noisier2noise_correction = true``. For NOISY sub-sampled
-training data (Millard & Chiew 2024), the network is fed a *noisier* measurement
-:math:`\mathbf{z} = \mathbf{y} + \tilde{\mathbf{n}}`, with
-:math:`\tilde{\mathbf{n}} \sim \mathcal{CN}(0, \sigma^2)` injected on the
-acquired support (``ssdu_strategy.inject_noisier_kspace``), while the held-out
-:math:`\Theta` loss target stays the original (less-noisy) :math:`\mathbf{y}` —
-the Noisier2Noise principle (train noisier → less-noisy). The noise
-:math:`\sigma` is wired via ``ssdu.noise_std_estimate`` (fail-closed: the schema
-validator and the strategy raise if the correction is on without it), and the
-dataset-driven ``ssdu.noise_model`` (``gaussian_kspace`` / ``ncchi_magnitude``)
-is shared with the T1 keystone. **Corner case:** at :math:`\sigma \to 0` the
-injected noise vanishes and Robust SSDU reduces exactly to vanilla SSDU, so the
-repair provably generalizes the base method. The ``robust_ssdu_key_matches_correction``
+strategy with ``ssdu.noisier2noise_correction = true`` (Millard & Chiew,
+arXiv:2210.01696). Plain SSDU under measurement noise fills the missing lines but
+passes the acquired lines' noise through. Robust SSDU corrupts the input again
+before the split,
+
+.. math::
+
+   \tilde{\mathbf{y}} = \mathbf{M}_\Lambda(\mathbf{y} + \tilde{\mathbf{n}}),\qquad
+   \tilde{\mathbf{n}} \sim \mathcal{CN}(0, \alpha^2\sigma^2),
+
+scores the prediction on **all** of :math:`\Omega` with the residual on
+:math:`\Lambda` weighted by :math:`(1+\alpha^2)/\alpha^2`, and at validation feeds
+:math:`\mathbf{y}` and applies the Noisier2Noise correction on the acquired lines,
+
+.. math::
+
+   \hat{\mathbf{y}}_0 = \mathbf{M}_\Omega\,
+     \frac{(1+\alpha^2)\,\mathbf{F}\mathbf{S}\hat{\mathbf{x}} - \mathbf{y}}{\alpha^2}
+     + (\mathbf{I}-\mathbf{M}_\Omega)\,\mathbf{F}\mathbf{S}\hat{\mathbf{x}} .
+
+:math:`\alpha` is ``ssdu.alpha`` (default 0.75); :math:`\sigma` is
+``ssdu.noise_std_estimate`` or, under ``noise_std_source: self_calibrated``, a
+per-batch fit from the coil null space. The correction is derived for
+complex-Gaussian k-space noise, so the schema refuses ``noise_model:
+ncchi_magnitude`` with it on. The estimator and its tests live in
+``strategies/robust_ssdu.py``; the derivation is in
+``experiments/inprogress/self_supervised/PAPER.md``.
+
+The strategy owns the operator: the network is handed :math:`A^H\tilde{\mathbf{y}}`
+(SENSE-combined with the batch's complex coil maps), the model's data consistency
+receives :math:`\tilde{\mathbf{y}}`, :math:`\Lambda` and the maps, and the ``ssdu``
+loss applies :math:`\mathbf{F}\mathbf{S}` itself. Multi-coil SSDU therefore needs the
+``espirit_sensitivity`` transform. The ``robust_ssdu_key_matches_correction``
 audit refuses ``training_mode: robust_ssdu`` with the correction off, and
 ``ssdu_selection_density_range`` warns when ``theta_fraction`` leaves
 ``[0.2, 0.5]``.
@@ -1818,9 +1941,20 @@ reaching the network — the mechanism-fires guard.
 
 Configure via the ``training.equivariant_imaging`` sub-block (``group``,
 ``alpha_equivariance``, ``n_group_samples``, ``robust_correction``,
-``noise_std_estimate``, ``noise_model``, ``n_coils``). Corner case:
-``alpha_equivariance: 0`` reduces EI to a measurement-consistency
-reconstruction.
+``noise_std_estimate``, ``noise_model``, ``n_coils``, ``multicoil_operator``,
+``measurement_target``). Corner case: ``alpha_equivariance: 0`` reduces EI to a
+measurement-consistency reconstruction.
+
+``multicoil_operator: true`` inverts :math:`A = M F S` with the batch's complex coil
+maps, in training and at validation. ``measurement_target: alternate_repetition``
+(Rep-EI) scores the anchor with the declared ``masked_kspace_l2`` against a second
+repetition on the lines ``loss_mask`` selects, instead of against :math:`\mathbf{y}`;
+a k-space network (``complex_unet``) is supported, its output SENSE-combined before
+the group acts. The measurement :math:`\mathbf{y}` is read from the batch's
+``measured_kspace`` key, which the masking transforms write; the ``kspace`` key is
+the fully sampled reference on both k-space routes. An image network over a k-space
+loader declares ``validation.scoring.output_transform: ifft_target_magnitude`` so
+that only the target is brought to the image domain.
 
 .. automodule:: spectramr.infrastructure.training.strategies.equivariant_imaging_strategy
    :members:
@@ -1829,9 +1963,7 @@ reconstruction.
 
 .. note::
 
-   EI assumes a single (coil-combined) complex forward operator :math:`A = M F`;
-   multi-coil EI (:math:`A = M F S` via ``sense_forward``) is a future
-   extension. References: Chen *et al.*, "Equivariant imaging: Learning beyond
+   References: Chen *et al.*, "Equivariant imaging: Learning beyond
    the range space," *ICCV* 2021; Chen *et al.*, "Robust equivariant imaging,"
    *CVPR* 2022; Tachella *et al.*, sensing theorems, *JMLR* 2023.
 
@@ -1974,7 +2106,7 @@ default — surface the failure.
   schedules — section 5 below owns that rule and enumerates all three spellings.)
 - Catching a teacher-checkpoint load failure and setting ``self._teacher = None``,
   which trains the student as a plain reconstruction even though
-  ``checkpoint.resume_from`` was configured. A configured-but-unloadable teacher
+  ``training.distillation.teacher_checkpoint`` was configured. A configured-but-unloadable teacher
   must raise; the genuinely-optional no-teacher path returns early, before the
   load is attempted.
 

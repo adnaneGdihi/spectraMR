@@ -83,3 +83,45 @@ def test_vq_reconstruction_loss_is_registry_routed() -> None:
     )
     with pytest.raises(ValueError, match="Unsupported loss type"):
         vq_reconstruction_loss(recon, target, "nope")
+
+
+def _vqgan_grads(codebook_weight: float, commitment_cost: float) -> tuple[float, float]:
+    """Gradient magnitudes on (codebook vectors, encoder output) from VQGANLoss."""
+    from spectramr.models.losses.vq_losses import VQGANLoss
+
+    quantized, latent_targets = _pair()
+    loss_fn = VQGANLoss(
+        codebook_weight=codebook_weight,
+        commitment_cost=commitment_cost,
+        perceptual_weight=0.0,
+        adversarial_weight=0.0,
+    )
+    image = torch.zeros(2, 1, 8, 8)
+    total, _ = loss_fn(image, image, quantized, latent_targets)
+    total.backward()
+    return _grad_mag(quantized), _grad_mag(latent_targets)
+
+
+def test_vqgan_codebook_term_updates_codebook_only() -> None:
+    """#1432: VQGANLoss must route its codebook term exactly like VQLoss."""
+    to_codebook, to_encoder = _vqgan_grads(codebook_weight=1.0, commitment_cost=0.0)
+    assert to_codebook > 0
+    assert to_encoder == pytest.approx(0.0, abs=1e-12)
+
+
+def test_vqgan_commitment_term_updates_encoder_only() -> None:
+    """#1432: the commitment weight lands on the encoder output, not the codebook."""
+    to_codebook, to_encoder = _vqgan_grads(codebook_weight=0.0, commitment_cost=1.0)
+    assert to_encoder > 0
+    assert to_codebook == pytest.approx(0.0, abs=1e-12)
+
+
+def test_simple_api_accepts_inputs_as_third_positional_argument() -> None:
+    """The documented ``forward(quantized, targets, inputs)`` form must not raise."""
+    quantized, targets = _pair()
+    inputs = torch.randn(2, 4, 8, 8)
+    loss_fn = VQLoss(perceptual_weight=0.5, perceptual_loss_fn=torch.nn.L1Loss())
+    total, logs = loss_fn(quantized, targets, inputs)
+    assert "perceptual_loss" in logs
+    expected = logs["vq_loss"] + 0.5 * float(torch.nn.functional.l1_loss(inputs, quantized))
+    assert float(total) == pytest.approx(expected, rel=1e-5)

@@ -118,19 +118,19 @@ class TestExplicitVersusDefault:
     def test_nesterov_reaches_sgd_and_raises_on_adam(self) -> None:
         assert (
             resolve_optimizer_spec(
-                OptimizationConfigSchema(optimizer_type="sgd", nesterov=True)
+                OptimizationConfigSchema(optimizer={"type": "sgd", "nesterov": True})
             ).params["nesterov"]
             is True
         )
 
         with pytest.raises(OptimizerConfigurationError, match="nesterov"):
             resolve_optimizer_spec(
-                OptimizationConfigSchema(optimizer_type="adam", nesterov=True)
+                OptimizationConfigSchema(optimizer={"type": "adam", "nesterov": True})
             )
 
     def test_amsgrad_reaches_adamw(self) -> None:
         spec = resolve_optimizer_spec(
-            OptimizationConfigSchema(optimizer_type="adamw", amsgrad=True)
+            OptimizationConfigSchema(optimizer={"type": "adamw", "amsgrad": True})
         )
         assert spec.params["amsgrad"] is True
 
@@ -392,6 +392,33 @@ class TestFusedOptimizer:
     def test_explicit_false_is_forwarded(self) -> None:
         assert self._spec(type="adamw", fused=False).params.get("fused") is False
 
+    def test_fused_defaults_on_when_every_parameter_is_real_cuda(self, monkeypatch) -> None:
+        from spectramr.infrastructure.training import optimizer_resolution as mod
+
+        monkeypatch.setattr(mod, "_fused_supported", lambda model: True)
+        spec = resolve_optimizer_spec(
+            OptimizationConfigSchema(optimizer={"type": "adamw"}), model=object()
+        )
+        assert spec.params.get("fused") is True
+        assert spec.as_provenance()["applied_defaults"] == ["fused"]
+
+    def test_explicit_false_beats_the_cuda_default(self, monkeypatch) -> None:
+        from spectramr.infrastructure.training import optimizer_resolution as mod
+
+        monkeypatch.setattr(mod, "_fused_supported", lambda model: True)
+        spec = resolve_optimizer_spec(
+            OptimizationConfigSchema(optimizer={"type": "adamw", "fused": False}), model=object()
+        )
+        assert spec.params["fused"] is False and not spec.applied_defaults
+
+    def test_a_cpu_or_complex_model_is_not_given_fused(self) -> None:
+        import torch
+
+        from spectramr.infrastructure.training.optimizer_resolution import _fused_supported
+
+        assert not _fused_supported(torch.nn.Linear(2, 2))  # CPU
+        assert not _fused_supported(None)
+
     def test_declaring_it_on_an_optimizer_without_it_raises(self) -> None:
         """pitfall #15: a declared knob that cannot reach the optimizer is a
         silent no-op. Adafactor has no ``fused`` argument."""
@@ -424,3 +451,64 @@ class TestFusedOptimizer:
                 with pytest.raises(OptimizerConfigurationError):
                     self._spec(type=name, fused=True)
         assert checked, "no optimizer was introspectable; the test proved nothing"
+
+
+class TestOneAnswerForBeta1:
+    """#2308: the schema default said 0.5, the live optimizer ran 0.9, and no
+    record said which. Unset beta1 now means the optimizer's own default."""
+
+    def test_an_undeclared_pair_runs_and_records_the_constructor_default(self) -> None:
+        cfg = OptimizationConfigSchema(optimizer_type="adamw", learning_rate=1e-4)
+        assert cfg.optimizer.beta1 is None
+        spec = resolve_optimizer_spec(cfg)
+        assert "betas" not in spec.params
+        record = spec.as_provenance()
+        assert record["betas"] == (0.9, 0.999)
+        assert record["betas_source"] == "optimizer constructor default"
+
+    def test_beta1_alone_keeps_the_schema_beta2(self) -> None:
+        cfg = OptimizationConfigSchema(optimizer_type="adamw", beta1=0.5)
+        assert resolve_optimizer_spec(cfg).params["betas"] == (0.5, 0.999)
+
+    def test_beta2_alone_pairs_with_the_optimizer_beta1(self) -> None:
+        cfg = OptimizationConfigSchema(optimizer_type="adamw", beta2=0.99)
+        assert resolve_optimizer_spec(cfg).params["betas"] == (0.9, 0.99)
+
+    def test_a_declared_pair_is_recorded_as_declared(self) -> None:
+        record = resolve_optimizer_spec(
+            OptimizationConfigSchema(optimizer_type="adamw", betas=(0.5, 0.9))
+        ).as_provenance()
+        assert record["betas"] == (0.5, 0.9)
+        assert "betas_source" not in record
+
+    def test_a_pair_beside_beta2_alone_is_checked_against_the_optimizer_beta1(self) -> None:
+        """With beta1 unset the scalar side is (0.9, beta2), so a pair that
+        agrees with it is accepted and one that contradicts beta2 raises."""
+        agree = OptimizationConfigSchema(optimizer_type="adamw", betas=(0.9, 0.99), beta2=0.99)
+        assert resolve_optimizer_spec(agree).params["betas"] == (0.9, 0.99)
+        with pytest.raises(OptimizerConfigurationError, match="disagrees"):
+            resolve_optimizer_spec(
+                OptimizationConfigSchema(optimizer_type="adamw", betas=(0.9, 0.99), beta2=0.999)
+            )
+
+    def test_a_list_in_kwargs_agrees_with_the_same_declared_pair(self) -> None:
+        """YAML gives a list; the resolved pair is a tuple. Equal values raised."""
+        cfg = OptimizationConfigSchema(
+            optimizer_type="adamw",
+            betas=(0.9, 0.99),
+            optimizer={"kwargs": {"betas": [0.9, 0.99]}},
+        )
+        assert tuple(resolve_optimizer_spec(cfg).params["betas"]) == (0.9, 0.99)
+
+
+class TestParamGroupsAddressTheGenerator:
+    """The generator's named-parameter prefixes were applied to the discriminator."""
+
+    def test_the_discriminator_ignores_generator_prefixes(self) -> None:
+        cfg = OptimizationConfigSchema(
+            learning_rate=1e-3,
+            optimizer={"param_groups": {"residual_head": {"learning_rate": 1e-5}}},
+        )
+        discriminator = nn.Sequential(nn.Linear(4, 1))
+        spec = resolve_optimizer_spec(cfg, role="discriminator", model=discriminator)
+        assert spec.param_groups == ()

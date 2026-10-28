@@ -160,3 +160,52 @@ class TestRegistration:
         # component with filtered kwargs at compute time).
         names = [w.name for w in composite.losses]
         assert "null_space_content" in names
+
+
+class TestNullSpaceAcquiredPlane:
+    """Padded (never-acquired) lines are no one's null space (#2160)."""
+
+    @staticmethod
+    def _case(n_pad: int):
+        torch.manual_seed(0)
+        n = 16 + n_pad
+        pred = torch.zeros(1, 2, 8, n)
+        target = torch.zeros(1, 2, 8, n)
+        pred[..., :16] = torch.randn(1, 2, 8, 16)
+        target[..., :16] = torch.randn(1, 2, 8, 16)
+        mask = torch.zeros(1, 1, 8, n)
+        mask[..., 0:16:2] = 1.0
+        acquired = torch.zeros(1, 1, 8, n)
+        acquired[..., :16] = 1.0
+        return pred, target, mask, acquired
+
+    def test_padding_does_not_change_the_value(self):
+        loss = NullSpaceContentLoss()
+        base = loss(*self._case(0)[:3], acquired=self._case(0)[3])
+        for n_pad in (4, 12):
+            pred, target, mask, acq = self._case(n_pad)
+            assert loss(pred, target, mask=mask, acquired=acq).item() == pytest.approx(
+                base.item(), rel=1e-6
+            )
+            # Planted violation: without the plane the padded bins dilute the mean.
+            assert loss(pred, target, mask=mask).item() != pytest.approx(base.item(), rel=1e-3)
+
+    def test_acquired_none_is_the_legacy_value(self):
+        pred, target, mask, _ = self._case(6)
+        null = (1.0 - mask).expand_as(pred)
+        expected = (((pred - target) ** 2) * null).sum() / null.sum()
+        got = NullSpaceContentLoss()(pred, target, mask=mask)
+        assert got.item() == pytest.approx(expected.item(), rel=1e-6)
+
+    def test_denominator_counts_only_acquired_unkept_bins(self):
+        """diff = 1 on every bin: mean over the weighted bins is 1 only if the
+        denominator equals the numerator's weight sum, padded bins excluded."""
+        pred, target, mask, acq = self._case(5)
+        pred = torch.ones_like(pred)
+        target = torch.zeros_like(target)
+        loss = NullSpaceContentLoss()(pred, target, mask=mask, acquired=acq)
+        assert loss.item() == pytest.approx(1.0, rel=1e-6)
+        # Padded bins carry weight 0: perturbing them cannot move the value.
+        pred[..., 16:] = 7.0
+        again = NullSpaceContentLoss()(pred, target, mask=mask, acquired=acq)
+        assert again.item() == pytest.approx(1.0, rel=1e-6)

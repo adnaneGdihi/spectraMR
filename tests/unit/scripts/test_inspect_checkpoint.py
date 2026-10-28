@@ -1,10 +1,10 @@
 """Paired tests for ``scripts/verification/inspect_checkpoint.py``.
 
-The script's job is to say, of a real artifact, which groups a resume would
-restore. Its own failure mode is the one that matters: a report that prints
-PRESENT for a key the file does not carry is worse than no report, because it
-is the thing being consulted precisely when the checkpoint is in doubt. So each
-case below plants an absence and asserts the report names it.
+The script's job is to say, of a real artifact, which RunState parts a resume would
+restore. Its own failure mode is the one that matters: a report that prints PRESENT for
+a part the file does not carry is worse than no report, because it is the thing being
+consulted precisely when the checkpoint is in doubt. So each case below plants an
+absence and asserts the report names it.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from spectramr.infrastructure.checkpointing import codecs
+from spectramr.infrastructure.checkpointing.payload import build_meta
+from tests.fixtures.run_state_files import write_run_state
 from tests.utils.repo_scripts import require_repo_file
 
 _SCRIPT = require_repo_file("scripts/verification/inspect_checkpoint.py")
@@ -29,85 +32,110 @@ def _load_module():
 
 inspect_checkpoint = _load_module()
 
+_GENERATOR = {"w": torch.zeros(4, 4), "b": torch.zeros(4)}  # 2 tensors, 80 bytes
 
-def _complete_blob() -> dict:
-    """The key set CheckpointDirector.save writes for a GAN arm."""
-    return {
-        "epoch": 3,
-        "global_step": 40_000,
-        "generator": {"w": torch.zeros(4, 4), "b": torch.zeros(4)},
-        "optimizer_g": {"param_groups": [{"lr": 2e-4}], "state": {0: {}}},
-        "scheduler_g": {"last_epoch": 3, "_step_count": 4},
-        "counter_state": {"current_step": 40_000, "current_epoch": 3},
-        "rng_state": {"torch": torch.zeros(8, dtype=torch.uint8), "numpy": (), "python": ()},
-        "metrics": {},
+
+def _parts(**drop: bool) -> dict:
+    """The optional parts a GAN step file carries; ``drop`` names the ones to leave out."""
+    parts = {
+        "optim": {"generator": {"param_groups": [{"lr": 2e-4}], "state": {}}},
+        "sched": {"generator": {"last_epoch": 3, "_step_count": 4}},
+        "rng": {"torch": torch.zeros(8, dtype=torch.uint8)},
     }
+    return {k: v for k, v in parts.items() if not drop.get(k)}
 
 
-def _write(tmp_path: Path, blob: dict) -> Path:
-    path = tmp_path / "checkpoint_epoch_0003_step_040000.pt"
-    torch.save(blob, path)
-    return path
+def _write(tmp_path: Path, *, models: dict | None = None, ema: bool = True, **drop: bool) -> Path:
+    return write_run_state(
+        tmp_path / "step_00000010.pt",
+        models if models is not None else {"generator": _GENERATOR, "discriminator": {"d": torch.zeros(2)}},
+        ema={"w": torch.zeros(4, 4), "b": torch.zeros(4)} if ema else None,
+        role="step",
+        extra_parts=_parts(**drop),
+    )
 
 
 @pytest.mark.unit
 def test_complete_checkpoint_reports_ok(tmp_path, capsys):
-    exit_code = inspect_checkpoint.report(_write(tmp_path, _complete_blob()))
+    exit_code = inspect_checkpoint.report(_write(tmp_path))
     out = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "global_step=40000" in out
-    assert "OK: every group a resume needs" in out
+    assert "role=step" in out and "step=10" in out
+    assert "OK: every part a resume needs" in out
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("dropped", ["generator", "optimizer_g", "global_step"])
-def test_a_missing_required_group_fails_loudly(tmp_path, capsys, dropped):
-    """The planted violation: a checkpoint that cannot continue a run."""
-    blob = _complete_blob()
-    del blob[dropped]
+def test_each_part_reports_its_tensor_count_and_bytes(tmp_path, capsys):
+    inspect_checkpoint.report(_write(tmp_path))
+    lines = {line.strip() for line in capsys.readouterr().out.splitlines()}
 
-    exit_code = inspect_checkpoint.report(_write(tmp_path, blob))
+    # ema holds the shadow's two tensors plus its integer update counter.
+    assert f"{'models.generator':<22} PRESENT  2 tensors, 80 bytes" in lines
+    assert f"{'models.discriminator':<22} PRESENT  1 tensors, 8 bytes" in lines
+    assert f"{'ema':<22} PRESENT  2 tensors, 80 bytes" in lines
+
+
+@pytest.mark.unit
+def test_a_missing_optimizer_fails_loudly(tmp_path, capsys):
+    """The planted violation: a checkpoint that cannot continue a run."""
+    exit_code = inspect_checkpoint.report(_write(tmp_path, optim=True))
     out = capsys.readouterr().out
 
     assert exit_code == 1
-    assert f"{dropped:<20} MISSING" in out
+    assert f"{'optim':<22} MISSING" in out
     assert "cannot resume" in out
 
 
 @pytest.mark.unit
-def test_absent_rng_state_is_reported_not_assumed(tmp_path, capsys):
-    """The exact regression this script was written after.
-
-    ``rng_state`` is optional -- older checkpoints predate it -- so its absence
-    must not fail the run, but it must be visible, because a resume without it
-    silently draws a different timestep/mask sequence.
-    """
-    blob = _complete_blob()
-    del blob["rng_state"]
-
-    exit_code = inspect_checkpoint.report(_write(tmp_path, blob))
+def test_a_missing_generator_fails_loudly(tmp_path, capsys):
+    exit_code = inspect_checkpoint.report(
+        _write(tmp_path, models={"discriminator": {"d": torch.zeros(2)}})
+    )
     out = capsys.readouterr().out
 
-    assert exit_code == 0
-    assert "rng_state            absent" in out
+    assert exit_code == 1
+    assert f"{'models.generator':<22} MISSING" in out
 
 
 @pytest.mark.unit
-def test_rng_summary_names_the_streams(tmp_path, capsys):
-    blob = _complete_blob()
-    blob["rng_state"]["cuda"] = [torch.zeros(8, dtype=torch.uint8)] * 2
+def test_an_engine_held_optimizer_is_not_missing(tmp_path, capsys):
+    """Under DeepSpeed the optimizer lives in the native tag directory, so the
+    file's ``optim`` part is empty by design."""
+    path = tmp_path / "step_00000010.pt"
+    meta = build_meta(
+        role="step",
+        reason="periodic",
+        epoch=1,
+        step=10,
+        fmt="pt",
+        topology={"world_size": 2, "parallel_strategy": "deepspeed"},
+        native_tag="step_00000010",
+    )
+    codecs.write(path, {"meta": meta, "models": {"generator": _GENERATOR}, "optim": {}})
 
-    inspect_checkpoint.report(_write(tmp_path, blob))
+    exit_code = inspect_checkpoint.report(path)
     out = capsys.readouterr().out
 
-    assert "torch, numpy, python, cuda[2]" in out
+    assert exit_code == 0
+    assert "native tag step_00000010" in out
+
+
+@pytest.mark.unit
+def test_absent_rng_is_reported_not_assumed(tmp_path, capsys):
+    """``rng`` is optional, so its absence must not fail the run, but it must be
+    visible: a resume without it draws a different timestep/mask sequence."""
+    exit_code = inspect_checkpoint.report(_write(tmp_path, rng=True))
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert f"{'rng':<22} absent" in out
 
 
 @pytest.mark.unit
 def test_the_uncarried_half_is_always_stated(tmp_path, capsys):
-    """A key list cannot show what no key covers, so the report says it."""
-    inspect_checkpoint.report(_write(tmp_path, _complete_blob()))
+    """A part list cannot show what no part covers, so the report says it."""
+    inspect_checkpoint.report(_write(tmp_path))
     out = capsys.readouterr().out
 
     assert "NOT CARRIED BY ANY CHECKPOINT" in out
@@ -116,14 +144,12 @@ def test_the_uncarried_half_is_always_stated(tmp_path, capsys):
 
 
 @pytest.mark.unit
-def test_a_bare_state_dict_is_refused(tmp_path):
-    """A consolidated DeepSpeed export is not an envelope and must not be read
-    as one -- reporting every group MISSING would misdiagnose it."""
-    path = tmp_path / "consolidated.pt"
-    torch.save([torch.zeros(2)], path)
+def test_a_pre_v1_file_exits_2_naming_the_converter(tmp_path, capsys):
+    path = tmp_path / "checkpoint_epoch_0003_step_040000.pt"
+    torch.save({"generator": _GENERATOR, "global_step": 40_000}, path)
 
-    with pytest.raises(TypeError, match="not a checkpoint envelope"):
-        inspect_checkpoint.report(path)
+    assert inspect_checkpoint.main(["--checkpoint", str(path)]) == 2
+    assert "convert_checkpoints_v1" in capsys.readouterr().err
 
 
 @pytest.mark.unit

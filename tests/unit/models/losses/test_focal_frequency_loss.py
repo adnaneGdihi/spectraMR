@@ -126,3 +126,9 @@ class TestFocalFrequencyLoss:
         # Second call should reuse cache
         ffl(pred, target)
         assert ffl._cached_size == (32, 32)
+
+
+def test_unknown_weight_mode_raises() -> None:
+    """A misspelt mode used to fall through to ``radial`` without a word."""
+    with pytest.raises(ValueError, match="parabolic"):
+        FocalFrequencyLoss(mode="parabollic")

@@ -21,7 +21,7 @@ loss weights come from ``config.losses.reconstruction`` (SSOT).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -57,6 +57,8 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         noise_estimator: Marker-based noise variance estimator (monitoring).
     """
 
+    synthesises_model_input: ClassVar[bool] = True
+
     #: The twin undersamples at ``physics.digital_twin.acceleration`` when its
     #: ``enable_undersampling`` is true; the top-level ``undersampling:`` block
     #: reaches nothing here (the k-space mixin's generator is never called), so
@@ -72,7 +74,8 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize Digital Twin from config, operator chain, and losses."""

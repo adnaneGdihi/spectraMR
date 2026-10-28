@@ -213,3 +213,55 @@ class TestEverySliceIsCalibrated:
         )
         single = ESPIRiTSensitivityTransform(acs_size=24)(alone)["sensitivity_complex"].data
         assert torch.allclose(batched[..., 2:3], single, atol=1e-5)
+
+
+def _published(calibration_tag: str = "acs_size=24;kernel_size=6;eigen_threshold=0.95"):
+    """A subject whose loader already attached maps, as ``coil_maps_root`` does."""
+    subject = _subject()
+    maps = torch.full((_C, _S, _S, 1), 0.5 + 0.0j, dtype=torch.complex64)
+    subject.add_image(tio.ScalarImage(tensor=maps), "sensitivity_complex")
+    subject.add_image(tio.ScalarImage(tensor=maps.abs()), "sensitivity")
+    subject["coil_maps_source"] = "file:/maps/2022061001_T1.pt"
+    subject["coil_maps_calibration"] = calibration_tag
+    return subject, maps
+
+
+class TestPublishedMapsAreCheckedNotReplaced:
+    """Under ``data.coil_maps_root`` the loader's maps win; this transform only checks."""
+
+    def test_it_does_not_estimate_over_them(self, monkeypatch) -> None:
+        import spectramr.infrastructure.physics.coil_sensitivity as coil_sensitivity
+
+        monkeypatch.setattr(
+            coil_sensitivity, "estimate_csm_espirit", lambda *a, **k: pytest.fail("estimated")
+        )
+        subject, maps = _published()
+        out = ESPIRiTSensitivityTransform(acs_size=24)(subject)
+        assert torch.equal(out["sensitivity_complex"].data, maps)
+
+    def test_a_different_declared_calibration_raises(self) -> None:
+        from spectramr.data.datasets.m4raw_coil_maps import CoilMapMismatchError
+
+        subject, _ = _published()
+        with pytest.raises(CoilMapMismatchError, match="acs_size=32"):
+            ESPIRiTSensitivityTransform(acs_size=32)(subject)
+
+    def test_maps_of_another_array_raise(self) -> None:
+        from spectramr.data.datasets.m4raw_coil_maps import CoilMapMismatchError
+
+        subject, _ = _published()
+        subject.remove_image("sensitivity_complex")
+        subject.add_image(
+            tio.ScalarImage(tensor=torch.ones(_C + 2, _S, _S, 1, dtype=torch.complex64)),
+            "sensitivity_complex",
+        )
+        with pytest.raises(CoilMapMismatchError, match="coil count"):
+            ESPIRiTSensitivityTransform(acs_size=24)(subject)
+
+    def test_unstamped_maps_are_still_re_estimated(self) -> None:
+        """Only the loader's stamp opts out; a manifest-loaded map keeps today's path."""
+        subject, maps = _published()
+        del subject["coil_maps_source"]
+        subject.update_attributes()
+        out = ESPIRiTSensitivityTransform(acs_size=24)(subject)
+        assert not torch.equal(out["sensitivity_complex"].data, maps)

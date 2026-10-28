@@ -54,6 +54,7 @@ PIPELINE_VERBS = (
     "hpo",
     "ablation",
     "experiment",
+    "profile",
 )
 
 WHERE_CHOICES = ("local", "docker", "apptainer", "slurm")

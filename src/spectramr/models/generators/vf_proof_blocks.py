@@ -236,15 +236,24 @@ class FourierShiftOperator(_Task2Mixin, IGenerator, nn.Module):
     Args:
         in_channels: Input channels.
         out_channels: Output channels.
+        correction: ``"marker"`` applies the marker-derived (or learnable) shift;
+            ``"none"`` applies zero shift and ignores the marker, giving the
+            matched-compute uncorrected control (same filter, no phase ramp).
     """
 
     def __init__(
         self,
         in_channels: int = 2,
         out_channels: int = 2,
+        correction: str = "marker",
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if correction not in ("marker", "none"):
+            raise ValueError(
+                f"FourierShiftOperator correction must be 'marker' or 'none'; got {correction!r}."
+            )
+        self.correction = correction
         self.delta_x = nn.Parameter(torch.tensor(0.0))
         self.delta_y = nn.Parameter(torch.tensor(0.0))
         self.spectral_filter = nn.Sequential(
@@ -275,7 +284,10 @@ class FourierShiftOperator(_Task2Mixin, IGenerator, nn.Module):
         marker_prior = kwargs.get("marker_prior")
         B, C, H, W = x.shape
 
-        if marker_prior is not None:
+        if self.correction == "none":
+            dx = torch.zeros(B, device=x.device, dtype=x.dtype)
+            dy = torch.zeros(B, device=x.device, dtype=x.dtype)
+        elif marker_prior is not None:
             dx, dy = _extract_shift_from_marker(x, marker_prior)
         else:
             dx = self.delta_x.expand(B)

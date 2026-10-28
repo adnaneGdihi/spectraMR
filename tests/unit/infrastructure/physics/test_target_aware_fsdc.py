@@ -101,9 +101,9 @@ class TestTargetAwareFSDC:
         meas = multi_contrast_data["kspace_measured"]
         H, W = 32, 32
 
-        # ACS region (center 10% = ~3 lines on each side)
-        pad_h = max(1, int(H * fsdc.center_fraction))
-        pad_w = max(1, int(W * fsdc.center_fraction))
+        # ACS box: center_fraction is its full width, so the half-width is cf * N / 2.
+        pad_h = max(1, int(H * fsdc.center_fraction / 2))
+        pad_w = max(1, int(W * fsdc.center_fraction / 2))
         ch, cw = H // 2, W // 2
 
         target_out = out[:, 8:, ch - pad_h : ch + pad_h, cw - pad_w : cw + pad_w]
@@ -248,7 +248,7 @@ class TestAcsTaper:
         """
         fsdc = TargetAwareFSDC(
             target_channels=2,
-            center_fraction=0.1,
+            center_fraction=0.2,
             acs_taper="hann",
         )
         ref = torch.zeros(1, 1, 64, 64)
@@ -360,3 +360,31 @@ class TestAcsTaper:
         # Mask must be valid (no NaNs, sums >= 1).
         assert not torch.isnan(m).any()
         assert m.sum().item() >= 1.0
+
+
+
+def test_acs_box_spans_the_declared_fraction() -> None:
+    """Planted: the box used to span 2 * center_fraction of each axis."""
+    fsdc = TargetAwareFSDC(target_channels=2, center_fraction=0.125)
+    m = fsdc._build_acs_mask(64, 64, torch.zeros(1, 1, 64, 64))
+    rows = int(m[0, 0].any(dim=1).sum())
+    assert rows == 8  # 0.125 * 64
+
+
+def test_log_scaled_hf_blend_is_linear() -> None:
+    from spectramr.data.transforms.normalization import compress_kspace_log, decompress_kspace_log
+
+    torch.manual_seed(0)
+    fsdc = TargetAwareFSDC(target_channels=2, center_fraction=0.0625, log_scaled=True)
+    lin_pred = torch.randn(1, 2, 32, 32) * 20
+    lin_meas = torch.randn(1, 2, 32, 32) * 20
+    mask = torch.ones(1, 1, 32, 32)
+    out = fsdc(
+        compress_kspace_log(lin_pred, channel_dim=1),
+        compress_kspace_log(lin_meas, channel_dim=1),
+        mask,
+    )
+    b = torch.sigmoid(fsdc.lambda_hf).detach()
+    expected = (1 - b) * lin_pred + b * lin_meas
+    got = decompress_kspace_log(out, channel_dim=1)
+    torch.testing.assert_close(got[..., 0, 0], expected[..., 0, 0], rtol=1e-3, atol=1e-3)

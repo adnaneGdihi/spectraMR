@@ -219,8 +219,64 @@ def broadcast_conditioning_map(
     return cond.expand(batch, channels, *spatial)
 
 
+def require_contrast_rows(contrast_emb: torch.Tensor, rows: int, *, owner: str) -> torch.Tensor:
+    """Return ``contrast_emb`` unchanged if it carries exactly one row per sample.
+
+    The one owner of the row rule for a contrast embedding meeting the batch it
+    conditions (#2055). Neither truncation nor broadcasting is legal: slicing a
+    longer embedding to ``rows`` keeps whichever ids came first, and a single row
+    added to many conditions every sample on one id. Both produce shapes that
+    agree and a run that trains on the wrong contrast, so the producer has to
+    align ids to rows (``_contrast_idx_from_batch`` and
+    :func:`expand_contrast_over_slices`) and anything else raises here.
+
+    Raises:
+        ValueError: The leading dimension is not ``rows``; names both sizes.
+    """
+    if contrast_emb.shape[0] != rows:
+        raise ValueError(
+            f"{owner}: contrast_emb batch {contrast_emb.shape[0]} does not match the "
+            f"batch of {rows} row(s) it conditions. Each row needs its own contrast "
+            "row; truncating or broadcasting would condition samples on another "
+            "sample's contrast."
+        )
+    return contrast_emb
+
+
+def fuse_contrast_embedding(
+    t_emb: torch.Tensor | None, contrast_emb: torch.Tensor | None, *, owner: str
+) -> torch.Tensor | None:
+    """Add a contrast embedding onto a timestep embedding under the row rule.
+
+    Either side may be absent: the other is returned as is. When both are
+    present their batches must agree (:func:`require_contrast_rows`).
+    """
+    if contrast_emb is None:
+        return t_emb
+    if t_emb is None:
+        return contrast_emb
+    return t_emb + require_contrast_rows(contrast_emb, t_emb.shape[0], owner=owner)
+
+
+def expand_contrast_over_slices(contrast_emb: torch.Tensor, rows: int, depth: int) -> torch.Tensor:
+    """Expand one contrast row per volume onto that volume's ``depth`` slices.
+
+    A volume flattened ``(B, ..., D) -> (B*D, ...)`` is volume-major, so slice
+    ``i`` of volume ``v`` sits at ``v * D + i`` and the rows must run
+    ``[c0]*D + [c1]*D``; ``repeat_interleave`` gives that, ``repeat`` would not.
+    Applied only when ``B * depth == rows``; any other shape is returned
+    untouched for :func:`require_contrast_rows` to refuse.
+    """
+    if depth > 1 and contrast_emb.shape[0] * depth == rows:
+        return contrast_emb.repeat_interleave(depth, dim=0)
+    return contrast_emb
+
+
 __all__ = [
     "broadcast_conditioning_map",
     "build_contrast_sequence",
     "contrast_sequence_dim",
+    "expand_contrast_over_slices",
+    "fuse_contrast_embedding",
+    "require_contrast_rows",
 ]

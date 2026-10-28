@@ -2,10 +2,15 @@
 
 Two shapes the census found across ``experiments/inprogress``:
 
-* ``optimization.scheduler.warmup_steps >= training.max_iterations`` on four
-  arms -- two of them with ``max_iterations: 1``, a smoke setting left in a
-  research arm. The learning rate never leaves warm-up, so the run measures
-  the warm-up ramp, not the method.
+* a warm-up at least as long as the run's optimizer steps on four arms -- two
+  of them with ``max_iterations: 1``, a smoke setting left in a research arm.
+  The learning rate never leaves warm-up, so the run measures the warm-up ramp,
+  not the method. Schedulers step once per optimizer step, i.e. once every
+  ``gradient.accumulation_steps`` micro-batches, so the budget is
+  ``max_iterations // accumulation_steps``. ``training.epochs`` does not shorten
+  a run that declares a positive ``max_iterations`` (the loop reads epochs only
+  when ``max_iterations <= 0``), and an epoch-derived budget needs the loader
+  length, which is not decidable here.
 * ``training.epochs: 0`` with no ``max_iterations`` on seven arms: a budget of
   zero steps that trains nothing and still writes a run directory.
 
@@ -62,32 +67,44 @@ def _verdict(name: str, passed: bool, message: str, **extra) -> WitnessVerdict:
     tiers=(Tier.T0, Tier.T1),
     subjects=(Subject.CONFIG,),
     severity=Severity.ERROR,
-    description="The learning-rate warm-up ends before the iteration budget does",
+    description="The learning-rate warm-up ends before the run's optimizer steps do",
     fix_hint=(
-        "Raise training.max_iterations above optimization.scheduler.warmup_steps, "
+        "Raise training.max_iterations above warmup_steps x gradient.accumulation_steps, "
         "or shorten the warm-up; max_iterations: 1 is a smoke setting."
     ),
 )
 def warmup_shorter_than_budget(subject: WitnessSubject) -> WitnessVerdict:
-    """Error when the scheduler warm-up covers the whole (or more than the) run."""
+    """Error when the warm-up covers the whole (or more than the) run, in optimizer steps."""
     raw = subject.raw_config
-    warmup = _number(((raw.get("optimization") or {}).get("scheduler") or {}).get("warmup_steps"))
+    optimization = raw.get("optimization") or {}
+    scheduler = optimization.get("scheduler")
+    nested = _number(scheduler.get("warmup_steps")) if isinstance(scheduler, dict) else None
+    # The scheduler resolver reads both spellings (and raises if they disagree).
+    warmup = nested or _number(optimization.get("warmup_steps"))
     max_iter = _number((raw.get("training") or {}).get("max_iterations"))
-    if warmup is None or max_iter is None or max_iter <= 0:
+    if not warmup or max_iter is None or max_iter <= 0:
         return _verdict(
             _WARMUP, True, "no bounded warm-up/budget pair declared; nothing to compare"
         )
-    if warmup >= max_iter:
+    gradient = optimization.get("gradient")
+    accumulation = _number(gradient.get("accumulation_steps")) if isinstance(gradient, dict) else None
+    accumulation = max(1, int(accumulation or 1))
+    budget = int(max_iter) // accumulation
+    if warmup >= budget:
         return _verdict(
             _WARMUP,
             False,
-            f"optimization.scheduler.warmup_steps={int(warmup)} >= training.max_iterations="
-            f"{int(max_iter)}: the learning rate never leaves warm-up, so the run measures "
-            "the ramp rather than the method.",
-            yaml_keys=("optimization.scheduler.warmup_steps", "training.max_iterations"),
+            f"warmup_steps={int(warmup)} >= {budget} optimizer steps (training.max_iterations="
+            f"{int(max_iter)} // gradient.accumulation_steps={accumulation}): the learning "
+            "rate never leaves warm-up, so the run measures the ramp rather than the method.",
+            yaml_keys=(
+                "optimization.scheduler.warmup_steps",
+                "training.max_iterations",
+                "optimization.gradient.accumulation_steps",
+            ),
             fix_hint="Raise training.max_iterations or shorten the warm-up.",
         )
-    return _verdict(_WARMUP, True, f"warm-up {int(warmup)} < budget {int(max_iter)} iterations")
+    return _verdict(_WARMUP, True, f"warm-up {int(warmup)} < budget {budget} optimizer steps")
 
 
 @register_witness(

@@ -41,6 +41,7 @@ import pytest
 
 from spectramr.infrastructure.training.strategies import reconstruction as _recon_mod
 from spectramr.infrastructure.training.strategies import vae as _vae_mod
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 
 
 def _loss_impl_sources(module: object) -> list[tuple[str, str]]:
@@ -145,7 +146,7 @@ def test_metrics_throttle_honours_current_step() -> None:
     spy = _SpyComputer()
     # ``training_metrics_computer`` is a lazy property backed by ``_training_computer``.
     mixin._training_computer = spy  # type: ignore[attr-defined]
-    mixin._apply_metric_transforms = lambda p, t, c: (p, t)  # type: ignore[attr-defined]
+    mixin._metric_transform_views = lambda p, t, c: MetricViews(p, t)  # type: ignore[attr-defined]
 
     config = type(
         "Cfg",

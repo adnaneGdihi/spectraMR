@@ -49,10 +49,16 @@ def mock_env():
     gen.enc_s = MagicMock(return_value=(torch.randn(2, 4), torch.randn(2, 4)))  # style (mu, logvar)
     gen.reparameterize = MagicMock(return_value=torch.randn(2, 4))  # style code
     gen.gen = MagicMock(return_value=torch.randn(2, 1, 64, 64))  # decoded image
+    # The model's one decode / conditioning seam, delegating to the doubles above.
+    gen.decode_tissue = lambda c, s: gen.gen(c, s)
+    gen.condition_style = lambda s, cls: s
     gen.predict_physics = MagicMock(return_value=torch.rand(2, 4))  # physics params
     gen.training = True
     gen.train = MagicMock()
     gen.eval = MagicMock()
+    # A bare module: unwrap_model must stop here, not descend into an auto-created mock child.
+    for attr in ("module", "_orig_mod", "_fsdp_wrapped_module", "_checkpoint_wrapped_module"):
+        setattr(gen, attr, None)
 
     # Add to models dict (new API)
     env.models = {"generator": gen}
@@ -75,6 +81,7 @@ def mock_env():
 
     # Mock config (SSOT)
     env.config = MagicMock()
+    env.config.parallel = None  # single-process; a MagicMock reads as an unknown backend
     env.config.losses.reconstruction.lambda_recon = 1.0
     env.config.losses.latent.lambda_kl = 0.01
     env.config.losses.latent.kl_capacity_target = 20.0
@@ -92,6 +99,8 @@ def mock_env():
     env.config.optimization.precision.enabled = False
     env.config.optimization.precision.dtype = "float16"
     env.config.model.model_type = "disentangled_model"
+    # A real mapping: the strategy validates bloch_sequence_by_contrast (#2611).
+    env.config.model.model_kwargs = {}
     env.config.model.in_channels = 1
     env.config.model.out_channels = 1
     env.model_type = "disentangled_model"
@@ -128,6 +137,9 @@ def mock_env():
     env.config.losses.reconstruction.lambda_ssim = 0.0
     env.config.losses.latent.lambda_kl = 0.01
     env.config.r1_interval = 1  # Add this for UnifiedGANLossComputer
+    # A bare MagicMock ``config.metrics`` fails every int comparison and enum
+    # lookup in the metrics mixin (#1655); the cadence is not this file's subject.
+    env.config.metrics.enable_tracking = False
     if hasattr(env.config.losses.reconstruction, "lambda_kl"):
         del env.config.losses.reconstruction.lambda_kl
 
@@ -374,6 +386,22 @@ def test_validation_visual_target_is_ground_truth_4d(strategy, mock_env):
     )
 
 
+def test_validation_names_the_slab_flag_when_slices_arrive_as_channels(strategy, mock_env):
+    """Whole-volume validation under `enable_slab_mode` folds 18 slices into 18 channels.
+
+    Sabine, 2026-10-08: experiment 32a failed all 45 validation batches inside a reflect-padded
+    Conv2d ("expected input[1, 18, 262, 262] to have 1 channels"), which does not say where
+    the 18 came from.
+    """
+    mock_env.config.metrics.output_dir = None
+    strategy.logging_service = None
+    strategy._in_channels = 1
+    volume_as_channels = torch.zeros(1, 18, 16, 16)
+
+    with pytest.raises(ValueError, match="enable_slab_mode"):
+        strategy.validation_step(volume_as_channels, volume_as_channels)
+
+
 def test_fail_fast_missing_losses(mock_env):
     """Test that strategy fails fast if enabled losses are missing."""
     mock_env.config.losses.reconstruction.enable_perceptual = True
@@ -499,11 +527,14 @@ class TestValidationImageDirIsARealPath:
         gen.enc_c.return_value = torch.randn(1, 4, 8, 8)
         gen.enc_s.return_value = torch.randn(1, 4, 1, 1)
         gen.gen.return_value = torch.randn(1, 1, 8, 8)
+        gen.decode_tissue = lambda c, s: gen.gen(c, s)
+        gen.condition_style = lambda s, cls: s
 
         mock_self = MagicMock()
         mock_self.device = torch.device("cpu")
         mock_self._in_channels = 1
         mock_self.env.generator = gen
+        mock_self.inner_for_call = lambda model, name: model  # single-process (#2629)
         mock_self._recon_loss_fn = MagicMock(return_value=torch.tensor(0.5))
         for absent in (
             "_hist_loss_fn",
@@ -646,24 +677,22 @@ class TestPCGradClosureReturnsAConnectedLoss:
         # ``autograd.grad(loss, params)`` on each, and a total unrelated to
         # ``params`` yields all-None grads, which silently skips the projection
         # loop and would make this test vacuous.
-        recon_total = (param * 2.0).sum() * 0.0 + total_value
-        adv_total = (param * 3.0).sum() * 0.0 + 0.25
+        # Per element d(recon)/dp = 2 and d(adv)/dp = -3: the two conflict, so
+        # PCGrad projects the adversarial gradient to 0 and leaves 2, where the
+        # plain sum would give -1. That difference is what proves the branch ran.
+        recon_total = (param * 2.0).sum() - (param * 2.0).sum().detach() + total_value
+        adv_total = (param * -3.0).sum() - (param * -3.0).sum().detach() + 0.25
 
         strategy._enable_pcgrad = True
         mock_env.config.losses.reconstruction.use_curriculum_scheduling = False
         mock_env.config.losses.latent.use_capacity_scheduling = False
-        # The shared ``mock_env`` leaves ``config.metrics`` a bare MagicMock, so
-        # the training-metrics mixin compares a MagicMock with ``>`` and raises
-        # (``metrics_mixin.py:988``). That is pre-existing fixture rot -- it is
-        # why ``test_train_step_execution`` is red on ``dev`` today -- and it is
-        # not this seam's subject, so switch the block off rather than repair it
-        # here (NN17: the metrics cadence has its own owner).
-        mock_env.config.metrics.enable_tracking = False
 
         adv_computer = MagicMock()
         adv_computer.compute_generator_loss.return_value = LossOutput(
             total=adv_total, components={"adv": adv_total.detach()}, metrics={}
         )
+        # The step asks the computer for the adversarial weight; past warm-up it is 1.0.
+        adv_computer._get_loss_weight.return_value = 1.0
         strategy.adv_loss_computer = adv_computer
 
         with patch.object(strategy.loss_computer, "compute") as mock_compute:
@@ -680,13 +709,12 @@ class TestPCGradClosureReturnsAConnectedLoss:
         return loss, [param], recon_total
 
     def test_the_branch_is_actually_reached(self, strategy, mock_env):
-        """Guard against a vacuous pass: if the setup stops short of the PCGrad
-        branch the closure returns ``total_gen_loss`` instead, and every
-        assertion below would hold for the wrong reason."""
-        _, params, _ = self._drive(strategy, mock_env)
-        # PCGrad writes p.grad by hand BEFORE backward(); the non-PCGrad return
-        # path never touches it.
-        assert params[0].grad is not None, "PCGrad branch was not entered"
+        """The projected gradient (2) differs from the plain sum (-1), so this
+        fails if the setup stops short of the PCGrad branch."""
+        loss, params, _ = self._drive(strategy, mock_env)
+        assert params[0].grad is None, "the closure must not write p.grad itself"
+        loss.backward()
+        assert torch.allclose(params[0].grad, torch.full((4,), 2.0))
 
     def test_the_returned_loss_carries_a_graph(self, strategy, mock_env):
         loss, _, _ = self._drive(strategy, mock_env)
@@ -694,17 +722,370 @@ class TestPCGradClosureReturnsAConnectedLoss:
             "closure returned a leaf; the pre-backward guard would refuse it"
         )
 
-    def test_the_reported_value_is_the_real_loss(self, strategy, mock_env):
-        loss, _, recon_total = self._drive(strategy, mock_env)
-        # The zero-weighted parameter term supplies the graph without moving the
-        # value the executor logs.
-        assert loss.item() == pytest.approx(recon_total.item())
+    def test_the_reported_value_is_the_generator_total(self, strategy, mock_env):
+        """The executor logs the returned value; with or without PCGrad it is the
+        generator total, reconstruction plus adversarial (0.5 + 0.25)."""
+        loss, _, _ = self._drive(strategy, mock_env)
+        assert float(loss.detach()) == pytest.approx(0.75)
 
-    def test_backward_leaves_the_projected_gradients_untouched(self, strategy, mock_env):
-        loss, params, _ = self._drive(strategy, mock_env)
-        before = [p.grad.clone() for p in params]
-        loss.backward()
-        for p, b in zip(params, before, strict=True):
-            assert torch.equal(p.grad, b), (
-                "backward() perturbed the gradients PCGrad had already written"
-            )
+
+# --- PCGrad surrogate and the non-finite path (#1471) -----------------------
+
+
+def _two_param_problem():
+    from torch import nn
+
+    net = nn.Linear(3, 1, bias=True)
+    params = list(net.parameters())
+    x = torch.randn(4, 3)
+    physics = net(x).pow(2).mean()
+    adv = -net(x).mean()
+    g_p = torch.autograd.grad(physics, params, retain_graph=True)
+    g_s = torch.autograd.grad(adv, params, retain_graph=True)
+    return net, params, physics + adv, g_p, g_s
+
+
+def test_pcgrad_surrogate_carries_the_combined_gradient_and_the_real_value():
+    from spectramr.infrastructure.training.strategies.disentangled_strategy import (
+        pcgrad_surrogate_loss,
+    )
+
+    _, params, total, g_p, g_s = _two_param_problem()
+    loss = pcgrad_surrogate_loss(total, params, g_p, g_s)
+    assert torch.allclose(loss.detach(), total.detach())
+    loss.backward()
+    for p, a, b in zip(params, g_p, g_s, strict=True):
+        assert torch.allclose(p.grad, a + b)
+
+
+def test_pcgrad_surrogate_obeys_the_executor_accumulation_and_loss_scale():
+    """The executor divides by the accumulation count and multiplies by the loss
+    scale before backward, then unscales. Hand-written ``p.grad`` saw neither, so
+    it arrived N times too large and divided by the scale; the surrogate sees both."""
+    from spectramr.infrastructure.training.strategies.disentangled_strategy import (
+        pcgrad_surrogate_loss,
+    )
+
+    _, params, total, g_p, g_s = _two_param_problem()
+    n_accum, scale = 4, 2.0**16
+    loss = pcgrad_surrogate_loss(total, params, g_p, g_s)
+    (loss / n_accum * scale).backward()
+    for p, a, b in zip(params, g_p, g_s, strict=True):
+        assert torch.allclose(p.grad / scale, (a + b) / n_accum)
+
+
+def test_pcgrad_surrogate_accepts_a_parameter_only_the_adversary_reaches():
+    """``g_p + g_s`` with ``g_p is None`` raised TypeError in the old closure."""
+    from spectramr.infrastructure.training.strategies.disentangled_strategy import (
+        pcgrad_surrogate_loss,
+    )
+
+    _, params, total, g_p, g_s = _two_param_problem()
+    loss = pcgrad_surrogate_loss(total, params, [None, g_p[1]], g_s)
+    loss.backward()
+    assert torch.allclose(params[0].grad, g_s[0])
+
+
+def test_non_finite_generator_loss_is_returned_not_replaced_by_a_zero_leaf(strategy, mock_env):
+    """#1471: the closure fabricated ``tensor(0.0, requires_grad=True)``. It must hand
+    the real (non-finite) total to the executor, whose guard owns the decision."""
+    from spectramr.models.losses.computers.base import LossOutput
+
+    mock_env.config.losses.reconstruction.use_curriculum_scheduling = False
+    mock_env.config.losses.latent.use_capacity_scheduling = False
+    bad = torch.tensor(float("nan"), requires_grad=True) * 1.0
+    adv_computer = MagicMock()
+    adv_computer.compute_generator_loss.return_value = LossOutput(
+        total=torch.zeros(()), components={}, metrics={}
+    )
+    # The step asks the computer for the adversarial weight; past warm-up it is 1.0.
+    adv_computer._get_loss_weight.return_value = 1.0
+    strategy.adv_loss_computer = adv_computer
+    with patch.object(strategy.loss_computer, "compute") as mock_compute:
+        mock_compute.return_value = LossOutput(total=bad, components={}, metrics={})
+        x = torch.randn(2, 1, 64, 64)
+        steps = strategy.train_step({"input": x, "target": x.clone()}, epoch=0)
+        loss = steps[0]["closure"]()
+    assert not torch.isfinite(loss)
+    assert loss.grad_fn is not None
+
+
+class _FactorisedGenerator(torch.nn.Module):
+    """content = zero-mean structure, style = mean intensity: a factorisation by construction."""
+
+    use_vae = False
+
+    def enc_c(self, x):
+        return x - x.mean(dim=(1, 2, 3), keepdim=True)
+
+    def enc_s(self, x):
+        # (m, m^2): a linear one-vs-rest probe cannot isolate the middle class of a 1-D code.
+        m = x.mean(dim=(1, 2, 3))
+        return torch.stack([m, m * m], dim=1)
+
+    def condition_style(self, style, label):
+        return style
+
+    def decode_tissue(self, content, style):
+        return content + style[:, :1].view(-1, 1, 1, 1)
+
+
+def _validation_pass(
+    strategy,
+    mock_env,
+    labels_per_batch,
+    *,
+    labelled=True,
+    sequence_field=None,
+    subjects=False,
+    generator=None,
+    contrast_names=None,
+    before_finalize=None,
+):
+    mock_env.config.metrics.output_dir = None
+    mock_env.generator = (generator or _FactorisedGenerator)()
+    strategy.logging_service = None
+    strategy._in_channels = 1
+    computer = MagicMock()
+    computer.compute.return_value = {}
+    strategy._get_validation_metrics_computer = MagicMock(return_value=computer)
+    strategy.reset_validation_metrics()
+    gen = torch.Generator().manual_seed(0)
+    for k, label in enumerate(labels_per_batch):
+        images = (0.2 + 0.3 * label) + 0.05 * torch.randn(4, 1, 8, 8, generator=gen)
+        default = {} if contrast_names else {"contrast_type": torch.zeros(4, dtype=torch.long)}
+        batch = dict(sequence_field or default)
+        if labelled:
+            batch["contrast_idx"] = torch.full((4,), label)
+        if subjects:  # three contrasts per subject, as in M4Raw
+            batch["subject_id"] = [f"S{k // 3}"] * 4
+        if contrast_names:
+            batch["contrast"] = [contrast_names[label]] * 4
+        strategy.validation_step(images, images, batch_data=batch)
+    if before_finalize:
+        before_finalize()
+    return strategy.finalize_validation()
+
+
+def test_a_labelled_validation_pass_reports_the_disentanglement_readings(strategy, mock_env):
+    summary = _validation_pass(strategy, mock_env, [0, 1, 2] * 2)
+    assert summary["val_style_contrast_acc"] > 0.9
+    assert summary["val_content_contrast_leak"] < 0.5
+    assert summary["val_swap_content_distance"] == pytest.approx(0.0, abs=1e-4)
+    assert summary["val_swap_style_distance"] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_the_probes_split_by_subject_when_the_batches_carry_subject_ids(strategy, mock_env):
+    with_ids = _validation_pass(strategy, mock_env, [0, 1, 2] * 2, subjects=True)
+    assert with_ids["val_probe_split_by_subject"] == 1.0
+    assert with_ids["val_style_contrast_acc"] > 0.9
+    without = _validation_pass(strategy, mock_env, [0, 1, 2] * 2)
+    assert without["val_probe_split_by_subject"] == 0.0
+
+
+def test_an_image_decoder_arm_needs_no_bloch_sequence_map(strategy, mock_env):
+    """A model that emits an image renders nothing, so a batch with contrast names and no
+    bloch_sequence_by_contrast must not be asked for sequence families."""
+    strategy._sequence_map = {}
+    summary = _validation_pass(
+        strategy, mock_env, [0, 1, 2] * 2, sequence_field={"contrast": ["T1", "T2", "FLAIR", "T1"]}
+    )
+    assert summary["val_swap_content_distance"] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_a_single_contrast_pass_raises_instead_of_reporting_a_number(strategy, mock_env):
+    with pytest.raises(ValueError, match="at least 2 contrast labels"):
+        _validation_pass(strategy, mock_env, [1] * 6)
+
+
+def test_an_unlabelled_pass_reports_no_disentanglement_readings(strategy, mock_env):
+    summary = _validation_pass(strategy, mock_env, [0, 1, 2] * 2, labelled=False)
+    assert not [k for k in summary if "contrast" in k or "swap" in k]
+
+
+def test_the_readings_belong_to_one_pass(strategy, mock_env):
+    _validation_pass(strategy, mock_env, [0, 1, 2] * 2)
+    assert strategy.finalize_validation().get("val_style_contrast_acc") is None
+
+
+class _TissueGenerator(_FactorisedGenerator):
+    """Decodes to tissue maps, as the Bloch-render arms do."""
+
+    def decode_tissue(self, content, style):
+        rho = torch.sigmoid(content + style[:, :1].view(-1, 1, 1, 1)) * 0.9 + 0.1
+        return {
+            "rho": rho,
+            "t1": torch.full_like(rho, 1000.0),
+            "t2": torch.full_like(rho, 80.0),
+            "b1_plus": torch.ones_like(rho),
+        }
+
+
+def test_a_swap_is_rendered_with_the_style_sources_declared_protocol(strategy, mock_env):
+    """Decode i's content with j's style: the image is j's contrast, so j's TR/TE/TI render it."""
+    from spectramr.infrastructure.training.strategies.disentangled_bloch_inputs import (
+        parse_protocol_map,
+        parse_sequence_map,
+    )
+
+    strategy._sequence_map = parse_sequence_map({"T1": "SE", "T2": "SE", "FLAIR": "IR"})
+    strategy._protocol_map = parse_protocol_map(
+        {
+            "T1": {"TR": 500.0, "TE": 18.4},
+            "T2": {"TR": 5500.0, "TE": 128.0},
+            "FLAIR": {"TR": 7500.0, "TE": 98.0, "TI": 1655.0},
+        }
+    )
+    strategy._fno_epg = None
+    strategy._dipole_pad_z = 0
+    swap_batches: list[dict] = []
+    render = strategy._synthesize_via_bloch
+
+    def spy(raw, batch, key):
+        swap_batches.append(batch)
+        return render(raw, batch, key)
+
+    def start_recording_swaps():
+        swap_batches.clear()
+        strategy._synthesize_via_bloch = spy
+
+    summary = _validation_pass(
+        strategy,
+        mock_env,
+        [0, 1, 2] * 2,
+        generator=_TissueGenerator,
+        contrast_names=["T1", "T2", "FLAIR"],
+        before_finalize=start_recording_swaps,
+    )
+    assert swap_batches, "finalize decoded no swap pair"
+    seen_tr = set()
+    for row in swap_batches:
+        tr, ti = float(row["acquisition"]["TR"]), float(row["acquisition"]["TI"])
+        assert (tr == 7500.0) == (ti == 1655.0) == bool(row["contrast_type"] == 1)
+        seen_tr.add(tr)
+    assert len(seen_tr) > 1  # several contrasts' protocols reached the render
+    assert all(torch.isfinite(torch.tensor(v)) for v in summary.values())
+    # The protocol owns contrast here: the style code is not part of the render, so only the
+    # content readings are reported.
+    assert "val_content_contrast_leak" in summary
+    assert "val_swap_content_distance" in summary
+    assert not [k for k in summary if k.startswith(("val_style_", "val_swap_style"))]
+
+
+def _header_strategy(*, adversarial: bool, gan_recon_weight: float = 0.0):
+    """A strategy carrying only what ``declared_metric_keys`` reads."""
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    gan = SimpleNamespace(enable_adversarial=adversarial, enable_gradient_penalty=False)
+    strategy.config = SimpleNamespace(
+        losses=SimpleNamespace(gan=gan, reconstruction=SimpleNamespace(loss_type="mse"))
+    )
+    adv = MagicMock()
+    adv._get_loss_weight.return_value = gan_recon_weight
+    strategy.adv_loss_computer = adv if adversarial else None
+    strategy.env = SimpleNamespace(
+        discriminator=MagicMock() if adversarial else None,
+        opt_d=MagicMock() if adversarial else None,
+    )
+    return strategy
+
+
+def test_the_csv_header_names_what_the_smoke_discarded():
+    # sabine job 17885505 discarded these four on all three disentangled arms.
+    from spectramr.pipelines.training_loop import resolve_producer_declared_columns
+
+    columns = resolve_producer_declared_columns(_header_strategy(adversarial=False))
+    assert {"total_loss", "recon", "patch_nce", "style_consistency", "mse"} <= columns
+    assert "d_real_loss" not in columns
+
+
+def test_the_csv_header_names_the_gan_terms_only_when_the_discriminator_steps():
+    from spectramr.pipelines.training_loop import resolve_producer_declared_columns
+
+    columns = resolve_producer_declared_columns(_header_strategy(adversarial=True))
+    assert {"g_adv_loss", "d_total_loss", "d_real_loss", "d_fake_loss"} <= columns
+    assert "g_reconstruction" not in columns
+    weighted = _header_strategy(adversarial=True, gan_recon_weight=1.0)
+    assert "g_reconstruction" in resolve_producer_declared_columns(weighted)
+
+
+def test_visual_capture_reuses_the_validated_render_without_running_the_generator():
+    # The pipeline's fallback ran generator(input_batch) on the whole volume, then discarded
+    # the result for _last_visual_pred; on arm 51 that call ran out of GPU memory (job 17886743).
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    strategy.env = SimpleNamespace(generator=MagicMock(side_effect=AssertionError("ran")))
+    rendered = torch.rand(1, 1, 8, 8)
+    strategy._last_visual_pred = rendered
+    assert strategy._validation_forward(torch.rand(1, 1, 4, 8, 8), {}) is rendered
+    strategy.env.generator.assert_not_called()
+
+
+def test_validation_images_are_named_after_the_training_step():
+    # _global_step was set once to 0 and never advanced, so every validation pass wrote
+    # recon_iter000000.png over the last one (job 17886987, a 2,000-iteration run).
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    strategy._global_step = 0
+    strategy.config = SimpleNamespace(losses=SimpleNamespace(gan=None))
+    strategy.env = SimpleNamespace(opt_g=MagicMock(), generator=MagicMock())
+    x = torch.rand(1, 1, 8, 8)
+    strategy.train_step((x, x), epoch=0, iteration=1234)
+    assert strategy._global_step == 1234
+
+
+def _adversarial_strategy(warmup: int = 1000, interval: int = 1):
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    strategy._global_step = 0
+    gan = SimpleNamespace(enable_adversarial=True, disc_updates=1, disc_update_interval=interval)
+    strategy.config = SimpleNamespace(losses=SimpleNamespace(gan=gan))
+    strategy.env = SimpleNamespace(
+        opt_g=MagicMock(), opt_d=MagicMock(), generator=MagicMock(), discriminator=MagicMock()
+    )
+    adv = MagicMock()
+    adv._get_loss_weight.side_effect = lambda name, epoch=0, iteration=0: (
+        0.0 if iteration < warmup else 1.0
+    )
+    strategy.adv_loss_computer = adv
+    return strategy
+
+
+def test_the_discriminator_waits_for_the_adversarial_weight():
+    # It stepped from iteration 1 while the generator's adversarial weight was gated to 0,
+    # and arrived at the switch-on dominant: arm 51 ended at d_real/d_fake 0.0002/0.0
+    # (job 17886987).
+    strategy = _adversarial_strategy()
+    x = torch.rand(1, 1, 8, 8)
+    names = [c["name"] for c in strategy.train_step((x, x), epoch=0, iteration=10)]
+    assert names == ["generator"]
+    names = [c["name"] for c in strategy.train_step((x, x), epoch=0, iteration=1500)]
+    assert names == ["generator", "discriminator"]
+
+
+def test_the_discriminator_follows_the_update_interval():
+    strategy = _adversarial_strategy(interval=20)
+    x = torch.rand(1, 1, 8, 8)
+
+    def steps(iteration):
+        return [c["name"] for c in strategy.train_step((x, x), epoch=0, iteration=iteration)]
+
+    assert steps(1020) == ["generator", "discriminator"]
+    assert steps(1500) == ["generator", "discriminator"]
+    assert steps(1021) == ["generator"]
+    assert steps(980) == ["generator"]  # on the interval, but still inside the warm-up
+
+
+def test_a_scheduled_adversarial_weight_reaches_the_gan_computer():
+    # The loop publishes loss_schedule overrides into self.loss_computer only; a ramp on
+    # "adversarial" never reached the GAN computer that weights it.
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    strategy.loss_computer = SimpleNamespace(scheduled_weights={})
+    strategy.adv_loss_computer = SimpleNamespace(scheduled_weights={})
+    strategy.loop_state = SimpleNamespace(loss_weight_overrides={"adversarial": 0.3})
+    strategy.sync_scheduled_loss_weights()
+    assert strategy.loss_computer.scheduled_weights == {"adversarial": 0.3}
+    assert strategy.adv_loss_computer.scheduled_weights == {"adversarial": 0.3}
+
+
+def test_visual_capture_without_a_validated_render_says_why():
+    strategy = DisentangledTrainingStrategy.__new__(DisentangledTrainingStrategy)
+    strategy._last_visual_pred = None
+    with pytest.raises(RuntimeError, match="validation_step"):
+        strategy._validation_forward(torch.rand(1, 1, 8, 8), {})

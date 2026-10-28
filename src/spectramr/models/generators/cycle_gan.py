@@ -49,6 +49,10 @@ class ResNetGenerator(nn.Module):
         for i in range(n_blocks):
             model += [ResnetBlock(ngf * mult)]
 
+        # Z_anat is the encoder output (after the ResBlocks): the split index below.
+        self._anatomy_split = len(model)
+        self.latent_channels = ngf * mult
+
         # Upsample
         for i in range(n_downsampling):
             mult = 2 ** (n_downsampling - i)
@@ -67,6 +71,15 @@ class ResNetGenerator(nn.Module):
 
         model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, 7), nn.Tanh()]
         self.model = nn.Sequential(*model)
+
+    def forward_with_anatomy(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Return ``(translation, Z_anat)`` from one pass; ``Z_anat`` is the encoder bottleneck.
+
+        Splits the same ``Sequential`` ``forward`` runs, so the parameters, state-dict keys and
+        output are unchanged; only the bottleneck tensor is also returned.
+        """
+        z = self.model[: self._anatomy_split](x)
+        return self.model[self._anatomy_split :](z), z
 
     def forward(self, x: Tensor) -> Tensor:
         """forward.

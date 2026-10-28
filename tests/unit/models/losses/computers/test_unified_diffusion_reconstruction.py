@@ -456,10 +456,21 @@ class TestTheBuiltBarrierReceivesTheStrategysMaps:
 
     @staticmethod
     def _kspace(images: torch.Tensor) -> torch.Tensor:
+        """k-space as the arm's data path serves it: ``log1p``-compressed (#2338)."""
+        from spectramr.data.transforms.normalization import compress_kspace_log
         from spectramr.infrastructure.physics.fft_ops import fft2c
 
-        k = fft2c(images)
+        k = compress_kspace_log(fft2c(images))
         return torch.stack([k.real, k.imag], dim=2).flatten(1, 2)
+
+    def test_the_arm_serves_compressed_kspace(self) -> None:
+        """The premise of ``_kspace``: if the arm stops log-scaling, re-aim it."""
+        from spectramr.config.settings import TrainingSettings
+
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        cfg = TrainingSettings.from_yaml(_KSPACE_FILLING_ARM)
+        assert KSpaceNormalizationSpec.from_data_config(cfg.data).log_compressed is True
 
     @staticmethod
     def _phantom() -> tuple[torch.Tensor, torch.Tensor]:
@@ -483,3 +494,220 @@ class TestTheBuiltBarrierReceivesTheStrategysMaps:
         images[:, 0] += 0.5
         k = self._kspace(images)
         assert float(_call_safe_loss(built_coil_barrier, k, k, smaps=maps, mask=None)) > 1e-2
+
+
+# ---------------------------------------------------------------------------
+# #2546: the non-finite substitution must not read the loss back to the host.
+# ---------------------------------------------------------------------------
+
+from spectramr.models.losses.computers.unified_diffusion_reconstruction import (  # noqa: E402
+    _complex_safe_l1,
+    _complex_safe_mse,
+)
+
+_SAFE_LOSSES = pytest.mark.parametrize("safe_loss", [_complex_safe_mse, _complex_safe_l1])
+
+
+def _forbid_host_reads(monkeypatch) -> None:
+    """Make any device->host scalar read raise, so a hidden sync fails the test."""
+
+    def _raise(*_a, **_k):
+        raise AssertionError("host read of a tensor value")
+
+    for name in ("__bool__", "__float__", "item"):
+        monkeypatch.setattr(torch.Tensor, name, _raise)
+
+
+@_SAFE_LOSSES
+@pytest.mark.parametrize(
+    ("poison", "expected"),
+    [(float("nan"), 0.0), (float("inf"), 1e4)],
+)
+def test_a_non_finite_loss_keeps_its_old_substitute(safe_loss, poison, expected) -> None:
+    pred = torch.zeros(1, 1, 4, 4)
+    pred[0, 0, 0, 0] = poison
+    loss = safe_loss(pred, torch.zeros_like(pred))
+    assert loss.item() == expected
+
+
+@_SAFE_LOSSES
+def test_a_finite_loss_is_unchanged_and_keeps_its_gradient(safe_loss) -> None:
+    pred = torch.randn(2, 1, 4, 4, requires_grad=True)
+    target = torch.randn(2, 1, 4, 4)
+    loss = safe_loss(pred, target)
+    reference = (
+        torch.nn.functional.mse_loss(pred, target)
+        if safe_loss is _complex_safe_mse
+        else torch.nn.functional.l1_loss(pred, target)
+    )
+    assert torch.equal(loss, reference)
+    (grad,) = torch.autograd.grad(loss, pred)
+    (ref_grad,) = torch.autograd.grad(reference, pred)
+    assert torch.equal(grad, ref_grad)
+
+
+@_SAFE_LOSSES
+def test_a_nan_loss_still_gives_a_zero_gradient(safe_loss) -> None:
+    pred = torch.zeros(1, 1, 4, 4)
+    pred[0, 0, 0, 0] = float("nan")
+    pred.requires_grad_(True)
+    (grad,) = torch.autograd.grad(safe_loss(pred, torch.zeros(1, 1, 4, 4)), pred)
+    assert torch.equal(grad[0, 0, 1:], torch.zeros_like(grad[0, 0, 1:]))
+
+
+@_SAFE_LOSSES
+@pytest.mark.parametrize("poison", [None, float("nan")])
+def test_the_loss_reads_nothing_back_to_the_host(safe_loss, poison, monkeypatch) -> None:
+    pred = torch.randn(1, 1, 4, 4)
+    if poison is not None:
+        pred[0, 0, 0, 0] = poison
+    target = torch.randn(1, 1, 4, 4)
+    _forbid_host_reads(monkeypatch)
+    safe_loss(pred, target)
+
+
+def test_the_detector_catches_the_old_guard(monkeypatch) -> None:
+    """Planted violation: the pre-#2546 ``if isnan or isinf`` guard trips it."""
+    loss = torch.tensor(1.0)
+    _forbid_host_reads(monkeypatch)
+    with pytest.raises(AssertionError, match="host read"):
+        if torch.isnan(loss) or torch.isinf(loss):
+            pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync debug mode needs CUDA")
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+@_SAFE_LOSSES
+def test_no_synchronizing_call_on_cuda(safe_loss) -> None:
+    pred = torch.randn(1, 1, 4, 4, device="cuda")
+    target = torch.randn(1, 1, 4, 4, device="cuda")
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        safe_loss(pred, target)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+# ---------------------------------------------------------------------------
+# #2546: the substitution stays visible as a device-side run count.
+# ---------------------------------------------------------------------------
+
+from spectramr.models.losses.computers.unified_diffusion_reconstruction import (  # noqa: E402
+    NONFINITE_SUBSTITUTIONS_KEY,
+    NonFiniteSubstitutionCounter,
+)
+
+
+def _nan_pred() -> torch.Tensor:
+    pred = torch.zeros(1, 1, 4, 4)
+    pred[0, 0, 0, 0] = float("nan")
+    return pred.requires_grad_(True)
+
+
+def _assert_counts_one_substitution(safe_loss) -> None:
+    counter = NonFiniteSubstitutionCounter()
+    safe_loss(_nan_pred(), torch.zeros(1, 1, 4, 4), counter=counter)
+    assert counter.total is not None and counter.total.item() == 1.0
+
+
+@_SAFE_LOSSES
+def test_a_nan_loss_increments_the_counter(safe_loss) -> None:
+    _assert_counts_one_substitution(safe_loss)
+
+
+@_SAFE_LOSSES
+def test_finite_and_grad_free_losses_are_not_counted(safe_loss) -> None:
+    counter = NonFiniteSubstitutionCounter()
+    safe_loss(torch.randn(1, 1, 4, 4, requires_grad=True), torch.zeros(1, 1, 4, 4), counter=counter)
+    safe_loss(_nan_pred().detach(), torch.zeros(1, 1, 4, 4), counter=counter)
+    assert counter.total is not None and counter.total.item() == 0.0
+
+
+@_SAFE_LOSSES
+def test_the_counter_is_cumulative(safe_loss) -> None:
+    counter = NonFiniteSubstitutionCounter()
+    for _ in range(3):
+        safe_loss(_nan_pred(), torch.zeros(1, 1, 4, 4), counter=counter)
+    assert counter.total.item() == 3.0
+
+
+@_SAFE_LOSSES
+def test_the_detector_catches_a_dropped_counter(safe_loss, monkeypatch) -> None:
+    """Planted violation: a counter that never observes leaves the run silent."""
+    monkeypatch.setattr(NonFiniteSubstitutionCounter, "observe", lambda self, loss: None)
+    with pytest.raises(AssertionError):
+        _assert_counts_one_substitution(safe_loss)
+
+
+def _l2_computer() -> UnifiedReconstructionLossComputer:
+    cfg = SimpleNamespace(
+        losses=LossConfigSchema(
+            reconstruction=ReconstructionLossesConfig(
+                lambda_l1=0.0, lambda_l2=1.0, warmup_iterations=0
+            )
+        )
+    )
+    return UnifiedReconstructionLossComputer(config=cfg, device=torch.device("cpu"))
+
+
+def _assert_compute_reports_the_count(comp) -> None:
+    out = comp.compute(pred=_nan_pred(), target=torch.zeros(1, 1, 4, 4), iteration=5000)
+    assert out.components[NONFINITE_SUBSTITUTIONS_KEY].item() == 1.0
+    # Reported after stacking: the count is logged, never summed into the loss.
+    assert out.total.item() == 0.0
+
+
+class TestTheComputerReportsTheCount:
+    def test_a_nan_step_shows_up_in_the_components(self) -> None:
+        _assert_compute_reports_the_count(_l2_computer())
+
+    def test_a_clean_step_stamps_a_zero(self) -> None:
+        """Stamped every call, so a declared CSV column is never left empty."""
+        out = _l2_computer().compute(
+            pred=torch.randn(1, 1, 4, 4, requires_grad=True),
+            target=torch.randn(1, 1, 4, 4),
+            iteration=5000,
+        )
+        assert out.components[NONFINITE_SUBSTITUTIONS_KEY].item() == 0.0
+
+    def test_the_step_reads_nothing_back_to_the_host(self, monkeypatch) -> None:
+        comp = _l2_computer()
+        pred, target = _nan_pred(), torch.zeros(1, 1, 4, 4)
+        _forbid_host_reads(monkeypatch)
+        out = comp.compute(pred=pred, target=target, iteration=5000)
+        monkeypatch.undo()
+        assert out.components[NONFINITE_SUBSTITUTIONS_KEY].item() == 1.0
+
+    def test_the_detector_catches_a_computer_that_drops_the_count(self, monkeypatch) -> None:
+        """Planted violation: without ``report_into`` the count never reaches the log."""
+        monkeypatch.setattr(
+            NonFiniteSubstitutionCounter, "report_into", lambda self, components, like: None
+        )
+        with pytest.raises(KeyError):
+            _assert_compute_reports_the_count(_l2_computer())
+
+    def test_both_computers_declare_the_key(self) -> None:
+        assert NONFINITE_SUBSTITUTIONS_KEY in UnifiedReconstructionLossComputer.stamped_component_keys
+        assert NONFINITE_SUBSTITUTIONS_KEY in UnifiedDiffusionLossComputer.stamped_component_keys
+
+
+
+def test_a_declared_loss_that_fails_is_never_dropped_in_silence():
+    """A non-ValueError inside a list loss used to be logged and skipped, so a coil-map
+    barrier that errored left its arm training as the control arm."""
+
+    def broken(pred, target):
+        raise RuntimeError("planted: coil maps missing")
+
+    comp = UnifiedReconstructionLossComputer(
+        config=SimpleNamespace(
+            losses=LossConfigSchema(
+                reconstruction=ReconstructionLossesConfig(lambda_l1=1.0, warmup_iterations=0)
+            )
+        ),
+        device=torch.device("cpu"),
+    )
+    pred = torch.zeros(1, 1, 4, 4, requires_grad=True)
+    target = torch.zeros(1, 1, 4, 4)
+    with pytest.raises(RuntimeError, match="planted: coil maps missing"):
+        comp.compute(pred=pred, target=target, iteration=5000, losses_dict={"barrier": broken})

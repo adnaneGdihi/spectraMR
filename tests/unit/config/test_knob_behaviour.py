@@ -222,7 +222,7 @@ COERCED_BLOCKS = [
     "riemannian_bloch_diffusion",
     "privileged",
     "dtn2s",
-    # Specs that already EXISTED and were merely never mounted -- these six were
+    # Specs that already EXISTED and were merely never mounted -- these seven were
     # in BYPASSED_BLOCKS until 2026-08-02. Mounting them needed a `defer_build`
     # + deferred-import fix, because four of their modules import back into
     # training/base.py for a different class in the same file.
@@ -232,13 +232,13 @@ COERCED_BLOCKS = [
     "hamiltonian_acquisition",
     "bloch_manifold_dps",
     "equivariance_conformal",
+    "phys_residual_conformal",
+    "motion",
 ]
 
 BYPASSED_BLOCKS = [
-    "motion",
     "ssl",
     "tto",
-    "phys_residual_conformal",
     "federated",
     "meta_learning",
     "spectra_tta",
@@ -248,12 +248,10 @@ BYPASSED_BLOCKS = [
 
 #: Blocks whose schema has REQUIRED fields, so `{}` cannot construct them. The
 #: minimum payload is not padding -- it is what the block genuinely needs, and a
-#: coercion test that skipped them would silently stop covering three of the six
-#: specs mounted in 2026-08.
+#: coercion test that skipped them would silently stop covering these two blocks.
 COERCED_BLOCK_MINIMUM: dict[str, dict] = {
     "twin_dps": {"marker_template_path": "/tmp/marker.pt"},
-    "bloch_manifold_dps": {"pretrained_score_checkpoint": "/tmp/score.pt"},
-    "equivariance_conformal": {"pretrained_reconstructor_checkpoint": "/tmp/recon.pt"},
+    "phys_residual_conformal": {"tr_ms": 3000.0, "te_ms": 90.0},
 }
 
 
@@ -289,25 +287,12 @@ def test_bypassed_block_arrives_as_a_raw_dict(block):
     )
 
 
-def test_bypassed_block_accepts_values_its_own_schema_forbids():
-    """The concrete cost of the bypass, on a block with real bounds.
-
-    MotionConfig bounds max_translation to (0, 128] and sets extra="forbid".
-    Neither survives the trip through TrainingStrategyConfigSchema.
-    """
-    from spectramr.config.schemas.training.motion import MotionConfig
-
+def test_motion_block_rejects_values_its_own_schema_forbids():
+    """MotionConfig bounds max_translation to (0, 128] and sets extra="forbid"; both must run."""
     out_of_bounds = {"max_translation": 99999.0, "totally_invented_key": True}
 
-    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
-        MotionConfig(**out_of_bounds)
-
-    arrived = _training_block("motion", out_of_bounds)
-    assert arrived == out_of_bounds, (
-        "Expected the known-bad behaviour: the live path stores motion as a raw "
-        f"dict, so gt=0/le=128 and extra='forbid' never run. Got {arrived!r}. If "
-        "training.motion is now validated, update BYPASSED_BLOCKS and this test."
-    )
+    with pytest.raises(Exception, match="max_translation"):  # pydantic ValidationError
+        _training_block("motion", out_of_bounds)
 
 
 # --------------------------------------------------------------------------

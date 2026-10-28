@@ -3,9 +3,10 @@
 Unified SSOT pattern for loss computation across all training paradigms.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar, Self
 
 import torch
 
@@ -14,6 +15,22 @@ from spectramr.models.losses.weights import (
     build_loss_weight_table,
     resolve_loss_weight,
 )
+
+_logger = logging.getLogger(__name__)
+
+#: Default ``device`` for every computer's constructor (a call in the signature
+#: would be evaluated once at import anyway; this names the one instance).
+DEFAULT_LOSS_DEVICE = torch.device("cpu")
+
+
+def _all_finite_flags(tensors: list[torch.Tensor]) -> list[bool]:
+    """``[bool(torch.isfinite(t).all()) for t in tensors]`` with one host transfer."""
+    if not tensors:
+        return []
+    device = tensors[0].device
+    flags = torch.stack([torch.isfinite(t).all().to(device) for t in tensors])
+    result: list[bool] = flags.tolist()
+    return result
 
 
 @dataclass
@@ -34,12 +51,14 @@ class LossOutput:
             the prediction was produced under ``no_grad``, so asserting it here
             would fire on every validation batch.
         components: Detailed loss components for logging (detached)
-        metrics: Non-differentiable metrics (e.g., PSNR, SSIM)
+        metrics: Non-differentiable metrics (e.g., PSNR, SSIM). A producer on the
+            training path stores detached tensors rather than ``float``s, so that
+            filling this dict does not force a device sync every step.
     """
 
     total: torch.Tensor  # Scalar loss for backward
     components: dict[str, torch.Tensor] = field(default_factory=dict)  # Detailed losses
-    metrics: dict[str, float] = field(default_factory=dict)  # Monitoring metrics
+    metrics: dict[str, float | torch.Tensor] = field(default_factory=dict)  # Monitoring metrics
 
     def to_dict(self) -> dict[str, torch.Tensor]:
         """Convert to dictionary for logging.
@@ -47,7 +66,7 @@ class LossOutput:
         Returns:
             Dictionary with total loss and all components.
         """
-        result = {"total_loss": self.total}
+        result: dict[str, torch.Tensor] = {"total_loss": self.total}
         result.update(self.components)
         return result
 
@@ -81,7 +100,14 @@ class BaseLossComputer(torch.nn.Module, ABC):
     - compute()
     """
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    #: Component keys :meth:`compute` stamps on every call beyond the loss terms
+    #: themselves. A strategy that forwards ``LossOutput.components`` into its
+    #: step dict declares these as CSV columns
+    #: (``BaseTrainingStrategy.forwards_loss_components``, read by
+    #: ``training_loop.resolve_producer_declared_columns``).
+    stamped_component_keys: ClassVar[frozenset[str]] = frozenset()
+
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize loss computer.
 
         Args:
@@ -98,13 +124,11 @@ class BaseLossComputer(torch.nn.Module, ABC):
         self.scheduled_weights: dict[str, float] = {}
         self._initialize_losses()
 
-    def to(self, *args, **kwargs):
+    def to(self, *args: Any, **kwargs: Any) -> Self:
         """Override to() to also update self.device."""
-        # Use torch's internal parsing if possible, or just look for device in args/kwargs
         device = kwargs.get("device")
-        if device is None and args:
-            if isinstance(args[0], (torch.device, str, int)):
-                device = args[0]
+        if device is None and args and isinstance(args[0], (torch.device, str, int)):
+            device = args[0]
 
         if device is not None:
             self.device = torch.device(device)
@@ -238,31 +262,31 @@ class BaseLossComputer(torch.nn.Module, ABC):
             iteration: Current iteration for scheduling
 
         Returns:
-            Total weighted loss
+            Total weighted loss. When no component survives (none given, or every
+            one non-finite) this is a ``requires_grad`` leaf with no ``grad_fn``,
+            which the backward guard (``ensure_backward_ready``) refuses.
         """
-        import logging as _logging
-
-        _logger = _logging.getLogger(__name__)
-
-        if not components:
+        present = [(name, val) for name, val in components.items() if val is not None]
+        n_candidates = len(present)
+        if not n_candidates:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        total = torch.tensor(0.0, device=self.device, requires_grad=True)
+        # One device->host transfer for the whole finiteness check, rather than an
+        # ``if nan.any() or inf.any()`` sync pair per component on every step.
+        tensors = [val for _, val in present if isinstance(val, torch.Tensor)]
+        finite_iter = iter(_all_finite_flags(tensors))
+        finite = [
+            next(finite_iter) if isinstance(val, torch.Tensor) else True for _, val in present
+        ]
 
-        n_candidates = 0  # real-tensor components (not None)
-        n_skipped = 0  # of those, how many were NaN/Inf
+        # The seed must not require grad: a leaf seed gives the total a ``grad_fn``
+        # even when no component is connected to the model (a prediction made under
+        # ``no_grad``), which lets that total past the backward guard.
+        total = torch.zeros((), device=self.device)
+        n_skipped = 0
         applied_weight_sum = 0.0  # Σ|weight| over finite (surviving) components
-        for loss_name, loss_val in components.items():
-            if loss_val is None:
-                continue
-            n_candidates += 1
-
-            # [STABILITY FIX] NaN/Inf guard per component.
-            # A single diverged loss (e.g., from an unstable GNN output)
-            # must not poison the total and crash backward().
-            if isinstance(loss_val, torch.Tensor) and (
-                torch.isnan(loss_val).any() or torch.isinf(loss_val).any()
-            ):
+        for (loss_name, loss_val), is_finite in zip(present, finite, strict=True):
+            if not is_finite:
                 n_skipped += 1
                 _logger.warning(
                     "[LossComputer] Skipping NaN/Inf loss component '%s' "
@@ -273,7 +297,6 @@ class BaseLossComputer(torch.nn.Module, ABC):
                 )
                 continue
 
-            # Get weight from custom dict or from config
             if weights and loss_name in weights:
                 weight = weights[loss_name]
             else:
@@ -282,20 +305,10 @@ class BaseLossComputer(torch.nn.Module, ABC):
             applied_weight_sum += abs(float(weight))
             total = total + weight * loss_val
 
-        # [SILENT-NAN-COLLAPSE GUARD / 2026-05-21]
-        # Per-component skipping is benign when *some* component survives.
-        # But if EVERY candidate was NaN/Inf, ``total`` is still exactly 0.0
-        # with no graph contribution → ``backward()`` yields zero gradients
-        # and the model silently stops learning while ``loss=0.0`` looks
-        # perfect and the experiment "PASSES" smoke. This is the CLAUDE.md
-        # #10 "passed-with-warnings is the most dangerous outcome" trap
-        # (surfaced by experiment_120_capsule_networks: every step
-        # ``loss=0.0000 train_psnr=nan``). Escalate to a distinct, grep-able
-        # ERROR so smoke-log triage reclassifies it as a failure. We do not
-        # raise — a one-off AMP overflow on a single step can recover, so
-        # killing training here would be too aggressive; the loud signal +
-        # log-parser gate is the correct layer.
-        if n_candidates > 0 and n_skipped == n_candidates:
+        # Neither exit raises here. The all-NaN leaf is refused at the backward
+        # guard (whether it should raise earlier is #1986); the dead-loss total is
+        # grad-connected, and its persistent form is the dead_loss detector's job.
+        if n_skipped == n_candidates:
             _logger.error(
                 "[LossComputer] SILENT NaN COLLAPSE: all %d loss component(s) "
                 "were NaN/Inf — total loss is 0.0 and the model is NOT "
@@ -303,20 +316,9 @@ class BaseLossComputer(torch.nn.Module, ABC):
                 "model forward pass, not a benign single-component skip.",
                 n_candidates,
             )
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        # [DEAD-LOSS GUARD / 2026-06-27] Parallel hole to the NaN collapse: every
-        # *finite* surviving component can still be weighted to exactly 0.0, so
-        # ``total`` is a zero-gradient leaf and training silently stalls while
-        # ``loss=0.0`` looks fine. The NaN guard above misses this because the
-        # component is finite (not skipped). Root failure mode: the spatial-loss
-        # warmup gate holds l1 at weight 0 while it is the only finite loss (its
-        # ms_ssim sibling went NaN on an off-scale operator output and was
-        # skipped) — the cs_mno dead_loss cohort, 2026-06-27. Same loud,
-        # grep-able ERROR + log-parser gate as the NaN case (we do not raise: a
-        # transient single-step all-zero is recoverable; the persistent case is
-        # caught by the diagnostics dead_loss detector).
-        n_surviving = n_candidates - n_skipped
-        if n_surviving > 0 and applied_weight_sum == 0.0:
+        if applied_weight_sum == 0.0:
             _logger.error(
                 "[LossComputer] DEAD LOSS: all %d finite loss component(s) were "
                 "weighted to 0.0 (Σ|weight|=0) — total loss is 0.0 and the model "
@@ -325,7 +327,7 @@ class BaseLossComputer(torch.nn.Module, ABC):
                 "loss at weight 0 for the whole run; set "
                 "losses.reconstruction.warmup_iterations lower or add a "
                 "non-gated loss.",
-                n_surviving,
+                n_candidates - n_skipped,
             )
 
         return total

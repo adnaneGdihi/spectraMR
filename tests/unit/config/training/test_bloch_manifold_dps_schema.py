@@ -25,7 +25,6 @@ def _valid_block(**overrides) -> dict:
         "sampling_steps": 1000,
         "sampler_type": "ddim",
         "prediction_type": "epsilon",
-        "pretrained_score_checkpoint": "experiments/active/diffusion/m4raw_ddpm.ckpt",
     }
     block.update(overrides)
     return block
@@ -47,18 +46,10 @@ def test_frozen_and_extra_forbid():
 
 
 def test_defaults_apply():
-    minimal = {"pretrained_score_checkpoint": "ckpt.pt"}
-    cfg = BlochManifoldDPSConfig.model_validate(minimal)
+    cfg = BlochManifoldDPSConfig.model_validate({})
     assert cfg.pulse_sequence == "spgr"
     assert cfg.projection_inner_iterations == 10
     assert cfg.sampling_steps == 1000
-
-
-def test_missing_checkpoint_rejected():
-    block = _valid_block()
-    del block["pretrained_score_checkpoint"]
-    with pytest.raises(ValidationError):
-        BlochManifoldDPSConfig.model_validate(block)
 
 
 def test_inverted_t1_bounds_rejected():

@@ -81,5 +81,5 @@ def test_rejects_batch_mismatch() -> None:
     block = FiLMMambaBlock(d_model=16, contrast_dim=4)
     x = torch.randn(2, 32, 16)
     bad_c = torch.randn(3, 4)  # batch size mismatch
-    with pytest.raises(ValueError, match="Batch size"):
+    with pytest.raises(ValueError, match="contrast_emb batch 3"):
         block(x, bad_c)

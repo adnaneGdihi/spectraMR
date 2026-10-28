@@ -80,3 +80,22 @@ def test_zero_kernel_returns_zero_output() -> None:
     out = layer(x)
     assert torch.allclose(out.real, torch.zeros_like(out.real), atol=1e-6)
     assert torch.allclose(out.imag, torch.zeros_like(out.imag), atol=1e-6)
+
+
+def test_shift_transfer_matches_per_point_item_reads() -> None:
+    """One ``tolist()`` of the shifts gives the same output as reading each point with ``.item()``."""
+    import torch
+
+    from spectramr.models.blocks.heisenberg_conv import twisted_convolution_step as fn
+
+    torch.manual_seed(0)
+    psi = torch.randn(2, 3, 8, 8, dtype=torch.complex64)
+    kernel = torch.randn(5, 3, 3, dtype=torch.complex64)
+    shifts = torch.randint(-2, 3, (5, 2))
+    ramps = torch.randn(5, 8, 8, dtype=torch.complex64)
+    out = fn(psi, kernel, shifts, ramps)
+    ref = torch.zeros_like(psi)
+    for k in range(5):
+        shifted = torch.roll(psi, (int(shifts[k, 0].item()), int(shifts[k, 1].item())), (-2, -1))
+        ref = ref + torch.einsum("co,bohw->bchw", kernel[k], shifted * ramps[k])
+    torch.testing.assert_close(out, ref)

@@ -37,11 +37,11 @@ class GeoMambaULFInferenceStrategy(BaseInferenceStrategy):
 
             - ``contrast_id``: int or list[int] — defaults to 0.
             - ``clamp_output``: bool — clamp output to ``[0, 1]``.
-            - ``apply_unwarp``: bool — when True and a ``b0_hz``
-              kwarg is supplied to ``run_inference``, applies
-              :class:`spectramr.infrastructure.physics.unwarp.PhysicalUnwarp`
-              before the model forward pass.
-            - ``echo_spacing_s``: float — required when ``apply_unwarp`` is True.
+            - ``unwarp``: the ``training.geomamba_ulf.unwarp`` block. When
+              present it builds the same
+              :class:`~spectramr.infrastructure.physics.ulf_unwarp.UlfUnwarp`
+              the training strategy uses. A B0 map is read from ``b0_hz``.
+            - ``apply_unwarp`` / ``echo_spacing_s``: retired. Setting them raises.
     """
 
     @property
@@ -67,7 +67,7 @@ class GeoMambaULFInferenceStrategy(BaseInferenceStrategy):
 
         # Optional physical unwarp (B0 / Maxwell). Lazily import to
         # avoid the heavy physics module load when unused.
-        if self.config.get("apply_unwarp", False):
+        if self.config.get("unwarp") is not None:
             volume = self._apply_unwarp(volume, kwargs)
 
         mask_obj = kwargs.get("mask")
@@ -116,34 +116,23 @@ class GeoMambaULFInferenceStrategy(BaseInferenceStrategy):
     # ------------------------------------------------------------------
 
     def _apply_unwarp(self, volume: torch.Tensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        from spectramr.infrastructure.physics.unwarp import PhysicalUnwarp
+        from spectramr.config.schemas.training.geomamba_ulf import UnwarpConfig
+        from spectramr.infrastructure.physics.ulf_unwarp import UlfUnwarp
 
-        echo_spacing_s = self.config.get("echo_spacing_s")
-        if echo_spacing_s is None:
-            raise ValueError("config['apply_unwarp']=True requires config['echo_spacing_s']")
-        unwarp = PhysicalUnwarp(echo_spacing_s=float(echo_spacing_s))
+        for retired in ("apply_unwarp", "echo_spacing_s"):
+            if retired in self.config:
+                raise ValueError(
+                    f"config[{retired!r}] is retired: declare config['unwarp'] (the "
+                    "training.geomamba_ulf.unwarp block) instead, so inference applies "
+                    "the same correction as training."
+                )
+        raw = self.config["unwarp"]
+        cfg = raw if isinstance(raw, UnwarpConfig) else UnwarpConfig.model_validate(raw)
         b0_obj = kwargs.get("b0_hz")
-        maxwell_obj = kwargs.get("maxwell_hz")
-        gnl_obj = kwargs.get("gnl_displacement")
-        b0_hz = (
-            cast(torch.Tensor, b0_obj).to(self.device) if isinstance(b0_obj, torch.Tensor) else None
-        )
-        maxwell_hz = (
-            cast(torch.Tensor, maxwell_obj).to(self.device)
-            if isinstance(maxwell_obj, torch.Tensor)
-            else None
-        )
-        gnl_displacement = (
-            cast(torch.Tensor, gnl_obj).to(self.device)
-            if isinstance(gnl_obj, torch.Tensor)
-            else None
-        )
-        return unwarp(
-            volume,
-            b0_hz=b0_hz,
-            maxwell_hz=maxwell_hz,
-            gnl_displacement=gnl_displacement,
-        )
+        batch: dict[str, Any] = {}
+        if cfg.b0_map_key is not None and isinstance(b0_obj, torch.Tensor):
+            batch[cfg.b0_map_key] = b0_obj.to(self.device)
+        return UlfUnwarp(cfg).apply(volume, batch)
 
 
 def _resolve_geomamba_ulf_strategy(

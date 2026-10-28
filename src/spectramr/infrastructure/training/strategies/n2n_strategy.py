@@ -1,133 +1,138 @@
-#!/usr/bin/env python
-"""Noise-to-Noise Self-Supervised Denoising Strategy
+"""Noise2Noise self-supervised denoising strategy.
 
-Paradigm: Self-Supervised Denoising for Multi-Repetition Data.
-Uses multi-repetition data (M4Raw) to learn signal recovery without ground truth.
-Assumption: Noise is zero-mean and uncorrelated between scans.
+Trains on pairs of independent noisy observations of the same signal. For a
+squared loss and a target whose noise is zero-mean and independent of the input,
+
+    E||f(y1) - y2||^2 = E||f(y1) - x||^2 + E||n2||^2,
+
+so the minimiser is the supervised one although no clean target exists
+(Lehtinen et al., ICML 2018). The M4Raw loader serves no target for this
+strategy: it publishes a repetition stack (``data.n2n_pairing``) whose slot 0 is
+the input, and the strategy forms the target from the remaining slots.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, ClassVar
 
 import torch
 
-from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
-from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
-from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
+from spectramr.config.schemas.enums import Regime, Task
+from spectramr.models.capabilities import StrategyCapabilities
+
+from .base import BaseTrainingStrategy
+from .mixins.model_validation import ModelValidationMixin
+from .mixins.reconstruction import ReconstructionMixin
+from .reconstruction import ReconstructionStepMixin
+
+#: The batch key the loader publishes the stack under (``m4raw_dataset.REPETITION_STACK_KEY``).
+_STACK_KEY = "kspace_reps"
+
+#: Pairings this strategy implements; the schema validates the YAML against the same set.
+_PAIRINGS = frozenset({"random_pair", "one_vs_rest_mean", "ordered"})
 
 
-class NoiseToNoiseStrategy(BaseTrainingStrategy):
-    """Self-Supervised Denoising using N2N paradigm.
+def _data_tensor(item: Any) -> torch.Tensor | None:
+    """The tensor of a collated TorchIO image (``{"data": ...}``) or a bare tensor."""
+    if isinstance(item, dict):
+        item = item.get("data")
+    return item if isinstance(item, torch.Tensor) else None
 
-    Learns to denoise multi-repetition MRI data without requiring ground truth images.
-    Uses pairs of noisy acquisitions to train a denoising network under the assumption
-    that noise is uncorrelated between repetitions.
 
-    Typical use case: M4Raw dataset with 2-3 repetitions of same slice.
+def pair_from_stack(
+    input_batch: torch.Tensor,
+    stack: torch.Tensor,
+    pairing: str,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """The training target for ``input_batch`` drawn from its repetition stack.
 
-    Attributes:
-        env: Training environment with generator and optimizers
-        loss_computer: UnifiedReconstructionLossComputer for SSOT loss computation
+    Args:
+        input_batch: ``[B, C, ...]``, equal to slot 0 of the stack.
+        stack: ``[B, N * C, ...]``, the loader's slots concatenated on the channel axis.
+        pairing: ``random_pair`` (one other slot per sample, uniformly),
+            ``one_vs_rest_mean`` (mean of the other slots) or ``ordered`` (slot 1).
+        generator: Optional RNG for ``random_pair``.
+
+    Returns:
+        ``[B, C, ...]`` target, never slot 0.
+    """
+    if pairing not in _PAIRINGS:
+        raise ValueError(f"Unknown n2n pairing {pairing!r}; valid: {sorted(_PAIRINGS)}")
+    channels = input_batch.shape[1]
+    if stack.shape[1] % channels:
+        raise ValueError(
+            f"repetition stack has {stack.shape[1]} channels, not a multiple of the "
+            f"input's {channels}"
+        )
+    n_slots = stack.shape[1] // channels
+    if n_slots < 2:
+        raise ValueError("Noise2Noise needs at least two slots in the repetition stack")
+    slots = stack.reshape(stack.shape[0], n_slots, channels, *stack.shape[2:])
+    others = slots[:, 1:]
+    if pairing == "ordered":
+        if n_slots != 2:
+            raise ValueError(f"'ordered' expects the two halves of a split, got {n_slots} slots")
+        return others[:, 0]
+    if pairing == "one_vs_rest_mean":
+        return others.mean(dim=1)
+    pick = torch.randint(0, n_slots - 1, (stack.shape[0],), device=stack.device, generator=generator)
+    index = pick.view(-1, 1, *([1] * (others.dim() - 2))).expand(-1, 1, *others.shape[2:])
+    return others.gather(1, index).squeeze(1)
+
+
+class NoiseToNoiseStrategy(
+    ReconstructionStepMixin, ModelValidationMixin, ReconstructionMixin, BaseTrainingStrategy
+):
+    """Noise2Noise denoising: the reconstruction step on a target drawn from a repetition stack.
+
+    The forward path, losses and validation are the shared reconstruction step;
+    this class owns only how the training target is formed (``data.n2n_pairing``).
+    Validation scores against the loader's ``val_target_mode`` reference.
     """
 
-    def __init__(
-        self,
-        env: TrainingEnvironment | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """__init__.
-
-        Args:
-            env (Optional[TrainingEnvironment]): Description.
-        """
-        super().__init__(env=env, **kwargs)
-        self.loss_computer = UnifiedReconstructionLossComputer(
-            config=self.config, device=self.device
-        )
+    forwards_loss_components: ClassVar[bool] = True
+    _ZF_BASELINE_METRICS: ClassVar[tuple[str, ...]] = (
+        *ModelValidationMixin._ZF_BASELINE_METRICS,
+        *ModelValidationMixin._ZF_OBJECT_METRICS,
+    )
+    parallel_compat = frozenset({"replicated", "sharded"})
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = True
+    validates_on_batch_context: ClassVar[bool] = False
+    capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
+        workflows=frozenset({Regime.STRUCTURAL}),
+        tasks=frozenset({Task.DENOISING}),
+    )
 
     def _setup_strategy_specific_components(self) -> None:
-        """No additional components needed for N2N."""
-        pass
+        """Read the pairing; a Noise2Noise run without a repetition stack has no target."""
+        pairing = self.config.data.n2n_pairing
+        if pairing not in _PAIRINGS:
+            raise ValueError(
+                "NoiseToNoiseStrategy needs data.n2n_pairing in "
+                f"{sorted(_PAIRINGS)}, got {pairing!r}: the loader serves the "
+                "repetition stack this strategy pairs from only when it is set."
+            )
+        self.n2n_pairing: str = pairing
+        if self.logging_service:
+            self._log_config_features(self.logging_service)
 
     def _unpack_batch(self, batch: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Custom batch unpacking for N2N to handle multi-repetition data."""
-        input_batch, target_batch = None, None
+        """Input from ``batch["input"]``; the target from the stack under the pairing.
 
-        # N2N specific data extraction: look for 'image_reps' [B, N, C, H, W]
-        if isinstance(batch, dict):
-            reps = batch.get("image_reps")
-            if reps is not None and isinstance(reps, torch.Tensor) and reps.ndim == 5:
-                # N must be at least 2
-                if reps.shape[1] >= 2:
-                    # Pick two DISTINCT repetitions at random each step. N2N only
-                    # needs two independent noisy draws of the same signal, so
-                    # fixing 0/1 wasted any extra reps (e.g. rep 2 of 3-rep
-                    # M4Raw) and biased training toward one pair (audit 2026-06).
-                    i, j = torch.randperm(reps.shape[1])[:2].tolist()
-                    input_batch = reps[:, i]
-                    target_batch = reps[:, j]
-                    return input_batch, target_batch
-                # Fail loudly on single-repetition data rather than falling
-                # through to the generic "(None, None)" mixin path, which would
-                # surface the misleading downstream "requires both" error and
-                # hide the real cause (pitfall #9 spirit).
-                msg = (
-                    "Noise2Noise requires 'image_reps' with at least 2 "
-                    f"repetitions; got shape[1]={reps.shape[1]}."
-                )
-                raise ValueError(msg)
-
-        # Fallback to standard mixin unpacking if N2N-specific keys missing
-        return super()._unpack_batch(batch)
-
-    def _compute_losses_impl(
-        self,
-        input_batch: torch.Tensor,
-        target_batch: torch.Tensor,
-        epoch: int,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Compute N2N denoising loss via UnifiedReconstructionLossComputer (SSOT).
-
-        Args:
-            input_batch: First repetition [B, C, H, W]
-            target_batch: Second repetition [B, C, H, W]
-            epoch: Current epoch
-            **kwargs: Additional arguments
-
-        Returns:
-            Dictionary with loss components from the loss computer
+        A batch without the stack falls back to the loader's ``input``/``target``,
+        which is what the validation split serves.
         """
-        generator = self.env.generator
-
-        if input_batch is None or target_batch is None:
-            raise ValueError(
-                "Noise2Noise strategy requires both input and target tensors "
-                "(two independent noisy repetitions). Check that your dataset "
-                "provides 'image_reps' with at least 2 repetitions, or "
-                "'input'/'target' keys in each batch."
-            )
-
-        # Forward pass: denoise first repetition
-        denoised_pred = generator(input_batch)
-
-        # SSOT: Delegate loss computation to UnifiedReconstructionLossComputer
-        env_losses = {}
-        if self.env and hasattr(self.env, "losses"):
-            env_losses = self.env.losses or {}
-
-        # The pipeline forwards the step counter as ``iteration`` (train.py),
-        # not ``step``; reading the wrong key froze the loss-weight schedule at
-        # iteration 0. Prefer the canonical ``iteration`` key, keep ``step`` as
-        # a legacy fallback.
-        iteration = kwargs.get("iteration", kwargs.get("step", 0))
-        loss_output = self.loss_computer.compute(
-            pred=denoised_pred,
-            target=target_batch,
-            epoch=epoch,
-            iteration=iteration,
-            losses_dict=env_losses,
-        )
-
-        result = {"g_total_loss": loss_output.total}
-        result.update(loss_output.components)
-        return result
+        # The loop hands a TrainingBatch, which parks the stack in ``metadata``.
+        if isinstance(batch, dict):
+            source, raw_input = batch, batch.get("input")
+        else:
+            source, raw_input = getattr(batch, "metadata", None), getattr(batch, "input", None)
+        if isinstance(source, dict) and _STACK_KEY in source:
+            input_batch = _data_tensor(raw_input)
+            stack = _data_tensor(source[_STACK_KEY])
+            if input_batch is None or stack is None:
+                raise ValueError("Noise2Noise batch carries a repetition stack but no input tensor")
+            return input_batch, pair_from_stack(input_batch, stack, self.n2n_pairing)
+        return super()._unpack_batch(batch)

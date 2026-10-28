@@ -221,14 +221,10 @@ class WindowAttention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
+        bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # (1, nH, N, N)
 
         if mask is not None:
             # ``nW`` is read off the mask, so a mask from another resolution
@@ -251,13 +247,18 @@ class WindowAttention(nn.Module):
                     f"attention mask describes {nW} windows but {B_} window-rows were "
                     f"partitioned; the mask was built for a different resolution"
                 )
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            # Fold the window axis into the head axis so one 4-D fused SDPA call sees a
+            # (1, nW*nH, N, N) bias instead of a (B_, nH, N, N) score tensor.
+            bias = (bias + mask.unsqueeze(1)).reshape(1, nW * self.num_heads, N, N)
+            q, k, v = (
+                t.reshape(B_ // nW, nW * self.num_heads, N, C // self.num_heads) for t in (q, k, v)
+            )
 
-        attn = self.softmax(attn)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias.to(q.dtype), dropout_p=dropout_p, scale=self.scale
+        )
+        x = x.reshape(B_, self.num_heads, N, C // self.num_heads).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

@@ -174,3 +174,51 @@ def test_runner_does_not_train_model() -> None:
     runner.run(_make_loader(n_batches=3))
     # No exception, no gradient-tracking — implied by the ``no_grad`` block.
     assert _Counter.forward_calls == 3
+
+
+class _GeometryModel(nn.Module):
+    """Stand-in for a geometry-plane generator: raises without ``mask=``, records it."""
+
+    kspace_geometry_channels = 6
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.masks: list[torch.Tensor] = []
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if mask is None:
+            raise ValueError("forward needs mask=")
+        self.masks.append(mask)
+        return x
+
+
+def test_a_geometry_model_is_given_the_measurement_support() -> None:
+    """The kspace_cold_diffusion conformal arms raised on every batch without it."""
+    from spectramr.models.blocks.kspace_geometry_encoding import measurement_support
+
+    y = torch.zeros(2, 2, 8, 8)
+    y[..., ::2] = 1.0
+    loader = [(y, y.clone()), (y, y.clone())]
+    model = _GeometryModel()
+    runner = ConformalCalibrationRunner(
+        model=model, calibrator=ConformalCalibrator(alpha=0.5), device="cpu"
+    )
+    report = runner.run(loader[:1], loader[1:])
+    assert report.empirical_coverage is not None
+    assert len(model.masks) == 2
+    for mask in model.masks:
+        torch.testing.assert_close(mask, measurement_support(y))
+
+
+def test_a_model_without_geometry_planes_is_called_bare() -> None:
+    seen: list[dict] = []
+
+    class _Bare(nn.Module):
+        def forward(self, x, **kwargs):
+            seen.append(kwargs)
+            return x
+
+    ConformalCalibrationRunner(
+        model=_Bare(), calibrator=ConformalCalibrator(alpha=0.5), device="cpu"
+    ).run(_make_loader(n_batches=1))
+    assert seen == [{}]

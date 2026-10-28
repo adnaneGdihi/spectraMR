@@ -5,9 +5,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from spectramr.models.blocks.kspace_geometry_encoding import KSPACE_GEOMETRY_CHANNELS
 from spectramr.models.generators.kspace_cold_diffusion_generator import (
     KSpaceColdDiffusionGenerator,
 )
+
+#: Real channels the v2 geometry planes add to every non-exempt backbone input.
+_GEOMETRY_WIDTH = 2 * KSPACE_GEOMETRY_CHANNELS
 
 
 def _measurement_kwargs(x: torch.Tensor) -> dict:
@@ -54,15 +58,51 @@ def test_generator_builds_noise_adaptive_dc_layer():
         attention_type="none",
         dc_method="noise_adaptive",
         dc_weight=0.5,
+        kspace_log_scaled=True,
     )
     assert isinstance(model.dc_layer, NoiseAdaptiveDataConsistency)
     assert float(model.dc_layer.beta) == pytest.approx(0.5)
+    assert model.dc_layer.log_scaled is True
     assert set(model.get_kan_trust_map_telemetry()) == {
         "noise_adaptive_trust/center",
         "noise_adaptive_trust/periphery",
         "noise_adaptive_trust/mean",
         "noise_adaptive_trust/std",
     }
+
+
+def test_generator_builds_wiener_gain_dc_layer():
+    """``dc_method='wiener_gain'`` builds the gain-fitted Wiener layer in the arm's
+    declared k-space domain, forwards ``dc_weight`` as beta, and surfaces the gain."""
+    from spectramr.infrastructure.physics.wiener_gain_dc import WienerGainDataConsistency
+
+    model = KSpaceColdDiffusionGenerator(
+        in_channels=2,
+        out_channels=2,
+        base_channels=16,
+        num_layers=2,
+        attention_type="none",
+        dc_method="wiener_gain",
+        dc_weight=0.5,
+        kspace_log_scaled=True,
+    )
+    assert isinstance(model.dc_layer, WienerGainDataConsistency)
+    assert model.dc_layer.log_scaled is True
+    assert float(model.dc_layer.beta) == pytest.approx(0.5)
+    assert "wiener_gain/alpha" in model.get_kan_trust_map_telemetry()
+
+
+def test_wiener_gain_refuses_an_undeclared_kspace_domain():
+    """The blend is defined on linear k-space, so the compression flag is required."""
+    with pytest.raises(ValueError, match="kspace_log_scaled"):
+        KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=16,
+            num_layers=2,
+            attention_type="none",
+            dc_method="wiener_gain",
+        )
 
 
 class TestKSpaceColdDiffusionGenerator:
@@ -260,25 +300,13 @@ class TestKSpaceColdDiffusionGenerator:
         of = of[0] if isinstance(of, tuple) else of
         assert float(of.abs().max()) > ceil  # unbounded head exceeds the ceiling
 
-    def test_output_kspace_clip_ratio_skips_on_batch_mismatch(self):
-        """The guard is SKIPPED (not crashed) when ``kspace_measured`` cannot
-        broadcast to ``x_out``. The forward must still return finite output.
-
-        This happens in production when a 5D (D>1) input restores x_out to
-        [B,C,H,W,D] while kspace_measured stays flattened to [B*D,...]; the
-        batch mismatch itself is what the guard keys on, and it is exercised
-        directly here (see the note on the 5D route below).
-        """
-        torch.manual_seed(0)
-        model = KSpaceColdDiffusionGenerator(
+    @staticmethod
+    def _clip_generator(**kwargs):
+        # The plain contract: with ``condition_with_smaps=True`` the backbone is
+        # built at 2x in_channels and a bare ``in_channels`` stack is refused.
+        return KSpaceColdDiffusionGenerator(
             in_channels=2,
             out_channels=2,
-            # This case exercises shape/scale/conditioning behaviour, not S-map
-            # conditioning, so it declares the plain contract. With the default
-            # ``condition_with_smaps=True`` the backbone is built at 2x
-            # in_channels and a bare ``in_channels`` stack is a width error —
-            # which FourierBridgeNetwork used to absorb by building an untrained
-            # ChannelAdapter (#1326) and now correctly refuses.
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
@@ -286,30 +314,75 @@ class TestKSpaceColdDiffusionGenerator:
             attention_type="none",
             output_kspace_clip_ratio=1.3,
             kspace_log_scaled=False,
+            **kwargs,
         )
+
+    def test_hard_dc_bins_survive_a_band_local_clip(self):
+        """PLANTED (#2310): the output clip ran after DC on the whole plane, and the
+        band_local envelope, a running minimum, cut an outer measured row."""
+        torch.manual_seed(0)
+        model = self._clip_generator(output_kspace_clip_reference="band_local", dc_method="hard")
         model.train()
-        # The mechanism under test is "kspace_measured's batch cannot broadcast
-        # to x_out, so the ceiling is skipped rather than crashing" — expressed
-        # here in 4D, which isolates it.
-        #
-        # It used to be expressed with a 5D [1, 2, 16, 16, 2] input, and that
-        # route asserted almost nothing. The generator reads 5D as
-        # [B, D, C, H, W] and flattens to [B*D, C, H, W], so that tensor reached
-        # the backbone as SIXTEEN channels against in_channels=2 — absorbed by
-        # a rebuilt (untrained) ChannelAdapter — and came back as (1, 2, 16, 2,
-        # 2) from a (1, 2, 16, 16, 2) input, i.e. with its spatial dims mangled.
-        # Only ``isfinite`` was asserted, so neither showed. The layout-correct
-        # [1, D=2, C=2, 16, 16] does not work either: it raises inside
-        # complex_conv on dev as well as here. The 5D volumetric path is filed
-        # separately; this case no longer depends on it.
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[..., 14:18, :] = 1.0
+        mask[..., 0, :] = 1.0
+        measured = 0.001 * torch.randn(1, 2, 32, 32) * mask
+        measured[:, 0, 0, 0] = 0.05
+        with torch.no_grad():
+            out = model(
+                torch.randn(1, 2, 32, 32),
+                timestep=torch.zeros(1, dtype=torch.long),
+                kspace_measured=measured,
+                mask=mask,
+            )
+        out = out[0] if isinstance(out, tuple) else out
+        assert torch.allclose(out * mask, measured, atol=1e-7)
+
+    def test_declared_dc_raises_on_a_batch_mismatch(self):
+        """A measurement that cannot align with the prediction is an error when DC
+        is declared, not a skipped layer (``72b955514``, #2153)."""
+        torch.manual_seed(0)
+        model = self._clip_generator()
+        model.train()
         x = torch.randn(1, 2, 16, 16)
-        t = torch.randint(0, 1000, (1,))
         measured = 0.001 * torch.randn(2, 2, 16, 16)  # batch 2 != x batch 1
-        mask = torch.ones(2, 1, 16, 16)
+        # The mask matches x: a mismatched mask is refused earlier, by the
+        # geometry planes, so it cannot reach the DC alignment check under test.
+        with pytest.raises(ValueError, match="do not align"):
+            model(x, timestep=torch.zeros(1, dtype=torch.long), kspace_measured=measured,
+                  mask=torch.ones(1, 1, 16, 16))
+
+    def test_output_clip_skips_on_a_batch_mismatch_without_dc(self):
+        """The clip ceiling is per sample, so a measurement it cannot broadcast
+        against is skipped; with DC off that is the only consumer of it."""
+        torch.manual_seed(0)
+        model = self._clip_generator(dc_method="none")
+        # The same weights without the ceiling, which is what a skip must produce.
+        twin = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            condition_with_smaps=False,
+            base_channels=8,
+            num_layers=2,
+            use_complex_conv=False,
+            attention_type="none",
+            kspace_log_scaled=False,
+            dc_method="none",
+        )
+        twin.load_state_dict(model.state_dict())
+        model.train()
+        twin.train()
+        x = torch.randn(1, 2, 16, 16)
+        t = torch.zeros(1, dtype=torch.long)
+        measured = 0.001 * torch.randn(2, 2, 16, 16)
+        mask = torch.ones(1, 1, 16, 16)
         with torch.no_grad():
             out = model(x, timestep=t, kspace_measured=measured, mask=mask)
+            ref = twin(x, timestep=t, mask=mask)
         out = out[0] if isinstance(out, tuple) else out
+        ref = ref[0] if isinstance(ref, tuple) else ref
         assert torch.isfinite(out).all()
+        assert torch.equal(out, ref), "a skipped ceiling must leave the prediction untouched"
 
     def test_timesteps_kwarg_binds_num_timesteps(self):
         """model_kwargs.timesteps must drive num_timesteps (the time-embedding
@@ -338,6 +411,20 @@ class TestKSpaceColdDiffusionGenerator:
                 num_layers=2,
                 use_complex_conv=False,
                 num_timesteps=500,
+                timesteps=28,
+            )
+
+    def test_an_explicit_1000_beside_a_different_timesteps_raises(self):
+        """PLANTED: 1000 was the "not given" sentinel, so an explicit
+        num_timesteps=1000 beside timesteps=28 passed and trained at 28."""
+        with pytest.raises(ValueError, match="conflicting"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                use_complex_conv=False,
+                num_timesteps=1000,
                 timesteps=28,
             )
 
@@ -406,8 +493,9 @@ class TestKSpaceColdDiffusionGenerator:
         t1 = torch.tensor([100])
         t2 = torch.tensor([900])
 
-        out1 = model(x, timesteps=t1)
-        out2 = model(x, timesteps=t2)
+        mask = torch.ones(1, 1, 32, 32)
+        out1 = model(x, timesteps=t1, mask=mask)
+        out2 = model(x, timesteps=t2, mask=mask)
 
         if isinstance(out1, tuple):
             out1 = out1[0]
@@ -512,6 +600,7 @@ class TestKSpaceColdDiffusionDCBlobRegression:
         model = self._build(attention_type)
         x = torch.randn(2, 4, 64, 64)
         t = torch.full((2,), 500, dtype=torch.long)
+        mask = torch.ones(2, 1, 64, 64)
 
         const = {"v": 0.0}
 
@@ -524,10 +613,10 @@ class TestKSpaceColdDiffusionDCBlobRegression:
         try:
             with torch.no_grad():
                 const["v"] = 1.0
-                o1 = model(x, timesteps=t)
+                o1 = model(x, timesteps=t, mask=mask)
                 o1 = o1[0] if isinstance(o1, tuple) else o1
                 const["v"] = -1.0
-                o2 = model(x, timesteps=t)
+                o2 = model(x, timesteps=t, mask=mask)
                 o2 = o2[0] if isinstance(o2, tuple) else o2
         finally:
             handle.remove()
@@ -559,19 +648,12 @@ class TestPhaseSafeDualAttentionResidualContract:
         assert torch.allclose(out_a, x_kspace, atol=1e-6)
         assert torch.allclose(out_a, out_b, atol=1e-6)
 
-    def test_attention_caps_tokens_to_avoid_oom(self):
-        """At full image resolution the dense ``[B, N, N]`` softmax OOMs
-        (256x256 -> N=65536 -> ~32 GiB; this is the crash exposed once the
-        masking try/except was removed). The ``max_tokens`` cap pools q/k/v to
-        a coarse grid before attention and upsamples the result, so a large map
-        runs in bounded memory and preserves spatial shape. Without the cap
-        this allocates a ~17 GiB ``[1, 65536, 65536]`` matrix and OOMs.
-        """
+    def test_full_resolution_map_runs_in_bounded_memory(self):
+        """A dense ``[B, N, N]`` softmax at 256x256 would need ~17 GiB; linear
+        attention runs the same map at native resolution in O(N) memory."""
         from spectramr.models.blocks.attention import PhaseSafeDualAttention
 
-        attn = PhaseSafeDualAttention(
-            in_channels=4, num_heads=1, reduction=1, max_tokens=256
-        ).eval()
+        attn = PhaseSafeDualAttention(in_channels=4, num_heads=1, reduction=1).eval()
         x_kspace = torch.randn(1, 8, 256, 256)
         x_image = torch.randn(1, 8, 256, 256)
         with torch.no_grad():
@@ -579,25 +661,23 @@ class TestPhaseSafeDualAttentionResidualContract:
         assert out.shape == x_kspace.shape
         assert torch.isfinite(out).all()
 
-    def test_attention_below_cap_uses_full_resolution(self):
-        """Below the cap, attention runs at native resolution (no pooling),
-        and the gamma=0 residual still yields an exact x_kspace passthrough."""
+    def test_gamma_zero_is_an_exact_passthrough(self):
+        """The gamma=0 residual yields an exact x_kspace passthrough."""
         from spectramr.models.blocks.attention import PhaseSafeDualAttention
 
-        attn = PhaseSafeDualAttention(
-            in_channels=2, num_heads=1, reduction=1, max_tokens=4096
-        ).eval()
+        attn = PhaseSafeDualAttention(in_channels=2, num_heads=1, reduction=1).eval()
         x = torch.randn(2, 4, 16, 16)
         with torch.no_grad():
             out = attn(x, torch.randn(2, 4, 16, 16))
         assert out.shape == x.shape
         assert torch.allclose(out, x, atol=1e-6)
 
-    def test_invalid_max_tokens_raises(self):
+    def test_retired_max_tokens_is_rejected_not_ignored(self):
+        """The token cap no longer changes the computation, so passing it raises (pitfall 15)."""
         from spectramr.models.blocks.attention import PhaseSafeDualAttention
 
-        with pytest.raises(ValueError, match="max_tokens"):
-            PhaseSafeDualAttention(in_channels=2, max_tokens=0)
+        with pytest.raises(TypeError, match="max_tokens"):
+            PhaseSafeDualAttention(in_channels=2, max_tokens=4096)
 
 
 class TestKSpaceColdDiffusionMultiStepSample:
@@ -726,7 +806,7 @@ class TestChannelAdapterWidthContract:
         backbone's width and whether a caller may concatenate."""
         model = self._build()
         assert model.expects_smaps_concat is True
-        assert self._bridge(model).config.in_channels == 2 * model.in_channels
+        assert self._bridge(model).config.in_channels == 2 * model.in_channels + _GEOMETRY_WIDTH
 
     def test_backbone_in_channels_is_published_for_the_contract(self) -> None:
         """The width the model-input contract compares against.
@@ -739,16 +819,21 @@ class TestChannelAdapterWidthContract:
         with the width the bridge was actually built at whichever way
         ``expects_smaps_concat`` falls.
         """
+        # The geometry planes join inside the generator, after the model input
+        # this attribute describes, so the build is wider by exactly their width.
         conditioned = self._build()
         assert conditioned.backbone_in_channels == 2 * conditioned.in_channels
         assert (
-            conditioned.backbone_in_channels
+            conditioned.backbone_in_channels + _GEOMETRY_WIDTH
             == self._bridge(conditioned).config.in_channels
         )
 
         plain = self._build(condition_with_smaps=False)
         assert plain.backbone_in_channels == plain.in_channels
-        assert plain.backbone_in_channels == self._bridge(plain).config.in_channels
+        assert (
+            plain.backbone_in_channels + _GEOMETRY_WIDTH
+            == self._bridge(plain).config.in_channels
+        )
 
     def test_the_contract_resolver_reads_the_published_width(self) -> None:
         """Wiring, not just presence (CLAUDE.md #16): the attribute is only a
@@ -764,7 +849,7 @@ class TestChannelAdapterWidthContract:
 
         plain = self._build(condition_with_smaps=False)
         assert plain.expects_smaps_concat is False
-        assert self._bridge(plain).config.in_channels == plain.in_channels
+        assert self._bridge(plain).config.in_channels == plain.in_channels + _GEOMETRY_WIDTH
 
     def test_bare_width_raises_instead_of_building_an_untrained_adapter(self) -> None:
         """PLANTED VIOLATION: the exact call the multi-step validation path
@@ -1032,8 +1117,9 @@ class TestInternalDCBackboneSmapChannels:
         doubled (2x ``in_channels``) input for S-map conditioning — the fix must
         not over-correct working backbones."""
         model = self._build("complex_unet")
-        # FourierBridgeNetwork.config.in_channels carries the build-time width.
-        assert model.backbone.config.in_channels == 16
+        # FourierBridgeNetwork.config.in_channels carries the build-time width:
+        # the doubled stack plus the geometry planes the internal-DC pair omits.
+        assert model.backbone.config.in_channels == 16 + _GEOMETRY_WIDTH
 
 
 class TestWaveletGateDispatch:
@@ -1076,6 +1162,28 @@ class TestWaveletGateDispatch:
         )
         assert block.attention.inner.gate_type == "kan"
 
+
+
+class TestChannelAttentionIsPhasePreservingOnComplexFeatures:
+    """``attention_type: channel`` on interleaved complex features gates each complex
+    channel with one gain; a per-real-channel gate would rotate phase."""
+
+    @pytest.mark.parametrize("block_name", ["KSpaceDownsampleBlock", "KSpaceUpsampleBlock"])
+    @pytest.mark.parametrize("complex_conv", [True, False])
+    def test_gate_follows_the_feature_layout(self, block_name: str, complex_conv: bool):
+        from spectramr.models.blocks.attention import ChannelAttention, ComplexChannelAttention
+        from spectramr.models.generators import kspace_cold_diffusion_generator as gen
+
+        block = getattr(gen, block_name)(
+            in_channels=16,
+            out_channels=16,
+            attention_type="channel",
+            use_complex_conv=complex_conv,
+            feature_domain="kspace",
+        )
+        gate = getattr(block.attention, "inner", block.attention)
+        expected = ComplexChannelAttention if complex_conv else ChannelAttention
+        assert type(gate) is expected
 
 class TestBlockActivationValidation:
     """Pitfall #9: the k-space blocks' activation resolution must raise on an
@@ -1333,8 +1441,26 @@ class TestReverseSamplingModeKnob:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
+                reverse_sampling_mode="replace_freeze_dc",
                 reverse_clip_ratio=-1.0,
             )
+
+    def test_sampling_steps_is_a_named_parameter_the_builder_can_inject(self):
+        """PLANTED (#566): the generator read ``kwargs.get("sampling_steps", 50)``, so the
+        declared training.diffusion.sampling_steps never reached ``sample()``."""
+        import inspect
+
+        assert "sampling_steps" in inspect.signature(KSpaceColdDiffusionGenerator.__init__).parameters
+        declared = KSpaceColdDiffusionGenerator(
+            in_channels=2, out_channels=2, base_channels=8, num_layers=2,
+            attention_type="none", num_timesteps=29, sampling_steps=20,
+        )
+        assert declared._sampling_steps == 20
+        undeclared = KSpaceColdDiffusionGenerator(
+            in_channels=2, out_channels=2, base_channels=8, num_layers=2,
+            attention_type="none", num_timesteps=29,
+        )
+        assert undeclared._sampling_steps == 29
 
     def test_default_is_additive(self):
         model = KSpaceColdDiffusionGenerator(
@@ -1359,6 +1485,170 @@ class TestReverseSamplingModeKnob:
         )
         assert model._reverse_mode == "replace_freeze"
         assert model._reverse_clip_ratio == pytest.approx(3.0)
+
+    def test_refine_alpha_under_another_mode_raises_at_build(self):
+        """An unread knob is refused at construction (pitfall 15)."""
+        with pytest.raises(ValueError, match="reverse_refine_alpha"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                attention_type="none",
+                reverse_sampling_mode="replace_freeze_dc",
+                reverse_refine_alpha=0.5,
+            )
+
+    def test_refine_mode_without_alpha_raises_at_build(self):
+        with pytest.raises(ValueError, match="reverse_refine_alpha"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                attention_type="none",
+                reverse_sampling_mode="reveal_refine_dc",
+            )
+
+    def test_refine_alpha_stamped(self):
+        model = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            attention_type="none",
+            reverse_sampling_mode="reveal_refine_dc",
+            reverse_refine_alpha=0.5,
+        )
+        assert model._refine_alpha == pytest.approx(0.5)
+
+    def test_unknown_integrity_check_raises_at_build(self):
+        with pytest.raises(ValueError, match="reverse_integrity_check"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                attention_type="none",
+                reverse_integrity_check="warn",
+            )
+
+    def test_integrity_check_fires_on_the_sample_path(self):
+        """The knob reaches the sampler ``sample()`` builds, and the check runs there."""
+        model = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            attention_type="none",
+            process_type="cold_diffusion",
+            kspace_log_scaled=False,
+            condition_with_smaps=False,
+            reverse_sampling_mode="additive_normalized",
+            reverse_integrity_check="raise",
+        ).eval()
+        meas = torch.randn(1, 2, 32, 32)
+        mask = torch.ones(1, 1, 32, 32)
+        mask[..., ::2] = 0
+        meas = meas * mask
+        with torch.no_grad():
+            model.sample(measurement=meas, mask=mask, inference_timesteps=3)
+        stats = model.last_reverse_stats
+        assert stats["reverse_mode"] == "additive_normalized"
+        assert stats["integrity_check"] == "raise"
+        assert stats["integrity_steps_verified"] == stats["effective_steps"] > 0
+        assert stats["band_divisor_max"] is not None
+
+
+    def test_an_illegal_reverse_physics_option_raises_at_build(self):
+        with pytest.raises(ValueError, match="reverse_support_radius"):
+            KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                attention_type="none",
+                reverse_sampling_mode="replace_freeze_dc",
+                reverse_support_radius=2,
+            )
+
+    def test_reverse_physics_fires_on_the_sample_path(self):
+        """Support-ordered commitment with the joint-TV projection runs under ``sample()``."""
+        model = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            attention_type="none",
+            process_type="cold_diffusion",
+            kspace_log_scaled=False,
+            condition_with_smaps=False,
+            reverse_sampling_mode="support_ordered_dc",
+            reverse_support_radius=2,
+            reverse_projection="joint_tv",
+            reverse_integrity_check="raise",
+        ).eval()
+        meas = torch.randn(1, 2, 32, 32)
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[..., 14:19, :] = 1.0
+        mask[..., ::4, :] = 1.0
+        meas = meas * mask
+        with torch.no_grad():
+            model.sample(measurement=meas, mask=mask, inference_timesteps=3)
+        stats = model.last_reverse_stats
+        assert stats["reverse_mode"] == "support_ordered_dc"
+        assert stats["reverse_physics"]["projection"] == "joint_tv"
+        assert stats["reverse_physics"]["support_radius"] == 2
+        assert stats["integrity_steps_verified"] == stats["effective_steps"] > 0
+        assert stats["projection_rejected_steps"] is not None
+
+    def test_reverse_dc_reaches_the_sample_path_and_is_stamped(self):
+        """Same weights, same input: only the per-step pin differs, and the output moves."""
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[..., 14:19, :] = 1.0
+        mask[..., ::4, :] = 1.0
+        meas = torch.randn(1, 2, 32, 32, generator=torch.Generator().manual_seed(1)) * mask
+        outs = {}
+        for reverse_dc in ("per_step", "unconstrained"):
+            torch.manual_seed(0)
+            model = KSpaceColdDiffusionGenerator(
+                in_channels=2,
+                out_channels=2,
+                base_channels=8,
+                num_layers=2,
+                attention_type="none",
+                process_type="cold_diffusion",
+                kspace_log_scaled=False,
+                condition_with_smaps=False,
+                reverse_sampling_mode="replace_freeze_dc",
+                reverse_dc=reverse_dc,
+            ).eval()
+            with torch.no_grad():
+                outs[reverse_dc] = model.sample(measurement=meas, mask=mask, inference_timesteps=3)
+            assert model.last_reverse_stats["reverse_physics"]["reverse_dc"] == reverse_dc
+        assert not torch.allclose(outs["per_step"], outs["unconstrained"])
+
+
+class TestTimestepEmbeddingScaleKnob:
+    """``model_kwargs.timestep_embedding_scale`` is read, validated at build and
+    forwarded to the backbone as ``timestep_scale`` (#2315)."""
+
+    def _build(self, **kwargs):
+        return KSpaceColdDiffusionGenerator(
+            in_channels=2, out_channels=2, base_channels=8, num_layers=2,
+            attention_type="none", **kwargs,
+        )
+
+    def test_default_is_the_legacy_dividing_form(self):
+        assert self._build()._timestep_embedding_scale == "unit_interval"
+
+    @pytest.mark.parametrize("scale", ["integer", "horizon_band"])
+    def test_non_default_scale_is_stamped(self, scale):
+        assert self._build(timestep_embedding_scale=scale)._timestep_embedding_scale == scale
+
+    def test_unknown_value_raises_at_build(self):
+        with pytest.raises(ValueError, match="timestep embedding scale"):
+            self._build(timestep_embedding_scale="log")
 
 
 class TestKSpaceFeatureNormPlumbing:
@@ -1663,12 +1953,17 @@ _SEAMLESS = [
     "u_vit",
     "hat",
     "diffit",
+    "kspace_ar",
+    "kspace_masked",
 ]
 
 #: Names in ``_SEAMLESS`` that cannot be CONSTRUCTED in this environment, so the
 #: build-side cases below skip them while the raise-side cases still run: the
 #: mamba pair needs the ``.[mamba]`` extra (deliberately outside ``[dev]``).
 _SEAMLESS_UNBUILDABLE = {"vision_mamba", "mamba_unet"}
+
+#: Line-token backbones have no image-domain view, so they build only under pure k-space.
+_PURE_KSPACE_ONLY = {"kspace_ar", "kspace_masked"}
 
 
 @pytest.mark.parametrize("backbone", _SEAMLESS)
@@ -1701,6 +1996,7 @@ def test_seamless_backbone_accepts_none_attention(backbone):
         num_layers=2,
         backbone_type=backbone,
         attention_type="none",
+        force_pure_kspace=backbone in _PURE_KSPACE_ONLY,
     )
     assert isinstance(model, nn.Module)
 
@@ -1730,6 +2026,7 @@ def test_seamless_backbone_unspecified_attention_resolves_to_none(backbone):
         base_channels=8,
         num_layers=2,
         backbone_type=backbone,
+        force_pure_kspace=backbone in _PURE_KSPACE_ONLY,
     )
     assert isinstance(model, nn.Module)
 
@@ -1878,8 +2175,30 @@ def test_fallback_concat_prepares_smaps_and_leaves_sense_input_untouched() -> No
         if "smaps_k" in names or "smaps" in names:
             assert "smaps" not in names, "raw image-domain maps concatenated"
 
-    # the SENSE projection still receives the untransformed maps
-    assert "self.sense_projector(x_out, smaps)" in src
+    # the SENSE projection still receives the untransformed maps, and its domain
+    assert "self.sense_projector(x_out, smaps, log_scaled=self._kspace_log_scaled)" in src
+
+
+@pytest.mark.unit
+def test_the_projection_refuses_to_guess_the_kspace_domain() -> None:
+    """Maps passed, ``kspace_log_scaled`` never supplied: raise before projecting (#2488)."""
+    generator = KSpaceColdDiffusionGenerator(
+        in_channels=4,
+        out_channels=4,
+        base_channels=8,
+        num_layers=2,
+        backbone_type="complex_unet",
+        attention_type="none",
+        use_complex_conv=True,
+        timesteps=4,
+        condition_with_smaps=False,
+    ).eval()
+    x = torch.randn(1, 4, 16, 16)
+    smaps = torch.ones(1, 2, 16, 16, dtype=torch.complex64) / 2**0.5
+    with pytest.raises(ValueError, match="kspace_log_scaled was never supplied"):
+        generator(
+            x, torch.full((1,), 1, dtype=torch.long), smaps=smaps, mask=torch.ones(1, 1, 16, 16)
+        )
 
 
 class TestTheOneWidthResolver:
@@ -1945,7 +2264,8 @@ class TestTheOneWidthResolver:
         # Every arm here DECLARES conditioning; only the resolved answer differs.
         assert model.condition_with_smaps is True
         assert model_expects_smaps_concat(model) is doubled
-        expected = 16 if doubled else 8
+        # complex_unet also carries the geometry planes; the internal-DC pair is exempt.
+        expected = 16 + _GEOMETRY_WIDTH if doubled else 8
         assert self._first_conv_width(model) == expected
 
     def test_the_resolved_contract_outranks_the_declaration(self) -> None:
@@ -2368,10 +2688,12 @@ def test_hard_dc_layer_receives_the_declared_noise_levels():
     assert model.dc_layer.eval_noise_level == pytest.approx(0.033)
 
 
-def test_hard_dc_noise_levels_default_when_undeclared():
+def test_hard_dc_noise_levels_default_to_zero():
+    """Hard DC holds the acquired lines as measured unless an arm asks for noise
+    (``6a00bc55c``): an absolute level on log1p k-space randomises their phase."""
     model = _dc_generator(dc_method="hard")
-    assert model.dc_layer.train_noise_level == pytest.approx(0.01)
-    assert model.dc_layer.eval_noise_level == pytest.approx(0.005)
+    assert model.dc_layer.train_noise_level == 0.0
+    assert model.dc_layer.eval_noise_level == 0.0
 
 
 def test_hard_dc_ignores_dc_weight_by_construction():
@@ -2423,7 +2745,9 @@ def test_unsupported_noise_type_raises_through_the_generator():
 
 
 def _pre_dc_generator():
-    return _dc_generator(dc_method="hard", eval_noise_level=0.0).eval()
+    # The forward passes sensitivity maps, so the coil projection needs the k-space
+    # domain (#2488); these tests feed linear k-space.
+    return _dc_generator(dc_method="hard", eval_noise_level=0.0, kspace_log_scaled=False).eval()
 
 
 def _pre_dc_forward_kwargs(x: torch.Tensor) -> dict:
@@ -2522,7 +2846,7 @@ def test_post_dc_at_t0_reproduces_the_measurement_but_pre_dc_does_not():
 
 def test_training_mode_still_returns_the_pair_without_the_flag():
     """The pre-existing training contract is unchanged by the new keyword."""
-    model = _dc_generator(dc_method="hard", eval_noise_level=0.0).train()
+    model = _dc_generator(dc_method="hard", eval_noise_level=0.0, kspace_log_scaled=False).train()
     x = torch.randn(1, 2, 16, 16)
     out = model(x, torch.zeros(1, dtype=torch.long), **_pre_dc_forward_kwargs(x))
     assert isinstance(out, tuple) and len(out) == 2
@@ -2749,7 +3073,9 @@ def test_dispatch_opts_the_three_blocks_out_of_their_own_zero_init() -> None:
                 feature_domain="kspace",
             )
             proj = getattr(block.attention.inner, proj_attr)
-            assert proj.weight.abs().sum().item() > 0.0, (
+            # A real Linear holds `weight`; a ComplexConv2d holds `weight_real` and `weight_imag`.
+            mass = sum(p.abs().sum().item() for p in proj.parameters() if p.dim() > 1)
+            assert mass > 0.0, (
                 f"{builder.__name__}/{attention_type}: the block still zero-inits its "
                 "own output projection under IdentityAtInitAttention"
             )
@@ -2918,20 +3244,26 @@ class TestRadialBandTokensPlumbing:
             KSpaceColdDiffusionGenerator(**{**_BAND_BASE, **extra}, radial_band_tokens_bands=8)
 
     def test_it_fires_on_the_bare_reverse_loop_call(self):
-        """``model(x, t)`` with no kwargs is where the reported numbers come from."""
+        """The reverse loop's call -- ``(x, t)`` plus only the current support --
+        is where the reported numbers come from; no measurement reaches it."""
         model = self._generator(radial_band_tokens_bands=8)
         fired: list[int] = []
         self._tokens(model).register_forward_hook(lambda m, i, o: fired.append(int(i[1][0])))
         with torch.no_grad():
-            model(torch.randn(1, 4, 32, 32), torch.full((1,), 22, dtype=torch.long))
+            model(
+                torch.randn(1, 4, 32, 32),
+                torch.full((1,), 22, dtype=torch.long),
+                mask=torch.ones(1, 1, 32, 32),
+            )
         assert len(fired) == len(model.backbone.backbone.ups)
         assert set(fired) == {22}, "the rung must be the timestep the sampler passed"
 
     def test_an_armed_arm_reproduces_its_control_at_initialisation(self):
         x, t = torch.randn(1, 4, 32, 32), torch.tensor([7])
+        mask = torch.ones(1, 1, 32, 32)
         with torch.no_grad():
-            control = self._generator()(x, t)
-            armed = self._generator(radial_band_tokens_bands=8)(x, t)
+            control = self._generator()(x, t, mask=mask)
+            armed = self._generator(radial_band_tokens_bands=8)(x, t, mask=mask)
         assert torch.equal(control, armed)
 
 
@@ -2969,16 +3301,17 @@ class TestRadialBandGainTimestepConditioning:
 
         model.radial_band_gain.band_gains = spy
         with torch.no_grad():
-            model(torch.randn(1, 4, 32, 32), torch.tensor([3]))
+            model(torch.randn(1, 4, 32, 32), torch.tensor([3]), mask=torch.ones(1, 1, 32, 32))
         assert seen == [True]
 
     def test_a_time_conditioned_gain_still_reproduces_its_control_at_init(self):
         """``gamma`` is still zero, so the A/B stays attributable."""
         x, t = torch.randn(1, 4, 32, 32), torch.tensor([3])
+        mask = torch.ones(1, 1, 32, 32)
         with torch.no_grad():
-            control = self._generator()(x, t)
+            control = self._generator()(x, t, mask=mask)
             gained = self._generator(radial_band_gain_bands=8, radial_band_gain_time_embed_dim=32)(
-                x, t
+                x, t, mask=mask
             )
         assert torch.allclose(control, gained, atol=1e-6)
 
@@ -3022,6 +3355,7 @@ class TestPhaseSafeGuidanceLayout:
                 _t.randn(1, channels, 64, 64),
                 _t.zeros(1, dtype=_t.long),
                 sensitivity_maps=_t.randn(1, max(channels // 2, 1), 64, 64, dtype=_t.complex64),
+                mask=_t.ones(1, 1, 64, 64),
             )
         assert "q" in captured, "the attention never fired"
         return captured["q"]
@@ -3045,3 +3379,620 @@ class TestPhaseSafeGuidanceLayout:
         src = inspect.getsource(mod.FourierBridgeNetwork.forward)
         assert "complex_to_interleaved(spatial_complex)" in src
         assert "torch.cat([spatial_complex.real, spatial_complex.imag], dim=1)" not in src
+
+
+_T_SCALES: list[str | None] = [None, "integer", "horizon_band"]
+
+
+class TestTimestepScaleCheckpointGuard:
+    """A checkpoint fitted to one timestep scale must not load under the other (#2315)."""
+
+    @staticmethod
+    def _build(scale=None):
+        kwargs = {
+            "in_channels": 2,
+            "out_channels": 2,
+            "base_channels": 8,
+            "num_layers": 2,
+            "attention_type": "none",
+        }
+        if scale is not None:
+            kwargs["timestep_embedding_scale"] = scale
+        torch.manual_seed(0)
+        return KSpaceColdDiffusionGenerator(**kwargs)
+
+    @pytest.mark.parametrize("scale", _T_SCALES)
+    def test_same_scale_round_trips(self, scale):
+        state = self._build(scale).state_dict()
+        self._build(scale).load_state_dict(state)
+
+    @pytest.mark.parametrize(
+        ("saved", "built"),
+        [(a, b) for a in _T_SCALES for b in _T_SCALES if a != b],
+    )
+    def test_every_cross_scale_load_is_refused(self, saved, built):
+        """All six ordered pairs, including the two a boolean marker cannot tell apart."""
+        state = self._build(saved).state_dict()
+        with pytest.raises(
+            ValueError, match=f"trained with timestep_embedding_scale='{saved or 'unit_interval'}'"
+        ):
+            self._build(built).load_state_dict(state)
+
+    def test_integer_checkpoints_keep_their_marker_name(self):
+        """Checkpoints written before the third scale existed must still resolve."""
+        assert "timestep_embedding_scale_integer" in self._build("integer").state_dict()
+
+    def test_two_markers_in_one_checkpoint_raise(self):
+        state = self._build("integer").state_dict()
+        state["timestep_embedding_scale_horizon_band"] = torch.ones(1)
+        with pytest.raises(ValueError, match="more than one timestep-scale marker"):
+            self._build("integer").load_state_dict(state)
+
+    def test_legacy_state_dict_is_unchanged(self):
+        """Default-scale checkpoints carry no marker, so every existing one still loads."""
+        assert not any("timestep_embedding_scale" in k for k in self._build().state_dict())
+
+
+@pytest.mark.parametrize("log_scaled", [True, False])
+def test_an_off_grid_process_is_told_whether_the_plane_is_compressed(log_scaled: bool):
+    """#2341: NUFFT resampling does not commute with log1p, so the flag must arrive."""
+    gen = KSpaceColdDiffusionGenerator(
+        in_channels=2,
+        out_channels=2,
+        features=(8, 16),
+        force_pure_kspace=True,
+        attention_type="none",
+        use_dc=False,
+        kspace_log_scaled=log_scaled,
+        condition_with_smaps=False,
+        timesteps=4,
+        num_timesteps=4,
+        kspace_process_type="golden_angle_spokes",
+        num_spokes=128,
+        samples_per_spoke=64,
+        im_size=32,
+        dc_method="none",
+        acceleration_config={"acceleration_range": [1.0, 2.0, 4.0, 16.0]},
+    )
+    assert gen.kspace_process.kspace_log_scaled is log_scaled
+
+
+class TestContrastStashScope:
+    """A training forward's contrast must not condition a later call that carries none (#2435)."""
+
+    _KW: ClassVar[dict] = {
+        "in_channels": 4,
+        "out_channels": 4,
+        "features": (8, 16),
+        "force_pure_kspace": True,
+        "attention_type": "none",
+        "use_dc": False,
+        "kspace_log_scaled": False,
+        "condition_with_smaps": False,
+        "num_contrasts": 3,
+        "timesteps": 4,
+    }
+
+    def _gen_and_spy(self):
+        torch.manual_seed(0)
+        gen = KSpaceColdDiffusionGenerator(**self._KW).eval()
+        fired: list[tuple[int, ...]] = []
+        gen.contrast_embedding.register_forward_hook(lambda m, i, o: fired.append(tuple(o.shape)))
+        return gen, fired
+
+    def test_a_contrasted_forward_leaves_no_stash_behind(self):
+        gen, fired = self._gen_and_spy()
+        x = torch.randn(1, 4, 32, 32)
+        mask = torch.ones(1, 1, 32, 32)
+        with torch.no_grad():
+            gen(x, torch.zeros(1, dtype=torch.long), contrast_idx=torch.tensor([2]), mask=mask)
+        assert len(fired) == 1
+        assert getattr(gen, "_current_contrast_idx", None) is None
+
+    def test_an_uncontrasted_sample_after_a_contrasted_forward_is_unconditioned(self):
+        gen, fired = self._gen_and_spy()
+        x = torch.randn(1, 4, 32, 32)
+        mask = torch.ones(1, 1, 32, 32)
+        with torch.no_grad():
+            gen(x, torch.zeros(1, dtype=torch.long), contrast_idx=torch.tensor([2]), mask=mask)
+            fired.clear()
+            gen.sample(measurement=x, mask=torch.ones_like(x), inference_timesteps=2)
+        assert fired == [], "the last training batch's contrast conditioned an unconditioned sample"
+
+    def test_sample_still_conditions_every_inner_forward_on_its_contrast(self):
+        gen, fired = self._gen_and_spy()
+        x = torch.randn(1, 4, 32, 32)
+        with torch.no_grad():
+            gen.sample(
+                measurement=x,
+                mask=torch.ones_like(x),
+                inference_timesteps=2,
+                contrast_idx=torch.tensor([1]),
+            )
+        assert len(fired) >= 1
+        assert getattr(gen, "_current_contrast_idx", None) is None
+
+
+class TestProbeSuppliesTheReference:
+    """The audit probe must feed a reference arm its source contrast (#2452).
+
+    Called on a stub so no network is built.
+    """
+
+    @staticmethod
+    def _stub(reference_channels: int):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            reference_channels=reference_channels,
+            dc_layer=None,
+            _output_kspace_clip_ratio=None,
+            _dc_passthrough_size=None,
+            kspace_geometry_channels=KSPACE_GEOMETRY_CHANNELS,
+            _PROBE_MASK_STRIDE=KSpaceColdDiffusionGenerator._PROBE_MASK_STRIDE,
+        )
+
+    def test_reference_arm_gets_a_reference_of_its_declared_width(self) -> None:
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        x = torch.randn(2, 8, 16, 16)
+        kwargs = KSpaceColdDiffusionGenerator.synthetic_forward_probe_kwargs(self._stub(8), x)
+        assert kwargs["reference"].shape == (2, 8, 16, 16)
+        assert not torch.equal(kwargs["reference"], x), "the probe must not feed x as its own reference"
+
+    def test_arm_without_reference_gets_none(self) -> None:
+        """No reference and no measurement mechanism: only the mask the geometry
+        planes are built from."""
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        kwargs = KSpaceColdDiffusionGenerator.synthetic_forward_probe_kwargs(
+            self._stub(0), torch.randn(1, 8, 16, 16)
+        )
+        assert set(kwargs) == {"mask"}
+        assert kwargs["mask"].shape == (1, 1, 16, 16)
+        assert 0.0 < float(kwargs["mask"].mean()) < 1.0, "an undersampled, not all-ones, mask"
+
+
+class TestContrastEmbeddingRows:
+    """One contrast row per backbone row (#2055): never truncated, never broadcast."""
+
+    def test_pure_kspace_unet_refuses_a_longer_contrast_batch(self) -> None:
+        """The retired guard sliced three rows down to two and trained on."""
+        from spectramr.models.generators.kspace_cold_diffusion_generator import PureKSpaceUNet
+
+        torch.manual_seed(0)
+        net = PureKSpaceUNet(2, 2, features=(8, 16), time_embedding_dim=32).eval()
+        x = torch.randn(2, 2, 16, 16)
+        with pytest.raises(ValueError, match="contrast_emb batch 3"), torch.no_grad():
+            net(x, torch.tensor([1, 2]), contrast_emb=torch.randn(3, 32))
+        with torch.no_grad():
+            assert net(x, torch.tensor([1, 2]), contrast_emb=torch.randn(2, 32)).shape == x.shape
+
+    def test_a_volume_batch_conditions_each_slice_on_its_own_volume(self, monkeypatch) -> None:
+        """A ``(B, D, C, H, W)`` input flattens to ``B*D`` rows after the contrast
+        embedding is built per volume; the ids must follow the timesteps onto the
+        slices, volume-major, or the backbone refuses the batch."""
+        import spectramr.models.reconstruction.unet as unet_mod
+
+        seen: list[torch.Tensor] = []
+        real_fuse = unet_mod.fuse_contrast_embedding
+
+        def spy(t_emb, contrast_emb, *, owner):
+            seen.append(contrast_emb)
+            return real_fuse(t_emb, contrast_emb, owner=owner)
+
+        monkeypatch.setattr(unet_mod, "fuse_contrast_embedding", spy)
+        torch.manual_seed(0)
+        model = KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            condition_with_smaps=False,
+            base_channels=8,
+            num_layers=2,
+            use_complex_conv=False,
+            attention_type="none",
+            num_contrasts=3,
+            dc_method="none",
+        ).eval()
+        ids = torch.tensor([0, 2])
+        with torch.no_grad():
+            # A per-volume mask follows the slices onto the B*D rows like the ids.
+            model(
+                torch.randn(2, 3, 2, 32, 32),
+                timesteps=torch.tensor([4, 5]),
+                contrast_idx=ids,
+                mask=torch.ones(2, 1, 32, 32),
+            )
+            expected = model.contrast_embedding(torch.tensor([0, 0, 0, 2, 2, 2]))
+        assert seen and torch.equal(seen[0], expected)
+
+
+def test_differential_lr_groups_route_through_the_spline_selector() -> None:
+    """Wiring (#2105): the method the optimizer calls puts only spline coefficients on the KAN LR.
+
+    Called unbound on a tiny module so no generator is built.
+    """
+    from spectramr.models.blocks.kan_layer import KANLayer
+
+    tiny = nn.Sequential(KANLayer(3, 2), nn.Linear(2, 2))
+    tiny._kan_lr_ratio, tiny._kan_weight_decay_ratio = 0.1, 0.1
+    groups = KSpaceColdDiffusionGenerator.get_differential_lr_param_groups(
+        tiny, base_lr=1e-3, weight_decay=0.01
+    )
+    kan = next(g for g in groups if g.get("name") == "kan")
+    assert [id(p) for p in kan["params"]] == [id(tiny[0].spline_weight)]
+    assert kan["lr"] == pytest.approx(1e-4)
+    record = tiny.kan_param_group_record
+    assert record["n_params"] == tiny[0].spline_weight.numel()
+
+
+# ── architecture v2: geometry planes on every backbone input, version guard ──────
+_V2_KW: dict = {
+    "in_channels": 4,
+    "out_channels": 4,
+    "base_channels": 8,
+    "num_layers": 2,
+    "attention_type": "none",
+    "use_dc": False,
+    "kspace_log_scaled": False,
+    "condition_with_smaps": False,
+    "timesteps": 4,
+}
+
+
+def _v2(**over) -> KSpaceColdDiffusionGenerator:
+    torch.manual_seed(0)
+    return KSpaceColdDiffusionGenerator(**{**_V2_KW, **over}).eval()
+
+
+def _column_mask(*cols: int, size: int = 32) -> torch.Tensor:
+    mask = torch.zeros(1, 1, size, size)
+    mask[..., list(cols)] = 1.0
+    return mask
+
+
+def _trained_geometry_gain(model):
+    """Move a zero-initialised geometry gain off the identity, as training would."""
+    gain = getattr(getattr(model.backbone, "backbone", None), "geometry_gain", None)
+    if gain is not None:
+        torch.manual_seed(0)
+        for p in gain.parameters():
+            p.data.normal_(0, 0.5)
+    return model
+
+
+class TestGeometryPlanes:
+    @pytest.mark.parametrize(
+        "over",
+        [
+            {"backbone_type": "complex_unet", "force_pure_kspace": True},
+            {"backbone_type": "complex_unet", "force_pure_kspace": False},
+            {"backbone_type": "unet", "force_pure_kspace": True},
+        ],
+    )
+    def test_the_output_depends_on_the_mask(self, over):
+        """Same input, same t, different rung support: the backbone sees the difference."""
+        model = _trained_geometry_gain(_v2(**over))
+        x, t = torch.randn(1, 4, 32, 32), torch.tensor([2])
+        with torch.no_grad():
+            a = model(x, t, mask=_column_mask(14, 15, 16, 17))
+            b = model(x, t, mask=_column_mask(*range(8, 24)))
+        assert not torch.allclose(a, b)
+
+    def test_the_output_depends_on_the_acquired_plane(self):
+        model = _trained_geometry_gain(_v2(backbone_type="complex_unet", force_pure_kspace=True))
+        x, t, mask = torch.randn(1, 4, 32, 32), torch.tensor([2]), _column_mask(16)
+        with torch.no_grad():
+            full = model(x, t, mask=mask)
+            padded = model(x, t, mask=mask, acquired=_column_mask(*range(4, 28)))
+        assert not torch.allclose(full, padded)
+
+    def test_a_forward_without_a_mask_raises(self):
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        with pytest.raises(ValueError, match="forward needs mask="):
+            model(torch.randn(1, 4, 32, 32), torch.tensor([1]))
+
+    def test_the_bridge_appends_the_planes_after_its_entry_transform(self):
+        """Image-domain bridge: the last channels the backbone sees are the planes
+        themselves, as (plane, 0) pairs, not their inverse FFT."""
+        from spectramr.models.blocks.kspace_geometry_encoding import (
+            as_interleaved_complex,
+            kspace_geometry_channels,
+        )
+
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=False)
+        seen: list[torch.Tensor] = []
+        model.backbone.backbone.register_forward_pre_hook(lambda m, i: seen.append(i[0]))
+        mask = _column_mask(3, 16, 29)
+        with torch.no_grad():
+            model(torch.randn(1, 4, 32, 32), torch.tensor([1]), mask=mask)
+        expected = as_interleaved_complex(kspace_geometry_channels(mask, None, (32, 32), batch=1))
+        assert seen[0].shape[1] == 4 + _GEOMETRY_WIDTH
+        torch.testing.assert_close(seen[0][:, 4:], expected)
+
+    def test_a_pure_kspace_complex_unet_takes_the_planes_as_a_gain(self):
+        """Not as input channels: those are a k-space term independent of the measurement."""
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        bridge = model.backbone
+        assert bridge.config.in_channels == model.in_channels
+        assert bridge.backbone.geometry_gain.num_planes == model.kspace_geometry_channels
+        seen: list[dict] = []
+        bridge.backbone.register_forward_pre_hook(
+            lambda m, a, kw: seen.append(kw), with_kwargs=True
+        )
+        mask = _column_mask(3, 16, 29)
+        with torch.no_grad():
+            model(torch.randn(1, 4, 32, 32), torch.tensor([1]), mask=mask)
+        assert seen[0]["geometry"].shape == (1, model.kspace_geometry_channels, 32, 32)
+
+    def test_the_derived_gain_width_is_not_a_knob(self):
+        with pytest.raises(ValueError, match="declare kspace_geometry_planes instead"):
+            _v2(backbone_type="complex_unet", force_pure_kspace=True, kspace_geometry_gain_planes=6)
+
+    @pytest.mark.parametrize("backbone_type", ["diff_varnet", "diff_varnet_kan"])
+    def test_the_internal_dc_backbones_are_built_without_planes(self, backbone_type):
+        model = _v2(backbone_type=backbone_type, force_pure_kspace=False)
+        assert model.kspace_geometry_channels == 0
+        assert model.backbone.config.in_channels == model.in_channels
+
+    def test_the_probe_supplies_the_mask_the_planes_need(self):
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        x = torch.randn(1, 4, 32, 32)
+        kwargs = model.synthetic_forward_probe_kwargs(x)
+        with torch.no_grad():
+            assert model(x, torch.tensor([1]), **kwargs).shape == x.shape
+
+
+class TestMaskScope:
+    """The stashed mask conditions a bare forward only inside ``mask_scope``."""
+
+    def test_a_masked_call_leaves_nothing_for_a_later_bare_call(self):
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        x, t = torch.randn(1, 4, 32, 32), torch.tensor([1])
+        with torch.no_grad():
+            model(x, t, mask=_column_mask(3, 16))
+            with pytest.raises(ValueError, match="forward needs mask="):
+                model(x, t)
+
+    def test_a_set_stash_alone_does_not_condition_a_bare_call(self):
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        model.set_current_mask(_column_mask(16))
+        with torch.no_grad(), pytest.raises(ValueError, match="mask_scope"):
+            model(torch.randn(1, 4, 32, 32), torch.tensor([1]))
+
+    def test_inside_the_scope_a_bare_call_reads_the_stash_and_exit_restores(self):
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        x, t, mask = torch.randn(1, 4, 32, 32), torch.tensor([1]), _column_mask(5, 16)
+        outer = _column_mask(1)
+        with torch.no_grad():
+            explicit = model(x, t, mask=mask)
+            with model.mask_scope(outer):
+                with model.mask_scope(mask):
+                    torch.testing.assert_close(model(x, t), explicit)
+                assert model._current_mask is outer
+            assert model._current_mask is None
+            with pytest.raises(ValueError, match="forward needs mask="):
+                model(x, t)
+
+    def test_a_sampler_calling_forward_bare_inside_sample_still_works(self, monkeypatch):
+        """Non-cold samplers re-enter ``forward(x, t)`` with no kwargs."""
+        import spectramr.models.diffusion.samplers as samplers
+
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        mask = _column_mask(*range(12, 20))
+        seen: list[torch.Tensor] = []
+
+        class _BareSampler:
+            def sample(self, measurement, mask):
+                seen.append(model(measurement, torch.tensor([1])))
+                return seen[-1]
+
+        monkeypatch.setattr(samplers, "get_sampler", lambda name, **_: _BareSampler())
+        y = torch.randn(1, 4, 32, 32) * mask
+        with torch.no_grad():
+            out = model.sample(y, mask=mask, inference_timesteps=2)
+            torch.testing.assert_close(out, model(y, torch.tensor([1]), mask=mask))
+            with pytest.raises(ValueError, match="forward needs mask="):
+                model(y, torch.tensor([1]))
+        assert seen
+
+
+class TestArchitectureVersionGuard:
+    def test_the_version_travels_in_the_state_dict(self):
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSPACE_GENERATOR_ARCH_VERSION_KEY,
+        )
+
+        state = _v2(backbone_type="complex_unet", force_pure_kspace=True).state_dict()
+        assert int(state[KSPACE_GENERATOR_ARCH_VERSION_KEY]) == 2
+        _v2(backbone_type="complex_unet", force_pure_kspace=True).load_state_dict(state)
+
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_a_v1_state_dict_raises_naming_the_change(self, strict):
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSPACE_GENERATOR_ARCH_VERSION_KEY,
+        )
+
+        model = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        state = model.state_dict()
+        del state[KSPACE_GENERATOR_ARCH_VERSION_KEY]
+        with pytest.raises(ConfigurationError, match=r"architecture v1.*geometry channels"):
+            model.load_state_dict(state, strict=strict)
+
+    def test_a_prefixed_v1_state_dict_raises_too(self):
+        """A wrapper (DDP ``module.``) loads the generator under a prefix."""
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSPACE_GENERATOR_ARCH_VERSION_KEY,
+        )
+
+        wrapper = nn.Module()
+        wrapper.module = _v2(backbone_type="complex_unet", force_pure_kspace=True)
+        state = wrapper.state_dict()
+        assert f"module.{KSPACE_GENERATOR_ARCH_VERSION_KEY}" in state
+        del state[f"module.{KSPACE_GENERATOR_ARCH_VERSION_KEY}"]
+        with pytest.raises(ConfigurationError, match="architecture v1"):
+            wrapper.load_state_dict(state)
+def test_dc_trust_scalars_are_excluded_from_weight_decay() -> None:
+    """Planted: soft-DC lambda under AdamW decay drifts towards ignoring the measurement."""
+    from spectramr.infrastructure.physics.data_consistency import SoftDataConsistency
+
+    tiny = nn.Module()
+    tiny.body = nn.Linear(2, 2)
+    tiny.dc_layer = SoftDataConsistency(lambda_init=1.0)
+    tiny._kan_lr_ratio, tiny._kan_weight_decay_ratio = 0.1, 0.1
+    groups = KSpaceColdDiffusionGenerator.get_differential_lr_param_groups(
+        tiny, base_lr=1e-3, weight_decay=0.01
+    )
+    trust = next(g for g in groups if g.get("name") == "dc_trust")
+    assert [id(p) for p in trust["params"]] == [id(tiny.dc_layer.lambda_param)]
+    assert trust["weight_decay"] == 0.0
+    others = [id(p) for g in groups if g is not trust for p in g["params"]]
+    assert id(tiny.dc_layer.lambda_param) not in others
+    assert {id(p) for p in tiny.body.parameters()} <= set(others)
+
+
+@pytest.mark.parametrize("method", ["soft", "noise_adaptive", "noise_adjusted", "target_aware_fsdc"])
+def test_blend_dc_refuses_an_undeclared_compression(method: str) -> None:
+    """A blend computed on log1p values is a different operator, so the flag is required."""
+    with pytest.raises(ValueError, match="kspace_log_scaled was never declared"):
+        KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=16,
+            num_layers=2,
+            attention_type="none",
+            dc_method=method,
+        )
+
+
+def test_accepts_timesteps_matches_the_exact_parameter_name() -> None:
+    from torch import nn
+
+    from spectramr.models.generators.kspace_cold_diffusion_generator import _accepts_timesteps
+
+    class _Takes(nn.Module):
+        def forward(self, x, timesteps=None):
+            return x
+
+    class _Lookalike(nn.Module):
+        def forward(self, x, timesteps_unused=None):
+            return x
+
+    assert _accepts_timesteps(_Takes())
+    assert not _accepts_timesteps(_Lookalike())
+
+
+def _contrast_model(**extra):
+    return KSpaceColdDiffusionGenerator(
+        in_channels=2,
+        out_channels=2,
+        condition_with_smaps=False,
+        base_channels=8,
+        num_layers=2,
+        use_complex_conv=False,
+        attention_type="none",
+        num_contrasts=3,
+        **extra,
+    )
+
+
+def test_forward_without_a_contrast_id_raises_on_a_contrast_model():
+    from spectramr.domain.exceptions import ConfigurationError
+
+    model = _contrast_model()
+    x = torch.randn(2, 2, 32, 32)
+    with pytest.raises(ConfigurationError, match="contrast_idx"):
+        model(x, timestep=torch.zeros(2, dtype=torch.long), **_measurement_kwargs(x))
+
+
+def test_forward_with_a_contrast_id_runs_on_a_contrast_model():
+    model = _contrast_model()
+    x = torch.randn(2, 2, 32, 32)
+    out = model(
+        x,
+        timestep=torch.zeros(2, dtype=torch.long),
+        contrast_idx=torch.tensor([0, 2]),
+        **_measurement_kwargs(x),
+    )
+    assert (out[0] if isinstance(out, tuple) else out).shape[0] == 2
+
+
+@pytest.mark.parametrize("backbone", ["unet", "nafnet"])
+def test_a_declared_scale_these_backbones_ignore_is_refused(backbone):
+    from spectramr.domain.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="ignores"):
+        KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            backbone_type=backbone,
+            timestep_embedding_scale="horizon_band",
+        )
+
+
+class TestForwardNoiseKnob:
+    """``forward_noise_sigma`` / ``forward_noise_schedule`` model_kwargs (hot forward noise).
+
+    Read at build into the forward process, refused beside ``sampler_sigma > 0``, and
+    reached on the production ``sample()`` path: the reverse denoiser input is re-noised
+    there, which the spy observes.
+    """
+
+    @staticmethod
+    def _build(**kw) -> KSpaceColdDiffusionGenerator:
+        return KSpaceColdDiffusionGenerator(
+            in_channels=2,
+            out_channels=2,
+            base_channels=8,
+            num_layers=2,
+            attention_type="none",
+            kspace_log_scaled=False,
+            **kw,
+        )
+
+    def test_defaults_are_off(self) -> None:
+        model = self._build()
+        assert model.kspace_process.forward_noise_sigma == 0.0
+        assert model.kspace_process.forward_noise_schedule == "linear_t"
+
+    def test_knobs_are_read_into_the_forward_process(self) -> None:
+        model = self._build(forward_noise_sigma=0.3, forward_noise_schedule="sqrt_t")
+        assert model.kspace_process.forward_noise_sigma == pytest.approx(0.3)
+        assert model.kspace_process.forward_noise_schedule == "sqrt_t"
+        assert model.kspace_process.forward_noise_record() == {"sigma": 0.3, "schedule": "sqrt_t"}
+
+    def test_unknown_schedule_raises_at_build(self) -> None:
+        with pytest.raises(ValueError, match="forward_noise_schedule"):
+            self._build(forward_noise_sigma=0.3, forward_noise_schedule="cosine_t")
+
+    def test_forward_noise_beside_sampler_sigma_raises_at_build(self) -> None:
+        with pytest.raises(ValueError, match="one"):
+            self._build(forward_noise_sigma=0.3, sampler_sigma=0.1)
+
+    def test_sample_path_re_noises_the_denoiser_input(self, monkeypatch) -> None:
+        from spectramr.models.diffusion.kspace_process import PhysicsInformedColdDiffusion
+
+        calls = {"n": 0}
+        original = PhysicsInformedColdDiffusion._renoise_unmeasured
+
+        def _spy(self, x, t, support):
+            calls["n"] += 1
+            return original(self, x, t, support)
+
+        monkeypatch.setattr(PhysicsInformedColdDiffusion, "_renoise_unmeasured", _spy)
+        model = self._build(
+            forward_noise_sigma=0.3, sampling_steps=3, timesteps=10, condition_with_smaps=False
+        )
+        measurement = torch.randn(1, 2, 16, 16)
+        mask = torch.zeros(1, 1, 16, 16)
+        mask[..., ::2] = 1.0
+        model.sample(measurement * mask, mask)
+        assert calls["n"] > 0, "the reverse loop never re-noised its denoiser input"

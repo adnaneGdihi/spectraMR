@@ -1,26 +1,28 @@
-"""``validation_metric_names_resolve`` (cohort review 2026-09-02, T0.5).
+"""``validation_metric_names_resolve``: every checkpoint selector has a producer (T0.5).
 
-``metrics.compute`` is gated against ``MetricsRegistry`` at strategy
-construction (#173) and at audit (``check_metric_names_are_registered``);
-``validation.scoring.compute``, ``metrics.best_metric_name`` and
-``early_stopping.metric`` were not. Thirteen arms used the validation list to
-name keys their strategy's own ``validation_step`` writes (``field_mse`` on
-the qMRI arms) -- honest keys the registry does not know -- and one arm once
-selected its checkpoint on ``val_nmse``, a key no path produced, so early
-stopping never fired.
+``metrics.best_metric_name`` and ``early_stopping.metric`` name a key the
+validation pass must produce. One arm once selected its checkpoint on
+``val_nmse``, a key no path produced, so early stopping never fired. A selector
+resolves when it is registered, emitted by the strategy
+(``capabilities.emitted_metrics``) or written undeclared by the strategy's
+validation path (``val_loss``, which ``MetricsMixin.validation_step`` does not
+write, #2838).
+It may also carry a ``val_`` prefix and a ``_<n>x`` / ``_mean`` cascade suffix,
+because the validation pass reports per-rung and aggregated copies of a metric.
+Error when the strategy has declared its emitted set (opt-in strictness); INFO
+census line when it has not.
 
-A strategy now declares the keys it writes itself in
-``capabilities.emitted_metrics``. Every name here must resolve in the
-registry, in that set, or in the universal set (``val_loss``); a selector may
-also carry a ``val_`` prefix and a ``_<n>x`` / ``_mean`` cascade suffix.
-Error when the strategy has declared its emitted set (opt-in strictness);
-INFO census line when it has not.
+``validation.scoring.compute`` is not checked here. Those names are handed to
+the metrics computer verbatim, so no suffix is stripped from them, and
+``check_metric_names_are_registered`` owns them through the runtime's own
+predicate (#2819).
 """
 
 from __future__ import annotations
 
 import re
 
+from spectramr.core.metrics.validation_names import UNIVERSAL_VALIDATION_KEYS
 from spectramr.infrastructure.validation.witness.registry import (
     Severity,
     Stage,
@@ -31,11 +33,10 @@ from spectramr.infrastructure.validation.witness.registry import (
 )
 from spectramr.infrastructure.validation.witness.subject import WitnessSubject
 
-__all__ = ["unresolved_metric_names", "validation_metric_names_resolve"]
+__all__ = ["unresolved_metric_names", "validation_metric_names_resolve", "validation_owners_for"]
 
 _NAME = "validation_metric_names_resolve"
 _CATEGORY = "metrics_misconfiguration"
-_UNIVERSAL = frozenset({"loss", "val_loss"})
 _SUFFIX = re.compile(r"_(mean|min|max|median|heldout_\d+x|\d+x)$")
 
 
@@ -49,9 +50,11 @@ def _bases(name: str) -> set[str]:
     return out
 
 
-def unresolved_metric_names(names: list[str], registered, emitted: frozenset[str]) -> list[str]:
-    """Names with no owner: not registered, not emitted, not universal."""
-    known = set(emitted) | _UNIVERSAL
+def unresolved_metric_names(
+    names: list[str], registered, emitted: frozenset[str], *, universal: frozenset[str]
+) -> list[str]:
+    """Names with no owner: not registered, not emitted, not written by the validation path."""
+    known = set(emitted) | set(universal)
     out = []
     for name in names:
         bases = _bases(name)
@@ -63,9 +66,6 @@ def unresolved_metric_names(names: list[str], registered, emitted: frozenset[str
 
 def _declared_names(settings) -> list[str]:
     names: list[str] = []
-    validation = getattr(settings, "validation", None)
-    scoring = getattr(validation, "scoring", None)
-    names.extend(str(m) for m in (getattr(scoring, "compute", None) or []))
     metrics = getattr(settings, "metrics", None)
     best = getattr(metrics, "best_metric_name", None)
     if best:
@@ -77,15 +77,26 @@ def _declared_names(settings) -> list[str]:
     return names
 
 
-def _emitted_for(settings) -> tuple[frozenset[str], str]:
+def validation_owners_for(settings) -> tuple[frozenset[str], frozenset[str], str]:
+    """``(declared emitted keys, undeclared keys its validation path writes, strategy name)``.
+
+    An unresolvable strategy keeps the ``val_loss`` exemption: which path it
+    takes is unknown, and the audit already reports the strategy as
+    ``"unresolved"`` rather than blaming the selector.
+    """
     try:
         from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
 
         cls = TrainingStrategyFactory().get_strategy_class(settings)
     except Exception:
-        return frozenset(), "unresolved"
+        return frozenset(), UNIVERSAL_VALIDATION_KEYS, "unresolved"
+    from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import (
+        universal_validation_keys,
+    )
+
     caps = getattr(cls, "capabilities", None)
-    return frozenset(getattr(caps, "emitted_metrics", frozenset()) or ()), cls.__name__
+    emitted = frozenset(getattr(caps, "emitted_metrics", frozenset()) or ())
+    return emitted, universal_validation_keys(cls), cls.__name__
 
 
 @register_witness(
@@ -95,14 +106,14 @@ def _emitted_for(settings) -> tuple[frozenset[str], str]:
     tiers=(Tier.T1,),
     subjects=(Subject.SETTINGS,),
     severity=Severity.ERROR,
-    description="Every validation metric and selector name has an owner (registry or strategy)",
+    description="Every checkpoint selector name has an owner (registry or strategy)",
     fix_hint=(
         "Fix the name, register the metric with @register_metric, or declare it in the "
         "strategy's capabilities.emitted_metrics if its validation_step writes it."
     ),
 )
 def validation_metric_names_resolve(subject: WitnessSubject) -> WitnessVerdict:
-    """Error (declared strategy) / advisory (undeclared) on an ownerless metric name."""
+    """Error (declared strategy) / advisory (undeclared) on an ownerless selector name."""
     from spectramr.core.metrics.registry import MetricsRegistry
 
     settings = subject.settings
@@ -111,19 +122,21 @@ def validation_metric_names_resolve(subject: WitnessSubject) -> WitnessVerdict:
         return WitnessVerdict(
             witness_name=_NAME,
             passed=True,
-            message="no validation metric or selector declared",
+            message="no checkpoint selector declared",
             severity=Severity.INFO,
             category=_CATEGORY,
             stage=Stage.DECLARE,
             tier=Tier.T1,
         )
-    emitted, strategy_name = _emitted_for(settings)
-    unresolved = unresolved_metric_names(names, MetricsRegistry.is_registered, emitted)
+    emitted, universal, strategy_name = validation_owners_for(settings)
+    unresolved = unresolved_metric_names(
+        names, MetricsRegistry.is_registered, emitted, universal=universal
+    )
     if not unresolved:
         return WitnessVerdict(
             witness_name=_NAME,
             passed=True,
-            message=f"all {len(names)} validation/selector name(s) resolve (strategy {strategy_name})",
+            message=f"all {len(names)} selector name(s) resolve (strategy {strategy_name})",
             severity=Severity.ERROR,
             category=_CATEGORY,
             stage=Stage.DECLARE,
@@ -136,15 +149,13 @@ def validation_metric_names_resolve(subject: WitnessSubject) -> WitnessVerdict:
             message=(
                 f"{len(unresolved)} name(s) are neither registered nor emitted by "
                 f"{strategy_name}: {sorted(unresolved)}. A selector no path produces means the "
-                "best checkpoint is never chosen; a compute entry no path produces is a silently "
-                "missing column."
+                "best checkpoint is never chosen."
             ),
             severity=Severity.ERROR,
             category=_CATEGORY,
             stage=Stage.DECLARE,
             tier=Tier.T1,
             yaml_keys=(
-                "validation.scoring.compute",
                 "metrics.best_metric_name",
                 "early_stopping.metric",
             ),

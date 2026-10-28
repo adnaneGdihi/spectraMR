@@ -15,24 +15,33 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from tqdm import tqdm
 
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.compute_device import resolve_torch_device
-from spectramr.core.module_utils import resolve_state_dict, unwrap_model
+from spectramr.core.module_utils import unwrap_model
 from spectramr.domain.exceptions import (
     ConfigurationError,
     DataCorruptionError,
     DimensionMismatchError,
     SpectraMRError,
 )
+from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.inference.inference_factory import InferenceStrategyFactory
+from spectramr.infrastructure.inference.predict_contrast import resolve_predict_contrast
+from spectramr.infrastructure.inference.predict_kspace import PredictKSpace
+from spectramr.infrastructure.inference.predict_rung import resolve_predict_rung
+from spectramr.infrastructure.logging.log_policy import apply_logging_config
+from spectramr.infrastructure.logging.progress import make_progress
 from spectramr.infrastructure.reporting.inference_artifacts import (
     STATUS_COMPUTED,
     InferenceEvaluator,
     write_inference_run_summary,
 )
 from spectramr.infrastructure.reporting.run_hook import maybe_run_reporting
+from spectramr.infrastructure.validation.inference_settings import (
+    _describe_inference_source,
+    resolve_inference_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,117 +68,18 @@ def _resolve_inference_paradigm(config: Any) -> str:
     return InferenceStrategyFactory._infer_strategy_type(config.model_dump())
 
 
-def resolve_inference_settings(
-    config_path: Path | str | None,
-    checkpoint_path: Path | str | None,
-    *,
-    from_yaml: bool = False,
-) -> tuple[TrainingSettings, dict[str, Any]]:
-    """The settings an inference run uses, and where they came from.
+def _refuse_unservable_strategy(config: Any) -> None:
+    """Raise when the arm's training strategy builds its network input where ``infer`` cannot."""
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
 
-    Precedence (#1379, the corpus review's T0.13): the run's own
-    ``resolved_config.json`` beside the checkpoint wins, because it holds what
-    the training run declared after every override; the training YAML is read
-    only when ``from_yaml`` is set or no artifact exists. When both exist and
-    the YAML disagrees with the artifact, the top-level blocks that differ are
-    logged at WARNING and recorded in the source, so a predict run cannot
-    silently score under a config the checkpoint never trained under.
-
-    Returns ``(settings, source)`` where ``source`` is
-    ``{"kind": "resolved_config" | "yaml", "path": ..., ...}``.
-    """
-    from spectramr.infrastructure.validation.resolved_config_artifact import (
-        has_declared_block,
-        resolved_config_beside,
-        settings_from_resolved_config,
-    )
-
-    artifact = resolved_config_beside(checkpoint_path)
-    # An artifact written before the ``_declared`` block cannot rebuild the
-    # settings; every run directory on the cluster is in that state today, so
-    # the documented ``infer --config ...`` command must keep working there:
-    # the YAML is used and the artifact's age is reported, never a refusal.
-    predates = artifact is not None and not has_declared_block(artifact)
-    if from_yaml or artifact is None or predates:
-        if config_path is None or not Path(config_path).exists():
-            raise FileNotFoundError(
-                "inference needs its settings: pass --config <training YAML>, or run against "
-                "a checkpoint whose run directory holds a resolved_config.json with a "
-                "`_declared` block"
-                + (
-                    f" ({artifact} predates that block, written before 2026-09-03)"
-                    if predates
-                    else (
-                        f" (none beside {checkpoint_path})" if checkpoint_path is not None else ""
-                    )
-                )
-                + ("; --from-yaml was set" if from_yaml else "")
-                + "."
-            )
-        settings = TrainingSettings.from_yaml(str(config_path))
-        source: dict[str, Any] = {
-            "kind": "yaml",
-            "path": str(config_path),
-            "resolved_config": str(artifact) if artifact is not None else None,
-        }
-        if predates and not from_yaml:
-            source["resolved_config_predates_declared"] = True
-            logger.warning(
-                "[config] %s predates the `_declared` block (written before 2026-09-03) and cannot "
-                "rebuild the run's settings; inference uses %s. Re-running training rewrites the "
-                "artifact with the block.",
-                artifact,
-                config_path,
-            )
-        return settings, source
-    settings = settings_from_resolved_config(artifact)
-    source = {"kind": "resolved_config", "path": str(artifact), "yaml": None}
-    if config_path is not None and Path(config_path).exists():
-        source["yaml"] = str(config_path)
-        from_artifact = settings.model_dump(mode="json")
-        from_file = TrainingSettings.from_yaml(str(config_path)).model_dump(mode="json")
-        diverging = sorted(
-            key
-            for key in set(from_artifact) | set(from_file)
-            if from_artifact.get(key) != from_file.get(key)
-        )
-        if diverging:
-            source["diverging_blocks"] = diverging
-            logger.warning(
-                "[config] %s and %s disagree in %s; inference uses the run's resolved config. "
-                "Pass --from-yaml to score under the YAML instead.",
-                artifact,
-                config_path,
-                diverging,
-            )
-    return settings, source
-
-
-def _describe_inference_source(
-    config_path: Path | str | None, checkpoint_path: Path | str | None, from_yaml: bool
-) -> dict[str, Any]:
-    """The ``source`` :func:`resolve_inference_settings` would report, without loading."""
-    from spectramr.infrastructure.validation.resolved_config_artifact import (
-        has_declared_block,
-        resolved_config_beside,
-    )
-
-    artifact = resolved_config_beside(checkpoint_path)
-    predates = artifact is not None and not has_declared_block(artifact)
-    if from_yaml or artifact is None or predates:
-        source: dict[str, Any] = {
-            "kind": "yaml",
-            "path": str(config_path),
-            "resolved_config": str(artifact) if artifact else None,
-        }
-        if predates and not from_yaml:
-            source["resolved_config_predates_declared"] = True
-        return source
-    return {
-        "kind": "resolved_config",
-        "path": str(artifact),
-        "yaml": str(config_path) if config_path else None,
-    }
+    try:
+        strategy_cls = TrainingStrategyFactory().get_strategy_class(config)
+    except ConfigurationError:
+        return
+    blocker = getattr(strategy_cls, "standalone_infer_blocker", None)
+    reason = blocker(config) if blocker is not None else None
+    if reason:
+        raise ConfigurationError(f"infer cannot serve {strategy_cls.__name__}: {reason}.")
 
 
 def run_inference_pipeline(
@@ -182,6 +92,8 @@ def run_inference_pipeline(
     from_manifest_test_split: bool = False,
     from_yaml: bool = False,
     settings: TrainingSettings | None = None,
+    acceleration: float | None = None,
+    contrast_idx: int | None = None,
 ) -> dict[str, Any]:
     """Unified inference pipeline using config-driven setup.
 
@@ -207,6 +119,12 @@ def run_inference_pipeline(
             ``data.source.paired_manifest_path``. Opt-in on purpose: making
             this a fallback for an empty glob would let a mistyped
             ``input_path`` silently switch data sources (pitfall #9).
+        acceleration: Cold diffusion only: degrade each fully sampled input to the
+            rung for this acceleration and sample from that rung, as validation does
+            (#2883). See :mod:`spectramr.infrastructure.inference.predict_rung`.
+        contrast_idx: Cold diffusion with ``num_contrasts > 0``: the contrast id fed to the
+            model. Else it is read from a contrast keyword in each file name; neither source
+            raises. See :mod:`spectramr.infrastructure.inference.predict_contrast`.
 
     Returns:
         dict with output paths, metrics, and processing summary
@@ -236,6 +154,7 @@ def run_inference_pipeline(
         config, config_source = resolve_inference_settings(
             config_path, checkpoint_path, from_yaml=from_yaml
         )
+        apply_logging_config(config.logging)
     else:
         # The preamble (``main.begin_inference_run``) resolved them once already;
         # describing the source again costs a file-existence check, not a load.
@@ -253,6 +172,8 @@ def run_inference_pipeline(
 
     paradigm = _resolve_inference_paradigm(config)
     logger.info(f"Config loaded: model={config.model.model_type}, paradigm={paradigm}")
+    if paradigm != "multi":
+        _refuse_unservable_strategy(config)
 
     # =====================================================================
     # PHASE 2: Create Model/Strategy and Load Checkpoint
@@ -301,42 +222,15 @@ def run_inference_pipeline(
         model = ModelBuilder(config, device_obj).build_generator().validate().build()["generator"]
         logger.info("Model created on %s via ModelBuilder", device_obj)
 
-        # Load weights
         logger.info(f"Loading checkpoint: {checkpoint_path}")
-        if not Path(checkpoint_path).exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        weights(checkpoint_path, "generator", model, policy="exact")
+        logger.info("Checkpoint loaded successfully")
 
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
-            # ``model`` here is freshly built and bare, so a checkpoint written
-            # by a compiled / DDP / FSDP run carries "_orig_mod."/"module."
-            # prefixes -- and CheckpointDirector wraps the parameters under
-            # "generator", an envelope this reader knew nothing about. The old
-            # `model_state_dict`-else-whole-dict branch therefore handed the
-            # entire envelope (epoch, optimizer, config, ...) to
-            # load_state_dict and failed with 'generator' (#1310).
-            model.load_state_dict(
-                resolve_state_dict(
-                    checkpoint, model.state_dict().keys(), source=str(checkpoint_path)
-                )
-            )
-            logger.info("Checkpoint loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            raise
-
-        # Sub-phase 2.10: enforce train↔infer transform parity when the
-        # YAML declares ``data.modes.infer.strict_train_parity=true``.
-        # CheckpointService writes the training-time signature under key
-        # 'transform_signature' (Phase 2 amendments). When the flag is
-        # true, we recompute the val-mode signature from the current YAML
-        # and compare; on divergence we refuse to proceed.
+        # Strict train<->infer transform parity: RunState carries no transform signature
+        # yet (Ruling 13), so parity is checked against None.
         from spectramr.data.transforms.signature import enforce_train_infer_parity
 
-        _checkpoint_signature: str | None = None
-        if isinstance(checkpoint, dict):
-            _checkpoint_signature = checkpoint.get("transform_signature")
-        _infer_sig = enforce_train_infer_parity(config, _checkpoint_signature)
+        _infer_sig = enforce_train_infer_parity(config, None)
         logger.info(
             "[STRICT-PARITY] Transform signature %s… — inference proceeds.",
             _infer_sig[:16],
@@ -415,6 +309,9 @@ def run_inference_pipeline(
     # Stamped again after the loop with the counts; declared here so a run that
     # aborts before its first file still says what the knob was.
     results["data_consistency_at_predict"] = strategy.predict_dc_provenance()
+    kspace = PredictKSpace(config, strategy)
+    results["kspace_at_predict"] = kspace.provenance()
+    results["rung_at_predict"] = {"acceleration_requested": acceleration, "files": []}
 
     # Evaluation is set up before the loop so the declared set is resolved once,
     # and so a metric the arm names but this path cannot compute is recorded for
@@ -434,6 +331,9 @@ def run_inference_pipeline(
             batch_size,
             results,
             evaluator,
+            kspace,
+            acceleration=acceleration,
+            contrast_idx=contrast_idx,
         )
 
     # =====================================================================
@@ -450,6 +350,7 @@ def run_inference_pipeline(
     # figure set depending on whether `report` was re-run by hand afterwards.
     # Whether, and by whom, predictions were projected onto the measurement.
     results["data_consistency_at_predict"] = strategy.predict_dc_provenance()
+    results["kspace_at_predict"] = kspace.provenance()
     artifacts = evaluator.write(output_path)
     write_inference_run_summary(
         output_path,
@@ -467,6 +368,8 @@ def run_inference_pipeline(
             "num_failed": len(results["failures"]),
             "seed": config.run.seed,
             "data_consistency_at_predict": results["data_consistency_at_predict"],
+            "kspace_at_predict": results["kspace_at_predict"],
+            "rung_at_predict": results["rung_at_predict"],
         },
     )
     outcomes = evaluator.outcomes()
@@ -513,6 +416,10 @@ def _process_all_files(
     batch_size: int,
     results: dict[str, Any],
     evaluator: Any = None,
+    kspace: PredictKSpace | None = None,
+    *,
+    acceleration: float | None = None,
+    contrast_idx: int | None = None,
 ) -> None:
     """Run every input through the model, classifying failures by blast radius.
 
@@ -534,7 +441,7 @@ def _process_all_files(
       per-file turns that strictness into a facade (pitfall #16): N identical
       errors in the log and a zero exit status with nothing written.
     """
-    for input_file in tqdm(input_files, desc="Processing files"):
+    for input_file in make_progress(input_files, config.logging, desc="Processing files"):
         try:
             _process_single_file(
                 input_file,
@@ -546,6 +453,9 @@ def _process_all_files(
                 batch_size,
                 results,
                 evaluator,
+                kspace,
+                acceleration=acceleration,
+                contrast_idx=contrast_idx,
             )
         except DataCorruptionError as e:
             logger.error("Failed to process %s: %s", input_file.name, e)
@@ -616,13 +526,29 @@ def _process_single_file(
     batch_size: int,
     results: dict,
     evaluator: Any = None,
+    kspace: PredictKSpace | None = None,
+    *,
+    acceleration: float | None = None,
+    contrast_idx: int | None = None,
 ) -> None:
-    """Process a single input file using config-aligned preprocessing."""
+    """Process a single input file using config-aligned preprocessing.
+
+    ``kspace`` (resolved once per run) normalises the input as training did,
+    runs the arm's declared estimator per batch and de-normalises the output.
+    ``acceleration`` selects the cold-diffusion rung the input is degraded to
+    (:func:`~spectramr.infrastructure.inference.predict_rung.resolve_predict_rung`);
+    the scale is measured on the undegraded volume first, as validation's is.
+    """
     logger.info(f"Processing: {input_file.name}")
 
     # Load input
     tensor = _load_input(input_file, device_obj)
     logger.info(f"Loaded input: shape={tensor.shape}, dtype={tensor.dtype}")
+
+    prepared = None
+    if kspace is not None:
+        prepared = kspace.prepare(_reshape_to_batch(tensor), input_file.stem)
+        tensor = prepared.tensor
 
     # Preprocess
     tensor = _preprocess_tensor(tensor, config, device_obj, model)
@@ -630,6 +556,22 @@ def _process_single_file(
 
     # What the predict-time projection needs, when the arm asks for it.
     dc_inputs = _predict_dc_inputs(strategy, input_file, tensor, config)
+    acquired = _predict_acquired_lines(strategy, input_file, tensor)
+    volume_scale = _volume_kspace_scale(strategy, tensor, config)
+    rung = resolve_predict_rung(strategy, input_file, tensor, acquired, acceleration)
+    contrast = _predict_contrast(config, input_file, contrast_idx)
+    if rung is not None:
+        logger.info(
+            "[PREDICT-RUNG] %s: R=%g (%s) -> start_timestep=%d (realises R=%.4f)",
+            input_file.name,
+            rung.acceleration,
+            rung.source,
+            rung.timestep,
+            rung.realized,
+        )
+        results.setdefault("rung_at_predict", {"files": []})["files"].append(
+            rung.provenance(input_file)
+        )
 
     # Batch processing
     num_samples = tensor.shape[0]
@@ -639,13 +581,30 @@ def _process_single_file(
         batch_end = min(i + batch_size, num_samples)
         batch_tensor = tensor[i:batch_end]
 
+        rung_kwargs: dict[str, Any] = {}
+        if rung is not None:
+            batch_acquired = None if acquired is None else acquired[i:batch_end]
+            batch_tensor, rung_kwargs = rung.batch(batch_tensor, batch_acquired, i, batch_end)
+        # After the rung: the projection's measurement is what the model was given.
+        dc_kwargs = _dc_batch_kwargs(dc_inputs, batch_tensor, i, batch_end)
+        dc_kwargs.update(rung_kwargs)
+        if acquired is not None:
+            dc_kwargs["measured_lines"] = acquired[i:batch_end]
+        if volume_scale is not None:
+            dc_kwargs["kspace_scale"] = volume_scale[i:batch_end]
+        if contrast is not None:
+            dc_kwargs["contrast_idx"] = contrast.expand(batch_end - i)
         with torch.no_grad():
-            batch_output = strategy.infer_single(
-                batch_tensor, **_dc_batch_kwargs(dc_inputs, batch_tensor, i, batch_end)
-            )
-
-        if isinstance(batch_output, tuple):
-            batch_output = batch_output[0]
+            if prepared is None:
+                batch_output = _first(strategy.infer_single(batch_tensor, **dc_kwargs))
+            else:
+                batch_output = kspace.run(
+                    lambda x, kw=dc_kwargs: _first(strategy.infer_single(x, **kw)),
+                    batch_tensor,
+                    prepared.batch_data(i, batch_end),
+                    batch_key=i,
+                )
+                batch_output = kspace.denormalize(batch_output, prepared.scale[i:batch_end])
 
         outputs_list.append(batch_output.detach().cpu())
 
@@ -667,6 +626,46 @@ def _process_single_file(
 
     results["outputs"].append(str(output_path / f"{input_file.stem}_output.npy"))
     results["num_processed"] += 1
+
+
+def _predict_contrast(
+    config: TrainingSettings, input_file: Path, explicit: int | None
+) -> torch.Tensor | None:
+    """The contrast id for this file, for a cold-diffusion arm trained with ``num_contrasts > 0``."""
+    kwargs = config.model.model_kwargs or {}
+    if "kspace_cold_diffusion" not in str(config.model.model_type).lower():
+        if explicit is not None:
+            raise ConfigurationError("--contrast-idx applies to kspace_cold_diffusion checkpoints.")
+        return None
+    if str(getattr(config.data.dataset_type, "value", config.data.dataset_type)).lower() == "m4raw":
+        from spectramr.data.datasets.m4raw_dataset import CONTRAST_MAP
+
+        contrast_map: dict[str, int] = CONTRAST_MAP
+    else:
+        contrast_map = config.data.multi_contrast.contrast_map
+    return resolve_predict_contrast(
+        int(kwargs.get("num_contrasts", 0) or 0), input_file, explicit, contrast_map
+    )
+
+
+def _volume_kspace_scale(
+    strategy: Any, tensor: torch.Tensor, config: TrainingSettings
+) -> torch.Tensor | None:
+    """``[S]`` scales measured over the file, for a strategy that normalises its own input.
+
+    ``None`` for any other strategy, whose input ``PredictKSpace`` already normalised
+    per volume.
+    """
+    scale_of = getattr(strategy, "volume_kspace_scale", None)
+    if scale_of is None or not getattr(strategy, "owns_kspace_normalization", False):
+        return None
+    per_slice = bool(getattr(config.data, "slice_level_records", False))
+    return scale_of(tensor, per_slice=per_slice)
+
+
+def _first(output: Any) -> torch.Tensor:
+    """The prediction out of a strategy's ``(output, extras)`` tuple, or the output itself."""
+    return output[0] if isinstance(output, tuple) else output
 
 
 def _predict_dc_inputs(
@@ -710,6 +709,28 @@ def _predict_dc_inputs(
         "measurement_is_input": measurement_is_input,
         "num_samples": tensor.shape[0],
     }
+
+
+def _predict_acquired_lines(
+    strategy: Any, input_file: Path, tensor: torch.Tensor
+) -> torch.Tensor | None:
+    """``[B, N]`` bool acquired phase-encode lines for a strategy that counts R over them (#2572).
+
+    ``None`` when the strategy has no line axis (``acquisition_line_dim`` absent or
+    ``None``), so every other arm's call is unchanged. Otherwise the support comes
+    from the file's ISMRMRD encoding limits (M4Raw's count-in-``maximum`` header resolves
+    through the file's own data lines, see ``acquired_lines_for_input``) and an
+    unavailable or inconsistent header RAISES: the
+    input's own zero lines cannot tell never-acquired padding from lines the
+    undersampling dropped, and the full plane is the shift this closes.
+    """
+    dim = getattr(strategy, "acquisition_line_dim", None)
+    if dim is None:
+        return None
+    from spectramr.data.ismrmrd_limits import acquired_lines_for_input
+    from spectramr.models.diffusion.acquired_line_budget import acquired_lines_of
+
+    return acquired_lines_for_input(input_file, acquired_lines_of(tensor, dim))
 
 
 def _dc_batch_kwargs(
@@ -990,8 +1011,35 @@ def _save_output(
     """
     from spectramr.data.writers.output_writer import OutputWriter
 
-    # k-space → magnitude conversion (legacy behavior, unchanged).
-    if output.shape[1] % 2 == 0 and output.ndim == 4 and not output.is_complex():
+    # The resolved output domain decides the IFFT, never the channel parity: an
+    # image-domain model emitting [B, 2, H, W] real/imag (the FDB baseline) was
+    # transformed a second time and saved as |IFFT(image)|, a cross-hair.
+    from spectramr.infrastructure.training.utils.domain_inference import (
+        resolve_output_domain,
+    )
+
+    decision = resolve_output_domain(config)
+    output_is_kspace = decision.domain == "kspace"
+    real_4d = output.ndim == 4 and not output.is_complex()
+    if output_is_kspace and real_4d and output.shape[1] % 2 != 0:
+        if decision.declared:
+            raise ValueError(
+                f"Declared k-space output has {output.shape[1]} channels; real/imag "
+                "interleaved k-space needs an even count."
+            )
+        # A heuristic tier guessed k-space for an undeclared model; an odd channel
+        # count cannot be real/imag k-space, so the guess is overruled, loudly.
+        model_type = getattr(getattr(config, "model", None), "model_type", None)
+        logger.warning(
+            "Output domain of model_type=%r was guessed as k-space by cascade tier %d, "
+            "but the output has %d channels; saving it as an image. Declare "
+            "model.target_domain (or data.domain.output) on this arm.",
+            model_type,
+            decision.tier,
+            output.shape[1],
+        )
+        output_is_kspace = False
+    if output_is_kspace and real_4d:
         from spectramr.infrastructure.physics.fft_ops import ifft2c
 
         logger.info("Converting k-space output to magnitude image")

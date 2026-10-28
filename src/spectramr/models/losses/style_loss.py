@@ -34,11 +34,15 @@ def _gram(features: torch.Tensor) -> torch.Tensor:
         features: Tensor of shape ``(B, C, H, W)``.
 
     Returns:
-        Gram matrix ``(B, C, C)``, normalised by ``C * H * W``.
+        Gram matrix ``(B, C, C)``, normalised by ``C * H * W``, in float32.
     """
     b, c, h, w = features.shape
-    flat = features.reshape(b, c, h * w)
-    gram = torch.bmm(flat, flat.transpose(1, 2))
+    # Each entry sums H*W products, which overflows float16 (max 65504) on an
+    # early VGG layer at MRI resolution, so the product runs in float32 with
+    # autocast disabled.
+    flat = features.reshape(b, c, h * w).float()
+    with torch.autocast(device_type=flat.device.type, enabled=False):
+        gram = torch.bmm(flat, flat.transpose(1, 2))
     return gram / (c * h * w)
 
 
@@ -68,6 +72,7 @@ class GramStyleLoss(nn.Module):
             weights = [1.0] * len(layers)
         if len(weights) != len(layers):
             raise ValueError(f"weights len {len(weights)} != layers len {len(layers)}")
+        self.layer_weights: torch.Tensor
         self.register_buffer("layer_weights", torch.tensor(weights))
         self.extractor = VGGFeatureExtractor(layers=layers, use_input_norm=use_input_norm)
 
@@ -81,7 +86,7 @@ class GramStyleLoss(nn.Module):
         with torch.no_grad():
             feats_target = self.extractor(target)
         loss = prediction.new_zeros(())
-        for w, fp, ft in zip(self.layer_weights, feats_pred, feats_target):
+        for w, fp, ft in zip(self.layer_weights, feats_pred, feats_target, strict=True):
             gp, gt = _gram(fp), _gram(ft)
             loss = loss + w * (gp - gt).pow(2).mean()
         return loss

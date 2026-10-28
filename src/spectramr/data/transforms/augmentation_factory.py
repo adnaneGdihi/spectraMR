@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # and re-compute k-space afterwards.
 _COMPLEX_DATASET_TYPES = frozenset({"kspace", "kspace_3d"})
 
+# Subject keys holding the ground truth (``mri`` aliases ``target``). Degradations
+# apply to ``input`` only: TorchIO draws intensity parameters per image, so
+# leaving the target in corrupts the clean label and decouples it from the input.
+_TARGET_KEYS = ("target", "mri")
+
 
 class TorchIOAugmentationFactory:
     """Builds TorchIO transform pipelines from configuration.
@@ -62,6 +67,7 @@ class TorchIOAugmentationFactory:
 
         transforms = []
         prob = config.probability
+        degrade = {"p": prob, "exclude": _TARGET_KEYS}
 
         # =====================================================================
         # 1. Geometric Transforms
@@ -137,6 +143,30 @@ class TorchIOAugmentationFactory:
                     )
                 )
 
+        # Before the intensity block, so a simulated input is degraded like a measured one.
+        if config.enable_forward_operator:
+            if is_complex:
+                raise ValueError(
+                    "data.augmentation.enable_forward_operator simulates a magnitude ULF "
+                    f"image and cannot run on dataset_type={dataset_type!r}."
+                )
+            from spectramr.data.transforms.synthetic_ulf_simulator import SimulateULFFromHF
+
+            transforms.append(
+                SimulateULFFromHF(
+                    source_image="target",
+                    output_image="input",
+                    p=config.prob_forward_operator,
+                    **config.forward_operator_kwargs,
+                )
+            )
+            logger.info(
+                "[AUGMENTATION] forward-operator augmentation: input <- simulate_ulf_from_hf"
+                "(target) with p=%.3f, kwargs=%s",
+                config.prob_forward_operator,
+                sorted(config.forward_operator_kwargs),
+            )
+
         # =====================================================================
         # 2. Intensity Transforms
         # =====================================================================
@@ -172,7 +202,7 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 tio.RandomGamma(
                     log_gamma=(math.log(gamma_min), math.log(gamma_max)),
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -180,7 +210,7 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 RandomBrightness(
                     brightness_range=config.brightness_range,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -188,13 +218,13 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 RandomContrast(
                     contrast_range=config.contrast_range,
-                    p=prob,
+                    **degrade,
                 )
             )
 
         if config.enable_noise and not skip_intensity:
             # Gaussian noise; `enable_rician_noise` below is the magnitude model.
-            transforms.append(tio.RandomNoise(std=config.noise_std, p=prob))
+            transforms.append(tio.RandomNoise(std=config.noise_std, **degrade))
 
         # =====================================================================
         # 3. MRI-Specific Augmentations
@@ -204,7 +234,7 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 tio.RandomBiasField(
                     coefficients=config.bias_field_coefficients,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -212,7 +242,7 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 RandomRicianNoise(
                     noise_level=config.rician_noise_level,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -220,12 +250,12 @@ class TorchIOAugmentationFactory:
             transforms.append(
                 RandomMotionBlur(
                     motion_intensity=config.motion_blur_intensity,
-                    p=prob,
+                    **degrade,
                 )
             )
 
         if config.enable_blur and not skip_intensity:
-            transforms.append(tio.RandomBlur(std=config.blur_std, p=prob))
+            transforms.append(tio.RandomBlur(std=config.blur_std, **degrade))
 
         if config.enable_ghosting:
             # Restrict ghosting to in-plane axes (0, 1)
@@ -235,7 +265,7 @@ class TorchIOAugmentationFactory:
                     num_ghosts=config.num_ghosts,
                     axes=axes,
                     intensity=config.ghosting_intensity,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -244,7 +274,7 @@ class TorchIOAugmentationFactory:
                 tio.RandomSpike(
                     num_spikes=config.num_spikes,
                     intensity=config.spike_intensity,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -256,7 +286,7 @@ class TorchIOAugmentationFactory:
                 tio.RandomAnisotropy(
                     axes=(0, 1),
                     downsampling=config.anisotropy_downsampling,
-                    p=prob,
+                    **degrade,
                 )
             )
 
@@ -267,6 +297,7 @@ class TorchIOAugmentationFactory:
                 RandomB0Distortion(
                     max_displacement=config.b0_max_displacement,
                     p=config.b0_prob,
+                    exclude=_TARGET_KEYS,
                 )
             )
 

@@ -105,6 +105,18 @@ def _to_ri(x: torch.Tensor) -> torch.Tensor:
     return torch.view_as_real(x)
 
 
+def centred_freqs(
+    n: int, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Cycles-per-pixel of each sample on a ``fft2c`` axis of length ``n`` (DC at ``n // 2``).
+
+    The grid that makes ``fft2c(x) * exp(-2j*pi*f*d)`` an exact shift by ``d`` pixels.
+    ``linspace(-0.5, 0.5, n)`` is not this grid: its spacing is ``1/(n-1)`` and it has no
+    zero at the DC sample.
+    """
+    return (torch.arange(n, device=device, dtype=dtype) - n // 2) / n
+
+
 @dynamo_disable
 def fft2c(x: torch.Tensor) -> torch.Tensor:
     """Centered 2D FFT with orthonormal normalization.
@@ -264,8 +276,11 @@ def ifft2c_masked(k: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Te
 def spatial_dims(x: torch.Tensor) -> tuple[int, ...]:
     """Spatial axes of a ``[B, C, *spatial]`` tensor (2-D or 3-D).
 
+    The spatial axes are the trailing ones in tensor order; canonical volumes
+    are ``(B, C, D, H, W)``.
+
     Args:
-        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
 
     Returns:
         The trailing axis indices, i.e. ``(2, 3)`` or ``(2, 3, 4)``.
@@ -276,7 +291,7 @@ def spatial_dims(x: torch.Tensor) -> tuple[int, ...]:
     """
     ndim = x.ndim - 2
     if ndim not in (2, 3):
-        raise ValueError(f"expected [B, C, H, W] or [B, C, H, W, D], got shape {tuple(x.shape)}")
+        raise ValueError(f"expected [B, C, H, W] or [B, C, D, H, W], got shape {tuple(x.shape)}")
     return tuple(range(2, x.ndim))
 
 
@@ -287,6 +302,7 @@ def _resolve_dims(x: torch.Tensor, dims: tuple[int, ...] | None) -> tuple[int, .
     return tuple(a % x.ndim for a in dims)
 
 
+@dynamo_disable
 def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     """CENTRED N-D FFT over the spatial axes, each channel independently.
 
@@ -307,7 +323,7 @@ def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     channel-layout change into what should be a centering-only fix.
 
     Args:
-        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        x: Tensor shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
         dims: Axes to transform. Defaults to every spatial axis. Pass an
             explicit tuple (e.g. ``(-2, -1)``) for an in-plane transform of a
             volume, where the default would give a 3-D transform instead.
@@ -316,16 +332,18 @@ def fftnc(x: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
         Complex centred spectrum of the same shape.
     """
     d = _resolve_dims(x, dims)
-    z = torch.fft.ifftshift(x.to(torch.complex64), dim=d)
-    k = torch.fft.fftn(z, dim=d, norm="ortho")
-    return torch.fft.fftshift(k, dim=d)
+    with torch.amp.autocast("cuda", enabled=False):
+        z = torch.fft.ifftshift(x.to(torch.complex64), dim=d)
+        k = torch.fft.fftn(z, dim=d, norm="ortho")
+        return torch.fft.fftshift(k, dim=d)
 
 
+@dynamo_disable
 def ifftnc(k: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor:
     """Inverse of :func:`fftnc` -- CENTRED N-D inverse FFT.
 
     Args:
-        k: Centred spectrum shaped ``[B, C, H, W]`` or ``[B, C, H, W, D]``.
+        k: Centred spectrum shaped ``[B, C, H, W]`` or ``[B, C, D, H, W]``.
         dims: Axes to transform; must match the forward call. Defaults to every
             spatial axis.
 
@@ -333,9 +351,10 @@ def ifftnc(k: torch.Tensor, dims: tuple[int, ...] | None = None) -> torch.Tensor
         Complex image of the same shape.
     """
     d = _resolve_dims(k, dims)
-    z = torch.fft.ifftshift(k.to(torch.complex64), dim=d)
-    x = torch.fft.ifftn(z, dim=d, norm="ortho")
-    return torch.fft.fftshift(x, dim=d)
+    with torch.amp.autocast("cuda", enabled=False):
+        z = torch.fft.ifftshift(k.to(torch.complex64), dim=d)
+        x = torch.fft.ifftn(z, dim=d, norm="ortho")
+        return torch.fft.fftshift(x, dim=d)
 
 
 def coil_combine_rss(img_coils: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -754,6 +773,7 @@ __all__ = [
     "_to_complex",
     "_to_ri",
     "apply_mask",
+    "centred_freqs",
     "coil_combine",
     "coil_combine_rss",
     "fft1_uncentered",

@@ -11,10 +11,12 @@ the evolving :math:`\hat x_0` estimate:
 - the **first violation index** :math:`s^*` — the earliest step at which a
   monitored bound is broken, localising *where* a reconstruction went wrong.
 
-:class:`TrajectoryMonitor` is shaped as the ``step_callback`` the
-``ColdDiffusionInferenceStrategy`` reverse loop fires ``(step_idx, pred_x0,
-current_mask)`` per strided step. It observes the NORMALIZED k-space domain;
-every recorded quantity is relative, so the normalization scale cancels.
+:class:`TrajectoryMonitor` takes ``(step_idx, pred_x0, current_mask)`` once per
+reverse step. The predict-side loop that fired it was deleted when predict moved
+onto ``generator.sample()`` (#2067), and that path has no per-step hook yet, so
+nothing in ``train``/``predict`` drives the monitor today. It observes the
+NORMALIZED k-space domain; every recorded quantity is relative, so the
+normalization scale cancels.
 
 The admissible radius is never hardcoded: :func:`calibrate_admissible_radius`
 derives it from clean validation trajectories as a conformal quantile with a

@@ -67,6 +67,7 @@ from typing import Any, ClassVar
 import torch
 from torch.nn import functional as func
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import read_batch_field
 from spectramr.infrastructure.physics.vf_operators import MarkerPriorProjection
 from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
@@ -91,10 +92,17 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
             left unset.
     """
 
+    # parallel_compat: The EMA teacher is a frozen copy of the inner generator, updated on
+    # every rank from the synchronised weights, so it needs no reduction.
+    parallel_compat = frozenset({"replicated"})
+
     #: Loss ownership (issue #1918). mse_loss(student_pred, teacher_pred) is a DISTILLATION term against the
     #: teacher, not the target; the hook folds nothing from the builder.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
     folds_image_losses: ClassVar[bool] = False
+    #: The student and teacher inputs are noised copies of ``target``;
+    #: ``input_batch`` never reaches the network.
+    synthesises_model_input: ClassVar[bool] = True
 
     #: Defaults applied when the heavyweight base init has run (training path).
     _DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -124,11 +132,20 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
         return getattr(self, name)
 
     # -------------------------------------------------------------- EMA teacher
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Rebuild the EMA teacher, which exists only after the first step, before restore."""
+        super()._materialize_owned_state(state)
+        gen = getattr(self.env, "generator", None)
+        if "_ema_teacher" in state.get("modules", {}) and gen is not None:
+            self._ensure_ema_teacher(gen)
+
     def _ensure_ema_teacher(self, student: torch.nn.Module) -> torch.nn.Module:
         """Create the frozen EMA teacher as a deepcopy of the student."""
         teacher = getattr(self, "_ema_teacher", None)
         if teacher is None:
-            teacher = copy.deepcopy(student)
+            # The inner module: a copy of a DDP wrapper carries its process group and
+            # prefixes every checkpoint key with ``module.``.
+            teacher = copy.deepcopy(unwrap_model(student))
             for p in teacher.parameters():
                 p.requires_grad_(False)
             teacher.eval()
@@ -139,6 +156,7 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
     def _update_ema(self, student: torch.nn.Module) -> None:
         """``theta^- <- decay * theta^- + (1 - decay) * theta`` (params+buffers)."""
         teacher = self._ema_teacher
+        student = unwrap_model(student)
         decay = float(self._knob("ema_decay"))
         for tp, sp in zip(teacher.parameters(), student.parameters(), strict=False):
             tp.mul_(decay).add_(sp.detach(), alpha=1.0 - decay)

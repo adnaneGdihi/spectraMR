@@ -28,7 +28,7 @@ orchestrates them.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -53,6 +53,17 @@ class OperatorIdBCHTrainingStrategy(BaseTrainingStrategy, KspaceMixin):
     """
 
     training_mode = "operator_id"
+
+    # parallel_compat: Calls generator.build_lowrank outside the wrapped forward, so DDP/ZeRO
+    # reduce no gradient for it and FSDP reads a shard.
+    parallel_compat = frozenset()
+
+    #: Both terms are built and weighted here (``mmd_weight`` in
+    #: ``training.operator_id``); no builder module is folded (#1956).
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset(
+        {"structured_gaussian_nll", "pushforward_mmd"}
+    )
+    folds_image_losses: ClassVar[bool | None] = False
 
     def __init__(self, env: Any = None, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
@@ -143,17 +154,20 @@ class OperatorIdBCHTrainingStrategy(BaseTrainingStrategy, KspaceMixin):
         r"""Compute :math:`\mathcal L = \mathcal L_{\mathrm{pair}} + \lambda \mathcal L_{\mathrm{unpair}}`.
 
         Args:
-            input_batch: Clean reference :math:`x` (NEX-averaged).
-            target_batch: Degraded observation :math:`y` (single repetition).
+            input_batch: Degraded observation :math:`y` (a single repetition), the
+                framework's input role and what the M4Raw route delivers there.
+            target_batch: Clean reference :math:`x` (the repetition mean).
             epoch: Current epoch.
             kwargs: Optional ``contrast_idx`` / ``field_coord`` conditioning,
                 and ``unpaired`` (observed degraded pool for the MMD term).
         """
         if input_batch is None or target_batch is None:
-            raise ValueError("operator_id requires paired input (clean) and target (degraded).")
+            raise ValueError("operator_id requires paired input (degraded) and target (clean).")
 
-        x = self._to_complex_image(input_batch)
-        y = self._to_complex_image(target_batch)
+        # The operator maps the clean reference onto the observation; reading the
+        # roles the other way fitted the inverse direction (#1773).
+        x = self._to_complex_image(target_batch)
+        y = self._to_complex_image(input_batch)
         b, c, h, w = x.shape
         self._ensure_generators(c, h, w, x.device, x.dtype)
 

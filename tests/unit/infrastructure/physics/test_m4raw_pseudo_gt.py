@@ -458,6 +458,61 @@ class TestReadAcquisitionParams:
 
         assert read_acquisition_params(self._write(tmp_path, None)) == {}
 
+    def test_reads_echo_spacing_train_length_and_encoded_geometry(self, tmp_path) -> None:
+        """The series-gain gate and the EPG forward model need these beside TR/TE/TI."""
+        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
+            read_acquisition_params,
+        )
+
+        path = self._write(
+            tmp_path,
+            "<ns0:ismrmrdHeader><ns0:encoding><ns0:encodedSpace><ns0:matrixSize>"
+            "<ns0:x>256</ns0:x><ns0:y>256</ns0:y><ns0:z>1</ns0:z></ns0:matrixSize>"
+            "<ns0:fieldOfView_mm><ns0:x>240</ns0:x><ns0:y>240</ns0:y><ns0:z>5</ns0:z>"
+            "</ns0:fieldOfView_mm></ns0:encodedSpace><ns0:reconSpace><ns0:matrixSize>"
+            "<ns0:x>512</ns0:x><ns0:y>512</ns0:y><ns0:z>1</ns0:z></ns0:matrixSize>"
+            "</ns0:reconSpace><ns0:echoTrainLength>16</ns0:echoTrainLength></ns0:encoding>"
+            "<ns0:sequenceParameters><ns0:TR>4000</ns0:TR><ns0:TE>100</ns0:TE>"
+            "<ns0:echo_spacing>12.5</ns0:echo_spacing></ns0:sequenceParameters>"
+            "</ns0:ismrmrdHeader>",
+        )
+        got = read_acquisition_params(path)
+        assert got["echo_spacing"] == 12.5
+        assert got["echo_train_length"] == 16.0
+        assert got["encoded_matrix"] == (256, 256)  # not the reconSpace 512
+        assert got["fov_mm"] == (240.0, 240.0, 5.0)
+
+    def test_echo_spacing_with_a_unit_suffix_is_a_number_and_na_is_absent(self, tmp_path) -> None:
+        """M4Raw writes ``16.3ms`` on its TSE series and ``N/A`` on its single-echo SE T1."""
+        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
+            read_acquisition_params,
+        )
+
+        tse = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>16.3ms</echo_spacing></ismrmrdHeader>")
+        assert read_acquisition_params(tse)["echo_spacing"] == 16.3
+        se = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>N/A</echo_spacing></ismrmrdHeader>")
+        assert "echo_spacing" not in read_acquisition_params(se)
+
+    def test_echo_spacing_in_an_unknown_unit_raises(self, tmp_path) -> None:
+        """A silently mis-scaled echo spacing would put the TSE echo at the wrong index."""
+        import pytest
+
+        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
+            read_acquisition_params,
+        )
+
+        path = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>0.0163s</echo_spacing></ismrmrdHeader>")
+        with pytest.raises(ValueError, match="echo_spacing"):
+            read_acquisition_params(path)
+
+    def test_geometry_is_omitted_when_the_header_has_none(self, tmp_path) -> None:
+        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
+            read_acquisition_params,
+        )
+
+        got = read_acquisition_params(self._write(tmp_path, "<ismrmrdHeader><TR>1</TR></ismrmrdHeader>"))
+        assert "encoded_matrix" not in got and "fov_mm" not in got
+
 
 class TestSliceOnlyRepReads:
     """#616 (audit D5). Pseudo-GT averages ONE slice across every repetition.

@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.fft_ops import fft2c
 from spectramr.infrastructure.training.strategies.mixins.utils import pick_present
 from spectramr.infrastructure.training.strategies.virtual_fiducial_strategy import (
@@ -48,6 +49,15 @@ class IBVFTrainingStrategy(ConcreteVirtualFiducialStrategy):
     aggregation: ``_ib_term`` is added to whatever the parent
     strategy already returned.
     """
+
+    # parallel_compat: The two critics and the navigator encoder are owned modules, built in
+    # __init__ on every rank and run via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = tuple((name, OWNED_MODULE) for name in ("critic_max", "critic_min", "nav_encoder"))
+        return (*super().owned_module_declarations(config), *own)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -126,6 +136,8 @@ class IBVFTrainingStrategy(ConcreteVirtualFiducialStrategy):
         ib_modules = (self.critic_max, self.critic_min, self.nav_encoder)
         for module in ib_modules:
             module.to(self.device)
+        for name in ("critic_max", "critic_min", "nav_encoder"):
+            self.register_owned_module(name, getattr(self, name))
         if opt is None:
             logger.warning(
                 "[IBVFTrainingStrategy] no generator optimizer (env.opt_g) found; "
@@ -154,8 +166,8 @@ class IBVFTrainingStrategy(ConcreteVirtualFiducialStrategy):
         Returns:
             Scalar tensor — the IB regulariser.
         """
-        loss_max = self.critic_max(z_m, theta_hat)
-        loss_min = self.critic_min(z_m, anatomy_features)
+        loss_max = self.call_owned("critic_max", z_m, theta_hat)
+        loss_min = self.call_owned("critic_min", z_m, anatomy_features)
         # critic returns -lower_bound; for maximisation we flip the sign.
         return -self.beta_plus * (-loss_max) + self.beta_minus * (-loss_min)
 
@@ -203,10 +215,9 @@ class IBVFTrainingStrategy(ConcreteVirtualFiducialStrategy):
         # Encode with the strategy-owned 1-D navigator encoder (NOT the main
         # generator, which reconstructs the 2-D image for the parent VF path).
         # NavEncoder1D accepts a complex (B, T) sequence and splits real/imag.
-        enc = self.nav_encoder
-        z_m = enc(nav_corrupt)
-        theta_hat = enc(nav_residual)
-        anatomy_features = enc(nav_clean)
+        z_m = self.call_owned("nav_encoder", nav_corrupt)
+        theta_hat = self.call_owned("nav_encoder", nav_residual)
+        anatomy_features = self.call_owned("nav_encoder", nav_clean)
         return z_m, theta_hat, anatomy_features
 
     def _compute_losses_impl(

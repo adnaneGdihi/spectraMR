@@ -116,7 +116,6 @@ parallel:
     zero_stage: 2
     offload_optimizer: none
     offload_param: none
-    save_consolidated_best: true  # false makes the run resume-only
     allow_multi_engine: false     # every arm here is single-optimizer diffusion
 data:
   # See TODO/audit/smoke_audit_experiment_11_kspace_cold_diffusion_20260615.md.
@@ -147,7 +146,6 @@ data:
   multi_contrast:
     enabled: true
     n_contrasts: 3
-    embed_dim: 128
   loader:
     batch_size: 2
     num_workers: 8
@@ -214,7 +212,6 @@ training:
   device: cuda
   deterministic: false
   output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual
-  enable_gradient_checkpointing: false
   training_mode: diffusion
   # Curriculum bounds the timestep sampler at iter i to
   # ``min(num_timesteps, start_t + i * rate)`` (diffusion.py:432-435).
@@ -239,7 +236,6 @@ training:
     type: cold
     prediction_type: sample
     degradation: kspace_mask
-    degradation_dynamics: null
     enable_diffusion_amp: false
     enforce_output_range: false
     lambda_mse: 0.0
@@ -253,7 +249,6 @@ metrics:
   enable_paradigm_specific: true
   eval_on_epoch: false
   metric_interval: 2500
-  track_best_metric: true
   best_metric_name: val_hfen_mean
   best_metric_mode: min
   output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/metrics
@@ -381,7 +376,6 @@ loss_logging:
   output_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/metrics
 validation:
   enabled: true
-  use_training_loss: true
   schedule:
     interval_steps: 17500
     on_epoch: false
@@ -406,10 +400,7 @@ validation:
 checkpoint:
   enabled: true
   save_interval: 5000
-  checkpoint_dir: experiments/results/experiment_11_kspace_cold_diffusion_perceptual/checkpoints
   keep_last_n: 3
-  keep_best_n: 2
-  save_on_epoch: true
 
 early_stopping:
   # patience is denominated in VALIDATION EVENTS, not iterations, and it is sized

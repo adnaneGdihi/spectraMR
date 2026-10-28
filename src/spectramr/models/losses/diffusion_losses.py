@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +20,7 @@ class DiffusionMSELoss(nn.Module):
     """
 
     @validate_loss_inputs
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute MSE loss.
 
         forward method for DiffusionMSELoss.
@@ -50,10 +52,10 @@ class VelocityPredictionLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{VelocityPrediction} = \text{SmoothL1}(v_{pred}, v_{target})"""
+        \\mathcal{L}_{VelocityPrediction} = \\text{SmoothL1}(v_{pred}, v_{target})"""
 
     @validate_loss_inputs
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute velocity prediction loss.
 
         forward method for VelocityPredictionLoss.
@@ -94,7 +96,7 @@ class HuberLoss(nn.Module):
         self.delta = delta
 
     @validate_loss_inputs
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute Huber loss.
 
         forward method for HuberLoss.

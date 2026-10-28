@@ -49,6 +49,8 @@ absolute companion and behaves cleanly on the same cases: 0.0000, 0.0000,
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -175,7 +177,12 @@ class JacobianAnatomyLoss(nn.Module):
         if x.shape[1] > 1:
             # Interleaved coils/channels: RSS to one geometric map, so the
             # displacement is estimated on anatomy and not on a coil profile.
-            x = x.pow(2).sum(dim=1, keepdim=True).sqrt()
+            # Zero-signal pixels go through a constant: sqrt'(0) is infinite and
+            # would turn the zero upstream gradient there into NaN.
+            power = x.pow(2).sum(dim=1, keepdim=True)
+            nonzero = power > 0
+            safe = torch.where(nonzero, power, torch.ones_like(power))
+            x = torch.where(nonzero, safe.sqrt(), torch.zeros_like(power))
         return x
 
     @staticmethod
@@ -195,7 +202,9 @@ class JacobianAnatomyLoss(nn.Module):
         )
         return var / var.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
 
-    def forward(self, prediction: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, prediction: torch.Tensor, reference: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
         """Scalar penalty; ~``0`` when the two differ by no warp at all."""
         moving = self._as_magnitude(prediction)
         fixed = self._as_magnitude(reference)

@@ -34,6 +34,8 @@ References:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,32 +43,37 @@ import torch.nn.functional as F
 from spectramr.models.losses.registry import register_loss
 
 
-def _sample_t(batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Uniform t ~ U(0, 1) of shape (B, 1, 1, 1) (4D) or (B, 1, 1, 1, 1) (5D)
-    is left to the caller to broadcast — we return shape (B,)."""
-    return torch.rand(batch, device=device, dtype=dtype)
+def _require_x0(ctx: dict[str, Any], loss_name: str) -> torch.Tensor:
+    """Return the base sample the strategy built ``x_t`` from, or raise.
 
-
-def _broadcast_t(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
-    shape = (t.shape[0],) + (1,) * (like.dim() - 1)
-    return t.view(shape)
+    The regression target ``x1 - x0`` is only meaningful for the ``x0`` that
+    produced the network input; a freshly drawn one is independent of it, so
+    the optimum would be ``E[x1 | x_t]`` rather than the flow velocity.
+    """
+    x0 = ctx.get("x0")
+    if x0 is None:
+        raise ValueError(
+            f"{loss_name} requires context['x0']: the base sample used to build "
+            "x_t = (1 - t) x0 + t x1 for the velocity prediction."
+        )
+    if not isinstance(x0, torch.Tensor):
+        raise TypeError(f"context['x0'] must be a tensor, got {type(x0).__name__}")
+    return x0
 
 
 def _flow_matching_loss(
     velocity_pred: torch.Tensor,
     x0: torch.Tensor,
     x1: torch.Tensor,
-    t: torch.Tensor,
     norm: str,
 ) -> torch.Tensor:
-    """Generic v-regression at the linear-interpolant midpoint."""
+    """Regress the prediction onto the straight-line velocity ``x1 - x0``."""
     target_v = x1 - x0  # straight-line velocity field
     if velocity_pred.shape != target_v.shape:
         raise ValueError(
             f"velocity prediction shape {tuple(velocity_pred.shape)} != "
             f"target velocity shape {tuple(target_v.shape)}"
         )
-    _ = t  # t already used by caller to construct x_t
     if norm == "l1":
         return F.l1_loss(velocity_pred, target_v)
     return F.mse_loss(velocity_pred, target_v)
@@ -85,11 +92,11 @@ class ConditionalFlowMatchingLoss(nn.Module):
     * ``prediction``: velocity prediction :math:`v_{\boldsymbol{\theta}}
       (\mathbf{x}_t, t)`. Same shape as the data tensor.
     * ``target``: the data sample :math:`\mathbf{x}_1`. Same shape.
-    * ``context["x0"]``: optional base sample :math:`\mathbf{x}_0`. If
-      missing, drawn from :math:`\mathcal{N}(0,\mathbf{I})` matching
-      ``target`` shape.
-    * ``context["t"]``: optional time scalar. If missing, sampled
-      :math:`t\sim U(0,1)` per example.
+    * ``context["x0"]``: required base sample :math:`\mathbf{x}_0` — the
+      one the strategy used to build the network input :math:`\mathbf{x}_t`.
+
+    The time :math:`t` enters only through :math:`\mathbf{x}_t`; the
+    straight-line target does not depend on it.
 
     Args:
         norm: ``"l2"`` (default, paper) or ``"l1"``.
@@ -105,17 +112,11 @@ class ConditionalFlowMatchingLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        ctx = context or {}
-        x0 = ctx.get("x0")
-        if x0 is None:
-            x0 = torch.randn_like(target)
-        t = ctx.get("t")
-        if t is None:
-            t = _sample_t(target.shape[0], target.device, target.dtype)
-        return _flow_matching_loss(prediction, x0, target, t, self.norm)
+        x0 = _require_x0(context or {}, type(self).__name__)
+        return _flow_matching_loss(prediction, x0, target, self.norm)
 
 
 @register_loss(
@@ -129,8 +130,7 @@ class RectifiedFlowLoss(nn.Module):
 
     The strategy is responsible for sampling :math:`(\mathbf{x}_0,
     \mathbf{x}_1)` from the previous flow's deterministic ODE and
-    passing them via context. Falls back to independent draws if not
-    supplied (in which case it equals CFM).
+    passing ``x0`` via ``context["x0"]`` (required).
 
     Args:
         norm: ``"l2"`` (default) or ``"l1"``.
@@ -146,35 +146,34 @@ class RectifiedFlowLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        ctx = context or {}
-        x0 = ctx.get("x0")
-        if x0 is None:
-            x0 = torch.randn_like(target)
-        t = ctx.get("t")
-        if t is None:
-            t = _sample_t(target.shape[0], target.device, target.dtype)
-        return _flow_matching_loss(prediction, x0, target, t, self.norm)
+        x0 = _require_x0(context or {}, type(self).__name__)
+        return _flow_matching_loss(prediction, x0, target, self.norm)
 
 
 def _hungarian_pair(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
     """Find an optimal-transport pairing of (x0, x1) within the batch.
 
-    Returns a permutation ``perm`` such that ``x1[perm]`` is the
-    minimum-cost pairing under squared-Euclidean cost. Uses the
+    Returns the permutation ``perm`` of ``x0`` such that ``x0[perm][j]`` is the
+    partner of ``x1[j]`` under the minimum squared-Euclidean cost. Uses the
     Hungarian algorithm via ``scipy.optimize.linear_sum_assignment``
     on the detached cost matrix (the loss itself remains
     differentiable through the resulting straight-line velocity).
     """
-    from scipy.optimize import linear_sum_assignment  # local import — keep startup cheap
+    from scipy.optimize import (  # type: ignore[import-untyped]  # local: keep startup cheap
+        linear_sum_assignment,
+    )
 
     flat_x0 = x0.reshape(x0.shape[0], -1)
     flat_x1 = x1.reshape(x1.shape[0], -1)
     cost = torch.cdist(flat_x0, flat_x1).pow(2).detach().cpu().numpy()
+    # linear_sum_assignment pairs x0[i] with x1[col[i]]; argsort inverts that
+    # to the x0 row matched to each x1[j].
     _, col = linear_sum_assignment(cost)
-    return torch.as_tensor(col, device=x0.device, dtype=torch.long)
+    col_t = torch.as_tensor(col, device=x0.device, dtype=torch.long)
+    return torch.argsort(col_t)
 
 
 @register_loss(
@@ -203,17 +202,17 @@ class OTConditionalFlowMatchingLoss(nn.Module):
       :math:`\mathbf{x}_0` accordingly, builds :math:`\mathbf{x}_t`,
       runs the network, and hands the result back as ``prediction``.
     * ``target``: data sample :math:`\mathbf{x}_1`.
-    * ``context["x0"]``: optional :math:`\mathbf{x}_0` (else drawn).
+    * ``context["x0"]``: required :math:`\mathbf{x}_0` (unpaired).
 
     Notes:
-        For convenience, when ``context["return_permutation"] = True``
-        the loss attaches the chosen permutation to
-        ``context["permutation"]`` so the strategy can reuse it. The
-        loss assumes the strategy has already built
-        :math:`\mathbf{x}_t` using the *same* permutation that the OT
-        solve returns — when ``context`` provides a pre-computed
-        ``permutation`` we honour it; otherwise we Hungarian-pair on
-        the fly and the strategy is expected to have done the same.
+        ``context["permutation"]`` indexes ``x0``: ``x0[permutation][j]``
+        is the partner of ``x1[j]``. When ``context["return_permutation"]
+        = True`` the loss attaches the permutation it solved so the strategy
+        can reuse it. The loss assumes the strategy has already built
+        :math:`\mathbf{x}_t` using the *same* permutation — when
+        ``context`` provides a pre-computed ``permutation`` we honour it;
+        otherwise we Hungarian-pair on the fly and the strategy is
+        expected to have done the same.
 
     Args:
         norm: ``"l2"`` (default) or ``"l1"``.
@@ -229,24 +228,15 @@ class OTConditionalFlowMatchingLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         ctx = context if context is not None else {}
-        x0 = ctx.get("x0")
-        if x0 is None:
-            x0 = torch.randn_like(target)
+        x0 = _require_x0(ctx, type(self).__name__)
         perm = ctx.get("permutation")
         if perm is None:
             perm = _hungarian_pair(x0, target)
             if context is not None and ctx.get("return_permutation"):
                 ctx["permutation"] = perm
         x0_paired = x0[perm]
-        t = ctx.get("t")
-        if t is None:
-            t = _sample_t(target.shape[0], target.device, target.dtype)
-        return _flow_matching_loss(prediction, x0_paired, target, t, self.norm)
-
-
-# Keep helper visible
-_ = _broadcast_t
+        return _flow_matching_loss(prediction, x0_paired, target, self.norm)

@@ -247,11 +247,10 @@ class EquivarianceConformalCalibrationStrategy(BaseTrainingStrategy, MetricsMixi
             cfg = EquivarianceConformalConfig(**cfg)
         self._ec_cfg = cfg
         logger.info(
-            "EquivarianceConformalCalibrationStrategy: alpha=%s K=%s group=%s ckpt=%s",
+            "EquivarianceConformalCalibrationStrategy: alpha=%s K=%s group=%s",
             cfg.alpha,
             cfg.num_rotations_K,
             cfg.group,
-            cfg.pretrained_reconstructor_checkpoint,
         )
 
     # ------------------------------------------------------------------

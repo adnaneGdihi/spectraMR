@@ -7,24 +7,80 @@ Supports PCGrad gradient surgery, FNO-based EPG, and zero-padded dipole fields.
 """
 
 import logging
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import torch
 
+from spectramr.core.metrics.disentanglement import DisentanglementAccumulator
+from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.distributed.owned_modules import OWNED_CALL
+from spectramr.infrastructure.physics.fno_epg_pretrain import (
+    ECHO_TRAIN_LENGTH,
+    build_fno_epg_surrogate,
+    check_protocol_within_fit,
+)
 from spectramr.infrastructure.physics.multi_physics_bloch import MultiPhysicsBlochLayer
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.disentangled_bloch_inputs import (
+    acquisition_params,
+    check_flip_angle_is_read,
+    check_protocol_matches_families,
+    parse_protocol_map,
+    parse_sequence_map,
+    sequence_codes,
+)
+from spectramr.infrastructure.training.strategies.disentangled_diagnostics import (
+    expand_row_names,
+    record_validation_rows,
+    swap_distances,
+)
+from spectramr.infrastructure.training.strategies.disentangled_metric_keys import (
+    declared_step_keys,
+    discriminator_column,
+    generator_column,
+)
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
+    _resolve_disc_updates,
 )
 from spectramr.infrastructure.training.strategies.mixins.reconstruction import (
     ReconstructionMixin,
 )
 from spectramr.infrastructure.training.strategies.mixins.utils import pick_present
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
 
 logger = logging.getLogger(__name__)
 
+#: Echoes in the rendered train (read at the middle one). One owner: the surrogate is fitted
+#: for this length and refuses to load for another.
+_ECHO_TRAIN_LENGTH = ECHO_TRAIN_LENGTH
+
+
+
+def pcgrad_surrogate_loss(
+    value: torch.Tensor,
+    params: list[torch.nn.Parameter],
+    grad_primary: Sequence[torch.Tensor | None],
+    grad_projected: Sequence[torch.Tensor | None],
+) -> torch.Tensor:
+    """A loss whose value is ``value`` and whose gradient is ``grad_primary + grad_projected``.
+
+    PCGrad's combined gradient is handed back as a loss rather than written into
+    ``p.grad``, so the executor's accumulation divide and ``scaler.scale`` act on it
+    exactly as on any other loss; a hand-written ``p.grad`` escapes the first and is
+    then divided by the loss scale in ``scaler.unscale_`` without ever having been
+    multiplied by it.
+    """
+    surrogate = params[0].sum() * 0.0
+    for p, g_p, g_s in zip(params, grad_primary, grad_projected, strict=True):
+        for g in (g_p, g_s):
+            if g is not None:
+                surrogate = surrogate + (g.detach() * p).sum()
+    return value.detach() + (surrogate - surrogate.detach())
 
 class DisentangledTrainingStrategy(
     AdversarialMixin,
@@ -33,10 +89,20 @@ class DisentangledTrainingStrategy(
 ):
     """Training strategy for Disentangled MRI synthesis with content-style separation."""
 
-    def __init__(self, *args, **kwargs):
-        """__init__."""
-        super().__init__(*args, **kwargs)
-        self._setup_strategy_specific_components()
+    # parallel_compat: Every training step runs the generator through enc_c / enc_s /
+    # decode_tissue, outside the wrapped forward, which the call declaration refuses under ddp.
+    # Its log_vars and learnable flip angle are bare groups on opt_g.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("generator.enc_c", OWNED_CALL),)
+        return (*super().owned_module_declarations(config), *own)
+
+    # No ``__init__``: ``BaseTrainingStrategy.__init__`` already calls
+    # ``_setup_strategy_specific_components()``. An explicit second call here ran the whole
+    # setup twice, and setup is not idempotent once it adds optimizer param groups: the
+    # first (discarded) loss computer and Bloch layer each left an orphan group on opt_g.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize strategy-specific components following SSOT pattern."""
@@ -72,6 +138,11 @@ class DisentangledTrainingStrategy(
         )
         model_kwargs = model_kwargs or {}
         learnable_flip = model_kwargs.get("learnable_flip_angle", False)
+        self._sequence_map = parse_sequence_map(model_kwargs.get("bloch_sequence_by_contrast"))
+        check_flip_angle_is_read(bool(learnable_flip), self._sequence_map)
+        self._protocol_map = parse_protocol_map(model_kwargs.get("bloch_protocol_by_contrast"))
+        if self._protocol_map:
+            check_protocol_matches_families(self._protocol_map, self._sequence_map)
         self._bloch_layer = MultiPhysicsBlochLayer(
             default_flip_angle_deg=10.0,
             learnable_flip_angle=learnable_flip,
@@ -98,8 +169,27 @@ class DisentangledTrainingStrategy(
             existing_params = {p for group in self.env.opt_g.param_groups for p in group["params"]}
             loss_params = list(self.loss_computer.parameters())
             if loss_params and loss_params[0] not in existing_params:
-                self.env.opt_g.add_param_group(
-                    {"params": loss_params, "lr": 1e-3, "name": "uncertainty_weights"}
+                add_owned_param_group(
+                    self,
+                    self.env.opt_g,
+                    {"params": loss_params, "lr": 1e-3, "name": "uncertainty_weights"},
+                    owner="its uncertainty weights",
+                )
+
+            # ``learnable_flip_angle`` makes the Bloch layer's flip angle an nn.Parameter, but
+            # no optimizer received it, so the arm advertised a learned flip angle and trained
+            # with it frozen at the default. It is a radian-valued scalar, so the same small
+            # step as the uncertainty weights is a reasonable rate.
+            registered = {p for group in self.env.opt_g.param_groups for p in group["params"]}
+            bloch_params = [
+                p for p in self._bloch_layer.parameters() if p.requires_grad and p not in registered
+            ]
+            if bloch_params:
+                add_owned_param_group(
+                    self,
+                    self.env.opt_g,
+                    {"params": bloch_params, "lr": 1e-3, "name": "bloch_flip_angle"},
+                    owner="its learnable flip angle",
                 )
 
         # [FIX] PCGrad: Gradient surgery for physics vs adversarial conflicts
@@ -112,18 +202,12 @@ class DisentangledTrainingStrategy(
         if self._dipole_pad_z > 0:
             logger.info("Dipole z-padding: %d slices per side", self._dipole_pad_z)
 
-        # [NEW] FNO EPG surrogate for FSE/FLAIR synthesis
-        self._use_fno_epg = model_kwargs.get("use_fno_epg", False)
-        self._fno_epg = None
-        if self._use_fno_epg:
-            try:
-                from spectramr.infrastructure.physics.fno_epg import FNOEPGSurrogate
-
-                self._fno_epg = FNOEPGSurrogate().to(self.device)
-                logger.info("FNO EPG surrogate initialized")
-            except Exception as exc:
-                logger.warning("FNO EPG init failed, falling back to analytical EPG: %s", exc)
-                self._fno_epg = None
+        # FNO EPG surrogate for FSE/FLAIR synthesis: a stored fit of the analytic EPG, loaded
+        # frozen. A default-initialised one is a random function, and a failed load must not
+        # fall back to another renderer unannounced (nothing here swallows it).
+        self._fno_epg = build_fno_epg_surrogate(model_kwargs, self.device)
+        if self._fno_epg is not None and self._protocol_map:
+            check_protocol_within_fit(self._protocol_map)
 
     @property
     def loss_weights(self) -> dict[str, float]:
@@ -193,6 +277,8 @@ class DisentangledTrainingStrategy(
         x_a, x_b = self._unpack_batch(batch)
         device = x_a.device
         self._last_step_metrics = {}
+        # validation_step receives no iteration; it names its images after this one.
+        self._global_step = int(kwargs.get("iteration", self._global_step))
 
         def gen_closure() -> torch.Tensor:
             """gen_closure.
@@ -284,9 +370,11 @@ class DisentangledTrainingStrategy(
                     )
                     if hasattr(adv_output, "components"):
                         for k, v in adv_output.components.items():
-                            self._last_step_metrics[f"g_{k}"] = (
-                                v.detach() if isinstance(v, torch.Tensor) else v
-                            )
+                            column = generator_column(k)
+                            if column is not None:
+                                self._last_step_metrics[column] = (
+                                    v.detach() if isinstance(v, torch.Tensor) else v
+                                )
 
             self._last_step_metrics.update(loss_output.to_dict())
             total_gen_loss = loss_output.total + adv_loss_total
@@ -306,11 +394,9 @@ class DisentangledTrainingStrategy(
                 )
             )
 
-            if not torch.isfinite(loss_output.total):
-                return torch.tensor(0.0, device=device, requires_grad=True)
-
-            # [FIX] PCGrad: If enabled, resolve gradient conflicts between
-            # physics/reconstruction losses and adversarial losses.
+            # A non-finite total is left to the executor's pre-backward guard, the
+            # one owner of that rule: it raises without a GradScaler and lets the
+            # scaler skip the step under AMP (#1471).
             if (
                 self._enable_pcgrad
                 and isinstance(adv_loss_total, torch.Tensor)
@@ -328,36 +414,9 @@ class DisentangledTrainingStrategy(
                     adv_loss_total, params, retain_graph=True, allow_unused=True
                 )
                 grad_projected = project_conflicting_gradients(list(grad_physics), list(grad_adv))
-                # [FIX] Accumulate PCGrad projections to preserve
-                # gradient_accumulation_steps behavior (= overwrites, += accumulates)
-                for p, g_p, g_s in zip(params, grad_physics, grad_projected, strict=False):
-                    new_grad = (g_p + g_s) if g_s is not None else g_p
-                    if new_grad is not None:
-                        if p.grad is None:
-                            p.grad = new_grad.clone()
-                        else:
-                            p.grad += new_grad
-                # PCGrad populated ``p.grad`` by hand above, so this closure
-                # must hand the executor something it can run backward on
-                # WITHOUT disturbing those gradients -- and whose *value* is
-                # still the real loss, because the executor logs what it gets
-                # (``losses_record[name] = loss.detach()``).
-                #
-                # ``.detach()`` supplies the value; the zero-weighted parameter
-                # term supplies a graph. ``d(0 * p.sum())/dp == 0``, so every
-                # ``p.grad`` accumulates exactly 0.0 and keeps its projected
-                # value. Attaching to one parameter rather than multiplying the
-                # total by zero keeps this O(1): the latter would cost a second
-                # full traversal of the loss graph every step, on top of the two
-                # ``autograd.grad`` traversals PCGrad already pays.
-                #
-                # This used to return ``loss_output.total.detach().requires_grad_(True)``,
-                # which worked only because ``backward()`` on a leaf is a silent
-                # no-op -- the same mechanism that lets a genuinely severed loss
-                # train nothing (#1952). The pre-backward graph guard now refuses
-                # leaves, and this path is not exempted from it: an exemption
-                # would be indistinguishable from the defect.
-                return loss_output.total.detach() + 0.0 * params[0].sum()
+                return pcgrad_surrogate_loss(
+                    total_gen_loss, params, grad_physics, grad_projected
+                )
 
             return total_gen_loss
 
@@ -398,9 +457,11 @@ class DisentangledTrainingStrategy(
                 )
                 if hasattr(d_loss_output, "components"):
                     for k, v in d_loss_output.components.items():
-                        self._last_step_metrics[f"d_{k}"] = (
-                            v.detach() if isinstance(v, torch.Tensor) else v
-                        )
+                        column = discriminator_column(k)
+                        if column is not None:
+                            self._last_step_metrics[column] = (
+                                v.detach() if isinstance(v, torch.Tensor) else v
+                            )
 
             return d_total
 
@@ -417,20 +478,79 @@ class DisentangledTrainingStrategy(
             if hasattr(self.config, "losses") and hasattr(self.config.losses, "gan")
             else None
         )
+        # The discriminator steps only while the generator's adversarial term is weighted, so
+        # the warm-up gate (or a loss_schedule ramp) delays both sides. Stepping it from
+        # iteration 1 let it train unopposed and arrive at the switch-on dominant.
+        # The cadence (disc_updates every disc_update_interval-th iteration) has one owner.
         if (
             gan_config_final
             and gan_config_final.enable_adversarial
             and getattr(self.env, "opt_d", None)
-        ):
-            configs.append(
-                {
-                    "name": "discriminator",
-                    "closure": disc_closure,
-                    "optimizer": self.env.opt_d,
-                    "model": getattr(self.env, "discriminator", None),
-                }
+            and self.adv_loss_computer is not None
+            and self.adv_loss_computer._get_loss_weight(
+                "adversarial", epoch, iteration=self._global_step
             )
+            > 0
+        ):
+            for _ in range(_resolve_disc_updates(self.config, iteration=self._global_step)):
+                configs.append(
+                    {
+                        "name": "discriminator",
+                        "closure": disc_closure,
+                        "optimizer": self.env.opt_d,
+                        "model": getattr(self.env, "discriminator", None),
+                    }
+                )
         return configs
+
+    def sync_scheduled_loss_weights(self) -> None:
+        """Publish ``loss_schedule`` overrides to the GAN computer as well.
+
+        The base publishes only into ``self.loss_computer``; the adversarial weight lives
+        in ``adv_loss_computer``, so a rule on ``adversarial`` never reached it. With a
+        library that returns pre-weighted terms the weight gates the term on or off, and
+        the discriminator step follows that gate.
+        """
+        super().sync_scheduled_loss_weights()
+        adv = getattr(self, "adv_loss_computer", None)
+        if adv is not None:
+            loop_state = getattr(self, "loop_state", None)
+            adv.scheduled_weights = getattr(loop_state, "loss_weight_overrides", None) or {}
+
+    def declared_metric_keys(self) -> frozenset[str]:
+        """The stamped keys the CSV header cannot derive from the config (#1682)."""
+        losses = getattr(self.config, "losses", None)
+        gan_cfg = getattr(losses, "gan", None)
+        adversarial = bool(
+            gan_cfg is not None
+            and gan_cfg.enable_adversarial
+            and self.adv_loss_computer is not None
+            and getattr(self.env, "discriminator", None) is not None
+            and getattr(self.env, "opt_d", None) is not None
+        )
+        gan_recon = adversarial and self.adv_loss_computer._get_loss_weight("reconstruction") > 0
+        loss_type = getattr(getattr(losses, "reconstruction", None), "loss_type", None) or "l1"
+        return declared_step_keys(
+            loss_type,
+            adversarial=adversarial,
+            gan_recon=gan_recon,
+            gradient_penalty=adversarial and bool(gan_cfg.enable_gradient_penalty),
+        )
+
+    def _validation_forward(self, input_batch: Any, batch_ctx: Any) -> torch.Tensor:
+        """The visual sample: the render ``validation_step`` just graded for this batch.
+
+        Without this hook the pipeline ran ``generator(input_batch)`` on the whole volume,
+        skipping the chunking and the Bloch render, and then discarded the result for
+        ``_last_visual_pred`` anyway; on arm 51 that call ran out of GPU memory.
+        """
+        pred = getattr(self, "_last_visual_pred", None)
+        if pred is None:
+            raise RuntimeError(
+                "No validated render to show: validation_step sets _last_visual_pred before "
+                "the visual capture, and it did not run for this batch."
+            )
+        return pred
 
     def get_last_metrics(self) -> dict[str, Any]:
         """Return the metrics collected during the last train_step.
@@ -453,11 +573,9 @@ class DisentangledTrainingStrategy(
         self, x_a: torch.Tensor, x_b: torch.Tensor | None, batch: Any
     ) -> dict[str, Any]:
         """Forward pass logic for disentanglement."""
-        model = self.env.generator
+        model = self.inner_for_call(self.env.generator, "generator.enc_c")
         results = {"x_a": x_a, "x_b": x_b if x_b is not None else x_a}
-        class_idx_a = batch.get("contrast_idx")
-        if class_idx_a is not None:
-            class_idx_a = class_idx_a.to(x_a.device)
+        class_idx_a = read_batch_field(batch, "contrast_idx")
 
         # [FIX] Complex→Real guard: disentangled encoders use standard nn.Conv2d
         # which cannot handle complex tensors. Convert to magnitude representation.
@@ -478,20 +596,9 @@ class DisentangledTrainingStrategy(
         else:
             results["s_a"] = style_out_a
 
-        s_a_cond = results["s_a"]
-        if class_idx_a is not None and getattr(model, "class_embedding", None):
-            # [FIX] Clamp indices to valid range to prevent CUDA device-side assert.
-            # CANONICAL_CONTRASTS has 6 entries but num_classes may be smaller.
-            num_classes = model.class_embedding.num_embeddings
-            class_idx_a = class_idx_a.clamp(0, num_classes - 1)
-            s_a_cond = s_a_cond + model.class_embedding(class_idx_a)
-
-        x_a_recon_raw = model.gen(results["c_a"], s_a_cond)
-        # [FIX] Inject sequence parameters to complete the causal graph:
-        # style_encoder → sequence_mlp → Bloch simulator → L1 loss
-        if isinstance(x_a_recon_raw, dict) and getattr(model, "sequence_mlp", None):
-            seq_params = model.sequence_mlp(s_a_cond)
-            x_a_recon_raw.update(seq_params)
+        s_a_cond = model.condition_style(results["s_a"], class_idx_a)
+        # The model's one decode, shared with validation, forward and decode.
+        x_a_recon_raw = model.decode_tissue(results["c_a"], s_a_cond)
         results["x_a_recon"] = (
             self._synthesize_via_bloch(x_a_recon_raw, batch, "a")
             if isinstance(x_a_recon_raw, dict)
@@ -503,11 +610,7 @@ class DisentangledTrainingStrategy(
             style_out_b = model.enc_s(x_b)
             results["s_b"] = model.reparameterize(*style_out_b) if model.use_vae else style_out_b
 
-            x_ab_raw = model.gen(results["c_a"], results["s_b"])
-            # [FIX] Same injection for cross-translated output
-            if isinstance(x_ab_raw, dict) and getattr(model, "sequence_mlp", None):
-                seq_params_b = model.sequence_mlp(results["s_b"])
-                x_ab_raw.update(seq_params_b)
+            x_ab_raw = model.decode_tissue(results["c_a"], results["s_b"])
             results["x_ab"] = (
                 self._synthesize_via_bloch(x_ab_raw, batch, "ab")
                 if isinstance(x_ab_raw, dict)
@@ -535,15 +638,58 @@ class DisentangledTrainingStrategy(
         """
         return {}
 
+    #: Declared TR/TE/TI per contrast (``model_kwargs.bloch_protocol_by_contrast``); empty
+    #: leaves the echo-train render on its protocol-free defaults.
+    _protocol_map: Mapping[str, Mapping[str, float]] = MappingProxyType({})
+
+    #: Rows of the running validation pass for the disentanglement readings; ``None`` outside
+    #: a pass opened by ``reset_validation_metrics``.
+    _disentanglement: DisentanglementAccumulator | None = None
+
+    def reset_validation_metrics(self) -> None:
+        """Open a validation pass: also start the disentanglement accumulator."""
+        super().reset_validation_metrics()
+        self._disentanglement = DisentanglementAccumulator()
+
+    def finalize_validation(self) -> dict[str, float]:
+        """Close the pass: add the style/content probes and the swap distances.
+
+        Present only for arms whose batches carry ``contrast_idx``; a pass that saw fewer
+        than two contrast labels raises (``linear_probe``) because the factorisation claim
+        cannot be read from it.
+        """
+        summary = dict(super().finalize_validation())
+        acc, self._disentanglement = self._disentanglement, None
+        if acc is None or acc.n_rows == 0:
+            return summary
+        # A declared protocol owns the contrast: the tissue-map render takes no style code, so
+        # only the content readings describe the model (is anatomy contrast-invariant?).
+        include_style = not self._protocol_map
+        summary.update(acc.probes(include_style=include_style))
+        summary.update(
+            swap_distances(
+                self.env.generator,
+                lambda raw, row: self._synthesize_via_bloch(raw, row, "a"),
+                acc,
+                include_style=include_style,
+            )
+        )
+        return summary
+
     @torch.no_grad()
     def validation_step(
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Perform a single validation step."""
-        batch = (input_batch, target_batch)
+        """Perform a single validation step.
+
+        ``batch_data`` is the loader's batch; train.py forwards it only to a strategy
+        that declares it, and the Bloch render reads each sample's contrast from it.
+        """
+        batch = batch_data if batch_data is not None else (input_batch, target_batch)
         if input_batch is None or target_batch is None:
             if isinstance(batch, dict):
                 input_batch = pick_present(
@@ -559,7 +705,8 @@ class DisentangledTrainingStrategy(
 
         if input_batch is None:
             return {}
-        model = self.env.generator
+        # Validation runs under no_grad, so the non-forward calls read the inner module freely.
+        model = self.inner_for_call(self.env.generator, "generator.enc_c")
         model.eval()
 
         with torch.no_grad():
@@ -584,7 +731,14 @@ class DisentangledTrainingStrategy(
                             val,
                         ),
                     )
-                return TorchIOAdapter.to_batch_format(val.to(self.device), in_ch)
+                val = val.to(self.device)
+                # A collated 4D batch is already (B, C, H, W). The adapter reads a 4D tensor
+                # whose first dim equals in_ch as an unbatched (C, H, W, D) volume, so a
+                # batch of one with the slices as channels was permuted into a 1-channel
+                # tensor instead of reaching the channel check.
+                if val.ndim == 4:
+                    return val
+                return TorchIOAdapter.to_batch_format(val, in_ch)
 
             in_ch = self._in_channels
             x_a_raw = _prepare(input_batch, in_ch)
@@ -616,6 +770,51 @@ class DisentangledTrainingStrategy(
             x_a_flat = flatten(x_a_raw)
             x_b_flat = flatten(x_b_raw)
             target_flat = x_b_flat
+            n_rows = x_a_flat.shape[0]
+            cls_rows = read_batch_field(batch, "contrast_idx")
+            if isinstance(cls_rows, torch.Tensor):
+                if n_rows % cls_rows.numel():
+                    raise ValueError(f"{cls_rows.numel()} contrast_idx values for {n_rows} rows")
+                cls_rows = cls_rows.view(-1).repeat_interleave(n_rows // cls_rows.numel())
+            subject_rows = expand_row_names(read_batch_field(batch, "subject_id"), n_rows)
+            row_codes: torch.Tensor | None = None
+            row_acq: dict[str, torch.Tensor] | None = None
+
+            def _chunk_batch(lo: int, hi: int) -> dict:
+                # Per-row families and, when declared, protocol; read only when a tissue
+                # dict is rendered.
+                nonlocal row_codes, row_acq
+                if row_codes is None:
+                    row_codes = sequence_codes(
+                        batch, self._sequence_map, n_rows, torch.device("cpu")
+                    )
+                rows: dict[str, Any] = {"contrast_type": row_codes[lo:hi]}
+                if self._protocol_map:
+                    if row_acq is None:
+                        row_acq = acquisition_params(
+                            batch, self._protocol_map, n_rows, torch.device("cpu")
+                        )
+                    rows["acquisition"] = {k: v[lo:hi] for k, v in row_acq.items()}
+                return rows
+
+            def _decode(x_in: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+                c_a = model.enc_c(x_in)
+                style_out = model.enc_s(x_in)
+                s_a = model.reparameterize(*style_out) if model.use_vae else style_out
+                cls = None if cls_rows is None else cls_rows[lo:hi]
+                if cls is not None and self._disentanglement is not None:
+                    record_validation_rows(
+                        self._disentanglement,
+                        c_a,
+                        s_a,
+                        cls,
+                        (lambda: _chunk_batch(lo, hi)) if self._sequence_map else None,
+                        None if subject_rows is None else subject_rows[lo:hi],
+                    )
+                raw = model.decode_tissue(c_a, model.condition_style(s_a, cls))
+                if isinstance(raw, dict):
+                    return self._synthesize_via_bloch(raw, _chunk_batch(lo, hi), "a")
+                return raw
 
             if x_a_raw.ndim == 5:
                 chunk_size, num_slices = 1, x_a_flat.shape[0]
@@ -632,13 +831,9 @@ class DisentangledTrainingStrategy(
                         x_a_in = x_a_chunk[:, 0:1, ...]
                     elif x_a_chunk.shape[1] == 1 and in_ch == 3:
                         x_a_in = x_a_chunk.repeat(1, 3, 1, 1)
+                    self._require_model_channels(x_a_in, in_ch)
 
-                    c_a = model.enc_c(x_a_in)
-                    style_out = model.enc_s(x_a_in)
-                    s_a = model.reparameterize(*style_out) if model.use_vae else style_out
-                    x_a_recon_chunk = model.gen(c_a, s_a)
-                    if isinstance(x_a_recon_chunk, dict):
-                        x_a_recon_chunk = self._synthesize_via_bloch(x_a_recon_chunk, batch, "a")
+                    x_a_recon_chunk = _decode(x_a_in, i, end)
 
                     if i == 0:
                         self._last_visual_pred = x_a_recon_chunk.detach()
@@ -690,15 +885,10 @@ class DisentangledTrainingStrategy(
                         x_a_in = x_a_slice[:, 0:1, ...]
                     elif x_a_slice.shape[1] == 1 and in_ch == 3:
                         x_a_in = x_a_slice.repeat(1, 3, 1, 1)
+                    self._require_model_channels(x_a_in, in_ch)
 
                     # Validation runs in fp32 — Bloch synthesis FFT is unstable in fp16
-                    c_a = model.enc_c(x_a_in)
-                    style_out = model.enc_s(x_a_in)
-                    s_a = model.reparameterize(*style_out) if model.use_vae else style_out
-                    x_a_recon = model.gen(c_a, s_a)
-
-                    if isinstance(x_a_recon, dict):
-                        x_a_recon = self._synthesize_via_bloch(x_a_recon, batch, "a")
+                    x_a_recon = _decode(x_a_in, i, i + 1)
 
                     # Guard against NaN from early unstable training
                     x_a_recon = torch.nan_to_num(x_a_recon, nan=0.0)
@@ -811,6 +1001,20 @@ class DisentangledTrainingStrategy(
             model.train()
             return metrics
 
+    @staticmethod
+    def _require_model_channels(x: torch.Tensor, in_ch: int) -> None:
+        """Name the cause when validation input and encoder disagree on channels.
+
+        Whole-volume validation under ``data.sampling.enable_slab_mode`` delivers the
+        slices as channels; the encoder would only fail inside its padded first Conv2d.
+        """
+        if x.shape[1] != in_ch:
+            raise ValueError(
+                f"validation input has {x.shape[1]} channels but the model takes {in_ch}; "
+                "check data.sampling.enable_slab_mode (slab collation folds the volume's "
+                "slices into channels on whole-volume validation)"
+            )
+
     def _compute_tissue_bounds_loss(self, tp_a, tp_b) -> torch.Tensor:
         """Tissue bounds regularization."""
         total_loss, count = torch.tensor(0.0, device=self.device), 0
@@ -867,16 +1071,9 @@ class DisentangledTrainingStrategy(
         Reconstruction losses on the output image provide sufficient
         gradient signal for learning tissue parameters.
         """
-        # validation_step passes a ``(input, target)`` TUPLE as ``batch`` (it
-        # never carries the metadata dict), but the sequence-param lookups in
-        # _synthesize_via_bloch_fp32 call ``batch.get(...)`` -> AttributeError
-        # on a tuple. Coerce a non-dict batch to {} so those lookups are safe;
-        # the acquisition params are then resolved from the model prediction
-        # (disentangled_mri always emits predicted_{tr,te,ti,alpha}) via
-        # ``_resolve_acq_param`` — which fails loud if neither the model nor the
-        # batch supplies a value (no silent GRE default, pitfall #9).
-        if not isinstance(batch, dict):
-            batch = {}
+        # The batch passes through untouched: every read goes through read_batch_field,
+        # which reaches a TrainingBatch's metadata. Coercing it to {} rendered every
+        # sample as GRE (#2611).
         # [FIX] Force fp32 for Bloch synthesis — FFT, exponentials, and dipole
         # kernel operations overflow in fp16 under AMP, producing NaN.
         # Gradients flow normally; per-sample normalization in _synthesize_via_bloch_fp32
@@ -903,7 +1100,7 @@ class DisentangledTrainingStrategy(
         v = tissue_params.get(pred_key)
         if v is not None:
             return v
-        v = batch.get(batch_key)
+        v = read_batch_field(batch, batch_key)
         if v is not None:
             return v
         raise ValueError(
@@ -914,25 +1111,85 @@ class DisentangledTrainingStrategy(
             f"hardcoded default is applied (pitfall #9)."
         )
 
+    @staticmethod
+    def _apply_ir_prep(
+        signal: torch.Tensor, ti: Any, t1: torch.Tensor, is_ir: torch.Tensor
+    ) -> torch.Tensor:
+        """Inversion-recovery magnitude on the IR rows of an echo-train signal only."""
+        if isinstance(ti, torch.Tensor):
+            ti = ti.view(-1, 1, 1, 1)
+        prep = torch.abs(1.0 - 2.0 * torch.exp(-ti / t1))
+        return signal * torch.where(is_ir, prep, torch.ones_like(prep))
+
+    @classmethod
+    def _apply_echo_train_prep(
+        cls,
+        signal: torch.Tensor,
+        ti: Any,
+        t1: torch.Tensor,
+        is_ir: torch.Tensor,
+        acq: dict[str, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Longitudinal weighting of an echo-train signal.
+
+        With a declared protocol (``acq``): saturation ``1 - exp(-TR/T1)`` on spin-echo rows
+        and the inversion-recovery magnitude ``|1 - 2 exp(-TI/T1) + exp(-TR/T1)|`` on IR
+        rows. Without one, the TR-free inversion prep of every arm that predates it.
+        """
+        if acq is None:
+            return cls._apply_ir_prep(signal, ti, t1, is_ir)
+        e_tr = torch.exp(-acq["TR"] / t1)
+        inversion = torch.abs(1.0 - 2.0 * torch.exp(-acq["TI"] / t1) + e_tr)
+        return signal * torch.where(is_ir, inversion, 1.0 - e_tr)
+
     def _synthesize_via_bloch_fp32(
         self, tissue_params: dict, batch: dict, _source_key: str
     ) -> torch.Tensor:
         """Inner Bloch synthesis running in fp32."""
         # [FIX] Enforce physics/style coupling: prioritize network predictions
         # over batch metadata, completing the differentiable causal chain.
-        metadata = {
-            "TR": self._resolve_acq_param(tissue_params, batch, "predicted_tr", "TR"),
-            "TE": self._resolve_acq_param(tissue_params, batch, "predicted_te", "TE"),
-            "TI": self._resolve_acq_param(tissue_params, batch, "predicted_ti", "TI"),
-            "alpha": self._resolve_acq_param(tissue_params, batch, "predicted_alpha", "alpha"),
-            "contrast_type": batch.get("contrast_type", "GRE"),
-        }
-
-        contrast_idx = batch.get("contrast_idx")
-        # 1 and 2 are usually T2w and FLAIR based on standard configs.
-        is_fse = (contrast_idx is not None and contrast_idx in [1, 2]) or (
-            metadata["contrast_type"] in ["SE", "IR"]
+        metadata: dict[str, Any] = {}
+        if not self._protocol_map:  # a declared protocol supplies TR/TE/TI below instead
+            metadata = {
+                "TR": self._resolve_acq_param(tissue_params, batch, "predicted_tr", "TR"),
+                "TE": self._resolve_acq_param(tissue_params, batch, "predicted_te", "TE"),
+                "TI": self._resolve_acq_param(tissue_params, batch, "predicted_ti", "TI"),
+                "alpha": self._resolve_acq_param(
+                    tissue_params, batch, "predicted_alpha", "alpha"
+                ),
+            }
+        # Per-row families, decided on the host so the branch below costs no device sync.
+        rho = tissue_params["rho"]
+        codes = sequence_codes(batch, self._sequence_map, rho.shape[0], torch.device("cpu"))
+        fse_codes = torch.tensor(
+            [MultiPhysicsBlochLayer.SEQ_SPIN_ECHO, MultiPhysicsBlochLayer.SEQ_INVERSION_RECOVERY]
         )
+        is_fse = bool(torch.isin(codes, fse_codes).all())
+        metadata["contrast_type"] = codes.to(rho.device, non_blocking=True)
+        is_ir = metadata["contrast_type"] == MultiPhysicsBlochLayer.SEQ_INVERSION_RECOVERY
+
+        # The declared protocol replaces the style code's unconstrained prediction of
+        # TR/TE/TI: a free protocol trades off against the tissue maps and nothing
+        # identifies it. The echo train is read at echo ETL//2, so its spacing is TE / (ETL//2).
+        acq = None
+        te_spacing: float | torch.Tensor = 10.0
+        if self._protocol_map:
+            if not is_fse or not (self._fno_epg is not None or "b1_plus" in tissue_params):
+                raise ValueError(
+                    "bloch_protocol_by_contrast is declared, but these rows have no echo-train "
+                    "render: they need spin-echo or inversion-recovery families and either "
+                    "use_fno_epg or a B1+ map among the tissue outputs"
+                )
+            # Built on the host and copied without blocking, as the sequence codes above are:
+            # a tensor built on the device from a Python list syncs every training step.
+            acq = {
+                k: v.to(rho.device, non_blocking=True)
+                for k, v in acquisition_params(
+                    batch, self._protocol_map, rho.shape[0], torch.device("cpu")
+                ).items()
+            }
+            metadata.update(acq)
+            te_spacing = acq["TE"] / max(1, _ECHO_TRAIN_LENGTH // 2)
 
         _bloch_layer_normalized = False
         # Path 1: FNO EPG surrogate (O(N log N) differentiable replacement)
@@ -942,20 +1199,12 @@ class DisentangledTrainingStrategy(
                 t1=tissue_params["t1"],
                 t2=tissue_params["t2"],
                 b1_plus=tissue_params.get("b1_plus"),
-                te_spacing=10.0,
-                echo_train_length=16,
+                te_spacing=te_spacing,
+                echo_train_length=_ECHO_TRAIN_LENGTH,
             )
-
-            # If IR/FLAIR, apply inversion recovery scaling
-            if (contrast_idx is not None and contrast_idx == 2) or metadata[
-                "contrast_type"
-            ] == "IR":
-                TI_val = metadata["TI"]
-                if isinstance(TI_val, torch.Tensor):
-                    TI_val = TI_val.view(-1, 1, 1, 1)
-                t1 = tissue_params["t1"]
-                ir_prep = torch.abs(1.0 - 2.0 * torch.exp(-TI_val / t1))
-                signal = signal * ir_prep
+            signal = self._apply_echo_train_prep(
+                signal, metadata["TI"], tissue_params["t1"], is_ir, acq
+            )
 
         # Path 2: Analytical EPG (simplified differentiable proxy)
         elif is_fse and "b1_plus" in tissue_params:
@@ -978,18 +1227,10 @@ class DisentangledTrainingStrategy(
                 t2=t2,
                 excitation_fa=excitation_fa,
                 refocusing_fa=refocusing_fa,
-                echo_train_length=16,
+                echo_train_length=_ECHO_TRAIN_LENGTH,
+                te_spacing=te_spacing,
             )
-
-            # If IR/FLAIR, apply inversion recovery scaling
-            if (contrast_idx is not None and contrast_idx == 2) or metadata[
-                "contrast_type"
-            ] == "IR":
-                TI_val = metadata["TI"]
-                if isinstance(TI_val, torch.Tensor):
-                    TI_val = TI_val.view(-1, 1, 1, 1)
-                ir_prep = torch.abs(1.0 - 2.0 * torch.exp(-TI_val / t1))
-                signal = signal * ir_prep
+            signal = self._apply_echo_train_prep(signal, metadata["TI"], t1, is_ir, acq)
 
         # Path 3: MultiPhysicsBlochLayer (GRE/SPGR/DWI)
         else:
@@ -997,7 +1238,8 @@ class DisentangledTrainingStrategy(
             # Path 3 self-normalizes via _normalize_signal() — skip sig_max below
             _bloch_layer_normalized = True
 
-        if "bias_field" in tissue_params:
+        # The Bloch layer applies bias_field itself; only the echo-train paths need it here.
+        if "bias_field" in tissue_params and not _bloch_layer_normalized:
             signal = signal * tissue_params["bias_field"]
 
         # [FIX] Map susceptibility χ to R2' magnitude decay (not phase).
@@ -1047,6 +1289,12 @@ class DisentangledTrainingStrategy(
                 b, c, d, h, w = dephasing_factor.shape
                 dephasing_factor = dephasing_factor.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
 
+            # A spin echo refocuses static dephasing: R2' decays only the gradient-echo rows.
+            # Applied to every row, it weighted the shared chi map by each contrast's TE.
+            refocused = torch.isin(metadata["contrast_type"], fse_codes.to(signal.device))
+            dephasing_factor = torch.where(
+                refocused, torch.ones_like(dephasing_factor), dephasing_factor
+            )
             signal = signal * dephasing_factor
 
         if self._in_channels == 3 and signal.shape[1] == 1:

@@ -212,8 +212,6 @@ def test_fit_gan_honours_the_two_timescale_update_rule(monkeypatch):
     [
         "flow_matching",
         "rectified_flow",
-        "fisher_rao_flow",
-        "levy_diffusion",
         "resetting_diffusion",
         "tissue_diffusion_pretrain",
         # distinct subclasses with the identical training.diffusion contract
@@ -242,6 +240,13 @@ def test_fit_recon_routed_paradigm_uses_recon_defaults(monkeypatch):
     cap = _capture(monkeypatch)
     fit(nn.Conv2d(2, 2, 3, padding=1), _loader(), paradigm="dual_task", device="cpu")
     assert cap["settings"].training.strategy_class == "dual_task"
+
+
+def test_fit_fisher_rao_flow_takes_recon_defaults_without_diffusion_block(monkeypatch):
+    """fisher_rao_flow routes to ReconstructionTrainingStrategy, which refuses training.diffusion."""
+    cap = _capture(monkeypatch)
+    fit(nn.Conv2d(2, 2, 3, padding=1), _loader(), paradigm="fisher_rao_flow", device="cpu")
+    assert "diffusion" not in cap["settings"].training.model_fields_set
 
 
 def test_fit_nondefault_paradigm_without_config_raises():

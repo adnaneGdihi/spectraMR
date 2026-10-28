@@ -55,3 +55,40 @@ def test_forward_non_cubic_non_pow2() -> None:
     x = torch.randn(1, 8, 6, 10, 12)
     out = enc(x)
     assert out.shape == (1, 8, 6, 10, 12)
+
+
+class _NoMixing(torch.nn.Module):
+    """Stands in for the Mamba encoder so the time code runs on any box."""
+
+    def forward(self, x):
+        return torch.zeros_like(x)
+
+
+def _time_code(model, timesteps):
+    seen = []
+    model.encoder = _NoMixing()
+    model.time_mlp.register_forward_hook(lambda _m, args, _out: seen.append(args[0]))
+    model(torch.randn(timesteps.shape[0], 2, 1, 4, 4), timesteps=timesteps)
+    return seen[0].squeeze(-1)
+
+
+@pytest.mark.parametrize("horizon", [29, 1000])
+def test_hld_mamba_divides_by_its_horizon(horizon) -> None:
+    """PLANTED (#2442): t / 1000 put a 29-step chain in [0, 0.028]."""
+    from spectramr.models.generators.hdsf_mamba_generators import HDSFHLDMamba
+
+    model = HDSFHLDMamba(d_model=8, num_layers=1, d_state=4, block_size=4, dilation=2,
+                         time_embed_dim=8, num_timesteps=horizon)
+    code = _time_code(model, torch.tensor([0, horizon - 1]))
+    assert torch.equal(code, torch.tensor([0, horizon - 1]).float() / horizon)
+
+
+def test_exp_hm_09_resolves_its_declared_horizon() -> None:
+    """The only arm on this class declares T=1000, so its code is unchanged."""
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.builders.generator_kwargs import resolve_generator_kwargs
+    from spectramr.models.generators.hdsf_mamba_generators import HDSFHLDMamba
+
+    cfg = TrainingSettings.from_yaml("experiments/inprogress/hilbert_mamba/exp_hm_09_hld_mamba.yaml")
+    kwargs = resolve_generator_kwargs(config=cfg, model_cls=HDSFHLDMamba, device="cpu")
+    assert kwargs["num_timesteps"] == cfg.training.diffusion.timesteps == 1000

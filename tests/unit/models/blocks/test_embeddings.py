@@ -178,3 +178,12 @@ def test_patch_embedding_shape_matrix(img_size: int, patch_size: int, embed_dim:
     out = embed(x)
     expected_patches = (img_size // patch_size) ** 2
     assert out.shape == (1, expected_patches, embed_dim)
+
+
+def test_the_kan_time_embedding_spans_the_horizon_it_is_given():
+    """#2442: the default 1000 stood in for every chain length, so the horizon is required."""
+    from spectramr.models.blocks.embeddings import KANTimeEmbedding
+
+    with pytest.raises(TypeError, match="max_timesteps"):
+        KANTimeEmbedding(16)  # type: ignore[call-arg]
+    assert KANTimeEmbedding(16, max_timesteps=29).fourier_kan.max_positions == 29

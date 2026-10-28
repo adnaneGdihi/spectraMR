@@ -53,6 +53,10 @@ def _make_self(generator, *, metrics=None, chunk_size=2):
         _is_cold_diffusion=lambda: True,
         _build_generator_kwargs=_build_generator_kwargs,
         _compute_validation_metrics=_compute_validation_metrics,
+        # The probe stashes the acquired-line plane beside the mask (#2792) and drops the
+        # measurement-aware metrics its all-ones mask leaves undefined.
+        _acquired_plane_of=lambda kspace: None,
+        _t0_probe_dropped_metrics=DiffusionTrainingStrategy._t0_probe_dropped_metrics,
         # The probe chunks its forward on the same knob as the cascade rungs,
         # so the stub has to carry it; `validation: None` is a legal arm and
         # reaches this method too, which the sibling test below pins.
@@ -285,3 +289,123 @@ def test_emit_reports_defaults_to_true_so_the_cascade_is_unaffected():
         "emit_reports"
     ]
     assert param.default is True
+
+
+# --- the kept acquired-bin error, through the real scoring seam ------------------
+def _real_scoring_host(generator, input_kspace):
+    """A host whose ``_compute_validation_metrics`` is the production method.
+
+    The stubs above replace the scoring seam, so they cannot see what the seam
+    needs stashed. This one runs it: the measurement-aware pass reads
+    ``_zf_measurement``, and a probe that does not stash it scores ``nan``.
+    """
+    from types import MethodType
+    from unittest.mock import MagicMock
+
+    from spectramr.config.schemas.data import DataProcessingConfigSchema
+    from spectramr.core.metrics.acquired_bin_error import ACQUIRED_NAME
+    from spectramr.core.metrics.computer import ValidationMetricsComputer
+    from spectramr.core.metrics.types import MetricSpec, ValidationMetricsConfig
+    from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import MetricsMixin
+
+    host = MagicMock()
+    host.config = SimpleNamespace(
+        validation=SimpleNamespace(
+            loader=SimpleNamespace(chunk_size=1),
+            scoring=SimpleNamespace(
+                enable_image_metrics=True,
+                domain="image",
+                output_transform="ifft_sense_adjoint",
+                measurement_maps="off",
+            ),
+        ),
+        model=SimpleNamespace(model_type="kspace_cold_diffusion", input_type="kspace"),
+        data=SimpleNamespace(
+            processing=DataProcessingConfigSchema(
+                enable_kspace_normalization=False, enable_log_scaling=False
+            )
+        ),
+    )
+    host.generator_model = generator
+    host._is_cold_diffusion = MagicMock(return_value=True)
+    host._build_generator_kwargs = lambda **kw: {
+        "mask": kw["mask"],
+        "smaps": host._select_batch_compatible_smaps(input_kspace.shape[0]),
+    }
+    host._acquired_plane_of = lambda kspace: None
+    host._t0_probe_dropped_metrics = DiffusionTrainingStrategy._t0_probe_dropped_metrics
+    for name in ("_compute_validation_metrics", "_measurement_aware_metrics"):
+        setattr(host, name, MethodType(getattr(DiffusionTrainingStrategy, name), host))
+    for name in ("_metric_transform_views", "_apply_metric_transforms"):
+        setattr(host, name, MethodType(getattr(MetricsMixin, name), host))
+    for name in (
+        "_MEASUREMENT_AWARE_METRICS",
+        "_K_SPACE_METRICS",
+        "_PRED_SCALE_WARN_FRACTION",
+        "_ZF_BASELINE_METRICS",
+    ):
+        setattr(host, name, getattr(DiffusionTrainingStrategy, name))
+    host._select_batch_compatible_smaps = lambda batch: (
+        torch.ones(
+            batch, input_kspace.shape[1] // 2, *input_kspace.shape[-2:], dtype=torch.complex64
+        )
+        / (input_kspace.shape[1] // 2) ** 0.5
+    )
+    host._measure_prediction_scale = lambda pred, target: {
+        "pred_above_target_fraction": 0.0,
+        "target_abs_max": 1.0,
+        "pred_target_scale_ratio": 1.0,
+    }
+    host._convert_metrics_to_floats = lambda d: d
+    specs = [MetricSpec.from_name(n) for n in ("psnr", "hfen", ACQUIRED_NAME)]
+    host.validation_metrics_computer = ValidationMetricsComputer(
+        config=ValidationMetricsConfig(metrics=specs)
+    )
+    for name in ("_zf_measurement", "_rung_mask", "_rung_acquired", "_rung_measured_maps"):
+        setattr(host, name, None)
+    host._ensemble_members = None
+    return host
+
+
+def test_the_kept_acquired_bin_error_is_a_number_on_the_real_scoring_seam():
+    """The probe's one kept measurement-aware metric, and its input twin, are finite.
+
+    The pre-DC proposal is closer to the target than the input, so its acquired-bin
+    error sits below the input's: the reading the probe exists to report.
+    """
+    import math
+
+    gen_ = torch.Generator().manual_seed(0)
+    target = torch.randn(1, 4, 16, 16, generator=gen_)
+    noisy = target + 0.3 * torch.randn(target.shape, generator=gen_)
+    cleaner = target + 0.05 * torch.randn(target.shape, generator=gen_)
+
+    class _Denoiser:
+        exposes_pre_dc = True
+
+        def __call__(self, x, timesteps=None, *, return_pre_dc=False, **kwargs):
+            return x, cleaner[: x.shape[0]]
+
+    host = _real_scoring_host(_Denoiser(), noisy)
+    metrics = DiffusionTrainingStrategy._t0_pre_dc_probe_metrics(
+        host, target, noisy, None, torch.ones(1), 0
+    )
+    model = metrics["val_t0_predc_acquired_bin_nrmse"]
+    floor = metrics["val_t0_predc_zf_acquired_bin_nrmse"]
+    assert math.isfinite(model) and math.isfinite(floor), metrics
+    assert model < floor
+    assert host._zf_measurement is None, "the stash must not outlive the probe's scoring"
+
+
+def test_planted_the_seam_without_a_measurement_scores_nan():
+    """Planted: what the probe did before it stashed the measurement."""
+    import math
+
+    gen_ = torch.Generator().manual_seed(1)
+    target = torch.randn(1, 4, 16, 16, generator=gen_)
+    host = _real_scoring_host(_Generator(), target)
+    host._rung_mask = torch.ones_like(target[:, :1])
+    metrics = DiffusionTrainingStrategy._compute_validation_metrics(
+        host, target + 0.1, target, target, torch.zeros(1, dtype=torch.long), None, torch.ones(1)
+    )
+    assert math.isnan(float(metrics.get("val_acquired_bin_nrmse", float("nan"))))

@@ -27,7 +27,7 @@ _ARM = pathlib.Path(
     "experiments/inprogress/kspace_filling/attention_shootout/experiment_11_attention_none.yaml"
 )
 
-_KSPACE_ANCHOR = "  - name: complex_l1\n    weight: 1.0\n    enabled: true\n"
+_KSPACE_ANCHOR = "  - name: complex_l1\n    weight: 0.25\n    enabled: true\n"
 
 
 @pytest.fixture(scope="module")

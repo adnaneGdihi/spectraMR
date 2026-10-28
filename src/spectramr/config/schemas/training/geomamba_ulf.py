@@ -18,7 +18,9 @@ components of the paradigm:
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from spectramr.config.schemas.strictness import StrictSchema
 
@@ -114,6 +116,54 @@ class UnwarpConfig(StrictSchema):
             "into physical space when composing the unwarp."
         ),
     )
+    shift_mode: Literal["epi", "readout"] = Field(
+        default="epi",
+        description=(
+            "How a frequency offset becomes a pixel shift. 'epi': shift = df * echo_spacing_s * "
+            "N_pe along the phase-encode axis. 'readout': shift = df / pixel_bandwidth_hz along "
+            "the readout axis."
+        ),
+    )
+    echo_spacing_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="EPI echo spacing in seconds. Required when shift_mode is 'epi'.",
+    )
+    pixel_bandwidth_hz: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Readout pixel bandwidth in Hz (DICOM PixelBandwidth). Required when shift_mode is "
+            "'readout'; the batch does not carry it, so it is declared here."
+        ),
+    )
+    b0_map_key: str | None = Field(
+        default=None,
+        description="Batch field holding the B0 offset map in Hz. Required when enable_b0 is true.",
+    )
+    gnl_coeff_path: str | None = Field(
+        default=None,
+        description=(
+            "Gradient-nonlinearity coefficient file. Declared for a reader that is not wired yet; "
+            "setting it raises."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _shift_model_is_declared_when_a_term_is_on(self) -> UnwarpConfig:
+        if not (self.enable_b0 or self.enable_maxwell):
+            return self
+        if self.shift_mode == "epi" and self.echo_spacing_s is None:
+            raise ValueError(
+                "echo_spacing_s is required when shift_mode='epi' and enable_b0 or enable_maxwell "
+                "is true: the frequency offset has no pixel shift without it."
+            )
+        if self.shift_mode == "readout" and self.pixel_bandwidth_hz is None:
+            raise ValueError(
+                "pixel_bandwidth_hz is required when shift_mode='readout' and enable_b0 or "
+                "enable_maxwell is true."
+            )
+        return self
 
 
 class TopologyConfig(StrictSchema):
@@ -182,7 +232,13 @@ class GeoMambaULFTrainingConfigSchema(StrictSchema):
 
     metric_sfc: MetricSFCConfig = Field(default_factory=MetricSFCConfig)
     film: FiLMConfig = Field(default_factory=FiLMConfig)
-    unwarp: UnwarpConfig = Field(default_factory=UnwarpConfig)
+    # An undeclared block builds no unwarp (GeoMambaULFStrategy._build_ulf_unwarp), so its default
+    # has every term off; the all-on field defaults would fail the shift-parameter check.
+    unwarp: UnwarpConfig = Field(
+        default_factory=lambda: UnwarpConfig(
+            enable_b0=False, enable_grad_nonlinearity=False, enable_maxwell=False
+        )
+    )
     topology: TopologyConfig = Field(default_factory=TopologyConfig)
     uncertainty: UncertaintyConfig = Field(default_factory=UncertaintyConfig)
 

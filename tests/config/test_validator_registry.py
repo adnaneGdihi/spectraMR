@@ -23,7 +23,6 @@ from spectramr.config.schemas.validator_registry import (
     _validate_loss_weights_positive,
     _validate_model_in_out_channels,
     _validate_num_workers,
-    _validate_training_mode_compatibility,
     _validate_training_mode_specified,
     get_validator_registry,
 )
@@ -362,23 +361,6 @@ class TestValidationFunctions:
         # Invalid: out of range
         config = {"losses": {"gan": {"lambda_adv": 20.0}}}
         errors = _validate_loss_weights_positive(config)
-        assert len(errors) > 0
-
-    def test_validate_training_mode_compatibility(self) -> None:
-        """Test training mode compatibility."""
-        # Valid: GAN with GAN objective
-        config = {
-            "training": {"training_mode": "gan"},
-            "objectives": {"gan": {}},
-        }
-        assert _validate_training_mode_compatibility(config) == []
-
-        # Invalid: Diffusion without diffusion objective
-        config = {
-            "training": {"training_mode": "diffusion"},
-            "objectives": {"gan": {}},
-        }
-        errors = _validate_training_mode_compatibility(config)
         assert len(errors) > 0
 
     def test_validate_dataset_config(self) -> None:

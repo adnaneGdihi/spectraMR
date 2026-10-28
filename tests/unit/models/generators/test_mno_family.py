@@ -239,3 +239,12 @@ def test_me_mno_oh_is_exactly_equivariant() -> None:
             f"equivariance failed for perm={perm}, signs={signs}: "
             f"max diff {(y_g - g_y).abs().max().item():.4e}"
         )
+
+
+def test_me_mno_forwards_grad_checkpointing_to_backbone() -> None:
+    m = MEMNOOperator(
+        symmetry_group="identity", in_channels=1, out_channels=1,
+        spatial_shape=(16, 16), n_layers=1, modes=4, dim=8, d_state=4,
+    )
+    m.set_grad_checkpointing(True)
+    assert m.backbone.grad_checkpointing is True

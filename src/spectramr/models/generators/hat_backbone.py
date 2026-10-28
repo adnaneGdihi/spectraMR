@@ -153,7 +153,13 @@ class HATBackbone(GradCheckpointingMixin, nn.Module, IGenerator):
         k_view, i_view = both_domain_views(x, self.feature_domain)
         h = self.shallow_kspace(k_view) + self.shallow_image(i_view)
 
-        cond = self.time(timesteps, x.shape[0], x.device, max_timesteps=kwargs.get("max_timesteps"))
+        cond = self.time(
+            timesteps,
+            x.shape[0],
+            x.device,
+            max_timesteps=kwargs.get("max_timesteps"),
+            scale=kwargs.get("timestep_scale", "unit_interval"),
+        )
         cond = apply_contrast_conditioning(
             cond, kwargs.get("contrast_emb"), self.contrast_proj, owner="HATBackbone"
         )

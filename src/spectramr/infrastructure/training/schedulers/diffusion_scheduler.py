@@ -172,10 +172,10 @@ class DiffusionScheduler:
         # Also move t to the target device after gathering
         batch_size = t.shape[0]
 
-        # Use clamp to ensure indices are within bounds
-        t_clamped = torch.clamp(t, 0, tensor.shape[0] - 1)
-
-        out = tensor.gather(-1, t_clamped)
+        # No clamp: a timestep outside [0, T) comes from a different schedule
+        # (#2306), and a clamp answered it with the last entry. gather's own
+        # bounds check raises instead, without a host sync per step.
+        out = tensor.gather(-1, t)
         # Reshape to (batch_size, 1, 1, ...) to match all spatial/channel dimensions
         # This ensures proper broadcasting for all tensor dimensions
         return (

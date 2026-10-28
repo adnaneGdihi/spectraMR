@@ -439,7 +439,7 @@ class TrainingSettings(MockBaseModel):
             ),
             model=MockBaseModel(model_type="unet"),
             logging=MockBaseModel(log_dir="logs"),
-            checkpoint=MockBaseModel(save_dir="checkpoints"),
+            checkpoint=MockBaseModel(save_interval=1000),
         )
 
 

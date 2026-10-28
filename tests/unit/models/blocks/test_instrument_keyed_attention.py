@@ -118,6 +118,12 @@ def test_content_and_marker_are_capacity_matched() -> None:
     assert n_content == n_marker
 
 
+def test_none_drops_exactly_the_frame_attention_parameters() -> None:
+    """The stated capacity gap is 4C^2 + NC, the projections plus frame embedding."""
+    gap = sum(p.numel() for p in _block("content").parameters())
+    assert gap == 4 * C * C + N * C
+
+
 def test_none_carries_no_attention_parameters() -> None:
     """Absent, not disabled: a switched-off attention that still ran its
     projections would be a different model, not an ablation of one. The arms

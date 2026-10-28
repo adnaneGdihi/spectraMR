@@ -179,6 +179,7 @@ def test_model_output_pre_post_dc_are_authoritative_kspace(tmp_path, monkeypatch
     t = torch.zeros(1, 8, 8, 8)
     s.save_debug_snapshot(
         {
+            "model_output_backbone": t,
             "model_output_pre_dc": t,
             "model_output_post_dc": t,
             "target": t,
@@ -186,9 +187,16 @@ def test_model_output_pre_post_dc_are_authoritative_kspace(tmp_path, monkeypatch
         },
         step=0,
         tag="model_output",
-        in_kspace_keys={"model_output_pre_dc", "model_output_post_dc", "target", "input"},
+        in_kspace_keys={
+            "model_output_backbone",
+            "model_output_pre_dc",
+            "model_output_post_dc",
+            "target",
+            "input",
+        },
     )
     auth = captured["authoritative_kspace_keys"]
+    assert "model_output_backbone" in auth
     assert "model_output_pre_dc" in auth
     assert "model_output_post_dc" in auth
 

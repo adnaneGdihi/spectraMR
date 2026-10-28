@@ -64,3 +64,32 @@ def test_unknown_linearization_mode_raises() -> None:
     # Pitfall #9: an unknown scan order must raise, never fall back to raster.
     with pytest.raises(ValueError, match="Unknown linearization mode"):
         _build("not_a_real_curve")(torch.randn(1, 1, 32, 32))
+
+
+def test_run_block_checkpointing_matches_plain_grads() -> None:
+    """The checkpointed stage path yields the same output and gradient as the plain one."""
+
+    class _Stage(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4)
+
+        def forward(self, x, emb=None, ssm_override=None):
+            return self.lin(x).tanh()
+
+    model = _build("raster")
+    model.train()
+    stage = _Stage()
+    x = torch.randn(3, 4, requires_grad=True)
+
+    y_ref = model._run_block(stage, x, None, None)
+    y_ref.sum().backward()
+    g_ref = x.grad.clone()
+
+    x.grad = None
+    model.set_grad_checkpointing(True)
+    y = model._run_block(stage, x, None, None)
+    y.sum().backward()
+
+    assert torch.allclose(y, y_ref, atol=1e-6)
+    assert torch.allclose(x.grad, g_ref, atol=1e-6)

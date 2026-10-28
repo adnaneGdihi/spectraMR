@@ -71,25 +71,9 @@ class TestNoTrueSubFlagUnderADisabledParent:
     #: is explicitly ``enabled: true``.
     #:
     #: This set may shrink, never grow. It was five; three were flipped and one
-    #: reclassified on 2026-08-03, leaving one.
-    KNOWN_TRUE_UNDER_DISABLED_PARENT: ClassVar[frozenset[tuple[str, str]]] = frozenset(
-        {
-            # 594 parent-on arms, all relying on the default -- but the reason
-            # this was held back was WRONG. The old comment claimed flipping
-            # "changes data-consistency behaviour across a third of the corpus".
-            # It changes nothing: `enable_acs_replacement` has ZERO readers
-            # (grep the tree -- the only hits are its own Field declaration and
-            # this line), no `**` splat reaches it, and `model_builder.py:193`
-            # forwards exactly `enabled` / `method` / `weight`. It is an unwired
-            # knob (pitfall #15) whose description advertises a real mechanism --
-            # "hard-replaces predicted ACS lines with ground truth lines during
-            # inference/validation" -- that nothing implements, defaulting True
-            # on 594 arms. Its sibling `enable_acs_decoupling` is unwired too.
-            # Wiring it or deleting it is an owner call, not a default edit,
-            # so it stays here with the corrected justification. Issue #688.
-            ("DataConsistencyConfig", "enable_acs_replacement"),
-        }
-    )
+    #: reclassified on 2026-08-03, and the last, the unread
+    #: `DataConsistencyConfig.enable_acs_replacement`, is refused at load since #563.
+    KNOWN_TRUE_UNDER_DISABLED_PARENT: ClassVar[frozenset[tuple[str, str]]] = frozenset()
 
     #: Sub-flags that trip the rule and SHOULD keep defaulting True. Separated
     #: from the set above because the two mean opposite things: that one is

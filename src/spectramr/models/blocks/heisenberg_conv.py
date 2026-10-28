@@ -84,8 +84,9 @@ def twisted_convolution_step(
         psi = torch.complex(psi, torch.zeros_like(psi))
     h, w = psi.shape[-2:]
     out = torch.zeros_like(psi)
+    shift_list = shifts.tolist()  # one host transfer instead of two per lattice point
     for k_idx in range(kernel.shape[0]):
-        ay, ax = int(shifts[k_idx, 0].item()), int(shifts[k_idx, 1].item())
+        ay, ax = int(shift_list[k_idx][0]), int(shift_list[k_idx][1])
         shifted = torch.roll(psi, shifts=(ay, ax), dims=(-2, -1))
         ramped = shifted * phase_ramps[k_idx]  # broadcasting on (B, C, H, W)
         weighted = torch.einsum("co,bohw->bchw", kernel[k_idx], ramped)

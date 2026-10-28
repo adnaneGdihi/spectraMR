@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from spectramr.infrastructure.reporting.legend import sparse_ticks
 from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figure, write_sidecar
 from spectramr.infrastructure.reporting.plotters import _stats
 from spectramr.infrastructure.reporting.style import (
@@ -51,7 +52,7 @@ def make(
     metrics = [m for m in metrics if m in set(test["metric"])]
     if not metrics:
         return None
-    use_default_style("nature")
+    use_default_style()
     fig, axes = plt.subplots(
         1,
         len(metrics),
@@ -76,6 +77,7 @@ def make(
         ax.set_xticks(range(1, len(methods) + 1))
         ax.set_xticklabels(methods, rotation=20, ha="right")
         ax.set_ylabel(pretty_label(metric))
+        sparse_ticks(ax)
         if len(metrics) > 1:
             panel_label(ax, chr(ord("a") + j))
         # significance bracket between best two methods (by mean)

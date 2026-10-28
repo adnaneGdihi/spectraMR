@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
 
 from spectramr.models.losses.base_loss import BaseLoss, IComputableLoss
-
 
 # ---------------------------------------------------------------------------
 # Construction
@@ -160,3 +158,12 @@ def test_protocol_rejects_objects_without_forward() -> None:
         pass
 
     assert not isinstance(_NotALoss(), IComputableLoss)
+
+
+@pytest.mark.parametrize("cls", [BaseLoss, IComputableLoss])
+def test_the_math_block_survives_as_latex(cls: type) -> None:
+    """Non-raw docstrings turned ``\\text`` into a TAB plus ``ext``."""
+    doc = cls.__doc__ or ""
+    assert "\t" not in doc
+    assert "\\text{abstract}" in doc
+    assert "\\mathcal{L}" in doc and "\\\\mathcal" not in doc

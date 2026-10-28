@@ -15,7 +15,11 @@ ground truth via
 The loss therefore needs the *target* k-space mask :math:`\Theta` to be
 supplied via the loss ``context`` dict. ``prediction`` here is taken to
 be the network output already in image space (the loss applies the
-forward operator internally).
+forward operator internally): :math:`\mathbf{F}\mathbf{S}` when
+``context["coil_sensitivities"]`` carries complex maps, :math:`\mathbf{F}`
+otherwise. Robust SSDU scores all of :math:`\Omega` instead of :math:`\Theta`
+and weights the residual per location (``context["loss_weights"]``, inside the
+norm); the strategy supplies both.
 
 The "multi-mask" variant (Yaman *et al.* 2022) averages the SSDU loss
 over many random :math:`(\Lambda,\Theta)` splits per example, which
@@ -33,35 +37,62 @@ References:
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.infrastructure.physics.fft_ops import fft2c, sense_forward
 from spectramr.models.losses.registry import register_loss
 
 
 def _coerce_mask(mask: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     """Broadcast a sampling mask to the k-space tensor's shape.
 
-    Mask is expected as a real ``(H, W)``, ``(1, 1, H, W)``, or
+    Mask is expected as a real ``(H, W)``, ``(B, H, W)``, ``(1, 1, H, W)``, or
     ``(B, 1, H, W)`` boolean / float tensor.
     """
+    # A per-sample (B, H, W) mask lacks only the channel axis; padding it at the
+    # front would align B with the coil axis and score each sample on another's Θ.
+    if mask.dim() == like.dim() - 1 and mask.dim() >= 3:
+        mask = mask.unsqueeze(1)
     while mask.dim() < like.dim():
         mask = mask.unsqueeze(0)
     return mask.to(like.real.dtype if like.is_complex() else like.dtype)
 
 
-def _kspace_residual(
-    pred_image: torch.Tensor, target_kspace: torch.Tensor, theta_mask: torch.Tensor
-) -> torch.Tensor:
-    """Compute :math:`\\|\\mathbf{M}_\\Theta(F\\hat{x} - y)\\|_2^2`.
+def _predicted_kspace(pred_image: torch.Tensor, maps: torch.Tensor | None) -> torch.Tensor:
+    """``F S x`` with complex coil maps, ``F x`` without.
 
-    pred_image: real-valued :math:`(B, C, H, W)` or complex :math:`(B, 1, H, W)`.
+    Without maps a single-image prediction cannot be compared with multi-coil ``y``
+    at all, and the shape check below raises; the strategy passes the maps (#2327).
+    """
+    if maps is None:
+        return fft2c(pred_image)
+    if not (torch.is_complex(pred_image) and torch.is_complex(maps)):
+        raise ValueError(
+            "SSDU's coil operator F S needs a complex image prediction and complex "
+            f"maps, got {pred_image.dtype} and {maps.dtype}."
+        )
+    return sense_forward(pred_image, maps, None)
+
+
+def _kspace_residual(
+    pred_image: torch.Tensor,
+    target_kspace: torch.Tensor,
+    theta_mask: torch.Tensor,
+    maps: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute :math:`\\|W\\mathbf{M}_\\Theta(FS\\hat{x} - y)\\|_2^2`.
+
+    pred_image: complex :math:`(B, 1, H, W)` (or real, for a single-coil ``F``).
     target_kspace: complex :math:`(B, C, H, W)`.
     theta_mask: real, broadcastable to ``target_kspace``.
+    maps: optional complex :math:`(B, C, H, W)` coil sensitivities.
+    weights: optional real per-location weights inside the norm (Robust SSDU).
     """
-    pred_k = fft2c(pred_image)
+    pred_k = _predicted_kspace(pred_image, maps)
     if pred_k.shape != target_kspace.shape:
         raise ValueError(
             f"pred k-space shape {tuple(pred_k.shape)} != target k-space "
@@ -69,6 +100,8 @@ def _kspace_residual(
         )
     diff = pred_k - target_kspace
     masked = diff * _coerce_mask(theta_mask, diff)
+    if weights is not None:
+        masked = masked * _coerce_mask(weights, diff)
     # Treat real & imaginary channels equally
     if masked.is_complex():
         masked = torch.view_as_real(masked)
@@ -86,8 +119,15 @@ class SSDULoss(nn.Module):
     * ``target``: ignored (kept for registry signature).
     * ``context["target_kspace"]``: the *original* (multi-coil) k-space
       :math:`\mathbf{y}` before the :math:`\Theta`-split was applied.
-    * ``context["theta_mask"]``: the held-out mask :math:`\Theta`.
+    * ``context["theta_mask"]``: the held-out mask :math:`\Theta` (all of
+      :math:`\Omega` under Robust SSDU).
+    * ``context["coil_sensitivities"]`` (optional): complex maps for :math:`FS`.
+    * ``context["loss_weights"]`` (optional): Robust SSDU's per-location weights.
     """
+
+    #: The prediction is an image and the loss applies ``F S`` itself, so an
+    #: image-output arm lists it under ``kspace_losses`` with no bridge in front.
+    applies_forward_operator: ClassVar[bool] = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -96,7 +136,7 @@ class SSDULoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
@@ -107,7 +147,13 @@ class SSDULoss(nn.Module):
         theta_mask = context.get("theta_mask")
         if target_kspace is None or theta_mask is None:
             raise ValueError("context must supply 'target_kspace' and 'theta_mask'.")
-        return _kspace_residual(prediction, target_kspace, theta_mask)
+        return _kspace_residual(
+            prediction,
+            target_kspace,
+            theta_mask,
+            maps=context.get("coil_sensitivities"),
+            weights=context.get("loss_weights"),
+        )
 
 
 @register_loss(
@@ -137,6 +183,9 @@ class MultiMaskSSDULoss(nn.Module):
         norm: ``"l2"`` (default, paper) or ``"l1"``.
     """
 
+    #: See :attr:`SSDULoss.applies_forward_operator`.
+    applies_forward_operator: ClassVar[bool] = True
+
     def __init__(self, norm: str = "l2") -> None:
         super().__init__()
         if norm not in ("l1", "l2"):
@@ -147,12 +196,17 @@ class MultiMaskSSDULoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
             raise ValueError(
                 "MultiMaskSSDULoss requires context['target_kspace'] and context['theta_masks']."
+            )
+        if context.get("loss_weights") is not None:
+            raise ValueError(
+                "MultiMaskSSDULoss does not apply context['loss_weights'] (Robust SSDU); "
+                "use the 'ssdu' loss with alpha > 0, or set alpha to 0."
             )
         target_kspace = context.get("target_kspace")
         theta_masks = context.get("theta_masks")
@@ -164,12 +218,14 @@ class MultiMaskSSDULoss(nn.Module):
         if isinstance(theta_masks, torch.Tensor):
             theta_masks = [theta_masks[i] for i in range(theta_masks.shape[0])]
 
-        loss = prediction.new_zeros(())
+        # A real accumulator: a complex prediction's own dtype would make the loss complex.
+        real_dtype = prediction.real.dtype if prediction.is_complex() else prediction.dtype
+        loss = prediction.new_zeros((), dtype=real_dtype)
         # Pre-rolled: prediction has leading mask axis matching theta_masks
         if prediction.dim() == 5 and prediction.shape[0] == len(theta_masks):
+            maps = context.get("coil_sensitivities")
             for i, mk in enumerate(theta_masks):
-                pred_i = prediction[i]
-                pred_k = fft2c(pred_i)
+                pred_k = _predicted_kspace(prediction[i], maps)
                 diff = (pred_k - target_kspace) * _coerce_mask(mk, pred_k)
                 if self.norm == "l1":
                     loss = loss + diff.abs().mean()
@@ -179,9 +235,15 @@ class MultiMaskSSDULoss(nn.Module):
                     loss = loss + diff.pow(2).mean()
             return loss / len(theta_masks)
 
+        if prediction.dim() == 5:
+            raise ValueError(
+                f"MultiMaskSSDULoss got a pre-rolled prediction with {prediction.shape[0]} "
+                f"reconstructions but {len(theta_masks)} theta masks; they must pair one-to-one."
+            )
+
         # Single-prediction fallback: average over multiple holdouts
+        pred_k = _predicted_kspace(prediction, context.get("coil_sensitivities"))
         for mk in theta_masks:
-            pred_k = fft2c(prediction)
             diff = (pred_k - target_kspace) * _coerce_mask(mk, pred_k)
             if self.norm == "l1":
                 loss = loss + diff.abs().mean()
@@ -190,7 +252,3 @@ class MultiMaskSSDULoss(nn.Module):
                     diff = torch.view_as_real(diff)
                 loss = loss + diff.pow(2).mean()
         return loss / max(len(theta_masks), 1)
-
-
-# Suppress the lint about unused F import — kept for symmetry with siblings.
-_ = F

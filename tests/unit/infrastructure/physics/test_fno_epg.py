@@ -29,7 +29,8 @@ class TestFNOEPGSurrogate:
 
     @pytest.fixture
     def model(self):
-        """Create FNO EPG Surrogate."""
+        """Create FNO EPG Surrogate (seeded: an untrained net's B1+ sensitivity is ~1e-4)."""
+        torch.manual_seed(0)
         return FNOEPGSurrogate(
             tissue_channels=4,
             hidden_width=16,
@@ -79,6 +80,22 @@ class TestFNOEPGSurrogate:
 
         assert rho.grad is not None
         assert not torch.isnan(rho.grad).any()
+
+    def test_backward_through_a_predicted_b1_plus_map(self, model):
+        """A B1+ map that requires grad must backpropagate (it is the network's own output).
+
+        Writing the B1+-modulated flip angles into the sequence vector in place edited a
+        tensor autograd had saved for the product, so backward raised on the first step.
+        """
+        rho = (torch.rand(2, 1, 4, 4) + 0.2).requires_grad_(True)
+        t1 = (torch.full((2, 1, 4, 4), 1000.0)).requires_grad_(True)
+        t2 = (torch.full((2, 1, 4, 4), 80.0)).requires_grad_(True)
+        b1 = (torch.rand(2, 1, 4, 4) * 0.4 + 0.8).requires_grad_(True)
+
+        model(rho, t1, t2, b1, echo_train_length=16).sum().backward()
+
+        assert b1.grad is not None and torch.isfinite(b1.grad).all()
+        assert b1.grad.abs().sum() > 0
 
     def test_b1_plus_modulation(self, model):
         """B1+ should affect the output (different B1+ → different signal)."""

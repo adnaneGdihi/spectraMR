@@ -26,6 +26,7 @@ import pathlib
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # Anchored to this file, not to the CWD. A bare ``pathlib.Path("src/...")``
 # resolves against the process working directory, and this read happens at
@@ -111,7 +112,7 @@ def test_no_teacher_branch_logs_info_not_warning() -> None:
     assert "logger.warning(" not in preceding
 
 
-def _bare_strategy_with_resume(resume_from):
+def _bare_strategy_with_teacher(teacher_checkpoint):
     from spectramr.infrastructure.training.strategies.distillation_strategy import (
         ConcreteDistillationStrategy,
     )
@@ -120,24 +121,72 @@ def _bare_strategy_with_resume(resume_from):
     s.device = "cpu"
     s._teacher = None
     s.config = SimpleNamespace(
-        checkpoint=SimpleNamespace(resume_from=resume_from),
+        training=SimpleNamespace(
+            distillation=SimpleNamespace(teacher_checkpoint=teacher_checkpoint)
+        ),
         model=SimpleNamespace(in_channels=1, out_channels=1, model_kwargs=None),
     )
     return s
 
 
-def test_configured_teacher_load_failure_raises() -> None:
-    """When ``checkpoint.resume_from`` IS set but the load fails, the strategy
-    must RAISE — a run that explicitly requested distillation must not silently
-    train as plain reconstruction (pitfall #16). Contrast with the unconfigured
-    graceful mode above."""
-    s = _bare_strategy_with_resume("/nonexistent/teacher_checkpoint.pt")
+def test_configured_teacher_load_failure_raises(monkeypatch) -> None:
+    """When ``training.distillation.teacher_checkpoint`` IS set but the load fails,
+    the strategy must RAISE — a run that explicitly requested distillation must not
+    silently train as plain reconstruction (pitfall #16). Contrast with the
+    unconfigured graceful mode above."""
+    import spectramr.infrastructure.training.strategies.distillation_strategy as ds
+
+    # A Linear stands in for the oracle UNet: the failure under test is the load.
+    monkeypatch.setattr(ds, "_build_teacher", lambda config: torch.nn.Linear(1, 1))
+    s = _bare_strategy_with_teacher("/nonexistent/teacher_checkpoint.pt")
     with pytest.raises(RuntimeError, match="[Tt]eacher"):
         s._load_teacher()
 
 
 def test_unconfigured_teacher_is_graceful() -> None:
-    """No ``resume_from`` -> supported no-teacher mode, no raise, teacher None."""
-    s = _bare_strategy_with_resume(None)
+    """No ``training.distillation.teacher_checkpoint`` -> supported no-teacher mode,
+    no raise, teacher None."""
+    s = _bare_strategy_with_teacher(None)
     s._load_teacher()
     assert s._teacher is None
+
+
+def test_no_distillation_block_is_the_no_teacher_mode() -> None:
+    """``training.distillation`` defaults to ``None``: no teacher, no raise."""
+    s = _bare_strategy_with_teacher(None)
+    s.config.training.distillation = None
+    s._load_teacher()
+    assert s._teacher is None
+
+
+def test_a_configured_teacher_loads_through_weights(tmp_path, monkeypatch) -> None:
+    import spectramr.infrastructure.training.strategies.distillation_strategy as ds
+
+    seen: dict = {}
+    monkeypatch.setattr(ds, "weights", lambda ref, part, into, *, policy: seen.update(
+        ref=ref, part=part, policy=policy))
+    monkeypatch.setattr(ds, "_build_teacher", lambda config: torch.nn.Linear(1, 1))
+    s = _bare_strategy_with_teacher(str(tmp_path / "best.safetensors"))
+    s._load_teacher()
+    assert seen == {"ref": str(tmp_path / "best.safetensors"), "part": "generator", "policy": "overlap"}
+    assert all(not p.requires_grad for p in s._teacher.parameters())
+
+
+def test_the_student_latent_probe_reads_through_a_wrapper() -> None:
+    """A DDP/DP wrapper's forward takes only ``*inputs, **kwargs``; probing it dropped the
+    distillation term silently (#2629)."""
+    from spectramr.infrastructure.training.strategies.distillation_strategy import (
+        ConcreteDistillationStrategy,
+    )
+
+    class _Student(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Conv2d(1, 1, 1)
+
+        def forward(self, x, return_latent=False):
+            return self.conv(x)
+
+    wrapped = torch.nn.DataParallel(_Student())
+    assert ConcreteDistillationStrategy._student_returns_latent(wrapped)
+    assert not ConcreteDistillationStrategy._student_returns_latent(torch.nn.Conv2d(1, 1, 1))

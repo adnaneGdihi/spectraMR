@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
+
 
 class StrategyInitializationHelper:
     """Helper class for strategy initialization and common tasks."""
@@ -119,9 +121,9 @@ class StrategyInitializationHelper:
             return
 
         # 1. Prioritize model-integrated DC
-        gen = getattr(strategy, "generator_model", None)
-        if hasattr(gen, "module"):
-            gen = gen.module
+        # unwrap_model, not one ``.module`` hop: a compiled-then-DDP model nests
+        # as DDP(OptimizedModule), and the DC layer sits on the innermost module.
+        gen = unwrap_model(getattr(strategy, "generator_model", None))
 
         if hasattr(gen, "dc_layer") and gen.dc_layer is not None:
             strategy.dc_layer = gen.dc_layer

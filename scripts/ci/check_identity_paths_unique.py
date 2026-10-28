@@ -9,10 +9,8 @@ the evidence behind a published number is silently a mixture of two runs (#1930)
 
 **This gate resolves; it does not parse**, for the reason
 ``check_witness_corpus.py`` states: a gate that reads the YAML grades the
-document rather than the run. That is load-bearing here.
-``checkpoint.checkpoint_dir`` carries ``validation_alias="save_dir"`` and is the
-ONLY aliased field in the schema tree, with 293 corpus arms using the alias
-spelling. A parsing gate sees two independent keys where the run sees one field.
+document rather than the run. Defaults, renames and folds are applied before a
+value is compared, so the gate sees what the run sees.
 
 Two clauses, because the first has a blind spot the second covers:
 
@@ -35,11 +33,9 @@ names are in fact shared by fourteen arms, three of them a control arm carrying
 its treatment arm's name, but gating on collisions in a value no run consumes
 would report a defect nothing can act on; the unread knob is filed instead.
 
-Two blind spots follow from the scope and are tracked
-separately: relative values, which resolve against the launch CWD; and an arm
-declaring BOTH spellings of the aliased field, where the alias wins and the
-visible ``checkpoint_dir`` never reaches the run. ``docs/contributing/ci.rst``
-carries the measurements and the reasoning for all four decisions.
+One blind spot follows from the scope and is tracked separately: relative
+values, which resolve against the launch CWD. ``docs/contributing/ci.rst``
+carries the measurements and the reasoning for these decisions.
 
 ``test_kspace_filling_cohort_invariants.py::test_o_identity_paths_name_this_arm``
 enforces a *stricter, different* invariant -- every identity path must name
@@ -77,10 +73,9 @@ BASELINE = REPO_ROOT / "scripts" / "ci" / "identity_paths_baseline.txt"
 
 #: ``IDENTITY_PATHS`` is imported, not restated (non-negotiable 17). It names the
 #: dotted attribute paths on the RESOLVED settings object that locate an arm's
-#: artifacts -- canonical spellings only, since the schema has already folded
-#: ``save_dir`` into ``checkpoint_dir``, which is the point of resolving rather
+#: artifacts -- canonical spellings only, which is the point of resolving rather
 #: than parsing. Its owner is ``config_health_checker``, whose sibling check
-#: ``check_identity_paths_agree`` applies the same six paths WITHIN one config;
+#: ``check_identity_paths_agree`` applies the same paths WITHIN one config;
 #: this gate applies them ACROSS the corpus. Two copies of the list would let
 #: those two answers disagree about what an identity path is.
 

@@ -185,10 +185,6 @@ class WindowAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
-        # Add relative position bias
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(
@@ -196,18 +192,20 @@ class WindowAttention(nn.Module):
             self.window_size[0] * self.window_size[1],
             -1,
         )
-        attn = attn + relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+        bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # (1, nH, N, N)
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1,
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            # Fold the window axis into the head axis: one 4-D fused SDPA call, bias (1, nW*nH, N, N).
+            bias = (bias + mask.unsqueeze(1)).reshape(1, nW * self.num_heads, N, N)
+            q, k, v = (t.reshape(B_ // nW, nW * self.num_heads, N, -1) for t in (q, k, v))
 
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias.to(q.dtype),
+            dropout_p=getattr(self.attn_drop, "p", 0.0) if self.training else 0.0,
+            scale=self.scale,
+        )
+        x = x.reshape(B_, self.num_heads, N, -1).transpose(1, 2).reshape(B_, N, C)
         return self.proj_drop(self.proj(x))
 
 

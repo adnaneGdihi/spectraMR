@@ -9,15 +9,11 @@ clean run and is exactly how a detector test passes vacuously. ``_place`` assert
 the mutation actually took, and ``test_every_planted_corpus_loads`` asserts no
 plant was silently skipped as schema-invalid.
 
-The shapes deliberately include two the obvious implementation misses:
-
-* **same-stem duplicates** -- two arms with the same FILENAME in different
-  cohorts. A census keyed on the stem collapses them into one entry and can never
-  report them; that bug shipped in the first census written for #1930 and made it
-  report 2 arms where the issue correctly said 5.
-* **a collision spelled across the alias** -- one arm declaring ``save_dir`` and
-  another ``checkpoint_dir``, the same field under its two names. A gate that
-  parses YAML sees two unrelated keys and never compares them.
+The shapes deliberately include one the obvious implementation misses:
+**same-stem duplicates** -- two arms with the same FILENAME in different cohorts.
+A census keyed on the stem collapses them into one entry and can never report
+them; that bug shipped in the first census written for #1930 and made it report 2
+arms where the issue correctly said 5.
 """
 
 from __future__ import annotations
@@ -42,8 +38,6 @@ _REAL_ARM = (
 #: Where each in-scope identity path lives in the raw document.
 _BLOCKS: dict[str, tuple[str, ...]] = {
     "training.output_dir": ("training", "output_dir"),
-    "checkpoint.checkpoint_dir": ("checkpoint", "checkpoint_dir"),
-    "checkpoint.save_dir": ("checkpoint", "save_dir"),
     "logging.sinks.dir": ("logging", "sinks", "dir"),
     "loss_logging.output_dir": ("loss_logging", "output_dir"),
     "loss_logging.csv_path": ("loss_logging", "csv_path"),
@@ -139,29 +133,6 @@ def test_same_stem_duplicate_is_found(tmp_path: Path) -> None:
     assert arms == ["cohort_a/twin.yaml", "cohort_b/twin.yaml"]
 
 
-def test_a_collision_spelled_across_the_alias_is_found(tmp_path: Path) -> None:
-    """``save_dir`` and ``checkpoint_dir`` are ONE field under two names.
-
-    This is the plant that justifies resolving instead of parsing: a gate reading
-    the raw document sees two unrelated keys here and reports nothing.
-    """
-    _place(
-        tmp_path / "a" / "one.yaml", checkpoint__save_dir="experiments/results/shared/checkpoints"
-    )
-    _place(
-        tmp_path / "b" / "two.yaml",
-        checkpoint__checkpoint_dir="experiments/results/shared/checkpoints",
-    )
-    duplicates, _, unloadable = _findings(tmp_path)
-    assert unloadable == 0
-    assert duplicates == {
-        "duplicate::checkpoint.checkpoint_dir::experiments/results/shared/checkpoints": [
-            "a/one.yaml",
-            "b/two.yaml",
-        ]
-    }
-
-
 def test_hijack_without_a_duplicate_is_found(tmp_path: Path) -> None:
     """Clause 1's blind spot: a pointer at an arm that spells its own path differently.
 
@@ -182,13 +153,13 @@ def test_hijack_without_a_duplicate_is_found(tmp_path: Path) -> None:
 def test_a_hijack_is_seen_at_any_depth(tmp_path: Path) -> None:
     """The named arm sits in a MIDDLE segment, not the last one.
 
-    A first-or-last-segment rule misses ``.../<name>/checkpoints`` entirely, which
+    A first-or-last-segment rule misses ``.../<name>/metrics`` entirely, which
     scored the real offending arm at 1 key instead of 6.
     """
     _place(tmp_path / "c" / "leader.yaml", training__output_dir="experiments/results/leader_v2")
     _place(
         tmp_path / "c" / "follower.yaml",
-        checkpoint__checkpoint_dir="experiments/results/leader/checkpoints",
+        metrics__output_dir="experiments/results/leader/metrics",
     )
     _, hijacks, _ = _findings(tmp_path)
     assert len(hijacks) == 1
@@ -222,7 +193,7 @@ def test_an_arm_naming_itself_is_not_a_hijack(tmp_path: Path) -> None:
     _place(
         tmp_path / "c" / "solo.yaml",
         training__output_dir="experiments/results/solo",
-        checkpoint__checkpoint_dir="experiments/results/solo/checkpoints",
+        metrics__output_dir="experiments/results/solo/metrics",
     )
     duplicates, hijacks, _ = _findings(tmp_path)
     assert duplicates == {}
@@ -230,17 +201,17 @@ def test_an_arm_naming_itself_is_not_a_hijack(tmp_path: Path) -> None:
 
 
 def test_relative_paths_are_out_of_scope(tmp_path: Path) -> None:
-    """Both arms resolve ``./checkpoints`` and still produce no finding.
+    """Both arms resolve ``./metrics`` and still produce no finding.
 
     Not an endorsement: relative values collide in the launch CWD and are a
-    corpus-wide defect owned by the schema default, tracked separately. This test
-    pins the SCOPE so the exclusion cannot be lost by accident.
+    corpus-wide defect, tracked separately. This test pins the SCOPE so the
+    exclusion cannot be lost by accident.
     """
-    one = _place(tmp_path / "c" / "one.yaml", checkpoint__save_dir="./checkpoints")
-    _place(tmp_path / "c" / "two.yaml", checkpoint__save_dir="./checkpoints")
+    one = _place(tmp_path / "c" / "one.yaml", metrics__output_dir="./metrics")
+    _place(tmp_path / "c" / "two.yaml", metrics__output_dir="./metrics")
     duplicates, _, unloadable = _findings(tmp_path)
     assert unloadable == 0, "an unloadable plant would make this pass for the wrong reason"
-    assert yaml.safe_load(one.read_text())["checkpoint"]["save_dir"] == "./checkpoints"
+    assert yaml.safe_load(one.read_text())["metrics"]["output_dir"] == "./metrics"
     assert duplicates == {}
 
 

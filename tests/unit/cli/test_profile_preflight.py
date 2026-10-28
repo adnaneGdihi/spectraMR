@@ -60,9 +60,17 @@ def settings(*, strategy="none", max_iterations=None, interval_steps=100, on_epo
 
 
 def args(**over):
-    base = {"target": "train", "extra": []}
+    base = {"target": "train", "extra": [], "config": "arm.yaml"}
     base.update(over)
     return argparse.Namespace(**base)
+
+
+@pytest.fixture(autouse=True)
+def _arm_trains(monkeypatch):
+    """Default: the arm's model is a network; parameter-free tests override this."""
+    monkeypatch.setattr(
+        "spectramr.cli.manifest_dispatch.declares_parameter_free_arm", lambda config: False
+    )
 
 
 # ------------------------------------------------- guard 1: process-group strategies
@@ -87,13 +95,30 @@ def test_infer_is_exempt_because_it_applies_no_parallelism():
     pf.check_parallel_strategy(settings=settings(strategy="deepspeed"), target="infer")
 
 
-def test_refusal_names_the_workaround_that_actually_works():
-    """The message must NOT suggest `-O parallel.strategy=none` (issue #1480)."""
+def test_refusal_names_the_single_process_flag():
     with pytest.raises(ValueError) as exc:
         pf.check_parallel_strategy(settings=settings(strategy="deepspeed"), target="train")
-    msg = str(exc.value)
-    assert "does NOT work" in msg and "#1480" in msg
-    assert "copy" in msg.lower()
+    assert "--single-process" in str(exc.value)
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "deepspeed"])
+def test_single_process_overrides_validate_and_clear_the_guard(strategy):
+    """Applied through the real override parser, so #1480's 'none' -> None regresses red."""
+    argv = pf.single_process_overrides(settings(strategy=strategy))
+    assert argv == [
+        "--override",
+        "parallel.strategy=none",
+        "--override",
+        f"parallel.{strategy}.enabled=false",
+    ]
+    resolved = pf.effective_settings(settings(strategy=strategy), argv)
+    assert resolved.parallel.strategy == "none"
+    pf.check_parallel_strategy(settings=resolved, target="train")
+
+
+@pytest.mark.parametrize("strategy", ["none", "dp"])
+def test_single_process_overrides_are_a_noop_without_a_process_group(strategy):
+    assert pf.single_process_overrides(settings(strategy=strategy)) == []
 
 
 def test_process_group_strategies_matches_the_registry():
@@ -247,3 +272,35 @@ def test_run_preflight_runs_both_checks():
         pf.run_preflight(args(), settings(strategy="ddp"))
     with pytest.raises(ValueError, match="can NEVER fire"):
         pf.run_preflight(args(), settings(max_iterations=300, interval_steps=5000))
+
+
+# ------------------------------------------------- guard 3: parameter-free arms
+
+
+@pytest.mark.parametrize("target", ["train", "sanity_check"])
+def test_a_parameter_free_arm_is_refused_for_training_targets(monkeypatch, target):
+    monkeypatch.setattr(
+        "spectramr.cli.manifest_dispatch.declares_parameter_free_arm", lambda config: True
+    )
+    with pytest.raises(ValueError, match="nothing to train"):
+        pf.run_preflight(args(target=target), settings())
+
+
+def test_a_parameter_free_arm_may_still_be_inferred(monkeypatch):
+    monkeypatch.setattr(
+        "spectramr.cli.manifest_dispatch.declares_parameter_free_arm", lambda config: True
+    )
+    pf.run_preflight(args(target="infer"), settings())
+
+
+def test_a_trainable_arm_passes_the_parameter_free_check():
+    pf.check_parameter_free(config="arm.yaml", target="train")
+
+
+def test_a_torchless_interpreter_reports_instead_of_guessing(monkeypatch, caplog):
+    def no_torch(config):
+        raise ImportError("no torch", name="torch")
+
+    monkeypatch.setattr("spectramr.cli.manifest_dispatch.declares_parameter_free_arm", no_torch)
+    pf.check_parameter_free(config="arm.yaml", target="train")
+    assert any("check skipped" in r.getMessage() for r in caplog.records)

@@ -414,18 +414,17 @@ def test_beta_schedule_kwarg_is_honoured():
 
 
 # ---------------------------------------------------------------------------
-# Stage-1 VAE hand-off (2026-07-11).
+# Stage-1 VAE hand-off.
 #
-# CheckpointDirector.save() writes the weights under the key "generator" (and
-# also writes "epoch"). The loader only looked for "model_state_dict" /
-# "state_dict", and its raw-dict fallback is disabled by the presence of
-# "epoch" — so EVERY stage-1 checkpoint this repo produces failed to load and
-# the LDM silently trained against a randomly-initialised VAE.
+# The training builder reads the stage-1 RunState's generator part and hands it to
+# ``load_autoencoder_state``; the generator does no checkpoint IO itself. Before the
+# 2026-07-11 fix the loader missed the writer's key and the LDM silently trained
+# against a randomly-initialised VAE, so every incomplete restore must raise.
 # ---------------------------------------------------------------------------
 
 
-def _stage1_checkpoint(tmp_path, key: str = "generator"):
-    """Write a checkpoint shaped exactly like CheckpointDirector.save()."""
+def _stage1_state():
+    """The generator part a stage-1 ``autoencoder_kl_pretrain`` run writes."""
     from spectramr.models.generators.autoencoder_pretrain_generator import (
         AutoencoderPretrainGenerator,
     )
@@ -440,27 +439,16 @@ def _stage1_checkpoint(tmp_path, key: str = "generator"):
         base_channels=16,
         spatial_dims=2,
     )
-    path = tmp_path / "checkpoint_best.pt"
-    torch.save(
-        {
-            "epoch": 3,
-            "global_step": 3000,
-            key: stage1.state_dict(),
-            "optimizer_g": {},
-            "metrics": {"val_psnr": 34.9},
-        },
-        path,
-    )
-    return path, stage1
+    return dict(stage1.state_dict()), stage1
 
 
-def test_loads_checkpoint_director_generator_key(tmp_path):
-    """The 'generator' key written by CheckpointDirector must be recognised."""
-    path, stage1 = _stage1_checkpoint(tmp_path)
+def test_load_autoencoder_state_strips_the_stage1_prefix():
+    """The stage-1 generator's keys sit under ``autoencoder.``; they must land."""
+    state, stage1 = _stage1_state()
+    assert any(k.startswith("autoencoder.") for k in state)
 
-    gen = LatentDiffusionGenerator(
-        _config(), num_layers=3, vae_checkpoint_path=str(path), freeze_vae=True
-    )
+    gen = LatentDiffusionGenerator(_config(), num_layers=3)
+    gen.load_autoencoder_state(state, freeze=True, source="stage1/best.safetensors")
 
     # Weights actually transferred (not left at random init).
     ref = stage1.autoencoder.state_dict()
@@ -471,50 +459,42 @@ def test_loads_checkpoint_director_generator_key(tmp_path):
     else:  # pragma: no cover - defensive
         pytest.fail("no comparable autoencoder parameter found")
 
-    # freeze_vae=True must actually freeze.
+    # freeze=True must actually freeze.
     assert all(not p.requires_grad for p in gen.autoencoder.parameters())
 
 
-def test_unloadable_vae_checkpoint_raises_not_warns(tmp_path):
-    """A checkpoint with no recognisable state-dict must RAISE (#9), never warn
-    and silently leave the autoencoder random-initialised."""
-    path = tmp_path / "checkpoint_best.pt"
-    torch.save({"epoch": 1, "metrics": {}, "not_a_state_dict": 123}, path)
-
-    with pytest.raises(RuntimeError, match="state-dict"):
-        LatentDiffusionGenerator(_config(), num_layers=3, vae_checkpoint_path=str(path))
+def test_the_constructor_no_longer_reads_the_file():
+    """The path is the builder's to read; the constructor only validates the backbone."""
+    LatentDiffusionGenerator(
+        _config(), num_layers=3, vae_backbone="custom", vae_checkpoint_path="/does/not/exist"
+    )
 
 
-def test_vae_checkpoint_with_no_matching_keys_raises(tmp_path):
+def test_vae_checkpoint_with_no_matching_keys_raises():
     """Architecture divergence between stage-1 and stage-2 must RAISE (#9)."""
-    path = tmp_path / "checkpoint_best.pt"
-    torch.save({"epoch": 1, "generator": {"totally.unrelated.weight": torch.zeros(2)}}, path)
+    gen = LatentDiffusionGenerator(_config(), num_layers=3)
+    with pytest.raises(RuntimeError, match="contained no keys matching"):
+        gen.load_autoencoder_state(
+            {"totally.unrelated.weight": torch.zeros(2)}, freeze=True, source="x.pt"
+        )
 
-    with pytest.raises(RuntimeError, match="no keys matching"):
-        LatentDiffusionGenerator(_config(), num_layers=3, vae_checkpoint_path=str(path))
 
-
-def test_partially_matching_vae_checkpoint_raises(tmp_path):
-    """A checkpoint that restores only SOME autoencoder tensors must RAISE (#9).
+def test_partially_matching_vae_checkpoint_raises():
+    """A state that restores only SOME autoencoder tensors must RAISE (#9).
 
     ``load_state_dict(strict=False)`` tolerates missing keys by leaving them at
     their random init, and the emptiness guard only catches a *total* miss. A
-    stage-1 VAE whose key set merely diverges (different depth) therefore loaded
-    a PARTIALLY random autoencoder and still reported PASS — the same defect the
-    'generator'-key fix closes, reached by a different door.
+    stage-1 VAE whose key set merely diverges (different depth) would otherwise
+    load a PARTIALLY random autoencoder and still report PASS.
     """
-    path, stage1 = _stage1_checkpoint(tmp_path)
+    state, _ = _stage1_state()
+    # Key names and shapes still line up; the restore is incomplete. This is the
+    # depth-drift case (shape drift already raises inside load_state_dict).
+    del state[next(k for k in state if k.startswith("autoencoder."))]
 
-    # Drop one tensor: key names still line up, shapes still line up, but the
-    # restore is incomplete. This is the depth-drift case (shape drift already
-    # raises inside load_state_dict).
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    dropped = next(k for k in ckpt["generator"] if k.startswith("autoencoder."))
-    del ckpt["generator"][dropped]
-    torch.save(ckpt, path)
-
-    with pytest.raises(RuntimeError, match="randomly initialised"):
-        LatentDiffusionGenerator(_config(), num_layers=3, vae_checkpoint_path=str(path))
+    gen = LatentDiffusionGenerator(_config(), num_layers=3)
+    with pytest.raises(RuntimeError, match="restored only"):
+        gen.load_autoencoder_state(state, freeze=True, source="x.pt")
 
 
 class TestValidationSamplerSteps:
@@ -572,6 +552,22 @@ class TestValidationSamplerSteps:
         # Strided schedule must run strictly high -> low and end at t=0.
         assert seen == sorted(seen, reverse=True)
         assert seen[-1] == 0
+
+    def test_the_full_chain_passes_the_timestep_to_p_sample_step(self, monkeypatch):
+        """PLANTED (#482): the loop counter went in, so the FIRST step (t = T-1) dropped
+        its posterior noise and the last one kept it."""
+        gen = self._gen(timesteps=20)
+        self._count_denoiser_calls(gen, monkeypatch)
+        passed: list[int] = []
+        real = gen.diffusion.p_sample_step
+
+        def _spy(x, t, noise, t_index):
+            passed.append(int(t_index))
+            return real(x, t, noise, t_index)
+
+        monkeypatch.setattr(gen.diffusion, "p_sample_step", _spy)
+        gen.sample((1, 1, 16, 16), device="cpu")
+        assert passed == list(range(19, -1, -1))
 
     def test_default_runs_the_full_reverse_loop(self, monkeypatch):
         gen = self._gen(timesteps=20)
@@ -670,3 +666,221 @@ def test_quant_conv_receives_no_gradient_from_the_stage1_objective() -> None:
     )
     # The decoder-side twin IS trained, because decode() applies it.
     assert gen.autoencoder.post_quant_conv.weight.grad is not None
+
+
+# ── multi-axis CFG + channel_multipliers (LM-19) ─────────────────────────────
+
+
+def _cfg_gen(**kwargs) -> LatentDiffusionGenerator:
+    # Explicit arguments: a config object makes the generator ignore these kwargs.
+    return LatentDiffusionGenerator(
+        in_channels=1,
+        out_channels=1,
+        latent_channels=4,
+        base_channels=16,
+        timesteps=5,
+        spatial_dims=2,
+        num_layers=3,
+        conditional_translation=True,
+        use_contrast_guidance=True,
+        num_contrasts=3,
+        **kwargs,
+    )
+
+
+def test_channel_multipliers_set_the_unet_depth():
+    gen = _cfg_gen(channel_multipliers=[1, 2, 4, 4])
+    assert tuple(gen.denoise_net.channel_mult) == (1, 2, 4, 4)
+    assert tuple(_cfg_gen().denoise_net.channel_mult) == (1, 2, 4)
+
+
+@pytest.mark.parametrize("bad", [[], [1, 0], [1, "2"], "124", 4])
+def test_bad_channel_multipliers_raise(bad):
+    with pytest.raises(ValueError, match="channel_multipliers"):
+        _cfg_gen(channel_multipliers=bad)
+
+
+def test_declaring_a_no_data_axis_raises_at_construction():
+    with pytest.raises(ValueError, match="thickness"):
+        _cfg_gen(cfg_drop_probs={"contrast": 0.1, "thickness": 0.05})
+
+
+def _wake_zero_init(gen: LatentDiffusionGenerator) -> None:
+    """Zero-initialised embedding projections hide conditioning at init; perturb them."""
+    with torch.no_grad():
+        for p in gen.denoise_net.parameters():
+            if not p.any():
+                p.normal_(0.0, 0.1)
+
+
+def test_contrast_drop_changes_the_training_forward():
+    """A dropped contrast row equals the contrast_idx=None path, not index 0."""
+    torch.manual_seed(0)
+    gen = _cfg_gen(cfg_drop_probs={"condition": 0.0, "contrast": 0.999999}).train()
+    gen.denoise_net.eval()  # U-Net dropout off; the generator stays in training mode
+    _wake_zero_init(gen)
+    z = torch.randn(2, 4, 4, 4)
+    t = torch.tensor([1, 2])
+    cond = torch.randn(2, 1, 32, 32)
+    idx = torch.tensor([0, 2])
+    dropped = gen(z, t, context={"contrast_idx": idx}, condition_image=cond)
+    unet_in = torch.cat([z, gen.encode_condition(cond)], dim=1)
+    with torch.no_grad():
+        null = gen._process_slices(unet_in, t, contrast_idx=None)
+        kept = gen._process_slices(unet_in, t, contrast_idx=idx)
+    assert torch.allclose(dropped, null, atol=1e-5)
+    assert not torch.allclose(dropped, kept)
+
+
+def test_absent_cfg_knobs_reproduce_the_legacy_condition_drop():
+    """Same seed, same 10% bernoulli mask on the ULF latent as before LM-19."""
+    gen = _cfg_gen().train()
+    gen.denoise_net.eval()
+    z = torch.randn(4, 4, 4, 4)
+    t = torch.tensor([1, 2, 3, 4])
+    cond = torch.randn(4, 1, 32, 32)
+    idx = torch.tensor([0, 1, 2, 0])
+    torch.manual_seed(3)
+    out = gen(z, t, context={"contrast_idx": idx}, condition_image=cond)
+    torch.manual_seed(3)
+    mask = torch.bernoulli(torch.zeros(4) + 0.9).view(-1, 1, 1, 1)
+    with torch.no_grad():
+        ref = gen._process_slices(
+            torch.cat([z, gen.encode_condition(cond) * mask], dim=1), t, contrast_idx=idx
+        )
+    assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_guided_sampling_changes_the_output_and_batches_the_passes(monkeypatch):
+    torch.manual_seed(0)
+    gen = _cfg_gen(cfg_drop_probs={"condition": 0.1, "contrast": 0.1}, cfg_weights={"condition": 2.0, "contrast": 2.0}).eval()
+    _wake_zero_init(gen)
+    plain = _cfg_gen().eval()
+    plain.load_state_dict(gen.state_dict())
+    seen = []
+    orig = gen.denoise_net.forward
+    monkeypatch.setattr(gen.denoise_net, "forward", lambda x, *a, **k: seen.append(x.shape[0]) or orig(x, *a, **k))
+    kw = {
+        "shape": (1, 1, 32, 32),
+        "condition_image": torch.randn(1, 1, 32, 32),
+        "contrast_idx": torch.tensor([1]),
+        "num_inference_steps": 2,
+    }
+    torch.manual_seed(1)
+    guided = gen.sample(**kw)
+    torch.manual_seed(1)
+    unguided = plain.sample(**kw)
+    assert not torch.allclose(guided, unguided)
+    assert seen == [3, 3], "null + two axes in one U-Net call per step"
+
+
+# ── Pattern-C acquisition FiLM (LM-20) ───────────────────────────────────────
+
+_LEIDEN_MAP = {"T1w": 0, "T2w": 1, "FLAIR": 2}
+_LEIDEN_ROWS = [
+    {"name": "T1w", "TE": 12.0, "TR": 600.0, "TI": -1.0, "FA": 70.0},
+    {"name": "T2w", "TE": 80.0, "TR": 4000.0, "TI": -1.0, "FA": 90.0},
+    {"name": "FLAIR", "TE": 120.0, "TR": 8000.0, "TI": 2200.0, "FA": 90.0},
+]
+
+
+def test_acquisition_film_needs_contrast_guidance():
+    with pytest.raises(ValueError, match="use_contrast_guidance"):
+        LatentDiffusionGenerator(
+            in_channels=1, out_channels=1, latent_channels=4, base_channels=16,
+            timesteps=5, num_layers=3, acquisition_film=True,
+        )
+
+
+def test_acquisition_film_must_be_a_bool():
+    with pytest.raises(ValueError, match="true/false"):
+        _cfg_gen(acquisition_film="yes")
+
+
+def test_acquisition_film_off_adds_no_parameters():
+    assert not any(k.startswith("acquisition_film") for k in _cfg_gen().state_dict())
+
+
+def test_acquisition_film_changes_the_forward_and_the_sampler():
+    torch.manual_seed(0)
+    on = _cfg_gen(acquisition_film=True).eval()
+    on.set_acquisition_params(_LEIDEN_MAP, _LEIDEN_ROWS)
+    _wake_zero_init(on)
+    torch.nn.init.normal_(on.acquisition_film.to_gamma_beta.weight, std=0.5)
+    off = _cfg_gen().eval()
+    off.load_state_dict(on.state_dict(), strict=False)
+    z, t = torch.randn(2, 4, 4, 4), torch.tensor([1, 2])
+    cond, ctx = torch.randn(2, 1, 32, 32), {"contrast_idx": torch.tensor([0, 2])}
+    assert not torch.allclose(on(z, t, context=ctx, condition_image=cond), off(z, t, context=ctx, condition_image=cond))
+    kw = {
+        "shape": (1, 1, 32, 32),
+        "condition_image": torch.randn(1, 1, 32, 32),
+        "contrast_idx": torch.tensor([2]),
+        "num_inference_steps": 2,
+    }
+    torch.manual_seed(1)
+    a = on.sample(**kw)
+    torch.manual_seed(1)
+    b = off.sample(**kw)
+    assert not torch.allclose(a, b)
+
+
+def test_acquisition_film_unbound_raises_at_forward():
+    gen = _cfg_gen(acquisition_film=True).eval()
+    with pytest.raises(RuntimeError, match="no acquisition table"):
+        gen(torch.randn(1, 4, 4, 4), torch.tensor([1]), context={"contrast_idx": torch.tensor([0])}, condition_image=torch.randn(1, 1, 32, 32))
+
+
+# ── latent_scaling_factor: auto (LM-14): calibrate std(mu), not the posterior sigma ──
+
+
+def _auto_gen() -> LatentDiffusionGenerator:
+    return LatentDiffusionGenerator(_config(), num_layers=3, latent_scaling_factor="auto")
+
+
+def test_auto_scale_standardises_the_first_training_batch():
+    torch.manual_seed(0)
+    gen = _auto_gen().train()
+    x = torch.rand(4, 1, 32, 32) * 2 - 1
+    z = gen.encode_to_latent(x)
+    assert float(z.std(unbiased=False)) == pytest.approx(1.0, rel=1e-3)
+    assert bool(gen.latent_scale_calibrated)
+
+
+def test_auto_scale_changes_the_latent_relative_to_the_identity():
+    torch.manual_seed(0)
+    x = torch.rand(4, 1, 32, 32) * 2 - 1
+    gen = _auto_gen().train()
+    plain = LatentDiffusionGenerator(_config(), num_layers=3)
+    plain.load_state_dict(gen.state_dict(), strict=False)
+    assert not torch.allclose(gen.encode_to_latent(x), plain.encode_to_latent(x))
+
+
+def test_auto_scale_is_measured_once_then_frozen():
+    torch.manual_seed(0)
+    gen = _auto_gen().train()
+    gen.encode_to_latent(torch.rand(4, 1, 32, 32))
+    first = gen.latent_std.clone()
+    gen.encode_to_latent(torch.rand(4, 1, 32, 32) * 10)
+    assert torch.equal(gen.latent_std, first)
+
+
+def test_auto_scale_survives_a_checkpoint_round_trip_in_eval():
+    torch.manual_seed(0)
+    trained = _auto_gen().train()
+    trained.encode_to_latent(torch.rand(4, 1, 32, 32))
+    restored = _auto_gen().eval()
+    restored.load_state_dict(trained.state_dict())
+    x = torch.rand(2, 1, 32, 32)
+    assert torch.allclose(restored.encode_to_latent(x), trained.eval().encode_to_latent(x))
+
+
+def test_auto_scale_uncalibrated_in_eval_raises():
+    with pytest.raises(RuntimeError, match="not calibrated"):
+        _auto_gen().eval().encode_to_latent(torch.rand(1, 1, 32, 32))
+
+
+def test_numeric_scale_has_no_calibration_buffer():
+    """Old checkpoints of numeric-scale arms must still load strictly."""
+    gen = LatentDiffusionGenerator(_config(), num_layers=3, latent_scaling_factor=2.45)
+    assert "latent_scale_calibrated" not in gen.state_dict()

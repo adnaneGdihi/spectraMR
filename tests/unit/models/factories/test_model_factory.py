@@ -668,3 +668,73 @@ class TestRoleDeclaredNotGuessed:
         finally:
             MODEL_REGISTRY.clear()
             MODEL_REGISTRY.update(backup)
+
+
+@pytest.mark.parametrize("embed_type", ["kan", "simple_kan"])
+def test_the_time_conditioned_wrapper_hands_its_horizon_to_the_kan_code(embed_type):
+    """PLANTED (#2442): both KAN creators dropped the wrapper's max_timesteps."""
+    import torch.nn as nn
+
+    from spectramr.models.factories.model_factory import TimeConditionedWrapper
+
+    wrapper = TimeConditionedWrapper(
+        nn.Identity(), time_embed_dim=16, max_timesteps=29, time_embed_type=embed_type
+    )
+    embedding = wrapper.time_embedding
+    horizon = getattr(embedding, "num_timesteps", None) or embedding.fourier_kan.max_positions
+    assert horizon == 29
+
+
+def test_enhanced_deep_unet_builds_the_configurable_unet():
+    # Meta device: construction only, no weights allocated.
+    import torch
+
+    from spectramr.models.factories.model_factory import ModelFactory
+    from spectramr.models.reconstruction.unet import UNet
+
+    with torch.device("meta"):
+        model = ModelFactory().create_generator(
+            "enhanced_deep_unet", in_channels=1, out_channels=1, model_channels=16, channel_mult=(1, 2)
+        )
+    assert type(model) is UNet
+    assert model.features == (16, 32)
+    assert model.config.use_dense_skip and model.config.dropout == 0.1
+
+
+def test_strict_target_raises_on_a_declared_key_it_cannot_accept():
+    """register_model(strict_kwargs=True): a declared model_kwargs key must not vanish."""
+    from spectramr.models.errors import ModelCreationError
+
+    ExecutionLedger.begin_run()
+    with pytest.raises(ModelCreationError, match="sampler_steps"):
+        _filter_kwargs_to_signature(
+            {"in_channels": 2, "sampler_steps": 25},
+            Narrow,
+            logger_=logger,
+            site="test",
+            declared=frozenset({"sampler_steps"}),
+            strict=True,
+        )
+
+
+def test_strict_target_ignores_undeclared_forwarded_fields():
+    """Top-level model.* fields are forwarded opportunistically; they must not raise."""
+    ExecutionLedger.begin_run()
+    out = _filter_kwargs_to_signature(
+        {"in_channels": 2, "dropout": 0.1},
+        Narrow,
+        logger_=logger,
+        site="test",
+        declared=frozenset({"in_channels"}),
+        strict=True,
+    )
+    assert out == {"in_channels": 2}
+
+
+def test_pimn_kwargs_are_not_silently_filtered() -> None:
+    """experiment_41 declared ``hidden_channels`` and the mapper dropped it without a
+    word. PIMN takes no such parameter, so the key must reach the build and be refused."""
+    from spectramr.models.factories.model_factory import ParameterMapper
+
+    mapped = ParameterMapper().map_generator_params("pimn", hidden_channels=64, num_iterations=3)
+    assert mapped["hidden_channels"] == 64

@@ -39,7 +39,8 @@ from spectramr.data.datasets.m4raw_dataset import (
 
 def test_valid_target_modes_is_the_advertised_set() -> None:
     assert (
-        frozenset({"complex_mean", "phase_aligned_mean", "rep_pair", "r2r"}) == _VALID_TARGET_MODES
+        frozenset({"complex_mean", "phase_aligned_mean", "rep_pair", "r2r", "nullspace_r2r"})
+        == _VALID_TARGET_MODES
     )
 
 
@@ -90,20 +91,99 @@ def test_average_reps_exclude_index_none_is_all_reps() -> None:
 
 
 def test_average_reps_exclude_leaving_one_rep_passes_through() -> None:
-    """Two reps, exclude one → the single retained rep (no empty mean)."""
+    """Two reps, exclude one → the single retained rep (no empty mean).
+
+    ``complex_mean`` returns it untouched; ``phase_aligned_mean`` returns it in
+    the excluded (input) repetition's frame, as every leave-one-out mean is.
+    """
     torch.manual_seed(2)
     reps = [torch.randn(1, 2, 4, 4, dtype=torch.complex64) for _ in range(2)]
-    assert torch.allclose(_average_reps(reps, "phase_aligned_mean", exclude_index=0), reps[1])
+    assert torch.allclose(_average_reps(reps, "complex_mean", exclude_index=0), reps[1])
+    torch.testing.assert_close(
+        _average_reps(reps, "phase_aligned_mean", exclude_index=0),
+        m4raw_mod._phase_align(reps[1], reps[0]),
+    )
 
 
-def test_average_reps_phase_alignment_anchors_to_first_retained_rep() -> None:
-    """With rep 0 excluded, phase is anchored to rep 1, not the dropped rep."""
+def test_average_reps_leave_one_out_is_anchored_to_the_input_frame() -> None:
+    """#1863: the leave-one-out mean sits in the excluded (input) repetition's frame.
+
+    Asserted on the COMPLEX value. The test this replaces compared ``.abs()``,
+    which both anchor conventions pass identically -- only their phase differs.
+    """
     torch.manual_seed(3)
     x = torch.randn(1, 2, 8, 8, dtype=torch.complex64)
     reps = [x * torch.exp(torch.tensor(2.7j)), x, x * torch.exp(torch.tensor(-0.9j))]
     loo = _average_reps(reps, "phase_aligned_mean", exclude_index=0)
-    # reps 1,2 phase-aligned to rep 1 (== x) recover the coherent magnitude
-    assert torch.allclose(loo.abs(), x.abs(), atol=1e-4)
+    torch.testing.assert_close(loo, reps[0], atol=1e-5, rtol=1e-5)
+
+
+def _first_retained_anchor(reps: list[torch.Tensor], exclude_index: int) -> torch.Tensor:
+    """The retired convention, reproduced so the test can show it goes red."""
+    kept = [r for i, r in enumerate(reps) if i != exclude_index]
+    ref = kept[0]
+    aligned = [
+        r * torch.exp(-1j * torch.angle((r * ref.conj()).sum(dim=(-2, -1), keepdim=True)))
+        for r in kept
+    ]
+    return torch.stack(aligned).mean(0)
+
+
+def _global_phase_deg(target: torch.Tensor, reference: torch.Tensor) -> float:
+    """``angle(sum target * conj(reference))`` in degrees."""
+    return float(torch.rad2deg(torch.angle((target * reference.conj()).sum())))
+
+
+def test_average_reps_first_retained_anchor_misses_the_input_frame() -> None:
+    """Planted violation: the old anchoring leaves the target at rep 1's phase."""
+    torch.manual_seed(4)
+    x = torch.randn(1, 2, 8, 8, dtype=torch.complex64)
+    reps = [x * torch.exp(torch.tensor(1j * p)) for p in (0.0, 2.0, -1.2)]
+    old = _first_retained_anchor(reps, exclude_index=0)
+    new = _average_reps(reps, "phase_aligned_mean", exclude_index=0)
+    assert abs(_global_phase_deg(old, reps[0])) == pytest.approx(np.degrees(2.0), abs=0.5)
+    assert abs(_global_phase_deg(new, reps[0])) < 0.5
+
+
+def test_leave_one_out_target_on_getitem_is_in_the_inputs_frame(tmp_path) -> None:
+    """The production path: ``__getitem__`` with reps at distinct global phases.
+
+    Repetitions of one noisy scan, each rotated by its own receiver phase; the
+    leave-one-out target must land at theta ~ 0 against the input, where the
+    retired anchoring (reproduced on the same repetitions) lands near rep 1's
+    phase, 110 deg away.
+    """
+    phases = (0.3, 2.2, -1.5)
+    rng = np.random.default_rng(7)
+    shape = (1, 2, 16, 16)
+    base = np.zeros(shape, dtype=np.complex64)
+    base[..., 4:12, 4:12] = 1.0
+    files, reps = [], []
+    for i, phase in enumerate(phases, start=1):
+        noisy = base + 0.05 * (rng.standard_normal(shape) + 1j * rng.standard_normal(shape))
+        img = (noisy * np.exp(1j * phase)).astype(np.complex64)
+        k = np.fft.fftshift(
+            np.fft.fft2(np.fft.ifftshift(img, axes=(-2, -1)), norm="ortho"), axes=(-2, -1)
+        ).astype(np.complex64)
+        path = tmp_path / f"2022_T1{i:02d}.h5"
+        with h5py.File(str(path), "w") as f:
+            f.create_dataset("kspace", data=k)
+        files.append(path)
+        reps.append(torch.from_numpy(k))
+    ds = M4RawRepetitionDataset(
+        h5_files=files,
+        single_contrast=True,
+        coil_processing_mode="none",
+        use_repetitions=True,
+        target_mode="phase_aligned_mean",
+        nex_target_exclude_input=True,
+    )
+    subject = ds[0]
+    target = _stacked_to_complex(subject["target"].data)
+    inp = _stacked_to_complex(subject["input"].data)
+    assert abs(_global_phase_deg(target, inp)) < 2.0
+    old = _first_retained_anchor(reps, exclude_index=0)
+    assert abs(_global_phase_deg(old, reps[0])) > 90.0
 
 
 def test_valid_coil_modes_is_the_advertised_set() -> None:
@@ -845,14 +925,16 @@ class TestSingleSurvivingRepIsRefused:
             "the single-surviving-rep guard is gone; a NEX arm can silently "
             "train input->input again"
         )
-        # The guard carries exactly ONE exemption. R2R builds both halves from
-        # the input repetition, so a 1-rep group is the case it exists to serve,
-        # not a degenerate one -- but the exemption must stay narrow, and a
-        # substring pin is the cheapest way to notice a second one appearing.
-        assert 'self.target_mode != "r2r"' in src, (
-            "the r2r exemption is gone; single-excitation groups would be skipped, "
-            "which is exactly the data the r2r arm exists to use"
+        # The guard carries exactly ONE exemption: the split modes build both
+        # halves from the input repetition, so a 1-rep group is the case they
+        # exist to serve. It must stay one named set, and a substring pin is the
+        # cheapest way to notice a second exemption appearing.
+        assert "self.target_mode not in _SINGLE_REP_SPLIT_MODES" in src, (
+            "the split-mode exemption is gone; single-excitation groups would be "
+            "skipped, which is exactly the data the r2r arms exist to use"
         )
+        split_modes = m4raw_mod._SINGLE_REP_SPLIT_MODES
+        assert split_modes == {"r2r", "nullspace_r2r"}
         assert src.count("len(kspace_reps) < 2") == 1, (
             "a second single-rep guard appeared; elect one owner (non-negotiable 17)"
         )
@@ -1738,7 +1820,9 @@ class TestSelfCalibratedR2RCovariance:
         ds = M4RawRepetitionDataset.__new__(M4RawRepetitionDataset)
         ds.r2r_alpha = alpha
         ds.r2r_covariance_source = source
+        ds.noise_fit_support_policy = "band"
         ds._r2r_cov_cache = {}
+        ds._noise_covariance_store = None
         ds._r2r_sampler = None
         if source == "committed":
             from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
@@ -1746,13 +1830,17 @@ class TestSelfCalibratedR2RCovariance:
             ds._r2r_sampler = M4RawNoiseSampler(alpha=alpha)
         return ds
 
+    @staticmethod
+    def _sampler(ds, kspace: torch.Tensor, key: str):
+        return ds._sampler_for_scan(kspace, key)
+
     def test_the_committed_source_is_blind_to_receiver_gain(self) -> None:
         """The failure the knob exists for, stated as a number."""
         from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
 
         gain = 3.0
         kspace = self._scan(gain)
-        committed = self._bare("committed")._sampler_for_scan(kspace, "scan")
+        committed = self._sampler(self._bare("committed"), kspace, "scan")
         drawn = float(committed._cov.diagonal().real.sum())
         truth = float(single_repetition_covariance().diagonal().real.sum()) * gain**2
         assert drawn == pytest.approx(truth / gain**2, rel=1e-6), (
@@ -1766,33 +1854,115 @@ class TestSelfCalibratedR2RCovariance:
 
         gain = 3.0
         kspace = self._scan(gain)
-        fitted = self._bare("self_calibrated")._sampler_for_scan(kspace, "scan")
+        fitted = self._sampler(self._bare("self_calibrated"), kspace, "scan")
         drawn = float(fitted._cov.diagonal().real.sum())
         truth = float(single_repetition_covariance().diagonal().real.sum()) * gain**2
         assert drawn == pytest.approx(truth, rel=0.05), (drawn, truth)
 
-    def test_the_fit_is_cached_per_scan(self) -> None:
-        """Sigma_n is a receive-chain property; ESPIRiT is ~1 s per slice.
+    def test_the_fit_is_cached_per_scan(self, monkeypatch) -> None:
+        """Sigma_n is a receive-chain property; ESPIRiT is ~2.3 s per slice.
 
-        Without the cache, `samples_per_volume` draws per volume per epoch each
-        pay a full eigendecomposition.
+        The cache serves every later slice sample of the scan in the same
+        worker; the fit itself must run once.
         """
+        import spectramr.infrastructure.physics.scan_coil_calibration as calibration
+
+        calls = []
+        real_fit = calibration.fit_scan_covariance
+        monkeypatch.setattr(
+            calibration,
+            "fit_scan_covariance",
+            lambda *a, **k: calls.append(1) or real_fit(*a, **k),
+        )
         kspace = self._scan(1.0)
         ds = self._bare("self_calibrated")
-        first = ds._sampler_for_scan(kspace, "scanA")
-        again = ds._sampler_for_scan(kspace, "scanA")
-        assert again is first, "the per-scan covariance was refitted"
+        first = self._sampler(ds, kspace, "scanA")
+        again = self._sampler(ds, kspace, "scanA")
+        assert len(calls) == 1, "the per-scan covariance was refitted"
+        assert again._cov is first._cov
         assert set(ds._r2r_cov_cache) == {"scanA"}
+
+    def test_the_loader_fits_through_the_public_function_predict_calls(self, monkeypatch) -> None:
+        """One owner for the per-scan fit: predict calls it too (#2329)."""
+        calls = []
+        real = m4raw_mod.fit_scan_noise_covariance
+        monkeypatch.setattr(
+            m4raw_mod,
+            "fit_scan_noise_covariance",
+            lambda *a, **k: calls.append(k["support_policy"]) or real(*a, **k),
+        )
+        ds = self._bare("self_calibrated")
+        self._sampler(ds, self._scan(1.0), "scanA")
+        assert calls == [ds.noise_fit_support_policy]
 
     def test_two_scans_get_two_covariances(self) -> None:
         """The cache must key on the scan, not collapse the corpus to one fit."""
         ds = self._bare("self_calibrated")
-        quiet = ds._sampler_for_scan(self._scan(1.0), "scanA")
-        loud = ds._sampler_for_scan(self._scan(4.0), "scanB")
-        assert quiet is not loud
+        quiet = self._sampler(ds, self._scan(1.0), "scanA")
+        loud = self._sampler(ds, self._scan(4.0), "scanB")
+        assert quiet._cov is not loud._cov
         quiet_trace = float(quiet._cov.diagonal().real.sum())
         loud_trace = float(loud._cov.diagonal().real.sum())
         assert loud_trace > 4 * quiet_trace, (quiet_trace, loud_trace)
+
+    @staticmethod
+    def _volume(slices: int = 3, size: int = 128, zero_cols: int = 31) -> torch.Tensor:
+        """``(S, C, H, W)`` k-space at the committed noise level, PE tail zero-filled.
+
+        31 of 128 columns is M4Raw's ~24% partial phase FOV.
+        """
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+
+        gen = torch.Generator().manual_seed(7)
+        chol = torch.linalg.cholesky(single_repetition_covariance().to(torch.complex128))
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, size), torch.linspace(-1, 1, size), indexing="ij"
+        )
+        centres = [(-0.6, -0.6), (0.6, -0.6), (-0.6, 0.6), (0.6, 0.6)]
+        sens = torch.stack([torch.exp(-((xx - a) ** 2 + (yy - b) ** 2)) for a, b in centres])
+        sens = sens * torch.exp(1j * torch.stack([k * xx for k in range(4)]))
+        sens = (sens / sens.abs().pow(2).sum(0, keepdim=True).sqrt()).to(torch.complex128)
+        out = []
+        for s in range(slices):
+            anatomy = ((xx**2 + yy**2) < 0.3 + 0.1 * s).double() * 30.0
+            white = torch.complex(
+                torch.randn(4, size, size, generator=gen, dtype=torch.float64),
+                torch.randn(4, size, size, generator=gen, dtype=torch.float64),
+            ) / 2**0.5
+            out.append(fft2c(sens * anatomy + torch.einsum("ij,jhw->ihw", chol, white)))
+        kspace = torch.stack(out).to(torch.complex64)
+        kspace[..., size - zero_cols :] = 0
+        return kspace
+
+    def test_a_volume_with_zero_filled_columns_recovers_the_single_rep_sigma(self) -> None:
+        """#2322: the per-group ``(S, C, H, W)`` volume, 24% of PE columns zero.
+
+        Two defects used to meet here. Flattening S into the coil axis handed
+        ESPIRiT 12 "coils" and it raised rank-deficient; and the image-domain fit
+        sees ``f * Sigma`` per pixel, so the trace came out at ~0.76 of the truth.
+        """
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+
+        volume = self._volume()
+        fitted = self._sampler(self._bare("self_calibrated"), volume, "vol")._cov
+        truth = single_repetition_covariance().to(torch.complex128)
+        fitted = fitted.to(torch.complex128)
+        assert fitted.shape == (4, 4)
+        relative = float(torch.linalg.norm(fitted - truth) / torch.linalg.norm(truth))
+        assert relative < 0.03, relative
+        trace_ratio = float(fitted.diagonal().real.sum() / truth.diagonal().real.sum())
+        assert trace_ratio == pytest.approx(1.0, abs=0.03), (
+            f"trace ratio {trace_ratio:.3f}: ~0.76 means the sampled-fraction "
+            "correction is gone"
+        )
+
+    def test_scattered_undersampling_is_refused(self) -> None:
+        """Aliased signal enters the null space there, and the fit reads ~5x high."""
+        volume = self._volume(zero_cols=0)
+        volume[..., 3::4] = 0
+        with pytest.raises(ValueError, match="contiguous band"):
+            self._bare("self_calibrated")._recorrupt_r2r(volume, scan_key="scattered")
 
     def test_an_unknown_source_raises(self) -> None:
         """Pitfall #9: never degrade to the committed matrix."""
@@ -1856,3 +2026,652 @@ class TestTheKnobIsWiredEndToEnd:
         from spectramr.infrastructure.validation.paired_arms_diff_paths import DEFAULT_DIFF_PATHS
 
         assert "data.r2r_covariance_source" in DEFAULT_DIFF_PATHS
+
+
+# ── precomputed coil maps (data.coil_maps_root, #2339) ───────────────────────
+
+
+def _write_coil_scan(path, *, seed: int, phase: float, slices: int = 2, size: int = 32) -> None:
+    """Smooth 4-coil anatomy at its own global phase, 6 PE columns zero-filled."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.linspace(-1, 1, size), np.linspace(-1, 1, size), indexing="ij")
+    centres = [(-0.6, -0.6), (0.6, -0.6), (-0.6, 0.6), (0.6, 0.6)]
+    sens = np.stack([np.exp(-((xx - a) ** 2 + (yy - b) ** 2)) for a, b in centres])
+    anatomy = ((xx**2 + yy**2) < 0.5) * 20.0
+    shape = (slices, 4, size, size)
+    image = sens[None] * anatomy * np.exp(1j * phase)
+    image = image + rng.normal(size=shape) + 1j * rng.normal(size=shape)
+    k = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(image, axes=(-2, -1))), axes=(-2, -1))
+    k = (k / size).astype(np.complex64)
+    k[..., -6:] = 0
+    with h5py.File(str(path), "w") as f:
+        f.create_dataset("kspace", data=k)
+
+
+def _coil_scan_files(tmp_path, n_reps: int = 3) -> list[pathlib.Path]:
+    files = []
+    for i, phase in enumerate((0.0, 1.9, -2.4)[:n_reps], start=1):
+        path = tmp_path / f"2022061001_T1{i:02d}.h5"
+        _write_coil_scan(path, seed=i, phase=phase)
+        files.append(path)
+    return files
+
+
+def _precompute(tmp_path, files, **calibration_override) -> tuple[pathlib.Path, torch.Tensor]:
+    """What scripts/precompute_m4raw_coil_maps.py writes for this group."""
+    from spectramr.data.datasets.m4raw_coil_maps import (
+        estimate_group_maps,
+        load_group_kspace,
+        save_coil_maps,
+    )
+    from spectramr.infrastructure.physics.scan_coil_calibration import DEFAULT_CALIBRATION
+
+    root = tmp_path / "maps"
+    maps, meta = estimate_group_maps(
+        load_group_kspace(files), {**DEFAULT_CALIBRATION, **calibration_override}
+    )
+    save_coil_maps(root / "2022061001_T1.pt", maps, meta)
+    return root, maps
+
+
+def _maps_ds(files, **kw) -> M4RawRepetitionDataset:
+    kw.setdefault("target_mode", "nullspace_r2r")
+    kw.setdefault("coil_processing_mode", "none")
+    return M4RawRepetitionDataset(
+        h5_files=files, single_contrast=True, use_repetitions=True, **kw
+    )
+
+
+class TestPrecomputedCoilMaps:
+    """``coil_maps_root``: read once, published on both splits, never recomputed silently."""
+
+    def test_the_split_uses_the_file_and_runs_no_espirit(self, tmp_path, monkeypatch) -> None:
+        import spectramr.infrastructure.physics.scan_coil_calibration as calibration
+
+        files = _coil_scan_files(tmp_path)
+        root, maps = _precompute(tmp_path, files)
+        monkeypatch.setattr(
+            calibration, "estimate_csm_espirit", lambda *a, **k: pytest.fail("ESPIRiT ran")
+        )
+        subject = _maps_ds(files, coil_maps_root=root)[0]
+        assert subject["coil_maps_source"] == f"file:{root / '2022061001_T1.pt'}"
+        torch.testing.assert_close(subject["sensitivity_complex"].data, maps.permute(1, 2, 3, 0))
+        torch.testing.assert_close(
+            subject["sensitivity"].data, maps.permute(1, 2, 3, 0).abs()
+        )
+
+    def test_the_split_is_computed_with_the_files_maps(self, tmp_path, monkeypatch) -> None:
+        """The maps reach ``split_kspace``, not only the subject."""
+        import spectramr.infrastructure.physics.coil_split_r2r as split_mod
+
+        files = _coil_scan_files(tmp_path)
+        root, maps = _precompute(tmp_path, files)
+        seen = []
+        real = split_mod.split_kspace
+        monkeypatch.setattr(
+            split_mod,
+            "split_kspace",
+            lambda k, m, *a, **kw: seen.append(m.clone()) or real(k, m, *a, **kw),
+        )
+        _maps_ds(files, coil_maps_root=root)[0]
+        torch.testing.assert_close(seen[0], maps)
+
+    def test_the_validation_split_publishes_them_too(self, tmp_path) -> None:
+        files = _coil_scan_files(tmp_path)
+        root, maps = _precompute(tmp_path, files)
+        subject = _maps_ds(
+            files,
+            coil_maps_root=root,
+            target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+            emit_alternate_input=True,
+        )[0]
+        torch.testing.assert_close(subject["sensitivity_complex"].data, maps.permute(1, 2, 3, 0))
+        assert subject["coil_maps_calibration"] == "acs_size=24;kernel_size=6;eigen_threshold=0.95"
+
+    def test_without_a_root_nothing_changes(self, tmp_path) -> None:
+        subject = _maps_ds(_coil_scan_files(tmp_path))[0]
+        assert "sensitivity_complex" not in subject and "coil_maps_source" not in subject
+
+    def test_an_absent_map_file_fails_the_construction_not_the_first_sample(self, tmp_path) -> None:
+        """Planted: a declared root without its maps must stop the arm before any sample."""
+        files = _coil_scan_files(tmp_path)
+        with pytest.raises(FileNotFoundError, match=r"1 coil-map file\(s\) missing") as exc:
+            _maps_ds(files, coil_maps_root=tmp_path / "empty")
+        assert "2022061001_T1.pt" in str(exc.value)
+
+    def test_a_complete_root_constructs(self, tmp_path) -> None:
+        files = _coil_scan_files(tmp_path)
+        root, _ = _precompute(tmp_path, files)
+        assert len(_maps_ds(files, coil_maps_root=root)) > 0
+
+    def test_a_miss_raises_unless_estimate_is_declared(self, tmp_path) -> None:
+        files = _coil_scan_files(tmp_path)
+        with pytest.raises(FileNotFoundError, match="coil_maps_missing"):
+            _maps_ds(files, coil_maps_root=tmp_path / "empty")._load_item(0)
+        estimated = _maps_ds(
+            files, coil_maps_root=tmp_path / "empty", coil_maps_missing="estimate"
+        )[0]
+        _, maps = _precompute(tmp_path, files)
+        assert estimated["coil_maps_source"] == "estimated"
+        torch.testing.assert_close(
+            estimated["sensitivity_complex"].data, maps.permute(1, 2, 3, 0), atol=1e-4, rtol=1e-4
+        )
+
+    def test_the_declared_recipe_and_acs_width_reach_the_source(self, tmp_path) -> None:
+        """Both knobs reach ``CoilMapSource``: the file written with them is served."""
+        from spectramr.data.datasets.m4raw_coil_maps import (
+            estimate_group_maps,
+            load_group_kspace,
+            save_coil_maps,
+        )
+        from spectramr.infrastructure.physics.scan_coil_calibration import DEFAULT_CALIBRATION
+
+        files = _coil_scan_files(tmp_path)
+        root = tmp_path / "maps"
+        calibration = {**DEFAULT_CALIBRATION, "acs_size": 20}
+        maps, meta = estimate_group_maps(load_group_kspace(files), calibration, "input_repetition")
+        save_coil_maps(root / "2022061001_T1.pt", maps, meta)
+        ds = _maps_ds(
+            files,
+            coil_maps_root=root,
+            coil_maps_recipe="input_repetition",
+            coil_maps_acs_size=20,
+            target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+        )
+        assert ds._coil_maps.recipe == "input_repetition"
+        assert ds._coil_maps.calibration["acs_size"] == 20
+        subject = ds[0]
+        torch.testing.assert_close(subject["sensitivity_complex"].data, maps.permute(1, 2, 3, 0))
+        assert subject["coil_maps_calibration"].startswith("acs_size=20;")
+
+    def test_a_file_from_another_calibration_raises(self, tmp_path) -> None:
+        from spectramr.data.datasets.m4raw_coil_maps import CoilMapMismatchError
+
+        files = _coil_scan_files(tmp_path)
+        root, _ = _precompute(tmp_path, files, acs_size=28)
+        with pytest.raises(CoilMapMismatchError, match="acs_size"):
+            _maps_ds(files, coil_maps_root=root, coil_maps_missing="estimate")._load_item(0)
+
+    def test_the_slice_route_reads_its_own_slice(self, tmp_path) -> None:
+        files = _coil_scan_files(tmp_path)
+        root, maps = _precompute(tmp_path, files)
+        ds = _maps_ds(files, coil_maps_root=root, slice_level_records=True)
+        subject = ds[1]
+        torch.testing.assert_close(
+            subject["sensitivity_complex"].data, maps[1:2].permute(1, 2, 3, 0)
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"coil_processing_mode": "rss", "target_mode": "phase_aligned_mean"}, "PHYSICAL"),
+            ({"coil_maps_missing": "recompute"}, "coil_maps_missing"),
+            ({"coil_maps_recipe": "all_reps_median"}, "unknown coil-map recipe"),
+            ({"coil_maps_acs_size": 0}, "coil_maps_acs_size"),
+        ],
+        ids=["combined_coils", "unknown_policy", "unknown_recipe", "zero_acs"],
+    )
+    def test_unusable_declarations_raise_at_construction(self, tmp_path, kwargs, message) -> None:
+        with pytest.raises(ValueError, match=message):
+            _maps_ds(_coil_scan_files(tmp_path, 2), coil_maps_root=tmp_path, **kwargs)
+
+    def test_the_cross_contrast_route_refuses_it(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="single-contrast"):
+            M4RawRepetitionDataset(
+                h5_files=_coil_scan_files(tmp_path, 2),
+                single_contrast=False,
+                coil_processing_mode="none",
+                coil_maps_root=tmp_path,
+            )
+
+
+class TestNoiseFitSupportPolicy:
+    """``noise_fit_support_policy`` reaches the per-scan fit and is validated."""
+
+    def test_it_reaches_fit_scan_covariance(self, tmp_path, monkeypatch) -> None:
+        import spectramr.infrastructure.physics.scan_coil_calibration as calibration
+
+        seen = []
+        real = calibration.fit_scan_covariance
+        monkeypatch.setattr(
+            calibration,
+            "fit_scan_covariance",
+            lambda *a, **k: seen.append(k.get("support_policy")) or real(*a, **k),
+        )
+        ds = _maps_ds(
+            _coil_scan_files(tmp_path, 1),
+            target_mode="r2r",
+            r2r_covariance_source="self_calibrated",
+            noise_fit_support_policy="acs",
+        )
+        ds[0]
+        assert seen == ["acs"]
+
+    def test_an_unknown_policy_raises(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="noise_fit_support_policy"):
+            _maps_ds(_coil_scan_files(tmp_path, 1), noise_fit_support_policy="whole")
+
+
+class TestTheValidationSplitPublishesTheScansSigma:
+    """A self-calibrated arm's averaging split carries the scan's own Sigma_n."""
+
+    def test_published_on_the_validation_split_of_a_self_calibrated_arm(self, tmp_path) -> None:
+        ds = _maps_ds(
+            _coil_scan_files(tmp_path),
+            target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+            r2r_covariance_source="self_calibrated",
+        )
+        subject = ds[0]
+        cov = subject["noise_covariance"]
+        assert cov.shape == (4, 4) and torch.is_complex(cov)
+        assert next(iter(ds._r2r_cov_cache.values())) is cov
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"target_mode": "phase_aligned_mean", "nex_target_exclude_input": True},
+            {"target_mode": "r2r", "r2r_covariance_source": "self_calibrated"},
+        ],
+        ids=["committed_arm", "training_split"],
+    )
+    def test_absent_where_nothing_reads_it(self, tmp_path, kwargs) -> None:
+        assert "noise_covariance" not in _maps_ds(_coil_scan_files(tmp_path), **kwargs)[0]
+
+
+def _write_phased_reps(tmp_path, stem, phases, *, seed, shape=(1, 2, 16, 16)):
+    """One repetition file per phase: the same noisy scan at its own receiver phase."""
+    rng = np.random.default_rng(seed)
+    base = np.zeros(shape, dtype=np.complex64)
+    base[..., 4:12, 4:12] = 1.0
+    files, reps = [], []
+    for i, phase in enumerate(phases, start=1):
+        noisy = base + 0.05 * (rng.standard_normal(shape) + 1j * rng.standard_normal(shape))
+        k = (noisy * np.exp(1j * phase)).astype(np.complex64)
+        path = tmp_path / f"{stem}{i:02d}.h5"
+        with h5py.File(str(path), "w") as f:
+            f.create_dataset("kspace", data=k)
+        files.append(path)
+        reps.append(torch.from_numpy(k))
+    return files, reps
+
+
+def _cross_contrast_halves(subject) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(source, target)`` complex k-space of a cross-contrast subject's target tensor."""
+    full = _stacked_to_complex(subject["target"].data)
+    half = full.shape[1] // 2
+    return full[:, :half], full[:, half:]
+
+
+class TestCrossContrastTargetHonoursTargetMode:
+    """#2450: the cross-contrast route averaged with a plain complex mean whatever
+    ``target_mode`` declared, so every ``phase_aligned_mean`` arm on it trained on
+    the signal-cancelling ``complex_mean`` target."""
+
+    def _dataset(self, tmp_path, **kwargs):
+        t1, t1_reps = _write_phased_reps(tmp_path, "p1_T1", (0.3, 2.2, -1.5), seed=1)
+        t2, t2_reps = _write_phased_reps(tmp_path, "p1_T2", (-0.4, 1.9, 2.8), seed=2)
+        ds = M4RawRepetitionDataset(
+            h5_files=t1 + t2,
+            single_contrast=False,
+            coil_processing_mode="none",
+            use_repetitions=True,
+            **kwargs,
+        )
+        return ds, t1_reps, t2_reps
+
+    def test_phase_aligned_mean_reaches_both_sides(self, tmp_path) -> None:
+        ds, t1_reps, t2_reps = self._dataset(tmp_path, target_mode="phase_aligned_mean")
+        source, target = _cross_contrast_halves(ds[0])
+        expected_t1 = _average_reps(t1_reps, "phase_aligned_mean")
+        expected_t2 = _average_reps(t2_reps, "phase_aligned_mean")
+        torch.testing.assert_close(source, expected_t1)
+        torch.testing.assert_close(target, expected_t2)
+        # Planted violation: the plain mean the route used to serve is a different,
+        # weaker target -- the drifting phases cancel most of the signal.
+        plain = _average_reps(t2_reps, "complex_mean")
+        assert plain.abs().sum() < 0.6 * target.abs().sum()
+
+    def test_leave_one_out_drops_the_input_repetition(self, tmp_path) -> None:
+        ds, _, t2_reps = self._dataset(
+            tmp_path, target_mode="phase_aligned_mean", nex_target_exclude_input=True
+        )
+        subject = ds[0]
+        _, target = _cross_contrast_halves(subject)
+        torch.testing.assert_close(
+            target, _average_reps(t2_reps, "phase_aligned_mean", exclude_index=0)
+        )
+        # The input's target half is repetition 0, the one left out.
+        inp = _stacked_to_complex(subject["input"].data)
+        torch.testing.assert_close(inp[:, inp.shape[1] // 2 :], t2_reps[0])
+
+    def test_undersized_leave_one_out_group_is_refused_on_either_side(self, tmp_path) -> None:
+        t1, _ = _write_phased_reps(tmp_path, "p1_T1", (0.3, 2.2, -1.5), seed=1)
+        flair, _ = _write_phased_reps(tmp_path, "p1_FLAIR", (0.1, 1.0), seed=3)
+        with pytest.raises(ValueError, match="FLAIR: 1 group"):
+            M4RawRepetitionDataset(
+                h5_files=t1 + flair,
+                single_contrast=False,
+                coil_processing_mode="none",
+                use_repetitions=True,
+                target_mode="phase_aligned_mean",
+                nex_target_exclude_input=True,
+            )
+
+
+class TestSeparateSourceLayout:
+    """``source_layout: separate`` keeps the source contrast out of the target tensors (#2452)."""
+
+    def test_source_is_served_beside_a_target_only_stack(self, tmp_path) -> None:
+        files = _federated_files(tmp_path)
+        kw = {"single_contrast": False, "coil_processing_mode": "none"}
+        stacked = M4RawRepetitionDataset(files, **kw)[0]
+        separate = M4RawRepetitionDataset(files, source_layout="separate", **kw)[0]
+
+        half = int(stacked["federated_target_channel_start"])
+        for key in ("input", "target", "kspace"):
+            assert torch.equal(separate[key].data, stacked[key].data[half:]), key
+        # The source is the acquired repetition, i.e. the stacked INPUT's leading half.
+        assert torch.equal(separate["kspace_source"].data, stacked["input"].data[:half])
+        assert "federated_target_channel_start" not in separate
+        assert "kspace_source" not in stacked
+
+    def test_target_only_is_the_separate_layout_without_the_source(self, tmp_path) -> None:
+        files = _federated_files(tmp_path)
+        kw = {"single_contrast": False, "coil_processing_mode": "none"}
+        separate = M4RawRepetitionDataset(files, source_layout="separate", **kw)[0]
+        control = M4RawRepetitionDataset(files, source_layout="target_only", **kw)[0]
+        for key in ("input", "target", "kspace"):
+            assert torch.equal(control[key].data, separate[key].data), key
+        assert "kspace_source" not in control
+        assert "federated_target_channel_start" not in control
+
+    def test_unknown_layout_raises(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="source_layout"):
+            M4RawRepetitionDataset(
+                _federated_files(tmp_path),
+                single_contrast=False,
+                coil_processing_mode="none",
+                source_layout="interleaved",
+            )
+
+    def test_single_contrast_refuses_a_source_layout(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="no source"):
+            M4RawRepetitionDataset(
+                _federated_files(tmp_path),
+                single_contrast=True,
+                coil_processing_mode="none",
+                source_layout="separate",
+            )
+
+
+class TestFederatedContrastChoice:
+    """The cross-contrast source and targets are declared, not fixed to T1 -> all."""
+
+    @staticmethod
+    def _three_contrasts(tmp_path):
+        files = []
+        for seed, contrast in enumerate(("T1", "T2", "FLAIR")):
+            for rep in (1, 2):
+                p = tmp_path / f"p1_{contrast}{rep:02d}.h5"
+                _write_varied_kspace_h5(p, slices=2, seed=10 * seed + rep)
+                files.append(p)
+        return files
+
+    def test_default_pairs_t1_with_every_other_contrast(self, tmp_path) -> None:
+        ds = M4RawRepetitionDataset(
+            self._three_contrasts(tmp_path), single_contrast=False, coil_processing_mode="none"
+        )
+        pairs = {(p["source_contrast"], p["target_contrast"]) for p in ds._federated_pairs}
+        assert pairs == {("T1", "T2"), ("T1", "FLAIR")}
+
+    def test_t2_guided_flair(self, tmp_path) -> None:
+        files = self._three_contrasts(tmp_path)
+        kw = {"single_contrast": False, "coil_processing_mode": "none"}
+        ds = M4RawRepetitionDataset(
+            files, source_contrast="T2", target_contrasts=["FLAIR"], source_layout="separate", **kw
+        )
+        assert [(p["source_contrast"], p["target_contrast"]) for p in ds._federated_pairs] == [
+            ("T2", "FLAIR")
+        ]
+        subject = ds[0]
+        assert subject["contrast"] == "FLAIR"
+        # The reference is T2's acquired repetition: the T1-sourced stack's target input.
+        t1_to_t2 = M4RawRepetitionDataset(
+            files, target_contrasts=["T2"], source_layout="separate", **kw
+        )[0]
+        assert torch.equal(subject["kspace_source"].data, t1_to_t2["input"].data)
+
+    @pytest.mark.parametrize(
+        ("kw", "match"),
+        [
+            ({"source_contrast": "PD"}, "Unknown contrast"),
+            ({"target_contrasts": ["T1"]}, "exclude the source"),
+            ({"target_contrasts": []}, "non-empty"),
+        ],
+    )
+    def test_illegal_pairings_raise(self, tmp_path, kw, match) -> None:
+        with pytest.raises(ValueError, match=match):
+            M4RawRepetitionDataset(
+                self._three_contrasts(tmp_path),
+                single_contrast=False,
+                coil_processing_mode="none",
+                **kw,
+            )
+
+    def test_single_contrast_refuses_a_pairing(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="pairs nothing"):
+            M4RawRepetitionDataset(
+                self._three_contrasts(tmp_path),
+                single_contrast=True,
+                coil_processing_mode="none",
+                source_contrast="T2",
+            )
+
+
+class TestScoringMapsStore:
+    """``coil_maps_reference_root`` (#2664): published under a key nothing trains on."""
+
+    def _val(self, files, **kw):
+        return _maps_ds(
+            files,
+            target_mode="phase_aligned_mean",
+            nex_target_exclude_input=True,
+            emit_alternate_input=True,
+            **kw,
+        )
+
+    def test_the_validation_subject_carries_the_scoring_maps(self, tmp_path) -> None:
+        from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
+
+        files = _coil_scan_files(tmp_path)
+        root, maps = _precompute(tmp_path, files)
+        subject = self._val(files, coil_maps_reference_root=root)[0]
+        torch.testing.assert_close(subject[REFERENCE_MAPS_KEY].data, maps.permute(1, 2, 3, 0))
+        # Only the scoring key: the training-map keys stay absent without coil_maps_root.
+        assert "sensitivity_complex" not in subject and "sensitivity" not in subject
+
+    def test_the_scoring_key_is_no_coil_map_alias(self) -> None:
+        """Planted shape: an alias would let operators, losses and inputs resolve it."""
+        from spectramr.core.coil_map_names import COIL_MAP_ALIASES, REFERENCE_MAPS_KEY
+        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
+            _COIL_MAP_KEYS,
+        )
+
+        assert REFERENCE_MAPS_KEY not in COIL_MAP_ALIASES
+        assert REFERENCE_MAPS_KEY not in _COIL_MAP_KEYS
+
+    def test_an_absent_scoring_file_fails_the_construction(self, tmp_path) -> None:
+        files = _coil_scan_files(tmp_path)
+        with pytest.raises(FileNotFoundError, match=r"1 coil-map file\(s\) missing"):
+            self._val(files, coil_maps_reference_root=tmp_path / "empty")
+
+
+class TestMeasuredKspaceIsTheInput:
+    """#2761: the batch context resolves ``measured_kspace`` before ``kspace``.
+
+    ``kspace`` is the reference on this route, so without an explicit
+    ``measured_kspace`` the model was handed the target as its measurement ``y``.
+    """
+
+    @staticmethod
+    def _repetition_files(tmp_path) -> list[pathlib.Path]:
+        rng = np.random.default_rng(7)
+        files = []
+        for rep in ("01", "02"):
+            shape = (2, 4, 16, 12)
+            k = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+            path = tmp_path / f"2022000001_T1{rep}.h5"
+            # Same seed, same bytes: a second subject must not truncate a file the reader holds open.
+            if not path.exists():
+                with h5py.File(str(path), "w") as f:
+                    f.create_dataset("kspace", data=k)
+            files.append(path)
+        return files
+
+    def _subject(self, tmp_path, transform=None):
+        ds = M4RawRepetitionDataset(
+            h5_files=self._repetition_files(tmp_path),
+            single_contrast=True,
+            coil_processing_mode="none",
+            use_repetitions=True,
+            target_mode="phase_aligned_mean",
+            transform=transform,
+        )
+        return ds[0]
+
+    @staticmethod
+    def _resolved_measurement(subject) -> torch.Tensor:
+        """What the strategy's batch context reads, through the real key order."""
+        from spectramr.infrastructure.training.strategies.mixins.reconstruction import (
+            AUX_KEY_MAPPING,
+        )
+        from spectramr.infrastructure.training.strategies.mixins.utils import pick_present
+
+        keys = AUX_KEY_MAPPING["measured_kspace"]
+        return pick_present(*(subject[k].data if k in subject else None for k in keys))
+
+    def test_the_resolved_measurement_is_the_input_not_the_target(self, tmp_path) -> None:
+        """PLANTED: on the old route this resolved to ``kspace``, the target."""
+        subject = self._subject(tmp_path)
+        assert not torch.equal(subject["input"].data, subject["target"].data)
+        measured = self._resolved_measurement(subject)
+        torch.testing.assert_close(measured, subject["input"].data)
+        assert not torch.equal(measured, subject["target"].data)
+
+    def test_kspace_stays_the_reference(self, tmp_path) -> None:
+        """The coil-map estimator, renderers and the target-first scale read it."""
+        subject = self._subject(tmp_path)
+        torch.testing.assert_close(subject["kspace"].data, subject["target"].data)
+
+    def test_normalization_scales_it_once_like_the_input(self, tmp_path) -> None:
+        from spectramr.data.transforms.normalization import KSpaceNormalizationTransform
+
+        raw = self._subject(tmp_path)
+        served = self._subject(tmp_path, transform=KSpaceNormalizationTransform())
+        scale = served["kspace_scale"]
+        torch.testing.assert_close(served["input"].data, raw["input"].data / scale)
+        torch.testing.assert_close(served["measured_kspace"].data, served["input"].data)
+
+    def test_a_masking_transform_still_owns_the_measurement(self, tmp_path) -> None:
+        """The masked input overwrites the dataset's unmasked one (self_supervised arms)."""
+        from spectramr.data.transforms.complementary_rep_masking import ComplementaryRepMasking
+
+        raw = self._subject(tmp_path)
+        served = self._subject(tmp_path, transform=ComplementaryRepMasking(acceleration=4.0))
+        torch.testing.assert_close(served["measured_kspace"].data, served["input"].data)
+        assert not torch.equal(served["measured_kspace"].data, raw["input"].data)
+
+    def test_the_cross_contrast_route_publishes_its_input_too(self, tmp_path) -> None:
+        """PLANTED: that route also serves the target under ``kspace``."""
+        rng = np.random.default_rng(3)
+        files = []
+        for name in ("2022_T101.h5", "2022_T102.h5", "2022_T201.h5", "2022_T202.h5"):
+            k = rng.standard_normal((2, 4, 16, 12)) + 1j * rng.standard_normal((2, 4, 16, 12))
+            path = tmp_path / name
+            with h5py.File(str(path), "w") as f:
+                f.create_dataset("kspace", data=k.astype(np.complex64))
+            files.append(path)
+        ds = M4RawRepetitionDataset(
+            h5_files=files, single_contrast=False, coil_processing_mode="none"
+        )
+        subject = ds[0]
+        assert not torch.equal(subject["input"].data, subject["target"].data)
+        torch.testing.assert_close(self._resolved_measurement(subject), subject["input"].data)
+
+
+class TestNoiseToNoiseRepetitionStack:
+    """``n2n_pairing``: the training split serves a repetition stack and no target."""
+
+    @staticmethod
+    def _ds(tmp_path, **kw):
+        from tests.unit.data.datasets.test_m4raw_split_modes import _dataset
+
+        return _dataset(tmp_path, **kw)
+
+    def test_a_split_mode_stacks_its_two_halves_with_the_input_first(self, tmp_path) -> None:
+        subject = self._ds(tmp_path, target_mode="r2r", n2n_pairing="ordered")[0]
+        stack = subject["kspace_reps"].data
+        channels = subject["input"].data.shape[0]
+        assert stack.shape[0] == 2 * channels
+        assert torch.equal(stack[:channels], subject["input"].data)
+        assert not torch.equal(stack[channels:], stack[:channels])
+        assert "target" not in subject and "kspace" not in subject
+
+    def test_real_repetitions_are_stacked_in_the_inputs_phase_frame(self, tmp_path) -> None:
+        from tests.unit.data.datasets.test_m4raw_split_modes import _complex
+
+        subject = self._ds(
+            tmp_path,
+            reps=("01", "02", "03"),
+            target_mode="rep_pair",
+            nex_target_exclude_input=True,
+            n2n_pairing="random_pair",
+        )[0]
+        stack = subject["kspace_reps"].data
+        channels = subject["input"].data.shape[0]
+        assert stack.shape[0] == 3 * channels
+        assert torch.equal(stack[:channels], subject["input"].data)
+        anchor = _complex(stack[:channels])
+        for s in (1, 2):
+            other = _complex(stack[s * channels : (s + 1) * channels])
+            # Phase-aligned to the anchor: the coil-plane inner product is real and positive.
+            inner = (other * anchor.conj()).sum(dim=(-2, -1))
+            assert torch.allclose(inner.imag, torch.zeros_like(inner.imag), atol=1e-2 * inner.abs().max())
+            assert torch.all(inner.real > 0)
+        assert "target" not in subject
+
+    def test_unset_keeps_the_served_target(self, tmp_path) -> None:
+        subject = self._ds(tmp_path, target_mode="r2r")[0]
+        assert "target" in subject and "kspace_reps" not in subject
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"target_mode": "r2r", "n2n_pairing": "bogus"}, "Unknown n2n_pairing"),
+            ({"target_mode": "r2r", "n2n_pairing": "random_pair"}, "needs the single-contrast"),
+            (
+                {"target_mode": "phase_aligned_mean", "n2n_pairing": "ordered"},
+                "needs the single-contrast",
+            ),
+        ],
+    )
+    def test_an_unusable_pairing_raises_at_construction(self, tmp_path, kwargs, match) -> None:
+        with pytest.raises(ValueError, match=match):
+            self._ds(tmp_path, **kwargs)
+
+
+def test_the_unwired_file_split_builder_is_gone() -> None:
+    """It split by file (repetitions of one group on both sides) and fell back to validating on training."""
+    from spectramr.data.datasets import m4raw_dataset
+
+    assert not hasattr(m4raw_dataset, "build_m4raw_datasets")
+
+
+def test_contrast_index_for_filename_returns_none_without_a_keyword() -> None:
+    from spectramr.data.datasets.m4raw_dataset import contrast_index_for_filename
+
+    assert contrast_index_for_filename("m4raw_FLAIR_rep1.h5") == 2
+    assert contrast_index_for_filename("volume_0001.h5") is None

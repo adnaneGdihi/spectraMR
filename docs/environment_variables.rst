@@ -264,6 +264,11 @@ Framework behaviour and the CLI
      - *unset*
      - Suppresses the heavy-startup notice for slow CLI commands.
        Read by ``src/spectramr/cli/app.py``
+   * - ``SPECTRAMR_LOG_LEVEL``
+     - *unset*
+     - Log level for the whole process (``debug`` to ``critical``). Beats the config's
+       ``logging.sinks.level``; ``--log-level`` beats this. An unknown value exits ``2``.
+       Read by ``src/spectramr/infrastructure/logging/log_policy.py``
    * - ``SPECTRAMR_DEBUG``
      - *unset*
      - Forces a full traceback on CLI errors (same effect as ``-v``).
@@ -287,6 +292,17 @@ Framework behaviour and the CLI
      - *unset*
      - Absolute path the run writes when it yields at the wall clock. The **launcher** chooses it and the run obeys, so the side that reads it back cannot look somewhere the side that wrote it never went.
        Unset falls back to ``<training.output_dir>/WALL_CLOCK_YIELD``.
+   * - ``SPECTRAMR_DISPATCH_ALLOW_DRIFT``
+     - *unset*
+     - ``1`` lets an array task start although the checkout has left ``dev``, dev no longer contains the submitted commit, or its YAML has an uncommitted edit; the drift is stamped into the run record. Dev advancing is never drift. Unset or ``0`` refuses such a task by name; any other value raises. Set it when submitting: it rides ``--export=ALL``.
+       Read by ``src/spectramr/core/dispatch_snapshot.py``
+   * - ``SPECTRAMR_DISPATCH_RUN_BRANCH``
+     - ``dev``
+     - The branch array runs follow; submitting and every task start refuse any other branch or a detached HEAD. It exists for test fixtures whose checkout is a feature branch; never set it on a cluster. Recorded in the snapshot as ``branch``; a value with surrounding whitespace raises.
+       Read by ``src/spectramr/core/dispatch_git.py``
+   * - ``SPECTRAMR_DISPATCH_SNAPSHOT_RECORD``
+     - *unset*
+     - Path of the per-task snapshot verdict. Set by ``manifest_dispatch`` for the run it launches and stamped into provenance as ``dispatch_snapshot``; never set it by hand.
    * - ``SPECTRAMR_DIMENSION_CONTRACT``
      - ``observe``
      - Dimension-contract mode, one of the valid modes; defaults to ``observe``. An unrecognized value raises.
@@ -329,6 +345,12 @@ Most of these the framework **sets for you** — see `Variables the framework wr
      - ``1``
      - OpenBLAS threads. Pinned at import the same way.
        Read by ``src/spectramr/main.py`` (+1 more)
+   * - ``SPECTRAMR_CPU_THREADS``
+     - *granted cores per rank*
+     - The value :file:`main.py` pins the three variables above, and torch, to. Unset, it is
+       ``SLURM_CPUS_PER_TASK`` divided by ``LOCAL_WORLD_SIZE`` (``1`` outside a Slurm job);
+       a non-positive or non-integer value raises.
+       Read by ``src/spectramr/infrastructure/config/cpu_threads.py``
    * - ``PYTORCH_CUDA_ALLOC_CONF``
      - *unset*
      - Allocator config; ``main.py`` writes ``expandable_segments:True,max_split_size_mb:512``.
@@ -568,8 +590,8 @@ you export can be silently replaced. Two different disciplines are in use:
 .. warning::
 
    Exporting ``OMP_NUM_THREADS=8`` before ``spectramr train`` has **no effect** —
-   :file:`main.py` overwrites it with ``1`` on import. Thread count is an entry-point
-   property here, not an environment one.
+   :file:`main.py` overwrites it on import with the Slurm-granted cores per rank. Export
+   ``SPECTRAMR_CPU_THREADS=8`` to override that; it is the one value :file:`main.py` reads.
 
 .. list-table::
    :header-rows: 1

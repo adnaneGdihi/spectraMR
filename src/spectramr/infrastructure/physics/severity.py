@@ -12,7 +12,7 @@ a sweep whose physical range lives only in a function body cannot be put in a
 table, a paper, or a caption.
 
 This module declares it once. :class:`SeveritySpec` hangs off every
-:class:`~spectramr.infrastructure.physics.digital_twin_extensions.DegradationSpec`,
+:class:`~spectramr.infrastructure.physics.degradations.DegradationSpec`,
 and is the single source for both the sweep's theta grid and the reported
 physical range.
 

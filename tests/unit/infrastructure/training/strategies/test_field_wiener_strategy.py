@@ -129,3 +129,36 @@ def test_strategy_registered_and_config_mounted() -> None:
 
     assert "field_wiener" in TrainingStrategyFactory.STRATEGY_CLASS_PATHS
     assert "field_wiener" in TrainingStrategyConfigSchema.model_fields
+
+
+def test_loss_uses_declared_source_field_on_paired_route() -> None:
+    # The paired ULF route stamps no per-sample field_strength; the declared 64 mT source
+    # field supplies it, so the restorer runs at the stated field rather than raising.
+    batch = {"input": torch.rand(2, 1, 32, 32), "target": torch.rand(2, 1, 32, 32)}
+    out = compute_field_wiener_loss(_net(), batch, source_field=0.064)
+    assert torch.isfinite(out["loss_total"])
+
+
+def test_validation_forward_uses_declared_source_field() -> None:
+    strat = object.__new__(FieldWienerStrategy)
+    strat.env = types.SimpleNamespace(generator=_net().eval())
+    strat._fw_source_field = 0.064
+    pred = strat._validation_forward(torch.rand(2, 1, 32, 32), {}).detach()
+    assert float(pred.min()) >= 0.0 and float(pred.max()) <= 1.0
+
+
+def test_validation_forward_raises_without_any_field() -> None:
+    strat = object.__new__(FieldWienerStrategy)
+    strat.env = types.SimpleNamespace(generator=_net().eval())
+    with pytest.raises(ValueError, match="source field"):
+        strat._validation_forward(torch.rand(2, 1, 32, 32), {})
+
+
+def test_source_field_knob_validated() -> None:
+    from pydantic import ValidationError
+
+    from spectramr.config.schemas.training.field_wiener import FieldWienerConfig
+
+    assert FieldWienerConfig().source_field is None
+    with pytest.raises(ValidationError):
+        FieldWienerConfig(source_field=-0.1)

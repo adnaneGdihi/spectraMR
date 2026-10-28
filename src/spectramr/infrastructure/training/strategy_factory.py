@@ -81,6 +81,7 @@ class TrainingStrategyFactory:
         "ttt": "spectramr.infrastructure.training.strategies.test_time_adaptation_strategy.TttAdaptationStrategy",
         "meta_learning": "spectramr.infrastructure.training.strategies.meta_learning_strategy.MetaLearningTrainingStrategy",
         "disentangled": "spectramr.infrastructure.training.strategies.disentangled_strategy.DisentangledTrainingStrategy",
+        "calibrated_qmap": "spectramr.infrastructure.training.strategies.calibrated_qmap_strategy.CalibratedQMapStrategy",
         "cross_field_translation": "spectramr.infrastructure.training.strategies.cross_field_translation_strategy.CrossFieldTranslationStrategy",
         "field_cocycle": "spectramr.infrastructure.training.strategies.field_cocycle_strategy.FieldCocycleTranslationStrategy",
         "field_flow": "spectramr.infrastructure.training.strategies.field_flow_strategy.FieldFlowStrategy",
@@ -187,7 +188,6 @@ class TrainingStrategyFactory:
         "multi": "spectramr.infrastructure.training.strategies.pipeline_strategy.MultiTrainingStrategy",
         # Aliases for training_mode values used in experiment YAMLs
         "cold_diffusion": "spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy.GraphColdDiffusionStrategy",
-        "upstream_process": "spectramr.infrastructure.training.strategies.upstream_process_strategy.UpstreamProcessStrategy",
         "kspace_cold_diffusion": "spectramr.infrastructure.training.strategies.graph_cold_diffusion_strategy.GraphColdDiffusionStrategy",
         "hybrid": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "mesh": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
@@ -227,7 +227,7 @@ class TrainingStrategyFactory:
         "tropical_mrf": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "fisher_rao_flow": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "sheaf_kspace": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
-        "resetting_diffusion": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
+        "resetting_diffusion": "spectramr.infrastructure.training.strategies.levy_denoising_strategy.LevyDenoisingStrategy",
         "hyperbolic_cardiac": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "heisenberg_phase": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "hjb_trajectory": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
@@ -235,7 +235,7 @@ class TrainingStrategyFactory:
         "symplectic_bloch": "spectramr.infrastructure.training.strategies.cycle_bloch_strategy.CycleBlochStrategy",
         "frontdoor_federated": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "hodge_motion": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
-        "levy_diffusion": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
+        "levy_diffusion": "spectramr.infrastructure.training.strategies.levy_denoising_strategy.LevyDenoisingStrategy",
         "koopman_fmri": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "sheaf_multi_contrast": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "hjb_waveform": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
@@ -378,6 +378,11 @@ class TrainingStrategyFactory:
         "corruption_calibration": "spectramr.infrastructure.training.strategies.pmps_strategies.CorruptionCalibrationStrategy",
         "paired_synthesis": "spectramr.infrastructure.training.strategies.pmps_strategies.PairedSynthesisStrategy",
         "data_efficiency_harness": "spectramr.infrastructure.training.strategies.pmps_strategies.DataEfficiencyHarnessStrategy",
+        # Hardware-warp identification from repeat-session commutators (batch-1 Proposal 2,
+        # 2026-09-24). Frozen-parameter orchestrator in the quality_matching pattern: the
+        # deliverable is the warp artifact read by the ``hardware_unwarp`` transform, not a
+        # checkpoint.
+        "hardware_warp_calibration": "spectramr.infrastructure.training.strategies.hardware_warp_calibration_strategy.HardwareWarpCalibrationStrategy",
         # VF campaign Phase 2 breakthrough methods (B-1..B-4).
         "equivariance_conformal": "spectramr.infrastructure.training.strategies.equivariance_conformal_strategy.EquivarianceConformalCalibrationStrategy",
         "phys_residual_conformal": "spectramr.infrastructure.training.strategies.phys_residual_conformal_strategy.PhysResidualConformalStrategy",

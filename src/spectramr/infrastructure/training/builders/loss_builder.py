@@ -21,6 +21,13 @@ from .base import Builder
 
 logger = logging.getLogger(__name__)
 
+#: Bridge mode -> (``return_complex`` for the wrapper, label for the log line). A mode not
+#: listed ('none') leaves the loss in its native domain.
+_BRIDGE_WRAPPERS: dict[str, tuple[bool, str]] = {
+    "ifft_magnitude": (False, "iFFT→magnitude bridge"),
+    "ifft_complex": (True, "iFFT→complex bridge"),
+}
+
 #: Losses that ``LossBuilder`` must NOT instantiate as standalone modules
 #: because a training strategy computes them inline (they need gradients,
 #: encoder features, an injected ``context`` dict, or are bundled inside a
@@ -31,6 +38,7 @@ logger = logging.getLogger(__name__)
 STRATEGY_MANAGED_LOSSES: frozenset[str] = frozenset(
     {
         # Strategy-managed (built by the training strategy)
+        "calibrated_gain_bloch",  # CalibratedQMapStrategy: needs the render and gain context
         "commitment",
         "codebook",
         "r1",
@@ -758,12 +766,11 @@ class LossBuilder(Builder):
                             f"read k-space and bridge itself."
                         )
 
-                if bridge_mode == "ifft_magnitude":
-                    loss_fn = _BridgedLoss(loss_fn, return_complex=False)
-                    logger.info(f"Created {name} loss (weight={weight}) with iFFT→magnitude bridge")
-                elif bridge_mode == "ifft_complex":
-                    loss_fn = _BridgedLoss(loss_fn, return_complex=True)
-                    logger.info(f"Created {name} loss (weight={weight}) with iFFT→complex bridge")
+                bridge = _BRIDGE_WRAPPERS.get(bridge_mode)
+                if bridge is not None:
+                    return_complex, label = bridge
+                    loss_fn = _BridgedLoss(loss_fn, return_complex=return_complex)
+                    logger.info(f"Created {name} loss (weight={weight}) with {label}")
                 else:
                     logger.info(f"Created {name} loss (weight={weight}) [native domain]")
 
@@ -784,10 +791,7 @@ class LossBuilder(Builder):
             # Image-output model: kspace losses receive image-domain inputs
             # as-is. Some kspace losses self-FFT (e.g. focal_frequency,
             # log_spectral), others (complex_l1) do NOT — those will
-            # silently produce wrong values. The right declarative fix is
-            # to declare an explicit `adapters.pre_loss_pred:
-            # [fft_image_to_kspace]` chain when the model truly outputs
-            # image and kspace losses are wanted.
+            # silently produce wrong values; the loss list must match the model domain.
             kspace_bridge = "none"
             image_bridge = "none"
             complex_bridge = "none"
@@ -1132,10 +1136,56 @@ class LossBuilder(Builder):
         logger.info(f"Loss validation passed ({len(self._losses)} losses created)")
         return self
 
+    def _kspace_is_log_scaled(self) -> bool:
+        """Whether the arm's k-space reaches the losses ``log1p``-compressed.
+
+        Read from the same spec the data path normalises with, so the answer is
+        the one the tensors were produced under rather than a second reading of
+        the YAML. The loss-only shims (``loss_audit``, ``domain_validation``) carry
+        no ``data`` block, and with no data there is no compressed k-space.
+        """
+        from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+        data = getattr(self._config, "data", None)
+        if data is None:
+            return False
+        return KSpaceNormalizationSpec.from_data_config(data).log_compressed
+
+    def _apply_kspace_log_scaling(self) -> None:
+        """Set ``log_scaled`` on every k-space -> image step in the built stack (#2338).
+
+        A loss that moves its operands to the image domain -- the builder's own
+        bridges, or a loss with ``use_fourier_bridge`` -- must decompress
+        ``log1p``-compressed k-space first, or it scores the inverse FFT of the
+        compressed plane instead of the image. A transform that cannot take the
+        flag raises, so a new self-bridging loss cannot silently skip it.
+        """
+        from spectramr.models.losses.physics_losses import DifferentiableFourierBridge
+
+        log_scaled = self._kspace_is_log_scaled()
+        for name, loss in self._losses.items():
+            if not isinstance(loss, nn.Module):
+                continue
+            for module in loss.modules():
+                bridges = isinstance(module, DifferentiableFourierBridge)
+                if not bridges and getattr(module, "use_fourier_bridge", False) is not True:
+                    continue
+                if hasattr(module, "log_scaled"):
+                    module.log_scaled = log_scaled
+                elif not any(isinstance(m, DifferentiableFourierBridge) for m in module.modules()):
+                    raise ConfigurationError(
+                        f"Loss '{name}' moves k-space to the image domain "
+                        f"({type(module).__name__}.use_fourier_bridge=True) but exposes no "
+                        "`log_scaled` attribute, so it cannot undo the arm's log1p "
+                        "k-space compression. Route its inverse FFT through "
+                        "physics_losses.kspace_to_image and declare `log_scaled`."
+                    )
+
     def build(self) -> dict[str, nn.Module]:
-        """build.
+        """Return the built losses, with every k-space -> image step matched to the data.
 
         Returns:
-            dict[str, nn.Module]: Description.
+            dict[str, nn.Module]: The loss modules by name.
         """
+        self._apply_kspace_log_scaling()
         return dict(self._losses)

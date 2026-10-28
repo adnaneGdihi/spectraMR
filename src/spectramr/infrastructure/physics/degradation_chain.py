@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from spectramr.infrastructure.physics.digital_twin_extensions import (
+from spectramr.infrastructure.physics.degradations.registry import (
     DEGRADATION_REGISTRY,
     apply_degradation,
     derive_axis_seed,
@@ -45,10 +45,6 @@ __all__ = [
 #: and 0.00 on replay). Derived from the two banks rather than written out, so a
 #: newly dual-listed axis is covered the day it is added.
 _DUAL_BANK_AXES: frozenset[str] = NATIVE_DEGRADATION_AXES & frozenset(DEGRADATION_REGISTRY)
-
-#: The simulator's own AWGN stage. It is UNCONDITIONAL -- there is no
-#: ``enable_noise`` -- so an emitted chain has to silence it explicitly.
-_NATIVE_NOISE_STAGE = "noise"
 
 
 class UnapplicableAxisError(ValueError):
@@ -147,7 +143,8 @@ class DegradationChain:
         ``(0.0, 1.0)``, which would silently track the corruption factor instead of
         holding the fitted severity.
 
-        ``noise`` is pinned to ``(0.0, 0.0)`` although it is not a chain axis. The
+        Every native stage is pinned to ``(0.0, 0.0)``, ``noise`` included, although
+        none is a chain axis. The
         simulator's AWGN stage has no enable flag, and ``_get_effective_cf`` holds
         any feature *absent* from a non-empty ``progressive_degradations`` at 1.0 --
         so a block naming only the fitted axes replays them PLUS a fresh 10-25 dB
@@ -167,10 +164,11 @@ class DegradationChain:
             "enabled": True,
             "progressive_degradations": list(self.axes),
             "degradation_ranges": {
-                # Pinned FIRST so a chain axis can never be overwritten by it.
-                # ``noise`` is native-only, so __post_init__ already rejects it as a
-                # link; this ordering keeps that true if the banks ever change.
-                _NATIVE_NOISE_STAGE: (0.0, 0.0),
+                # Every native stage is pinned to 0, FIRST so a chain axis can never be
+                # overwritten by it: a stage the consumer enables but the fit never saw
+                # (b1, motion, ...) is otherwise held at full strength on replay.
+                # Native names are rejected as links by __post_init__.
+                **dict.fromkeys(sorted(NATIVE_DEGRADATION_AXES), (0.0, 0.0)),
                 **{link.axis: (link.theta, link.theta) for link in self.links},
             },
         }

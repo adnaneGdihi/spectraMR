@@ -1,7 +1,7 @@
 """Energy off the coil manifold, and the ways this could be silently wrong.
 
-The penalty is zero on every realisable image by construction, so the thing to
-pin is not that it is small on good input -- that is trivially true of any term
+The penalty is zero on every noise-free rank-one image by construction, so the
+thing to pin is not that it is small on good input -- that is trivially true of any term
 multiplied by zero. It is that it is LARGE on input a coil array could not have
 produced, and that it refuses to run on inputs where it would be quietly wrong:
 
@@ -108,6 +108,19 @@ class TestItMeasuresWhatItClaims:
         )
         assert torch.allclose(k, i, rtol=1e-3, atol=1e-6), (float(k), float(i))
 
+    @pytest.mark.parametrize("sigma", [0.01, 0.05, 0.1])
+    def test_a_noisy_physical_image_pays_the_noise_floor(self, parts, sigma) -> None:
+        """Not zero on measured data: white coil noise leaves (C - 1) * sigma^2 per pixel."""
+        generator = torch.Generator().manual_seed(1)
+        noise = sigma * torch.randn(
+            parts["physical"].shape, dtype=torch.complex64, generator=generator
+        )
+        loss = CoilSubspaceResidualLoss(input_domain="image", weight_by_support=False)
+        value = loss(
+            _interleave(parts["physical"] + noise), None, coil_sensitivities=parts["maps"]
+        )
+        assert float(value) == pytest.approx((_C - 1) * sigma**2, rel=0.05)
+
     def test_it_is_differentiable(self, parts) -> None:
         loss = CoilSubspaceResidualLoss(input_domain="kspace")
         pred = _interleave(fft2c(parts["physical"])).requires_grad_(True)
@@ -148,7 +161,11 @@ class TestItRefusesWhatWouldBeQuietlyWrong:
             )
 
     def test_all_zero_maps_raise(self, parts) -> None:
-        """No pixel carries a rank-one constraint, so there is nothing to measure."""
+        """No pixel carries a rank-one constraint, so there is nothing to measure.
+
+        ValueError, not the RuntimeError ``torch._assert_async`` raises on CPU: the
+        declarative loss path re-raises only ValueError and drops anything else.
+        """
         with pytest.raises(ValueError, match="every sensitivity map is zero"):
             CoilSubspaceResidualLoss()(
                 _interleave(fft2c(parts["physical"])),
@@ -273,3 +290,61 @@ class TestTheMapsReachItThroughTheProductionCall:
                 _interleave(parts["physical"]),
                 pinn_loss=None,
             )
+
+
+class TestItUndoesTheArmsLogCompression:
+    """#2338: a rank-one coil field stays rank one only on the uncompressed plane."""
+
+    def test_the_physical_field_scores_zero_from_compressed_kspace_when_flagged(self, parts):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        k = compress_kspace_log(fft2c(parts["physical"]))
+        loss = CoilSubspaceResidualLoss(input_domain="kspace", weight_by_support=False)
+        loss.log_scaled = True
+        flagged = float(loss(k, k, coil_sensitivities=parts["maps"]))
+        loss.log_scaled = False
+        unflagged = float(loss(k, k, coil_sensitivities=parts["maps"]))
+        assert flagged < 1e-6
+        assert unflagged > 100 * max(flagged, 1e-9)
+
+
+def _forbid_host_reads(monkeypatch) -> None:
+    """Make any device->host scalar read raise, so a hidden sync fails the test."""
+
+    def _raise(*_a, **_k):
+        raise AssertionError("host read of a tensor value")
+
+    for name in ("__bool__", "__float__", "item"):
+        monkeypatch.setattr(torch.Tensor, name, _raise)
+
+
+class TestTheSupportGuardDoesNotSync:
+    """#2265: the zero-support guard ran ``float(total)`` on every step."""
+
+    def test_the_weighted_forward_reads_nothing_back(self, parts, monkeypatch) -> None:
+        pred = _interleave(fft2c(parts["physical"]))
+        _forbid_host_reads(monkeypatch)
+        CoilSubspaceResidualLoss(input_domain="kspace")(
+            pred, None, coil_sensitivities=parts["maps"]
+        )
+
+    def test_the_detector_catches_the_old_guard(self, monkeypatch) -> None:
+        """Planted violation: the pre-#2265 guard trips the detector."""
+        total = torch.tensor(3.0)
+        _forbid_host_reads(monkeypatch)
+        with pytest.raises(AssertionError, match="host read"):
+            if float(total) <= 0.0:
+                raise ValueError("unreachable")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="sync debug mode needs CUDA")
+    @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+    def test_no_synchronizing_call_on_cuda(self, parts) -> None:
+        pred = _interleave(fft2c(parts["physical"])).cuda()
+        maps = parts["maps"].cuda()
+        loss = CoilSubspaceResidualLoss(input_domain="kspace")
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            loss(pred, None, coil_sensitivities=maps)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")

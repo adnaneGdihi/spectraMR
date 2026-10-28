@@ -147,10 +147,24 @@ class TestTheDeviceIsCrossCheckedFirst:
         import spectramr.infrastructure.training.builders.compile_apply as mod
 
         monkeypatch.setattr(mod, "triton_available", lambda: True)
+        monkeypatch.setattr(mod, "capability_of_device", lambda device: (8, 9))
         result, _ = apply_compile(
             _models(), _config(), stage="after_stage_b", device="cuda"
         )
         assert result["generator"] is not None
+
+    def test_a_p100_raises_before_anything_is_compiled(self, monkeypatch):
+        """Planted (LM-16): Inductor on sm_60 must be refused at build time."""
+        import spectramr.infrastructure.training.builders.compile_apply as mod
+
+        monkeypatch.setattr(mod, "triton_available", lambda: True)
+        monkeypatch.setattr(mod, "capability_of_device", lambda device: (6, 0))
+        compiled = []
+        monkeypatch.setattr(torch, "compile", lambda m, **k: compiled.append(m) or m)
+
+        with pytest.raises(CompileUnsupportedError, match=r"6\.0"):
+            apply_compile(_models(), _config(), stage="after_stage_b", device="cuda:0")
+        assert compiled == []
 
     def test_a_backend_that_does_not_need_triton_is_not_refused(self, monkeypatch):
         """Planted: refusing ``eager`` for want of Triton would be a false

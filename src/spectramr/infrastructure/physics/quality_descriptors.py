@@ -13,6 +13,7 @@ absorb a geometry error and report a good residual on a wrong voxel size.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -27,8 +28,10 @@ __all__ = [
     "UnmeasurableAttributeError",
     "measure",
     "measure_attributes",
+    "normalise_intensity",
     "read_spacing_mm",
     "resample_to_spacing",
+    "robust_scale",
     "validate_attributes",
 ]
 
@@ -100,6 +103,28 @@ def measure_attributes(
         name: float(get_metric(name)(batch))  # type: ignore[call-arg]
         for name in attributes
     }
+
+
+def robust_scale(volume: torch.Tensor, percentile: float) -> float:
+    """The ``percentile``-th value of ``|volume|``: the intensity unit both sides share.
+
+    A high percentile rather than the maximum, so one hot voxel does not set the unit.
+    Raises on a non-positive scale: dividing by it would fabricate every attribute.
+    """
+    mags = volume.detach().abs().flatten().float()
+    k = max(1, math.ceil(float(percentile) / 100.0 * mags.numel()))
+    scale = float(torch.kthvalue(mags, k).values)
+    if not scale > 0.0:
+        raise ValueError(
+            f"the {percentile}th percentile of |volume| is {scale}; a volume with no "
+            "signal at that percentile cannot be put on a shared intensity scale."
+        )
+    return scale
+
+
+def normalise_intensity(volume: torch.Tensor, percentile: float) -> torch.Tensor:
+    """``volume`` divided by its own robust scale, so its ``percentile`` lands at 1."""
+    return volume / robust_scale(volume, percentile)
 
 
 def read_spacing_mm(header: Any, volume: torch.Tensor) -> tuple[float, float, float]:

@@ -236,7 +236,6 @@ class TorchIOAdapter:
         elif pred_ch < tgt_ch and tgt_ch % pred_ch == 0:
             # Generic case: target has more channels than prediction (cross-contrast).
             # Take LAST channels = target contrast (M4Raw stacks [source|target]).
-            # Consistent with _slice_to_target_contrast_single which uses [:, -target_ch:].
             target = target[:, -pred_ch:]
             logger.info(
                 f"[TorchIOAdapter] Sliced target {tgt_ch}ch → last {pred_ch}ch (target contrast)"

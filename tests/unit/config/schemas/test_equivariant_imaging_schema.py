@@ -34,7 +34,7 @@ def test_defaults():
 
 def test_rejects_unknown_field():
     with pytest.raises(ValidationError):
-        TrainingConfigEquivariantImaging(grup="dihedral")  # typo -> extra="forbid"
+        TrainingConfigEquivariantImaging(grouping="dihedral")  # unknown key -> extra="forbid"
 
 
 def test_rejects_unknown_group():
@@ -81,3 +81,82 @@ def test_ei_keys_registered_and_resolvable():
         assert paths[key].endswith(
             "equivariant_imaging_strategy.EquivariantImagingStrategy"
         )
+
+
+def test_measurement_target_defaults_to_the_measurement():
+    """Every existing EI arm keeps its anchor on the y it reconstructs from."""
+    assert TrainingConfigEquivariantImaging().measurement_target == "measured"
+
+
+def test_measurement_target_is_a_closed_set():
+    with pytest.raises(ValidationError):
+        TrainingConfigEquivariantImaging(measurement_target="the_other_one")
+
+
+def test_the_gsure_anchor_refuses_an_alternate_repetition():
+    """GSURE corrects the MEASURED anchor's noise; against a second repetition it
+    has nothing to correct, so the pair is a contradiction, not a combination."""
+    with pytest.raises(ValidationError, match="alternate repetition"):
+        TrainingConfigEquivariantImaging(
+            robust_correction=True,
+            noise_std_estimate=0.1,
+            measurement_target="alternate_repetition",
+        )
+
+
+class TestBandKnobs:
+    """The acquired-band knobs default to today's anchor and target, and refuse the
+    anchors that never read them (non-negotiable 8)."""
+
+    def test_defaults_are_the_unchanged_objective(self):
+        from spectramr.config.schemas.training.equivariant_imaging import (
+            TrainingConfigEquivariantImaging,
+        )
+
+        cfg = TrainingConfigEquivariantImaging()
+        assert (cfg.anchor_mask, cfg.anchor_normalization, cfg.equivariance_target) == (
+            "input",
+            "all_entries",
+            "transformed",
+        )
+
+    def test_accepted_on_the_plain_measured_anchor(self):
+        from spectramr.config.schemas.training.equivariant_imaging import (
+            TrainingConfigEquivariantImaging,
+        )
+
+        cfg = TrainingConfigEquivariantImaging(
+            anchor_mask="with_structural_zeros",
+            anchor_normalization="selected",
+            equivariance_target="band_limited",
+        )
+        assert cfg.anchor_mask == "with_structural_zeros"
+
+    @pytest.mark.parametrize(
+        "planted",
+        [
+            {"anchor_mask": "with_structural_zeros", "robust_correction": True, "noise_std_estimate": 0.1},
+            {"anchor_normalization": "selected", "measurement_target": "alternate_repetition"},
+        ],
+        ids=["gsure-anchor", "alternate-repetition-anchor"],
+    )
+    def test_refused_where_the_anchor_never_reads_them(self, planted):
+        from pydantic import ValidationError
+
+        from spectramr.config.schemas.training.equivariant_imaging import (
+            TrainingConfigEquivariantImaging,
+        )
+
+        with pytest.raises(ValidationError, match="never read them"):
+            TrainingConfigEquivariantImaging(**planted)
+
+    @pytest.mark.parametrize("field", ["anchor_mask", "anchor_normalization", "equivariance_target"])
+    def test_an_unknown_value_is_refused(self, field):
+        from pydantic import ValidationError
+
+        from spectramr.config.schemas.training.equivariant_imaging import (
+            TrainingConfigEquivariantImaging,
+        )
+
+        with pytest.raises(ValidationError):
+            TrainingConfigEquivariantImaging(**{field: "bogus"})

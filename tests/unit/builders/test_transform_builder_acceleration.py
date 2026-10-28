@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from spectramr.config.schemas.acceleration import AccelerationConfigSchema
 from spectramr.data.builders.torchio_transform_builder import (
     TorchIOTransformBuilder,
@@ -135,6 +137,66 @@ def test_transform_builder_injects_digital_twin_when_opted_in():
     assert any(
         isinstance(t, DigitalTwinDegradation) for t in transforms.transforms
     ), "Pipeline MUST include DigitalTwinDegradation when apply_as_transform is set"
+
+
+def test_transform_route_builds_the_acquisition_profile_at_the_config_field():
+    from spectramr.config.schemas.physics import DigitalTwinConfig
+    from spectramr.data.transforms.tio_physics import DigitalTwinDegradation
+
+    config = TorchIOTransformConfig(
+        patch_size=(32, 32, 1),
+        dataset_type="kspace",
+        digital_twin_apply=True,
+        digital_twin_config=DigitalTwinConfig(acquisition={"scanner_profile": "m4raw_0.3T"}),
+        digital_twin_field_strength_t=0.3,
+    )
+    twin = next(
+        t
+        for t in TorchIOTransformBuilder.build_val_transforms(config).transforms
+        if isinstance(t, DigitalTwinDegradation)
+    )
+    profile = twin.simulator.scanner_profile
+    assert (profile.name, profile.b0_T) == ("m4raw_0.3T", 0.3)
+    record = twin.applied_record()
+    assert record["scanner_profile"] == "m4raw_0.3T"
+    assert record["scanner_profile_sha256"] == profile.meta_sha256()
+
+
+@pytest.mark.parametrize(
+    ("declared", "pe_axis", "source"),
+    [(-1, "H", "data.acquisition.phase_encode_axis"), (None, "W", "undeclared")],
+)
+def test_the_twin_reads_the_dataset_phase_encode_axis(declared, pe_axis, source):
+    from spectramr.config.schemas.physics import DigitalTwinConfig
+    from spectramr.data.transforms.tio_physics import DigitalTwinDegradation
+
+    config = TorchIOTransformConfig(
+        patch_size=(32, 32, 1),
+        dataset_type="kspace",
+        digital_twin_apply=True,
+        digital_twin_config=DigitalTwinConfig(),
+        phase_encode_axis=declared,
+    )
+    (twin,) = (
+        t
+        for t in TorchIOTransformBuilder.build_val_transforms(config).transforms
+        if isinstance(t, DigitalTwinDegradation)
+    )
+    record = twin.applied_record()
+    assert (record["pe_axis"], record["pe_axis_source"]) == (pe_axis, source)
+
+
+def test_from_training_config_carries_physics_field_strength_to_the_twin():
+    from spectramr.config.schemas.physics import PhysicsConfigSchema
+
+    data = DataConfigStub(patch_size=(32, 32, 1), coil_processing_mode="none")
+    data.undersampling = AccelerationConfigSchema(base_acceleration=1.0)
+    data.physics = PhysicsConfigSchema(
+        field_strength=0.3,
+        digital_twin={"apply_as_transform": True, "acquisition": {"scanner_profile": "m4raw_0.3T"}},
+    )
+    config = TorchIOTransformConfig.from_training_config(data)
+    assert config.digital_twin_field_strength_t == 0.3
 
 
 def test_transform_builder_no_digital_twin_by_default():

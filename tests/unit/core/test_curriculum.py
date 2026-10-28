@@ -100,3 +100,52 @@ def test_resolution_reads_only_config_and_never_raises_on_a_bare_object() -> Non
     state = resolve_curriculum_state(SimpleNamespace())
     assert not state.declared and not state.effective
     assert state.max_iterations == DEFAULT_MAX_ITERATIONS
+
+
+# ---------------------------------------------------------------------------
+# When the top rung opens (#2066)
+# ---------------------------------------------------------------------------
+
+
+def _laddered(start, rate, max_iterations, timesteps=29) -> SimpleNamespace:
+    cfg = _config(start, rate, max_iterations)
+    cfg.training.diffusion = SimpleNamespace(timesteps=timesteps)
+    return cfg
+
+
+def test_top_opens_at_matches_the_sampler_cap() -> None:
+    """``int(1 + i * 0.0005) >= 29`` first holds at i = 56000."""
+    state = resolve_curriculum_state(_laddered(1, 0.0005, 70_000))
+    assert state.top_opens_at == 56_000
+    assert int(1 + (state.top_opens_at - 1) * 0.0005) < 29 <= int(1 + state.top_opens_at * 0.0005)
+
+
+def test_an_early_ladder_is_silent() -> None:
+    state = resolve_curriculum_state(_laddered(1, 0.002, 70_000))
+    assert state.top_opens_at == 14_000
+    assert state.ladder_warning() is None
+
+
+def test_a_late_ladder_is_reported() -> None:
+    """PLANTED: the kspace_filling shape, open at 80 % of the budget."""
+    state = resolve_curriculum_state(_laddered(1, 0.0005, 70_000))
+    assert state.opens_late and not state.truncated
+    assert "80%" in state.ladder_warning()
+
+
+def test_a_truncated_ladder_is_reported() -> None:
+    """PLANTED: #2066's run, 17500 iterations against an opening at 56000."""
+    state = resolve_curriculum_state(_laddered(1, 0.0005, 17_500))
+    assert state.truncated
+    assert "never inside the budget" in state.ladder_warning()
+
+
+def test_the_late_boundary_is_exclusive() -> None:
+    state = resolve_curriculum_state(_laddered(1, 0.0008, 70_000))
+    assert state.top_opens_at == 35_000
+    assert state.ladder_warning() is None
+
+
+def test_an_unknown_horizon_reports_nothing() -> None:
+    state = resolve_curriculum_state(_config(1, 0.0005, 70_000))
+    assert state.top_opens_at is None and state.ladder_warning() is None

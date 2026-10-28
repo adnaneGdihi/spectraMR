@@ -43,10 +43,9 @@ order, and stale the moment the cascade is reordered or disabled.
 is the 5D->4D depth flatten -- 36 rows for an 18-slice volume at B=2 -- and at
 t=0 the revealed mask is all-ones, so it is the densest input of the whole
 sweep, evaluated after the cascade has already filled the card. Splitting ``x``
-alone would not be enough either: ``complex_unet`` truncates a longer
-``contrast_emb`` to match ``t_emb`` rather than raising (#2055), so a full-batch
-``contrast_idx`` beside a one-row ``x`` conditions every chunk on row 0's
-contrast and still returns a number.
+alone would not be enough either: the generator refuses a ``contrast_emb`` whose
+rows differ from ``t_emb``'s (``require_contrast_rows``, #2055), so a full-batch
+``contrast_idx`` beside a chunk of ``x`` stops the probe instead of scoring it.
 
 Scoring is deliberately NOT done here. The strategy owns one metrics seam
 (``_compute_validation_metrics``); this module hands it a tensor and renames
@@ -150,10 +149,8 @@ def slice_row_kwargs(
     ``kspace_measured``. Anything else -- a scalar, a flag, a broadcastable
     ``(1, ...)`` map -- reaches every chunk untouched.
 
-    A chunked ``x`` beside full-batch kwargs is not a shape error the model
-    reports: ``complex_unet`` truncates the longer of ``contrast_emb`` /
-    ``t_emb`` to the shorter (#2055), so every chunk would be conditioned on
-    row 0's contrast and still score.
+    A chunked ``x`` beside a full-batch ``contrast_idx`` fails at the
+    generator, which requires one contrast row per timestep row (#2055).
     """
     return {
         key: (

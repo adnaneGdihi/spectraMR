@@ -29,6 +29,7 @@ from spectramr.models.blocks.attention_domains import (
     interleaved_to_complex,
     validate_feature_domain,
 )
+from spectramr.models.blocks.contrast_conditioning import require_contrast_rows
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
 
 
@@ -43,11 +44,11 @@ class TokenAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         b, n, d = x.shape
         qkv = self.qkv(x).reshape(b, n, 3, self.heads, d // self.heads)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.proj(out.transpose(1, 2).reshape(b, n, d))
 
 
@@ -102,15 +103,24 @@ class TimeConditioning(nn.Module):
         batch: int,
         device: torch.device,
         max_timesteps: float | None = None,
+        scale: str = "unit_interval",
     ) -> torch.Tensor:
-        """Embed ``timesteps``; a caller that passes none conditions on step 0."""
+        """Embed ``timesteps``; a caller that passes none conditions on step 0.
+
+        ``scale="integer"`` embeds the step index and ignores both horizons.
+        """
         if timesteps is None:
             timesteps = torch.zeros(batch, device=device)
         t = timesteps.float().flatten()
         if t.numel() == 1 and batch > 1:
             t = t.expand(batch)
+        # Slicing a longer vector conditions each sample on another sample's step
+        # and still trains, so only a broadcast scalar is legal (#2438).
         if t.shape[0] != batch:
-            t = t[:batch]
+            raise ValueError(
+                f"TimeConditioning received {t.shape[0]} timesteps for a batch of "
+                f"{batch}; pass one per sample or a single broadcast step."
+            )
         effective_max = self.max_timesteps
         if max_timesteps is not None:
             if effective_max is not None and float(effective_max) != float(max_timesteps):
@@ -120,8 +130,10 @@ class TimeConditioning(nn.Module):
                     "two owners of the diffusion horizon disagree."
                 )
             if effective_max is None:
-                t = t / float(max_timesteps)
-        basis = sinusoidal_timestep_embedding(t, self.dim, max_timesteps=effective_max)
+                effective_max = float(max_timesteps)
+        basis = sinusoidal_timestep_embedding(
+            t, self.dim, max_timesteps=effective_max, scale=scale
+        )
         return self.mlp(basis)
 
 
@@ -161,10 +173,11 @@ def apply_contrast_conditioning(
     """
     if contrast is None:
         return cond
+    require_contrast_rows(contrast, cond.shape[0], owner=owner)
     if contrast.shape[-1] == cond.shape[-1]:
-        return cond + contrast[: cond.shape[0]]
+        return cond + contrast
     if contrast_proj is not None and contrast_proj.in_features == contrast.shape[-1]:
-        return cond + contrast_proj(contrast[: cond.shape[0]])
+        return cond + contrast_proj(contrast)
     raise ValueError(
         f"{owner} received contrast_emb width {contrast.shape[-1]} that matches "
         f"neither cond width {cond.shape[-1]} nor the built contrast_proj "

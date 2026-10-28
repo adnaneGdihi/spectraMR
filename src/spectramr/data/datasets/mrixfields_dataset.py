@@ -21,7 +21,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Callable
 from itertools import permutations
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -1186,17 +1186,21 @@ class MRIxFieldsPairedDataset(torch.utils.data.Dataset):
             )
         return index_map
 
+    #: The loader for each pairing policy that is not the plain source-target pair.
+    _GETITEM_BY_POLICY: ClassVar[dict[str, str]] = {
+        "multi_source": "_getitem_multi_source",
+        "multi_contrast": "_getitem_multi_contrast",
+        "multi_field": "_getitem_multi_field",
+    }
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         if self._slice_mode == "all_slices":
             container_idx, slice_idx = self._index_map[idx]
         else:
             container_idx, slice_idx = idx, None
-        if self._policy == "multi_source":
-            return self._getitem_multi_source(container_idx, slice_idx)
-        if self._policy == "multi_contrast":
-            return self._getitem_multi_contrast(container_idx, slice_idx)
-        if self._policy == "multi_field":
-            return self._getitem_multi_field(container_idx, slice_idx)
+        getter = self._GETITEM_BY_POLICY.get(self._policy)
+        if getter is not None:
+            return getattr(self, getter)(container_idx, slice_idx)
         src, tgt = self._pairs[container_idx]
         sample: dict[str, Any] = {
             "input": self._img(src["primary_path"], slice_idx),

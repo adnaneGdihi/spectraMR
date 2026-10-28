@@ -135,7 +135,13 @@ class UViTBackbone(GradCheckpointingMixin, nn.Module, IGenerator):
         self, x: torch.Tensor, timesteps: torch.Tensor | None = None, **kwargs: Any
     ) -> torch.Tensor:
         grid = self.stem.grid(x.shape[-2], x.shape[-1])
-        cond = self.time(timesteps, x.shape[0], x.device, max_timesteps=kwargs.get("max_timesteps"))
+        cond = self.time(
+            timesteps,
+            x.shape[0],
+            x.device,
+            max_timesteps=kwargs.get("max_timesteps"),
+            scale=kwargs.get("timestep_scale", "unit_interval"),
+        )
         cond = apply_contrast_conditioning(
             cond, kwargs.get("contrast_emb"), self.contrast_proj, owner="UViTBackbone"
         )

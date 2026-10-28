@@ -269,3 +269,124 @@ class TestPerEntryKwargsReachTheConstructor:
             kspace_losses=[LossComponentConfig(name="sobolev_kspace", weight=1.0)]
         )
         assert "sobolev_kspace" in builder._losses
+
+
+# ---------------------------------------------------------------------------
+# #2338: every k-space -> image step on the loss path decompresses the arm's
+# log1p-compressed k-space. The builder sets `log_scaled` from the data spec and
+# refuses a self-bridging loss that cannot take it.
+# ---------------------------------------------------------------------------
+
+
+class _DataShim:
+    def __init__(self, *, log_scaling: bool, enabled: bool = True) -> None:
+        self.processing = type(
+            "P",
+            (),
+            {
+                "enable_kspace_normalization": enabled,
+                "kspace_percentile": 0.95,
+                "kspace_scale_domain": "image",
+                "enable_log_scaling": log_scaling,
+                "log_scaling_center_fraction": 0.25,
+            },
+        )()
+
+
+def _build_with_data(data, **lists: list[LossComponentConfig]) -> dict:
+    losses = LossConfigSchema(output_domain="kspace", **lists)
+    shim = _ConfigShim(losses)
+    shim.data = data
+    builder = LossBuilder(shim, device="cpu")  # type: ignore[arg-type]
+    builder._build_list_based_losses()
+    return builder.build()
+
+
+_KSPACE_TO_IMAGE_STACK = {
+    "kspace_losses": [_entry("complex_spatial_gradient"), _entry("sense_adjoint_l1")],
+    "image_losses": [_entry("hfen")],
+    "complex_losses": [_entry("coil_subspace_residual", input_domain="image")],
+}
+
+
+def _flags(built: dict) -> dict[str, list[bool]]:
+    """``log_scaled`` of every module that actually moves k-space to the image.
+
+    A loss behind the builder's bridge with ``input_domain: image`` carries the
+    attribute but performs no transform, so it is not a step and is not listed.
+    """
+    from spectramr.models.losses.physics_losses import DifferentiableFourierBridge
+
+    return {
+        name: [
+            m.log_scaled
+            for m in loss.modules()
+            if hasattr(m, "log_scaled")
+            and (
+                isinstance(m, DifferentiableFourierBridge)
+                or getattr(m, "use_fourier_bridge", False) is True
+            )
+        ]
+        for name, loss in built.items()
+    }
+
+
+def test_a_log_scaled_arm_flags_every_kspace_to_image_step() -> None:
+    flags = _flags(_build_with_data(_DataShim(log_scaling=True), **_KSPACE_TO_IMAGE_STACK))
+    assert set(flags) == {
+        "complex_spatial_gradient",
+        "sense_adjoint_l1",
+        "hfen",
+        "coil_subspace_residual",
+    }
+    for name, values in flags.items():
+        assert values and all(values), (name, values)
+
+
+@pytest.mark.parametrize(
+    "data", [_DataShim(log_scaling=False), _DataShim(log_scaling=True, enabled=False), None]
+)
+def test_an_uncompressed_arm_leaves_every_step_unflagged(data) -> None:
+    """No log scaling, normalisation off (log never applied), or no data block."""
+    for name, values in _flags(_build_with_data(data, **_KSPACE_TO_IMAGE_STACK)).items():
+        assert values and not any(values), (name, values)
+
+
+def test_a_self_bridging_loss_without_the_flag_is_refused() -> None:
+    """Planted: a loss that iFFTs by itself but cannot be told the plane is compressed."""
+    import torch
+
+    class _BlindBridge(torch.nn.Module):
+        use_fourier_bridge = True
+
+        def forward(self, pred, target):
+            return (pred - target).abs().mean()
+
+    losses = LossConfigSchema(output_domain="kspace", kspace_losses=[_entry("complex_l1")])
+    shim = _ConfigShim(losses)
+    shim.data = _DataShim(log_scaling=True)
+    builder = LossBuilder(shim, device="cpu")  # type: ignore[arg-type]
+    builder._build_list_based_losses()
+    builder._losses["blind"] = _BlindBridge()
+    with pytest.raises(ConfigurationError, match="log_scaled"):
+        builder.build()
+
+
+def test_a_loss_that_owns_a_bridge_child_is_covered_through_the_child() -> None:
+    """ComplexGradientLoss has no flag of its own; its bridge child carries it."""
+    built = _build_with_data(
+        _DataShim(log_scaling=True), kspace_losses=[_entry("complex_spatial_gradient")]
+    )
+    loss = built["complex_spatial_gradient"]
+    assert not hasattr(loss, "log_scaled")
+    assert loss.bridge.log_scaled is True
+
+
+def test_the_bridge_wrapper_table_covers_exactly_the_two_bridged_modes() -> None:
+    """The mode -> (return_complex, label) table replaced an if/elif; 'none' stays native."""
+    from spectramr.infrastructure.training.builders.loss_builder import _BRIDGE_WRAPPERS
+
+    assert _BRIDGE_WRAPPERS == {
+        "ifft_magnitude": (False, "iFFT→magnitude bridge"),
+        "ifft_complex": (True, "iFFT→complex bridge"),
+    }

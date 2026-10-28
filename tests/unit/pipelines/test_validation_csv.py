@@ -127,3 +127,51 @@ class TestValidationCSVWriter:
         assert len(df) == 3
         assert set(df.columns) == {"iteration", "psnr", "ssim", "fid"}
         assert df.iloc[2]["fid"] == 12.3
+
+
+class TestWriteValidationCsvRow:
+    """The production writer, ``train._write_validation_csv_row``."""
+
+    def test_unchanged_keys_never_read_data_rows(self, tmp_path, monkeypatch):
+        from spectramr.pipelines import train
+
+        path = str(tmp_path / "validation_metrics.csv")
+        for it in (1, 2, 3):
+            train._write_validation_csv_row(path, {"iteration": it, "psnr": 20.0 + it})
+
+        rows_read = []
+        real_reader = csv.DictReader
+
+        def counting(*args, **kwargs):
+            for row in real_reader(*args, **kwargs):
+                rows_read.append(row)
+                yield row
+
+        monkeypatch.setattr(train.csv, "DictReader", counting)
+        train._write_validation_csv_row(path, {"iteration": 4, "psnr": 24.0})
+
+        assert rows_read == []
+        with open(path, newline="") as f:
+            assert len(list(csv.DictReader(f))) == 4
+
+    def test_new_key_rewrites_with_merged_header(self, tmp_path):
+        from spectramr.pipelines import train
+
+        path = tmp_path / "validation_metrics.csv"
+        train._write_validation_csv_row(str(path), {"iteration": 1, "psnr": 20.0})
+        train._write_validation_csv_row(str(path), {"iteration": 2, "psnr": 21.0, "kid": 0.5})
+
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert list(rows[0].keys()) == ["iteration", "psnr", "kid"]
+        assert rows[0]["kid"] == "" and rows[1]["kid"] == "0.5"
+
+    def test_failure_raises(self, tmp_path):
+        import pytest
+
+        from spectramr.pipelines import train
+
+        blocker = tmp_path / "file"
+        blocker.write_text("x")
+        with pytest.raises(OSError):
+            train._write_validation_csv_row(str(blocker / "v.csv"), {"iteration": 1})

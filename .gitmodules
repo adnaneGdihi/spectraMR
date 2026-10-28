@@ -12,3 +12,9 @@
 	path = external/baselines/fdb
 	url = https://github.com/icon-lab/FDB.git
 	ignore = dirty
+[submodule "external/baselines/shen2024"]
+	path = external/baselines/shen2024
+	url = https://github.com/GuoyaoShen/K-SapceColdDIffusion.git
+	# The "Sapce" typo is upstream's and the URL is real. Upstream ships no licence
+	# file, so this stays a pointer that redistributes nothing.
+	ignore = dirty

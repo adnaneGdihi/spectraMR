@@ -29,6 +29,7 @@ References
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -246,6 +247,22 @@ class TALL(nn.Module):
         self.tau_min = float(tau_min)
         self.anneal_steps = int(anneal_steps)
         self.register_buffer("step_counter", torch.zeros(1, dtype=torch.long))
+        # Set before forward when the locality term is requested; only then does
+        # forward keep the policy graph (``_last_choice``) alive for it.
+        self.track_locality = False
+        self._last_choice: torch.Tensor | None = None
+        self._last_ordered: torch.Tensor | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The stash holds a non-leaf graph tensor; copies and pickles must not carry it.
+        state = self.__dict__.copy()
+        state["_last_choice"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self._last_choice = None
+        self._last_ordered = None
 
     # ──────────────────────────────────────────────────────────────────
     # Helpers
@@ -375,6 +392,10 @@ class TALL(nn.Module):
             )
         )  # (n_cells, K, cells_per_block)
 
+        if self.track_locality:
+            self._last_choice = choice
+            self._last_ordered = ordered
+
         # Hard argmax permutation
         argmax = choice.argmax(dim=-1)  # (B, n_cells)
         c_idx = torch.arange(n_cells, device=x.device).unsqueeze(0).expand(B, -1)
@@ -411,42 +432,110 @@ class TALL(nn.Module):
 
         return soft_seq, permutation
 
+    def last_locality_loss(self) -> torch.Tensor:
+        """Differentiable locality term (Spec §9.3) of the latest :meth:`forward`.
+
+        Raises:
+            RuntimeError: if no forward has run yet.
+        """
+        if self._last_choice is None or self._last_ordered is None:
+            raise RuntimeError(
+                "TALL.last_locality_loss() has no traced forward; set track_locality=True "
+                "before forward()."
+            )
+        return expected_locality_loss(self._last_choice, self._last_ordered, self.side, self.n_dims)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Locality regulariser (Spec §9.3)
 # ──────────────────────────────────────────────────────────────────────
 
 
-def locality_loss(
-    permutation: torch.Tensor,
-    side: int,
-    n_dims: int = 2,
-) -> torch.Tensor:
-    r"""Encourage consecutive permutation entries to be spatial neighbours.
+def _flat_to_coords(index: torch.Tensor, side: int, n_dims: int) -> torch.Tensor:
+    """Flat voxel indices → float grid coordinates ``(..., n_dims)`` (y, x) or (z, y, x)."""
+    if n_dims == 2:
+        parts = [index // side, index % side]
+    elif n_dims == 3:
+        rem = index % (side**2)
+        parts = [index // (side**2), rem // side, rem % side]
+    else:
+        raise ValueError(f"TALL locality n_dims must be 2 or 3, got {n_dims}")
+    return torch.stack(parts, dim=-1).float()
+
+
+def _step_norm(diffs: torch.Tensor, eps: float) -> torch.Tensor:
+    """Length of each step vector, smoothed so the gradient is finite at zero."""
+    return torch.sqrt(diffs.pow(2).sum(dim=-1) + eps)
+
+
+def permutation_coords(permutation: torch.Tensor, side: int, n_dims: int = 2) -> torch.Tensor:
+    """Coordinates ``(B, N, n_dims)`` of a hard permutation ``(B, N)``.
+
+    Integer-derived, so the result carries no gradient (the hard diagnostic).
+    """
+    return _flat_to_coords(permutation, side, n_dims)
+
+
+def locality_loss(coords: torch.Tensor, side: int, eps: float = 1e-8) -> torch.Tensor:
+    r"""Mean step length of a hard traversal, normalised by the grid side.
 
     .. math::
-        \mathcal L_{\text{loc}} = \frac{1}{N-1} \sum_{i=1}^{N-1}
-            \big\| \mathbf r(\pi_{i+1}) - \mathbf r(\pi_i) \big\|
+        \mathcal L_{\text{loc}} = \frac{1}{(N-1)\,S} \sum_{i=1}^{N-1}
+            \sqrt{\big\| \mathbf r_{i+1} - \mathbf r_i \big\|^2 + \epsilon}
 
     Args:
-        permutation: ``(B, N)`` int64 permutation per batch.
-        side:        Spatial side of the grid.
-        n_dims:      2 or 3.
+        coords: ``(B, N, n_dims)`` float coordinates of the hard permutation.
+        side:   Spatial side of the grid.
+        eps:    Floor under the square root.
     """
-    if n_dims == 2:
-        cy = (permutation // side).float()
-        cx = (permutation % side).float()
-        coords = torch.stack([cy, cx], dim=-1)
-    elif n_dims == 3:
-        cz = (permutation // (side**2)).float()
-        rem = permutation % (side**2)
-        cy = (rem // side).float()
-        cx = (rem % side).float()
-        coords = torch.stack([cz, cy, cx], dim=-1)
-    else:
-        raise ValueError(f"locality_loss n_dims must be 2 or 3, got {n_dims}")
-    diffs = coords[:, 1:] - coords[:, :-1]
-    return diffs.norm(dim=-1).mean()
+    return _step_norm(coords[:, 1:] - coords[:, :-1], eps).mean() / side
 
 
-__all__ = ["TALL", "build_motif_permutations", "locality_loss"]
+def expected_locality_loss(
+    choice: torch.Tensor,
+    ordered: torch.Tensor,
+    side: int,
+    n_dims: int = 2,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    r"""Exact expected step length of the soft traversal, normalised by ``side``.
+
+    Each traversal step is a function of at most two cell choices: a within-cell
+    step depends on one choice, a cross-cell step on the pair of adjacent choices.
+    Since the cells are chosen independently, the expectation of every step is
+    computed exactly from its own ``K``- or ``K x K``-entry table of constant
+    step lengths, and the expectation of their sum is the sum of expectations.
+    The expectation is taken *after* taking the step norm, so an indecisive
+    choice is never rewarded for averaging coordinates. The one-hot choice
+    reproduces :func:`locality_loss` on :func:`permutation_coords` exactly, and
+    for a fixed grid the value is multilinear in the cell choices, so its minimum
+    is attained at a pure (hard) choice.
+
+    Args:
+        choice:  ``(B, n_cells, K)`` motif weights (Gumbel-softmax output).
+        ordered: ``(n_cells, K, cells_per_block)`` absolute voxel index per motif step.
+    """
+    with torch.autocast(device_type=choice.device.type, enabled=False):
+        choice = choice.float()
+        oc = _flat_to_coords(ordered, side, n_dims)  # (n_cells, K, cpb, D)
+        # Within-cell steps: step j of motif k inside cell c, length ||oc[c,k,j+1]-oc[c,k,j]||.
+        within_len = _step_norm(oc[:, :, 1:] - oc[:, :, :-1], eps)  # (n_cells, K, cpb-1)
+        within = torch.einsum("bck,ckj->bcj", choice, within_len)  # (B, n_cells, cpb-1)
+        # Cross-cell steps: last point of cell c under motif k to first point of cell c+1 under l.
+        boundary = oc[:-1, :, -1, None, :] - oc[1:, None, :, 0, :]  # (n_cells-1, K, K, D)
+        boundary_len = _step_norm(boundary, eps)  # (n_cells-1, K, K)
+        cross = torch.einsum(
+            "bck,bcl,ckl->bc", choice[:, :-1], choice[:, 1:], boundary_len
+        )  # (B, n_cells-1)
+        n_steps = oc.shape[0] * oc.shape[2] - 1
+        total = within.sum(dim=(1, 2)) + cross.sum(dim=1)  # (B,)
+        return (total / n_steps).mean() / side
+
+
+__all__ = [
+    "TALL",
+    "build_motif_permutations",
+    "expected_locality_loss",
+    "locality_loss",
+    "permutation_coords",
+]

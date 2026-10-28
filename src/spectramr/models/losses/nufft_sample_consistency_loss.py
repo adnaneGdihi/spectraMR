@@ -29,6 +29,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from spectramr.data.transforms.normalization import decompress_kspace_log
 from spectramr.infrastructure.physics.fft_ops import ifft2c
 from spectramr.models.losses.null_space_loss import _to_complex_image
 from spectramr.models.losses.registry import register_loss
@@ -63,11 +64,16 @@ class NUFFTSampleConsistencyLoss(nn.Module):
             this term inherits on a non-Cartesian arm.
     """
 
+    #: Moves the prediction to the image domain itself, so ``LossBuilder`` sets
+    #: ``log_scaled`` on it from the arm's k-space normalisation (#2338, #2341).
+    use_fourier_bridge = True
+
     def __init__(self, norm: str = "l1") -> None:
         super().__init__()
         if norm not in ("l1", "l2"):
             raise ValueError(f"norm must be 'l1' or 'l2', got {norm!r}")
         self.norm = norm
+        self.log_scaled = False
 
     def forward(
         self,
@@ -120,15 +126,20 @@ class NUFFTSampleConsistencyLoss(nn.Module):
             )
 
         measurement = sample_measurement.to(pred.device)
-        image = ifft2c(_to_complex_image(pred))
+        # The measurement is linear (NonCartesianSpokeProcess decompresses before
+        # its NUFFT), so the compressed prediction is decompressed to match.
+        complex_pred = _to_complex_image(pred)
+        if self.log_scaled:
+            complex_pred = decompress_kspace_log(complex_pred)
+        image = ifft2c(complex_pred)
         # torchkbnufft's forward carries no 1/sqrt(HW), so its samples sit a
         # factor sqrt(H*W) above the ortho scale every other term in the arm is
         # measured on -- 31.9995 / 63.9995 / 128.0008 / 256.0007 against
         # fft2c's DC at 32/64/128/256. Without this the declared 0.3 would act
         # as roughly 17 beside the other five k-space terms.
         ortho = (image.shape[-2] * image.shape[-1]) ** 0.5
-        predicted = measurement.project(image) / ortho
-        measured = measurement.samples / ortho
+        predicted: Tensor = measurement.project(image) / ortho
+        measured: Tensor = measurement.samples / ortho
         if predicted.shape != measured.shape:
             raise ValueError(
                 f"projected {tuple(predicted.shape)} and measured "
@@ -136,7 +147,7 @@ class NUFFTSampleConsistencyLoss(nn.Module):
                 "prediction's coil count must match the measurement's."
             )
 
-        mask = measurement.mask
+        mask: Tensor = measurement.mask
         while mask.dim() < predicted.dim():
             mask = mask.unsqueeze(-2) if mask.dim() == predicted.dim() - 1 else mask.unsqueeze(0)
         mask = mask.to(dtype=torch.float32)

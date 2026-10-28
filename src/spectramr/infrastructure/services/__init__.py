@@ -2,8 +2,6 @@ __all__ = [
     "ABC",
     "Any",
     "Callable",
-    "CheckpointService",
-    "ICheckpointService",
     "IConfigurationService",
     "IDeviceService",
     "IErrorHandlingService",
@@ -40,7 +38,6 @@ import torch
 # This fixes Sphinx cross-reference warning [ref.python]
 from spectramr.domain.interfaces.service_interfaces import ILoggingService, IMetricsService
 
-from .checkpoint_service import CheckpointService
 from .logging_service import LoggingService
 
 # Add others as needed or rely on direct imports.
@@ -60,48 +57,6 @@ class IDeviceService(ABC):
     @abstractmethod
     def is_cuda_available(self) -> bool:
         """Checks if CUDA is available."""
-
-
-class ICheckpointService(ABC):
-    """Interface for checkpoint management."""
-
-    @abstractmethod
-    def save_checkpoint(
-        self,
-        model: torch.nn.Module,
-        optimizer: Any,
-        epoch: int,
-        loss: float | None = None,
-        checkpoint_name: str | None = None,
-        **kwargs,
-    ) -> str:
-        """Saves training checkpoint with model-based interface."""
-
-    @abstractmethod
-    def load_checkpoint(self, path: str) -> dict[str, Any]:
-        """Loads training checkpoint."""
-
-    @abstractmethod
-    def list_checkpoints(self) -> list[str]:
-        """Lists available checkpoints."""
-
-    @abstractmethod
-    def save_payload(
-        self,
-        payload: Any,
-        checkpoint_name: str,
-        **_torch_save_kwargs: Any,
-    ) -> str:
-        """Persist an arbitrary payload in the configured checkpoint directory."""
-
-    @abstractmethod
-    def save_payload_to_path(
-        self,
-        payload: Any,
-        output_path: str | Path,
-        **_torch_save_kwargs: Any,
-    ) -> str:
-        """Persist a payload to an explicit path respecting existing extensions."""
 
 
 class IPerformanceMonitor(ABC):
@@ -165,25 +120,6 @@ class IModelManagementService(ABC):
     @abstractmethod
     def update_model_metadata(self, model_id: str, metadata: dict[str, Any]) -> bool:
         """Update model metadata."""
-
-    @abstractmethod
-    def save_model_checkpoint(
-        self,
-        model_id: str,
-        model: torch.nn.Module,
-        optimizer: Any,
-        epoch: int,
-        metrics: dict[str, Any] | None = None,
-    ) -> str:
-        """Save model checkpoint with metadata."""
-
-    @abstractmethod
-    def load_model_checkpoint(
-        self,
-        model_id: str,
-        checkpoint_name: str,
-    ) -> dict[str, Any] | None:
-        """Load model checkpoint."""
 
     @abstractmethod
     def export_model(

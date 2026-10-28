@@ -53,7 +53,7 @@ def make(
     mat = np.full((len(methods), len(methods)), np.nan)
     for (i, k), q in zip(pairs, adj):
         mat[i][k] = q
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), column_width("single")))
     im = ax.imshow(mat, cmap="viridis_r", vmin=0, vmax=0.1)
     ax.set_xticks(range(len(methods)))

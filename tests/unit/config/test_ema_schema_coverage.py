@@ -262,24 +262,29 @@ class TestValidationSchemaFieldCoverage:
         "validation_batch_size",  # DataBuilder: val_batch_size override
         "enable_visualization",  # ValidationService.should_visualize()
         "visualization_interval",  # ValidationService.should_visualize()
-        "num_visualizations",  # ValidationService: how many images to save
-        "visualization_dir",  # ValidationService: save path
         "primary_metric",  # ValidationService: best model tracking
         "validation_metric",  # ValidationService: metric to compare
-        "use_training_loss",  # ValidationService: which loss to run
         "compute_image_metrics",  # ValidationService: metric computation
         "output_transform",  # ValidationService: pre-metric transform
         "domain",  # ValidationService: metric domain
         "metrics",  # ValidationService: override metric list
         "num_validation_batches",  # ValidationService: truncated validation
         "num_samples",  # ValidationService: sample count cap
-        "enable_validation_augmentation",  # DataBuilder: augment during val
         "shuffle_validation",  # DataBuilder: shuffle validation dataset
         "val_chunk_size",  # DataBuilder: chunk size for validation loading
         "val_batch_size",  # DataBuilder: alias of validation_batch_size for older YAMLs
         "empty_cache_before_validation",  # pipelines/train.py:1941 getattr(_val_cfg, ...)
         "input_dependence_tol",  # strategies/diffusion.py:2577,2784 input-dependence sanity gate
         "multistep_cold_sampling",  # strategies/diffusion.py:3607 full reverse-trajectory val (2026-06-09 cold-diffusion fix)
+        # Sub-blocks the flat fields above were folded into; each leaf has its own reader.
+        "cascade",  # strategies/diffusion.py: cascade levels
+        "gates",  # strategies/diffusion.py: gates.input_dependence_tol
+        "loader",  # builders/directors/test_split.py: validation.loader
+        "per_batch_rows",  # pipelines/train.py: per-batch CSV rows
+        "sampling",  # config/settings.py: sampling.ensemble_samples
+        "schedule",  # pipelines/training_loop.py: schedule.interval_steps
+        "scoring",  # core/metrics/computer.py: scoring.compute / scoring.primary
+        "visualization",  # bootstrap.py: visualization.enabled
     }
 
     # VF-v2 (Virtual-Fiducial) validation knobs that are advertised + completeness-

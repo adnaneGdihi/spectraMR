@@ -29,19 +29,26 @@ def test_mixed_precision_helper_float_mode():
         assert not getattr(ctx, "disable_tf32", False)
 
 
-def test_mixed_precision_helper_complex_mode():
-    """Test that helper selects ComplexGradScaler when enable_complex_support is True."""
+def test_mixed_precision_helper_rejects_fp16_on_a_complex_arm():
+    """fp16 has no complex type: this pairing ran in fp32 behind a scaler that
+    skipped non-finite steps, while reporting AMP on (#2302)."""
+    from spectramr.infrastructure.training.mixed_precision import (
+        AMPPrecisionUnsupportedError,
+    )
+
     config = MixedPrecisionConfig(
         enabled=True, precision="fp16", enable_complex_support=True
     )
-    helper = MixedPrecisionIntegrationHelper(config)
+    with pytest.raises(AMPPrecisionUnsupportedError, match="complex"):
+        MixedPrecisionIntegrationHelper(config, device="cpu")
 
-    assert isinstance(helper.scaler, ComplexGradScaler)
 
-    # Check autocast context
-    ctx = helper.get_autocast_context()
-    # Should disable TF32
-    assert getattr(ctx, "disable_tf32", True)
+def test_disabled_amp_on_a_complex_arm_is_accepted():
+    config = MixedPrecisionConfig(
+        enabled=False, precision="fp16", enable_complex_support=True
+    )
+    helper = MixedPrecisionIntegrationHelper(config, device="cpu")
+    assert helper.scaler is None
 
 
 def test_strategy_auto_detection_image_domain():

@@ -76,6 +76,9 @@ class VolumeBlockedSliceSampler(Sampler[int]):
             reproducible, and it keeps a capped/visualised prefix stable across checks).
         seed: base seed; the epoch is mixed in via :meth:`set_epoch` so each epoch differs
             while staying reproducible.
+        rank, num_replicas: this process's place in a data-parallel group. With
+            ``num_replicas > 1`` the sampler owns a static share of the containers: see
+            :meth:`sharded`.
     """
 
     def __init__(
@@ -86,8 +89,12 @@ class VolumeBlockedSliceSampler(Sampler[int]):
         max_resident_volumes: int,
         shuffle: bool = True,
         seed: int = 0,
+        rank: int = 0,
+        num_replicas: int = 1,
     ) -> None:
         super().__init__()
+        if num_replicas < 1 or not 0 <= rank < num_replicas:
+            raise ValueError(f"rank={rank} is outside num_replicas={num_replicas}.")
         if len(container_volumes) == 0:
             raise ValueError(
                 "VolumeBlockedSliceSampler needs per-container volume paths; got none. "
@@ -115,6 +122,91 @@ class VolumeBlockedSliceSampler(Sampler[int]):
         for dataset_idx, (container_idx, _slice_idx) in enumerate(self._index_map):
             by_container.setdefault(container_idx, []).append(dataset_idx)
         self._by_container = by_container
+
+        # The containers this process visits, and how many samples each rank owns.
+        # Static (epoch-independent) so ``__len__`` is a constant and every rank can
+        # derive the whole assignment locally with no communication.
+        self._rank, self._num_replicas = int(rank), int(num_replicas)
+        shares = self._partition(self._num_replicas)
+        self._owned = shares[self._rank]
+        share_sizes = [sum(len(by_container.get(c, ())) for c in share) for share in shares]
+        if min(share_sizes) == 0:
+            # Containers with no slices count toward the split but add no samples, so a
+            # rank can own containers and still have nothing to repeat up to the longest
+            # share; refuse here instead of failing inside the first epoch.
+            raise ValueError(
+                f"rank {share_sizes.index(0)} of {self._num_replicas} would own no slice "
+                f"samples (per-rank sample counts: {share_sizes}); use fewer ranks or a "
+                "dataset with more non-empty containers."
+            )
+        self._local_samples = share_sizes[self._rank]
+        self._target_len = max(share_sizes)
+        # Share of the epoch's samples that are repeats made to equalise rank lengths.
+        self._padded_fraction = 1.0 - sum(share_sizes) / (len(share_sizes) * self._target_len)
+
+    def _partition(self, num_replicas: int) -> list[list[int]]:
+        """Split the containers across ranks, keeping volume-sharing containers together.
+
+        Containers that share a volume are one connected component, and a component is
+        placed on one rank so each volume is decoded by one process instead of N. The
+        components go to ranks greedily, heaviest first, to balance sample counts. With
+        fewer components than ranks that cannot give every rank work, so the split falls
+        back to single containers: correct, at the price of some volumes being decoded on
+        more than one rank.
+        """
+        count = len(self._container_volumes)
+        if num_replicas == 1:
+            return [list(range(count))]
+        if count < num_replicas:
+            raise ValueError(
+                f"{count} container(s) cannot be split across {num_replicas} ranks; a rank "
+                "would have nothing to visit and its peers would wait on it."
+            )
+        parent = list(range(count))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        first_owner: dict[str, int] = {}
+        for container_idx, volumes in enumerate(self._container_volumes):
+            for volume in volumes:
+                other = first_owner.setdefault(volume, container_idx)
+                parent[find(container_idx)] = find(other)
+        groups: dict[int, list[int]] = {}
+        for container_idx in range(count):
+            groups.setdefault(find(container_idx), []).append(container_idx)
+        units = list(groups.values())
+        if len(units) < num_replicas:
+            units = [[container_idx] for container_idx in range(count)]
+
+        weight = lambda unit: sum(len(self._by_container.get(c, ())) for c in unit)  # noqa: E731
+        shares: list[list[int]] = [[] for _ in range(num_replicas)]
+        load = [0] * num_replicas
+        for unit in sorted(units, key=lambda u: (-weight(u), u[0])):
+            target = min(range(num_replicas), key=lambda r: (load[r], r))
+            shares[target].extend(unit)
+            load[target] += weight(unit)
+        return [sorted(share) for share in shares]
+
+    def sharded(self, rank: int, num_replicas: int) -> VolumeBlockedSliceSampler:
+        """The same sampler restricted to ``rank``'s share of an ``num_replicas`` group.
+
+        Every rank's length is padded to the longest share by repeating its own samples,
+        as ``DistributedSampler`` does, because FSDP and ZeRO-3 forwards are collectives
+        and ranks that disagree on batch count would hang.
+        """
+        return VolumeBlockedSliceSampler(
+            self._index_map,
+            self._container_volumes,
+            max_resident_volumes=self._max_resident,
+            shuffle=self._shuffle,
+            seed=self._seed,
+            rank=rank,
+            num_replicas=num_replicas,
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Re-seed the shuffle for ``epoch`` (mirrors ``DistributedSampler.set_epoch``)."""
@@ -146,7 +238,7 @@ class VolumeBlockedSliceSampler(Sampler[int]):
         generator = torch.Generator()
         generator.manual_seed(self._seed + self._epoch)
 
-        order = list(range(len(self._container_volumes)))
+        order = list(self._owned)
         if self._shuffle:
             order = [order[i] for i in torch.randperm(len(order), generator=generator)]
 
@@ -154,16 +246,23 @@ class VolumeBlockedSliceSampler(Sampler[int]):
         if self._shuffle:
             blocks = [blocks[i] for i in torch.randperm(len(blocks), generator=generator)]
 
+        pad = self._target_len - self._local_samples
+        emitted: list[int] = []
         for block in blocks:
             samples: list[int] = []
             for container_idx in block:
                 samples.extend(self._by_container.get(container_idx, []))
             if self._shuffle and samples:
                 samples = [samples[i] for i in torch.randperm(len(samples), generator=generator)]
+            if pad > 0:
+                emitted.extend(samples)
             yield from samples
+        # A shorter share repeats its own leading samples up to the longest share.
+        for i in range(pad):
+            yield emitted[i % len(emitted)]
 
     def __len__(self) -> int:
-        return len(self._index_map)
+        return self._target_len
 
     def describe(self) -> str:
         """One-line amortisation summary, for the loader to log.
@@ -172,13 +271,19 @@ class VolumeBlockedSliceSampler(Sampler[int]):
         operator to infer it: an ordering whose whole purpose is IO cost should say what
         that cost became.
         """
-        blocks = self._blocks(list(range(len(self._container_volumes))))
+        blocks = self._blocks(list(self._owned))
         decodes = sum(len({v for c in b for v in self._container_volumes[c]}) for b in blocks)
-        samples = len(self._index_map)
+        samples = self._local_samples
         per_decode = samples / decodes if decodes else 0.0
         return (
             f"VolumeBlockedSliceSampler: {samples} slice samples over {len(blocks)} "
             f"block(s), {decodes} volume decode(s) per epoch "
             f"(~{per_decode:.0f} samples per decode), "
             f"max_resident_volumes={self._max_resident}"
+            + (
+                f", {self._padded_fraction:.0%} of each epoch is repeated samples that "
+                f"equalise {self._num_replicas} unequal rank shares"
+                if self._padded_fraction > 0
+                else ""
+            )
         )

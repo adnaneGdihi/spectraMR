@@ -182,3 +182,30 @@ class TestAtomicSaveTorch:
             safe_io.torch.save = original
 
         assert list(tmp_path.iterdir()) == []
+
+
+class TestAtomicPublish:
+    """The one temp-file-then-rename primitive every checkpoint writer uses."""
+
+    def test_publishes_what_write_produced(self, tmp_path):
+        from spectramr.shared.utils.safe_io import atomic_publish
+
+        target = tmp_path / "sub" / "best.pt"
+        atomic_publish(target, lambda tmp: Path(tmp).write_bytes(b"new"))
+        assert target.read_bytes() == b"new"
+
+    def test_failed_write_leaves_target_and_no_temp(self, tmp_path):
+        from spectramr.shared.utils.safe_io import atomic_publish
+
+        target = tmp_path / "best.pt"
+        target.write_bytes(b"old")
+
+        def boom(tmp: str) -> None:
+            Path(tmp).write_bytes(b"half")
+            raise RuntimeError("disk full")
+
+
+        with pytest.raises(RuntimeError, match="disk full"):
+            atomic_publish(target, boom)
+        assert target.read_bytes() == b"old"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["best.pt"]

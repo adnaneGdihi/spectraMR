@@ -1,9 +1,11 @@
 r"""Figure A.7 — k-space → image reconstruction.
 
-Per-row layout (7 columns):
+Per-row layout:
 
-    zero-filled | CG-SENSE | proposed | fully-sampled |
+    zero-filled | [baseline] | proposed | fully-sampled |
     residual (proposed − FS) + colorbar | residual histogram | radial k-error
+
+The baseline column renders only when the case carries a recorded ``baseline``.
 
 Each magnitude image annotated with PSNR / SSIM / L1 versus FS reference.
 The radial k-error panel is on a log-y axis with bin-width-normalised
@@ -26,13 +28,16 @@ from spectramr.infrastructure.reporting.plotters._comparison_helpers import (
     add_residual_histogram,
     add_residual_panel,
 )
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import save_figure, use_default_style
 
 
 def _radial_error(pred: np.ndarray, ref: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    fp = np.fft.fftshift(np.fft.fft2(pred))
-    fr = np.fft.fftshift(np.fft.fft2(ref))
-    err = np.abs(fp - fr)
+    import torch
+
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    diff = torch.from_numpy(np.asarray(pred - ref, dtype=np.complex64))
+    err = fft2c(diff).abs().numpy()
     h, w = err.shape
     cy, cx = h // 2, w // 2
     y, x = np.indices(err.shape)
@@ -47,105 +52,73 @@ def make(
     out_path: str | Path,
     *,
     cases: Sequence[dict] | None = None,
+    formats: tuple[str, ...] = ("pdf", "png"),
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
+    **_ignored,
 ) -> Path | None:
     """Build the k-space reconstruction figure.
 
     Args:
-        cases: dicts with arrays ``zero_filled``, ``baseline``, ``pred``,
-            ``fs_ref`` (all magnitude images, same H×W).
+        cases: dicts with arrays ``zero_filled``, ``pred``, ``fs_ref`` and
+            optionally ``baseline`` (all magnitude images, same H x W).
     """
-    if cases is None or len(cases) == 0:
+    cases = [c for c in (cases or []) if all(k in c for k in ("zero_filled", "pred", "fs_ref"))]
+    if not cases:
         return None
     out_path = Path(out_path)
 
     use_default_style()
-    n_rows = len(cases)
-    n_cols = 7
-    col_w, row_h = 1.6, 1.6
+    # The comparison column exists only when the run recorded one. The loader used
+    # to alias ``baseline`` onto the zero-filled input, so a column titled
+    # "CG-SENSE" showed the input image for a baseline that never ran.
+    has_baseline = all("baseline" in c for c in cases)
+    images = [("zero_filled", "zero-filled", "#888888")]
+    if has_baseline:
+        images.append(("baseline", "baseline", "#0072B2"))
+    images += [("pred", "proposed", "#D55E00"), ("fs_ref", "fully-sampled", None)]
+    titles = [t for _, t, _ in images] + ["residual (ours \u2212 FS)", "residual histogram",
+                                           "radial k-error"]
+    n_rows, n_cols = len(cases), len(titles)
     fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(n_cols * col_w, n_rows * row_h),
-        squeeze=False,
+        n_rows, n_cols, figsize=(n_cols * 1.6, n_rows * 1.6), squeeze=False,
         gridspec_kw={"wspace": 0.22, "hspace": 0.20},
     )
-    titles = [
-        "zero-filled",
-        "CG-SENSE",
-        "proposed",
-        "fully-sampled",
-        "residual (ours − FS)",
-        "residual histogram",
-        "radial k-error",
-    ]
-
     for r, c in enumerate(cases):
-        zf = np.asarray(c["zero_filled"]).squeeze().astype(float)
-        bl = np.asarray(c["baseline"]).squeeze().astype(float)
-        pr = np.asarray(c["pred"]).squeeze().astype(float)
-        ref = np.asarray(c["fs_ref"]).squeeze().astype(float)
-        row_label = c.get("name")
-
-        add_image_panel(
-            axes[r][0],
-            zf,
-            title=titles[0] if r == 0 else None,
-            row_label=row_label,
-            metric_str=_format_metric_str(zf, ref),
-        )
-        add_image_panel(
-            axes[r][1],
-            bl,
-            title=titles[1] if r == 0 else None,
-            metric_str=_format_metric_str(bl, ref),
-        )
-        add_image_panel(
-            axes[r][2],
-            pr,
-            title=titles[2] if r == 0 else None,
-            metric_str=_format_metric_str(pr, ref),
-        )
-        add_image_panel(
-            axes[r][3],
-            ref,
-            title=titles[3] if r == 0 else None,
-        )
+        arrays = {key: np.asarray(c[key]).squeeze().astype(float) for key, _, _ in images}
+        ref, pr = arrays["fs_ref"], arrays["pred"]
+        for col, (key, title, _) in enumerate(images):
+            add_image_panel(
+                axes[r][col],
+                arrays[key],
+                title=title if r == 0 else None,
+                row_label=c.get("case_id") if col == 0 else None,
+                metric_str=None if key == "fs_ref" else _format_metric_str(arrays[key], ref),
+            )
+        base = len(images)
         abs_max, residual = add_residual_panel(
-            axes[r][4],
-            pr,
-            ref,
-            title=titles[4] if r == 0 else None,
-            fig=fig,
+            axes[r][base], pr, ref, title=titles[base] if r == 0 else None, fig=fig
         )
         add_residual_histogram(
-            axes[r][5],
-            residual,
-            abs_max=abs_max,
-            title=titles[5] if r == 0 else None,
+            axes[r][base + 1], residual, abs_max=abs_max,
+            title=titles[base + 1] if r == 0 else None,
         )
-
-        # 7. Radial k-error
-        ax = axes[r][6]
-        for img, label, colour in (
-            (zf, "ZF", "#888"),
-            (bl, "CG-SENSE", "#0072B2"),
-            (pr, "ours", "#D55E00"),
-        ):
-            k, e = _radial_error(img, ref)
+        ax = axes[r][base + 2]
+        for key, label, colour in images:
+            if colour is None:
+                continue
+            k, e = _radial_error(arrays[key], ref)
             ax.semilogy(k[1:], e[1:].clip(min=1e-12), color=colour, linewidth=0.9, label=label)
         if r == 0:
-            ax.set_title(titles[6], fontsize=8)
-            ax.legend(frameon=False, fontsize=6, loc="upper right")
-        ax.set_xlabel("|k|", fontsize=7)
-        ax.set_ylabel("|Δ k|", fontsize=7)
-        ax.tick_params(labelsize=6)
+            ax.set_title(titles[-1])
+            ax.legend(frameon=False, loc="upper right")
+        ax.set_xlabel("|k|")
+        ax.set_ylabel("|Δk|")
 
     if metadata is not None:
         stamp_figure(fig, metadata)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    written = save_figure(fig, out_path.parent, out_path.stem, formats=formats, dpi=dpi)
+    primary = written.get(formats[0])
+    if metadata is not None and primary is not None:
+        write_sidecar(primary, metadata)
+    return primary

@@ -135,23 +135,17 @@ model:
     latent_scaling_factor: 2.45
     # ── Stage-1 hand-off ──────────────────────────────────────────────
     # vae_checkpoint_path is overwritten by the campaign at submission
-    # time. Standalone runs must point at a real stage-1 .pt themselves.
-    # NB: CheckpointDirector.save_best() writes 'checkpoint_best.pt'. Point at that
-    # CANONICAL name -- it is the one both writers actually produce.
-    # (Correction 2026-08-13: the old note here said the 'best.pt' alias "is
-    # published only by CheckpointService, which is not always in the chain". That
-    # is stale -- CheckpointDirector publishes the alias too, via
-    # `_publish_best_alias` at checkpoint_director.py:626/631. The conclusion is
-    # unchanged and this line still points at 'checkpoint_best.pt': the alias is a
-    # convenience copy, the canonical artifact is what stage 2 should bind to.)
+    # time. Standalone runs must point at a real stage-1 checkpoint themselves.
+    # Stage 1 writes <output_dir>/checkpoints/best.<format>; bind to that file, whose
+    # extension is stage 1's checkpoint.format.
     # Smoke-audit E17 (2026-05-14).
     # 2026-07-11: this pointed at experiments/outputs/stage1_vae_hf_pretrain/,
     # a directory stage 1 never writes — stage1_vae_hf.yaml's output_dir is
     # experiments/results/stage1_vae_hf. Combined with a loader that only looked
-    # for 'model_state_dict'/'state_dict' (CheckpointDirector writes 'generator'),
+    # for 'model_state_dict'/'state_dict' (the trainer wrote 'generator'),
     # the VAE silently stayed random-init and stage 2 trained in a random latent
     # space (val_psnr≈6 dB). Both now raise instead of degrading.
-    vae_checkpoint_path: experiments/results/stage1_vae_hf/checkpoints/checkpoint_best.pt
+    vae_checkpoint_path: experiments/results/stage1_vae_hf/checkpoints/best.safetensors
     freeze_vae: true
 
 data:
@@ -195,7 +189,6 @@ data:
   multi_contrast:
     enabled: true
     n_contrasts: 4
-    embed_dim: 128
     # Contrast ids MUST match the PAIRED-TRAINING contrasts. The paired manifest
     # records are {T1w, FLAIR, T2w, ADC} — all four present at BOTH 64mT and 3T
     # (verified against the raw tree 2026-07-08: every one of the 11 paired
@@ -260,7 +253,6 @@ data:
     validation_fraction: 0.1
   processing:
     normalization_type: minmax
-    rescale_range: [-1.0, 1.0]
     data_range: 2.0
   sampling:
     # Full-slice training: every sample is a WHOLE 2D slice, not a random 128²
@@ -517,9 +509,6 @@ early_stopping:
 checkpoint:
   save_interval: 1000
   save_top_k: 3
-  # Inert key restated to the truth -- checkpoints land at
-  # `<training.output_dir>/checkpoints` (train.py:603). See stage1_vae_hf.yaml.
-  save_dir: experiments/results/stage2_ldm_ulf_to_hf/checkpoints
 
 training:
   strategy_class: spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy

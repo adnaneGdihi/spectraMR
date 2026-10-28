@@ -9,6 +9,8 @@ References:
     deformable registration." Medical Image Analysis, 2012.
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +24,7 @@ class MINDSSCLoss(nn.Module):
 
     **DOMAIN**: IMAGE-SPACE ONLY
     **Input**: [B, 1, H, W] or [B, C, H, W] image-space intensity
-    **3D Support**: Yes (3D kernel support)
+    **3D Support**: No (2-D neighbourhood; a 5-D input raises)
 
     Intensity-invariant self-similarity descriptors robust to non-linear intensity
     transformations (e.g., ULF vs HF contrasts). Do NOT use with k-space [B, 2, H, W].
@@ -49,7 +51,10 @@ class MINDSSCLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{MIND} = \\| \text{MIND}(\\hat{y}) - \text{MIND}(y) \\|_2^2"""
+        \\mathcal{L}_{MIND} = \\| \\text{MIND}(\\hat{y}) - \\text{MIND}(y) \\|_2^2"""
+
+    gaussian_kernel: torch.Tensor
+    mean_kernel: torch.Tensor
 
     def __init__(
         self,
@@ -57,7 +62,7 @@ class MINDSSCLoss(nn.Module):
         search_radius: int = 3,
         gaussian_sigma: float = 1.0,
         use_self_similarity: bool = True,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -90,6 +95,18 @@ class MINDSSCLoss(nn.Module):
             (1, 0),
             (1, 1),  # Bottom row
         ]
+        self.register_buffer(
+            "gaussian_kernel",
+            self._compute_gaussian_kernel(patch_size, gaussian_sigma).view(
+                1, 1, patch_size, patch_size
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "mean_kernel",
+            torch.full((1, 1, patch_size, patch_size), 1.0 / patch_size**2),
+            persistent=False,
+        )
 
     def _compute_gaussian_kernel(self, size: int, sigma: float) -> torch.Tensor:
         """Create 2D Gaussian kernel."""
@@ -112,59 +129,27 @@ class MINDSSCLoss(nn.Module):
         Returns:
             MIND descriptor [B, C*8, H, W] (8 directional features per channel)
         """
-        B, C, H, W = img.shape
-        device = img.device
+        if img.dim() != 4:
+            raise ValueError(f"MINDSSCLoss expects [B, C, H, W], got {tuple(img.shape)}")
 
-        # Gaussian kernel for weighted differences
-        gaussian_kernel = self._compute_gaussian_kernel(self.patch_size, self.gaussian_sigma).to(
-            device
-        )
-        gaussian_kernel = gaussian_kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
-
-        mind_features = []
-
-        for dx, dy in self.directions:
-            # Shift image in direction (dx, dy)
-            shifted = torch.roll(img, shifts=(dy, dx), dims=(-2, -1))
-
-            # Compute squared difference
-            diff = (img - shifted) ** 2
-
-            # Apply Gaussian weighting via convolution
-            # Use groups=C to process each channel independently
-            weighted_diff = F.conv2d(
-                diff,
-                gaussian_kernel.repeat(C, 1, 1, 1),
-                padding=self.padding,
-                groups=C,
-            )
-
-            mind_features.append(weighted_diff)
-
-        # Stack all directional features: [B, C*8, H, W]
-        mind = torch.cat(mind_features, dim=1)
+        # Squared differences to every shifted copy, stacked direction-major so a
+        # single grouped conv applies the per-channel Gaussian to all of them.
+        diffs = [
+            (img - torch.roll(img, shifts=(dy, dx), dims=(-2, -1))) ** 2
+            for dx, dy in self.directions
+        ]
+        stacked = torch.cat(diffs, dim=1)  # [B, C*8, H, W]
+        groups = stacked.shape[1]
+        gaussian = self.gaussian_kernel.to(device=img.device, dtype=img.dtype)
+        gaussian = gaussian.expand(groups, 1, -1, -1)
+        mind = F.conv2d(stacked, gaussian, padding=self.padding, groups=groups)
 
         # Variance normalization (self-similarity)
         if self.use_self_similarity:
-            # Compute local variance for normalization
-            mean_kernel = torch.ones(1, 1, self.patch_size, self.patch_size).to(device)
-            mean_kernel /= self.patch_size**2
-
-            local_mean = F.conv2d(
-                mind,
-                mean_kernel.repeat(mind.shape[1], 1, 1, 1),
-                padding=self.padding,
-                groups=mind.shape[1],
-            )
-            local_var = (
-                F.conv2d(
-                    mind**2,
-                    mean_kernel.repeat(mind.shape[1], 1, 1, 1),
-                    padding=self.padding,
-                    groups=mind.shape[1],
-                )
-                - local_mean**2
-            )
+            box = self.mean_kernel.to(device=mind.device, dtype=mind.dtype)
+            box = box.expand(groups, 1, -1, -1)
+            local_mean = F.conv2d(mind, box, padding=self.padding, groups=groups)
+            local_var = F.conv2d(mind**2, box, padding=self.padding, groups=groups) - local_mean**2
 
             # Normalize by local variance (add epsilon for stability)
             # [FIX] Clamp variance to be non-negative AND add epsilon before sqrt to prevent NaN gradient at 0
@@ -174,7 +159,7 @@ class MINDSSCLoss(nn.Module):
 
         return mind
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Compute MIND-SSC loss between predicted and target images.
 
         Args:

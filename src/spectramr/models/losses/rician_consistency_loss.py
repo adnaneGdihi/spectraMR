@@ -49,21 +49,17 @@ def _estimate_sigma_mad(image: torch.Tensor, background_quantile: float = 0.1) -
     threshold = torch.quantile(flat, background_quantile, dim=1, keepdim=True)  # [B, 1]
     bg_mask = flat <= threshold  # [B, N] boolean
 
-    sigmas = []
-    for b in range(B):
-        bg_vals = flat[b][bg_mask[b]]
-        if bg_vals.numel() < 4:
-            # Fall back to whole-image MAD if background is too sparse
-            bg_vals = flat[b]
-        med = bg_vals.median()
-        mad = (bg_vals - med).abs().median()
-        sigmas.append(mad / 0.6745)
-
-    sigma = torch.stack(sigmas).view(B, 1, 1, 1)
+    # Background-only statistics without boolean indexing: non-background entries become NaN
+    # and nanmedian skips them. A row with < 4 background voxels falls back to the whole image.
+    sparse = bg_mask.sum(dim=1, keepdim=True) < 4
+    src = torch.where(bg_mask | sparse, flat, torch.full_like(flat, float("nan")))
+    med = src.nanmedian(dim=1, keepdim=True).values
+    mad = (src - med).abs().nanmedian(dim=1).values
+    sigma = (mad / 0.6745).view(B, 1, 1, 1)
     return sigma.clamp(min=1e-8)
 
 
-def _rician_unbiased(magnitude: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def _rician_unbiased(magnitude: torch.Tensor, sigma: torch.Tensor | float) -> torch.Tensor:
     """Compute the Rician-unbiased estimate.
 
     x̂ = sqrt(max(y² - 2σ², 0))
@@ -73,12 +69,12 @@ def _rician_unbiased(magnitude: torch.Tensor, sigma: torch.Tensor) -> torch.Tens
 
     Args:
         magnitude: Observed magnitude image [B, C, H, W] (real ≥ 0).
-        sigma: Per-sample noise std [B, 1, 1, 1].
+        sigma: Per-sample noise std [B, 1, 1, 1], or a fixed Python float.
 
     Returns:
         Unbiased estimate, same shape as magnitude.
     """
-    variance_correction = 2.0 * sigma.pow(2)  # 2σ² (two degrees of freedom)
+    variance_correction = 2.0 * sigma**2  # 2 sigma^2: two degrees of freedom
     unbiased_sq = (magnitude.pow(2) - variance_correction).clamp(min=0.0)
     return torch.sqrt(unbiased_sq + 1e-12)  # sqrt-safe eps
 
@@ -119,7 +115,7 @@ class RicianConsistencyLoss(nn.Module):
         sigma: float | None = None,
         background_quantile: float = 0.10,
         bias_correction: bool = True,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -134,13 +130,12 @@ class RicianConsistencyLoss(nn.Module):
         self.background_quantile = background_quantile
         self.bias_correction = bias_correction
 
+        self._bridge: DifferentiableFourierBridge | None = None
         if use_fourier_bridge:
             self._bridge = DifferentiableFourierBridge(
                 spatial_loss_fn=None,  # We call it manually below
                 return_complex=False,
             )
-        else:
-            self._bridge = None
 
     def _to_magnitude(self, x: torch.Tensor) -> torch.Tensor:
         """Convert tensor to real magnitude.
@@ -161,6 +156,8 @@ class RicianConsistencyLoss(nn.Module):
 
         Uses the bridge's internal iFFT for gradient continuity, then takes magnitude.
         """
+        if self._bridge is None:
+            raise RuntimeError("k-space input requires use_fourier_bridge=True.")
         img = self._bridge._kspace_to_image(kspace)
         return self._to_magnitude(img)
 
@@ -203,13 +200,11 @@ class RicianConsistencyLoss(nn.Module):
                 target_mag = self._to_magnitude(target)
 
         if self.bias_correction:
-            # Estimate noise sigma per sample
+            # A fixed sigma stays a Python float so a constant costs no per-step
+            # host-to-device copy.
+            sigma: torch.Tensor | float
             if self.fixed_sigma is not None:
-                sigma = (
-                    torch.tensor(self.fixed_sigma, device=pred_mag.device, dtype=pred_mag.dtype)
-                    .view(1, 1, 1, 1)
-                    .expand(pred_mag.shape[0], 1, 1, 1)
-                )
+                sigma = float(self.fixed_sigma)
             else:
                 with torch.no_grad():
                     sigma = _estimate_sigma_mad(

@@ -214,7 +214,6 @@ def _resolve_adapter_chain(config: Any) -> tuple[AdapterCapabilities, ...]:
     for point in (
         "pre_model",
         "post_model",
-        "pre_loss_pred",
         "pre_loss_target",
         "pre_metric",
     ):

@@ -12,6 +12,7 @@ import logging
 import torch
 from torch import nn
 
+from spectramr.data.transforms.normalization import compress_kspace_log, decompress_kspace_log
 from spectramr.infrastructure.physics.dc_mask import align_dc_mask
 from spectramr.infrastructure.physics.dc_settings import SUPPORTED_NOISE_TYPES
 
@@ -23,13 +24,13 @@ logger = logging.getLogger(__name__)
 #: model-internal DC builder (``KSpaceColdDiffusionGenerator``) and the
 #: reverse-diffusion sampler (``PhysicsInformedColdDiffusion``) validate against
 #: this one frozenset so a method one accepts, the other can honour. ``hard`` /
-#: ``soft`` (and its alias ``noise_adjusted``) are closed-form k-space ops; the
-#: rest are learned ``nn.Module`` layers reused from the model at sampling time.
+#: ``soft`` are closed-form k-space ops; the rest are ``nn.Module`` layers reused
+#: from the model at sampling time.
 #: Divergence here is what caused the 2026-07-05 ``dc_method='adaptive'`` sampler
 #: crash (generator built ``AdaptiveDataConsistency``; sampler knew only hard/soft).
-#: ``noise_adaptive`` is a closed-form Wiener/SNR trust layer (``NoiseAdaptiveDataConsistency``);
-#: unlike the ``noise_adjusted`` alias (which just maps to soft) it genuinely adapts the
-#: measurement trust per k-space bin from the measured SNR — denoising the low-field periphery.
+#: ``noise_adaptive`` is a closed-form Wiener/SNR trust layer (``NoiseAdaptiveDataConsistency``)
+#: that sets the measurement trust per k-space bin from its measured SNR; ``noise_adjusted``
+#: (``NoiseAdjustedDataConsistency``) sets one trust per sample from its noise level.
 VALID_DC_METHODS: frozenset[str] = frozenset(
     {
         "hard",
@@ -39,8 +40,32 @@ VALID_DC_METHODS: frozenset[str] = frozenset(
         "kan_adaptive",
         "target_aware_fsdc",
         "noise_adaptive",
+        "wiener_gain",
     }
 )
+
+#: A measured coefficient below this fraction of its sample's peak power is
+#: zero-padding, not a measurement: exact zeros return from the log1p round trip
+#: as ~eps rather than 0.0, and noise power sits far above this ratio.
+STRUCTURAL_ZERO_FRACTION = 1e-10
+
+
+def _require_bool(log_scaled: object, owner: str) -> bool:
+    """``log_scaled`` is the arm's ``enable_log_scaling``; guessing it computes the blend
+    on the wrong values, so anything but a bool is refused."""
+    if not isinstance(log_scaled, bool):
+        raise TypeError(f"{owner} needs log_scaled as a bool, got {log_scaled!r}.")
+    return log_scaled
+
+
+def _linear(x: torch.Tensor, log_scaled: bool) -> torch.Tensor:
+    """``x`` in linear k-space magnitude, same layout (interleaved or complex)."""
+    return decompress_kspace_log(x, channel_dim=1) if log_scaled else x
+
+
+def _compressed(x: torch.Tensor, log_scaled: bool) -> torch.Tensor:
+    """Inverse of :func:`_linear`."""
+    return compress_kspace_log(x, channel_dim=1) if log_scaled else x
 
 
 def _validate_noise_type(noise_type: str, owner: str) -> str:
@@ -640,15 +665,31 @@ class HardDataConsistency(nn.Module):
 class SoftDataConsistency(nn.Module):
     """Soft Data Consistency Layer."""
 
-    def __init__(self, lambda_init: float = 10.0, learnable: bool = True):
-        """__init__.
+    def __init__(
+        self, lambda_init: float = 10.0, learnable: bool = True, log_scaled: bool = False
+    ):
+        """Proximal blend ``(k + lam M y) / (1 + lam M)`` on the sampled bins.
 
         Args:
-            lambda_init (float): Description.
-            learnable (bool): Description.
+            lambda_init: Initial ``lam > 0``. Stored as its softplus pre-image, so the
+                gradient never dies at a clamp and ``lam`` cannot reach zero.
+            learnable: Whether ``lam`` is optimised.
+            log_scaled: Whether the k-space received is ``log1p``-compressed; the blend
+                is computed on linear values and the result recompressed.
         """
         super().__init__()
-        self.lambda_param = nn.Parameter(torch.tensor(float(lambda_init)), requires_grad=learnable)
+        if float(lambda_init) <= 0.0:
+            raise ValueError(f"SoftDataConsistency needs lambda_init > 0, got {lambda_init!r}")
+        lam0 = torch.tensor(float(lambda_init), dtype=torch.float64)
+        # Inverse softplus, x + log(1 - e^-x): finite for every x > 0, unlike log(expm1(x)).
+        raw = (lam0 + torch.log(-torch.expm1(-lam0))).to(torch.get_default_dtype())
+        self.lambda_param = nn.Parameter(raw, requires_grad=learnable)
+        self.log_scaled = _require_bool(log_scaled, "SoftDataConsistency")
+
+    @property
+    def lam(self) -> torch.Tensor:
+        """The blend weight ``softplus(lambda_param)``."""
+        return torch.nn.functional.softplus(self.lambda_param)
 
     def forward(
         self,
@@ -693,6 +734,11 @@ class SoftDataConsistency(nn.Module):
                 and predicted_img.shape[1] % 2 == 0
             )
 
+        if self.log_scaled and not is_kspace_domain:
+            raise ValueError("SoftDataConsistency with log_scaled=True acts on k-space only.")
+        compressed_input = predicted_img
+        predicted_img = _linear(predicted_img, self.log_scaled)
+        measured_kspace = _linear(measured_kspace, self.log_scaled)
         is_complex_input = torch.is_complex(predicted_img)
         if is_kspace_domain:
             if not is_complex_input:
@@ -724,15 +770,15 @@ class SoftDataConsistency(nn.Module):
         if mask_real.ndim == 4 and mask_real.shape[1] > k_pred.shape[1]:
             mask_real = mask_real[:, : k_pred.shape[1], ...]
 
-        lam = torch.clamp(self.lambda_param, min=1e-6)
+        lam = self.lam
         num = k_pred + lam * measured_kspace * mask_real
         den = 1.0 + lam * mask_real
         k_out = num / den
 
         if is_kspace_domain:
             if not is_complex_input:
-                return torch.stack([k_out.real, k_out.imag], dim=2).flatten(1, 2)
-            return k_out
+                k_out = torch.stack([k_out.real, k_out.imag], dim=2).flatten(1, 2)
+            return _compressed(k_out, self.log_scaled).to(compressed_input.dtype)
         else:
             x_out = ifft2c(k_out)
             if not is_complex_input:
@@ -763,9 +809,10 @@ class NoiseAdaptiveDataConsistency(nn.Module):
     independent central blob: ``lam`` is a deterministic function of the *measured*
     magnitude, and unsampled bins are always pure prediction.
 
-    ``sigma^2`` defaults to a self-contained robust estimate from the outermost
-    *sampled* (noise-dominated) k-space bins; an explicit ``noise_sigma`` (a noise
-    standard deviation, e.g. from M4Raw rep-variance) overrides it.
+    ``sigma^2`` defaults to a self-contained robust estimate: the median power of
+    the outermost ``noise_support_frac`` of each sample's *measured* bins, ranked
+    by radius (see ``estimate_noise_variance``); an explicit ``noise_sigma`` (a
+    noise standard deviation, e.g. from M4Raw rep-variance) overrides it.
 
     Boundedness: ``lam in [0, 1)`` makes ``k_new`` a convex combination of ``y`` and
     ``k_pred``, so ``|k_new| <= max(|y|, |k_pred|)`` per bin (no amplification).
@@ -779,15 +826,24 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         self,
         beta: float = 1.0,
         learnable_beta: bool = False,
-        outer_radius_frac: float = 0.7,
+        noise_support_frac: float = 0.1,
         eps: float = 1e-8,
+        log_scaled: bool = False,
     ) -> None:
         super().__init__()
+        self.log_scaled = _require_bool(log_scaled, type(self).__name__)
+        if not 0.0 < float(noise_support_frac) <= 1.0:
+            raise ValueError(
+                f"noise_support_frac must lie in (0, 1], got {noise_support_frac!r}"
+            )
         self.beta = nn.Parameter(torch.tensor(float(beta)), requires_grad=bool(learnable_beta))
-        self.outer_radius_frac = float(outer_radius_frac)
+        self.noise_support_frac = float(noise_support_frac)
         self.eps = float(eps)
         self._coord_cache_shape: tuple[int, int] | None = None
         self.register_buffer("_coord_radius", torch.empty(0), persistent=False)
+        # Flat bin indices ordered by radius, outermost first, and its inverse.
+        self.register_buffer("_coord_order", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("_coord_rank", torch.empty(0, dtype=torch.long), persistent=False)
         # Telemetry: [center_mean, periphery_mean, overall_mean, overall_std],
         # populated every forward (parity with KANAdaptiveDataConsistency).
         self.register_buffer("_last_trust_stats", torch.zeros(4), persistent=False)
@@ -802,29 +858,88 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         if r_max <= 0:
             r_max = 1.0
         self._coord_radius = r / r_max  # [0, 1]; 0 at the k-space centre
+        self._coord_order = torch.argsort(r.flatten(), descending=True, stable=True)
+        self._coord_rank = torch.argsort(self._coord_order)
         self._coord_cache_shape = (H, W)
 
     @torch.no_grad()
-    def _estimate_sigma2(self, power: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
-        """Robust per-sample noise variance from the outermost sampled bins.
+    def noise_region(self, obs: torch.Tensor) -> torch.Tensor:
+        """The noise region of the support ``obs``, as a bool map ``[B, 1, H, W]``.
+
+        Per sample, the outermost ``ceil(noise_support_frac * n)`` of its ``n``
+        measured bins (``obs > 0``), ranked by radius. ``estimate_noise_variance``
+        passes the measured support with structural zeros removed. Ranking the measured support
+        rather than thresholding a fixed radius keeps the region non-empty on
+        centre-weighted masks (variable-density, gaussian), whose measured bins
+        never reach the outer annulus (#2475). Raises when a sample has no
+        measured bin, since its noise level is then undefined.
+        """
+        B, _, H, W = obs.shape
+        if self._coord_cache_shape != (H, W):
+            self._build_coords(H, W, obs.device)
+        measured = (obs > 0).any(dim=1).reshape(B, H * W)
+        n = measured.sum(dim=1)
+        empty = n == 0
+        if obs.is_cuda:
+            # An async device assert: the run must stop on an empty support, and a
+            # host-side check would sync once per DC call (every reverse step).
+            torch._assert_async(~empty.any())
+        elif bool(empty.any()):
+            raise ValueError(
+                "NoiseAdaptiveDataConsistency: sample(s) "
+                f"{empty.nonzero().flatten().tolist()} have no measured k-space bin; "
+                "the noise variance cannot be estimated from an empty support."
+            )
+        take = torch.ceil(n.to(torch.float64) * self.noise_support_frac).clamp_min(1)
+        ranked = measured[:, self._coord_order]
+        keep = ranked & (ranked.cumsum(dim=1) <= take[:, None])
+        return keep[:, self._coord_rank].view(B, 1, H, W)
+
+    @torch.no_grad()
+    def estimate_noise_variance(self, power: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        """Robust per-sample noise power from the outermost measured bins.
 
         ``power`` is ``[B, 1, H, W]`` (mean-over-coils ``|y|^2``); ``obs`` is the
-        observed support ``[B, 1, H, W]``. Uses the median of ``|y|^2`` over the
-        sampled bins in the outer radial annulus (noise-dominated); falls back to
-        the median over all sampled bins when the annulus is too sparse (e.g. very
-        high acceleration). Returns ``[B, 1, 1, 1]``.
+        observed support ``[B, 1, H, W]`` (or ``[1, 1, H, W]``, shared). Returns the
+        median of ``power`` over ``noise_region`` of the measured support as
+        ``[B, 1, 1, 1]``. For single-coil circular complex Gaussian noise of
+        variance ``sigma^2`` this median is ``sigma^2 ln 2``, not ``sigma^2``.
+
+        Zero-padded coefficients (M4Raw stores 195 of 256 phase-encode lines;
+        see ``STRUCTURAL_ZERO_FRACTION``) are left out of the support, or the
+        outermost bins would be the padded edge and the estimate would collapse
+        to ``eps``.
         """
         B, _, H, W = power.shape
-        if self._coord_cache_shape != (H, W):
-            self._build_coords(H, W, power.device)
-        outer = (self._coord_radius > self.outer_radius_frac).view(1, 1, H, W)
-        region = (obs > 0) & outer
-        sigma2 = power.new_empty(B, 1, 1, 1)
-        for b in range(B):
-            vals = power[b][region[b]]
-            if vals.numel() < 8:
-                vals = power[b][obs[b] > 0]
-            sigma2[b] = torch.median(vals) if vals.numel() > 0 else power.new_tensor(self.eps)
+        floor = STRUCTURAL_ZERO_FRACTION * power.amax(dim=(-2, -1), keepdim=True)
+        support = (obs.expand(B, -1, H, W) > 0).any(dim=1, keepdim=True) & (power > floor)
+        region = self.noise_region(support).reshape(B, H * W)
+        vals = torch.where(region, power.reshape(B, H * W), power.new_tensor(float("nan")))
+        sigma2 = torch.nanmedian(vals, dim=1).values.view(B, 1, 1, 1)
+        return sigma2.clamp_min(self.eps)
+
+    @staticmethod
+    def _measured_power(measured_kspace: torch.Tensor) -> torch.Tensor:
+        power = measured_kspace.abs() ** 2
+        if power.shape[1] > 1:
+            power = power.mean(dim=1, keepdim=True)  # share trust across coils
+        return power
+
+    def _noise_power(
+        self,
+        power: torch.Tensor,
+        mask: torch.Tensor,
+        noise_sigma: torch.Tensor | float | None,
+    ) -> torch.Tensor:
+        """``sigma^2`` as ``[B, 1, 1, 1]``: from ``noise_sigma`` when given, else estimated."""
+        if noise_sigma is None:
+            return self.estimate_noise_variance(power, align_dc_mask(mask, 1))
+        if torch.is_tensor(noise_sigma):
+            sigma2 = noise_sigma.to(power) ** 2
+            while sigma2.dim() < 4:
+                sigma2 = sigma2.unsqueeze(-1)
+        else:
+            sigma2 = power.new_tensor(float(noise_sigma) ** 2).view(1, 1, 1, 1)
         return sigma2.clamp_min(self.eps)
 
     def _compute_lambda(
@@ -832,26 +947,23 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         measured_kspace: torch.Tensor,
         mask: torch.Tensor,
         noise_sigma: torch.Tensor | float | None,
+        signal_power: torch.Tensor | None = None,
+        sigma2: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the Wiener trust map ``[B, 1, H, W]`` in ``[0, 1)``."""
-        power = measured_kspace.abs() ** 2
-        if power.shape[1] > 1:
-            power = power.mean(dim=1, keepdim=True)  # share trust across coils
+        """Return the Wiener trust map ``[B, 1, H, W]`` in ``[0, 1)``.
+
+        ``signal_power`` replaces ``|y|^2`` as the numerator's signal estimate;
+        ``sigma^2`` is still estimated from the measured power unless the caller
+        passes it as ``sigma2`` ``[B, 1, 1, 1]``.
+        """
+        power = self._measured_power(measured_kspace)
         _, _, H, W = power.shape
         if self._coord_cache_shape != (H, W):
             self._build_coords(H, W, power.device)
-
-        if noise_sigma is not None:
-            if torch.is_tensor(noise_sigma):
-                sigma2 = noise_sigma.to(power) ** 2
-                while sigma2.dim() < 4:
-                    sigma2 = sigma2.unsqueeze(-1)
-            else:
-                sigma2 = power.new_tensor(float(noise_sigma) ** 2).view(1, 1, 1, 1)
-            sigma2 = sigma2.clamp_min(self.eps)
-        else:
-            obs = align_dc_mask(mask, 1)
-            sigma2 = self._estimate_sigma2(power, obs)
+        if sigma2 is None:
+            sigma2 = self._noise_power(power, mask, noise_sigma)
+        if signal_power is not None:
+            power = signal_power.to(power)
 
         beta = torch.nn.functional.softplus(self.beta)
         lam = power / (power + beta * sigma2 + self.eps)
@@ -878,8 +990,17 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         is_kspace_domain: bool = False,
         acs_mask: torch.Tensor | None = None,
         noise_sigma: torch.Tensor | float | None = None,
+        signal_power: torch.Tensor | None = None,
+        trust_radius: float | None = None,
     ) -> torch.Tensor:
-        """Mirror the ``KANAdaptiveDataConsistency`` interface (see class docstring)."""
+        """Mirror the ``KANAdaptiveDataConsistency`` interface (see class docstring).
+
+        ``signal_power`` (``[B, 1, H, W]``) replaces ``|y|^2`` as the Wiener
+        signal estimate. ``trust_radius`` ``c`` first moves each measured bin of
+        the prediction into the disc ``|k_pred - y| <= c * sigma``, so the
+        convex blend leaves every measured bin within ``c * sigma`` of ``y``.
+        Both default to ``None``, which is the unmodified layer.
+        """
         del acs_mask, sensitivity_maps  # coil-wise: no SENSE operator needed
         if measured_kspace is None or mask is None:
             return img_pred
@@ -894,6 +1015,11 @@ class NoiseAdaptiveDataConsistency(nn.Module):
                 and measured_kspace.shape[1] == img_pred.shape[1]
             )
 
+        if self.log_scaled and not is_kspace_domain:
+            raise ValueError(f"{type(self).__name__} with log_scaled=True acts on k-space only.")
+        compressed_input = img_pred
+        img_pred = _linear(img_pred, self.log_scaled)
+        measured_kspace = _linear(measured_kspace, self.log_scaled)
         is_complex_input = torch.is_complex(img_pred)
         if not is_complex_input and img_pred.shape[1] % 2 == 0:
             x = torch.complex(img_pred[:, 0::2, ...], img_pred[:, 1::2, ...])
@@ -907,17 +1033,24 @@ class NoiseAdaptiveDataConsistency(nn.Module):
                 measured_kspace[:, 0::2, ...], measured_kspace[:, 1::2, ...]
             )
 
-        lambda_map = self._compute_lambda(measured_kspace, mask, noise_sigma)
-        k_new = (1.0 - lambda_map) * k_pred + lambda_map * measured_kspace
+        lambda_map = self._compute_lambda(measured_kspace, mask, noise_sigma, signal_power)
+        k_trusted = k_pred
+        if trust_radius is not None:
+            power = self._measured_power(measured_kspace)
+            radius = float(trust_radius) * self._noise_power(power, mask, noise_sigma).sqrt()
+            offset = k_pred - measured_kspace
+            shrink = (radius / offset.abs().clamp_min(self.eps)).clamp(max=1.0)
+            k_trusted = measured_kspace + offset * shrink
+        k_new = (1.0 - lambda_map) * k_trusted + lambda_map * measured_kspace
 
         k_out = torch.where(align_dc_mask(mask, k_pred.shape[-3]).bool(), k_new, k_pred)
 
         if is_kspace_domain:
-            if is_complex_input:
-                return k_out
-            if img_pred.shape[1] % 2 == 0:
-                return torch.stack([k_out.real, k_out.imag], dim=2).flatten(1, 2)
-            return k_out.real
+            if not is_complex_input:
+                if img_pred.shape[1] % 2 != 0:
+                    return k_out.real
+                k_out = torch.stack([k_out.real, k_out.imag], dim=2).flatten(1, 2)
+            return _compressed(k_out, self.log_scaled).to(compressed_input.dtype)
 
         x_out = ifft2c(k_out)
         if is_complex_input:
@@ -925,6 +1058,72 @@ class NoiseAdaptiveDataConsistency(nn.Module):
         if img_pred.shape[1] % 2 == 0:
             return torch.stack([x_out.real, x_out.imag], dim=2).flatten(1, 2)
         return x_out.real
+
+
+class NoiseAdjustedDataConsistency(NoiseAdaptiveDataConsistency):
+    r"""Noise-adjusted data consistency: one Wiener trust per sample, set by its noise level.
+
+    The global counterpart of :class:`NoiseAdaptiveDataConsistency`, with the same
+    estimator for ``sigma^2`` and the same blend, but the signal power is the sample's
+    mean measured power over its acquired support rather than each bin's own::
+
+        P_bar  = mean_{k in support} |y(k)|^2                      # one value per sample
+        lam    = P_bar / (P_bar + softplus(beta) * sigma^2)         # in [0, 1)
+        k_out  = where(mask, (1 - lam) * k_pred + lam * y, k_pred)
+
+    Every measured bin of a sample is therefore trusted equally, by an amount the
+    measurement's noise level sets. Against ``noise_adaptive`` it isolates whether the
+    per-bin SNR matters beyond the global noise level; against ``soft`` (one learned
+    weight, no noise model) whether the noise level does. Structural zeros are left out
+    of the support, as in the noise estimate.
+    """
+
+    def forward(
+        self,
+        img_pred: torch.Tensor,
+        measured_kspace: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        sensitivity_maps: torch.Tensor | None = None,
+        is_kspace_domain: bool = False,
+        acs_mask: torch.Tensor | None = None,
+        noise_sigma: torch.Tensor | float | None = None,
+        signal_power: torch.Tensor | None = None,
+        trust_radius: float | None = None,
+    ) -> torch.Tensor:
+        """The parent's blend with ``signal_power`` fixed to the sample's mean measured power."""
+        if signal_power is not None:
+            raise ValueError(
+                "NoiseAdjustedDataConsistency sets its own signal power (the sample mean "
+                "over the measured support); a caller-supplied signal_power would replace "
+                "the method. Use dc_method 'noise_adaptive' for a per-bin signal estimate."
+            )
+        if measured_kspace is None or mask is None:
+            return img_pred
+        y = _linear(measured_kspace, self.log_scaled)
+        if not torch.is_complex(y):
+            y = torch.complex(y[:, 0::2, ...], y[:, 1::2, ...])
+        return super().forward(
+            img_pred,
+            measured_kspace,
+            mask,
+            sensitivity_maps=sensitivity_maps,
+            is_kspace_domain=is_kspace_domain,
+            acs_mask=acs_mask,
+            noise_sigma=noise_sigma,
+            signal_power=self.mean_measured_power(y, mask),
+            trust_radius=trust_radius,
+        )
+
+    def mean_measured_power(self, measured_kspace: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """``[B, 1, 1, 1]`` mean of ``|y|^2`` over each sample's measured, non-padded bins."""
+        power = self._measured_power(measured_kspace)
+        b, _, h, w = power.shape
+        obs = align_dc_mask(mask, 1).to(power.device).expand(b, -1, h, w) > 0
+        floor = STRUCTURAL_ZERO_FRACTION * power.amax(dim=(-2, -1), keepdim=True)
+        support = obs & (power > floor)
+        total = torch.where(support, power, torch.zeros_like(power)).sum(dim=(-2, -1), keepdim=True)
+        count = support.sum(dim=(-2, -1), keepdim=True).clamp_min(1)
+        return total / count
 
 
 def data_consistency(x, k_measured, mask, weight=1.0):
@@ -989,6 +1188,7 @@ class TargetAwareFSDC(nn.Module):
         center_fraction: float = 0.03,
         hf_lambda: float = 0.5,
         acs_taper: str | None = None,
+        log_scaled: bool = False,
     ):
         """Initialise TA-FSDC.
 
@@ -1016,8 +1216,11 @@ class TargetAwareFSDC(nn.Module):
                 renders no longer show a hard saturated central cluster, and
                 trained-model behaviour is essentially unchanged (the HF
                 prediction dominates outside ACS).
+            log_scaled: Whether the k-space received is ``log1p``-compressed; the
+                high-frequency blend is computed on linear values.
         """
         super().__init__()
+        self.log_scaled = _require_bool(log_scaled, "TargetAwareFSDC")
         self.target_channels = target_channels
         self.center_fraction = center_fraction
         if acs_taper not in (None, "hann"):
@@ -1049,8 +1252,10 @@ class TargetAwareFSDC(nn.Module):
         of the ACS-only k-space has reduced sidelobes (audit-2026-05-14
         §1 round-5).
         """
-        pad_h = max(1, int(H * self.center_fraction))
-        pad_w = max(1, int(W * self.center_fraction))
+        # ``center_fraction`` is the full width of the box, as in fastMRI masks; the
+        # pad is its half-width on each side of the centre.
+        pad_h = max(1, int(H * self.center_fraction / 2))
+        pad_w = max(1, int(W * self.center_fraction / 2))
         ch, cw = H // 2, W // 2
 
         acs = torch.zeros(1, 1, H, W, device=reference.device, dtype=reference.dtype)
@@ -1139,6 +1344,9 @@ class TargetAwareFSDC(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
         """
+        compressed_dtype = kspace_pred.dtype
+        kspace_pred = _linear(kspace_pred, self.log_scaled)
+        kspace_measured = _linear(kspace_measured, self.log_scaled)
         B, C_total, H, W = kspace_pred.shape
 
         # Ensure mask is broadcastable  [B, 1, H, W]
@@ -1211,9 +1419,8 @@ class TargetAwareFSDC(nn.Module):
         target_out = lf_mask * target_lf + hf_mask * hf_blend + unsampled_mask * target_pred
 
         # ── 3. Re-concatenate source + target ────────────────────────
-        if C_source > 0:
-            return torch.cat([source_out, target_out], dim=1)
-        return target_out
+        out = torch.cat([source_out, target_out], dim=1) if C_source > 0 else target_out
+        return _compressed(out, self.log_scaled).to(compressed_dtype)
 
 
 def dc_passthrough_center_patch(
@@ -1271,8 +1478,7 @@ def dc_passthrough_center_patch(
 
     # Channel alignment — for cross-contrast layouts the measurement
     # tensor carries ``[source || target]`` while ``x_out`` is only the
-    # target half. Take the LAST C channels to align (same convention as
-    # ``_slice_to_target_contrast_single`` and the surrounding DC code).
+    # target half. Take the LAST C channels to align.
     if measured_kspace.shape[1] > x_out.shape[1]:
         measured_kspace = measured_kspace[:, -x_out.shape[1] :]
 

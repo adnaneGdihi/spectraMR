@@ -36,7 +36,7 @@ Layout reasoning:
 This is the SINGLE SOURCE OF TRUTH for all loss configuration.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -624,7 +624,26 @@ class ReconstructionLossesConfig(CompatSchema):
     # docstring names, and `rename_mounts.audit_mounts` reports an unmounted
     # record set as `missing_mount` -- it caught this one before it shipped.
     _reject_renamed = model_validator(mode="before")(
-        classmethod(reject_renamed_keys("losses.reconstruction"))
+        classmethod(reject_renamed_keys("losses.reconstruction"))  # type: ignore[arg-type]
+    )
+
+
+class DomainGRLConfig(BaseModel):
+    """Gradient-reversal domain head on the CycleGAN generator bottleneck (unpaired arms).
+
+    The head's weight is ``losses.gan.lambda_domain``, the knob DomainAdaptationStrategy reads
+    too; the reversal runs at unit strength. ``extra="forbid"`` makes a misspelled key raise,
+    since the parent block ignores unknown keys.
+    """
+
+    model_config = {"protected_namespaces": (), "extra": "forbid", "frozen": True}
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Attach a domain classifier to the generator's Z_anat (A = batch input, B = target) "
+            "behind a gradient-reversal layer. Requires strategy_class 'cyclegan'."
+        ),
     )
 
 
@@ -672,6 +691,14 @@ class GANLossesConfig(BaseModel):
     disc_updates: int = Field(
         default=1, gt=0, description="Discriminator updates per generator update"
     )
+    disc_update_interval: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Update the discriminator only on every N-th iteration (disc_updates times), "
+            "and not at all between; 1 updates it every iteration."
+        ),
+    )
     label_smoothing: float = Field(
         default=0.0, ge=0, le=1, description="Label smoothing for GAN loss"
     )
@@ -692,7 +719,14 @@ class GANLossesConfig(BaseModel):
     lambda_domain: float = Field(
         default=1.0,
         ge=0,
-        description="Weight for domain adversarial alignment loss (DomainAdaptationStrategy)",
+        description=(
+            "Weight of the domain adversarial loss: DomainAdaptationStrategy, and the "
+            "CycleGAN gradient-reversal head when domain_grl.enabled."
+        ),
+    )
+    domain_grl: DomainGRLConfig = Field(
+        default_factory=DomainGRLConfig,
+        description="Gradient-reversal domain head on the CycleGAN generator bottleneck.",
     )
 
     # ==================== TRANSLATION / STARGAN ====================
@@ -787,6 +821,15 @@ class LatentLossesConfig(BaseModel):
     enable_kl: bool = Field(default=False, description="Enable KL divergence loss")
     lambda_kl: float = Field(default=0.0, ge=0, description="KL divergence weight")
     beta_kl: float = Field(default=1.0, ge=0, description="KL annealing beta")
+    lambda_patch_nce: float = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "PatchNCE content-consistency weight of the disentangled loss computer. The "
+            "computer mapped patch_nce to this name but no field existed, so the term trained "
+            "at the lookup's fallback of 1.0 in every arm; 1.0 preserves that."
+        ),
+    )
 
     enable_commitment: bool = Field(default=False, description="Enable VQ commitment loss")
     lambda_commit: float = Field(default=0.0, ge=0, description="Commitment loss weight")
@@ -1210,6 +1253,14 @@ class LossComponentConfig(BaseModel):
         default_factory=dict,
         description="Additional arguments passed to loss constructor",
     )
+    role: Literal["target", "source"] = Field(
+        default="target",
+        description=(
+            "Which tensor the image loss compares the prediction against. 'target' (default) "
+            "is the paired ground truth; 'source' is the strategy's input domain (the "
+            "unpaired contract). A 'target' image loss under an unpaired strategy raises."
+        ),
+    )
 
     model_config = {"extra": "ignore", "frozen": True}
 
@@ -1247,7 +1298,7 @@ class ComposedLossConfig(BaseModel):
 
     @field_validator("components")
     @classmethod
-    def validate_unique_names(cls, components):
+    def validate_unique_names(cls, components: list[LossComponentConfig]) -> list[LossComponentConfig]:
         """Ensure all component names are unique."""
         names = [c.name for c in components]
         if len(names) != len(set(names)):
@@ -1414,8 +1465,12 @@ class LossConfigSchema(BaseModel):
     # place: the key stops working AND stops being visible. Promoting a
     # drained record in a block without this validator converts a working
     # fold into exactly that.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("losses")))
-    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("losses")))
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("losses"))  # type: ignore[arg-type]
+    )
+    _fold_renamed = model_validator(mode="before")(
+        classmethod(fold_renamed_keys("losses"))  # type: ignore[arg-type]
+    )
 
     # ---- ungrouped: inert, and flatness is the tell ----------------------
     # `normalize_losses` and `clip_loss_value` have ZERO readers and ZERO corpus
@@ -1721,7 +1776,7 @@ class LossConfigSchema(BaseModel):
 
             Only includes losses that are enabled AND have weight > 0.
             """
-            losses = {}
+            losses: dict[str, float] = {}
             if config is None:
                 return losses
 

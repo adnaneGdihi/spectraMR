@@ -25,6 +25,15 @@ class HeteroscedasticULFConfig(StrictSchema):
             "is (sigma_floor / (B0/3)^1.75)^2 via the Hoult scaling."
         ),
     )
+    source_field: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "ULF source field (Tesla) for the Hoult anchor when the batch carries no "
+            "per-sample field_strength (the paired ULF route). Required in that case: "
+            "absent both, the strategy raises rather than anchoring to the 3T floor."
+        ),
+    )
     lambda_var_prior: float = Field(
         default=0.1,
         ge=0.0,

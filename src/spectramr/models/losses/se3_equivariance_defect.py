@@ -60,7 +60,9 @@ def _random_rotation_3d(n: int, device: torch.device, generator: torch.Generator
     sign of the last column where ``det < 0`` to land in SO(3).
     """
     a = torch.randn(n, 3, 3, device=device, generator=generator)
-    q, r = torch.linalg.qr(a)
+    qr = torch.linalg.qr(a)
+    q: torch.Tensor = qr.Q
+    r: torch.Tensor = qr.R
     # Make the decomposition unique / proper: fix signs from R's diagonal.
     diag_sign = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
     diag_sign[diag_sign == 0] = 1.0
@@ -115,6 +117,9 @@ class SE3EquivarianceDefectLoss(nn.Module):
         self.reduction = reduction
         self.seed = int(seed)
         self.max_angle = float(max_angle)
+        # The sampler is re-seeded with a fixed seed, so every call draws the same
+        # rotations; cache them per (device, dtype) instead of a CPU draw + copy each step.
+        self._rotation_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
     @staticmethod
     def _apply_adjoint(u: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
@@ -124,11 +129,19 @@ class SE3EquivarianceDefectLoss(nn.Module):
         """
         omega = u[..., :3]
         v = u[..., 3:]
-        r_omega = torch.einsum("ij,blj->bli", rot, omega)
-        r_v = torch.einsum("ij,blj->bli", rot, v)
+        r_omega: torch.Tensor = torch.einsum("ij,blj->bli", rot, omega)
+        r_v: torch.Tensor = torch.einsum("ij,blj->bli", rot, v)
         return torch.cat([r_omega, r_v], dim=-1)
 
     def _sample_rotations(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        cached = self._rotation_cache.get(key)
+        if cached is None:
+            cached = self._draw_rotations(device, dtype)
+            self._rotation_cache[key] = cached
+        return cached
+
+    def _draw_rotations(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         gen = torch.Generator(device="cpu")
         gen.manual_seed(self.seed)
         if self.group == "SO2":
@@ -174,7 +187,7 @@ class SE3EquivarianceDefectLoss(nn.Module):
         if fn is None:
             g = _identity
         elif callable(fn):
-            g = fn  # type: ignore[assignment]
+            g = fn
         else:
             raise TypeError("equivariant_fn must be callable.")
 

@@ -27,10 +27,7 @@ def base_config_dict() -> dict:
         "metadata": {"name": "base"},
         "training": {"output_dir": "/tmp/x", "max_iterations": 100},
         "logging": {"log_dir": "/tmp/x/logs", "experiment_name": "base"},
-        "checkpoint": {
-            "save_dir": "/tmp/x/checkpoints",
-            "checkpoint_dir": "/tmp/x/checkpoints",
-        },
+        "checkpoint": {"save_interval": 10},
         "artifacts": {"persistent_root": "/tmp/x"},
         "loss_logging": {
             "csv_path": "/tmp/x/logs/loss_log.csv",
@@ -53,7 +50,7 @@ class TestBuildTrialYaml:
         assert path.exists()
         with open(path) as fh:
             cfg = yaml.safe_load(fh)
-        assert cfg["optimization"]["learning_rate"] == 5e-4
+        assert cfg["optimization"]["optimizer"]["learning_rate"] == 5e-4
         # max_iterations is forced to the trial budget
         assert cfg["training"]["max_iterations"] == 2000
 
@@ -84,9 +81,19 @@ class TestBuildTrialYaml:
         out_root = str(tmp_path / "trial_0003")
         assert cfg["training"]["output_dir"] == out_root
         assert out_root in cfg["logging"]["log_dir"]
-        assert out_root in cfg["checkpoint"]["checkpoint_dir"]
+        assert "checkpoint_dir" not in cfg.get("checkpoint", {})
+        assert "save_dir" not in cfg.get("checkpoint", {})
         assert out_root in cfg["loss_logging"]["csv_path"]
         assert cfg["metadata"]["name"] == "trial_0003"
+
+    def test_the_unread_artifacts_block_is_not_written(self, base_config_dict, tmp_path):
+        """#698: nothing reads `artifacts`, so a trial must not advertise one (the base's
+        would name the base arm's directory, the old repoint wrote a fresh one)."""
+        path = _build_trial_yaml(
+            base_config_dict, trial_number=2, overrides={}, output_root=tmp_path, max_iterations=10
+        )
+        with open(path) as fh:
+            assert "artifacts" not in yaml.safe_load(fh)
 
 
 class TestReadLatestMetrics:

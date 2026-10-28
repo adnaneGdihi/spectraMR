@@ -204,8 +204,10 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Standalone-script entrypoint: route the module logger to stdout so
-    # the "Wrote N records" message is visible when run directly (the
-    # root logger defaults to WARNING otherwise).
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Standalone entrypoint: attach a handler to this module's logger only; the root
+    # logger belongs to infrastructure/logging/log_policy.py.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
     main()

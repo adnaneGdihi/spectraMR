@@ -56,6 +56,7 @@ __all__ = [
     "TARGET_CAPABILITY_ENV",
     "DeviceCapabilities",
     "build_capabilities",
+    "capability_of_device",
     "native_bf16_supported",
     "parse_compute_capability",
     "probe_device_capabilities",
@@ -183,7 +184,9 @@ def build_capabilities(
     if device_type == "cuda" and capability is None:
         incomplete.append("capability")
     try:
-        backend: str | None = compile_backend_for(device_type, triton=triton)
+        backend: str | None = compile_backend_for(
+            device_type, triton=triton, capability=capability
+        )
     except (ValueError, CompileUnsupportedError):
         backend = None
         incomplete.append("compile_backend")
@@ -252,6 +255,29 @@ def probe_device_capabilities(
             capability, source = declared, f"env:{TARGET_CAPABILITY_ENV}"
 
     return build_capabilities(device_type, capability, triton=triton, source=source)
+
+
+def capability_of_device(device: Any) -> tuple[int, int] | None:
+    """Compute capability of *device* itself (its index, else the current device).
+
+    ``probe_device_capabilities`` defaults to index 0, which on a multi-rank node
+    is rank 0's GPU, not this rank's. Falls back to the declared target when the
+    device cannot be probed; ``None`` when neither is known.
+    """
+    if _device_type_of(device) != "cuda":
+        return None
+    if isinstance(device, str):
+        index = int(device.split(":", 1)[1]) if ":" in device else None
+    else:
+        index = getattr(device, "index", None)
+    if index is None:
+        try:
+            import torch
+
+            index = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        except Exception:
+            index = 0
+    return probe_device_capabilities(device, index=index).capability
 
 
 def _device_type_of(device: Any) -> str:

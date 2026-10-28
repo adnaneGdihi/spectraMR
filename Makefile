@@ -209,13 +209,17 @@ train:
 # -- an inference run against a silently-wrong directory is worse than a stopped
 # one, and `predict` cannot guess what the reader wants reconstructed.
 INPUT ?=
+# The weights: MODEL=<checkpoint file>, or RUN=<run_dir>, whose best checkpoint (else its
+# latest step, of any format) is chosen by the one selection rule, resolve_checkpoint.
+MODEL ?=
+RUN ?=
 predict:
 	@test -n "$(INPUT)" || { echo "make predict needs INPUT=<dir-or-file>, e.g. make predict INPUT=path/to/kspace/"; exit 2; }
-	python -m spectramr.cli predict --config $(CONFIG) --model $(MODEL) --input $(INPUT)
-
-# Where `predict` looks for weights. Was hardcoded to checkpoints/best.pt, which
-# the training loop only writes once a run has completed.
-MODEL ?= checkpoints/best.pt
+	@test -n "$(MODEL)$(RUN)" || { echo "make predict needs MODEL=<checkpoint file> or RUN=<run_dir>"; exit 2; }
+	@model="$(MODEL)"; \
+	if [ -z "$$model" ]; then model="$$(python -m spectramr.cli.resolve_checkpoint "$(RUN)/checkpoints")" || exit 2; fi; \
+	echo python -m spectramr.cli predict --config $(CONFIG) --model "$$model" --input $(INPUT); \
+	python -m spectramr.cli predict --config $(CONFIG) --model "$$model" --input $(INPUT)
 
 benchmark:
 	python -m spectramr.cli benchmark --suite standard

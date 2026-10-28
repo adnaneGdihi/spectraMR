@@ -27,7 +27,7 @@ from spectramr.infrastructure.reporting.metadata import (
     stamp_figure,
     write_sidecar,
 )
-from spectramr.infrastructure.reporting.style import use_default_style
+from spectramr.infrastructure.reporting.style import use_default_style, save_plot
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ def render_ksd_certificate(
     config_path: str | Path | None = None,
     samples_path: str | Path | None = None,
     title: str = "KSD defensibility certificate",
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path:
     """Render a one-page PDF certificate for a KSD audit outcome.
@@ -186,11 +188,7 @@ def render_ksd_certificate(
     if metadata is not None:
         stamp_figure(fig, metadata)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi, metadata=metadata)
 
 
 __all__ = ["render_ksd_certificate"]

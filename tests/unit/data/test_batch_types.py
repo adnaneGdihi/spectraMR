@@ -8,12 +8,15 @@ unpacking, metadata handling, and batch format adaptation.
 
 import pytest
 import torch
+from torch.utils.data import default_collate
 
 from spectramr.data.batch_types import (
     BatchAdapter,
+    TargetlessSampleError,
     TrainingBatch,
     align_scale_to_batch,
     read_batch_field,
+    reject_targetless_samples,
 )
 
 
@@ -1400,3 +1403,58 @@ class TestAlignScaleToBatch:
         assert scaled[2].unique().tolist() == [4.0]
         assert scaled[3].unique().tolist() == [4.0]
 
+
+
+class TestBatchAdapterRepetitionStack:
+    """A Noise2Noise batch has a stack instead of a target; nothing else may omit one."""
+
+    def test_stack_without_target_is_accepted(self):
+        batch = BatchAdapter.from_dict(
+            {"input": torch.zeros(2, 1, 4, 4), "kspace_reps": torch.zeros(2, 2, 4, 4)}
+        )
+        assert batch.target is None
+        assert "kspace_reps" in batch.metadata
+
+    def test_missing_target_without_stack_still_raises(self):
+        with pytest.raises(ValueError, match="canonical keys"):
+            BatchAdapter.from_dict({"input": torch.zeros(2, 1, 4, 4)})
+
+
+class TestRejectTargetlessSamples:
+    """A supervised step must refuse samples flagged has_target=False (planted violation)."""
+
+    def test_flagged_sample_in_training_batch_raises(self):
+        batch = TrainingBatch(
+            input=torch.zeros(2, 1, 8, 8),
+            target=torch.zeros(2, 1, 8, 8),
+            metadata={"has_target": torch.tensor([True, False])},
+        )
+        with pytest.raises(TargetlessSampleError, match="allow_unpaired"):
+            reject_targetless_samples(batch, strategy="ReconstructionTrainingStrategy")
+
+    def test_flagged_sample_in_dict_batch_raises(self):
+        batch = {"input": torch.zeros(1, 1, 8, 8), "target": torch.zeros(1, 1, 8, 8),
+                 "has_target": torch.tensor([False])}
+        with pytest.raises(TargetlessSampleError):
+            reject_targetless_samples(batch, strategy="GANTrainingStrategy")
+
+    def test_all_targets_present_passes(self):
+        batch = {"input": torch.zeros(2, 1, 8, 8), "target": torch.zeros(2, 1, 8, 8),
+                 "has_target": torch.tensor([True, True])}
+        reject_targetless_samples(batch, strategy="GANTrainingStrategy")
+
+    def test_absent_flag_is_a_paired_sample(self):
+        batch = TrainingBatch(input=torch.zeros(1, 1, 8, 8), target=torch.zeros(1, 1, 8, 8))
+        reject_targetless_samples(batch, strategy="GANTrainingStrategy")
+
+    @pytest.mark.parametrize("order", [(True, False), (False, True)])
+    def test_mixed_batch_keeps_flag_in_either_order(self, order):
+        """Collation takes keys from the first sample; the flag must survive either order."""
+        samples = [
+            {"input": torch.zeros(1, 8, 8), "target": torch.zeros(1, 8, 8),
+             "has_target": torch.tensor(flag)}
+            for flag in order
+        ]
+        batch = BatchAdapter.from_dict(default_collate(samples))
+        with pytest.raises(TargetlessSampleError):
+            reject_targetless_samples(batch, strategy="ReconstructionTrainingStrategy")

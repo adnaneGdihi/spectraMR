@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from spectramr.infrastructure.physics.sampling import (
+    MaskGenerator,
     RandomCartesianKSpaceAccelerator,
     _accelerator_kwarg_vocabulary,
     create_kspace_accelerator,
@@ -223,7 +224,7 @@ def test_min_center_fraction_is_accepted_not_swallowed():
 
 
 def test_min_center_fraction_defaults_to_center_fraction():
-    accel = RandomCartesianKSpaceAccelerator(center_fraction=0.08, max_acceleration=8.0)
+    accel = RandomCartesianKSpaceAccelerator(num_timesteps=1000, center_fraction=0.08, max_acceleration=8.0)
     assert accel.min_center_fraction == pytest.approx(0.08)
 
 
@@ -234,7 +235,7 @@ def test_unsatisfiable_acs_floor_raises_at_build():
     cannot fit, so the declared floor is unreachable. Fail loud (#9).
     """
     with pytest.raises(ValueError, match="exceeds the sampling budget"):
-        RandomCartesianKSpaceAccelerator(
+        RandomCartesianKSpaceAccelerator(num_timesteps=1000,
             max_acceleration=32.0, center_fraction=0.10, min_center_fraction=0.06
         )
 
@@ -250,7 +251,7 @@ def test_default_acs_never_raises_however_tight_the_budget(max_acceleration):
     rejected the default everywhere, which is how this was caught
     (``test_acceleration_levels``, ``test_sampling_expansion``).
     """
-    accel = RandomCartesianKSpaceAccelerator(max_acceleration=max_acceleration)
+    accel = RandomCartesianKSpaceAccelerator(num_timesteps=1000, max_acceleration=max_acceleration)
     mask = accel.get_acceleration_mask(SHAPE, accel.num_timesteps - 1)[0]
     assert mask[128, 128], "DC unsampled at the tightest budget"
     assert int(mask.sum()) > 0
@@ -258,7 +259,7 @@ def test_default_acs_never_raises_however_tight_the_budget(max_acceleration):
 
 def test_inverted_acs_bounds_raise():
     with pytest.raises(ValueError, match="exceeds center_fraction"):
-        RandomCartesianKSpaceAccelerator(
+        RandomCartesianKSpaceAccelerator(num_timesteps=1000,
             max_acceleration=4.0, center_fraction=0.02, min_center_fraction=0.08
         )
 
@@ -330,16 +331,15 @@ def _realised_accelerations(masks):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("pattern", SHRINK_FAMILIES)
-@pytest.mark.parametrize("declared", [None, 0.08])
-def test_no_declared_floor_leaves_the_cascade_byte_identical(pattern, declared):
+def test_no_declared_floor_leaves_the_cascade_byte_identical(pattern):
     """The blast-radius guarantee: no floor below the ACS => nothing moves.
 
     Every arm in the corpus is in this state, so this is what makes the change
-    safe for ``active/`` and ``validated/``. ``declared=0.08`` equals
-    ``center_fraction``, which is not a shrink either.
+    safe for ``active/`` and ``validated/``. A floor equal to ``center_fraction``
+    (0.08) no longer fits the 32x budget and is refused at build (#2061).
     """
     baseline = _cascade(pattern)
-    shifted = _cascade(pattern, min_center_fraction=declared)
+    shifted = _cascade(pattern, min_center_fraction=None)
     for before, after in zip(baseline, shifted, strict=True):
         assert torch.equal(before, after)
 
@@ -389,12 +389,12 @@ def test_the_helper_is_a_no_op_without_a_floor():
     """``_current_center_fraction`` is the single owner of the shrink."""
     from spectramr.infrastructure.physics.sampling import VDCartesian1DAccelerator
 
-    accel = VDCartesian1DAccelerator(num_timesteps=28, center_fraction=0.08)
+    accel = VDCartesian1DAccelerator(num_timesteps=28, max_acceleration=32.0, center_fraction=0.08)
     assert accel.min_center_fraction is None
     assert all(accel._current_center_fraction(t, 0.08) == 0.08 for t in range(28))
 
     accel = VDCartesian1DAccelerator(
-        num_timesteps=28, center_fraction=0.08, min_center_fraction=0.02
+        num_timesteps=28, max_acceleration=32.0, center_fraction=0.08, min_center_fraction=0.02
     )
     fractions = [accel._current_center_fraction(t, 0.08) for t in range(28)]
     assert fractions[0] == pytest.approx(0.08)
@@ -554,6 +554,27 @@ def test_zero_density_power_is_a_uniform_draw():
         float(mask[far].float().mean()), abs=0.05
     )
 
+
+def test_equispaced_line_selection_reads_no_index_back_to_the_host(monkeypatch) -> None:
+    """#2573: one ``Tensor.__index__`` per selected line is one sync each on CUDA.
+
+    Planted: the pre-fix list comprehension indexes a Python list with each
+    element of ``perm`` and trips this guard on the first selected line.
+    """
+    from spectramr.infrastructure.physics.sampling import UniformCartesianKSpaceAccelerator
+
+    accelerator = UniformCartesianKSpaceAccelerator(
+        num_timesteps=8, max_acceleration=8.0, base_acceleration=2.0, seed=3
+    )
+    expected = accelerator.get_acceleration_mask((1, 32, 32), 4)
+
+    def refuse(self: torch.Tensor) -> int:
+        raise AssertionError("a tensor element was read back as a Python index")
+
+    monkeypatch.setattr(torch.Tensor, "__index__", refuse)
+    mask = accelerator.get_acceleration_mask((1, 32, 32), 4)
+    monkeypatch.undo()
+    assert torch.equal(mask, expected)
 
 @pytest.mark.parametrize(
     ("kwargs", "match"),
@@ -756,6 +777,106 @@ class TestAccelerationScheduleDispatch:
         for t in range(self.BLOCK["num_timesteps"]):
             assert inner.timestep_for_acceleration(inner.get_acceleration_factor(t)) == t
 
+    @pytest.mark.parametrize(
+        "schedule", ["linear", "polynomial", "power_law", "exponential", "step"]
+    )
+    def test_every_schedule_runs_from_base_at_zero_to_max_at_last_timestep(
+        self, schedule: str
+    ) -> None:
+        """The degradation ladder is indexed from t=0, so R(0) is the base and
+        R(T-1) -- not R(T) -- is the maximum, with no dip in between. Measured
+        at the reverse cohort's shape (T=29, 1x..32x)."""
+        extra = {"acceleration_range": [1.0, 2.0, 8.0, 32.0]} if schedule == "step" else {}
+        accel = create_kspace_accelerator(
+            "random_cartesian",
+            acceleration_schedule=schedule,
+            num_timesteps=29,
+            max_acceleration=32.0,
+            base_acceleration=1.0,
+            center_fraction=0.08,
+            schedule_power=2.0,
+            seed=42,
+            **extra,
+        )
+        inner = getattr(accel, "accelerator", accel)
+        curve = [inner.get_acceleration_factor(t) for t in range(29)]
+        assert curve[0] == pytest.approx(1.0)
+        assert curve[-1] == pytest.approx(32.0)
+        assert all(b >= a for a, b in itertools.pairwise(curve)), curve
+        # A timestep past the end clamps onto the last rung rather than overshooting.
+        assert inner.get_acceleration_factor(29) == pytest.approx(32.0)
+
+    COHORT_RUNGS: ClassVar[list[float]] = [
+        1.0, 2.0, 2.226, 2.485, 2.753, 3.048, 3.413, 3.765, 4.197, 4.655,
+        5.224, 5.818, 6.4, 7.111, 8.0, 8.828, 9.846, 10.667, 11.636, 12.8,
+        14.222, 16.0, 18.286, 19.692, 21.333, 23.273, 25.6, 28.444, 32.0,
+    ]  # fmt: skip
+    #: R_k = 256 / round(256 * 2^(-k/6)): geometric in line count end to end.
+    EVEN_RUNGS: ClassVar[list[float]] = [
+        1.0, 1.123, 1.261, 1.414, 1.59, 1.778, 2.0, 2.246, 2.51, 2.813, 3.16,
+        3.556, 4.0, 4.491, 5.02, 5.689, 6.4, 7.111, 8.0, 8.828, 10.24, 11.13,
+        12.8, 14.222, 16.0, 18.286, 19.692, 23.273, 25.6, 28.444, 32.0,
+    ]  # fmt: skip
+
+    @staticmethod
+    def _process(rungs: list[float]):
+        from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+        return KSpaceUndersamplingProcess(
+            num_timesteps=len(rungs),
+            max_acceleration=32.0,
+            base_acceleration=1.0,
+            center_fraction=0.08,
+            min_center_fraction=0.02,
+            mask_type="density_nested",
+            schedule_type="step",
+            schedule_kwargs={"acceleration_range": rungs},
+            enforce_nested=True,
+            mask_direction="phase",
+            phase_encode_axis=-1,
+        )
+
+    @pytest.mark.parametrize("ladder", ["COHORT_RUNGS", "EVEN_RUNGS"])
+    def test_the_reverse_step_ladders_realise_distinct_nested_masks(self, ladder: str) -> None:
+        """Every step of the reverse arms' ladders reveals new lines, and the
+        fully sampled mask sits at t=0."""
+        rungs = getattr(self, ladder)
+        process = self._process(rungs)
+        T = len(rungs)
+        masks = [process.mask_at(t, (256, 256)).reshape(256, 256).bool() for t in range(T)]
+        assert bool(masks[0].all()), "t=0 must be the fully sampled mask"
+        for t in range(T - 1):
+            assert not bool((masks[t + 1] & ~masks[t]).any()), f"t={t + 1} not nested in t={t}"
+            assert not torch.equal(masks[t + 1], masks[t]), f"t={t}->{t + 1} is inert"
+
+    @pytest.mark.parametrize(
+        ("ladder", "anchors"),
+        [("COHORT_RUNGS", {2.0: 1, 8.0: 14, 32.0: 28}), ("EVEN_RUNGS", {2.0: 6, 8.0: 18, 32.0: 30})],
+    )
+    def test_the_validation_levels_sit_on_exact_rungs(
+        self, ladder: str, anchors: dict[float, int]
+    ) -> None:
+        """The validation cascade skips a level that inverts to no exact rung,
+        so 2/8/32 must each own one."""
+        process = self._process(getattr(self, ladder))
+        acc = process.mask_generator._get_accelerator(process.mask_type)
+        assert {r: acc.timestep_for_acceleration(r) for r in anchors} == anchors
+
+    def test_the_even_ladder_arm_declares_the_pinned_rungs(self) -> None:
+        import yaml
+
+        from tests.utils.corpus import repo_root
+
+        arm = repo_root() / (
+            "experiments/inprogress/kspace_filling/ablations/reverse/"
+            "experiment_11_reverse_additive_normalized_even_ladder.yaml"
+        )
+        if not arm.is_file():
+            pytest.skip(f"corpus not present: {arm}")
+        cfg = yaml.safe_load(arm.read_text())
+        assert cfg["undersampling"]["acceleration_range"] == self.EVEN_RUNGS
+        assert cfg["training"]["diffusion"]["timesteps"] == len(self.EVEN_RUNGS)
+
     def test_unknown_schedule_raises(self) -> None:
         """Non-negotiable #3: an unknown enum value raises, never degrades."""
         with pytest.raises(ValueError, match="unknown acceleration_schedule"):
@@ -819,20 +940,19 @@ class TestMinCenterFractionIsRead:
         assert self._top_realised(pattern, 0.02) >= 32.0 * 0.9
 
     @pytest.mark.parametrize("pattern", PATTERNS)
-    def test_floor_equal_to_center_fraction_still_caps(self, pattern: str) -> None:
-        """Polarity: the knob gates the ceiling, it does not just remove it.
+    def test_unreachable_floor_raises(self, pattern: str) -> None:
+        """A floor of 0.08 cannot fit the 1/32 budget, so it is refused at build (#2516).
 
-        With no room to shrink, the old ``1/center_fraction`` cap is the correct
-        answer -- so this asserts the mechanism, not merely a bigger number.
+        These families accepted it and then capped every higher rung at
+        ``1/center_fraction``, reporting a 32x ladder that realised 12.6x.
         """
-        assert self._top_realised(pattern, 0.08) < 16.0
+        with pytest.raises(ValueError, match="exceeds the sampling budget"):
+            self._top_realised(pattern, 0.08)
 
     @pytest.mark.parametrize("pattern", PATTERNS)
-    def test_undeclared_floor_leaves_masks_unchanged(self, pattern: str) -> None:
-        """The corpus declares no floor for these three; they must not move."""
-        assert self._top_realised(pattern, None) == pytest.approx(
-            self._top_realised(pattern, 0.08), rel=1e-6
-        )
+    def test_undeclared_floor_keeps_the_center_fraction_cap(self, pattern: str) -> None:
+        """No declared floor: the core stays at ``center_fraction``, as the corpus expects."""
+        assert self._top_realised(pattern, None) < 16.0
 
     @pytest.mark.parametrize("pattern", PATTERNS)
     def test_nesting_survives_the_shrinking_acs(self, pattern: str) -> None:
@@ -1101,3 +1221,355 @@ def test_cold_diffusion_nested_cache_is_bounded():
     )
     assert isinstance(accel._nested_cache, BoundedLRUCache)
     assert accel._nested_cache.capacity == DEFAULT_CACHE_CAPACITY
+
+
+# ---------------------------------------------------------------------------
+# VariableDensityKSpaceAccelerator: seed-keyed ranking and the ACS floor
+# (#1071, #1070, #1257); NestedKSpaceAccelerator's seed-keyed permutation (#1071)
+# ---------------------------------------------------------------------------
+
+_LADDER = [float(r) for r in range(2, 33)]
+
+
+def _vd(**overrides):
+    from spectramr.infrastructure.physics.sampling import VariableDensityKSpaceAccelerator
+
+    kwargs = {
+        "num_timesteps": 28,
+        "max_acceleration": 32.0,
+        "center_fraction": 0.08,
+        "seed": 42,
+    }
+    kwargs.update(overrides)
+    return VariableDensityKSpaceAccelerator(**kwargs)
+
+
+def _vd_ladder(**overrides):
+    """One rung per timestep over every integer R in 2..32."""
+    kwargs = {
+        "num_timesteps": len(_LADDER),
+        "base_acceleration": 2.0,
+        "acceleration_range": _LADDER,
+        "acceleration_schedule": "step",
+        "min_center_fraction": 0.03,
+    }
+    kwargs.update(overrides)
+    return _vd(**kwargs)
+
+
+def _core_disc(fraction: float, height: int = 256, width: int = 256) -> torch.Tensor:
+    """The equal-area centred disc the floor declares (the #581 ACS geometry)."""
+    radius = math.sqrt(max(height * width * fraction, 1.0) / math.pi)
+    rows = torch.arange(height, dtype=torch.float32) - height // 2
+    cols = torch.arange(width, dtype=torch.float32) - width // 2
+    return torch.sqrt(rows[:, None] ** 2 + cols[None, :] ** 2) <= radius
+
+
+def _floor_met_at_every_rung(accel, fraction: float) -> bool:
+    core = _core_disc(fraction)
+    for t in range(accel.num_timesteps):
+        mask = accel.get_acceleration_mask(SHAPE, t)[0]
+        if not bool(mask[core].all()):
+            return False
+    return True
+
+
+def _legacy_seedless_key(self, channels, height, width, device):
+    """The pre-#1071 memo key, which omitted the seed."""
+    return (channels, height, width, str(device))
+
+
+class TestVariableDensitySeed:
+    def test_two_seeds_give_different_rankings_and_masks(self) -> None:
+        a, b = _vd(seed=42), _vd(seed=999)
+        cpu = torch.device("cpu")
+        assert not torch.equal(
+            a._priority_ranking(1, 256, 256, cpu), b._priority_ranking(1, 256, 256, cpu)
+        )
+        assert not torch.equal(
+            a.get_acceleration_mask(SHAPE, 20), b.get_acceleration_mask(SHAPE, 20)
+        )
+
+    def test_same_seed_is_reproducible_across_instances(self) -> None:
+        assert torch.equal(
+            _vd(seed=7).get_acceleration_mask(SHAPE, 20),
+            _vd(seed=7).get_acceleration_mask(SHAPE, 20),
+        )
+
+    def test_mutating_seed_redraws_and_restoring_it_reproduces(self) -> None:
+        """The dynamic-mask path mutates ``.seed`` on one instance per sample."""
+        accel = _vd(seed=42)
+        first = accel.get_acceleration_mask(SHAPE, 20).clone()
+        accel.seed = 999
+        assert not torch.equal(first, accel.get_acceleration_mask(SHAPE, 20))
+        accel.seed = 42
+        assert torch.equal(first, accel.get_acceleration_mask(SHAPE, 20))
+
+    def test_planted_seedless_key_fails_the_redraw_property(self, monkeypatch) -> None:
+        """A memo key without the seed replays the first draw for every sample."""
+        from spectramr.infrastructure.physics.sampling import VariableDensityKSpaceAccelerator
+
+        monkeypatch.setattr(
+            VariableDensityKSpaceAccelerator, "_priority_cache_key", _legacy_seedless_key
+        )
+        accel = _vd(seed=42)
+        first = accel.get_acceleration_mask(SHAPE, 20).clone()
+        accel.seed = 999
+        assert torch.equal(first, accel.get_acceleration_mask(SHAPE, 20))
+
+    def test_cache_is_bounded(self) -> None:
+        from spectramr.infrastructure.physics.bounded_cache import BoundedLRUCache
+
+        assert isinstance(_vd()._priority_cache, BoundedLRUCache)
+
+
+class TestVariableDensityAcsFloor:
+    @pytest.mark.parametrize("density_power", [0.0, 2.0])
+    def test_floor_is_fully_sampled_at_every_rung_r2_to_r32(self, density_power: float) -> None:
+        """A flat density (power 0) leaves the core prefix as the only thing holding the floor."""
+        accel = _vd_ladder(density_power=density_power)
+        total = SHAPE[1] * SHAPE[2]
+        realised = [
+            total / int(accel.get_acceleration_mask(SHAPE, t).sum())
+            for t in range(accel.num_timesteps)
+        ]
+        assert realised[0] == pytest.approx(2.0, rel=1e-3)
+        assert realised[-1] == pytest.approx(32.0, rel=1e-3)
+        assert _floor_met_at_every_rung(accel, 0.03)
+
+    def test_planted_coreless_ranking_misses_the_floor(self, monkeypatch) -> None:
+        """Without the core prefix a flat density hole-punches the declared ACS."""
+        from spectramr.infrastructure.physics.sampling import VariableDensityKSpaceAccelerator
+
+        monkeypatch.setattr(
+            VariableDensityKSpaceAccelerator, "_guaranteed_core_fraction", lambda self, cf: 0.0
+        )
+        assert not _floor_met_at_every_rung(_vd_ladder(density_power=0.0), 0.03)
+
+    def test_center_fraction_is_the_core_when_no_floor_is_declared(self) -> None:
+        accel = _vd(center_fraction=0.05, density_power=0.0, max_acceleration=8.0, num_timesteps=4)
+        assert bool(accel.get_acceleration_mask(SHAPE, 3)[0][_core_disc(0.05)].all())
+
+    @pytest.mark.parametrize(
+        "cls_name", ["VariableDensityKSpaceAccelerator", "FractionalVariableDensityAccelerator"]
+    )
+    def test_impossible_floor_raises(self, cls_name: str) -> None:
+        from spectramr.infrastructure.physics import sampling
+
+        cls = getattr(sampling, cls_name)
+        with pytest.raises(ValueError, match="exceeds the sampling budget"):
+            cls(
+                num_timesteps=28,
+                max_acceleration=32.0,
+                center_fraction=0.08,
+                min_center_fraction=0.08,
+                seed=1,
+            )
+
+    def test_floor_at_the_budget_is_accepted(self) -> None:
+        assert _vd(min_center_fraction=1.0 / 32.0).min_center_fraction == pytest.approx(1 / 32)
+
+
+def test_nested_permutation_redraws_per_seed() -> None:
+    from spectramr.infrastructure.physics.bounded_cache import BoundedLRUCache
+    from spectramr.infrastructure.physics.sampling import NestedKSpaceAccelerator
+
+    accel = NestedKSpaceAccelerator(
+        num_timesteps=28, max_acceleration=32.0, center_fraction=0.02, seed=42
+    )
+    assert isinstance(accel._permutation_cache, BoundedLRUCache)
+    first = accel.get_acceleration_mask(SHAPE, 20).clone()
+    accel.seed = 999
+    assert not torch.equal(first, accel.get_acceleration_mask(SHAPE, 20))
+    accel.seed = 42
+    assert torch.equal(first, accel.get_acceleration_mask(SHAPE, 20))
+
+
+_NESTED_FAMILIES = ["NestedKSpaceAccelerator", "DensityNestedKSpaceAccelerator"]
+
+
+def _nested_family(cls_name: str, **overrides):
+    from spectramr.infrastructure.physics import sampling
+
+    kwargs = {"num_timesteps": 28, "max_acceleration": 32.0, "center_fraction": 0.08, "seed": 1}
+    kwargs.update(overrides)
+    return getattr(sampling, cls_name)(**kwargs)
+
+
+class TestNestedFamiliesAcsFloor:
+    """#2516: both fixed-ranking nested families refuse a floor the top budget cannot hold."""
+
+    @pytest.mark.parametrize("cls_name", _NESTED_FAMILIES)
+    def test_impossible_floor_raises(self, cls_name: str) -> None:
+        with pytest.raises(ValueError, match="exceeds the sampling budget"):
+            _nested_family(cls_name, min_center_fraction=0.08)
+
+    @pytest.mark.parametrize("cls_name", _NESTED_FAMILIES)
+    def test_floor_at_the_budget_is_accepted(self, cls_name: str) -> None:
+        accel = _nested_family(cls_name, min_center_fraction=1.0 / 32.0)
+        assert accel.min_center_fraction == pytest.approx(1.0 / 32.0)
+
+    @pytest.mark.parametrize("cls_name", _NESTED_FAMILIES)
+    def test_undeclared_floor_never_raises(self, cls_name: str) -> None:
+        """The implicit core is ``center_fraction`` and is truncated by budget, not rejected."""
+        assert _nested_family(cls_name).min_center_fraction is None
+
+    @pytest.mark.parametrize(
+        ("cls_name", "realised_top_r"),
+        [("NestedKSpaceAccelerator", 12.64), ("DensityNestedKSpaceAccelerator", 32.0)],
+    )
+    def test_planted_unvalidated_floor_is_silently_mishandled(
+        self, monkeypatch, cls_name: str, realised_top_r: float
+    ) -> None:
+        """Without the build-time check the declaration is accepted and then broken.
+
+        ``nested`` lets the ACS override the requested acceleration; ``density_nested``
+        truncates the core, so the declared floor is not delivered. Either way the run
+        reports the declared ladder while realising something else.
+        """
+        from spectramr.infrastructure.physics.sampling import KSpaceAccelerator
+
+        monkeypatch.setattr(KSpaceAccelerator, "_validate_center_floor", lambda self, r: None)
+        accel = _nested_family(cls_name, min_center_fraction=0.08)
+        mask = accel.get_acceleration_mask(SHAPE, accel.num_timesteps - 1)
+        total = SHAPE[1] * SHAPE[2]
+        assert total / int(mask.sum()) == pytest.approx(realised_top_r, rel=1e-2)
+        if cls_name == "DensityNestedKSpaceAccelerator":
+            assert not bool(mask[0][_core_disc(0.08)].all())
+
+
+def _registered_families() -> list[str]:
+    from spectramr.infrastructure.physics.sampling import _ACCELERATOR_REGISTRY
+
+    return sorted(_ACCELERATOR_REGISTRY)
+
+
+#: Caps its own top acceleration at 2x, so a 0.04 floor is inside its budget.
+_FLOOR_FITS_BY_GEOMETRY = {"partial_fourier"}
+
+
+@pytest.mark.parametrize("pattern", _registered_families())
+def test_every_family_answers_one_floor_declaration_the_same_way(pattern: str) -> None:
+    """#2061: one declaration, one answer, whichever family the arm picked."""
+    kwargs = {
+        "num_timesteps": 28,
+        "max_acceleration": 32.0,
+        "base_acceleration": 2.0,
+        "center_fraction": 0.04,
+        "seed": 1,
+    }
+    create_kspace_accelerator(pattern, **kwargs)
+    if pattern in _FLOOR_FITS_BY_GEOMETRY:
+        create_kspace_accelerator(pattern, min_center_fraction=0.04, **kwargs)
+        return
+    with pytest.raises(ValueError, match="exceeds the sampling budget"):
+        create_kspace_accelerator(pattern, min_center_fraction=0.04, **kwargs)
+
+
+def test_planted_guard_off_the_base_lets_families_diverge(monkeypatch) -> None:
+    """With the base no longer checking, the families that relied on it accept the floor."""
+    from spectramr.infrastructure.physics.sampling import KSpaceAccelerator
+
+    monkeypatch.setattr(KSpaceAccelerator, "_validate_center_floor", lambda self, r: None)
+    for pattern in ("uniform_cartesian", "poisson_disk", "variable_density_2d_gaussian"):
+        create_kspace_accelerator(
+            pattern,
+            num_timesteps=28,
+            max_acceleration=32.0,
+            base_acceleration=2.0,
+            center_fraction=0.04,
+            min_center_fraction=0.04,
+            seed=1,
+        )
+
+
+def test_family_reads_line_axis_matches_what_each_family_builds() -> None:
+    """#1082: the signature walk agrees with the built accelerator for every family.
+
+    A family that takes ``line_axis`` exposes it after construction; one that drops
+    it in ``**kwargs`` does not. ``multi_mask`` refuses a direction outright.
+    """
+    from spectramr.infrastructure.physics import sampling as S
+
+    for name in sorted(S._ACCELERATOR_REGISTRY):
+        claimed = S.family_reads_line_axis(name)
+        try:
+            built = S.ColdDiffusionAccelerator(
+                acceleration_type=name, num_timesteps=4, max_acceleration=8.0, mask_direction="y"
+            )
+        except ValueError:
+            assert name == "multi_mask" and not claimed
+            continue
+        assert claimed == (getattr(built.accelerator, "line_axis", None) is not None), name
+
+
+def test_family_reads_line_axis_resolves_aliases() -> None:
+    from spectramr.infrastructure.physics.sampling import family_reads_line_axis
+
+    assert family_reads_line_axis("density_nested")
+    assert not family_reads_line_axis("random")
+
+
+def _spoke_mask(theta: float, size: int = 256) -> torch.Tensor:
+    from spectramr.infrastructure.physics.sampling import MaskGenerator
+
+    radius = torch.linspace(-math.pi, math.pi, 2 * size - 1)
+    angle = torch.tensor(theta, dtype=torch.float32)
+    trajectory = torch.stack([radius * torch.cos(angle), radius * torch.sin(angle)])
+    rows, cols = MaskGenerator.trajectory_bin_indices(trajectory, size, size)
+    mask = torch.zeros(size, size, dtype=torch.bool)
+    mask[rows, cols] = True
+    return mask
+
+
+def test_rasteriser_puts_k0_on_the_centre_bin() -> None:
+    from spectramr.infrastructure.physics.sampling import MaskGenerator
+
+    rows, cols = MaskGenerator.trajectory_bin_indices(torch.zeros(2, 1), 256, 256)
+    assert (rows.item(), cols.item()) == (128, 128)
+
+
+def test_rasteriser_bins_a_0_and_90_degree_spoke_as_a_transpose_pair() -> None:
+    """#2551: ``cos(pi/2) = -4.4e-8`` must not move a sample off the centre line.
+
+    Planted: flooring (the pre-fix rule) and ``round(x - 0.5)`` (the rule the
+    issue proposed) both leave the pair differing on 82 bins at 256x256.
+    """
+    assert torch.equal(_spoke_mask(0.0), _spoke_mask(math.pi / 2).T)
+
+
+class TestVariableDensityPoissonDisc:
+    """The static Poisson-disc family the rep-masking transform draws from."""
+
+    @staticmethod
+    def _allowed() -> torch.Tensor:
+        allowed = torch.zeros(64, 64, dtype=torch.bool)
+        allowed[:, 8:56] = True
+        return allowed
+
+    def _draw(self, radius: float, seed: int = 0, **kwargs) -> torch.Tensor:
+        return MaskGenerator.variable_density_poisson_disc(
+            self._allowed(), radius, torch.Generator().manual_seed(seed), **kwargs
+        )
+
+    def test_it_stays_inside_the_allowed_bins(self) -> None:
+        assert not (self._draw(1.5) & ~self._allowed()).any()
+
+    def test_it_is_seeded(self) -> None:
+        assert torch.equal(self._draw(1.5, seed=3), self._draw(1.5, seed=3))
+        assert not torch.equal(self._draw(1.5, seed=3), self._draw(1.5, seed=4))
+
+    def test_a_larger_radius_keeps_fewer_bins(self) -> None:
+        counts = [int(self._draw(r).sum()) for r in (0.5, 1.0, 1.5, 2.5)]
+        assert counts == sorted(counts, reverse=True) and counts[0] > counts[-1]
+
+    def test_no_two_kept_bins_are_closer_than_the_dc_radius(self) -> None:
+        kept = torch.nonzero(self._draw(2.0, density_slope=0.0)).float()
+        dist = torch.cdist(kept, kept) + torch.eye(kept.shape[0]) * 1e9
+        assert float(dist.min()) >= 2.0
+
+    def test_the_density_falls_away_from_dc(self) -> None:
+        kept = self._draw(1.0).float()
+        centre = kept[24:40, 24:40].mean()
+        edge = torch.cat([kept[:8, 8:56].flatten(), kept[56:, 8:56].flatten()]).mean()
+        assert float(centre) > 2 * float(edge)

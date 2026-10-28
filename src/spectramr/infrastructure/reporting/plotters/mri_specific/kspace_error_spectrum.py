@@ -28,12 +28,12 @@ def _radial_profile(err2d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     cy, cx = h / 2.0, w / 2.0
     y, x = np.indices((h, w))
     r = np.sqrt((y - cy) ** 2 + (x - cx) ** 2).astype(int)
-    rmax = int(r.max())
     tbin = np.bincount(r.ravel(), err2d.ravel())
     nbin = np.bincount(r.ravel())
     radial = tbin / np.maximum(nbin, 1)
-    freq = np.arange(radial.size) / rmax
-    return freq, radial
+    # beyond min(h, w) / 2 an annulus is clipped to the corners and holds few samples
+    full = int(min(h, w) // 2) + 1
+    return np.arange(full) / (full - 1), radial[:full]
 
 
 def _fft_mag(img: np.ndarray) -> np.ndarray:
@@ -64,7 +64,7 @@ def make(
 ) -> Path | None:
     if not cases:
         return None
-    use_default_style("nature")
+    use_default_style()
     fig, ax = plt.subplots(figsize=(column_width("single"), column_width("single") * 0.75))
     for i, case in enumerate(cases):
         err = np.abs(_fft_mag(case["prediction"]) - _fft_mag(case["target"]))
@@ -78,7 +78,8 @@ def make(
     ax.set_yscale("log")
     ax.set_xlabel("normalised spatial frequency")
     ax.set_ylabel("mean |Δ k-space|")
-    ax.legend(loc="best")
+    if len(cases) > 1:
+        ax.legend(loc="best")
     fig.tight_layout()
     if metadata is not None:
         stamp_figure(fig, metadata)

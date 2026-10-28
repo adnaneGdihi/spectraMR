@@ -22,6 +22,7 @@ from spectramr.infrastructure.physics.coil_sensitivity import (
     confine_to_acs,
     estimate_smaps_calibrated,
 )
+from spectramr.data.transforms.normalization import compress_kspace_log
 from spectramr.infrastructure.physics.fft_ops import fft2c
 
 ACS = 24
@@ -106,7 +107,7 @@ def test_calibrated_maps_carry_unit_coil_rss(method: str, kwargs: dict) -> None:
     """RSS is 1 wherever the estimator claims support, with no lattice."""
     kspace, truth, support = _phantom()
     maps = estimate_smaps_calibrated(
-        kspace, method=method, out_size=(SIZE, SIZE), acs_size=ACS, **kwargs
+        kspace, log_scaled=False, method=method, out_size=(SIZE, SIZE), acs_size=ACS, **kwargs
     )
     assert maps is not None
     # espirit zeroes out-of-support pixels by construction (step 6 of Uecker
@@ -121,7 +122,7 @@ def test_calibrated_maps_carry_unit_coil_rss(method: str, kwargs: dict) -> None:
 def test_calibrated_maps_are_full_resolution(method: str) -> None:
     """No caller has to interpolate, because nothing comes back cropped."""
     kspace, _, _ = _phantom()
-    maps = estimate_smaps_calibrated(kspace, method=method, acs_size=ACS, kernel_size=6)
+    maps = estimate_smaps_calibrated(kspace, log_scaled=False, method=method, acs_size=ACS, kernel_size=6)
     assert maps is not None
     assert maps.shape[-2:] == kspace.shape[-2:]
 
@@ -154,7 +155,7 @@ def test_resize_renormalises_after_interpolating() -> None:
     """
     kspace, _, _ = _phantom()
     maps = estimate_smaps_calibrated(
-        kspace, method="power_iter", out_size=(SIZE * 2, SIZE * 2), acs_size=ACS, kernel_size=6
+        kspace, log_scaled=False, method="power_iter", out_size=(SIZE * 2, SIZE * 2), acs_size=ACS, kernel_size=6
     )
     assert maps is not None
     assert maps.shape[-2:] == (SIZE * 2, SIZE * 2)
@@ -178,8 +179,8 @@ def test_calibration_is_invariant_to_the_aliased_periphery() -> None:
     mask[..., lo:hi, :] = 1.0
 
     kwargs = {"method": "power_iter", "out_size": (SIZE, SIZE), "acs_size": ACS, "kernel_size": 6}
-    full = estimate_smaps_calibrated(kspace, **kwargs)
-    undersampled = estimate_smaps_calibrated(kspace * mask, **kwargs)
+    full = estimate_smaps_calibrated(kspace, log_scaled=False, **kwargs)
+    undersampled = estimate_smaps_calibrated(kspace * mask, log_scaled=False, **kwargs)
     assert full is not None and undersampled is not None
     torch.testing.assert_close(full, undersampled, atol=0, rtol=0)
 
@@ -194,11 +195,95 @@ def test_calibration_is_invariant_to_the_aliased_periphery() -> None:
 
 def test_method_none_returns_none() -> None:
     kspace, _, _ = _phantom()
-    assert estimate_smaps_calibrated(kspace, method="none") is None
+    assert estimate_smaps_calibrated(kspace, log_scaled=False, method="none") is None
 
 
 def test_unknown_method_raises_rather_than_degrading() -> None:
     """Non-negotiable 3: an unregistered method is an error, not a default."""
     kspace, _, _ = _phantom()
     with pytest.raises(ValueError, match="Unknown sensitivity estimation method"):
-        estimate_smaps_calibrated(kspace, method="not_a_method")
+        estimate_smaps_calibrated(kspace, log_scaled=False, method="not_a_method")
+
+
+def _angle_error_deg(est: torch.Tensor, true: torch.Tensor, support: torch.Tensor) -> float:
+    """Mean angle between estimated and true per-pixel coil vectors inside the object."""
+    inner = (est.conj() * true).sum(dim=1).abs()
+    norms = torch.sqrt((est.abs() ** 2).sum(dim=1) * (true.abs() ** 2).sum(dim=1)) + 1e-8
+    return float(torch.rad2deg(torch.acos((inner / norms).clamp(max=1.0)))[0][support].mean())
+
+
+def _bright_phantom() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The phantom at the loader's scale: compressed |k| near 3-4, as in the cohort's batches."""
+    kspace, maps, support = _phantom()
+    return kspace * (60.0 / kspace.abs().amax()), maps, support
+
+
+def test_compressed_kspace_is_decompressed_before_calibration() -> None:
+    """``log_scaled=True`` on compressed k-space recovers the linear-domain maps (#2488)."""
+    kspace, maps, support = _bright_phantom()
+    kwargs = {"method": "power_iter", "acs_size": ACS, "kernel_size": 6}
+    linear = estimate_smaps_calibrated(kspace, log_scaled=False, **kwargs)
+    compressed = estimate_smaps_calibrated(compress_kspace_log(kspace), log_scaled=True, **kwargs)
+    assert _angle_error_deg(compressed, maps, support) < 3.0
+    assert _angle_error_deg(compressed, linear, support) < 0.5
+
+
+def test_calibrating_on_compressed_kspace_as_if_linear_is_wrong_violation() -> None:
+    """PLANTED: the pre-#2488 path, compressed k-space handed over as linear, misses by > 5 deg."""
+    kspace, maps, support = _bright_phantom()
+    wrong = estimate_smaps_calibrated(
+        compress_kspace_log(kspace), log_scaled=False, method="power_iter", acs_size=ACS, kernel_size=6
+    )
+    assert _angle_error_deg(wrong, maps, support) > 5.0
+
+
+def test_log_scaled_is_a_required_argument() -> None:
+    """No default: a caller that does not state the domain cannot calibrate."""
+    kspace, _, _ = _phantom()
+    with pytest.raises(TypeError, match="log_scaled"):
+        estimate_smaps_calibrated(kspace, method="power_iter")  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# estimate_smaps_from_measurement -- the measurement-only estimator
+# ---------------------------------------------------------------------------
+
+
+def _estimation_config(method: str = "power_iter") -> object:
+    from types import SimpleNamespace
+
+    estimation = SimpleNamespace(method=method, kernel_size=6, acs_size=ACS)
+    return SimpleNamespace(physics=SimpleNamespace(coil_processing=SimpleNamespace(estimation=estimation)))
+
+
+def test_the_measurement_estimator_accepts_both_layouts_identically() -> None:
+    """Interleaved ``(re0, im0, re1, im1, ...)`` lifts to the same coils as complex input."""
+    from spectramr.infrastructure.physics.coil_sensitivity import estimate_smaps_from_measurement
+
+    kspace, _, _ = _phantom()
+    b, c, h, w = kspace.shape
+    interleaved = torch.view_as_real(kspace).permute(0, 1, 4, 2, 3).reshape(b, 2 * c, h, w)
+    config = _estimation_config()
+    a = estimate_smaps_from_measurement(kspace, config=config, log_scaled=False)
+    z = estimate_smaps_from_measurement(interleaved, config=config, log_scaled=False)
+    assert a.shape == (b, c, h, w) and torch.allclose(a, z)
+    assert torch.equal(
+        a,
+        estimate_smaps_calibrated(
+            kspace, log_scaled=False, method="power_iter", out_size=(h, w), kernel_size=6, acs_size=ACS
+        ),
+    )
+
+
+def test_the_measurement_estimator_stays_finite_on_a_sparse_acs() -> None:
+    """R=32: two lines inside the 24-line ACS window. A NaN here fails the run (#2750)."""
+    from spectramr.infrastructure.physics.coil_sensitivity import estimate_smaps_from_measurement
+
+    kspace, _, _ = _phantom()
+    mask = torch.zeros(1, 1, SIZE, SIZE)
+    mask[..., SIZE // 2] = 1.0
+    mask[..., SIZE // 2 + 5] = 1.0
+    maps = estimate_smaps_from_measurement(kspace * mask, config=_estimation_config(), log_scaled=False)
+    assert torch.isfinite(maps.real).all() and torch.isfinite(maps.imag).all()
+    rss = _coil_rss(maps)
+    assert rss.max() <= 1.0 + 1e-4

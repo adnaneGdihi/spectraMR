@@ -39,10 +39,11 @@ class SSDUTrainingConfigSchema(BaseModel):
     noisier2noise_correction: bool = Field(
         default=False,
         description=(
-            "Enable Robust SSDU: add synthetic complex-Gaussian noise of std "
-            "noise_std_estimate to the network input (noisier), keep the held-out "
-            "Theta loss target at the original (less-noisy) measurement — the "
-            "Noisier2Noise principle. Selected by the 'robust_ssdu' strategy key."
+            "Enable Robust SSDU (Millard & Chiew): corrupt the network input with "
+            "noise of std alpha * sigma_n before the Lambda split, score the "
+            "prediction on ALL acquired lines with the weighted loss, and apply the "
+            "Noisier2Noise correction at validation. Selected by the 'robust_ssdu' "
+            "strategy key."
         ),
     )
     noise_std_estimate: float | None = Field(
@@ -58,7 +59,7 @@ class SSDUTrainingConfigSchema(BaseModel):
         default="declared",
         description=(
             "Where the Noisier2Noise sigma comes from. 'declared' (default) uses "
-            "noise_std_estimate verbatim. 'self_calibrated' measures it per batch "
+            "noise_std_estimate verbatim. 'self_calibrated' measures it per slice "
             "from the coil null space, where a physical image is rank one and the "
             "residual is pure noise, and ignores noise_std_estimate. "
             "A constant cannot be right for every scan once the pipeline "
@@ -73,6 +74,19 @@ class SSDUTrainingConfigSchema(BaseModel):
             "maps already in it; it reads 1.5-7% HIGH with ESPIRiT maps."
         ),
     )
+    alpha: float = Field(
+        default=0.75,
+        gt=0.0,
+        description=(
+            "Robust SSDU's noise ratio: the network input is corrupted with "
+            "complex-Gaussian noise of std alpha * sigma_n on the acquired support "
+            "(arXiv:2210.01696 Eq. 25), where sigma_n is noise_std_estimate or the "
+            "per-slice null-space fit. It also sets the weight (1+alpha^2)/alpha^2 "
+            "on the input lines of the loss (Eq. 35) and the Noisier2Noise "
+            "correction applied at validation (Eq. 36). 0.75 is the paper's value "
+            "for the weighted loss. Read only under noisier2noise_correction."
+        ),
+    )
     noise_model: Literal["gaussian_kspace", "ncchi_magnitude"] = Field(
         default="gaussian_kspace",
         description=(
@@ -81,10 +95,38 @@ class SSDUTrainingConfigSchema(BaseModel):
             "Never hardcoded to 0.3T."
         ),
     )
+    noise_covariance: Literal["white", "committed_m4raw"] = Field(
+        default="white",
+        description=(
+            "Coil covariance of the injected noise. The Noisier2Noise correction "
+            "needs the injected noise distributed as alpha times the measurement "
+            "noise (arXiv:2210.01696 Eq. 29); M4Raw's coil noise is correlated "
+            "(normalised eigenvalues 0.62-1.39), so 'white' leaves the correction "
+            "approximate. 'committed_m4raw' draws with the shape of the committed "
+            "M4Raw covariance (infrastructure/physics/m4raw_noise.py), scaled so "
+            "the mean per-coil power is (alpha*sigma)^2. Read only under "
+            "noisier2noise_correction; needs n_coils equal to that matrix's size."
+        ),
+    )
     n_coils: int = Field(
         default=1,
         ge=1,
-        description="Number of coils (degrees of freedom L) for the nc-χ noise model.",
+        description=(
+            "Coils the measured k-space carries. The strategy refuses a batch with "
+            "a different count, because the loss, the noise injection and the "
+            "self-calibrated sigma are all per-coil."
+        ),
+    )
+
+    score_structural_zeros: bool = Field(
+        default=False,
+        description=(
+            "Add the columns outside the acquired phase-encode support to every "
+            "scored Theta. y is zero there by construction, so the reconstruction is "
+            "pulled to the acquisition's band without any reference. Needs "
+            "`support_mask` in the batch (`complementary_rep_masking` emits it). "
+            "Vanilla SSDU only: Robust SSDU scores all of Omega with its own weights."
+        ),
     )
 
     @model_validator(mode="after")
@@ -98,7 +140,37 @@ class SSDUTrainingConfigSchema(BaseModel):
                 "ssdu.noisier2noise_correction=true requires noise_std_estimate "
                 "(the k-space noise sigma); none was set (pitfall #15: the knob "
                 "must be wired). Set ssdu.noise_std_source: self_calibrated to "
-                "measure it per batch from the coil null space instead."
+                "measure it per slice from the coil null space instead."
+            )
+        if "alpha" in self.model_fields_set and not self.noisier2noise_correction:
+            raise ValueError(
+                "ssdu.alpha is read only by the Robust SSDU correction, which is off "
+                "(noisier2noise_correction: false). Remove it, or turn the correction on."
+            )
+        if self.noisier2noise_correction and self.noise_model != "gaussian_kspace":
+            raise ValueError(
+                "the Noisier2Noise correction is derived for complex-Gaussian k-space "
+                f"noise; ssdu.noise_model={self.noise_model!r} has no such correction."
+            )
+        if "noise_covariance" in self.model_fields_set and not self.noisier2noise_correction:
+            raise ValueError(
+                "ssdu.noise_covariance shapes the Robust SSDU injection, which is off "
+                "(noisier2noise_correction: false). Remove it, or turn the correction on."
+            )
+        if self.noise_covariance == "committed_m4raw" and self.n_coils != 4:
+            raise ValueError(
+                "ssdu.noise_covariance: committed_m4raw is the 4x4 M4Raw matrix; "
+                f"n_coils={self.n_coils} cannot use it."
+            )
+        if self.noisier2noise_correction and self.num_masks != 1:
+            raise ValueError(
+                "Robust SSDU draws one (Lambda, noise) corruption per step and scores "
+                f"all of Omega; num_masks={self.num_masks} has no Robust SSDU form here."
+            )
+        if self.score_structural_zeros and self.noisier2noise_correction:
+            raise ValueError(
+                "ssdu.score_structural_zeros extends the vanilla Theta; Robust SSDU "
+                "scores all of Omega with Eq. 35 weights and never reads it."
             )
         if self.noise_std_source == "self_calibrated" and self.noise_std_estimate is not None:
             raise ValueError(

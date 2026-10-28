@@ -46,7 +46,13 @@ def _interleave(z: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _degraded() -> tuple[torch.Tensor, torch.Tensor, object]:
+def _degraded() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]:
+    """``(x0, x_t, coverage, measurement)`` exactly as the arm's ``q_sample`` emits them.
+
+    ``coverage`` is what the diffusion strategy threads as ``mask=``
+    (``noisy_images, mask = gen.kspace_process.q_sample(...)``), so the fixture
+    must pass it too: ``null_space_content`` raises without one.
+    """
     process = NonCartesianSpokeProcess(
         num_spokes=64,
         samples_per_spoke=32,
@@ -57,8 +63,8 @@ def _degraded() -> tuple[torch.Tensor, torch.Tensor, object]:
         schedule_kwargs={"acceleration_range": list(LADDER)},
     )
     x0 = torch.randn(1, 2, *IM, dtype=torch.complex64)
-    x_t, _ = process.q_sample(x0, torch.tensor([1]))
-    return x0, x_t, process.last_sample_measurement
+    x_t, coverage = process.q_sample(x0, torch.tensor([1]))
+    return x0, x_t, coverage, process.last_sample_measurement
 
 
 def test_the_arm_declares_the_term_and_the_builder_constructs_it() -> None:
@@ -71,7 +77,7 @@ def test_the_arm_declares_the_term_and_the_builder_constructs_it() -> None:
 def test_it_lands_in_components_with_a_gradient() -> None:
     """The real computer must fold the term and pass a gradient back to pred."""
     config = _arm_config()
-    x0, x_t, measurement = _degraded()
+    x0, x_t, coverage, measurement = _degraded()
     pred = _interleave(x_t).clone().requires_grad_(True)
     target = _interleave(x0)
 
@@ -88,7 +94,7 @@ def test_it_lands_in_components_with_a_gradient() -> None:
         losses_dict=modules,
         timesteps=torch.tensor([1]),
         smaps=smaps,
-        mask=None,
+        mask=coverage,
         sample_measurement=measurement,
     )
 
@@ -111,7 +117,7 @@ def test_without_the_measurement_the_same_call_raises() -> None:
     no data fidelity at all.
     """
     config = _arm_config()
-    x0, x_t, _ = _degraded()
+    x0, x_t, _, _ = _degraded()
     modules = LossBuilder(config, device=torch.device("cpu")).build_reconstruction_losses().build()
     with pytest.raises(ValueError, match="sample_measurement=None"):
         UnifiedDiffusionLossComputer(config).compute(

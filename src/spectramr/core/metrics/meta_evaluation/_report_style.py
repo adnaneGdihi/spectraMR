@@ -20,20 +20,24 @@ Two design choices worth knowing:
 
 from __future__ import annotations
 
+import importlib.util
 import math
 from pathlib import Path
+from typing import Any
 
-try:  # optional in degraded cluster envs (a REQUIRED dep in pyproject)
+# Probed without importing: pyplot costs ~0.5 s and is needed only to draw.
+MATPLOTLIB_AVAILABLE = importlib.util.find_spec("matplotlib") is not None
+
+
+def pyplot() -> Any:
+    """Import ``matplotlib.pyplot`` on the headless Agg backend, on first use."""
+    _require_matplotlib()
     import matplotlib
 
-    matplotlib.use("Agg")  # headless-safe; must precede pyplot import
+    matplotlib.use("Agg")  # must precede the pyplot import
     import matplotlib.pyplot as plt
 
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only without matplotlib
-    matplotlib = None  # type: ignore[assignment]
-    plt = None  # type: ignore[assignment]
-    MATPLOTLIB_AVAILABLE = False
+    return plt
 
 
 def _require_matplotlib() -> None:
@@ -228,16 +232,14 @@ def figure(*, figsize: tuple[float, float] = (7.0, 4.5), polar: bool = False):
     without the ``tight_layout`` warning class. Use this everywhere instead
     of a bare ``plt.subplots`` + ``fig.tight_layout()``.
     """
-    _require_matplotlib()
     subplot_kw = {"projection": "polar"} if polar else None
-    fig, ax = plt.subplots(figsize=figsize, layout="constrained", subplot_kw=subplot_kw)
+    fig, ax = pyplot().subplots(figsize=figsize, layout="constrained", subplot_kw=subplot_kw)
     return fig, ax
 
 
 def figure_grid(rows: int, cols: int, *, figsize: tuple[float, float]):
     """Constrained-layout subplot grid (always 2-D ``axes``)."""
-    _require_matplotlib()
-    fig, axes = plt.subplots(rows, cols, figsize=figsize, layout="constrained", squeeze=False)
+    fig, axes = pyplot().subplots(rows, cols, figsize=figsize, layout="constrained", squeeze=False)
     return fig, axes
 
 
@@ -248,5 +250,5 @@ def save_figure(fig, path, *, dpi: int = DEFAULT_DPI) -> Path:
     # No bbox_inches="tight": constrained layout already trims; combining the
     # two re-introduces the very clipping/overlap we removed.
     fig.savefig(path, dpi=dpi)
-    plt.close(fig)
+    pyplot().close(fig)
     return path

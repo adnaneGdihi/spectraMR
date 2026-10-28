@@ -127,3 +127,34 @@ def test_kspace_swin_block_wrong_channel_raises() -> None:
     x = torch.randn(1, 16, 32)  # C=32 but block expects C=16
     with pytest.raises((RuntimeError, Exception)):
         block(x, H=4, W=4)
+
+
+def _explicit_radial_attention(m: RadialWindowAttention, x: torch.Tensor, H: int, W: int):
+    """The pre-SDPA reference: padded last window masked with an additive -inf block."""
+    B, L, C = x.shape
+    ws, nh = m.window_size, m.num_heads
+    pad_len = (ws - L % ws) % ws
+    xs = x[:, m.radial_indices, :]
+    if pad_len:
+        xs = torch.cat([xs, torch.zeros(B, pad_len, C)], dim=1)
+    n_win = xs.shape[1] // ws
+    qkv = m.qkv(xs.view(B, n_win, ws, C)).reshape(B, n_win, ws, 3, nh, C // nh).permute(3, 0, 1, 4, 2, 5)
+    q, k, v = qkv[0] * m.scale, qkv[1], qkv[2]
+    attn = q @ k.transpose(-2, -1)
+    if pad_len:
+        mask = torch.zeros(ws, ws)
+        mask[-pad_len:, :] = float("-inf")
+        mask[:, -pad_len:] = float("-inf")
+        mask[-pad_len:, -pad_len:] = 0.0
+        attn[:, -1:] = attn[:, -1:] + mask
+    out = (attn.softmax(-1) @ v).transpose(2, 3).reshape(B, n_win * ws, C)[:, :L]
+    return m.proj(out[:, m.inverse_indices, :])
+
+
+@pytest.mark.parametrize("H,W,ws", [(4, 4, 8), (4, 4, 6), (5, 5, 8), (4, 4, 32)])
+def test_radial_window_attention_sdpa_matches_explicit_softmax(H: int, W: int, ws: int) -> None:
+    torch.manual_seed(0)
+    m = RadialWindowAttention(dim=8, window_size=ws, num_heads=2).eval()
+    x = torch.randn(2, H * W, 8)
+    got = m(x, H=H, W=W)  # also builds the radial indices
+    torch.testing.assert_close(got, _explicit_radial_attention(m, x, H, W), rtol=1e-4, atol=1e-5)

@@ -42,10 +42,36 @@ def wrap_with_distributed_sampler(
         the source loader's batch size, workers, pin-memory, drop-last,
         collate, worker-init, and persistent-workers settings.
     """
+    import logging
+
     from torch.utils.data import DataLoader as _DataLoader
+    from torch.utils.data import RandomSampler, SequentialSampler
     from torch.utils.data.distributed import DistributedSampler
 
-    sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
+    if loader.batch_size is None:
+        raise ValueError(
+            "wrap_with_distributed_sampler cannot rewrap a loader built with a custom "
+            "batch_sampler (batch_size is None): rebuilding it with a DistributedSampler "
+            "would drop the batching rule. Shard the batch_sampler instead."
+        )
+    from spectramr.data.samplers import VolumeBlockedSliceSampler
+
+    if isinstance(loader.sampler, VolumeBlockedSliceSampler):
+        # Keep the volume-blocked order: it is what makes slice-expanded volumes
+        # affordable (~240x fewer decodes than a plain shuffle). Each rank gets a
+        # static share of the containers, so a volume is decoded on one rank rather
+        # than on every rank.
+        import torch.distributed as dist
+
+        sampler = loader.sampler.sharded(dist.get_rank(), dist.get_world_size())
+    else:
+        if not isinstance(loader.sampler, (RandomSampler, SequentialSampler)):
+            logging.getLogger(__name__).warning(
+                "[DDP] replacing the loader's %s with a DistributedSampler; its ordering "
+                "is not preserved across ranks.",
+                type(loader.sampler).__name__,
+            )
+        sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
     return _DataLoader(
         dataset=loader.dataset,
         batch_size=loader.batch_size,
@@ -60,4 +86,8 @@ def wrap_with_distributed_sampler(
         # None when there are no workers.
         prefetch_factor=(loader.prefetch_factor if loader.num_workers > 0 else None),
         persistent_workers=(loader.persistent_workers if loader.num_workers > 0 else False),
+        generator=loader.generator,
+        timeout=loader.timeout,
+        multiprocessing_context=loader.multiprocessing_context,
+        pin_memory_device=loader.pin_memory_device,
     )

@@ -86,10 +86,7 @@ def test_measure_is_sensitive_to_blur():
     ).squeeze(0)
     d_sharp = measure(sharp, HEADER, attributes=["tenengrad_variance"])
     d_blur = measure(blurred, HEADER, attributes=["tenengrad_variance"])
-    assert (
-        d_blur.attributes["tenengrad_variance"]
-        < d_sharp.attributes["tenengrad_variance"]
-    )
+    assert d_blur.attributes["tenengrad_variance"] < d_sharp.attributes["tenengrad_variance"]
 
 
 def test_sharpness_falls_under_noise_too_on_structured_data():
@@ -115,10 +112,7 @@ def test_sharpness_falls_under_noise_too_on_structured_data():
     )
     d_clean = measure(clean, HEADER, attributes=["tenengrad_variance"])
     d_noisy = measure(noisy, HEADER, attributes=["tenengrad_variance"])
-    assert (
-        d_noisy.attributes["tenengrad_variance"]
-        < d_clean.attributes["tenengrad_variance"]
-    )
+    assert d_noisy.attributes["tenengrad_variance"] < d_clean.attributes["tenengrad_variance"]
 
 
 def test_vector_orders_by_requested_keys():
@@ -210,9 +204,7 @@ def test_resample_is_a_noop_when_spacings_match():
 
 def test_resample_without_returning_gives_the_coarse_grid():
     vol = torch.rand(1, 64, 64)
-    out = resample_to_spacing(
-        vol, (5.0, 1.0, 1.0), (5.0, 2.0, 2.0), return_to_source_grid=False
-    )
+    out = resample_to_spacing(vol, (5.0, 1.0, 1.0), (5.0, 2.0, 2.0), return_to_source_grid=False)
     assert out.shape == (1, 32, 32)
 
 
@@ -228,8 +220,7 @@ def test_resample_rejects_nonpositive_spacing(bad):
 def test_thicker_target_slice_averages_through_plane():
     """A 2x thicker slice IS the average of two thin ones. That is partial volume."""
     vol = torch.rand(8, 16, 16)
-    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 1.0, 1.0),
-                              return_to_source_grid=False)
+    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 1.0, 1.0), return_to_source_grid=False)
     assert out.shape == (4, 16, 16)
 
 
@@ -242,8 +233,7 @@ def test_through_plane_averaging_destroys_slice_to_slice_detail():
     """
     vol = torch.zeros(8, 8, 8)
     vol[::2] = 1.0  # alternating slices
-    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 1.0, 1.0),
-                              return_to_source_grid=False)
+    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 1.0, 1.0), return_to_source_grid=False)
     # Each output slice averages one bright and one dark slice -> ~0.5 everywhere.
     assert out.std().item() < 1e-5
     assert out.mean().item() == pytest.approx(0.5, abs=1e-5)
@@ -278,6 +268,31 @@ def test_finer_target_raises_on_every_axis(src, dst, axis):
 
 def test_all_three_axes_can_coarsen_together():
     vol = torch.rand(8, 32, 32)
-    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 2.0, 2.0),
-                              return_to_source_grid=False)
+    out = resample_to_spacing(vol, (2.0, 1.0, 1.0), (4.0, 2.0, 2.0), return_to_source_grid=False)
     assert out.shape == (4, 16, 16)
+
+
+def test_intensity_normalisation_makes_attributes_unit_invariant():
+    # Planted: without a shared unit the same anatomy at 1e-2 and 1e2 scores differently.
+    from spectramr.infrastructure.physics.quality_descriptors import normalise_intensity
+
+    x = _phantom(n_slices=2, size=48)
+    a = measure_attributes(normalise_intensity(x, 99.0), attributes=["tenengrad_variance"])
+    for c in (1e-2, 100.0):
+        b = measure_attributes(normalise_intensity(c * x, 99.0), attributes=["tenengrad_variance"])
+        assert b["tenengrad_variance"] == pytest.approx(a["tenengrad_variance"], rel=1e-5)
+
+
+def test_robust_scale_raises_on_a_volume_with_no_signal():
+    from spectramr.infrastructure.physics.quality_descriptors import robust_scale
+
+    with pytest.raises(ValueError, match="no signal"):
+        robust_scale(torch.zeros(2, 8, 8), 99.0)
+
+
+def test_robust_scale_ignores_a_single_hot_voxel():
+    from spectramr.infrastructure.physics.quality_descriptors import robust_scale
+
+    x = torch.ones(1, 100, 100)
+    x[0, 0, 0] = 1e6
+    assert robust_scale(x, 99.0) == pytest.approx(1.0)

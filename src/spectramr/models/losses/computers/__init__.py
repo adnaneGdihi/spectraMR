@@ -10,17 +10,15 @@ from .unified_mae import UnifiedMAELossComputer
 from .unified_vae import UnifiedVAELossComputer, UnifiedVQVAELossComputer
 
 __all__ = [
-    # Base SSOT pattern
     "BaseLossComputer",
-    "LossOutput",
-    "LossComputerAdapter",
     "DictLossOutputAdapter",
-    # Unified SSOT implementations (only)
-    "UnifiedGANLossComputer",
+    "LossComputerAdapter",
+    "LossOutput",
     "UnifiedDiffusionLossComputer",
-    "UnifiedReconstructionLossComputer",
     "UnifiedDisentangledLossComputer",
+    "UnifiedGANLossComputer",
+    "UnifiedMAELossComputer",
+    "UnifiedReconstructionLossComputer",
     "UnifiedVAELossComputer",
     "UnifiedVQVAELossComputer",
-    "UnifiedMAELossComputer",
 ]

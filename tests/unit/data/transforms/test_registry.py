@@ -10,6 +10,9 @@ transform is constructible, and the keys live strategies read have a producer.
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from spectramr.data.transforms.registry import (
@@ -20,6 +23,7 @@ from spectramr.data.transforms.registry import (
     list_transforms,
     register_transform,
     transforms_producing,
+    transforms_without_effect,
 )
 
 
@@ -88,8 +92,33 @@ class TestUnregisteredNamesRaise:
 #: (193.37 ms rendered as 260.12 ms at 0.064 T), which is a plausible image, not
 #: an error. Declaring the arg here is what keeps the constructibility invariant
 #: honest without inventing a wrong physical default.
+#:
+#: ``hardware_unwarp`` reads and validates its calibration artifact at construction (a wrong
+#: path must fail when the pipeline is built, not at the first batch), so the table points it
+#: at an identity artifact written once per session; there is no artifact-free construction.
+
+
+def _identity_hardware_warp_artifact() -> str:
+    from spectramr.data.hardware_warp_artifacts import identity_artifact, write_artifact
+
+    path = Path(tempfile.mkdtemp(prefix="hardware_unwarp_")) / "identity.json"
+    write_artifact(
+        identity_artifact(
+            min_degree=2,
+            max_degree=3,
+            ball_radius_mm=100.0,
+            basis_points_per_axis=5,
+            unit_id="registry-test",
+            software_version="0",
+        ),
+        path,
+    )
+    return str(path)
+
+
 _BUILD_KWARGS: dict[str, dict] = {
     "graph_encoding": {},
+    "hardware_unwarp": {"artifact_path": _identity_hardware_warp_artifact()},
     "simulate_ulf_from_qmaps": {"b0_source": 3.0},
 }
 
@@ -177,11 +206,20 @@ class TestProducerInvariant:
     def test_transforms_producing_returns_nothing_for_an_unknown_key(self):
         assert transforms_producing("no_such_key") == ()
 
-    def test_every_registered_transform_declares_what_it_produces(self):
-        """A transform that adds no key cannot be verified to have fired."""
-        for name in list_transforms():
-            entry = get_transform(name)
-            assert entry.produces, f"{name} declares no produces=() keys"
+    def test_every_registered_transform_declares_its_effect(self):
+        """A transform that adds or rewrites no declared key cannot be verified to have fired."""
+        assert transforms_without_effect() == ()
+
+    def test_a_transform_declaring_no_effect_is_caught(self):
+        planted = {
+            "silent": RegisteredTransform(name="silent", cls=object),
+            "adds": RegisteredTransform(name="adds", cls=object, produces=("k",)),
+            "rewrites": RegisteredTransform(name="rewrites", cls=object, modifies=("input",)),
+        }
+        assert transforms_without_effect(planted) == ("silent",)
+
+    def test_an_in_place_edit_is_not_a_producer(self):
+        assert "slice_profile" not in transforms_producing("input")
 
 
 #: The five modules D16's wire half attached.

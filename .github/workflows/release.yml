@@ -8,14 +8,6 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      runner:
-        description: >-
-          Where the self-hosted jobs run. `thor` queues until the maintainer's
-          runner is listening; `hosted` runs them on ubuntu-latest instead.
-        type: choice
-        options: [thor, hosted]
-        default: thor
 
 # NOT declared at workflow level. `id-token: write` mints an OIDC token that is
 # a PyPI upload credential, and a workflow-level grant hands it to every job --
@@ -26,31 +18,11 @@ permissions:
 
 jobs:
   build:
-    # Runs on the maintainer's self-hosted runner (registered name `thor`).
-    #
-    # `runs-on` matches LABELS, never the runner NAME. thor was registered with
-    # its custom labels skipped, so `[self-hosted, Linux, ARM64]` is the only
-    # selector that reaches it -- `[self-hosted, thor]` would queue forever.
-    #
-    # thor listens via a foreground `./run.sh`, not a service, so it is offline
-    # unless the maintainer starts it, and a job targeted here QUEUES until then
-    # (GitHub cancels it after 24 h; there is no automatic failover between
-    # runner pools). That physical presence -- not `environment:`, which
-    # currently has empty protection_rules -- is what makes the release
-    # maintainer-driven today.
-    #
-    # The fallback is therefore a choice a person makes: the `runner` dispatch
-    # input, or the repository variable RELEASE_RUNNER=hosted for a tag push
-    # (which carries no inputs), moves this job to ubuntu-latest. Nothing here
-    # needs ARM64 -- build_dist.py reads the tree as text -- so the hosted run
-    # builds the same artefacts.
-    #
-    # spectraMR is a PUBLIC repo, so NO `pull_request`-family trigger may ever
-    # reach this runner: a fork PR would execute untrusted code on the
-    # maintainer's machine. This workflow fires only on `push: tags` and
-    # `workflow_dispatch`; keep it that way, and keep pr-required / pr-advisory
-    # / codeql on ubuntu-latest.
-    runs-on: ${{ (inputs.runner == 'hosted' || vars.RELEASE_RUNNER == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
+    # spectraMR is a PUBLIC repo and has no self-hosted runner; every job runs
+    # on GitHub-hosted runners. This workflow fires only on `push: tags` and
+    # `workflow_dispatch`, and the `pypi` environment's reviewer is what makes
+    # a release maintainer-driven.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -88,16 +60,9 @@ jobs:
     needs: build
     # A dry run must not be able to reach the index by any path.
     if: github.event_name == 'push'
-    # Deliberately NOT on thor, and this is a physical blocker rather than a
-    # preference. `pypa/gh-action-pypi-publish@release/v1` is a composite that
-    # GENERATES a Docker container action at run time and runs
-    # `docker://ghcr.io/pypa/gh-action-pypi-publish:release-v1`. Every published
-    # tag of that image is a single-arch linux/amd64 manifest -- checked on
-    # 2026-09-04 against the GHCR registry API for release-v1, v1.14, v1.14.1 and
-    # v1.14.2; not one carries an arm64 variant. On ARM64 the pull fails outright
-    # (or silently runs under qemu if binfmt happens to be registered, which is
-    # not a configuration to publish a release from). Move this job the moment
-    # upstream ships a multi-arch image.
+    # Must stay on x86_64: `pypa/gh-action-pypi-publish` runs a single-arch
+    # linux/amd64 container image (checked 2026-09-04 for release-v1 through
+    # v1.14.2).
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -114,11 +79,7 @@ jobs:
   github-release:
     needs: pypi
     if: github.event_name == 'push'
-    # On thor -- every action here is JavaScript (checkout, download-artifact,
-    # softprops/action-gh-release), so ARM64 runs them natively. See the build
-    # job for why the label triple, and not the name `thor`, is the selector,
-    # and for the hosted fallback this expression offers.
-    runs-on: ${{ (inputs.runner == 'hosted' || vars.RELEASE_RUNNER == 'hosted') && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "ARM64"]') }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

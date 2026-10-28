@@ -87,3 +87,60 @@ class TestVendorCommitSha:
         monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: b"  \n")
 
         assert meta_mod._vendor_commit_sha("cdiffmr") is None
+
+
+def test_run_provenance_reads_what_the_run_recorded(tmp_path):
+    """Reports printed `Dataset: None` because nothing passed it (#2502)."""
+    import json
+
+    from spectramr.infrastructure.reporting.metadata import run_provenance
+
+    assert run_provenance(tmp_path) == {
+        "dataset_version": None,
+        "config_path": None,
+        "config_hash": None,
+    }
+    (tmp_path / "resolved_config.json").write_text(
+        json.dumps(
+            {
+                "data": {
+                    "dataset_type": "m4raw",
+                    "source": {
+                        "index_path": "data/manifests/m4raw_train.json",
+                        "validation_index_path": "data/manifests/m4raw_val.json",
+                    },
+                }
+            }
+        )
+    )
+    (tmp_path / "provenance.json").write_text(json.dumps({"config_sha256": "abc123"}))
+    got = run_provenance(tmp_path)
+    assert got["dataset_version"] == "m4raw train=m4raw_train.json val=m4raw_val.json"
+    assert got["config_path"].endswith("resolved_config.json")
+    assert got["config_hash"] == "abc123"
+
+
+def test_the_report_summary_names_the_dataset(tmp_path):
+    import json
+
+    from spectramr.infrastructure.reporting import generate_report
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "validation_metrics.csv").write_text("step,val_psnr\n1,20\n2,21\n")
+    (tmp_path / "resolved_config.json").write_text(json.dumps({"data": {"dataset_type": "m4raw"}}))
+    res = generate_report(tmp_path, figures=[], tables_=[], html_report=False, qc_figures=False)
+    assert "Dataset: `m4raw`" in res["summary"].read_text()
+
+@pytest.mark.parametrize(
+    "resolved",
+    ["[1, 2]", '{"data": "m4raw"}', '{"data": {"source": "x"}}', "not json"],
+    ids=["list", "data-str", "source-str", "invalid"],
+)
+def test_run_provenance_survives_odd_json(tmp_path, resolved):
+    from spectramr.infrastructure.reporting.metadata import run_provenance
+
+    (tmp_path / "resolved_config.json").write_text(resolved)
+    (tmp_path / "provenance.json").write_text('{"config_sha256": {"nested": 1}}')
+    got = run_provenance(tmp_path)
+    assert got["config_hash"] is None
+    assert got["dataset_version"] is None

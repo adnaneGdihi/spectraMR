@@ -83,10 +83,15 @@ def _settings(losses: dict):
 
 
 def _gan_settings():
-    """A GAN arm: ``CompositeGANLoss``, no perceptual (so no VGG in a unit test)."""
+    """A GAN arm: ``CompositeGANLoss``, no perceptual (so no VGG in a unit test).
+
+    ``l1`` is declared because the composite takes its L1 weight from the
+    declaration alone: undeclared, ``l1_loss`` is exactly 0.0 and the
+    double-count check below has only one non-trivial sub-term to sum (#2262).
+    """
     return _settings(
         {
-            "image_losses": [{"name": "mse", "weight": 1.0}],
+            "image_losses": [{"name": "mse", "weight": 1.0}, {"name": "l1", "weight": 10.0}],
             "gan": {
                 "enable_adversarial": True,
                 "lambda_adv": 1.0,

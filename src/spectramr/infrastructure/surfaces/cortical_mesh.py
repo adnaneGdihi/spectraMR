@@ -50,7 +50,7 @@ class CorticalMesh:
 
     def hash(self) -> str:
         """Stable hash of the mesh — for cache invalidation."""
-        h = hashlib.sha1()
+        h = hashlib.sha1(usedforsecurity=False)
         h.update(self.vertices.tobytes())
         h.update(self.faces.tobytes())
         if self.subject_id:

@@ -41,6 +41,7 @@ from spectramr.infrastructure.orchestration.campaign_state import (
     ExperimentStatus,
 )
 from spectramr.models.registry import register_model as _register_model
+from tests.fixtures.run_state_files import write_run_state
 
 # ── PairwiseResult ─────────────────────────────────────────────────
 
@@ -474,18 +475,20 @@ class TestCampaignEvaluatorRebuildsTheTrainedModel:
     """The evaluated architecture must be the trained architecture."""
 
     @staticmethod
-    def _reconstruct(tmp_path: Path, payload: Any):
+    def _reconstruct(tmp_path: Path, models: dict[str, Any]):
         from spectramr.infrastructure.orchestration.campaign_evaluator import (
             CampaignEvaluator,
         )
 
         _CampaignEvalWitness.seen = {}
+        (tmp_path / "ckpt").mkdir(exist_ok=True)
+        path = write_run_state(tmp_path / "ckpt" / "best.pt", models)
         return CampaignEvaluator._reconstruct_model_from_config(
-            _witness_arm_yaml(tmp_path), payload, _torch.device("cpu")
+            _witness_arm_yaml(tmp_path), str(path), _torch.device("cpu")
         )
 
-    def test_a_generator_envelope_loads(self, tmp_path: Path) -> None:
-        """#1310: the envelope every GAN checkpoint actually uses."""
+    def test_the_generator_part_loads(self, tmp_path: Path) -> None:
+        """The RunState's generator part is the evaluated model's weights."""
         ref = _CampaignEvalWitness(in_channels=3, out_channels=3)
         model = self._reconstruct(tmp_path, {"generator": ref.state_dict()})
         assert isinstance(model, _torch.nn.Module)
@@ -518,6 +521,52 @@ class TestCampaignEvaluatorRebuildsTheTrainedModel:
         with pytest.raises(ValueError, match="shares zero parameter names"):
             self._reconstruct(tmp_path, {"generator": {"totally.unrelated": _torch.zeros(1)}})
 
-    def test_a_non_mapping_payload_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(TypeError):
-            self._reconstruct(tmp_path, [1, 2, 3])
+    def test_a_pre_v1_checkpoint_names_the_converter(self, tmp_path: Path) -> None:
+        """A director envelope from before schema 1 is refused, not guessed at."""
+        from spectramr.infrastructure.checkpointing.payload import SchemaVersionError
+        from spectramr.infrastructure.orchestration.campaign_evaluator import (
+            CampaignEvaluator,
+        )
+
+        ref = _CampaignEvalWitness(in_channels=3, out_channels=3)
+        legacy = tmp_path / "best.pt"
+        _torch.save({"generator": ref.state_dict(), "global_step": 7}, legacy)
+        with pytest.raises(SchemaVersionError, match="convert_checkpoints_v1"):
+            CampaignEvaluator._reconstruct_model_from_config(
+                _witness_arm_yaml(tmp_path), str(legacy), _torch.device("cpu")
+            )
+
+    def test_the_runs_resolved_config_wins_over_the_yaml(self, tmp_path: Path, monkeypatch) -> None:
+        """An edited YAML is reported, and the run's own artifact rebuilds the model."""
+        import spectramr.infrastructure.orchestration.campaign_evaluator as ce
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.validation.resolved_config_artifact import (
+            write_resolved_config,
+        )
+
+        seen: dict = {}
+        real = ce.resolve_inference_settings
+
+        def spy(config_path, checkpoint_path, **kw):
+            settings, source = real(config_path, checkpoint_path, **kw)
+            seen.update(checkpoint=checkpoint_path, source=source)
+            return settings, source
+
+        monkeypatch.setattr(ce, "resolve_inference_settings", spy)
+        trained = _witness_arm_yaml(tmp_path)
+        run = tmp_path / "ckpt"
+        run.mkdir()
+        write_resolved_config(run, TrainingSettings.from_yaml(trained), run_id="t")
+        doc = _yaml.safe_load(Path(trained).read_text())
+        doc["optimization"] = {"optimizer": {"learning_rate": 0.31337}}
+        edited = tmp_path / "edited.yaml"
+        edited.write_text(_yaml.safe_dump(doc))
+        ref = _CampaignEvalWitness(in_channels=3, out_channels=3)
+        path = write_run_state(run / "best.pt", {"generator": ref.state_dict()})
+
+        ce.CampaignEvaluator._reconstruct_model_from_config(
+            str(edited), str(path), _torch.device("cpu")
+        )
+        assert seen["checkpoint"] == str(path)
+        assert seen["source"]["kind"] == "resolved_config"
+        assert "optimization" in seen["source"]["diverging_blocks"]

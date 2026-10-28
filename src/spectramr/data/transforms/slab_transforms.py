@@ -5,7 +5,7 @@ import torchio as tio
 from spectramr.data.transforms.registry import register_transform
 
 
-@register_transform("slab_to_channel")
+@register_transform("slab_to_channel", modifies=("input", "target"))
 class SlabToChannel(tio.Transform):
     """
     Convert a 3D slab (patch with depth > 1) into a 2D multi-channel tensor.
@@ -78,7 +78,7 @@ class SlabToChannel(tio.Transform):
         return subject
 
 
-@register_transform("select_middle_slice")
+@register_transform("select_middle_slice", modifies=("target",))
 class SelectMiddleSlice(tio.Transform):
     """
     Select the middle slice along the depth dimension.

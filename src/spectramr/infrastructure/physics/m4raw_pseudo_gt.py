@@ -89,9 +89,38 @@ _ACQ_PARAM_TAGS: dict[str, str] = {
     "sliceThickness": "slice_thickness_mm",
     "spacingBetweenSlices": "slice_spacing_mm",
     "echo_train_length": "echo_train_length",
+    "echoTrainLength": "echo_train_length",
+    "echo_spacing": "echo_spacing",
     "sequence_type": "sequence_type",
     "protocolName": "protocol_name",
 }
+
+
+def _echo_spacing_ms(value: object) -> dict[str, float]:
+    """M4Raw writes ``16.3ms`` on its TSE series and ``N/A`` on its single-echo SE T1."""
+    if isinstance(value, float):
+        return {"echo_spacing": value}
+    text = str(value).strip()
+    if text.upper() == "N/A":
+        return {}
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*ms", text)
+    if match is None:
+        raise ValueError(f"echo_spacing {text!r} is neither milliseconds nor N/A")
+    return {"echo_spacing": float(match.group(1))}
+
+
+def _encoded_triple(xml: str, block: str) -> tuple[float, float, float] | None:
+    """``<block>`` x/y/z inside ``encodedSpace``; ``reconSpace`` repeats the tag names."""
+    space = re.search(r"<(?:\w+:)?encodedSpace>(.*?)</(?:\w+:)?encodedSpace>", xml, re.S)
+    if space is None:
+        return None
+    inner = re.search(rf"<(?:\w+:)?{block}>(.*?)</(?:\w+:)?{block}>", space.group(1), re.S)
+    if inner is None:
+        return None
+    axes = [re.search(rf"<(?:\w+:)?{a}>([^<]+)</", inner.group(1)) for a in "xyz"]
+    if any(m is None for m in axes):
+        return None
+    return tuple(float(m.group(1)) for m in axes)  # type: ignore[union-attr]
 
 
 def read_acquisition_params(path: Path) -> dict[str, object]:
@@ -130,6 +159,14 @@ def read_acquisition_params(path: Path) -> dict[str, object]:
             out[key] = float(text)
         except ValueError:
             out[key] = text
+    if "echo_spacing" in out:
+        out.update(_echo_spacing_ms(out.pop("echo_spacing")))
+    matrix = _encoded_triple(xml, "matrixSize")
+    if matrix is not None:
+        out["encoded_matrix"] = (int(matrix[0]), int(matrix[1]))
+    fov = _encoded_triple(xml, "fieldOfView_mm")
+    if fov is not None:
+        out["fov_mm"] = fov
     return out
 
 

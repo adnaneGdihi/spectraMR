@@ -5,7 +5,6 @@ stateless functional calls for efficient meta-learning steps (MAML).
 """
 
 import torch
-import torch.fft
 import torch.nn as nn
 from jaxtyping import Complex, Float
 from torch import Tensor

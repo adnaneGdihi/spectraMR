@@ -183,9 +183,7 @@ class DDIMSampler:
         # Get DDIM timesteps
         timesteps = self._get_ddim_timesteps(num_inference_steps)
 
-        for i, t in enumerate(timesteps):
-            # Get current timestep index
-            t_index = t.item()
+        for t_index in timesteps.tolist():
 
             # Create timestep tensor
             t_tensor = torch.full(

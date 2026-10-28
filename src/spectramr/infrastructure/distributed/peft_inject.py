@@ -142,6 +142,25 @@ def _walk_replace(model: nn.Module, targets: list[str], factory) -> int:
     return n
 
 
+def _injected_adapter_param_ids(model: nn.Module) -> set[int]:
+    """Identity of every parameter the injected adapters ADDED (never their frozen base).
+
+    Trainability used to be decided by substring on the parameter NAME (``".down."``,
+    ``".up."``, ``"lora_"``). That matched any backbone parameter that merely had such a
+    path component -- a UNet's ``decoder.up.0.conv`` -- so a LoRA run silently trained
+    part of the backbone. Identity cannot collide with a name.
+    """
+    ids: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, LoRAAdapter):
+            ids.update((id(module.lora_A), id(module.lora_B)))
+        elif isinstance(module, AdapterModule):
+            ids.update(id(p) for p in (*module.down.parameters(), *module.up.parameters()))
+        elif isinstance(module, PrefixModule):
+            ids.add(id(module.prefix))
+    return ids
+
+
 def inject_peft(model: nn.Module, peft_cfg: Any) -> nn.Module:
     """Inject LoRA / adapters into ``model`` per ``peft_cfg``.
 
@@ -197,8 +216,9 @@ def inject_peft(model: nn.Module, peft_cfg: Any) -> nn.Module:
         )
 
     # Trainability: freeze base params, then unfreeze the right slice.
+    adapter_ids = _injected_adapter_param_ids(model)
     for n, p in model.named_parameters():
-        is_adapter_param = "lora_" in n or ".down." in n or ".up." in n or n.endswith(".prefix")
+        is_adapter_param = id(p) in adapter_ids
         if is_adapter_param:
             p.requires_grad = True
             continue

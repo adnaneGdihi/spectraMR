@@ -164,11 +164,20 @@ def test_from_dict_full_specs() -> None:
     assert cfg.metrics[0].weight == 2.0
 
 
-def test_from_dict_empty_metrics_falls_back_to_defaults() -> None:
-    """Empty metrics list → defaults inserted."""
-    cfg = ValidationMetricsConfig.from_dict({"metrics": []})
-    names = {m.name for m in cfg.metrics}
-    assert names == {"psnr", "ssim", "mse"}
+@pytest.mark.parametrize("declared", [[], {"psnr": False, "ssim": False}])
+def test_from_dict_declared_empty_metrics_builds_no_metrics(declared) -> None:
+    """A declared empty set is honoured, never replaced by PSNR/SSIM/MSE (#2839)."""
+    cfg = ValidationMetricsConfig.from_dict({"metrics": declared, "primary_metric": "val_loss"})
+    assert cfg.metrics == []
+    assert cfg.primary_metric == "val_loss"
+
+
+@pytest.mark.parametrize("d", [{}, {"metrics": None}, {"primary_metric": "ssim"}])
+def test_from_dict_undeclared_metrics_keeps_defaults(d) -> None:
+    """No ``metrics`` value at all is the undeclared case: the documented default applies."""
+    cfg = ValidationMetricsConfig.from_dict(d)
+    assert {m.name for m in cfg.metrics} == {"psnr", "ssim", "mse"}
+    assert cfg.primary_metric == d.get("primary_metric", "psnr")
 
 
 def test_from_list_short_circuit() -> None:

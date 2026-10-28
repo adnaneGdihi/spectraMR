@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import torch
 
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
@@ -17,6 +19,8 @@ class DIFFSirenStrategy(BaseTrainingStrategy):
         from image reconstruction (SSIM, HFEN, LNCC) through the Virtual-Coil DC
         blocks down into the SIREN coordinates.
     """
+
+    forwards_loss_components: ClassVar[bool] = True
 
     def __init__(self, env=None, device=None, **kwargs):
         """Initialize DIFFSirenStrategy.

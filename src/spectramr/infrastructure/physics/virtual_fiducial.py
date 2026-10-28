@@ -223,7 +223,7 @@ class VirtualFiducial(nn.Module):
         """Build an N-D field of anisotropic Gaussian peaks.
 
         Args:
-            im_size: Image dimensions, 2-D ``(H, W)`` or 3-D ``(H, W, D)``.
+            im_size: Image dimensions, 2-D ``(H, W)`` or 3-D ``(D, H, W)``.
             spacing_px: Per-axis pixel spacing between centres.
             sigma_px: Per-axis peak width in pixels. Anisotropic by design: the
                 ULF cohort is 1.6 mm in-plane against 5.0 mm through-plane, so a

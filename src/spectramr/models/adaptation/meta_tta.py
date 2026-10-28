@@ -29,6 +29,8 @@ Author: Physics-AI MRI Framework
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

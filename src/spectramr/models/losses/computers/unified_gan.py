@@ -17,7 +17,11 @@ from typing import Any
 import torch
 from torch import nn
 
-from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.computers.base import (
+    DEFAULT_LOSS_DEVICE,
+    BaseLossComputer,
+    LossOutput,
+)
 from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
     _call_safe_loss,
 )
@@ -74,6 +78,12 @@ _NON_PRED_TARGET_LOSS_NAMES = frozenset(
 #: total would have summed the sub-terms *and* the pre-computed total sitting
 #: beside them -- every term counted twice.
 _LIBRARY_TOTAL_KEYS = ("g_total_loss", "d_total_loss")
+
+#: Terms this computer computes in its own slots, so the dynamic ``losses_dict``
+#: loop must not compute them a second time (``l1`` is the reconstruction slot).
+_BUILTIN_SLOTS = frozenset(
+    {"reconstruction", "adversarial", "perceptual", "r1", "r1_penalty", "l1"}
+)
 
 
 def _absorb_preweighted(
@@ -164,17 +174,18 @@ class UnifiedGANLossComputer(BaseLossComputer):
     #: makes that distinguishable from "resolved, nothing to convert".
     _critic_seam_resolved: bool = False
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize GAN loss computer.
 
         Args:
             config: Configuration with GAN loss settings
             device: Compute device
         """
-        self.adversarial_loss_fn = None
-        self.reconstruction_loss_fn = None
-        self.perceptual_loss_fn = None
-        self.r1_regularizer = None
+        # Duck-typed: the GAN loss library object exposing ``compute_*_loss``.
+        self.adversarial_loss_fn: Any = None
+        self.reconstruction_loss_fn: nn.Module | None = None
+        self.perceptual_loss_fn: nn.Module | None = None
+        self.r1_regularizer: nn.Module | None = None
 
         super().__init__(config, device)
 
@@ -309,7 +320,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
             LossOutput with total loss and components
         """
         device = target.device
-        components = {}
+        components: dict[str, Any] = {}
         # Keys that belong to the DISCRIMINATOR's objective. Reported in
         # ``components`` (so they still reach logs and metrics) but excluded from
         # the total, which is the generator's.
@@ -385,8 +396,8 @@ class UnifiedGANLossComputer(BaseLossComputer):
                     # ms-ssim / lpips. Converting here would compute L1 in
                     # k-space -- invisible on every same-side arm, wrong on a
                     # cross-domain one (#1921).
-                    real_images=target if "target" in locals() else target,
-                    fake_images=pred if "pred" in locals() else pred,
+                    real_images=target,
+                    fake_images=pred,
                 )
                 # Pre-weighted, and excluded from the stack below. Folding the
                 # dict raw re-weighted terms ``gan_loss_library`` had already
@@ -445,31 +456,24 @@ class UnifiedGANLossComputer(BaseLossComputer):
             components["perceptual"] = percep_loss
 
         # 4. R1 REGULARIZATION
-        if discriminator and self.r1_regularizer:
-            if self._should_apply_r1(epoch, iteration):
-                # R1 is a FEED SITE, not just a penalty: ``R1RegularizationLoss``
-                # calls ``discriminator(real_images)`` itself to get the logits it
-                # differentiates -- so it owes the critic BOTH its declared domain
-                # and the conditioning. An unconditioned call here regularizes a
-                # gradient the critic never takes; ``forward`` names ``critic_cond``
-                # explicitly because its ``**kwargs`` would have swallowed the
-                # payload silently.
-                r1_loss = self.r1_regularizer(
-                    discriminator, self._to_critic(target), critic_cond=cond
-                )
-                components["r1_penalty"] = r1_loss
+        if discriminator and self.r1_regularizer and self._should_apply_r1(epoch, iteration):
+            # R1 is a FEED SITE, not just a penalty: ``R1RegularizationLoss``
+            # calls ``discriminator(real_images)`` itself to get the logits it
+            # differentiates -- so it owes the critic BOTH its declared domain
+            # and the conditioning. An unconditioned call here regularizes a
+            # gradient the critic never takes; ``forward`` names ``critic_cond``
+            # explicitly because its ``**kwargs`` would have swallowed the
+            # payload silently.
+            r1_loss = self.r1_regularizer(discriminator, self._to_critic(target), critic_cond=cond)
+            components["r1_penalty"] = r1_loss
 
         # 5. DYNAMIC COMPONENT LOSSES (from losses_dict)
+        # Weights are resolved inside the loop's ``try`` and handed to the stack,
+        # so each is applied exactly once.
+        dynamic_weights: dict[str, float] = {}
         if losses_dict:
             for loss_name, loss_fn in losses_dict.items():
-                if loss_name in components or loss_name in [
-                    "reconstruction",
-                    "adversarial",
-                    "perceptual",
-                    "r1",
-                    "r1_penalty",
-                    "l1",  # Handled by reconstruction
-                ]:
+                if loss_name in components or loss_name in _BUILTIN_SLOTS:
                     continue
                 # Latent / KL / VQ / coords / flow losses do NOT take
                 # ``(pred, target)`` positionally — silently miscalling them
@@ -494,13 +498,13 @@ class UnifiedGANLossComputer(BaseLossComputer):
                     # what they need. `_call_safe_loss` filters by signature.
                     loss_val = _call_safe_loss(loss_fn, pred, target, **kwargs)
                     if isinstance(loss_val, torch.Tensor):
-                        # Apply weight if available via _get_loss_weight
-                        # Note: If LossBuilder already weighted it, this might be redundant or double-weighting.
-                        # Usually generic losses need explicit weighting here if not built-in.
-                        # For safety, we trust the loss_fn return value, but check for explicit override?
-                        # Using _get_loss_weight with default 1.0 seems safe if we assume loss_fn is raw.
-                        weight = self._get_loss_weight(loss_name, epoch, iteration)
-                        components[loss_name] = loss_val * weight
+                        # RAW into ``components``; the weight is applied once, by
+                        # the stack. Pre-multiplying here too would train every
+                        # dynamic term at w**2.
+                        dynamic_weights[loss_name] = self._get_loss_weight(
+                            loss_name, epoch, iteration
+                        )
+                        components[loss_name] = loss_val
                 except Exception as _exc:
                     # CLAUDE.md #10: warnings are not OK — but failing the whole
                     # forward pass for one bad loss is too destructive in
@@ -533,7 +537,12 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # gate at 0 for the stacked terms alone -- the same value resolving two
         # ways inside one method (#1950).
         total = (
-            self._stack_components(generator_components, epoch=epoch, iteration=iteration)
+            self._stack_components(
+                generator_components,
+                weights=dynamic_weights,
+                epoch=epoch,
+                iteration=iteration,
+            )
             if generator_components
             else None
         )
@@ -545,7 +554,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
         return LossOutput(
             total=total,
             components=components,
-            metrics={k: v for k, v in discriminator_only.items()},
+            metrics=dict(discriminator_only),
         )
 
     def compute_generator_loss(
@@ -580,7 +589,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
             LossOutput with generator components only
         """
         device = target.device
-        components = {}
+        components: dict[str, Any] = {}
         # The adversarial library's own pre-weighted total, and the keys it owns.
         library_total: torch.Tensor | None = None
         preweighted: set[str] = set()
@@ -610,8 +619,8 @@ class UnifiedGANLossComputer(BaseLossComputer):
                     # ms-ssim / lpips. Converting here would compute L1 in
                     # k-space -- invisible on every same-side arm, wrong on a
                     # cross-domain one (#1921).
-                    real_images=target if "target" in locals() else target,
-                    fake_images=pred if "pred" in locals() else pred,
+                    real_images=target,
+                    fake_images=pred,
                 )
                 # ``gan_loss_library.compute_generator_loss`` returns
                 # ``g_adv_loss``/``l1_loss``/``perceptual_loss``/... already
@@ -628,17 +637,12 @@ class UnifiedGANLossComputer(BaseLossComputer):
                 percep = percep[0]
             components["perceptual"] = percep
 
-        # Dynamic Generator Losses from losses_dict
+        # Dynamic Generator Losses from losses_dict. Weights resolved here, applied
+        # once by the stack (see ``compute``).
+        dynamic_weights: dict[str, float] = {}
         if losses_dict:
             for loss_name, loss_fn in losses_dict.items():
-                if loss_name in components or loss_name in [
-                    "reconstruction",
-                    "adversarial",
-                    "perceptual",
-                    "r1",
-                    "r1_penalty",
-                    "l1",  # Handled by reconstruction
-                ]:
+                if loss_name in components or loss_name in _BUILTIN_SLOTS:
                     continue
                 if (
                     loss_name in _NON_PRED_TARGET_LOSS_NAMES
@@ -656,8 +660,10 @@ class UnifiedGANLossComputer(BaseLossComputer):
                 try:
                     loss_val = _call_safe_loss(loss_fn, pred, target, **kwargs)
                     if isinstance(loss_val, torch.Tensor):
-                        weight = self._get_loss_weight(loss_name, epoch, iteration)
-                        components[loss_name] = loss_val * weight
+                        dynamic_weights[loss_name] = self._get_loss_weight(
+                            loss_name, epoch, iteration
+                        )
+                        components[loss_name] = loss_val
                 except Exception as _exc:
                     logger.warning(
                         "[unified_gan.G] Loss %r (%s) failed: %s — being SKIPPED.",
@@ -671,7 +677,9 @@ class UnifiedGANLossComputer(BaseLossComputer):
         # excluded from the stack and their authoritative total added once.
         stackable = {k: v for k, v in components.items() if k not in preweighted}
         total = (
-            self._stack_components(stackable, epoch=epoch, iteration=iteration)
+            self._stack_components(
+                stackable, weights=dynamic_weights, epoch=epoch, iteration=iteration
+            )
             if stackable
             else None
         )
@@ -721,7 +729,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
             LossOutput with discriminator components only
         """
         device = real.device
-        components = {}
+        components: dict[str, Any] = {}
         # The adversarial term, already summed, and the keys it owns. See below
         # for why they are not left to ``_stack_components``.
         adversarial_total: torch.Tensor | None = None
@@ -853,7 +861,7 @@ class UnifiedGANLossComputer(BaseLossComputer):
 
     def validate_config(self) -> None:
         """Validate configuration has required attributes."""
-        required_attrs = []
+        required_attrs: list[str] = []
 
         for attr in required_attrs:
             if not hasattr(self.config, attr):

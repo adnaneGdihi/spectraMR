@@ -73,3 +73,18 @@ def test_compute_infer_signature_tracks_the_config() -> None:
             self.undersampling = None
 
     assert compute_infer_signature(_Changed()) != baseline
+
+
+def test_the_signature_sees_the_digital_twin_and_stays_deterministic() -> None:
+    """``physics`` used to be dropped on the way to the builder, so a twin arm's
+    signature equalled the no-twin one."""
+    from spectramr.config.schemas.physics import PhysicsConfigSchema
+
+    def _twin():
+        s = _settings()
+        s.physics = PhysicsConfigSchema(digital_twin={"apply_as_transform": True})
+        return s
+
+    first = compute_infer_signature(_twin())
+    assert first == compute_infer_signature(_twin())
+    assert first != compute_infer_signature(_settings())

@@ -36,6 +36,8 @@ References:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -128,7 +130,7 @@ class DPSDataFitLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
@@ -177,4 +179,5 @@ class DPSDataFitLoss(nn.Module):
         pred_real = prediction.real if prediction.is_complex() else prediction
         grad_proxy = _project_manifold(residual_image, pred_real)
         scale = grad_proxy.norm() / residual_image.norm().clamp_min(1e-12)
-        return base * scale.detach()
+        scaled: torch.Tensor = base * scale.detach()
+        return scaled

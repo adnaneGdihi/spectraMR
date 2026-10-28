@@ -7,6 +7,7 @@ import torchio as tio
 from spectramr.config.data_config import DataConfig
 from spectramr.data.metadata.path_resolver import PathResolver
 from spectramr.data.split_utils import (
+    CONFIG_OWNED_SPLIT_TYPES,
     split_index,
     split_index_grouped,
     split_index_three_way_grouped,
@@ -756,7 +757,7 @@ class IndexBuilder:
         for mc in manifest_configs:
             if mc["role"] == "target":
                 pass
-            elif mc["role"] == "auxiliar":
+            elif mc["role"] == "auxiliar":  # codespell:ignore auxiliar
                 mc["role"] = "auxiliary"  # fix typo from slice above
 
         if not manifest_configs:
@@ -951,7 +952,7 @@ class IndexBuilder:
     def load_paired_bids_manifest(
         cls,
         manifest_path: "Path",
-        split: str,
+        split: str | None,
         config,
     ) -> list[dict]:
         """Load a v4 paired JSON manifest and return records for *split*.
@@ -1070,25 +1071,42 @@ class IndexBuilder:
                             break
 
         # --- 1. Split filter ---
-        # loso_subject partitions by SUBJECT, and it must run AFTER the pairing
-        # and contrast filters (step 3.6) — the subject list has to be the
-        # subjects actually in play. Computing it here saw all 65 manifest
-        # subjects instead of the 11 with a paired T1w, so folds 0-9 selected
-        # subjects with no matching record and produced an EMPTY validation set.
-        if config.split.type != "loso_subject":
+        # ``split=None`` is pool mode: every record survives the filters below and
+        # the caller partitions (``data.metadata.paired_partition``). A config-owned
+        # partition type never reads ``split_hint``, so it must not reach here with
+        # a split name -- that would be a second partition owner.
+        if split is None:
+            logger.info(f"[v{version} MANIFEST] pool mode: {len(records)} records, no split filter")
+        elif config.split.type in CONFIG_OWNED_SPLIT_TYPES:
+            raise ValueError(
+                f"split.type={config.split.type!r} owns the paired partition; call "
+                "ManifestLoader.load_paired_nifti_splits, not load_paired_bids_manifest"
+                f"(split={split!r}). Two readers would apply two partitions."
+            )
+        else:
             records = [r for r in records if r.get("split_hint") == split]
             logger.info(f"[v4 MANIFEST] After split_hint='{split}': {len(records)} records")
 
         # --- 2. Pairing status filter ---
-        allow_unpaired = config.pairing.allow_unpaired
-        if not allow_unpaired:
-            records = [r for r in records if r.get("pairing_status") == "paired"]
-            logger.info(f"[v4 MANIFEST] After allow_unpaired=False: {len(records)} paired records")
-        else:
-            n_unpaired = sum(1 for r in records if r.get("pairing_status") == "unpaired_ulf")
-            logger.info(
-                f"[v4 MANIFEST] allow_unpaired=True — including {n_unpaired} unpaired ULF records"
+        # Target-less ULF records are admitted per split: train only under
+        # unpaired_training, every other split (val/test/infer) under allow_unpaired.
+        # Pool mode keeps them all; the partition decides per split.
+        if split is not None:
+            keep_unpaired = (
+                config.pairing.unpaired_training
+                if split == "train"
+                else config.pairing.allow_unpaired
             )
+            if not keep_unpaired:
+                records = [r for r in records if r.get("pairing_status") == "paired"]
+                logger.info(
+                    f"[v4 MANIFEST] After allow_unpaired=False: {len(records)} paired records"
+                )
+            else:
+                n_unpaired = sum(1 for r in records if r.get("pairing_status") == "unpaired_ulf")
+                logger.info(
+                    f"[v4 MANIFEST] split={split!r} admits {n_unpaired} unpaired ULF records"
+                )
 
         # --- 3. Contrast filter ---
         contrasts = config.pairing.contrasts or []
@@ -1096,44 +1114,6 @@ class IndexBuilder:
             contrasts_upper = {c.upper() for c in contrasts}
             records = [r for r in records if r.get("contrast", "").upper() in contrasts_upper]
             logger.info(f"[v4 MANIFEST] After contrast filter {contrasts}: {len(records)} records")
-
-        # --- 3.6. Leave-one-SUBJECT-out ---
-        # Runs here, after pairing and contrast, so the fold index addresses the
-        # subjects that survive filtering. On a 10-subject cohort a single fixed
-        # split wastes most of the data and its variance is dominated by which
-        # subject landed in val, so arms report a spread over folds.
-        if config.split.type == "loso_subject":
-            subjects = sorted({str(r["subject_id"]) for r in records if r.get("subject_id")})
-            if not subjects:
-                raise ValueError(
-                    "split.type='loso_subject' but no surviving record "
-                    "carries a 'subject_id'. The split would put every record on "
-                    "one side and validate on nothing."
-                )
-            holdout = config.split.holdout_subject
-            if holdout is None:
-                fold = int(config.split.loso_fold or 0)
-                if fold >= len(subjects):
-                    raise ValueError(
-                        f"loso_fold={fold} but only {len(subjects)} subjects "
-                        f"survive filtering ({subjects}); folds are "
-                        f"0..{len(subjects) - 1}."
-                    )
-                holdout = subjects[fold]
-            elif holdout not in subjects:
-                raise ValueError(
-                    f"holdout_subject={holdout!r} is not among the subjects that "
-                    f"survive filtering: {subjects}"
-                )
-            keep_val = split == "val"
-            records = [r for r in records if (str(r.get("subject_id")) == holdout) == keep_val]
-            logger.info(
-                "[v4 MANIFEST] loso_subject holdout=%s (of %d subjects) -> split='%s': %d records",
-                holdout,
-                len(subjects),
-                split,
-                len(records),
-            )
 
         # --- 3.5. HF resolution filter ---
         hf_resolution = config.pairing.hf_resolution

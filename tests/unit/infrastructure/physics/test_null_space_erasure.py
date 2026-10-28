@@ -76,7 +76,7 @@ def test_orthogonal_anatomy_preserved() -> None:
 
 
 def test_mixture_only_marker_component_removed() -> None:
-    """``input = anatomy + α · basis`` → output ≈ anatomy."""
+    """``input = anatomy + alpha · basis`` → output ≈ anatomy."""
     torch.manual_seed(0)
     basis = torch.zeros(1, 1, 4, 4)
     basis[0, 0, 0, 0] = 1.0
@@ -147,3 +147,28 @@ def test_basis_registered_as_buffer() -> None:
     eraser = NullSpaceMarkerEraser(basis)
     names = {n for n, _ in eraser.named_buffers()}
     assert "M" in names
+
+
+def _complex_basis(device: str = "cpu") -> torch.Tensor:
+    m = torch.zeros(1, 1, 16, 16, dtype=torch.complex64, device=device)
+    m[0, 0, 4:7, 4:7] = 1.0 + 0.5j
+    return m
+
+
+def test_projection_is_idempotent_for_a_complex_basis() -> None:
+    eraser = NullSpaceMarkerEraser(_complex_basis(), epsilon=1e-9)
+    once = eraser(torch.randn(3, 1, 16, 16, dtype=torch.complex64) + _complex_basis())
+    assert torch.allclose(eraser(once), once, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs CUDA")
+def test_erasure_does_not_sync_the_host() -> None:
+    eraser = NullSpaceMarkerEraser(_complex_basis("cuda"), epsilon=1e-6)
+    y = torch.rand(2, 1, 16, 16, dtype=torch.complex64, device="cuda")
+    eraser(y)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        eraser(y)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

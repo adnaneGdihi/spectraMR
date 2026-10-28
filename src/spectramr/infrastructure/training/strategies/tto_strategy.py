@@ -48,6 +48,9 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
         motion_traj: Learnable motion trajectory (the ONLY optimized parameters).
     """
 
+    # parallel_compat: Owns the motion trajectory and freezes the wrapped generator.
+    parallel_compat = frozenset()
+
     def __init__(
         self,
         env: Any,
@@ -62,7 +65,8 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
             **kwargs: Additional kwargs.
         """
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize physics operators and freeze network weights."""

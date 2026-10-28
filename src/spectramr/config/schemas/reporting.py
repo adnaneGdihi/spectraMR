@@ -63,7 +63,7 @@ class ReportingSettings(BaseModel):
     )
     style: ReportStyle = Field(
         default=ReportStyle.NATURE,
-        description="House style for figures: nature (default) or ieee.",
+        description="House style for figures: nature (default), ieee, poster or slides.",
     )
     formats: list[str] = Field(
         default_factory=lambda: ["pdf", "png"],

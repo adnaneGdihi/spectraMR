@@ -29,6 +29,13 @@ onto the estimator's batch axis, so the whole volume is one vectorised call.
 them must serve its coils uncompressed (``data.coils.processing_mode: none``).
 Compressing to virtual coils after estimating maps for the physical ones would
 leave the two describing different arrays, which nothing downstream can detect.
+
+**Precomputed maps win, and are checked.** Under ``data.coil_maps_root`` the
+M4Raw loader has already attached the group's maps and stamped the calibration
+that made them (``coil_maps_calibration``). This transform then estimates
+nothing: it raises if that calibration or the maps' shape differs from its own
+declaration, and otherwise leaves the maps as they are. ``keys`` is not read on
+that path, since the maps come from every repetition rather than one key.
 """
 
 from __future__ import annotations
@@ -69,7 +76,9 @@ def _as_complex_slices(tensor: torch.Tensor) -> torch.Tensor:
 @register_transform(
     "espirit_sensitivity",
     produces=("sensitivity", "sensitivity_complex"),
-    requires=("kspace",),
+    # The k-space it reads is the instance's `keys` (first present wins): the
+    # full `kspace` by default, the masked `input` on the self-supervised arms.
+    requires=(),
 )
 class ESPIRiTSensitivityTransform(tio.transforms.Transform):
     """Estimate coil maps from the subject's k-space and attach them.
@@ -103,8 +112,41 @@ class ESPIRiTSensitivityTransform(tio.transforms.Transform):
         self.keys = tuple(keys)
         self.strict = bool(strict)
 
+    def _calibration(self) -> dict[str, float | int]:
+        return {
+            "acs_size": self.acs_size,
+            "kernel_size": self.kernel_size,
+            "eigen_threshold": self.eigen_threshold,
+        }
+
+    def _check_published(self, subject: tio.Subject) -> None:
+        """Maps the loader attached must match this declaration, or the run stops."""
+        from spectramr.data.datasets.m4raw_coil_maps import CoilMapMismatchError, calibration_tag
+
+        stamped = subject.get("coil_maps_calibration")
+        declared = calibration_tag(self._calibration())
+        if stamped != declared:
+            raise CoilMapMismatchError(
+                f"espirit_sensitivity declares {declared} but the loader's maps "
+                f"({subject.get('coil_maps_source')}) were estimated with {stamped}. "
+                "Align the transform's kwargs with the precompute, or re-run it."
+            )
+        maps = subject["sensitivity_complex"].data
+        kspace = next((subject[k].data for k in self.keys if k in subject), None)
+        if kspace is not None:
+            coils = kspace.shape[0] if torch.is_complex(kspace) else kspace.shape[0] // 2
+            if (coils, *kspace.shape[1:]) != tuple(maps.shape):
+                raise CoilMapMismatchError(
+                    f"published maps {tuple(maps.shape)} do not describe the k-space "
+                    f"{tuple(kspace.shape)} (coil count or matrix size)."
+                )
+
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         from spectramr.infrastructure.physics.coil_sensitivity import estimate_csm_espirit
+
+        if subject.get("coil_maps_source") is not None and "sensitivity_complex" in subject:
+            self._check_published(subject)
+            return subject
 
         source = next((k for k in self.keys if k in subject), None)
         if source is None:

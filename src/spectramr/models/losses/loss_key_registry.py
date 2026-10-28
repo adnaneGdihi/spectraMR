@@ -9,6 +9,10 @@ Standard Loss Keys:
 - metric_*: Computed metrics (not for backward)
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, ClassVar
+
 
 class LossKeyRegistry:
     """Registry of standard loss keys for SSOT pattern.
@@ -18,65 +22,77 @@ class LossKeyRegistry:
 
     # ============ GAN Training ============
     GAN_TOTAL_LOSS = "g_total_loss"
-    GAN_COMPONENTS = {
-        "g_loss_l1": "Generator L1 reconstruction",
-        "g_loss_l2": "Generator L2 reconstruction",
-        "g_loss_adversarial": "Generator adversarial loss",
-        "g_loss_perceptual": "Generator perceptual loss",
-        "g_loss_feature_matching": "Feature matching loss",
-        "d_total_loss": "Discriminator total loss",
-        "d_loss_real": "Discriminator real image loss",
-        "d_loss_fake": "Discriminator fake image loss",
-        "d_loss_r1": "R1 regularization penalty",
-        "d_loss_gp": "Gradient penalty",
-    }
+    GAN_COMPONENTS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "g_loss_l1": "Generator L1 reconstruction",
+            "g_loss_l2": "Generator L2 reconstruction",
+            "g_loss_adversarial": "Generator adversarial loss",
+            "g_loss_perceptual": "Generator perceptual loss",
+            "g_loss_feature_matching": "Feature matching loss",
+            "d_total_loss": "Discriminator total loss",
+            "d_loss_real": "Discriminator real image loss",
+            "d_loss_fake": "Discriminator fake image loss",
+            "d_loss_r1": "R1 regularization penalty",
+            "d_loss_gp": "Gradient penalty",
+        }
+    )
 
     # ============ Diffusion Training ============
     DIFFUSION_TOTAL_LOSS = "diffusion_total_loss"
-    DIFFUSION_COMPONENTS = {
-        "diffusion_loss_mse": "Diffusion MSE loss",
-        "diffusion_loss_score": "Score matching loss",
-        "diffusion_loss_recon": "Diffusion reconstruction loss",
-        "diffusion_loss_adversarial": "Diffusion adversarial loss",
-    }
+    DIFFUSION_COMPONENTS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "diffusion_loss_mse": "Diffusion MSE loss",
+            "diffusion_loss_score": "Score matching loss",
+            "diffusion_loss_recon": "Diffusion reconstruction loss",
+            "diffusion_loss_adversarial": "Diffusion adversarial loss",
+        }
+    )
 
     # ============ VAE Training ============
     VAE_TOTAL_LOSS = "vae_total_loss"
-    VAE_COMPONENTS = {
-        "vae_loss_recon": "VAE reconstruction loss",
-        "vae_loss_kl": "KL divergence loss",
-        "vae_loss_perceptual": "VAE perceptual loss",
-        "vae_loss_adversarial": "VAE adversarial loss",
-    }
+    VAE_COMPONENTS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "vae_loss_recon": "VAE reconstruction loss",
+            "vae_loss_kl": "KL divergence loss",
+            "vae_loss_perceptual": "VAE perceptual loss",
+            "vae_loss_adversarial": "VAE adversarial loss",
+        }
+    )
 
     # ============ VQ-VAE Training ============
     VQVAE_TOTAL_LOSS = "vqvae_total_loss"
-    VQVAE_COMPONENTS = {
-        "vqvae_loss_recon": "VQ-VAE reconstruction loss",
-        "vqvae_loss_codebook": "Codebook loss",
-        "vqvae_loss_commitment": "Commitment loss",
-        "vqvae_loss_perceptual": "VQ-VAE perceptual loss",
-    }
+    VQVAE_COMPONENTS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "vqvae_loss_recon": "VQ-VAE reconstruction loss",
+            "vqvae_loss_codebook": "Codebook loss",
+            "vqvae_loss_commitment": "Commitment loss",
+            "vqvae_loss_perceptual": "VQ-VAE perceptual loss",
+        }
+    )
 
     # ============ Reconstruction Training ============
     RECONSTRUCTION_TOTAL_LOSS = "reconstruction_total_loss"
-    RECONSTRUCTION_COMPONENTS = {
-        "recon_loss_l1": "L1 reconstruction",
-        "recon_loss_l2": "L2 reconstruction",
-        "recon_loss_perceptual": "Reconstruction perceptual",
-        "recon_loss_ssim": "SSIM loss",
-        "recon_loss_dists": "DISTS Perceptual Loss",
-    }
+    RECONSTRUCTION_COMPONENTS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "recon_loss_l1": "L1 reconstruction",
+            "recon_loss_l2": "L2 reconstruction",
+            "recon_loss_perceptual": "Reconstruction perceptual",
+            "recon_loss_ssim": "SSIM loss",
+            "recon_loss_dists": "DISTS Perceptual Loss",
+        }
+    )
 
     # ============ Shared Metric Keys ============
-    METRIC_KEYS = {
-        "metric_psnr": "Peak Signal-to-Noise Ratio",
-        "metric_ssim": "Structural Similarity Index",
-        "metric_lpips": "Learned Perceptual Image Patch Similarity",
-        "metric_fid": "Fréchet Inception Distance",
-        "metric_nrmse": "Normalized Root Mean Square Error",
-        "metric_mae": "Mean Absolute Error",
-    }
+    METRIC_KEYS: ClassVar[Mapping[str, str]] = MappingProxyType(
+        {
+            "metric_psnr": "Peak Signal-to-Noise Ratio",
+            "metric_ssim": "Structural Similarity Index",
+            "metric_lpips": "Learned Perceptual Image Patch Similarity",
+            "metric_fid": "Fréchet Inception Distance",
+            "metric_nrmse": "Normalized Root Mean Square Error",
+            "metric_mae": "Mean Absolute Error",
+        }
+    )
 
     @classmethod
     def get_all_loss_keys(cls) -> dict[str, str]:
@@ -85,7 +101,7 @@ class LossKeyRegistry:
         Returns:
             Dictionary mapping key names to descriptions
         """
-        all_keys = {}
+        all_keys: dict[str, str] = {}
         all_keys.update(cls.GAN_COMPONENTS)
         all_keys.update(cls.DIFFUSION_COMPONENTS)
         all_keys.update(cls.VAE_COMPONENTS)
@@ -120,7 +136,8 @@ class LossKeyRegistry:
             "reconstruction": cls.RECONSTRUCTION_COMPONENTS,
         }
 
-        return mode_map.get(training_mode, {})
+        # A copy, so a caller that edits the result cannot rewrite the registry.
+        return dict(mode_map.get(training_mode, {}))
 
     @classmethod
     def get_total_loss_key(cls, training_mode: str) -> str:
@@ -143,7 +160,7 @@ class LossKeyRegistry:
         return mode_map.get(training_mode, "total_loss")
 
     @classmethod
-    def validate_loss_dict(cls, losses_dict: dict, training_mode: str) -> bool:
+    def validate_loss_dict(cls, losses_dict: Mapping[str, Any], training_mode: str) -> bool:
         """Validate that loss dict uses standard keys.
 
         Args:
@@ -172,7 +189,7 @@ class LossKeyRegistry:
 class LossKeyValidator:
     """Validates loss dictionaries for consistency."""
 
-    def __init__(self, training_mode: str):
+    def __init__(self, training_mode: str) -> None:
         """Initialize validator for training mode.
 
         Args:
@@ -181,7 +198,7 @@ class LossKeyValidator:
         self.training_mode = training_mode
         self.expected_keys = LossKeyRegistry.get_training_mode_keys(training_mode)
 
-    def validate(self, losses_dict: dict, strict: bool = False) -> bool:
+    def validate(self, losses_dict: Mapping[str, Any], strict: bool = False) -> bool:
         """Validate loss dictionary.
 
         Args:

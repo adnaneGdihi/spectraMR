@@ -322,7 +322,7 @@ def test_bootstrap_console_logging_force_resets_handlers() -> None:
 
 
 def test_bootstrap_called_from_cli_app_main() -> None:
-    """Round-12 wiring: src/spectramr/cli/app.py::main() calls bootstrap_console_logging."""
+    """Round-12 wiring: cli/app.py::main() calls ``configure_entry``, which bootstraps the console."""
     import ast
     path = REPO_ROOT / "src" / "spectramr" / "cli" / "app.py"
     tree = ast.parse(path.read_text())
@@ -337,14 +337,14 @@ def test_bootstrap_called_from_cli_app_main() -> None:
         if isinstance(n, ast.Call):
             func = n.func
             if (
-                (isinstance(func, ast.Name) and func.id == "bootstrap_console_logging")
-                or (isinstance(func, ast.Attribute) and func.attr == "bootstrap_console_logging")
+                (isinstance(func, ast.Name) and func.id == "configure_entry")
+                or (isinstance(func, ast.Attribute) and func.attr == "configure_entry")
             ):
                 saw_call = True
                 break
     assert saw_call, (
         "F-LOG-COLOR round 12: src/cli/app.py::main() must call "
-        "bootstrap_console_logging() so 'python -m spectramr.cli <anything>' "
+        "log_policy.configure_entry() (which bootstraps the console) so 'python -m spectramr.cli <anything>' "
         "gets the colored handler installed. Without this wire, "
         "train/audit/predict/etc. all show plain output."
     )

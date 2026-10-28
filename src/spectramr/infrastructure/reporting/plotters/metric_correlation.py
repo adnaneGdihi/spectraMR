@@ -80,21 +80,6 @@ def make(
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=6)
     ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels, fontsize=6)
-    # annotate each cell; flip text colour on dark extremes for legibility
-    for i in range(corr.shape[0]):
-        for j in range(corr.shape[1]):
-            rho = corr.iloc[i, j]
-            if np.isnan(rho):
-                continue
-            ax.text(
-                j,
-                i,
-                f"{rho:.2f}",
-                ha="center",
-                va="center",
-                fontsize=5,
-                color="white" if abs(rho) > 0.6 else "#222222",
-            )
     cbar = fig.colorbar(im, ax=ax, shrink=0.7)
     cbar.set_label("Spearman ρ")
     ax.set_title(f"{split} metric correlation", pad=8)

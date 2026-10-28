@@ -13,7 +13,6 @@ import torch
 
 from spectramr.models.losses.contrastive_losses import ContrastiveLoss
 
-
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
@@ -136,3 +135,51 @@ def test_contrastive_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "contrastive" in list_available()
+
+
+# ---------------------------------------------------------------------------
+# Numerical form: the denominator is a logsumexp over every non-self sample
+# ---------------------------------------------------------------------------
+
+
+def _supcon_reference(features: torch.Tensor, labels: torch.Tensor, t: float) -> torch.Tensor:
+    """Supervised-contrastive loss written directly from its definition, in float64."""
+    f = torch.nn.functional.normalize(features.double(), dim=1)
+    sim = f @ f.T / t
+    eye = torch.eye(len(labels), dtype=torch.bool)
+    pos = (labels[:, None] == labels[None, :]) & ~eye
+    log_prob = sim - torch.logsumexp(sim.masked_fill(eye, float("-inf")), dim=1, keepdim=True)
+    per_anchor = (log_prob * pos).sum(1) / pos.sum(1).clamp_min(1)
+    return -per_anchor.mean()
+
+
+@pytest.mark.parametrize("temperature", [0.5, 0.07, 0.01, 0.005])
+def test_value_matches_the_definition_at_any_temperature(temperature: float) -> None:
+    """``exp(1 / tau)`` overflows float32 below tau ~ 0.011, where the old
+    ``log(sum(exp(.)) + 1e-9)`` returned NaN."""
+    torch.manual_seed(0)
+    features = torch.randn(8, 16)
+    labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+    got = ContrastiveLoss(temperature=temperature)(features, labels=labels)
+    assert torch.isfinite(got)
+    want = _supcon_reference(features, labels, temperature).float()
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_a_single_sample_batch_is_finite_in_value_and_gradient() -> None:
+    features = torch.randn(1, 4, requires_grad=True)
+    loss = ContrastiveLoss()(features, labels=torch.tensor([0]))
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+
+
+def test_the_jaxtyping_annotations_resolve() -> None:
+    """``Int[Tensor, B]`` named an undefined ``B``: any runtime type-hint
+    resolution (a jaxtyped/beartype decorator, ``get_type_hints``) raised NameError."""
+    import typing
+
+    from spectramr.models.losses.contrastive_losses import CAContrastiveLoss
+
+    assert "labels" in typing.get_type_hints(ContrastiveLoss.forward)
+    assert "subject_ids" in typing.get_type_hints(CAContrastiveLoss.forward)

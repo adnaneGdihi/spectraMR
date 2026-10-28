@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from spectramr.data.collation.unpad import remove_padding
+
 
 class CollateStrategy(ABC):
     """Collation is the process of combining variable-sized data samples
@@ -360,6 +362,10 @@ class ImageCollateStrategy(CollateStrategy):
                     continue
                 if not value.is_floating_point() and not value.is_complex():
                     continue
+                # Any NaN/inf makes the sum non-finite, so a finite sum proves the
+                # tensor clean in one reduction; overflow only costs the exact pass.
+                if bool(torch.isfinite(value.sum())):
+                    continue
                 finite = torch.isfinite(value)
                 if bool(finite.all()):
                     continue
@@ -393,24 +399,10 @@ class ImageCollateStrategy(CollateStrategy):
         Returns:
             List of unpadded tensors
         """
-        unpadded = []
-
-        for img, pad_info in zip(padded, padding_info, strict=False):
-            if pad_info is None:
-                # No padding was applied
-                unpadded.append(img)
-            else:
-                # Remove padding
-                slices = []
-                for pad_before, pad_after in pad_info:
-                    if pad_after == 0:
-                        slices.append(slice(pad_before, None))
-                    else:
-                        slices.append(slice(pad_before, -pad_after))
-
-                unpadded.append(img[tuple(slices)])
-
-        return unpadded
+        return [
+            remove_padding(img, pad_info)
+            for img, pad_info in zip(padded, padding_info, strict=False)
+        ]
 
 
 class SlabCollateStrategy(ImageCollateStrategy):

@@ -31,7 +31,7 @@ The unified launcher: ``spectramr launch``
    spectramr launch X.yaml --where slurm --gpus 2            # train on SLURM (2 GPUs)
    spectramr launch X.yaml --where docker                    # train in a Docker container
    spectramr launch X.yaml --pipeline infer --where local \
-       -- --checkpoint best.pt --input d/ --output o/      # a different verb; '--' passes verb args
+       -- --checkpoint best.safetensors --input d/ --output o/      # a different verb; '--' passes verb args
    spectramr launch C.yaml --fanout campaign --where slurm   # a whole campaign
 
 ``--dry-run`` prints the exact command / sbatch script that *would* run without
@@ -77,6 +77,38 @@ abort an array task mid-fan-out. The shell keeps only the REPO_ROOT spool anchor
 and the fail-loud venv/torch probe (their regression tests run torch-free and
 must not reach Python before the venv); the ``--dry-run`` path is torch-free, so
 it runs the unit tests without a GPU.
+
+An arm whose registered model class declares ``parameter_free`` (a classical solver such
+as ``cs_l1_wavelet_sense``) has nothing to train, and ``train`` refuses it. The task
+body asks the class (:func:`~spectramr.cli.manifest_dispatch.declares_parameter_free_arm`)
+and launches such an arm with ``--validate-only`` and no ``--resume``, so it stays in the
+array beside the learned arms and writes to the same run tree. A model type the registry
+does not know raises; it is never read as "learned".
+
+**Runs follow** ``dev``. A manifest lists config *paths*, and each task reads its
+YAML and imports ``src/`` from the live checkout when it starts. Both submitters
+(``submit_experiment_array.sh`` and the campaign array path) refuse a checkout
+that is not on the ``dev`` branch, and write ``<manifest>.snapshot.json`` beside
+the manifest, holding HEAD, the branch, its dirty flag and a sha256 per listed YAML
+(:mod:`spectramr.core.dispatch_snapshot`, git helpers in
+:mod:`spectramr.core.dispatch_git`). Every task start, a requeued wall-clock link
+included, checks the live checkout and exits 2 naming each problem:
+
+- the checkout is on another branch or a detached HEAD;
+- dev no longer contains the submitted commit (rewound, or another line);
+- the task's YAML differs from the record **and** from its committed version
+  (an uncommitted edit).
+
+Dev advancing past the submitted commit is not drift: a task that starts after a
+``git pull`` of dev runs the pulled code and YAML, and the commit it actually ran
+is stamped into the run record under ``"dispatch_snapshot"``
+(``recorded_head`` against ``current_head``). One array can therefore span
+several dev commits; read ``current_head`` per run when comparing arms.
+``SPECTRAMR_DISPATCH_ALLOW_DRIFT=1``, set when the array is submitted (it rides
+``--export=ALL``), lets a refused task run anyway, with the drift recorded. The
+dirty flag is recorded but not compared, so uncommitted edits to tracked code are
+not covered. A manifest written before the record existed has none; its tasks
+print a warning and proceed.
 
 Provenance
 ----------

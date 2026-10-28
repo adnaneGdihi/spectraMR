@@ -79,10 +79,28 @@ def _m4raw_cfg(**overrides) -> SimpleNamespace:
         "target_mode": _DataSchema.model_fields["target_mode"].default,
         "val_target_mode": _DataSchema.model_fields["val_target_mode"].default,
         "r2r_alpha": _DataSchema.model_fields["r2r_alpha"].default,
+        "r2r_covariance_source": _DataSchema.model_fields["r2r_covariance_source"].default,
+        "r2r_split_angle_deg": _DataSchema.model_fields["r2r_split_angle_deg"].default,
+        "r2r_whitening": _DataSchema.model_fields["r2r_whitening"].default,
+        "emit_alternate_input": _DataSchema.model_fields["emit_alternate_input"].default,
+        "n2n_pairing": _DataSchema.model_fields["n2n_pairing"].default,
         "nex_target_exclude_input": _DataSchema.model_fields["nex_target_exclude_input"].default,
         "nex_fallback": _DataSchema.model_fields["nex_fallback"].default,
+        "nex_registration": _DataSchema.model_fields["nex_registration"].default,
+        "input_repetition": _DataSchema.model_fields["input_repetition"].default,
         "use_repetitions": _DataSchema.model_fields["use_repetitions"].default,
         "slice_level_records": _DataSchema.model_fields["slice_level_records"].default,
+        "nex_shift_root": _DataSchema.model_fields["nex_shift_root"].default,
+        "nex_shifts_missing": _DataSchema.model_fields["nex_shifts_missing"].default,
+        "coil_maps_root": _DataSchema.model_fields["coil_maps_root"].default,
+        "coil_maps_missing": _DataSchema.model_fields["coil_maps_missing"].default,
+        "coil_maps_recipe": _DataSchema.model_fields["coil_maps_recipe"].default,
+        "coil_maps_acs_size": _DataSchema.model_fields["coil_maps_acs_size"].default,
+        "coil_maps_reference_root": _DataSchema.model_fields["coil_maps_reference_root"].default,
+        "noise_fit_support_policy": _DataSchema.model_fields["noise_fit_support_policy"].default,
+        "noise_covariance_root": _DataSchema.model_fields["noise_covariance_root"].default,
+        "noise_covariance_missing": _DataSchema.model_fields["noise_covariance_missing"].default,
+        "staging": _DataSchema.model_fields["staging"].default_factory(),
     }
     base.update(overrides)
     return _Cfg(**base)
@@ -161,6 +179,19 @@ def test_m4raw_threads_nex_fallback(monkeypatch) -> None:
     assert cap["nex_fallback"] == "all_reps"
 
 
+def test_m4raw_threads_nex_registration(monkeypatch) -> None:
+    """Repetition registration reaches both splits' datasets (#2849)."""
+    cap = _capture_m4raw(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(nex_registration="translation"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert cap["nex_registration"] == "translation"
+
+
 def test_m4raw_threads_slice_level_records(monkeypatch) -> None:
     """The slice-level index knob reaches the dataset (#1757)."""
     cap = _capture_m4raw(monkeypatch)
@@ -172,6 +203,28 @@ def test_m4raw_threads_slice_level_records(monkeypatch) -> None:
         None,
     )
     assert cap["slice_level_records"] is True
+
+
+def test_m4raw_slice_level_records_reaches_both_splits(monkeypatch) -> None:
+    """Validation is indexed like training: one record per slice on both, so the
+    k-space scale is per slice on both and the val rows keep their slice keys
+    (#2673). A split left on groups would grade on a per-volume scale."""
+    import spectramr.data.datasets.m4raw_dataset as m4raw_mod
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        m4raw_mod,
+        "M4RawRepetitionDataset",
+        lambda _h5, **kw: (calls.append(kw), _StubDS())[1],
+    )
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(slice_level_records=True),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw["slice_level_records"] for kw in calls] == [True, True]
 
 
 def test_m4raw_slice_level_records_defaults_off_from_the_schema(monkeypatch) -> None:
@@ -227,6 +280,7 @@ def test_m4raw_honours_an_explicit_use_repetitions(monkeypatch, declared) -> Non
         "r2r_alpha",
         "nex_target_exclude_input",
         "nex_fallback",
+        "nex_registration",
         "use_repetitions",
     ],
 )
@@ -334,6 +388,43 @@ def test_val_target_mode_reaches_the_val_split_only(monkeypatch) -> None:
     assert val_kw["target_mode"] == "phase_aligned_mean"
 
 
+def test_registration_reaches_only_the_split_that_averages(monkeypatch) -> None:
+    """The n2n r2r arms register their NEX reference; the r2r training split has one repetition.
+
+    Handing it the registration too made the dataset refuse it, so 10 of the 12 arms
+    could not build their loaders (sabine profile array, 2026-10-21).
+    """
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(
+            target_mode="r2r",
+            val_target_mode="phase_aligned_mean",
+            nex_registration="translation",
+            nex_shift_root="/x/shifts",
+        ),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    train_kw, val_kw = calls
+    assert (train_kw["nex_registration"], train_kw["nex_shift_root"]) == ("none", None)
+    assert val_kw["nex_registration"] == "translation"
+    assert val_kw["nex_shift_root"] is not None
+
+
+def test_registration_still_reaches_an_averaging_training_split(monkeypatch) -> None:
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(target_mode="rep_pair", nex_registration="translation"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw["nex_registration"] for kw in calls] == ["translation", "translation"]
+
+
 def test_val_target_mode_none_serves_the_training_mode_to_both_splits(monkeypatch) -> None:
     """The default must not silently change what every existing arm validates on.
 
@@ -355,6 +446,77 @@ def test_val_target_mode_none_serves_the_training_mode_to_both_splits(monkeypatc
     assert _DataSchema.model_fields["val_target_mode"].default is None  # anti-vacuity
 
 
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("r2r_split_angle_deg", 30.0),
+        ("r2r_whitening", "self_calibrated"),
+        ("emit_alternate_input", True),
+    ],
+)
+def test_m4raw_threads_the_split_and_alternate_knobs_to_both_splits(
+    monkeypatch, knob, value
+) -> None:
+    """A declared value that stopped at the instantiator would leave the YAML lying."""
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(**{knob: value}),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw[knob] for kw in calls] == [value, value]
+    assert value != _DataSchema.model_fields[knob].default  # anti-vacuity
+
+
+def test_input_repetition_reaches_the_training_split_only(monkeypatch) -> None:
+    """Validation serves repetition 0 whatever the arm declares, so its scores stay
+    comparable; the guarantee is the literal at the val call site, not the YAML."""
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(target_mode="phase_aligned_mean", input_repetition="random"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw["input_repetition"] for kw in calls] == ["random", "first"]
+
+
+def test_n2n_pairing_reaches_the_training_split_only(monkeypatch) -> None:
+    """Validation scores against val_target_mode, so its split never serves a stack."""
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(target_mode="rep_pair", n2n_pairing="random_pair"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert calls[0]["n2n_pairing"] == "random_pair"
+    assert "n2n_pairing" not in calls[1] or calls[1]["n2n_pairing"] is None
+
+
+def test_input_repetition_default_is_first_on_both_splits(monkeypatch) -> None:
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(), [{"primary_path": "/x/a.h5"}], [{"primary_path": "/x/b.h5"}], None, None
+    )
+    assert [kw["input_repetition"] for kw in calls] == ["first", "first"]
+    assert _DataSchema.model_fields["input_repetition"].default == "first"  # anti-vacuity
+
+
+def test_input_repetition_missing_from_receiver_fails_loud(monkeypatch) -> None:
+    _capture_m4raw(monkeypatch)
+    cfg = _m4raw_cfg()
+    delattr(cfg, "input_repetition")
+    with pytest.raises(AttributeError, match="input_repetition"):
+        DatasetInstantiator._create_m4raw_repetition(
+            cfg, [{"primary_path": "/x/a.h5"}], [{"primary_path": "/x/b.h5"}], None, None
+        )
+
+
 def test_the_m4raw_stub_declares_every_nex_field_the_schema_declares() -> None:
     """The stub must not omit a field a real config always carries (anti-F16).
 
@@ -362,7 +524,17 @@ def test_the_m4raw_stub_declares_every_nex_field_the_schema_declares() -> None:
     threading tests above would certify a code path production cannot reach.
     """
     cfg = _m4raw_cfg()
-    for field in ("target_mode", "val_target_mode", "r2r_alpha", "nex_target_exclude_input"):
+    for field in (
+        "target_mode",
+        "val_target_mode",
+        "r2r_alpha",
+        "r2r_covariance_source",
+        "r2r_split_angle_deg",
+        "r2r_whitening",
+        "emit_alternate_input",
+        "nex_target_exclude_input",
+        "input_repetition",
+    ):
         assert field in _DataSchema.model_fields, f"{field} left the schema"
         assert hasattr(cfg, field), (
             f"the m4raw stub omits `{field}`, which DataConfigSchema declares -- "
@@ -945,6 +1117,24 @@ def test_create_nifti_universal_slice_2d_slab_depth_from_patch(monkeypatch) -> N
     assert len(tr) == 2  # depth 6 / slab 3 = 2 windows
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_create_nifti_universal_slice_2d_redraws_train_augmentation_only(
+    monkeypatch, enabled: bool
+) -> None:
+    from spectramr.config.schemas.augmentation import AugmentationConfigSchema
+
+    _patch_volumetric_universal(monkeypatch)
+    cfg = _Cfg(
+        dataset_type="nifti_paired",
+        slice_2d=True,
+        augmentation=AugmentationConfigSchema(enabled=enabled),
+    )
+    idx = [{"primary_path": "u", "target_path": "h", "file_id": "s", "shape": [1, 4, 4, 3]}]
+    tr, va = DatasetInstantiator._create_nifti_universal(cfg, idx, idx, None, None)
+    assert tr.redraw is enabled
+    assert va.redraw is False
+
+
 # ── WS1: single-file train/val split — honest handling ────────────────────────
 
 
@@ -1274,3 +1464,286 @@ def test_create_mrixfields_multi_field_regroups_group_aware() -> None:
         return {recs[0]["subject_id"] for recs, _judge in ds._tuples}
 
     assert not (_subjects(train_ds) & _subjects(val_ds)), "subject leaked across the split"
+
+
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("coil_maps_missing", "estimate"),
+        ("noise_fit_support_policy", "acs"),
+        ("coil_maps_recipe", "input_repetition"),
+        ("coil_maps_acs_size", 20),
+    ],
+)
+def test_m4raw_threads_the_coil_map_and_noise_fit_knobs_to_both_splits(
+    monkeypatch, knob, value
+) -> None:
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(**{knob: value}),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw[knob] for kw in calls] == [value, value]
+    assert value != _DataSchema.model_fields[knob].default  # anti-vacuity
+
+
+def test_m4raw_resolves_the_coil_maps_root_for_both_splits(monkeypatch) -> None:
+    """Resolved like every data path, and never dropped on the validation split."""
+    from spectramr.data.metadata.path_resolver import PathResolver
+
+    monkeypatch.setattr(PathResolver, "resolve", staticmethod(lambda p: f"/resolved/{p}"))
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(coil_maps_root="databases/m4raw/coil_maps"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert [kw["coil_maps_root"] for kw in calls] == ["/resolved/databases/m4raw/coil_maps"] * 2
+
+
+def test_m4raw_hands_the_scoring_maps_to_the_validation_split_only(monkeypatch) -> None:
+    """#2664: the training split never receives the all-repetitions scoring store."""
+    from spectramr.data.metadata.path_resolver import PathResolver
+
+    monkeypatch.setattr(PathResolver, "resolve", staticmethod(lambda p: f"/resolved/{p}"))
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(coil_maps_reference_root="databases/m4raw/coil_maps"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    train, val = calls
+    assert train.get("coil_maps_reference_root") is None
+    assert val["coil_maps_reference_root"] == "/resolved/databases/m4raw/coil_maps"
+
+
+def test_m4raw_passes_no_coil_maps_root_when_the_arm_declares_none(monkeypatch) -> None:
+    calls = _capture_m4raw_both(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(), [{"primary_path": "/x/a.h5"}], [{"primary_path": "/x/b.h5"}], None, None
+    )
+    assert [kw["coil_maps_root"] for kw in calls] == [None, None]
+
+
+def test_image_domain_crop_reaches_both_universal_splits(monkeypatch) -> None:
+    import spectramr.data.builders.dataset_instantiator as inst_mod
+
+    captured: list[dict] = []
+    monkeypatch.setattr(inst_mod, "UniversalMRIDataset", lambda **kw: captured.append(kw))
+    cfg = _DataSchema(dataset_type="kspace", processing={"image_domain_crop_or_pad": [320, 320]})
+
+    DatasetInstantiator.create_datasets(cfg, [], [], None, None)
+
+    assert [kw["image_domain_crop_or_pad"] for kw in captured] == [(320, 320), (320, 320)]
+
+
+def test_fastmri_route_threads_the_contrast_map_only_when_enabled(monkeypatch) -> None:
+    """Without the map no sample carries ``contrast_idx`` and the generator runs unconditioned."""
+    import spectramr.data.builders.dataset_instantiator as inst_mod
+
+    captured: list[dict] = []
+    monkeypatch.setattr(inst_mod, "UniversalMRIDataset", lambda **kw: captured.append(kw))
+    cmap = {"AXT2": 0, "AXFLAIR": 1}
+    on = _DataSchema(dataset_type="kspace", multi_contrast={"enabled": True, "contrast_map": cmap})
+    off = _DataSchema(dataset_type="kspace", multi_contrast={"enabled": False, "contrast_map": cmap})
+
+    DatasetInstantiator.create_datasets(on, [], [], None, None)
+    DatasetInstantiator.create_datasets(off, [], [], None, None)
+
+    assert [kw["contrast_map"] for kw in captured] == [cmap, cmap, None, None]
+
+
+def test_image_domain_crop_on_a_route_that_ignores_it_raises() -> None:
+    """PLANTED VIOLATION: the M4Raw loader never reads the knob, so it must not be accepted."""
+    cfg = _DataSchema(dataset_type="m4raw", processing={"image_domain_crop_or_pad": [320, 320]})
+
+    with pytest.raises(ValueError, match="routes to 'm4raw'"):
+        DatasetInstantiator.create_datasets(cfg, [], [], None, None)
+
+
+def test_m4raw_pairing_kwargs_forward_the_cross_contrast_choice() -> None:
+    from types import SimpleNamespace
+
+    from spectramr.data.builders.dataset_instantiator import _m4raw_pairing_kwargs
+
+    default = SimpleNamespace(cross_contrast_source="T1", cross_contrast_targets=None)
+    assert _m4raw_pairing_kwargs(default) == {"source_contrast": "T1"}
+    t2 = SimpleNamespace(cross_contrast_source="T2", cross_contrast_targets=["FLAIR"])
+    assert _m4raw_pairing_kwargs(t2) == {"source_contrast": "T2", "target_contrasts": ("FLAIR",)}
+
+
+def test_m4raw_triplet_is_a_self_indexed_route() -> None:
+    """The registered trees are the index; no manifest feeds this route."""
+    from spectramr.data.datasets.registry import get_dataset_creator
+
+    DatasetInstantiator._ensure_registered()
+    creator = get_dataset_creator("m4raw_triplet")
+    assert creator is not None and creator.indexed is False
+
+
+def test_m4raw_triplet_without_its_block_raises() -> None:
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=None)
+    with pytest.raises(ValueError, match=r"data\.m4raw_triplet"):
+        DatasetInstantiator._create_m4raw_triplet(cfg, None, None)
+
+
+def test_m4raw_triplet_builds_train_and_val_from_their_splits(monkeypatch) -> None:
+    import spectramr.data.datasets.m4raw_triplet_dataset as mod
+
+    seen = []
+    monkeypatch.setattr(
+        mod,
+        "M4RawTripletDataset",
+        lambda t2, flair, split: seen.append((t2, flair, split)) or split,
+    )
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root=None,
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
+    assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
+    assert seen == [("A", "B", "tr"), ("A", "B", "va")]
+
+
+def test_m4raw_triplet_with_a_repetition_root_serves_independent_repetitions(monkeypatch) -> None:
+    import spectramr.data.datasets.m4raw_repetition_triplet as mod
+
+    seen = []
+
+    def fake(t2, flair, raw, split, *, deterministic):
+        seen.append((t2, flair, raw, split, deterministic))
+        return split
+
+    monkeypatch.setattr(mod, "M4RawRepetitionTripletDataset", fake)
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root="R",
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
+    assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
+    # random pairs for training, the same pair every pass for validation
+    assert seen == [("A", "B", "R", "tr", False), ("A", "B", "R", "va", True)]
+
+
+# ── coil mode handed to the M4Raw dataset ─────────────────────────────────────
+
+
+def _handed_coil_mode(monkeypatch, declared: str) -> str:
+    cap = _capture_m4raw(monkeypatch)
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(coil_processing_mode=declared),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    return cap["coil_processing_mode"]
+
+
+def test_m4raw_serves_all_coils_when_the_transform_pipeline_makes_the_image(monkeypatch) -> None:
+    """rss_image is applied by CoilCombineTransform; the dataset only has to serve every coil."""
+    assert _handed_coil_mode(monkeypatch, "rss_image") == "none"
+
+
+@pytest.mark.parametrize("mode", ["none", "rss", "svd", "flatten"])
+def test_m4raw_hands_a_mode_it_implements_through_unchanged(monkeypatch, mode: str) -> None:
+    assert _handed_coil_mode(monkeypatch, mode) == mode
+
+
+def test_m4raw_still_refuses_a_mode_neither_it_nor_the_transform_handles(monkeypatch) -> None:
+    """No silent fallback: an unknown mode reaches the dataset, which raises."""
+    assert _handed_coil_mode(monkeypatch, "not_a_mode") == "not_a_mode"
+
+
+def test_m4raw_threads_the_noise_covariance_store_to_both_splits(monkeypatch) -> None:
+    """The Sigma_n store (#3117) reaches the train AND validation datasets, resolved."""
+    import spectramr.data.datasets.m4raw_dataset as m4raw_mod
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        m4raw_mod, "M4RawRepetitionDataset", lambda _h5, **kw: (calls.append(kw), _StubDS())[1]
+    )
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(noise_covariance_root="/x/sigma", noise_covariance_missing="fit"),
+        [{"primary_path": "/x/a.h5"}],
+        [{"primary_path": "/x/b.h5"}],
+        None,
+        None,
+    )
+    assert len(calls) == 2
+    for kw in calls:
+        assert str(kw["noise_covariance_root"]).endswith("/x/sigma")
+        assert kw["noise_covariance_missing"] == "fit"
+
+
+def test_m4raw_reads_staged_copies_when_staging_is_on(monkeypatch, tmp_path) -> None:
+    """With data.staging on, the datasets receive node-local k-space and coil-map paths."""
+    import spectramr.data.datasets.m4raw_dataset as m4raw_mod
+    from spectramr.data.datasets.m4raw_coil_maps import map_key
+
+    src = tmp_path / "shared"
+    maps = tmp_path / "maps"
+    src.mkdir()
+    maps.mkdir()
+    files = [src / "2022_T101.h5", src / "2022_T102.h5"]
+    for f in files:
+        f.write_bytes(b"k")
+    (maps / f"{map_key(files[0].stem)}.pt").write_bytes(b"m")
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        m4raw_mod,
+        "M4RawRepetitionDataset",
+        lambda h5, **kw: (seen.append({"h5": list(h5), **kw}), _StubDS())[1],
+    )
+    staging = _DataSchema.model_fields["staging"].annotation(
+        mode="node_local", root=str(tmp_path / "local"), min_free_gb=0.0
+    )
+    DatasetInstantiator._create_m4raw_repetition(
+        _m4raw_cfg(staging=staging, coil_maps_root=str(maps)),
+        [{"primary_path": str(files[0])}],
+        [{"primary_path": str(files[1])}],
+        None,
+        None,
+    )
+    local = str(tmp_path / "local")
+    assert all(str(p).startswith(local) for ds in seen for p in ds["h5"])
+    assert all(ds["coil_maps_root"].startswith(local) for ds in seen)
+    assert [p.name for p in seen[0]["h5"]] == [files[0].name]
+
+
+def test_fastmri_route_receives_staged_records_when_staging_is_on(monkeypatch, tmp_path) -> None:
+    import spectramr.data.builders.dataset_instantiator as inst
+
+    src = tmp_path / "vol.h5"
+    src.write_bytes(b"k")
+    seen: list[list[dict]] = []
+    monkeypatch.setattr(
+        inst, "UniversalMRIDataset", lambda **kw: (seen.append(kw["index"]), _StubDS())[1]
+    )
+    staging = _DataSchema.model_fields["staging"].annotation(
+        mode="node_local", root=str(tmp_path / "local"), min_free_gb=0.0
+    )
+    cfg = _DataSchema(dataset_type="kspace", staging=staging)
+    DatasetInstantiator._create_fastmri_universal(
+        cfg,
+        [{"primary_path": str(src), "slice_index": 2}],
+        [{"primary_path": str(src), "slice_index": 5}],
+        None,
+        None,
+        True,
+    )
+    assert all(r[0]["primary_path"].startswith(str(tmp_path / "local")) for r in seen)
+    assert [r[0]["slice_index"] for r in seen] == [2, 5]

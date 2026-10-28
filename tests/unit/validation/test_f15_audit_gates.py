@@ -49,6 +49,7 @@ def _mock_settings(**overrides) -> SimpleNamespace:
     model = SimpleNamespace(
         discriminator_component=overrides.pop("discriminator_component", None),
         discriminator=overrides.pop("discriminator", None),
+        model_kwargs=overrides.pop("model_kwargs", {}),
     )
     losses = SimpleNamespace(
         pinn=overrides.pop("losses_pinn", None),
@@ -178,6 +179,49 @@ def test_legacy_model_discriminator_layout_also_triggers() -> None:
     assert not result.passed, (
         "Legacy model.discriminator block must also trigger the audit gate."
     )
+
+
+def test_adversarial_loss_without_a_discriminator_fires() -> None:
+    """The converse: ``enable_adversarial`` with nothing to build a critic from.
+
+    Under ``training_mode: gan`` the optimizer builder raises at build time; under the
+    disentangled strategy the adversarial step was silently skipped (sabine job 17885803).
+    """
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    for mode in ("gan", ""):
+        cfg = _mock_settings(
+            training_mode=mode, losses_gan=SimpleNamespace(enable_adversarial=True)
+        )
+        result = ConfigHealthChecker().check_discriminator_requires_gan_losses(cfg)
+        assert not result.passed and result.severity == "error"
+        assert "model.discriminator_component" in result.message
+
+
+def test_a_discriminator_under_model_kwargs_is_named_as_the_cause() -> None:
+    """The shape the three disentangled arms had: the block one level too deep, never read."""
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    cfg = _mock_settings(
+        losses_gan=SimpleNamespace(enable_adversarial=True),
+        model_kwargs={"discriminator_component": {"name": "patchgan"}},
+    )
+    result = ConfigHealthChecker().check_discriminator_requires_gan_losses(cfg)
+    assert not result.passed
+    assert "model.model_kwargs.discriminator_component" in result.message
+
+
+def test_adversarial_off_without_a_discriminator_passes() -> None:
+    from spectramr.infrastructure.validation.config_health_checker import (
+        ConfigHealthChecker,
+    )
+
+    cfg = _mock_settings(losses_gan=SimpleNamespace(enable_adversarial=False))
+    assert ConfigHealthChecker().check_discriminator_requires_gan_losses(cfg).passed
 
 
 # ── Diffusion paradigm requirement (already exists, pinned for completeness) ─

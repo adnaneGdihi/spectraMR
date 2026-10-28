@@ -163,6 +163,17 @@ class RankUtility:
             dist.barrier()
 
 
+def _all_reduce_mean(tensor: torch.Tensor) -> None:
+    """In-place mean across ranks that also works on ``gloo``.
+
+    ``ReduceOp.AVG`` is NCCL-only, so on the CPU test lane it raised and the
+    callers' ``except`` turned that into a logged warning instead of a result.
+    SUM then divide is identical on every backend.
+    """
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+
+
 class DistributedLossAudit:
     """Audits loss computation across multiple GPUs."""
 
@@ -177,6 +188,9 @@ class DistributedLossAudit:
         self.logger = logger or logging.getLogger(__name__)
         self.rank = RankUtility.get_rank()
         self.world_size = RankUtility.get_world_size()
+        #: Whether this rank's last audit produced a finite loss (and, when asked,
+        #: a successful backward). ``None`` until an audit has run.
+        self._last_valid: bool | None = None
 
     def audit_loss_computation(
         self,
@@ -223,14 +237,17 @@ class DistributedLossAudit:
                 result.gradient_norm = grad_norm
                 result.backward_successful = True
 
-            # Synchronize losses across ranks
-            if self.world_size > 1:
-                self._synchronize_losses(result)
-
         except Exception as e:
             result.error_message = str(e)
             self.logger.error(f"[Rank {self.rank}] Loss audit failed: {e}")
 
+        # Outside the try: a rank whose loss was non-finite raised above and, with
+        # the sync inside it, skipped the collective its peers were already waiting
+        # in -- a hang, not an error.
+        if self.world_size > 1:
+            self._synchronize_losses(result)
+
+        self._last_valid = result.loss_valid and (not backward or result.backward_successful)
         result.sync_time_ms = (time.time() - start_time) * 1000
         return result
 
@@ -259,18 +276,20 @@ class DistributedLossAudit:
             return
 
         try:
-            loss_tensor = torch.tensor(
-                [result.loss_value],
+            # [loss or 0, 1 if valid else 0], summed: the mean is over the ranks that
+            # produced a loss, and every rank joins the collective whatever its outcome.
+            valid = result.loss_valid
+            packed = torch.tensor(
+                [result.loss_value if valid else 0.0, 1.0 if valid else 0.0],
                 device=(torch.cuda.current_device() if torch.cuda.is_available() else "cpu"),
             )
-
-            # All-reduce to compute average loss
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
 
             result.all_losses_synchronized = True
 
-            if RankUtility.is_main_rank():
-                self.logger.info(f"[Rank {self.rank}] Synchronized loss: {loss_tensor.item():.6f}")
+            if RankUtility.is_main_rank() and packed[1].item() > 0:
+                mean_loss = (packed[0] / packed[1]).item()
+                self.logger.info(f"[Rank {self.rank}] Synchronized loss: {mean_loss:.6f}")
 
         except Exception as e:
             self.logger.warning(f"[Rank {self.rank}] Failed to synchronize losses: {e}")
@@ -286,7 +305,7 @@ class DistributedLossAudit:
 
         # Broadcast validity from each rank
         result_tensor = torch.tensor(
-            [1 if hasattr(self, "_last_valid") else 0],
+            [1 if self._last_valid else 0],
             device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu",
         )
 
@@ -402,20 +421,25 @@ class DistributedTrainingContext:
         self.is_initialized = False
 
     def __enter__(self):
-        """Enter context and initialize distributed training."""
+        """Enter context and initialize distributed training.
+
+        Raises when the process group cannot be created. Warning and carrying on
+        left every rank running as an independent single-process job that still
+        reported success.
+        """
         if not dist.is_available():
             return self
 
         if not dist.is_initialized():
-            try:
-                dist.init_process_group(backend=self.backend)
-                self.is_initialized = True
-                logging.info(
-                    f"Initialized distributed training: "
-                    f"rank={self.rank}, world_size={self.world_size}"
-                )
-            except Exception as e:
-                logging.warning(f"Failed to initialize distributed training: {e}")
+            dist.init_process_group(backend=self.backend)
+            self.is_initialized = True
+            # Re-read: rank and world size are only authoritative once the group exists.
+            self.rank = RankUtility.get_rank()
+            self.world_size = RankUtility.get_world_size()
+            logging.info(
+                f"Initialized distributed training: "
+                f"rank={self.rank}, world_size={self.world_size}"
+            )
 
         return self
 
@@ -463,7 +487,7 @@ def synchronize_across_ranks(value: float, op: str = "mean") -> float:
     )
 
     if op == "mean":
-        dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+        _all_reduce_mean(tensor)
     elif op == "sum":
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     elif op == "min":

@@ -58,7 +58,7 @@ class _Identity(torch.nn.Module):
         # one for the soft path to be exercisable at all.
         self.dc_layer = SoftDataConsistency(lambda_init=0.5)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **_kw: object) -> torch.Tensor:
         self.seen.append(int(t[0]))
         return x
 
@@ -217,9 +217,16 @@ def test_reverse_stats_carries_the_mode_that_produced_the_schedule():
     """
     from spectramr.models.diffusion.kspace_process import VALID_REVERSE_MODES
 
-    for mode in sorted(VALID_REVERSE_MODES):
+    for mode in sorted(VALID_REVERSE_MODES - {"reveal_refine_dc", "support_ordered_dc"}):
         diffusion, _ = _build("hard", mode)
         assert diffusion.reverse_stats["reverse_mode"] == mode
+    # These two modes require a knob of their own, which `_build` does not pass.
+    for mode, knob in (("reveal_refine_dc", {"refine_alpha": 0.5}), ("support_ordered_dc", {"support_radius": 2})):
+        sampler = PhysicsInformedColdDiffusion(
+            model=_Identity(), num_timesteps=8, reverse_mode=mode, kspace_log_scaled=False, **knob
+        )
+        assert sampler.reverse_stats["reverse_mode"] == mode
+        assert sampler.reverse_stats["reverse_physics"]["decay_envelope"] == "off"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +266,7 @@ class _Recorder(nn.Module):
         self.timesteps: list[int] = []
         self.kspace_process = process
 
-    def forward(self, x, t):
+    def forward(self, x, t, **_kw):
         self.timesteps.append(int(t[0]))
         return torch.ones_like(x)
 
@@ -311,15 +318,16 @@ def test_neither_keying_leaves_an_unwritten_coefficient(mode):
 
 
 @pytest.mark.unit
-def test_t0_keying_costs_no_extra_model_calls():
-    """It moves which rung is skipped, not how many steps run: the head step
-    reveals nothing under the new keying, exactly as t=0 did under the old."""
+def test_t0_keying_costs_exactly_one_extra_model_call():
+    """One more call than the default keying: the head call now runs, because
+    each call sees M(schedule[i]) as its input, and the terminal t=0 call is real
+    (it rewrites the unobserved plane), so it is not skipped."""
     old_model, old_sampler, _ = _sample("replace_freeze_dc")
     new_model, new_sampler, _ = _sample("replace_freeze_dc_t0")
 
-    assert len(new_model.timesteps) == len(old_model.timesteps)
+    assert len(new_model.timesteps) == len(old_model.timesteps) + 1
     assert new_sampler.reverse_stats["effective_steps"] == (
-        old_sampler.reverse_stats["effective_steps"]
+        old_sampler.reverse_stats["effective_steps"] + 1
     )
 
 
@@ -349,10 +357,14 @@ def test_the_skip_gate_and_the_write_read_one_owner():
 
     from spectramr.models.diffusion import kspace_process as kp
 
+    from spectramr.models.diffusion import reveal_plan
+
     source = inspect.getsource(kp.PhysicsInformedColdDiffusion)
     assert source.count("def _reveal_support") == 1
     # Neither loop may re-derive the mask itself.
     assert "mask_next.float() * (1.0 - committed)" not in source
-    assert inspect.getsource(kp.PhysicsInformedColdDiffusion._step_reveals_anything).count(
-        "_reveal_support"
-    ) == 1
+    # Both the gate and the write read the plan, which walks the one owner.
+    assert "_reveal_support(" not in inspect.getsource(
+        kp.PhysicsInformedColdDiffusion._sample_replace_freeze_dc
+    )
+    assert inspect.getsource(reveal_plan.plan_reveals).count("_reveal_support(") == 1

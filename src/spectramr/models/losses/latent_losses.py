@@ -6,13 +6,19 @@ This module implements loss functions specifically designed for latent space
 models including VAE, VQ-VAE, and latent diffusion models.
 """
 
+from collections.abc import Callable
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.hooks import RemovableHandle
 
 from spectramr.models.losses.kl_divergence import KLDivergenceLoss
 from spectramr.models.losses.registry import register_loss
 from spectramr.models.losses.vq_losses import VQLoss  # Import canonical VQLoss
+
+_LATENT_REGULARIZATION_TYPES = ("l2", "sparsity", "diversity")
 
 
 @register_loss(name="latent_diffusion", aliases=["LatentDiffusionLoss"])
@@ -28,7 +34,7 @@ class LatentDiffusionLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{LatentDiffusion} = \\| \\epsilon_\theta(z_t, t) - \\epsilon \\|_2^2"""
+        \\mathcal{L}_{LatentDiffusion} = \\| \\epsilon_\\theta(z_t, t) - \\epsilon \\|_2^2"""
 
     def __init__(self, prediction_type: str = "epsilon", aux_weight: float = 0.0):
         """__init__.
@@ -117,31 +123,30 @@ class PerceptualLatentLoss(nn.Module):
 
         if weights is None:
             weights = tuple(1.0 / len(layers) for _ in layers)
+        if len(weights) != len(layers):
+            raise ValueError(f"got {len(weights)} weights for {len(layers)} layers")
         self.weights = weights
 
         # Register hooks to extract features
-        self.features = {}
-        self.hooks = []
+        self.features: dict[str, torch.Tensor] = {}
+        self.hooks: list[RemovableHandle] = []
 
         for layer_name in layers:
             layer = getattr(self.encoder, layer_name, None)
-            if layer is not None:
-                hook = layer.register_forward_hook(self._get_features_hook(layer_name))
-                self.hooks.append(hook)
+            if not isinstance(layer, nn.Module):
+                raise ValueError(
+                    f"PerceptualLatentLoss: encoder has no submodule {layer_name!r} to hook"
+                )
+            hook = layer.register_forward_hook(self._get_features_hook(layer_name))
+            self.hooks.append(hook)
 
-    def _get_features_hook(self, layer_name: str):
+    def _get_features_hook(
+        self, layer_name: str
+    ) -> Callable[[nn.Module, tuple[Any, ...], torch.Tensor], None]:
         """Create hook function for feature extraction."""
 
-        def hook(module, input, output):
-            """hook.
-
-            Args:
-                module (Any): Description.
-                input (Any): Description.
-                output (Any): Description.
-            Returns:
-                Any: Description.
-            """
+        def hook(module: nn.Module, input: tuple[Any, ...], output: torch.Tensor) -> None:
+            """Store ``output`` under ``layer_name``."""
             self.features[layer_name] = output
 
         return hook
@@ -187,11 +192,10 @@ class PerceptualLatentLoss(nn.Module):
         # Extract features
         features2 = {layer: self.features[layer] for layer in self.layers}
 
-        # Compute perceptual loss
-        loss = 0.0
-        for i, layer in enumerate(self.layers):
-            if layer in features1 and layer in features2:
-                loss += (self.weights[i] * F.mse_loss(features1[layer], features2[layer])).item()
+        # Stays a tensor so the term trains the encoder rather than only reporting a value.
+        loss = input1.new_zeros(())
+        for weight, layer in zip(self.weights, self.layers, strict=True):
+            loss = loss + weight * F.mse_loss(features1[layer], features2[layer])
 
         return loss
 
@@ -220,6 +224,11 @@ class LatentRegularizationLoss(nn.Module):
             weight (float): Description.
         """
         super().__init__()
+        if regularization_type not in _LATENT_REGULARIZATION_TYPES:
+            raise ValueError(
+                f"regularization_type must be one of {_LATENT_REGULARIZATION_TYPES}, "
+                f"got {regularization_type!r}"
+            )
         self.regularization_type = regularization_type
         self.weight = weight
 
@@ -253,16 +262,18 @@ class LatentRegularizationLoss(nn.Module):
             return self.weight * torch.mean(torch.abs(latent))
 
         if self.regularization_type == "diversity":
-            # Encourage diversity in latent space
-            # Compute pairwise distances and encourage separation
-            latent_flat = latent.view(latent.size(0), -1)
+            # Mean inverse pairwise distance over the B(B-1) off-diagonal pairs; an
+            # off-diagonal weight replaces boolean-mask indexing, which syncs on CUDA.
+            n = latent.size(0)
+            if n < 2:
+                raise ValueError("diversity regularization needs at least 2 latents per batch")
+            latent_flat = latent.reshape(n, -1)
             distances = torch.cdist(latent_flat, latent_flat, p=2)
-            # Exclude self-distances
-            mask = torch.eye(distances.size(0), device=latent.device).bool()
-            distances = distances[~mask].view(distances.size(0), -1)
-            return self.weight * torch.mean(1.0 / (distances + 1e-8))
+            off_diag = 1.0 - torch.eye(n, device=latent.device, dtype=distances.dtype)
+            inv = off_diag / (distances + 1e-8)
+            return self.weight * inv.sum() / (n * (n - 1))
 
-        return torch.tensor(0.0, device=latent.device)
+        raise ValueError(f"unknown regularization_type {self.regularization_type!r}")
 
 
 # Convenience functions for creating losses

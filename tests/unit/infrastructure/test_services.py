@@ -92,24 +92,20 @@ class TestEarlyStoppingService:
         assert not es.should_stop()
 
     # @# pytest.mark.timeout(30)
-    def test_early_stopping_iteration_based(self):
-        """Early stopping should be iteration-based."""
+    def test_early_stopping_patience_counts_updates(self):
+        """Patience counts ``update`` calls -- one per validation pass -- not iterations."""
         from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
         from spectramr.infrastructure.services.early_stopping import EarlyStoppingService
 
-        config = EarlyStoppingConfigSchema(
-            enabled=True,
-            patience=3,
-            check_interval=1000,
-        )
+        es = EarlyStoppingService(EarlyStoppingConfigSchema(enabled=True, patience=3))
 
-        es = EarlyStoppingService(config)
-
-        # Should check at iteration intervals
-        assert es.should_check(1000)
-        assert es.should_check(2000)
-        assert not es.should_check(500)
-        assert not es.should_check(0)
+        es.update(1.0, 1000)
+        for iteration in (2000, 3000):
+            es.update(1.0, iteration)
+            assert not es.should_stop()
+        es.update(1.0, 4000)
+        assert es.should_stop()
+        assert es.best_iteration == 1000
 
 
 # === Logging Service Tests ===
@@ -184,64 +180,6 @@ class TestMetricsService:
         assert result["loss"] == 0.5
         assert result["psnr"] == 25.0
         assert result["ssim"] == 0.9
-
-
-# === Checkpoint Service Tests ===
-class TestCheckpointService:
-    """Test checkpoint service."""
-
-    # @# pytest.mark.timeout(30)
-    def test_checkpoint_service_import(self):
-        try:
-            from spectramr.infrastructure.services.checkpoint_service import CheckpointService
-
-            assert CheckpointService is not None
-        except ImportError:
-            pytest.skip("CheckpointService not available")
-
-    # @# pytest.mark.timeout(60)
-    def test_checkpoint_save_creates_file(self, tmp_path):
-        """Checkpoint save should create file."""
-        import torch.nn as nn
-
-        model = nn.Linear(10, 5)
-        optimizer = OptimizationBuilder.create_single_optimizer(
-            model.parameters(), optimizer_type="adam"
-        )
-
-        checkpoint = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "iteration": 1000,
-        }
-
-        ckpt_path = tmp_path / "ckpt_1000.pt"
-        torch.save(checkpoint, ckpt_path)
-
-        assert ckpt_path.exists()
-
-    # @# pytest.mark.timeout(60)
-    def test_checkpoint_load_restores_state(self, tmp_path):
-        """Checkpoint load should restore state."""
-        import torch.nn as nn
-
-        # Original model
-        model1 = nn.Linear(10, 5)
-        original_weight = model1.weight.clone()
-
-        # Modify weights
-        model1.weight.data.fill_(1.0)
-
-        # Save
-        torch.save({"model": model1.state_dict()}, tmp_path / "ckpt.pt")
-
-        # Load into new model
-        model2 = nn.Linear(10, 5)
-        loaded = torch.load(tmp_path / "ckpt.pt")
-        model2.load_state_dict(loaded["model"])
-
-        # Weights should match
-        assert torch.allclose(model1.weight, model2.weight)
 
 
 # === Iteration Counter Service Tests ===

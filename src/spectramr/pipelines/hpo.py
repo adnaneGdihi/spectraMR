@@ -421,7 +421,7 @@ def _build_trial_yaml(
     # selectors so search spaces can target list-of-dict fields like
     # losses.kspace_losses[name=log_spectral].weight).
     # Imported from its canonical home, not re-exported through
-    # ``hpo_search_spaces``. That re-export existed, and `366e3e1a6` ("formating")
+    # ``hpo_search_spaces``. That re-export existed, and `366e3e1a6`, a formatting commit,
     # removed it as an unused import -- unused in that MODULE, but the only path
     # this line and the tests had. The result was an ImportError on every HPO
     # trial that applies an override, i.e. every HPO run, unseen because it is a
@@ -437,9 +437,8 @@ def _build_trial_yaml(
     cfg["training"]["max_iterations"] = int(max_iterations)
     cfg.setdefault("logging", {})["log_dir"] = str(out / "logs")
     cfg["logging"]["experiment_name"] = name
-    cfg.setdefault("checkpoint", {})["save_dir"] = str(out / "checkpoints")
-    cfg["checkpoint"]["checkpoint_dir"] = str(out / "checkpoints")
-    cfg.setdefault("artifacts", {})["persistent_root"] = str(out)
+    # `artifacts` has no reader (#698); a copied block would name the base arm's directory.
+    cfg.pop("artifacts", None)
     cfg.setdefault("loss_logging", {})["csv_path"] = str(out / "logs" / "loss_log.csv")
     cfg["loss_logging"]["output_dir"] = str(out / "metrics")
     cfg.setdefault("metrics", {})["output_dir"] = str(out / "metrics")

@@ -159,7 +159,7 @@ INTENTIONAL_EXEMPT: dict[str, str] = {
 LEGACY_EXEMPT_BUDGET: dict[str, int] = {
     "src/spectramr/infrastructure/physics/coil_sensitivity.py": 1,
     "src/spectramr/infrastructure/physics/dc_navigator.py": 2,
-    # digital_twin_extensions.py fully migrated to fft_ops.fft2c / ifft2c (0 raw
+    # the degradations package fully migrated to fft_ops.fft2c / ifft2c (0 raw
     # torch.fft.* calls) — stale budget entry removed per the "drop the entry"
     # contract of test_legacy_budget_entries_still_violate.
     "src/spectramr/infrastructure/physics/dipole.py": 2,

@@ -38,18 +38,13 @@ helper sat.
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 __all__ = [
-    "CHECKPOINT_STATE_KEYS",
     "WRAPPER_ATTRS",
     "WRAPPER_PREFIXES",
     "is_wrapped",
-    "resolve_state_dict",
     "strip_wrapper_prefixes",
     "unwrap_model",
 ]
@@ -113,8 +108,8 @@ def unwrap_model[T](model: T) -> T:
                 inner = nxt
                 break
         else:
-            return inner  # type: ignore[return-value]
-    return inner  # type: ignore[return-value]
+            return inner  # type: ignore[no-any-return]
+    return inner  # type: ignore[no-any-return]
 
 
 def is_wrapped(model: Any) -> bool:
@@ -194,110 +189,3 @@ def strip_wrapper_prefixes(state_dict: Mapping[str, Any]) -> dict[str, Any]:
         sources[name] = key
         stripped[name] = value
     return stripped
-
-
-#: Container keys a checkpoint writer may wrap a parameter state dict under.
-#: Two writers disagree -- ``CheckpointDirector`` emits ``generator`` while
-#: ``CheckpointService`` emits ``model_state_dict`` -- and the readers each grew
-#: around whichever one they happened to meet, which is the whole reason this
-#: list exists. ``generator_state_dict`` is read by the GAN inference strategies
-#: and kept so consolidating onto this SSOT loses none of their reach.
-#:
-#: ``ema_state_dict`` is deliberately NOT here: the EMA copy is a *different
-#: model*, not another spelling of this one, and silently preferring it would
-#: swap the weights under the caller.
-CHECKPOINT_STATE_KEYS: tuple[str, ...] = (
-    "model",
-    "state_dict",
-    "generator",
-    "model_state_dict",
-    "generator_state_dict",
-)
-
-
-def resolve_state_dict(
-    payload: Any,
-    model_keys: Collection[str],
-    *,
-    source: str,
-) -> dict[str, Any]:
-    """Resolve a loaded checkpoint payload to a state dict matching ``model_keys``.
-
-    Three failures are folded into one place, because every checkpoint reader in
-    the repo has to solve all three and each solved a different subset:
-
-    1. **The envelope.** Writers wrap the parameters under a container key, and
-       the two writers here disagree (see :data:`CHECKPOINT_STATE_KEYS`). A
-       reader that knows only its own spelling hands the *whole envelope* to
-       ``load_state_dict``.
-    2. **The prefixes.** :func:`strip_wrapper_prefixes`, applied after unwrapping,
-       so a compiled / DDP / FSDP checkpoint reads back into a bare model.
-    3. **The silent miss.** Zero key overlap raises *here* rather than reaching a
-       ``load_state_dict(strict=False)`` that loads nothing and reports success
-       (CLAUDE.md pitfalls #9/#16).
-
-    Candidates are chosen by **overlap, not by order**: every recognised
-    container plus the payload itself is tried, and the first one sharing a
-    parameter name with ``model_keys`` wins. Ranking by list order instead would
-    pick the config out of a ``{"model": <config>, "generator": <weights>}``
-    payload -- ``"model"`` is a container key *and* a common config section
-    name, and both are mappings, so the two cannot be told apart from outside.
-
-    Strictness is left to the caller: warm-start transfer wants ``strict=False``
-    (a partially-overlapping architecture still shares its trunk), inference
-    wants ``strict=True``. The overlap check is what makes ``strict=False`` safe.
-
-    Args:
-        payload: Whatever ``torch.load`` returned.
-        model_keys: ``model.state_dict().keys()`` for the destination model.
-        source: Path or description of the checkpoint, used in error messages.
-
-    Returns:
-        Plain dict of parameter name -> value, ready for ``load_state_dict``.
-
-    Raises:
-        TypeError: If ``payload`` is not a mapping at all.
-        ValueError: If no candidate shares a parameter name with ``model_keys``.
-    """
-    if not isinstance(payload, Mapping):
-        raise TypeError(
-            f"checkpoint {source!r} holds {type(payload).__name__}, not a "
-            "mapping; expected a state dict, or a dict wrapping one under one "
-            f"of {list(CHECKPOINT_STATE_KEYS)}."
-        )
-
-    candidates: list[tuple[str | None, Mapping[str, Any]]] = [
-        (key, inner)
-        for key in CHECKPOINT_STATE_KEYS
-        if isinstance(inner := payload.get(key), Mapping)
-    ]
-    candidates.append((None, payload))  # the payload may itself be the state dict
-
-    wanted = set(model_keys)
-    collision: ValueError | None = None
-    for envelope, candidate in candidates:
-        try:
-            resolved = strip_wrapper_prefixes(candidate)
-        except ValueError as exc:
-            # Two modules under names differing only by a wrapper prefix. That
-            # disqualifies this candidate, not the whole payload -- but keep it
-            # so a total failure reports the real reason, not "no overlap".
-            collision = collision or exc
-            continue
-        if wanted & set(resolved):
-            if envelope is not None:
-                logger.debug("checkpoint %s: parameters found under %r", source, envelope)
-            return resolved
-
-    if collision is not None:
-        raise collision
-    tried = [k for k, _ in candidates if k is not None] or ["<none>"]
-    found = ", ".join(sorted(map(str, payload))[:6]) or "<empty>"
-    expected = ", ".join(sorted(wanted)[:3]) or "<none>"
-    raise ValueError(
-        f"checkpoint {source!r} shares zero parameter names with the model. "
-        f"Tried containers {tried} and the payload itself; payload keys e.g. "
-        f"[{found}]; the model expects e.g. [{expected}]. Recognised container "
-        f"keys are {list(CHECKPOINT_STATE_KEYS)} -- refusing to load nothing "
-        "and report success."
-    )

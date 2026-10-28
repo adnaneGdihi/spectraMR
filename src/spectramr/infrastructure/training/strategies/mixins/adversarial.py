@@ -28,8 +28,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _resolve_disc_updates(config: Any) -> int:
-    """Return the discriminator-updates-per-G-step count.
+def _resolve_disc_updates(config: Any, *, iteration: int) -> int:
+    """Return the discriminator updates to run at ``iteration``.
+
+    ``losses.gan.disc_updates`` critic updates on every
+    ``losses.gan.disc_update_interval``-th iteration and none between, so every
+    strategy that builds a critic step takes its cadence from here.
 
     v6.0 SSOT path: ``config.losses.gan.disc_updates``. Reading a
     top-level ``config.disc_updates`` is the legacy flat-config pattern
@@ -50,6 +54,8 @@ def _resolve_disc_updates(config: Any) -> int:
             "Add a `losses.gan:` block to the YAML (the canonical home "
             "for `disc_updates`, `gan_loss_type`, R1 schedule, etc.)."
         )
+    if int(iteration) % int(gan_losses.disc_update_interval):
+        return 0
     return int(gan_losses.disc_updates)
 
 
@@ -213,7 +219,7 @@ class AdversarialMixin:
 
         iteration = kwargs.get("iteration", kwargs.get("step", 0))
         config = self.env.config if hasattr(self, "env") and self.env else self.state.config
-        num_d_updates = _resolve_disc_updates(config)
+        num_d_updates = _resolve_disc_updates(config, iteration=iteration)
 
         # State block used for metric reporting
         self._last_step_metrics = {}

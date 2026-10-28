@@ -19,7 +19,7 @@ from .cold_diffusion import ColdDiffusion
 from .cold_mri_sampler import ColdMRISampler
 
 # Import components for backward compatibility
-from .components import DiffusionPrior, EnhancedDeepDiffusionUNet, StandardDiffusionUNet
+from .components import DiffusionPrior, StandardDiffusionUNet
 from .diffusion_parts.kan_diffusion import ColdDiffusionKAN, DiffusionKAN
 from .diffusion_parts.score_based_diffusion import ScoreBasedDiffusion
 from .diffusion_parts.stable_diffusion import StableDiffusion
@@ -47,7 +47,6 @@ __all__ = [
     "Diffusion",
     "DiffusionKAN",
     "DiffusionPrior",
-    "EnhancedDeepDiffusionUNet",
     "LaplaceDiffusion",
     "RicianDiffusion",
     "ScoreBasedDiffusion",

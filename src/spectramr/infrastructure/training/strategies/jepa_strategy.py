@@ -28,11 +28,14 @@ The strategy:
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 
 from .base import BaseTrainingStrategy
 from .mixins.utils import pick_present
@@ -86,6 +89,16 @@ def multi_block_mask(
 class JEPAStrategy(BaseTrainingStrategy):
     """I-JEPA SSL strategy with multi-block masking + predictor head + EMA."""
 
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
+
+    # parallel_compat: The predictor is an owned module, built on every rank's first step (DDP
+    # broadcasts rank 0's initialisation) and run via call_owned. The target encoder is a
+    # frozen EMA copy of the inner generator, updated from the synchronised weights.
+    parallel_compat = frozenset({"replicated"})
+
     momentum: float = 0.996
     n_targets: int = 4
     ctx_scale: float = 0.85
@@ -96,12 +109,16 @@ class JEPAStrategy(BaseTrainingStrategy):
         self._target_encoder: nn.Module | None = None
         self._predictor: nn.Module | None = None
 
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("_predictor", OWNED_MODULE))
+
     def _ensure_modules(self, embed_dim: int) -> None:
         gen = getattr(self.env, "generator", None)
         if gen is None:
             return
         if self._target_encoder is None:
-            self._target_encoder = deepcopy(gen)
+            self._target_encoder = deepcopy(unwrap_model(gen))
             for p in self._target_encoder.parameters():
                 p.requires_grad = False
         if self._predictor is None:
@@ -110,16 +127,25 @@ class JEPAStrategy(BaseTrainingStrategy):
                 nn.GELU(),
                 nn.Linear(embed_dim * 2, embed_dim),
             ).to(next(gen.parameters()).device)
+            self.register_owned_module("_predictor", self._predictor)
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
                 opt.add_param_group({"params": list(self._predictor.parameters()), "lr": 1e-4})
+
+    def _materialize_owned_state(self, state: dict[str, Any]) -> None:
+        """Rebuild the target encoder and predictor, sizing the predictor from its saved weight."""
+        super()._materialize_owned_state(state)
+        saved = state.get("modules", {}).get("_predictor")
+        if saved is not None and self._predictor is None:
+            self._ensure_modules(int(saved["0.weight"].shape[1]))
 
     @torch.no_grad()
     def _ema_update(self) -> None:
         gen = getattr(self.env, "generator", None)
         if gen is None or self._target_encoder is None:
             return
-        for tgt_p, src_p in zip(self._target_encoder.parameters(), gen.parameters(), strict=False):
+        src = unwrap_model(gen).parameters()
+        for tgt_p, src_p in zip(self._target_encoder.parameters(), src, strict=False):
             tgt_p.mul_(self.momentum).add_(src_p.detach(), alpha=1 - self.momentum)
 
     @staticmethod
@@ -223,7 +249,7 @@ class JEPAStrategy(BaseTrainingStrategy):
         with torch.no_grad():
             full_out = self._embed_to_vector(self._target_encoder(image))
 
-        pred = self._predictor(ctx_out)
+        pred = self.call_owned("_predictor", ctx_out)
         loss = F.smooth_l1_loss(pred, full_out.detach())
 
         # (Removed a dead per-target ``area = m.float().mean()...item()`` loop

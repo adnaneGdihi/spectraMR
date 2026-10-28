@@ -4,12 +4,23 @@ This module provides registry-compatible wrappers for standard PyTorch losses.
 Metrics can be optionally computed during loss calculation.
 """
 
+import math
+from typing import Any
+
 import torch
 import torch.nn as nn
 
 from spectramr.models.losses.metrics_aware_loss import MetricsAwareLossMixin
 from spectramr.models.losses.registry import register_loss
 from spectramr.models.losses.validation import validate_loss_inputs
+
+_REDUCTIONS = frozenset({"mean", "sum", "none"})
+
+
+def _check_reduction(reduction: str) -> None:
+    """Refuse an unknown ``reduction``; the complex branches would treat it as ``none``."""
+    if reduction not in _REDUCTIONS:
+        raise ValueError(f"reduction={reduction!r} is not one of {sorted(_REDUCTIONS)}")
 
 
 @register_loss(name="l1", aliases=["mae", "mean_absolute_error"], domain="agnostic")
@@ -30,11 +41,14 @@ class L1Loss(MetricsAwareLossMixin, nn.L1Loss):
             reduction (str): Description.
             compute_metrics (bool): Description.
         """
+        _check_reduction(reduction)
         super().__init__(reduction=reduction)
         self.compute_metrics_flag = compute_metrics
 
+    # The (loss, metrics) tuple under compute_metrics=True is the mixin's contract,
+    # which forward_with_metrics unwraps; nn.L1Loss declares a bare Tensor.
     @validate_loss_inputs
-    def forward(
+    def forward(  # type: ignore[override]
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """forward.
@@ -67,7 +81,7 @@ class L1Loss(MetricsAwareLossMixin, nn.L1Loss):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute L1-specific metrics."""
         diff = pred - target
@@ -115,11 +129,13 @@ class MSELoss(MetricsAwareLossMixin, nn.MSELoss):
             reduction (str): Description.
             compute_metrics (bool): Description.
         """
+        _check_reduction(reduction)
         super().__init__(reduction=reduction)
         self.compute_metrics_flag = compute_metrics
 
+    # Same tuple contract as L1Loss.forward above.
     @validate_loss_inputs
-    def forward(
+    def forward(  # type: ignore[override]
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """forward.
@@ -152,7 +168,7 @@ class MSELoss(MetricsAwareLossMixin, nn.MSELoss):
         pred: torch.Tensor,
         target: torch.Tensor,
         loss_value: torch.Tensor,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute MSE-specific metrics."""
         diff = pred - target
@@ -194,7 +210,7 @@ class SmoothL1Loss(nn.SmoothL1Loss):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SmoothL1} = \text{SmoothL1}(|\\hat{y} - y|)"""
+        \\mathcal{L}_{SmoothL1} = \\text{SmoothL1}(|\\hat{y} - y|)"""
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if pred.is_complex() or target.is_complex():
@@ -237,7 +253,7 @@ class CrossEntropyLoss(nn.CrossEntropyLoss):
 class TotalVariationLoss(nn.Module):
     """Total Variation Loss."""
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean") -> None:
         """__init__.
 
         Args:
@@ -247,7 +263,7 @@ class TotalVariationLoss(nn.Module):
         self.reduction = reduction
 
     def forward(
-        self, pred: torch.Tensor, target: torch.Tensor | None = None, **kwargs
+        self, pred: torch.Tensor, target: torch.Tensor | None = None, **kwargs: Any
     ) -> torch.Tensor:
         """forward.
 
@@ -272,31 +288,33 @@ class TotalVariationLoss(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService.
         """
         x = pred
-        batch_size = x.size(0)
-        h_x = x.size(2)
-        w_x = x.size(3)
-        count_h = self._tensor_size(x[:, :, 1:, :])
-        count_w = self._tensor_size(x[:, :, :, 1:])
+        if x.ndim < 3:
+            raise ValueError(
+                f"TotalVariationLoss needs [B, C, *spatial] with at least one spatial "
+                f"axis; got shape {tuple(x.shape)}"
+            )
+        # One squared-difference term per spatial axis, each normalised by its own
+        # element count; a unit axis has no neighbours and would divide 0 by 0.
+        penalty: torch.Tensor | None = None
+        for axis in range(2, x.ndim):
+            n = x.size(axis)
+            if n < 2:
+                continue
+            diff = x.narrow(axis, 1, n - 1) - x.narrow(axis, 0, n - 1)
+            if x.is_complex():
+                axis_tv = (diff.real.square() + diff.imag.square()).sum()
+            else:
+                axis_tv = torch.pow(diff, 2).sum()
+            term = axis_tv / self._tensor_size(diff)
+            penalty = term if penalty is None else penalty + term
 
-        diff_h = x[:, :, 1:, :] - x[:, :, : h_x - 1, :]
-        diff_w = x[:, :, :, 1:] - x[:, :, :, : w_x - 1]
-
-        if x.is_complex():
-            h_tv = (diff_h.real.square() + diff_h.imag.square()).sum()
-            w_tv = (diff_w.real.square() + diff_w.imag.square()).sum()
-        else:
-            h_tv = torch.pow(diff_h, 2).sum()
-            w_tv = torch.pow(diff_w, 2).sum()
-
-        return 2 * (h_tv / count_h + w_tv / count_w) / batch_size
+        if penalty is None:
+            zero: torch.Tensor = x.real.sum() * 0.0
+            return zero
+        tv: torch.Tensor = 2 * penalty / x.size(0)
+        return tv
 
     @staticmethod
-    def _tensor_size(t):
-        """_tensor_size.
-
-        Args:
-            t (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return t.size(1) * t.size(2) * t.size(3)
+    def _tensor_size(t: torch.Tensor) -> int:
+        """Elements per sample: the product of every axis after the batch axis."""
+        return math.prod(t.shape[1:])

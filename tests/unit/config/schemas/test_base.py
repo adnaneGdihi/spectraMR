@@ -953,3 +953,63 @@ class TestExperimentMetadataVersionIsNotASchemaTier:
         from spectramr.config.schemas.base import ExperimentMetadataSchema
 
         assert ExperimentMetadataSchema(version="2.0").version == "2.0"
+
+
+class TestComparisonNote:
+    """``metadata.comparison_note``: typed, optional, declared where #2101 needs it."""
+
+    def test_defaults_to_none_and_rejects_a_non_string(self) -> None:
+        from spectramr.config.schemas.base import ExperimentMetadataSchema
+
+        assert ExperimentMetadataSchema().comparison_note is None
+        with pytest.raises(ValidationError):
+            ExperimentMetadataSchema(comparison_note={"two": "blocks"})
+
+    def test_the_dual_domain_arm_declares_its_second_attention_block(self) -> None:
+        from pathlib import Path
+
+        arm = (
+            Path(__file__).resolve().parents[4]
+            / "experiments/inprogress/kspace_filling/attention_shootout"
+            / "experiment_11_attention_dual_domain.yaml"
+        )
+        meta = TrainingSettings.from_yaml(str(arm)).metadata
+        note = meta.get("comparison_note") if isinstance(meta, dict) else meta.comparison_note
+        assert note and "PhaseSafeDualAttention" in note
+
+
+class TestExperimentMetadataTagsDefault:
+    def test_each_instance_gets_its_own_empty_tags(self) -> None:
+        from spectramr.config.schemas.base import ExperimentMetadataSchema
+
+        a, b = ExperimentMetadataSchema.model_construct(), ExperimentMetadataSchema.model_construct()
+        assert a.tags == {} and a.tags is not b.tags
+
+    def test_a_list_of_tags_still_becomes_a_dict(self) -> None:
+        from spectramr.config.schemas.base import ExperimentMetadataSchema
+
+        assert ExperimentMetadataSchema.validate_tags(["a", "b"]) == {"a": "a", "b": "b"}
+
+
+def test_the_mypy_hook_does_not_follow_imports_into_unrelated_packages() -> None:
+    """#2706: without --follow-imports=silent the torch-less hook env reports errors in
+    models/ for any commit under config/, core/ or domain/."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[4] / ".pre-commit-config.yaml").read_text()
+    mypy_block = text[text.index("id: mypy") :].split("- repo:")[0]
+    assert "--follow-imports=silent" in mypy_block
+
+
+class TestFSDPPrecisionDefault:
+    """sbatch pins no GPU type and the clusters mix Ada and V100 (no native bf16)."""
+
+    def test_precision_is_float32_unless_an_arm_declares_one(self) -> None:
+        from spectramr.config.schemas.base import FSDPConfigSchema
+
+        assert FSDPConfigSchema(enabled=True).mixed_precision is None
+
+    def test_an_arm_may_still_declare_bf16(self) -> None:
+        from spectramr.config.schemas.base import FSDPConfigSchema
+
+        assert FSDPConfigSchema(enabled=True, mixed_precision="bf16").mixed_precision == "bf16"

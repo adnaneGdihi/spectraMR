@@ -156,10 +156,22 @@ class TestDispatchNoCrash:
         assert isinstance(out, dict)
 
     def test_pilot_legacy_signature_migrated(self, monkeypatch):
-        # _compute_losses_impl now reads self._trajectory (to inject it into the
-        # batch); set it None so the guard short-circuits cleanly.
+        # The sampled UNet input needs a trajectory and its NUFFT; a PILOT built without
+        # them raises rather than passing the raw input through, so both are wired here.
+        from spectramr.infrastructure.distributed.owned_modules import OwnedParameter
+        from spectramr.infrastructure.physics.implementations.nufft_operator import NUFFTOperator
+
+        traj = torch.nn.Parameter(torch.randn(8, 2) * 0.1)
         s = _make(
-            PILOTStrategy, _codesign=types.SimpleNamespace(enabled=False), _trajectory=None
+            PILOTStrategy,
+            _codesign=types.SimpleNamespace(enabled=False),
+            _trajectory=traj,
+            _owned_modules={"_trajectory": OwnedParameter(traj)},
+            _owned_wrappers={},
+            _n_shots=1,
+            _samples_per_shot=8,
+            _im_size=(4, 4),
+            _nufft=NUFFTOperator(traj=(2 * torch.pi * traj.detach()).flip(-1).T, im_size=(4, 4)),
         )
         _patch_parent(monkeypatch, s)
         out = s._compute_losses_impl(input_batch=_LR, target_batch=_HR, epoch=0)

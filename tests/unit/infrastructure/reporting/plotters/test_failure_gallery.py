@@ -57,3 +57,14 @@ def test_many_cases_wrap_to_grid(tmp_path):
     out = failure_gallery.make(pd.DataFrame(), tmp_path / "f.png",
                                cases=[_case(i, f"c{i}") for i in range(6)])
     assert out is not None and out.exists()
+
+
+def test_a_path_is_refused_rather_than_opened_here(tmp_path):
+    """File loading belongs to the data layer (#2501); a path used to be opened
+    with nib/np/PIL and a failure silently dropped the panel."""
+    import pytest
+
+    case = _case(0, "c0")
+    case["target"] = str(tmp_path / "missing.nii.gz")
+    with pytest.raises(TypeError, match="takes arrays"):
+        failure_gallery.make(pd.DataFrame(), tmp_path / "f.png", cases=[case])

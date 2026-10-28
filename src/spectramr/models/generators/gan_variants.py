@@ -88,11 +88,12 @@ class _SelfAttention2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        q = self.query(x).flatten(2)
-        k = self.key(x).flatten(2)
-        v = self.value(x).flatten(2)
-        attn = F.softmax(torch.bmm(q.permute(0, 2, 1), k), dim=-1)
-        out = torch.bmm(v, attn.permute(0, 2, 1)).reshape(B, C, H, W)
+        # (B, 1, HW, E) single head; scale=1.0 keeps SAGAN's unscaled logits.
+        q = self.query(x).flatten(2).transpose(1, 2).unsqueeze(1)
+        k = self.key(x).flatten(2).transpose(1, 2).unsqueeze(1)
+        v = self.value(x).flatten(2).transpose(1, 2).unsqueeze(1)
+        out = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+        out = out.squeeze(1).transpose(1, 2).reshape(B, C, H, W)
         return x + self.gamma * out
 
 

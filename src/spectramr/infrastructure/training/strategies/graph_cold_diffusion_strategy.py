@@ -21,10 +21,15 @@ from typing import Any, ClassVar
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
 from spectramr.infrastructure.training.utils.transform_ops import FFTTransformer
+from spectramr.models.blocks.kspace_geometry_encoding import (
+    measurement_support,
+    model_consumes_acquired_plane,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,10 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
        ~90 % undersampled (the model never sees ``x_0``) and the schedule saturates
        flat from about ``t=200`` (the timestep conditioning carries almost no
        information). Selecting one raises rather than training an arm whose forward
-       process does not implement the paper it cites.\n    ## Cold Diffusion Concept
+       process does not implement the paper it cites. Since #612 the families nest
+       and start at the identity, but this strategy's schedule still declares rungs
+       between R=1 and R=1.33, which no rasterised trajectory covers, so building the
+       mask generator raises for them anyway.\n    ## Cold Diffusion Concept
 
     **Standard Diffusion**: x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε (Gaussian noise)
     **Cold Diffusion**: x_t = D_t(x_0) (Deterministic degradation)\n    Where D_t progressively removes information via:
@@ -264,8 +272,14 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         )
 
         accel_config = self.config.undersampling
+        acquisition = self.config.data.acquisition
         accelerator_kwargs = (
-            accelerator_kwargs_from_config(accel_config)[1] if accel_config else {}
+            accelerator_kwargs_from_config(
+                accel_config,
+                phase_encode_axis=None if acquisition is None else acquisition.phase_encode_axis,
+            )[1]
+            if accel_config
+            else {}
         )
         return KSpaceMaskGenerator(
             num_timesteps=self.config.training.diffusion.timesteps,
@@ -291,21 +305,38 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         """Initialize Cold Diffusion specific components."""
 
         # Diffusion timesteps from training config
-        self.timesteps = self.config.training.diffusion.timesteps
+        diffusion = self.config.training.diffusion
+        self.timesteps = diffusion.timesteps
 
         # Which k-space mask pattern drives the degradation. Resolved ONCE here so an
         # illegal value fails at setup rather than at the first training step.
         self.degradation_pattern = self._resolve_degradation_pattern()
+        self.degradation = diffusion.degradation or "kspace_mask"
+        if self.degradation not in self._DEGRADATIONS:
+            raise ValueError(
+                f"training.diffusion.degradation={self.degradation!r} is not a forward "
+                f"process of this strategy; choose one of {sorted(self._DEGRADATIONS)}."
+            )
+        self.rician_sigma_max = diffusion.rician_sigma_max
+        self.validation_timestep = int(diffusion.validation_timestep or 0)
 
         # B0 Simulation
         self._setup_b0_simulator()
 
         logger.info(
-            "[Cold Diffusion] Initialized: timesteps=%d, pattern=%s, b0_sim=%s",
+            "[Cold Diffusion] Initialized: timesteps=%d, degradation=%s, pattern=%s, "
+            "rician_sigma_max=%s, validation_timestep=%d, b0_sim=%s",
             self.timesteps,
+            self.degradation,
             self.degradation_pattern,
+            self.rician_sigma_max,
+            self.validation_timestep,
             self.b0_simulator is not None,
         )
+
+    def _snapshot_mask_pattern(self) -> str:
+        """Every mask call passes this, so the generator's default is never used."""
+        return self.degradation_pattern
 
     # Remove obsolete _get_physics_config method - direct access via self.config.physics
 
@@ -323,6 +354,12 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
     #: Supported by the mask generator, but with a cold-diffusion schedule that is
     #: inverted at t=0 and flat thereafter -- see the class docstring's table.
     _NON_CARTESIAN_PATTERNS = frozenset({"radial", "spiral", "golden_angle"})
+
+    #: ``training.diffusion.degradation`` -> the method that builds x_t and its support.
+    _DEGRADATIONS: ClassVar[dict[str, str]] = {
+        "kspace_mask": "_degrade_kspace_mask",
+        "rician": "_degrade_rician",
+    }
 
     def _resolve_degradation_pattern(self) -> str:
         """Resolve the configured k-space mask pattern, or refuse to guess.
@@ -345,12 +382,11 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
             raise ValueError(
                 f"physics.compressed_sensing.sampling_pattern={declared!r} is a "
                 "non-Cartesian family, which this strategy REFUSES for cold "
-                "diffusion. The mask stack does produce it, but its schedule is not a "
-                "degradation schedule: t=0 is already ~90% undersampled (so the model "
-                "never sees x_0) and the sampled fraction saturates flat from about "
-                "t=200 (so the timestep carries almost no information). See the class "
-                "docstring for the measured table and #1092. Use a Cartesian pattern, "
-                "or implement a real trajectory schedule first."
+                "diffusion. Its schedule declares rungs between R=1 and R=1.33, and a "
+                "rasterised trajectory covers at most ~79% of the grid, so the mask "
+                "generator refuses those rungs at build (#612). See the class "
+                "docstring and #1092. Use a Cartesian pattern, or give this strategy a "
+                "schedule whose first undersampled rung is at R >= 1.33."
             )
 
         if pattern not in _ACCELERATOR_REGISTRY:
@@ -418,36 +454,24 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         B = target_batch.shape[0]
         device = target_batch.device
 
-        # 1. Sample random timesteps t ∈ [0, T)
-        t = torch.randint(0, self.timesteps, (B,), device=device).long()
+        # 1. One degradation level for the batch. `_apply_degradation` builds one
+        #    mask per batch, so a per-sample draw labelled B-1 of every B samples
+        #    with a timestep they were not degraded at. Drawn on the host, so the
+        #    mask generator's integer needs no device sync (#1760).
+        t_val = int(torch.randint(0, self.timesteps, (1,)))
+        t = torch.full((B,), t_val, device=device, dtype=torch.long)
 
         # 2. Apply physics-based degradation (forward diffusion)
-        x_t, trajectory, target_signal = self._apply_degradation(target_batch, t, **kwargs)
+        x_t, trajectory, _target_signal, rung_mask = self._apply_degradation(
+            target_batch, t, t_val=t_val, **kwargs
+        )
 
-        # 3. Model prediction
-        # Pass degraded signal, trajectory, and timestep to model
-        forward_kwargs = self._build_forward_kwargs(x_t, t, trajectory, **kwargs)
+        # 3. Model prediction: degraded signal, trajectory, timestep and the rung mask.
+        forward_kwargs = self._build_forward_kwargs(x_t, t, trajectory, mask=rung_mask)
         pred_signal = self.env.generator(x_t, **forward_kwargs)
 
-        # [STABILITY FIX] NaN/Inf guard on model output.
-        # If the generator produces garbage (e.g., from DCF explosion or
-        # graph aggregation divergence), return a zero-grad loss rather
-        # than crashing backward() with NaN gradients.
-        if torch.isnan(pred_signal).any() or torch.isinf(pred_signal).any():
-            nan_frac = torch.isnan(pred_signal).float().mean().item()
-            inf_frac = torch.isinf(pred_signal).float().mean().item()
-            logger.warning(
-                "[GraphColdDiffusion] NaN/Inf detected in generator output "
-                "(NaN=%.4f%%, Inf=%.4f%%). Returning zero loss for this step.",
-                nan_frac * 100,
-                inf_frac * 100,
-            )
-            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            return {
-                "g_total_loss": zero_loss,
-                "timestep_mean": t.float().mean(),
-                "nan_skip": torch.tensor(1.0, device=device),
-            }
+        # A non-finite prediction is left to the executor's pre-backward guard;
+        # a zero-grad leaf here trained nothing and synced the host every step.
 
         # 4. Compute loss via SSOT loss_computer
         # Convert prediction to image domain if it is in k-space
@@ -507,8 +531,10 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         self,
         x_0: torch.Tensor,
         t: torch.Tensor,
+        *,
+        t_val: int,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """Apply the cold-diffusion degradation: k-space undersampling (+ optional B0).
 
         The middle return slot used to carry a non-Cartesian trajectory. It is always
@@ -520,40 +546,19 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
 
         Args:
             x_0: Clean signal ``[B, C, H, W]`` (or ``[B, C, H, W, D]``).
-            t: Timesteps ``[B]``.
+            t: Timesteps ``[B]``, uniform across the batch.
+            t_val: ``t``'s common value as a host integer, for the mask generator.
 
         Returns:
-            ``(x_t, None, target)`` -- degraded k-space, no trajectory, clean image.
+            ``(x_t, None, target, mask)`` -- degraded k-space, no trajectory, clean
+            image, and the rung mask ``x_t`` was sampled on (``[1 or B, C, H, W]``).
         """
         shape = x_0.shape
-        _B, _C, H, W = shape[0], shape[1], shape[2], shape[3]
+        H, W = shape[2], shape[3]
 
-        # ONE mask per batch, from the first element's timestep. This is the
-        # simplification the method already made; it is preserved deliberately rather
-        # than quietly upgraded to per-sample masking, which would change what every
-        # existing arm trains on.
-        t_val = t[0].item()
-
-        # 1. FFT to k-space.
-        k_full = self.fft_transformer.fft2c(x_0)
-
-        # 2. Mask at this degradation level, on the CONFIGURED pattern. This was
-        #    hardcoded to "random_cartesian" behind a comment claiming it was a
-        #    fallback for when NUFFT "fails" -- NUFFT never ran, so the fallback was
-        #    the only path, and physics.compressed_sensing.sampling_pattern reached
-        #    nothing. `self.degradation_pattern` is validated at setup.
-        if t_val > 0:
-            mask = self.mask_generator.generate_acceleration_mask(
-                timestep=t_val,
-                image_shape=(H, W),
-                pattern=self.degradation_pattern,
-            )
-            mask = self.mask_generator.expand_mask_to_channels(mask, k_full.shape[1])
-        else:
-            # t=0 is the CLEAN end of the schedule: fully sampled, no degradation.
-            mask = torch.ones_like(k_full)
-
-        x_t = k_full * mask
+        # 1-2. The declared forward process (validated at setup) at ``t_val``, the
+        #      host-side copy of the uniform ``t``: ONE level per batch.
+        x_t, mask = getattr(self, self._DEGRADATIONS[self.degradation])(x_0, t_val)
 
         # 3. Optional B0 phase corruption, scaled by position along the schedule.
         #
@@ -575,23 +580,75 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
             x_t = apply_b0_phase_shift(x_t, b0_map, None, t_val / self.timesteps)
 
         target_signal = x_0  # loss is against the clean image
-        return x_t, None, target_signal
+        return x_t, None, target_signal, mask.to(dtype=torch.float32)
+
+    def _degrade_kspace_mask(
+        self, x_0: torch.Tensor, t_val: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Undersample ``fft2c(x_0)`` with the rung mask of the CONFIGURED pattern.
+
+        The pattern was once hardcoded to "random_cartesian" behind a NUFFT "fallback"
+        that was the only path; ``self.degradation_pattern`` is validated at setup.
+        """
+        k_full = self.fft_transformer.fft2c(x_0)
+        if t_val > 0:
+            mask = self.mask_generator.generate_acceleration_mask(
+                timestep=t_val,
+                image_shape=(x_0.shape[2], x_0.shape[3]),
+                pattern=self.degradation_pattern,
+            )
+            mask = self.mask_generator.expand_mask_to_channels(mask, k_full.shape[1])
+        else:
+            # t=0 is the CLEAN end of the schedule: fully sampled, no degradation.
+            mask = torch.ones_like(k_full)
+        return k_full * mask, mask
+
+    def _degrade_rician(self, x_0: torch.Tensor, t_val: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``fft2c(|x_0 + sigma_t (n_r + i n_i)|)``, ``sigma_t = sigma_max * t / (T-1)``.
+
+        Fully sampled at every level: the information removed is SNR, not k-space
+        support. ``sigma_max`` is a fraction of each image's p99 magnitude (the
+        ``degrade_rician_noise`` unit), so the schedule is scale-invariant.
+        """
+        from spectramr.infrastructure.physics.degradations.slice2d.noise import (
+            degrade_rician_noise,
+        )
+
+        if not x_0.is_complex() and x_0.shape[1] != 1:
+            raise ValueError(
+                f"degradation: rician needs a complex image or a 1-channel magnitude, "
+                f"got a real {x_0.shape[1]}-channel x_0 whose channels it cannot pair."
+            )
+        theta = t_val / max(self.timesteps - 1, 1)
+        # A fresh realisation per step from the host RNG (seeded by
+        # initialize_accelerator); no device sync.
+        seed = int(torch.randint(0, 2**31 - 1, (1,)))
+        x_noisy = degrade_rician_noise(x_0, theta, seed=seed, sigma_max=self.rician_sigma_max)
+        k_t = self.fft_transformer.fft2c(x_noisy)
+        return k_t, torch.ones(k_t.shape, device=k_t.device, dtype=torch.float32)
 
     def _build_forward_kwargs(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
         trajectory: torch.Tensor | None,
-        **kwargs,
+        *,
+        mask: torch.Tensor,
     ) -> dict[str, Any]:
-        """Build kwargs for generator forward pass, filtering unsupported ones."""
+        """Build kwargs for generator forward pass, filtering unsupported ones.
+
+        ``mask`` is the support ``x_t`` carries: the rung mask in training, the
+        measurement's support in validation. It reaches only a model whose
+        geometry planes read it, and such a model raises without it.
+        """
         from .mixins.utils import _callable_accepts_kwarg
 
         forward_kwargs = {}
 
         # Only add timesteps if model accepts it
         # Safely get the underlying model to check its forward signature
-        underlying_model = getattr(self.env.generator, "model", self.env.generator)
+        _inner_gen = unwrap_model(self.env.generator)
+        underlying_model = getattr(_inner_gen, "model", _inner_gen)
 
         if _callable_accepts_kwarg(underlying_model.forward, "timesteps"):
             forward_kwargs["timesteps"] = t
@@ -605,6 +662,9 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
                 forward_kwargs["trajectory"] = trajectory
             if _callable_accepts_kwarg(underlying_model.forward, "k_trajectory"):
                 forward_kwargs["k_trajectory"] = trajectory
+
+        if model_consumes_acquired_plane(underlying_model):
+            forward_kwargs["mask"] = mask
 
         return forward_kwargs
 
@@ -634,11 +694,16 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         target_batch = target_batch.to(self.device, non_blocking=True)
 
         self.env.generator.eval()
-        # Use t=0 (no degradation) for clean reconstruction
-        t = torch.zeros(input_batch.shape[0], device=self.device, dtype=torch.long)
+        # The declared level the input is taken to sit at; at the default t=0 a cold
+        # model has learned the identity, so the forward process never shows here.
+        t = torch.full(
+            (input_batch.shape[0],), self.validation_timestep, device=self.device, dtype=torch.long
+        )
 
         # Build forward kwargs, filtering unsupported args
-        forward_kwargs = self._build_forward_kwargs(input_batch, t, None)
+        forward_kwargs = self._build_forward_kwargs(
+            input_batch, t, None, mask=measurement_support(input_batch)
+        )
 
         # Generate reconstruction
         reconstructed = self.env.generator(input_batch, **forward_kwargs)

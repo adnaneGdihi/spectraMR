@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from spectramr.config.schemas.data import DataProcessingConfigSchema
 from spectramr.infrastructure.training.strategies.mixins.metrics_mixin import MetricsMixin
 
 
@@ -113,7 +114,7 @@ def test_prediction_for_visualization_reduces_a_distribution_head():
     mixin = _Mixin()
     mixin.config = types.SimpleNamespace(
         model=types.SimpleNamespace(model_type="evidential_unet"),
-        data=types.SimpleNamespace(processing=types.SimpleNamespace(enable_log_scaling=False)),
+        data=types.SimpleNamespace(processing=DataProcessingConfigSchema()),
     )
     pred = torch.arange(4, dtype=torch.float32).reshape(1, 4, 1, 1)
 
@@ -226,7 +227,7 @@ class TestReportCaseId:
         recorder (``arrays`` / ``domain``) and the inference-artifact writer
         (``prediction`` / ``target``) -- and only the first is passed a context.
         Matching on the bare name ``observe`` would drag the other two in and make
-        this test red for implementors it has no claim over.
+        this test red for implementers it has no claim over.
         """
         import ast
         import pathlib
@@ -584,12 +585,21 @@ ARM = (
 )
 
 
-def _real_validation_config():
+def _real_validation_config(transform: str | None = "ifft_magnitude"):
+    """The arm's validation block; ``transform=None`` keeps the arm's own declaration.
+
+    The cohort grades with ``ifft_sense_adjoint`` now, so the tests that exercise the
+    map-free ``ifft_magnitude`` path pin it here instead of inheriting it from the arm.
+    """
     if not ARM.is_file():
         pytest.skip(f"arm not present: {ARM}")
     from spectramr.config.settings import TrainingSettings
 
-    return TrainingSettings.from_yaml(str(ARM)).validation
+    val = TrainingSettings.from_yaml(str(ARM)).validation
+    if transform is None:
+        return val
+    scoring = val.scoring.model_copy(update={"output_transform": transform})
+    return val.model_copy(update={"scoring": scoring})
 
 
 class _KspaceMixin(MetricsMixin):
@@ -600,9 +610,6 @@ class _KspaceMixin(MetricsMixin):
             data=SimpleNamespace(coil_processing_mode="none", num_virtual_coils=4),
             validation=None,
         )
-
-    def _slice_to_target_contrast(self, pred, target):
-        return pred, target
 
 
 @pytest.mark.unit
@@ -742,6 +749,47 @@ def test_scoring_output_transform_outranks_a_metrics_block_declaration() -> None
 
 
 @pytest.mark.unit
+def test_the_arm_grades_validation_with_sense_adjoint() -> None:
+    """Validation and training metrics share one coil combine (SENSE adjoint)."""
+    val_config = _real_validation_config(transform=None)
+
+    assert val_config.scoring.output_transform == "ifft_sense_adjoint"
+
+
+@pytest.mark.unit
+def test_sense_adjoint_with_maps_combines_the_coils_into_one_image() -> None:
+    host = _KspaceMixinWithMetricsBlock(transform="ifft_sense_adjoint")
+    host._current_smaps = torch.complex(torch.ones(1, 4, 32, 32), torch.zeros(1, 4, 32, 32)) / 2
+    kspace = torch.randn(1, 8, 32, 32)
+
+    out, target = host._apply_metric_transforms(kspace, kspace.clone(), "ifft_sense_adjoint")
+
+    assert out.shape == (1, 1, 32, 32)
+    assert target.shape == (1, 1, 32, 32)
+
+
+@pytest.mark.unit
+def test_explicit_maps_override_the_strategys_own_for_sense_adjoint() -> None:
+    """The measured-map scoring family hands its own maps; the strategy's must not win."""
+    host = _KspaceMixinWithMetricsBlock(transform="ifft_sense_adjoint")
+    host._current_smaps = torch.complex(torch.ones(1, 4, 32, 32), torch.zeros(1, 4, 32, 32)) / 2
+    override = torch.zeros(1, 4, 32, 32, dtype=torch.complex64)
+    override[:, 0] = 1.0  # all weight on coil 0
+    kspace = torch.randn(1, 8, 32, 32)
+
+    from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+    own = host._metric_transform_views(kspace, kspace.clone(), "ifft_sense_adjoint")
+    explicit = host._metric_transform_views(
+        kspace, kspace.clone(), "ifft_sense_adjoint", smaps=override
+    )
+    coil0 = ifft2c(torch.complex(kspace[:, 0], kspace[:, 1])).abs().unsqueeze(1)
+
+    assert not torch.allclose(own.pred, explicit.pred)
+    assert torch.allclose(explicit.pred, coil0, atol=1e-5)
+
+
+@pytest.mark.unit
 def test_the_none_sentinel_survives_raise_on_unknown() -> None:
     """21 arms declare `metrics.transform: 'none'` — a *truthy* string.
 
@@ -826,3 +874,128 @@ def test_a_host_copy_that_fails_is_not_swallowed():
     ]
     assert helpers, "_magnitude_np is gone; move this guard to its replacement"
     assert not any(isinstance(n, ast.Try) for n in ast.walk(helpers[0]))
+
+
+@pytest.mark.unit
+def test_ifft_target_magnitude_crosses_only_the_target() -> None:
+    """#2325: an image prediction against a k-space target.
+
+    The prediction is left in its domain (its magnitude); the 8-channel target
+    is paired, inverse-transformed and RSS-combined. ``ifft_magnitude`` would have
+    Fourier-transformed the prediction too.
+    """
+    from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+    pred = torch.randn(1, 2, 32, 32)
+    kspace = torch.randn(1, 8, 32, 32)
+    out, target = _KspaceMixin()._apply_metric_transforms(pred, kspace, "ifft_target_magnitude")
+
+    assert torch.allclose(out, torch.complex(pred[:, 0], pred[:, 1]).abs().unsqueeze(1))
+    coils = ifft2c(torch.complex(kspace[:, 0::2], kspace[:, 1::2]))
+    assert torch.allclose(target, coils.abs().pow(2).sum(1, keepdim=True).sqrt(), atol=1e-6)
+
+
+def _sense_batch(coils: int = 4, size: int = 16):
+    """Unit-norm complex maps, the anatomy, and its coil k-space interleaved."""
+    from spectramr.core.metrics.coil_manifold import as_interleaved
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    torch.manual_seed(0)
+    maps = torch.randn(1, coils, size, size, dtype=torch.complex64)
+    maps = maps / maps.abs().pow(2).sum(1, keepdim=True).sqrt()
+    anatomy = torch.rand(1, 1, size, size).to(torch.complex64)
+    return maps, anatomy, as_interleaved(fft2c(maps * anatomy))
+
+
+@pytest.mark.unit
+def test_sense_magnitude_combines_a_kspace_prediction_with_the_batch_maps() -> None:
+    from spectramr.core.metrics.sense_image_metrics import sense_scoring_pair
+
+    maps, anatomy, kspace = _sense_batch()
+    views = _KspaceMixin()._metric_transform_views(
+        kspace, kspace.clone(), "sense_magnitude", batch_data={"sensitivity_complex": maps}
+    )
+    expected, _ = sense_scoring_pair(kspace, kspace, maps)
+    assert views.pred.shape == (1, 1, 16, 16)
+    torch.testing.assert_close(views.pred, expected.abs())
+    torch.testing.assert_close(views.target, anatomy.abs(), atol=1e-5, rtol=0)
+    assert views.complex_pair is not None  # phase metrics see the SENSE image
+
+
+@pytest.mark.unit
+def test_sense_magnitude_takes_an_image_prediction_as_it_is() -> None:
+    """EI/SSDU emit one S^H-combined image; a second combine would be wrong."""
+    maps, anatomy, kspace = _sense_batch()
+    pred = torch.cat([anatomy.real, anatomy.imag], dim=1)
+    out, target = _KspaceMixin()._apply_metric_transforms(
+        pred, kspace, "sense_magnitude", batch_data={"sensitivity_complex": maps}
+    )
+    torch.testing.assert_close(out, anatomy.abs())
+    torch.testing.assert_close(out, target, atol=1e-5, rtol=0)
+
+
+@pytest.mark.unit
+def test_sense_magnitude_without_maps_raises_instead_of_scoring_rss() -> None:
+    """Planted: the RSS image is the one fallback a SENSE column must never take."""
+    from spectramr.core.metrics.sense_image_metrics import SenseMapsMissingError
+
+    _, _, kspace = _sense_batch()
+    with pytest.raises(SenseMapsMissingError):
+        _KspaceMixin()._apply_metric_transforms(kspace, kspace, "sense_magnitude")
+    with pytest.raises(SenseMapsMissingError):
+        _KspaceMixin()._apply_metric_transforms(
+            kspace, kspace, "sense_magnitude", batch_data={"input": kspace}
+        )
+
+
+@pytest.mark.unit
+def test_training_metrics_hand_the_training_batch_maps_to_sense_magnitude(monkeypatch) -> None:
+    """Step 1 of a fresh n2n arm: the metrics block names no transform, so the
+    validation ``sense_magnitude`` reaches the training metrics and needs the batch."""
+    maps, anatomy, kspace = _sense_batch()
+    host = _KspaceMixin()
+    host.config = SimpleNamespace(
+        data=host.config.data,
+        metrics=None,
+        validation=SimpleNamespace(scoring=SimpleNamespace(output_transform="sense_magnitude")),
+        training=SimpleNamespace(max_iterations=10),
+    )
+    seen: list[torch.Tensor] = []
+    computer = SimpleNamespace(compute=lambda p, t, **_: seen.append(p) or {"psnr": 1.0})
+    monkeypatch.setattr(type(host), "training_metrics_computer", property(lambda _: computer))
+
+    from spectramr.data.batch_types import BatchAdapter
+
+    # The loop's TrainingBatch: the real ``sensitivity`` binds to ``coil_maps``,
+    # the complex maps ride in ``metadata``.
+    batch = BatchAdapter.from_dict(
+        {
+            "input": kspace,
+            "target": kspace,
+            "sensitivity_complex": maps,
+            "sensitivity": maps.abs(),
+        }
+    )
+    out = host._compute_training_metrics(
+        kspace, kspace.clone(), host.config, 1, batch_data=batch
+    )
+    assert out == {"train_psnr": 1.0}
+    torch.testing.assert_close(seen[0], anatomy.abs(), atol=1e-5, rtol=0)
+
+
+def test_convert_metrics_to_floats_reduces_through_the_shared_reducer(monkeypatch):
+    """The reduction has one owner (``mixins.utils.reduce_on_device``), which the
+    per-step ``_handle_anomalies`` also uses; this seam only adds the transfer."""
+    from spectramr.infrastructure.training.strategies.mixins import metrics_mixin as mm
+
+    seen: list[str] = []
+    real = mm.reduce_on_device
+
+    def _spy(key, value):
+        seen.append(key)
+        return real(key, value)
+
+    monkeypatch.setattr(mm, "reduce_on_device", _spy)
+    out = MetricsMixin._convert_metrics_to_floats({"a": torch.tensor([1.0, 3.0]), "b": 4})
+    assert out == {"b": 4.0, "a": 2.0}
+    assert seen == ["a", "b"]

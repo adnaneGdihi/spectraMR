@@ -135,3 +135,49 @@ def test_the_subcommand_is_one_the_cli_actually_registers() -> None:
         f"the launcher emits `{subcommand}`, which the CLI does not register. "
         f"Registered: {sorted(choices)}"
     )
+
+
+class TestRendezvousPort:
+    def test_free_port_is_a_usable_unprivileged_port(self):
+        import socket
+
+        from spectramr.infrastructure.distributed.launcher import _free_port
+
+        port = _free_port()
+        assert 1024 < port < 65536
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", port))  # still free
+
+    def test_single_node_spawn_gets_a_port_unless_one_is_declared(self, monkeypatch):
+        from unittest.mock import patch
+
+        from spectramr.infrastructure.distributed import launcher
+
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+        with patch("torch.multiprocessing.spawn") as spawn:
+            launcher.launch_distributed(lambda **_: None, object(), num_devices=2)
+        spawn.assert_called_once()
+        import os
+
+        assert os.environ["MASTER_PORT"] != "29500"
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+
+    def test_a_declared_port_is_kept(self, monkeypatch):
+        import os
+        from unittest.mock import patch
+
+        from spectramr.infrastructure.distributed import launcher
+
+        monkeypatch.setenv("MASTER_PORT", "31234")
+        with patch("torch.multiprocessing.spawn"):
+            launcher.launch_distributed(lambda **_: None, object(), num_devices=2)
+        assert os.environ["MASTER_PORT"] == "31234"
+
+    def test_multi_node_command_carries_a_rendezvous_id_and_the_declared_port(self):
+        from spectramr.infrastructure.distributed import launcher
+
+        command = launcher.launch_distributed(
+            lambda **_: None, object(), num_devices=2, num_nodes=2
+        )
+        assert "--rdzv_id=${SLURM_JOB_ID:-spectramr}" in command
+        assert "$MASTER_ADDR:${MASTER_PORT:-29500}" in command

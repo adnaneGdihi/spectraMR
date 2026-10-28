@@ -60,6 +60,7 @@ def test_the_training_forward_conditions_on_the_contrast():
             torch.randn(1, 4, 32, 32),
             torch.zeros(1, dtype=torch.long),
             contrast_idx=torch.tensor([1]),
+            mask=torch.ones(1, 1, 32, 32),  # the rung support training always passes
         )
     assert len(fired) == 1
 
@@ -97,16 +98,28 @@ def test_the_chunked_validation_path_splits_the_contrast_with_the_measurement():
     """Per-element tensors must be split in step, or one subject gets another's id.
 
     This is the shape of #1914 — x and timesteps sliced while a per-element
-    tensor stayed batch-aligned — so it is pinned rather than argued.
+    tensor stayed batch-aligned — so it is pinned on the chunk loop's behaviour.
+    The loop is ``sample_reverse_path`` since #2067; validation delegates to it.
     """
-    from spectramr.infrastructure.training.strategies.diffusion import (
-        DiffusionTrainingStrategy,
-    )
+    from spectramr.models.diffusion.reverse_path import sample_reverse_path
 
-    src = inspect.getsource(DiffusionTrainingStrategy._sample_multistep_chunked)
-    assert "contrast_idx.split(chunk, dim=0)" in src, "contrast id is not chunked"
-    assert '"contrast_idx": contrast_c' in src, "the chunk's own id is not the one passed"
-    assert "if contrast_c is not None" in src, (
+    seen: list[dict] = []
+
+    class _Gen:
+        def sample(self, measurement, mask=None, inference_timesteps=None, **kwargs):
+            seen.append(kwargs)
+            return measurement
+
+    measurement = torch.arange(3.0).reshape(3, 1, 1, 1).expand(3, 2, 4, 4)
+    contrast = torch.tensor([0, 1, 2])
+    sample_reverse_path(
+        _Gen(), measurement, mask=None, steps=None, chunk_size=1, contrast_idx=contrast
+    )
+    assert [int(call["contrast_idx"]) for call in seen] == [0, 1, 2]
+
+    seen.clear()
+    sample_reverse_path(_Gen(), measurement, mask=None, steps=None, chunk_size=1)
+    assert all("contrast_idx" not in call for call in seen), (
         "the id must be omitted rather than passed as None: sample() is called "
         "generically and a generator predating contrast conditioning never "
         "declared the keyword"

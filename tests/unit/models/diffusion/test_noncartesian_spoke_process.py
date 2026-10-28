@@ -274,13 +274,12 @@ def test_an_arm_without_a_declared_ladder_raises() -> None:
     ("knob", "match"),
     [
         ({"enable_dynamic_mask": True}, "IS the acquisition"),
-        ({"prior_channel_range": (0, 1)}, "no grid bins"),
     ],
 )
 def test_knobs_this_acquisition_cannot_honour_raise(knob: dict, match: str) -> None:
     """Planted violation for the unread-knob shape (non-negotiable 8).
 
-    Both knobs steer the parent's Cartesian mask generator, which this process
+    The knob steers the parent's Cartesian mask generator, which this process
     does not consult. Accepting them would let an arm declare a behaviour that
     silently never happens.
     """
@@ -327,3 +326,52 @@ def test_the_published_mask_tracks_the_rung() -> None:
         retained.append(float(process.last_sample_measurement.mask.sum()))
     assert retained == sorted(retained, reverse=True)
     assert retained[0] > retained[-1], "the ladder must drop samples as it climbs"
+
+
+class TestLogScaledKspace:
+    """#2341: NUFFT resampling does not commute with log1p compression.
+
+    With the flag, compressed input must give the compressed image of the LINEAR
+    degradation, and the published measurement must be the linear one.
+    """
+
+    @staticmethod
+    def _pair(rung: int):
+        from spectramr.data.transforms.normalization import compress_kspace_log
+
+        x_linear = fft2c(_phantom(batch=1, channels=2)) * 40.0
+        linear, flagged = _process(), _process(kspace_log_scaled=True)
+        t = torch.tensor([rung])
+        x_t_lin, _ = linear.q_sample(x_linear, t)
+        m_lin = linear.last_sample_measurement.samples
+        x_t_flag, _ = flagged.q_sample(compress_kspace_log(x_linear), t)
+        return x_t_lin, m_lin, x_t_flag, flagged.last_sample_measurement.samples
+
+    @pytest.mark.parametrize("rung", [0, 3, 7])
+    def test_the_measurement_is_the_linear_one(self, rung: int) -> None:
+        _, m_lin, _, m_flag = self._pair(rung)
+        # Norm-relative: the float32 log1p/expm1 round trip leaves ~1e-3 absolute
+        # error on a handful of large samples, far below the defect's scale.
+        rel = float((m_flag - m_lin).abs().norm() / m_lin.abs().norm())
+        assert rel < 1e-4, rel
+
+    @pytest.mark.parametrize("rung", [0, 3, 7])
+    def test_x_t_is_the_compressed_linear_degradation(self, rung: int) -> None:
+        from spectramr.data.transforms.normalization import compress_kspace_log
+
+        x_t_lin, _, x_t_flag, _ = self._pair(rung)
+        torch.testing.assert_close(x_t_flag, compress_kspace_log(x_t_lin), rtol=1e-4, atol=1e-4)
+
+    def test_without_the_flag_compressed_input_gives_a_different_degradation(self) -> None:
+        """The defect: degrading the compressed plane is not compressing the degradation."""
+        from spectramr.data.transforms.normalization import compress_kspace_log
+
+        x_linear = fft2c(_phantom(batch=1, channels=2)) * 40.0
+        t = torch.tensor([7])
+        x_t_lin, _ = _process().q_sample(x_linear, t)
+        x_t_wrong, _ = _process().q_sample(compress_kspace_log(x_linear), t)
+        expected = compress_kspace_log(x_t_lin)
+        assert float((x_t_wrong - expected).abs().norm() / expected.abs().norm()) > 0.05
+
+    def test_the_flag_defaults_off(self) -> None:
+        assert _process().kspace_log_scaled is False

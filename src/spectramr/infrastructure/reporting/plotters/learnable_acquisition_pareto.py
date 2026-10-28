@@ -44,6 +44,8 @@ def render_learnable_acquisition_pareto(
     out_path: str | Path,
     arms: Iterable[ArmResult],
     title: str = "Learnable-acquisition shootout — Pareto",
+    formats: tuple[str, ...] = ("pdf", "png"),
+    dpi: int = 600,
 ) -> Path | None:
     """Delegates to ``headline_pareto.make`` after schema conversion."""
     df = _to_long_dataframe(list(arms))
@@ -54,6 +56,8 @@ def render_learnable_acquisition_pareto(
         cost="sampling_budget",
         maximise_metric=True,
         title=title,
+        formats=formats,
+        dpi=dpi,
     )
 
 

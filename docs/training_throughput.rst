@@ -58,6 +58,11 @@ unrolled cascades here. Requires CUDA parameters. Declaring it on an optimizer
 whose constructor has no such argument **raises** rather than silently training
 un-fused.
 
+Left unset, ``adam`` and ``adamw`` default to fused when every trainable parameter
+is a real floating CUDA tensor (the default is stamped in provenance as
+``applied_defaults``). An explicit ``fused: false`` wins; a complex or CPU parameter
+keeps the unfused path.
+
 **3. AMP** — ``optimization.precision: {enabled: true, dtype: bfloat16}``
 
 The largest single-GPU lever, and the first one that changes numerics.
@@ -97,9 +102,24 @@ mutually exclusive with DeepCompile (``check_compile_with_sharded_strategy``).
    the combination a hard audit error. Details under
    "Complex / k-space arms do not torch.compile" in :doc:`troubleshooting`.
 
+   A GAN that pairs a real-valued model with one that works on k-space compiles only
+   the real one: ``optimization.compile.apply_to: [generator]`` (or ``[discriminator]``)
+   leaves the other eager, and the check then passes with an info line instead of an
+   error. Naming a subset asserts the compiled models never see complex tensors; the
+   check still refuses ``generator`` when the registry marks the generator complex.
+
    Note this is about complex **dtype**, not complex arithmetic:
    ``ComplexConv2d`` stores real and imaginary parts as separate real tensors
    and compiles cleanly.
+
+**4b. Channels-last** — ``optimization.compile.channels_last: [generator]``
+
+Converts the named models to the NHWC memory format, which cuDNN and oneDNN run 2-D
+convolutions fastest in. It uses the ``apply_to`` target names and is independent of
+``compile.enabled``, so a GAN can convert its image-domain model and leave the k-space one
+alone. A model with no 4-D real weight is refused. The converted models are recorded on
+``TrainingEnvironment.memory_format``. Off by default and unmeasured: time it per arm on the
+target GPU before adopting it.
 
 **5. Gradient checkpointing** — ``optimization.gradient.enable_checkpointing``
 
@@ -206,3 +226,26 @@ cannot see CUDA OOM or a GradScaler trap, the two things it exists for.
 
    :doc:`accelerated_run_contract`
        Why a heavy pipeline raises instead of falling back to CPU.
+
+Defaults that favour throughput
+-------------------------------
+
+``checkpoint.async_write`` defaults to ``true``: the checkpoint file write moves to a
+background thread, and a failed write surfaces at the next save or at the end of the
+loop. Set it to ``false`` to write on the training thread. ``data.loader.persistent_workers``
+also defaults to ``true`` (workers, and their per-worker caches, stay alive between epochs).
+
+Node-local data staging
+-----------------------
+
+A random slice read from the shared filesystem costs tens of milliseconds, and a loader that
+does one per item per repetition can starve the GPU. ``data.staging.mode: node_local`` copies
+the k-space files the train, validation and test indices name (and, for M4Raw, the coil-map
+files they use) under ``data.staging.root`` (default ``/tmp``) once, in the main process before
+any worker starts, and reads the copies. The default ``off`` reads in place.
+
+Jobs that share a node serialise on one lock and reuse each other's copy; a copy interrupted by
+a kill is discarded and made again. A set that does not leave ``min_free_gb`` free raises;
+``when_full: read_in_place`` is the explicit, logged opt-out. Wired so far: M4Raw and the fastMRI-style HDF5 route (``kspace`` / ``image`` with an index); other dataset types read in place.
+``scripts/diagnostics/simulate_staging.py`` models the mechanism on a synthetic tree; it does not
+measure any cluster.

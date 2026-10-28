@@ -184,10 +184,10 @@ class TestPresets:
     def test_load_preset_returns_search_space(self):
         space = load_preset("kan_dual_domain")
         assert isinstance(space, SearchSpace)
-        # Plan §4.2 specifies 14 dimensions — the preset should match exactly.
-        # If this number drifts, it means someone changed the canonical
-        # search space without updating the test.
-        assert len(space) >= 12, f"kan_dual_domain shrank to {len(space)} dims"
+        # Pinned exactly: log_spectral left with the cohort's term, and a
+        # further drift means the canonical space changed.
+        assert len(space) == 11, f"kan_dual_domain has {len(space)} dims"
+        assert not any("log_spectral" in path for path in space.params)
 
     def test_load_preset_unknown_name_raises(self):
         with pytest.raises(KeyError, match="Unknown preset"):
@@ -402,8 +402,8 @@ class TestApplyDottedOverride:
         # Guard the guard: if a refactor drops the selector paths from the two
         # loss presets, this invariant would still pass while testing nothing.
         if preset_name in ("kan_dual_domain", "loss_weights_only"):
-            assert selectors == 4, (
-                f"{preset_name} should carry 4 list-selector loss paths; found {selectors}"
+            assert selectors == 3, (
+                f"{preset_name} should carry 3 list-selector loss paths; found {selectors}"
             )
 
 

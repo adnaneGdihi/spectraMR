@@ -53,9 +53,9 @@ References:
     * Andersson et al., "How to correct susceptibility distortions in
       spin-echo echo-planar images," NeuroImage 20:870, 2003.
 
-The expanded D1-D28 taxonomy with a deterministic ``(theta, seed)``
+The expanded degradation taxonomy with a deterministic ``(theta, seed)``
 contract suitable for Sobol / MI / BT meta-evaluation lives in
-:mod:`spectramr.infrastructure.physics.digital_twin_extensions`.
+:mod:`spectramr.infrastructure.physics.degradations`.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ import logging
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -79,11 +79,22 @@ from spectramr.core.quantile import (  # noqa: F401  (re-export: tests read the 
     QUANTILE_MAX_ELEMS as _QUANTILE_MAX_ELEMS,
 )
 from spectramr.core.quantile import robust_quantile as _robust_quantile
-from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.infrastructure.physics.emi_degradation import add_readout_tones
+from spectramr.infrastructure.physics.fft_ops import centred_freqs, fft2c, fftnc, ifft2c, ifftnc
+from spectramr.infrastructure.physics.line_axis import LINE_AXIS_DIM, line_axis_for
+from spectramr.infrastructure.physics.per_sample_rng import (
+    per_sample_normal_pair,
+    per_sample_rand,
+    per_sample_randn,
+)
 from spectramr.infrastructure.physics.severity import shape_severity_ratio
 from spectramr.infrastructure.physics.spherical_harmonics import (
     _build_2d_polynomial_basis,
 )
+
+
+if TYPE_CHECKING:
+    from spectramr.infrastructure.physics.scanner_profile import ScannerProfile
 
 logger = logging.getLogger(__name__)
 
@@ -423,7 +434,7 @@ def simulate_b0_inhomogeneity(
             torch.linspace(-1, 1, W, device=device),
             indexing="ij",
         )
-        coeffs = torch.randn(B, 6, device=device) * strength
+        coeffs = per_sample_randn(B, 6, device=device) * strength
         field_map = (
             coeffs[:, 0].view(B, 1, 1, 1) * X.unsqueeze(0).unsqueeze(0) ** 2
             + coeffs[:, 1].view(B, 1, 1, 1) * Y.unsqueeze(0).unsqueeze(0) ** 2
@@ -457,6 +468,11 @@ def simulate_b0_inhomogeneity(
     dropout = torch.exp(-dropout_scale * grad_norm)  # in (e^{-4}, 1]
     image_distorted = image * phase * dropout.to(image.dtype)
     return fft2c(image_distorted)
+
+
+def gre_flip_modulation(kappa: torch.Tensor, nominal_alpha: float) -> torch.Tensor:
+    """Long-TR (TR >> T1) GRE signal ratio ``sin(kappa * alpha) / sin(alpha)`` for a B1+ scale ``kappa``."""
+    return torch.sin(nominal_alpha * kappa) / math.sin(nominal_alpha)
 
 
 def simulate_b1_bias_field(
@@ -513,11 +529,10 @@ def simulate_b1_bias_field(
         indexing="ij",
     )
 
-    # Generate smooth B1+ efficiency map via random low-frequency modes
-    freq_x = torch.rand(B, 1, 1, 1, device=device) * 2
-    freq_y = torch.rand(B, 1, 1, 1, device=device) * 2
-    phase_x = torch.rand(B, 1, 1, 1, device=device) * 2 * math.pi
-    phase_y = torch.rand(B, 1, 1, 1, device=device) * 2 * math.pi
+    # Generate smooth B1+ efficiency map via random low-frequency modes, one per subject.
+    r = per_sample_rand(B, 4, 1, 1, 1, device=device)
+    freq_x, freq_y = r[:, 0] * 2, r[:, 1] * 2
+    phase_x, phase_y = r[:, 2] * 2 * math.pi, r[:, 3] * 2 * math.pi
 
     # B1+ efficiency map: 1.0 = nominal, deviation controlled by strength
     b1_plus = 1.0 + strength * (
@@ -532,10 +547,21 @@ def simulate_b1_bias_field(
         # Degenerate flip angle, fall back to linear
         return image * b1_plus
 
-    effective_alpha = nominal_alpha * b1_plus
-    modulation = torch.sin(effective_alpha) / sin_nominal
+    return image * gre_flip_modulation(b1_plus, nominal_alpha)
 
-    return image * modulation
+
+def outer_line_count(H: int, n_center: int, R: float) -> int:
+    """Outer PE lines to acquire so the TOTAL kept count realises acceleration ``R``.
+
+    The declared acceleration is a statement about the whole acquisition:
+    ``R = H / (lines actually acquired)`` — the fastMRI convention. The lines
+    already spent on the fully-sampled ACS centre therefore come *out of* the
+    budget, they are not free (issue #246: the old code budgeted
+    ``(H - n_center) / R`` outer lines *on top of* the ACS, so a declared R = 8
+    realised R = 5.3).
+    """
+    n_total = max(n_center, round(H / max(R, 1e-6)))
+    return max(0, n_total - n_center)
 
 
 def simulate_undersampling(
@@ -543,6 +569,7 @@ def simulate_undersampling(
     acceleration: float = 4.0,
     center_fraction: float = 0.08,
     return_mask: bool = False,
+    line_dim: int = -2,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Simulate Cartesian k-space undersampling.
 
@@ -561,24 +588,35 @@ def simulate_undersampling(
         center_fraction: Fraction of center lines to always acquire.
         return_mask: When True, also return the binary sampling mask
             ``[1, 1, H, 1]`` (broadcasts over B/C/W).
+        line_dim: The k-space dimension whose lines are kept or dropped, -2 (rows,
+            the default) or -1 (columns). The twin resolves it from
+            ``physics.digital_twin.mask_axis``.
 
     Returns:
         Undersampled k-space ``[B, C, H, W]``, or ``(kspace, mask)`` when
         ``return_mask`` is True.
     """
-    H, W = kspace.shape[-2], kspace.shape[-1]
+    if line_dim not in (-1, -2):
+        raise ValueError(f"line_dim must be -1 or -2, got {line_dim!r}")
+    N = kspace.shape[line_dim]
     device = kspace.device
 
-    center_lines = int(H * center_fraction)
-    center_start = H // 2 - center_lines // 2
+    center_lines = int(N * center_fraction)
+    center_start = N // 2 - center_lines // 2
     center_end = center_start + center_lines
 
-    num_outer = int((H - center_lines) / acceleration)
-    outer_indices = torch.randperm(H, device=device)[:num_outer]
+    # Outer lines come out of the R budget and are drawn from outside the centre, so the
+    # realised acceleration N / (lines kept) is the declared one.
+    num_outer = outer_line_count(N, center_lines, acceleration)
+    outer_pool = torch.cat(
+        [torch.arange(0, center_start, device=device), torch.arange(center_end, N, device=device)]
+    )
+    outer_indices = outer_pool[torch.randperm(outer_pool.numel(), device=device)[:num_outer]]
 
-    mask = torch.zeros(1, 1, H, 1, device=device)
-    mask[:, :, center_start:center_end, :] = 1.0
-    mask[:, :, outer_indices, :] = 1.0
+    line = torch.zeros(N, device=device)
+    line[center_start:center_end] = 1.0
+    line[outer_indices] = 1.0
+    mask = line.reshape(1, 1, N, 1) if line_dim == -2 else line.reshape(1, 1, 1, N)
 
     undersampled = kspace * mask
     if return_mask:
@@ -625,8 +663,9 @@ def simulate_gibbs_ringing(
     H, W = kspace.shape[-2], kspace.shape[-1]
     device = kspace.device
 
-    ky = torch.linspace(-1, 1, H, device=device).view(1, 1, -1, 1)
-    kx = torch.linspace(-1, 1, W, device=device).view(1, 1, 1, -1)
+    # Normalised k in [-1, 1) on the fft2c grid, so the window is centred on DC.
+    ky = (2.0 * centred_freqs(H, device)).view(1, 1, -1, 1)
+    kx = (2.0 * centred_freqs(W, device)).view(1, 1, 1, -1)
     radius = torch.sqrt(kx**2 + ky**2) / math.sqrt(2.0)  # in [0, 1]
 
     window = (radius <= truncation_fraction).float()
@@ -691,12 +730,28 @@ def simulate_concomitant_phase(
     x_m = torch.linspace(-fov_x_m / 2, fov_x_m / 2, W, device=device).view(1, 1, 1, W)
     r2 = x_m**2 + y_m**2  # [1, 1, H, W]
 
-    gamma = 2 * math.pi * 42.577e6  # rad / (s * T)
+    gamma = 2 * math.pi * GAMMA_BAR_HZ_PER_T  # rad / (s * T)
     g_t_per_m = gradient_amplitudes_mT_per_m * 1e-3
     tau_s = duration_ms * 1e-3
     phase = (gamma * g_t_per_m**2 * tau_s) / (8.0 * b0_T) * r2
 
     return image * torch.exp(1j * phase).to(image.dtype)
+
+
+#: Fat-water chemical-shift difference (ppm): the one owner of the value, re-exported by
+#: ``scanner_profile`` and read by every fat axis.
+DEFAULT_CHI_PPM = 3.5
+#: Proton gyromagnetic ratio gamma / 2 pi (Hz/T): the one owner for the twin and the registry axes.
+GAMMA_BAR_HZ_PER_T = 42.577e6
+
+
+def chemical_shift_pixels(
+    b0_tesla: float, bw_per_pixel_hz: float, sigma_cs_ppm: float = DEFAULT_CHI_PPM
+) -> float:
+    """Fat-water displacement along readout in pixels: gamma/2pi * B0 * sigma_cs / BW_pixel."""
+    if bw_per_pixel_hz <= 0:
+        raise ValueError(f"bw_per_pixel_hz must be > 0; got {bw_per_pixel_hz}.")
+    return GAMMA_BAR_HZ_PER_T * float(b0_tesla) * (sigma_cs_ppm * 1e-6) / float(bw_per_pixel_hz)
 
 
 def simulate_chemical_shift(
@@ -707,12 +762,12 @@ def simulate_chemical_shift(
     *,
     b0_T: float | None = None,
     bw_per_pixel_hz: float | None = None,
-    sigma_cs_ppm: float = 3.5,
+    sigma_cs_ppm: float = DEFAULT_CHI_PPM,
     fat_fraction_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""Simulate fat-water chemical shift displacement.
 
-    Fat and water have a ~3.5 ppm chemical shift, which displaces the
+    Fat and water have a ~3.5 ppm (``DEFAULT_CHI_PPM``) chemical shift, which displaces the
     fat signal by a few pixels along the frequency-encode direction.
     Modeled as a shifted copy of the image scaled by ``fat_fraction``.
 
@@ -741,7 +796,7 @@ def simulate_chemical_shift(
         b0_T: Optional main field strength in tesla. Together with
             ``bw_per_pixel_hz`` overrides ``shift_pixels``.
         bw_per_pixel_hz: Bandwidth per pixel along the readout axis.
-        sigma_cs_ppm: Fat-water chemical shift in ppm (default 3.5).
+        sigma_cs_ppm: Fat-water chemical shift in ppm (default ``DEFAULT_CHI_PPM``).
         fat_fraction_map: Optional ``[B|1, 1, H, W]`` (or broadcastable)
             real-valued spatial map of fat fraction. When given,
             overrides the scalar ``fat_fraction``.
@@ -753,12 +808,10 @@ def simulate_chemical_shift(
     device = kspace.device
 
     if b0_T is not None and bw_per_pixel_hz is not None and bw_per_pixel_hz > 0:
-        # 42.577 MHz/T is the canonical proton gyromagnetic ratio.
-        delta_f_hz = 42.577e6 * b0_T * (sigma_cs_ppm * 1e-6)
-        shift_pixels = float(delta_f_hz / bw_per_pixel_hz)
+        shift_pixels = chemical_shift_pixels(b0_T, bw_per_pixel_hz, sigma_cs_ppm)
 
     # Phase ramp along readout for sub-pixel shift
-    kx = torch.linspace(-0.5, 0.5, W, device=device).view(1, 1, 1, -1)
+    kx = centred_freqs(W, device).view(1, 1, 1, -1)
     phase_ramp = torch.exp(-1j * 2 * math.pi * kx * shift_pixels)
 
     # Chemical shift PARTITIONS the signal: a fraction `fat_fraction` of it resonates at
@@ -800,11 +853,13 @@ def simulate_eddy_current(
     H = kspace.shape[-2]
     device = kspace.device
 
-    # Linear + quadratic phase per PE line
-    line_idx = torch.linspace(-1, 1, H, device=device).view(1, 1, -1, 1)
+    # Linear + quadratic phase per PE line, u in [-1, 1) with u = 0 on the k-space centre
+    # line, so the linear term is an exact PE shift of alpha pixels.
+    line_idx = (2.0 * centred_freqs(H, device)).view(1, 1, -1, 1)
     B = kspace.shape[0]
-    alpha = torch.randn(B, 1, 1, 1, device=device) * strength
-    beta = torch.randn(B, 1, 1, 1, device=device) * strength * 0.5
+    ab = per_sample_randn(B, 2, device=device).view(B, 2, 1, 1, 1)
+    alpha = ab[:, 0] * strength
+    beta = ab[:, 1] * strength * 0.5
 
     phase = alpha * line_idx + beta * line_idx**2
     return kspace * torch.exp(1j * math.pi * phase)
@@ -821,28 +876,61 @@ def simulate_spike_noise(
     In image space these appear as sinusoidal stripe (zipper) patterns
     across the entire FOV, affecting both anatomy and markers equally.
 
+    A spike is one event in time, so it lands on the same k-space sample in
+    every receive coil; its complex value differs per coil. The amplitude is
+    relative to each sample's own RMS over its coils.
+
     Args:
         kspace: Complex k-space ``[B, C, H, W]``.
-        probability: Per-element probability of a spike.
+        probability: Per-sample-point probability of a spike.
         spike_amplitude: Relative amplitude of spikes vs signal RMS.
 
     Returns:
         k-space with spike noise ``[B, C, H, W]``.
     """
-    device = kspace.device
-    signal_rms = torch.sqrt(torch.mean(kspace.abs() ** 2)).clamp(min=1e-8)
+    if kspace.dim() != 4:
+        raise ValueError(f"simulate_spike_noise expects [B, C, H, W], got {tuple(kspace.shape)}")
+    return _add_kspace_spikes(kspace, probability, spike_amplitude)
 
-    # Random spike mask
-    spike_mask = (torch.rand_like(kspace.real) < probability).float()
-    # Random complex spikes
-    spike_vals = (
-        torch.complex(
-            torch.randn_like(kspace.real),
-            torch.randn_like(kspace.real),
+
+def simulate_spike_noise_volume(
+    kspace: torch.Tensor,
+    probability: float = 0.01,
+    spike_amplitude: float = 5.0,
+) -> torch.Tensor:
+    """:func:`simulate_spike_noise` on a 3-D k-space ``[B, C, D, H, W]``.
+
+    A spike is one ``(kz, ky, kx)`` sample, shared by every coil; its amplitude is relative
+    to each sample's RMS over coils and the whole 3-D k-space.
+    """
+    if kspace.dim() != 5:
+        raise ValueError(
+            f"simulate_spike_noise_volume expects [B, C, D, H, W], got {tuple(kspace.shape)}"
         )
-        * signal_rms
-        * spike_amplitude
+    return _add_kspace_spikes(kspace, probability, spike_amplitude)
+
+
+def _add_kspace_spikes(
+    kspace: torch.Tensor, probability: float, spike_amplitude: float
+) -> torch.Tensor:
+    B, C, *grid = kspace.shape
+    signal_rms = (
+        kspace.abs()
+        .pow(2)
+        .mean(dim=tuple(range(1, kspace.dim())), keepdim=True)
+        .sqrt()
+        .clamp(min=1e-8)
     )
+    # One row of draws per sample, so sample b does not depend on the batch size.
+    n = math.prod(grid)
+    draws = per_sample_rand(B, n + 2 * C * n, device=kspace.device)
+    spike_mask = (draws[:, :n] < probability).view(B, 1, *grid).float()
+    # Box-Muller turns the uniform draws into the complex Gaussian spike values.
+    u1 = draws[:, n : n + C * n].clamp(min=1e-12).view(B, C, *grid)
+    u2 = draws[:, n + C * n :].view(B, C, *grid)
+    spike_vals = (
+        torch.sqrt(-2.0 * torch.log(u1)) * torch.exp(2j * math.pi * u2) / math.sqrt(2.0)
+    ) * (signal_rms * spike_amplitude)
 
     return kspace + spike_mask * spike_vals
 
@@ -854,43 +942,36 @@ def simulate_rf_crosstalk(
     """Simulate multi-slice RF crosstalk.
 
     In multi-slice acquisitions, imperfect RF pulse profiles cause
-    signal from neighbouring slices to leak into the current slice.
-    Modeled as a blurred version of the image added at low amplitude.
+    signal from neighbouring slices to leak into the current slice. A single
+    2-D slice has no neighbours, so this is an in-plane proxy: a fraction of
+    the slice is replaced by a blurred copy of itself, ``(1 - f) x + f blur(x)``.
+    The mix conserves the mean intensity; adding the blur on top would
+    brighten the slice by ``f``. A through-plane model needs the depth axis.
 
     Args:
         image: Complex image ``[B, C, H, W]``.
-        crosstalk_fraction: Fraction of blurred signal to add.
+        crosstalk_fraction: Fraction ``f`` of the slice replaced by the blur.
 
     Returns:
         Image with RF crosstalk ``[B, C, H, W]``.
     """
-    # Gaussian blur to simulate PSF of neighbouring slice
-    kernel_size = 7
+    # Gaussian PSF (sigma 2 px) as a k-space window: circular, per coil, no padding.
     sigma = 2.0
-    coords = torch.arange(kernel_size, dtype=torch.float32, device=image.device)
-    coords = coords - kernel_size // 2
-    g = torch.exp(-(coords**2) / (2 * sigma**2))
-    kernel = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
-    kernel = kernel / kernel.sum()
-
-    # Apply per-channel
-    B, C, H, W = image.shape
-    pad = kernel_size // 2
-    blurred_parts = []
-    for c in range(C):
-        ch = image[:, c : c + 1]
-        # Blur real and imaginary separately
-        ch_real = F.conv2d(ch.real, kernel, padding=pad)
-        ch_imag = F.conv2d(ch.imag, kernel, padding=pad)
-        blurred_parts.append(torch.complex(ch_real, ch_imag))
-    blurred = torch.cat(blurred_parts, dim=1)
-
-    return image + crosstalk_fraction * blurred
+    k = fft2c(image)
+    fy = centred_freqs(k.shape[-2], k.device).view(-1, 1)
+    fx = centred_freqs(k.shape[-1], k.device).view(1, -1)
+    blurred = ifft2c(k * torch.exp(-2.0 * math.pi**2 * sigma**2 * (fx**2 + fy**2)))
+    f = float(crosstalk_fraction)
+    return (1.0 - f) * image + f * blurred
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Image-Space Physical Degradations (apply BEFORE FFT)
 # ──────────────────────────────────────────────────────────────────────
+
+
+#: BW_FE / BW_PE per sequence: 0 means no phase-encode shift.
+_B0_PE_BANDWIDTH_DIVISOR: dict[str, float] = {"spin_warp": 0.0, "epi": 8.0}
 
 
 def simulate_b0_geometric_distortion(
@@ -900,13 +981,12 @@ def simulate_b0_geometric_distortion(
     b0_strength: float = 0.3,
     return_field: bool = False,
     external_b0_field: torch.Tensor | None = None,
+    sequence: str = "spin_warp",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Simulate B0-induced geometric distortion via voxel shifting.
 
     Uses a Halbach-informed 2nd-order polynomial field model (cf. Koolstra
     et al., MAGMA 2021) to produce realistic B0 inhomogeneity patterns.
-    Displacement is applied along **both** the frequency-encode (readout)
-    and phase-encode axes:
 
     .. math::
 
@@ -914,9 +994,14 @@ def simulate_b0_geometric_distortion(
         \quad
         \Delta y_{\text{PE}} = \frac{\Delta B_0}{\text{BW}_{\text{pixel,PE}}}
 
-    The PE bandwidth is typically :math:`\sim 10\times` lower than the FE
-    bandwidth (due to echo-train length), making PE distortion the dominant
-    clinical artifact in EPI and TSE sequences.
+    ``sequence`` sets the phase-encode bandwidth. In Cartesian spin-warp and
+    TSE every phase-encode step is a separate excitation (or a refocused echo)
+    acquired at the same echo time, so off-resonance accrues no phase across
+    phase-encode lines: the PE bandwidth is effectively infinite and the shift
+    is along readout only (``"spin_warp"``, the default). In EPI the
+    phase-encode lines are read in one echo train, so the PE bandwidth is far
+    lower than the readout bandwidth and the PE shift dominates (``"epi"``,
+    modelled here as ``BW_PE = BW_FE / 8``).
 
     The field pattern is a 2nd-order polynomial (dominant Halbach mode)
     plus low-frequency manufacturing perturbations:
@@ -938,21 +1023,28 @@ def simulate_b0_geometric_distortion(
             ``im_size``) instead of the synthetic Halbach field — so the VF
             field-scoring grades the model against a real off-resonance pattern
             (its spatial structure + magnitude), not a random simulation.
+        sequence: ``"spin_warp"`` (readout-only shift) or ``"epi"``. Raises on
+            any other value.
 
     Returns:
         Geometrically distorted image ``[B, C, H, W]``. When ``return_field`` is
         True, instead returns ``(distorted_image, b0_map, shift_y_pixels)`` where
         ``b0_map`` is the applied B0 field in Hz ``[B, H, W]`` and
-        ``shift_y_pixels`` is the dominant (PE-axis) pixel displacement field —
-        the reference a tracker is expected to recover.
+        ``shift_y_pixels`` is the PE-axis pixel displacement field (all zeros
+        for ``"spin_warp"``) — the reference an EPI tracker is expected to recover.
     """
+    if sequence not in _B0_PE_BANDWIDTH_DIVISOR:
+        raise ValueError(
+            f"sequence must be one of {sorted(_B0_PE_BANDWIDTH_DIVISOR)}; got {sequence!r}."
+        )
     H, W = im_size
     device = image.device
     B = image.shape[0]
+    rdt = image.real.dtype
 
     Y, X = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
+        torch.linspace(-1, 1, H, device=device, dtype=rdt),
+        torch.linspace(-1, 1, W, device=device, dtype=rdt),
         indexing="ij",
     )
 
@@ -962,7 +1054,7 @@ def simulate_b0_geometric_distortion(
         # Halbach polynomial. The scoring then grades the model against a REAL
         # off-resonance pattern (its spatial structure + magnitude), not a
         # randomly-simulated one. Accept [B,H,W] or [B,1,H,W], any resolution.
-        b0_map = external_b0_field.to(device=device, dtype=torch.float32)
+        b0_map = external_b0_field.to(device=device, dtype=rdt)
         if b0_map.dim() == 4:
             b0_map = b0_map.squeeze(1)
         if b0_map.dim() == 2:
@@ -979,8 +1071,11 @@ def simulate_b0_geometric_distortion(
         # Peak B0 offset in Hz: 600 Hz at b0_strength=1.0 (centre-slice Halbach)
         peak_hz = 600.0 * b0_strength
 
-        # Random polynomial coefficients for each batch element
-        coeffs = torch.randn(B, 6, device=device)
+        # One row of draws per sample (6 coefficients, then the perturbation grid), so a
+        # subject's field does not depend on the batch size.
+        h_lo, w_lo = max(2, H // 16), max(2, W // 16)
+        draws = per_sample_randn(B, 6 + h_lo * w_lo, device=device, dtype=rdt)
+        coeffs = draws[:, :6]
         field = (
             coeffs[:, 0].view(B, 1, 1) * 0.05  # constant offset
             + coeffs[:, 1].view(B, 1, 1) * X.unsqueeze(0) * 0.1  # linear x
@@ -996,7 +1091,7 @@ def simulate_b0_geometric_distortion(
         field = field / field_max * peak_hz * 0.8  # [B, H, W] in Hz
 
         # Add low-frequency perturbation (manufacturing imperfections)
-        noise_low = torch.randn(B, 1, max(2, H // 16), max(2, W // 16), device=device)
+        noise_low = draws[:, 6:].view(B, 1, h_lo, w_lo)
         noise_up = F.interpolate(noise_low, size=(H, W), mode="bicubic", align_corners=False)
         noise_up = noise_up.squeeze(1)  # [B, H, W]
         noise_max = noise_up.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
@@ -1007,21 +1102,17 @@ def simulate_b0_geometric_distortion(
     # Frequency-encode (readout) bandwidth per pixel
     bw_fe = 1.0 / (W * dwell_time)  # Hz/pixel
 
-    # Phase-encode bandwidth is ~10× lower (ETL effect in TSE/EPI)
-    # This makes PE distortion the dominant clinical artifact
-    etl_factor = 8.0  # typical echo-train length
-    bw_pe = bw_fe / etl_factor  # Hz/pixel
-
-    shift_x_pixels = b0_map / bw_fe  # FE displacement [B, H, W]
-    shift_y_pixels = b0_map / bw_pe  # PE displacement [B, H, W]
+    # BW_PE / BW_FE; zero for spin-warp, whose PE bandwidth is infinite.
+    shift_x_pixels = readout_offset_px(b0_map, bw_fe)  # FE displacement [B, H, W]
+    shift_y_pixels = b0_map * (_B0_PE_BANDWIDTH_DIVISOR[sequence] / bw_fe)  # PE [B, H, W]
 
     # ── Build sampling grid with 2-axis displacement ─────────────────
     grid_y = Y.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
     grid_x = X.unsqueeze(0).expand(B, -1, -1)
 
-    # Convert pixel shifts to [-1, 1] grid coordinates
-    grid_x_shifted = grid_x + shift_x_pixels * (2.0 / W)
-    grid_y_shifted = grid_y + shift_y_pixels * (2.0 / H)
+    # One pixel is 2 / (N - 1) in align_corners=True grid coordinates.
+    grid_x_shifted = grid_x + shift_x_pixels * (2.0 / max(W - 1, 1))
+    grid_y_shifted = grid_y + shift_y_pixels * (2.0 / max(H - 1, 1))
 
     grid = torch.stack([grid_x_shifted, grid_y_shifted], dim=-1)  # [B, H, W, 2]
 
@@ -1036,6 +1127,11 @@ def simulate_b0_geometric_distortion(
     if return_field:
         return distorted, b0_map, shift_y_pixels
     return distorted
+
+
+#: Grid size at which ``severity`` was calibrated (~5% FOV at 7e-5); the displacement is
+#: a fraction of the FOV at every grid size.
+_GNL_REFERENCE_GRID = 256
 
 
 def simulate_gradient_nonlinearity(
@@ -1096,19 +1192,24 @@ def simulate_gradient_nonlinearity(
         coeffs = sh_coefficients.to(device)  # [2, K]
     else:
         # Generate random coefficients; zero the constant term (index 0)
-        # to prevent global translation, emphasise higher-order distortion
-        scale = severity * max(H, W)
+        # to prevent global translation, emphasise higher-order distortion.
+        # The basis is in normalised [-1, 1] coordinates, so the coefficient scale must
+        # not depend on the grid: severity is calibrated at a 256 grid and fixed there.
+        scale = severity * _GNL_REFERENCE_GRID
         coeffs = torch.randn(2, K, device=device) * scale
-        coeffs[:, 0] = 0.0  # No global offset
+        # Order 0 is a translation and order 1 (basis columns 1, 2: y, x) a gradient
+        # scale/shear error; neither is non-linearity, so only order >= 2 is kept.
+        coeffs[:, :3] = 0.0
 
     # Evaluate displacement fields
-    dx = (basis @ coeffs[0]).reshape(H, W)  # [H, W]
-    dy = (basis @ coeffs[1]).reshape(H, W)  # [H, W]
+    rdt = image.real.dtype
+    dx = (basis @ coeffs[0]).reshape(H, W).to(rdt)  # [H, W]
+    dy = (basis @ coeffs[1]).reshape(H, W).to(rdt)  # [H, W]
 
     # Base grid in [-1, 1]
     Y, X = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
+        torch.linspace(-1, 1, H, device=device, dtype=rdt),
+        torch.linspace(-1, 1, W, device=device, dtype=rdt),
         indexing="ij",
     )
 
@@ -1235,13 +1336,6 @@ def simulate_magic_angle(
         torch.linspace(-1, 1, W, device=device),
         indexing="ij",
     )
-    # Random smooth orientation field (radians)
-    freq = torch.rand(B, 1, 1, device=device) * 3 + 1
-    phase = torch.rand(B, 1, 1, device=device) * 2 * math.pi
-    theta = (
-        math.pi / 2 * torch.sin(freq * math.pi * X.unsqueeze(0) + phase)
-    )  # [B, H, W], range [-π/2, π/2]
-
     # ── Collagen mask — elliptical fibre patches drawn INSIDE the anatomy ──
     #
     # Issue #223. The patches used to be centred on ``U[-1, 1]^2`` — anywhere in
@@ -1263,33 +1357,37 @@ def simulate_magic_angle(
     ry_mean, rx_mean = 0.07 * radius_scale, 0.105 * radius_scale
     # Ellipse area in normalised [-1, 1]^2 coords; the FOV itself has area 4.
     avg_patch_area = math.pi * ry_mean * rx_mean
-    support_frac = float(support.mean().clamp(min=1e-3))
-    # Patches needed to cover `collagen_fraction` OF THE SUPPORT.
-    n_patches = max(1, round(collagen_fraction * support_frac * 4.0 / avg_patch_area))
-    n_patches = min(n_patches, 64)
 
-    # Sample patch centres from the support (multinomial over its voxels).
-    flat = support.reshape(B, -1) + 1e-12
-    idx = torch.multinomial(flat, n_patches, replacement=True)  # [B, n]
-    cy_px = (idx // W).float()
-    cx_px = (idx % W).float()
-    # Pixel index → normalised [-1, 1] coordinate (matches the meshgrid above).
-    cy = (2.0 * cy_px / max(H - 1, 1) - 1.0).view(B, n_patches, 1, 1)
-    cx = (2.0 * cx_px / max(W - 1, 1) - 1.0).view(B, n_patches, 1, 1)
+    # Each subject gets its own orientation field and patches, drawn in its own pass:
+    # the patch count follows that subject's support, and no draw depends on B.
+    thetas, masks = [], []
+    for b in range(B):
+        freq = torch.rand(1, 1, 1, device=device) * 3 + 1
+        phase = torch.rand(1, 1, 1, device=device) * 2 * math.pi
+        # Random smooth orientation field (radians), range [-pi/2, pi/2].
+        thetas.append(math.pi / 2 * torch.sin(freq * math.pi * X.unsqueeze(0) + phase))
 
-    ry = ((torch.rand(n_patches, device=device) * 0.1 + 0.02) * radius_scale).view(
-        1, n_patches, 1, 1
-    )
-    rx = ((torch.rand(n_patches, device=device) * 0.15 + 0.03) * radius_scale).view(
-        1, n_patches, 1, 1
-    )
-
-    Xe = X.view(1, 1, H, W)
-    Ye = Y.view(1, 1, H, W)
-    ellipse = ((Xe - cx) / rx) ** 2 + ((Ye - cy) / ry) ** 2  # [B, n, H, W]
-    col_mask = (ellipse < 1.0).any(dim=1).float()  # [B, H, W]
-    # Fibres exist only where there is tissue.
-    col_mask = col_mask * support
+        sup = support[b : b + 1]
+        support_frac = float(sup.mean().clamp(min=1e-3))
+        # Patches needed to cover `collagen_fraction` OF THE SUPPORT.
+        n_patches = max(1, round(collagen_fraction * support_frac * 4.0 / avg_patch_area))
+        n_patches = min(n_patches, 64)
+        # Sample patch centres from the support (multinomial over its voxels).
+        idx = torch.multinomial(sup.reshape(1, -1) + 1e-12, n_patches, replacement=True)
+        # Pixel index -> normalised [-1, 1] coordinate (matches the meshgrid above).
+        cy = (2.0 * (idx // W).float() / max(H - 1, 1) - 1.0).view(1, n_patches, 1, 1)
+        cx = (2.0 * (idx % W).float() / max(W - 1, 1) - 1.0).view(1, n_patches, 1, 1)
+        ry = ((torch.rand(n_patches, device=device) * 0.1 + 0.02) * radius_scale).view(
+            1, n_patches, 1, 1
+        )
+        rx = ((torch.rand(n_patches, device=device) * 0.15 + 0.03) * radius_scale).view(
+            1, n_patches, 1, 1
+        )
+        ellipse = ((X.view(1, 1, H, W) - cx) / rx) ** 2 + ((Y.view(1, 1, H, W) - cy) / ry) ** 2
+        # Fibres exist only where there is tissue.
+        masks.append((ellipse < 1.0).any(dim=1).float() * sup)
+    theta = torch.cat(thetas)  # [B, H, W]
+    col_mask = torch.cat(masks)  # [B, H, W]
 
     # Dipolar interaction term. Relaxed from exp(-10*d) to exp(-3*d)
     # so the magic-angle band is wider — the prior weighting was so
@@ -1324,43 +1422,35 @@ def simulate_rf_zipper(
     r"""Simulate RF zipper artifact from continuous-wave interference.
 
     An external RF source (e.g. a fluorescent light, monitoring equipment)
-    leaks into the receiver at a fixed frequency, mapping to a specific
-    :math:`k_x` column. This creates a **dense coherent line** along the
-    **phase-encoding axis** — distinct from random data spikes.
-
-    Each PE line receives the same amplitude but a different random phase
-    relative to the ADC clock:
+    leaks into the receiver at a fixed frequency. In readout time that is a
+    tone, so every PE line gains a complex exponential across all of its
+    :math:`k_x` samples, with a phase that is not locked to the ADC clock:
 
     .. math::
 
-        K[k_y, k_{x,\text{leak}}] \mathrel{+}= A \cdot e^{j\phi(k_y)}
+        K[k_y, k_x] \mathrel{+}= A \, e^{j\phi(k_y)} \, e^{j 2\pi x_0 k_x}
 
-    In image-space this produces a bright vertical line (zipper) at the
-    corresponding frequency-encode position.
+    In image space this is a bright vertical line (zipper) at frequency-encode
+    position :math:`x_0`, distinct from random data spikes. Adding the leak to
+    a single :math:`k_x` column instead would be a plane wave across the whole
+    FOV, not a line. The tone model is shared with the registry ``emi`` axis
+    (:func:`~spectramr.infrastructure.physics.emi_degradation.add_readout_tones`).
 
     Args:
         kspace: Complex k-space ``[B, C, H, W]``.
-        fe_location: Normalised position of the leak along the FE axis (0–1).
-        intensity_ratio: Amplitude relative to peak k-space magnitude.
+        fe_location: Image-space position of the zipper line along FE, as a
+            fraction of the FOV (0 to 1, 0.5 is the centre column).
+        intensity_ratio: RMS of the added interference relative to each
+            sample's k-space RMS.
 
     Returns:
         k-space with zipper artifact ``[B, C, H, W]``.
     """
-    H, W = kspace.shape[-2], kspace.shape[-1]
-    device = kspace.device
-    B, C = kspace.shape[:2]
-
-    kx_idx = int(W * fe_location)
-    kx_idx = min(max(kx_idx, 0), W - 1)
-
-    interference_amp = intensity_ratio * kspace.abs().amax(dim=(-2, -1), keepdim=True)
-
-    # Random phase per PE line per batch/channel
-    phase_noise = torch.exp(1j * torch.rand(B, C, H, 1, device=device) * 2 * math.pi)
-
-    corrupted = kspace.clone()
-    corrupted[..., kx_idx : kx_idx + 1] += interference_amp * phase_noise
-    return corrupted
+    W = kspace.shape[-1]
+    position = torch.tensor([(fe_location - 0.5) * W], device=kspace.device)
+    return add_readout_tones(
+        kspace, position, torch.ones(1, device=kspace.device), float(intensity_ratio)
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1414,32 +1504,29 @@ def simulate_rigid_motion_kspace(
     B, C = kspace.shape[0], kspace.shape[1]
 
     # --- Per-PE-line translation (Fourier shift theorem) ---
-    if generator is None:
-        dx = (torch.rand(B, H, device=device) * 2 - 1) * max_translation
-        dy = (torch.rand(B, H, device=device) * 2 - 1) * max_translation
-    else:
-        dx = (torch.rand(B, H, generator=generator, device=device) * 2 - 1) * max_translation
-        dy = (torch.rand(B, H, generator=generator, device=device) * 2 - 1) * max_translation
+    # One row of draws per sample, so sample b's trajectory does not depend on B.
+    n_poses = min(8, H)
+    draws = per_sample_rand(B, 2 * H + n_poses, generator=generator, device=device) * 2 - 1
+    dx = draws[:, :H] * max_translation
+    dy = draws[:, H : 2 * H] * max_translation
 
-    kx = torch.linspace(-0.5, 0.5, W, device=device).view(1, 1, 1, -1)  # [1, 1, 1, W]
-    ky = torch.linspace(-0.5, 0.5, H, device=device).view(1, 1, -1, 1)  # [1, 1, H, 1]
+    kx = centred_freqs(W, device).view(1, 1, 1, -1)  # [1, 1, 1, W]
+    ky = centred_freqs(H, device).view(1, 1, -1, 1)  # [1, 1, H, 1]
     dx = dx.view(B, 1, H, 1)
     dy = dy.view(B, 1, H, 1)
     trans_phase = torch.exp(-1j * 2 * math.pi * (kx * dx + ky * dy))  # [B, 1, H, W]
-    kspace = kspace * trans_phase
 
     # --- Per-PE-line rotation (image-space resample, gather by line) ---
+    # Line k_y sees pose (R_p, t_ky): rotate the object, take that pose's line, then apply
+    # the line's own translation phase. Translating first would rotate every line's
+    # translation together with its neighbours'.
     if max_rotation <= 0.0:
-        return kspace
+        return kspace * trans_phase
 
     # Discretise into a small number of poses so we don't rotate the
     # image H times. 8 poses captures the dominant ghost spectrum and
     # keeps the cost bounded.
-    n_poses = min(8, H)
-    if generator is None:
-        thetas = (torch.rand(B, n_poses, device=device) * 2 - 1) * max_rotation
-    else:
-        thetas = (torch.rand(B, n_poses, generator=generator, device=device) * 2 - 1) * max_rotation
+    thetas = draws[:, 2 * H :] * max_rotation
 
     image = ifft2c(kspace)  # [B, C, H, W]
 
@@ -1471,7 +1558,7 @@ def simulate_rigid_motion_kspace(
     line_to_pose = torch.linspace(0, n_poses - 1e-6, H, device=device).long()  # [H]
     gather_idx = line_to_pose.view(1, 1, 1, H, 1).expand(B, 1, C, H, W)
     gathered = torch.gather(rotated_k, dim=1, index=gather_idx)  # [B, 1, C, H, W]
-    return gathered.squeeze(1)
+    return gathered.squeeze(1) * trans_phase
 
 
 def simulate_periodic_motion(
@@ -1504,7 +1591,7 @@ def simulate_periodic_motion(
     # displacement: [H] → phase per PE line
 
     # Phase ramp along readout for each PE line
-    kx = torch.linspace(-0.5, 0.5, W, device=device).view(1, 1, 1, -1)
+    kx = centred_freqs(W, device).view(1, 1, 1, -1)
     dx = displacement.view(1, 1, -1, 1)  # [1, 1, H, 1]
 
     phase_shift = torch.exp(-1j * 2 * math.pi * kx * dx)
@@ -1535,7 +1622,7 @@ def simulate_random_shot_motion(
     # Random displacement per PE line (different per batch element)
     dx = (torch.rand(B, H, device=device) * 2 - 1) * max_shift  # [B, H]
 
-    kx = torch.linspace(-0.5, 0.5, W, device=device).view(1, 1, -1)  # [1, 1, W]
+    kx = centred_freqs(W, device).view(1, 1, -1)  # [1, 1, W]
     dx = dx.unsqueeze(-1)  # [B, H, 1]
 
     phase_shift = torch.exp(-1j * 2 * math.pi * kx * dx)  # [B, H, W]
@@ -1551,6 +1638,7 @@ def simulate_elastic_motion(
     im_size: tuple[int, int],
     num_modes: int = 4,
     amplitude: float = 2.0,
+    displacement_out: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Simulate non-rigid elastic deformation (e.g. brain pulsation).
 
@@ -1563,6 +1651,8 @@ def simulate_elastic_motion(
         im_size: Image dimensions ``(H, W)``.
         num_modes: Number of random Fourier modes for the displacement field.
         amplitude: Peak displacement in pixels.
+        displacement_out: When given, receives ``"px"``: the applied displacement ``[B, 2, H, W]``
+            (x, y) in pixels, so a caller can score motion recovery against ground truth.
 
     Returns:
         Elastically deformed k-space ``[B, C, H, W]``.
@@ -1598,6 +1688,11 @@ def simulate_elastic_motion(
     grid_y = Y.unsqueeze(0).expand(B, -1, -1) + disp_y
     grid_x = X.unsqueeze(0).expand(B, -1, -1) + disp_x
     grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
+    if displacement_out is not None:
+        # grid units span [-1, 1] over N pixels, so one unit is (N - 1) / 2 pixels.
+        displacement_out["px"] = torch.stack(
+            [disp_x * (W - 1) / 2.0, disp_y * (H - 1) / 2.0], dim=1
+        )
 
     # Apply in image space (handle complex via real/imag split)
     image = ifft2c(kspace)
@@ -1657,13 +1752,11 @@ def known_degradation_axes() -> frozenset[str]:
     sampling operators, ``nyquist_ghost``, ``susceptibility``, ``t2star_blur``,
     and the rest. Only sim2rank's sweep could name them.
 
-    The import is deferred on purpose: ``digital_twin_extensions`` imports *this*
-    module at its line 48, so a module-level import here would be circular. The
-    same deferral is used in that module (its line 1194).
+    The import is deferred on purpose: the registry's 2-D kernels
+    (``degradations/slice2d``) import *this* module, so a module-level import here
+    would be circular.
     """
-    from spectramr.infrastructure.physics.digital_twin_extensions import (
-        DEGRADATION_REGISTRY,
-    )
+    from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
     return NATIVE_DEGRADATION_AXES | frozenset(DEGRADATION_REGISTRY)
 
@@ -1671,6 +1764,73 @@ def known_degradation_axes() -> frozenset[str]:
 # ──────────────────────────────────────────────────────────────────────
 # Full Digital Twin Simulator
 # ──────────────────────────────────────────────────────────────────────
+
+
+#: Native stage -> the flag that enables it. The receiver noise is absent: it always runs, and
+#: it is the one native stage with a volume_3d form (white noise in 3-D k-space).
+_NATIVE_STAGE_FLAGS: dict[str, str] = {
+    "motion": "enable_motion",
+    "b0": "enable_b0",
+    "b1": "enable_b1",
+    "undersampling": "enable_undersampling",
+    "gibbs": "enable_gibbs",
+    "chemical_shift": "enable_chemical_shift",
+    "eddy_current": "enable_eddy_current",
+    "spike_noise": "enable_spike_noise",
+    "rf_zipper": "enable_rf_zipper",
+    "rf_crosstalk": "enable_rf_crosstalk",
+    "b0_distortion": "enable_b0_distortion",
+    "gradient_nonlinearity": "enable_gradient_nonlinearity",
+    "magic_angle": "enable_magic_angle",
+}
+
+_KSPACE_3D = (-3, -2, -1)
+
+
+def _fold_slices(t: torch.Tensor | None) -> torch.Tensor | None:
+    """``(B, C, D, H, W)`` -> ``(B*D, C, H, W)``: each slice of a stack is its own 2-D sample."""
+    if t is None or t.dim() != 5:
+        return t
+    b, c, d, h, w = t.shape
+    return t.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
+
+
+def _unfold_slices(t: torch.Tensor, b: int, d: int) -> torch.Tensor:
+    """The exact inverse of :func:`_fold_slices`; a batch-1 broadcast tensor gains a unit D."""
+    if t.shape[0] == b * d:
+        return t.reshape(b, d, *t.shape[1:]).permute(0, 2, 1, 3, 4)
+    if t.shape[0] == 1:
+        return t.unsqueeze(2)
+    raise ValueError(f"cannot unfold batch {t.shape[0]} into {b} subjects x {d} slices")
+
+
+def _reject_profile_conflicts(
+    profile: ScannerProfile,
+    im_size: tuple[int, int],
+    b0_dwell_time: float,
+    chemical_shift_pixels: float,
+) -> None:
+    """With a profile, a native dwell or fat shift away from its default must equal the profile's.
+
+    Compared by value against the schema default: the profile owns both quantities, so a
+    differing explicit value is a second owner.
+    """
+    from spectramr.config.schemas.physics import DigitalTwinConfig
+
+    defaults = DigitalTwinConfig.model_fields
+    owned = {
+        "b0_dwell_time": (b0_dwell_time, profile.readout_dwell_s(im_size[-1])),
+        "chemical_shift_pixels": (chemical_shift_pixels, profile.chemical_shift_max_px()),
+    }
+    for key, (given, derived) in owned.items():
+        default = defaults[key].default
+        if not math.isclose(given, default) and not math.isclose(given, derived):
+            raise ValueError(
+                f"physics.digital_twin.{key}={given} conflicts with the "
+                f"physics.digital_twin.acquisition profile {profile.name!r}, which derives "
+                f"{key}={derived:.6g} from B0 and readout_bw_hz_per_px. The profile owns it: "
+                f"drop {key} or the acquisition block."
+            )
 
 
 class DigitalTwinSimulator(nn.Module):
@@ -1770,6 +1930,9 @@ class DigitalTwinSimulator(nn.Module):
         marker_is_water_only: bool = False,
         per_channel_marker_prior: bool = False,
         coherent_3d_motion: bool = False,
+        scanner_profile: ScannerProfile | None = None,
+        mask_axis: str | None = None,
+        phase_encode_axis: int | None = None,
     ) -> None:
         super().__init__()
         self.im_size = im_size
@@ -1798,6 +1961,13 @@ class DigitalTwinSimulator(nn.Module):
         self.b1_strength = b1_strength
         self.acceleration = acceleration
         self.gibbs_truncation = gibbs_truncation
+        # ``mask_axis`` unset keeps the historical rows (dim -2) mask; set, it resolves
+        # through the dataset's phase-encode axis and raises when that is undeclared.
+        if mask_axis is None:
+            self.undersampling_line_axis = "y"
+        else:
+            self.undersampling_line_axis = line_axis_for(mask_axis, phase_encode_axis)
+        self.undersampling_line_dim = LINE_AXIS_DIM[self.undersampling_line_axis]
 
         self.enable_motion = enable_motion
         self.enable_b0 = enable_b0
@@ -1837,6 +2007,17 @@ class DigitalTwinSimulator(nn.Module):
         # Mod4 --- 3-D inputs use one motion trajectory per subject instead
         # of independent per-slice motion.
         self.coherent_3d_motion = coherent_3d_motion
+        # Conditions the stage-5 registry operators and owns the native stages' field, dwell,
+        # shift model, fat shift and fat fraction; None keeps every stage on its own knobs.
+        self.scanner_profile = scanner_profile
+        self._b0_sequence = "epi"
+        if scanner_profile is not None:
+            _reject_profile_conflicts(scanner_profile, im_size, b0_dwell_time, chemical_shift_pixels)
+            # Resolved here so a non-Cartesian profile fails at build, not mid-training.
+            if enable_b0_distortion or "b0_geometric_distortion" in (progressive_degradations or []):
+                self._b0_sequence = b0_shift_sequence(scanner_profile.sequence)
+            if scanner_profile.geometry.mode is AcquisitionMode.VOLUME_3D:
+                self._reject_volume_native_stages()
 
         # Range configurations for progressive cold diffusion
         self.progressive_degradations = progressive_degradations or []
@@ -1928,16 +2109,19 @@ class DigitalTwinSimulator(nn.Module):
         self.last_undersampling_mask: torch.Tensor | None = None
         # Applied B0 field (Hz) + dominant PE pixel-shift field, exposed for
         # field self-consistency scoring; only populated when B0 geometric
-        # distortion fires this pass (see forward + _score_field).
+        # distortion fires this pass (see forward + _score_field). After a
+        # multislice_2d forward both stay in the folded (B*D, ...) slice layout.
         self.last_b0_field: torch.Tensor | None = None
         self.last_pe_shift_field: torch.Tensor | None = None
+        self.last_elastic_displacement_px: torch.Tensor | None = None
 
         logger.info(
             "[DigitalTwinSimulator] im_size=%s, marker=%s, motion=%s(%s), "
             "B0=%s(%.1f), B1=%s(%.1f), undersamp=%s(%.1fx), gibbs=%s(%.2f), "
             "chem_shift=%s(%.1f), eddy=%s(%.2f), spikes=%s(%.3f), crosstalk=%s(%.3f), "
             "b0_distort=%s, grad_nl=%s(%.1e), zipper=%s(%.2f), magic=%s, "
-            "progressive=%s, ranges=%s, schedule=%s, per_axis_schedules=%s",
+            "progressive=%s, ranges=%s, schedule=%s, per_axis_schedules=%s, "
+            "scanner_profile=%s, undersamp_line_axis=%s",
             im_size,
             marker_type,
             motion_type,
@@ -1970,6 +2154,8 @@ class DigitalTwinSimulator(nn.Module):
             self.degradation_ranges,
             self.degradation_schedule,
             self.degradation_schedules,
+            None if scanner_profile is None else scanner_profile.to_meta(),
+            self.undersampling_line_axis,
         )
 
     @property
@@ -2013,6 +2199,37 @@ class DigitalTwinSimulator(nn.Module):
         vmin, vmax = self.degradation_ranges.get(feat, (0.0, 1.0))
         return vmin + (vmax - vmin) * eff
 
+    def _b0_field_scale(self) -> float:
+        """Off-resonance scale ``B0 / 3 T`` of the profile; 1.0 without one."""
+        return 1.0 if self.scanner_profile is None else self.scanner_profile.b0_field_scale()
+
+    @property
+    def acquisition_geometry(self) -> AcquisitionGeometry | None:
+        """The geometry the scanner profile declares; ``None`` without a profile."""
+        return None if self.scanner_profile is None else self.scanner_profile.geometry
+
+    def _input_geometry(
+        self, x: torch.Tensor, geometry: AcquisitionGeometry | None
+    ) -> AcquisitionGeometry:
+        """The acquisition ``x`` came from: the per-call geometry or the profile's, never both."""
+        if geometry is not None and self.scanner_profile is not None:
+            raise ValueError(
+                "forward(geometry=...) and physics.digital_twin.acquisition both declare the "
+                "acquisition; the scanner profile carries its geometry, so pass one, not both"
+            )
+        return resolve_geometry(x, geometry if geometry is not None else self.acquisition_geometry)
+
+    def _reject_volume_native_stages(self, *inputs: str) -> None:
+        """volume_3d has no native-stage implementation yet; ``inputs`` names native-only inputs."""
+        stages = [s for s, flag in _NATIVE_STAGE_FLAGS.items() if getattr(self, flag)]
+        if stages or inputs:
+            raise ValueError(
+                f"volume_3d input: native twin stage(s) {stages} and input(s) {list(inputs)} "
+                "have no 3-D implementation until the degradation-bank consolidation "
+                "(TODO/plan_degradation_bank_consolidation.md). Disable them and use the "
+                "registry axes (progressive_degradations), or declare multislice_2d."
+            )
+
     def _schedule_for(self, feat: str) -> str:
         """Per-axis ramp shape, falling back to the arm-wide default."""
         return self.degradation_schedules.get(feat, self.degradation_schedule)
@@ -2035,14 +2252,39 @@ class DigitalTwinSimulator(nn.Module):
         return self._get_effective_cf(axis, ratio)
 
     @classmethod
-    def from_config(cls, dt: Any, im_size: tuple[int, int]) -> DigitalTwinSimulator:
+    def from_config(
+        cls,
+        dt: Any,
+        im_size: tuple[int, int],
+        *,
+        field_strength_t: float | None = None,
+        phase_encode_axis: int | None = None,
+    ) -> DigitalTwinSimulator:
         """Build a simulator from a ``DigitalTwinConfig`` (the SSOT mapping).
 
         Single source of truth for config→simulator, used by both
         ``build_simulator_from_config`` (VF strategies) and the transversal
         ``DigitalTwinDegradation`` data transform, so the two never drift.
+        ``field_strength_t`` is ``physics.field_strength``, the B0 of the profile a
+        declared ``dt.acquisition`` block builds; it is required when the block is.
+        ``phase_encode_axis`` is ``data.acquisition.phase_encode_axis``, which
+        ``physics.digital_twin.mask_axis`` resolves through.
         """
+        acquisition = getattr(dt, "acquisition", None)
+        profile = None
+        if acquisition is not None:
+            if field_strength_t is None:
+                raise ValueError(
+                    "physics.digital_twin.acquisition is declared, so the twin needs "
+                    "physics.field_strength (the profile's B0): pass field_strength_t."
+                )
+            from spectramr.infrastructure.physics.scanner_profile import ScannerProfile
+
+            profile = ScannerProfile.from_acquisition_config(
+                acquisition, field_strength_t=field_strength_t
+            )
         return cls(
+            scanner_profile=profile,
             im_size=im_size,
             marker_type=dt.marker_type,
             motion_type=dt.motion_type,
@@ -2067,6 +2309,8 @@ class DigitalTwinSimulator(nn.Module):
             b0_strength=dt.b0_strength,
             b1_strength=dt.b1_strength,
             acceleration=dt.acceleration,
+            mask_axis=dt.mask_axis,
+            phase_encode_axis=phase_encode_axis,
             gibbs_truncation=dt.gibbs_truncation,
             enable_motion=dt.enable_motion,
             enable_b0=dt.enable_b0,
@@ -2192,12 +2436,16 @@ class DigitalTwinSimulator(nn.Module):
         elif motion_type == "random_shot":
             return simulate_random_shot_motion(kspace, max_shift=self.motion_amplitude * s)
         elif motion_type == "elastic":
-            return simulate_elastic_motion(
+            sink: dict[str, torch.Tensor] = {}
+            out = simulate_elastic_motion(
                 kspace,
                 im_size=self.im_size,
                 num_modes=self.elastic_modes,
                 amplitude=self.motion_amplitude * s,
+                displacement_out=sink,
             )
+            self.last_elastic_displacement_px = sink["px"]
+            return out
         else:
             raise ValueError(f"Unknown motion_type: {motion_type!r}")
 
@@ -2224,6 +2472,7 @@ class DigitalTwinSimulator(nn.Module):
         degradation_only: bool = False,
         external_b0_field: torch.Tensor | None = None,
         seed: int | None = None,
+        geometry: AcquisitionGeometry | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the full Digital Twin forward model (optionally seeded).
 
@@ -2249,12 +2498,19 @@ class DigitalTwinSimulator(nn.Module):
           - Multi-contrast (C>1, no coil maps): per-contrast
             intensity-matched marker embedding.
 
+        A volume is read only in the canonical ``(B, C, D, H, W)`` layout (dim -3 the
+        slice or kz axis) and only with an acquisition mode, from ``geometry`` or the
+        scanner profile (not both). ``multislice_2d`` runs the native stages on each slice
+        as its own 2-D sample and the registry axes on the stack; ``volume_3d`` runs the
+        registry axes and the receiver noise only, and raises on any enabled native stage.
+
         Args:
-            clean_anatomy: Clean complex image [B, C, H, W].
+            clean_anatomy: Clean complex image [B, C, H, W], or [B, C, D, H, W] with a mode.
             snr_target: Target SNR in dB.  If None, sampled from snr_range.
             coil_sensitivities: Optional [1|B, C, H, W] complex coil
-                sensitivity maps.  When provided, triggers multi-coil
-                marker embedding.
+                sensitivity maps ([B, C, D, H, W] for a stack).  When provided,
+                triggers multi-coil marker embedding.
+            geometry: The acquisition of a 5-D input when no scanner profile declares it.
 
         Returns:
             corrupted_image: Fully corrupted joint image [B, C, H, W].
@@ -2285,6 +2541,7 @@ class DigitalTwinSimulator(nn.Module):
                 corruption_factor=corruption_factor,
                 degradation_only=degradation_only,
                 external_b0_field=external_b0_field,
+                geometry=geometry,
             )
 
         device = clean_anatomy.device
@@ -2300,6 +2557,8 @@ class DigitalTwinSimulator(nn.Module):
                 corruption_factor=corruption_factor,
                 degradation_only=degradation_only,
                 external_b0_field=external_b0_field,
+                seed=int(seed),
+                geometry=geometry,
             )
 
     def _forward_impl(
@@ -2310,9 +2569,10 @@ class DigitalTwinSimulator(nn.Module):
         corruption_factor: float = 1.0,
         degradation_only: bool = False,
         external_b0_field: torch.Tensor | None = None,
+        seed: int | None = None,
+        geometry: AcquisitionGeometry | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Unseeded body of :meth:`forward` (see it for the contract)."""
-        device = clean_anatomy.device
+        """Body of :meth:`forward` (see it for the contract); ``seed`` is the registry master seed."""
         # corruption_factor (cf) is the single diffusion-time knob; it drives
         # EVERY degradation (motion included) via _get_effective_cf so the
         # operator is continuous to identity at cf=0. cf=1.0 (VF default) is a
@@ -2325,19 +2585,61 @@ class DigitalTwinSimulator(nn.Module):
         self.last_undersampling_mask = None
         self.last_b0_field = None
         self.last_pe_shift_field = None
+        self.last_elastic_displacement_px = None
 
-        # Handle 5D TorchIO data [B, C, H, W, D]: fold depth into batch
-        _had_depth = clean_anatomy.ndim == 5
-        _depth_dim = 0
-        if _had_depth:
-            B, C, _H, _W, D = clean_anatomy.shape
-            _depth_dim = D
-            clean_anatomy = clean_anatomy.permute(0, 4, 1, 2, 3).reshape(B * D, C, _H, _W)
-            if coil_sensitivities is not None and coil_sensitivities.ndim == 5:
-                coil_sensitivities = coil_sensitivities.permute(0, 4, 1, 2, 3).reshape(
-                    B * D, C, _H, _W
-                )
+        mode = self._input_geometry(clean_anatomy, geometry).mode
+        if mode is AcquisitionMode.VOLUME_3D:
+            inputs = {
+                "markers (degradation_only=False)": not degradation_only,
+                "coil_sensitivities": coil_sensitivities is not None,
+                "external_b0_field": external_b0_field is not None,
+            }
+            self._reject_volume_native_stages(*(k for k, given in inputs.items() if given))
+            kspace = fftnc(clean_anatomy, _KSPACE_3D)
+            kspace = self._add_receiver_noise(kspace, snr_target, cf, (-4, -3, -2, -1))
+            corrupted_image = ifftnc(kspace, _KSPACE_3D)
+            marker_prior = torch.zeros_like(clean_anatomy[:, :1])
+            joint_clean = clean_anatomy
+        elif mode is AcquisitionMode.MULTISLICE_2D:
+            b, d = clean_anatomy.shape[0], clean_anatomy.shape[2]
+            corrupted_image, marker_prior, joint_clean = self._native_stages(
+                _fold_slices(clean_anatomy),
+                snr_target,
+                _fold_slices(coil_sensitivities),
+                cf,
+                degradation_only,
+                _fold_slices(external_b0_field),
+                depth=d,
+            )
+            corrupted_image = _unfold_slices(corrupted_image, b, d)
+            marker_prior = _unfold_slices(marker_prior, b, d)
+            joint_clean = _unfold_slices(joint_clean, b, d)
+        else:
+            corrupted_image, marker_prior, joint_clean = self._native_stages(
+                clean_anatomy,
+                snr_target,
+                coil_sensitivities,
+                cf,
+                degradation_only,
+                external_b0_field,
+                depth=None,
+            )
+        corrupted_image = self._apply_registry_axes(corrupted_image, cf, seed, geometry)
+        return corrupted_image, marker_prior, joint_clean
 
+    def _native_stages(
+        self,
+        clean_anatomy: torch.Tensor,
+        snr_target: float | torch.Tensor | None,
+        coil_sensitivities: torch.Tensor | None,
+        cf: float,
+        degradation_only: bool,
+        external_b0_field: torch.Tensor | None,
+        *,
+        depth: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stages 0-4 on ``(N, C, H, W)``; ``depth`` is the slice count when N = B*D folds a stack."""
+        device = clean_anatomy.device
         # ────────────────────────────────────────────────────
         # STEP 0: Multi-coil → image-space conversion (RSS)
         # ────────────────────────────────────────────────────
@@ -2353,7 +2655,7 @@ class DigitalTwinSimulator(nn.Module):
         # ────────────────────────────────────────────────────
         if self.enable_motion:
             anatomy_kspace = fft2c(clean_anatomy)
-            if _had_depth and self.coherent_3d_motion:
+            if depth is not None and self.coherent_3d_motion:
                 # Mod4 (digital-twin review): one motion trajectory per
                 # subject. Compute the motion's k-space modulation on a
                 # uniform probe per subject, then broadcast across D slices.
@@ -2361,6 +2663,7 @@ class DigitalTwinSimulator(nn.Module):
                 # periodic, random_shot) and approximate for elastic /
                 # rigid-with-rotation (image-space resampling).
                 _, _, _Hk, _Wk = anatomy_kspace.shape
+                B = anatomy_kspace.shape[0] // depth
                 probe = torch.ones(
                     B,
                     1,
@@ -2371,9 +2674,9 @@ class DigitalTwinSimulator(nn.Module):
                 )
                 mod_factor = self._apply_motion(probe, cf)  # [B, 1, H, W]
                 # Broadcast across the D-slice / C-channel axes.
-                ksp_5d = anatomy_kspace.view(B, _depth_dim, anatomy_kspace.shape[1], _Hk, _Wk)
+                ksp_5d = anatomy_kspace.view(B, depth, anatomy_kspace.shape[1], _Hk, _Wk)
                 anatomy_kspace = (ksp_5d * mod_factor.unsqueeze(1)).view(
-                    B * _depth_dim, anatomy_kspace.shape[1], _Hk, _Wk
+                    B * depth, anatomy_kspace.shape[1], _Hk, _Wk
                 )
             else:
                 anatomy_kspace = self._apply_motion(anatomy_kspace, cf)
@@ -2412,18 +2715,28 @@ class DigitalTwinSimulator(nn.Module):
         # STEP 2b: Image-space physical degradations (BEFORE FFT)
         # ────────────────────────────────────────────────────
 
-        # B0 geometric distortion (voxel shifting along FE)
+        # B0 geometric distortion (EPI: voxel shifting along FE and PE)
         if self.enable_b0_distortion:
+            profile = self.scanner_profile
             joint_image, b0_map, pe_shift = simulate_b0_geometric_distortion(
                 joint_image,
                 self.im_size,
-                dwell_time=self.b0_dwell_time,
-                b0_strength=self.b0_strength * self._get_effective_cf("b0_distortion", cf),
+                dwell_time=(
+                    self.b0_dwell_time
+                    if profile is None
+                    else profile.readout_dwell_s(self.im_size[-1])
+                ),
+                b0_strength=self.b0_strength
+                * self._b0_field_scale()
+                * self._get_effective_cf("b0_distortion", cf),
                 return_field=True,
                 # When a REAL B0 map is supplied (e.g. derived from multi-echo
                 # data), apply it verbatim so the field-scoring grades the model
                 # against a real off-resonance pattern (VF real-reference seam).
                 external_b0_field=external_b0_field,
+                # EPI without a profile: the VF tracker scores the PE shift, which only
+                # EPI produces. With one, the profile's sequence picks the shift model.
+                sequence=self._b0_sequence,
             )
             # Expose the applied field so a tracker's estimate can be SCORED
             # against it (field self-consistency, not just image recon) — see
@@ -2468,6 +2781,15 @@ class DigitalTwinSimulator(nn.Module):
         # ────────────────────────────────────────────────────
         # STEP 3: Scanner artifacts in k-space (affect BOTH)
         # ────────────────────────────────────────────────────
+        # B1+ transmit non-uniformity changes the excited magnetisation, so it acts on
+        # the signal before reception: the receiver noise added below is not modulated.
+        if self.enable_b1:
+            joint_image = simulate_b1_bias_field(
+                joint_image,
+                self.im_size,
+                strength=self.b1_strength * self._get_effective_cf("b1", cf),
+                b0_T=None if self.scanner_profile is None else self.scanner_profile.b0_T,
+            )
         joint_kspace = fft2c(joint_image)
 
         # 3a. B0 inhomogeneity (spatially-varying phase)
@@ -2475,7 +2797,9 @@ class DigitalTwinSimulator(nn.Module):
             joint_kspace = simulate_b0_inhomogeneity(
                 joint_kspace,
                 self.im_size,
-                strength=self.b0_strength * self._get_effective_cf("b0", cf),
+                strength=self.b0_strength
+                * self._b0_field_scale()
+                * self._get_effective_cf("b0", cf),
                 external_b0_field=external_b0_field,
             )
             # Expose the REAL B0 (Hz) as the field-scoring reference even on the
@@ -2483,17 +2807,6 @@ class DigitalTwinSimulator(nn.Module):
             # model's field estimate against it.
             if external_b0_field is not None and self.last_b0_field is None:
                 self.last_b0_field = external_b0_field.detach()
-
-        # 3b. K-space undersampling (aliasing). Capture the per-call random
-        # sampling mask so reconstruction strategies can feed it to the model's
-        # data-consistency layers (otherwise their DC is starved and no-ops).
-        if self.enable_undersampling and self.acceleration > 1.0:
-            accels_cf = self._get_effective_cf("undersampling", cf)
-            accel_val = 1.0 + (self.acceleration - 1.0) * accels_cf
-            if accel_val > 1.0:
-                joint_kspace, self.last_undersampling_mask = simulate_undersampling(
-                    joint_kspace, acceleration=accel_val, return_mask=True
-                )
 
         # 3c. Gibbs ringing (k-space truncation)
         if self.enable_gibbs and self.gibbs_truncation < 1.0:
@@ -2508,7 +2821,13 @@ class DigitalTwinSimulator(nn.Module):
         # shift to the *anatomy* only and re-add the marker prior so it
         # is not duplicated by a spurious shifted ghost.
         if self.enable_chemical_shift:
-            shift_px = self.chemical_shift_pixels * self._get_effective_cf("chemical_shift", cf)
+            profile = self.scanner_profile
+            max_shift_px = (
+                self.chemical_shift_pixels if profile is None else profile.chemical_shift_max_px()
+            )
+            shift_px = max_shift_px * self._get_effective_cf("chemical_shift", cf)
+            # The primitive's own default (0.15) without a profile, the profile's otherwise.
+            fat = {} if profile is None else {"fat_fraction": profile.fat_fraction}
             if self.marker_is_water_only:
                 # marker_prior may be [1, 1, H, W] or [B, C, H, W].
                 joint_image_back = ifft2c(joint_kspace)
@@ -2520,6 +2839,7 @@ class DigitalTwinSimulator(nn.Module):
                     fft2c(anatomy_only),
                     self.im_size,
                     shift_pixels=shift_px,
+                    **fat,
                 )
                 anatomy_shifted = ifft2c(anatomy_k)
                 joint_kspace = fft2c(anatomy_shifted + mp)
@@ -2528,6 +2848,7 @@ class DigitalTwinSimulator(nn.Module):
                     joint_kspace,
                     self.im_size,
                     shift_pixels=shift_px,
+                    **fat,
                 )
 
         # 3e. Eddy currents (gradient-induced linear phase)
@@ -2552,10 +2873,60 @@ class DigitalTwinSimulator(nn.Module):
                 intensity_ratio=self.rf_zipper_intensity * self._get_effective_cf("rf_zipper", cf),
             )
 
+        joint_kspace = self._add_receiver_noise(
+            joint_kspace, snr_target, cf, (-3, -2, -1), depth=depth
+        )
+
+        # 3i. K-space undersampling (aliasing), LAST: the scanner records signal, spikes,
+        # zipper and noise only on the lines it acquires. Capture the per-call random
+        # sampling mask so reconstruction strategies can feed it to the model's
+        # data-consistency layers (otherwise their DC is starved and no-ops).
+        if self.enable_undersampling and self.acceleration > 1.0:
+            accels_cf = self._get_effective_cf("undersampling", cf)
+            accel_val = 1.0 + (self.acceleration - 1.0) * accels_cf
+            if accel_val > 1.0:
+                joint_kspace, self.last_undersampling_mask = simulate_undersampling(
+                    joint_kspace,
+                    acceleration=accel_val,
+                    return_mask=True,
+                    line_dim=self.undersampling_line_dim,
+                )
+
+        # ────────────────────────────────────────────────────
+        # STEP 4: Reconstruct + image-space effects
+        # ────────────────────────────────────────────────────
+        corrupted_image = ifft2c(joint_kspace)
+
+        # 4b. RF crosstalk (multi-slice signal bleeding)
+        if self.enable_rf_crosstalk:
+            corrupted_image = simulate_rf_crosstalk(
+                corrupted_image,
+                crosstalk_fraction=self.crosstalk_fraction
+                * self._get_effective_cf("rf_crosstalk", cf),
+            )
+
+        return corrupted_image, marker_prior, joint_clean
+
+    def _add_receiver_noise(
+        self,
+        joint_kspace: torch.Tensor,
+        snr_target: float | torch.Tensor | None,
+        cf: float,
+        dims: tuple[int, ...],
+        depth: int | None = None,
+    ) -> torch.Tensor:
+        """Complex AWGN at the target SNR; ``dims`` are the axes of one sample's signal RMS.
+
+        With ``depth`` the batch folds ``depth`` slices per subject, and the noise level is
+        referenced to the subject's RMS: the receiver's thermal noise is the same for every
+        slice. A per-sample ``snr_target`` is then one value per subject, ``(B,)``.
+        """
+        device = joint_kspace.device
         # 3h. Complex AWGN (→ Rician noise in magnitude)
         noise_cf = self._get_effective_cf("noise", cf)
         if snr_target is None:
-            snr_target = self.snr_range[0] + torch.rand(1, device=device).item() * (
+            # Drawn on the device, so no host sync on CUDA.
+            snr_target = self.snr_range[0] + torch.rand(1, device=device) * (
                 self.snr_range[1] - self.snr_range[0]
             )
 
@@ -2577,66 +2948,60 @@ class DigitalTwinSimulator(nn.Module):
         # 3 dB lower than the value passed in. Macovski 1996 uses
         # power SNR; convert by SNR_power = SNR_amplitude - 3.0103 if
         # comparing.
-        if not isinstance(snr_target, torch.Tensor):
-            snr_target = torch.tensor([snr_target], device=device)
+        snr_target = torch.as_tensor(snr_target, device=device, dtype=torch.float32)
+        if depth is not None and snr_target.numel() > 1:
+            subjects = joint_kspace.shape[0] // depth
+            if tuple(snr_target.shape) != (subjects,):
+                raise ValueError(
+                    f"multislice snr_target must be a scalar or one value per subject "
+                    f"({subjects},); got shape {tuple(snr_target.shape)}"
+                )
+            snr_target = snr_target.repeat_interleave(depth)
+        snr_target = snr_target.reshape((-1,) + (1,) * (joint_kspace.dim() - 1))
 
-        signal_rms = torch.sqrt(torch.mean(joint_kspace.abs() ** 2, dim=(-2, -1), keepdim=True))
-
-        # Handle batch-varying SNR
-        if isinstance(snr_target, torch.Tensor) and snr_target.numel() > 1:
-            snr_target = snr_target.view(-1, 1, 1, 1)
-            noise_std = signal_rms / (10 ** (snr_target / 20.0))
+        # One receiver noise level per sample, shared by its coils: a weakly coupled coil
+        # sees the same thermal noise with less signal, not proportionally less noise.
+        if depth is None:
+            signal_rms = torch.sqrt(torch.mean(joint_kspace.abs() ** 2, dim=dims, keepdim=True))
         else:
-            snr_val = snr_target.item() if isinstance(snr_target, torch.Tensor) else snr_target
-            noise_std = signal_rms / (10 ** (snr_val / 20.0))
+            power = joint_kspace.abs().pow(2).reshape(joint_kspace.shape[0] // depth, -1)
+            signal_rms = power.mean(dim=1).sqrt().repeat_interleave(depth)
+            signal_rms = signal_rms.reshape((-1,) + (1,) * (joint_kspace.dim() - 1))
+        noise_std = signal_rms / (10 ** (snr_target / 20.0))
+        n_re, n_im = per_sample_normal_pair(*joint_kspace.shape, device=device)
+        joint_kspace = joint_kspace + torch.complex(n_re, n_im) * noise_std
+        return joint_kspace
 
-        noise = torch.complex(
-            torch.randn_like(joint_kspace.real) * noise_std,
-            torch.randn_like(joint_kspace.imag) * noise_std,
-        )
-        joint_kspace = joint_kspace + noise
-
-        # ────────────────────────────────────────────────────
-        # STEP 4: Reconstruct + image-space effects
-        # ────────────────────────────────────────────────────
-        corrupted_image = ifft2c(joint_kspace)
-
-        # 4a. B1 receive field non-uniformity (intensity modulation)
-        if self.enable_b1:
-            corrupted_image = simulate_b1_bias_field(
-                corrupted_image,
-                self.im_size,
-                strength=self.b1_strength * self._get_effective_cf("b1", cf),
-            )
-
-        # 4b. RF crosstalk (multi-slice signal bleeding)
-        if self.enable_rf_crosstalk:
-            corrupted_image = simulate_rf_crosstalk(
-                corrupted_image,
-                crosstalk_fraction=self.crosstalk_fraction
-                * self._get_effective_cf("rf_crosstalk", cf),
-            )
-
+    def _apply_registry_axes(
+        self,
+        corrupted_image: torch.Tensor,
+        cf: float,
+        seed: int | None,
+        geometry: AcquisitionGeometry | None,
+    ) -> torch.Tensor:
+        """Stage 5: the registry operators, with the per-call geometry or the profile."""
         # 5. Registry degradations — the physics operators in
         # DEGRADATION_REGISTRY that this pipeline has no native branch for.
-        # Applied here, while depth is still folded into the batch, so the tensor
-        # is the (B, C, H, W) that apply_degradation expects. Severity is the
-        # same diffusion-coupled factor every native axis uses, so a registry
+        # Applied to the unfolded input, at 5-D with its geometry for a volume. Severity
+        # is the same diffusion-coupled factor every native axis uses, so a registry
         # axis ramps with cf exactly like a native one.
         if self._registry_degradations:
-            from spectramr.infrastructure.physics.digital_twin_extensions import (
-                affected_components,
+            from spectramr.infrastructure.physics.degradations.registry import (
                 apply_degradation,
                 derive_axis_seed,
             )
+            from spectramr.infrastructure.physics.degradations.registry_queries import (
+                affected_components,
+            )
 
-            # The master seed is drawn from the ambient RNG rather than threaded
-            # in: `forward` already forks and re-seeds the global RNG when it was
-            # given a seed, so this draw is deterministic under `forward(seed=S)`
-            # and fresh under `seed=None` — the documented contract, with no
-            # extra plumbing through `_forward_impl`. The draw is on CPU, so
-            # int() is not a device sync (NN#9).
-            master = int(torch.randint(0, 2**31 - 1, (1,), device="cpu").item())
+            # forward(seed=S) uses S itself as the master seed, so the registry axes
+            # draw derive_axis_seed(S, axis) -- the realisation a DegradationChain fitted
+            # with seed S used. Without a seed it is fresh, drawn on CPU (no device sync).
+            master = (
+                int(seed)
+                if seed is not None
+                else int(torch.randint(0, 2**31 - 1, (1,), device="cpu").item())
+            )
             for axis in self._registry_degradations:
                 before = corrupted_image
                 out = apply_degradation(
@@ -2644,6 +3009,8 @@ class DigitalTwinSimulator(nn.Module):
                     before,
                     theta=self._get_effective_cf(axis, cf),
                     seed=derive_axis_seed(master, axis),
+                    geometry=geometry,
+                    profile=self.scanner_profile,
                 )
                 # Some registry ops are intrinsically real (rician acts on the
                 # magnitude), and this pipeline is complex end to end. Casting
@@ -2663,15 +3030,7 @@ class DigitalTwinSimulator(nn.Module):
                 elif not before.is_complex() and out.is_complex():
                     out = out.abs().to(before.dtype)
                 corrupted_image = out
-
-        # Unfold depth from batch if it was folded at entry
-        if _had_depth:
-            corrupted_image = corrupted_image.reshape(B, _depth_dim, C, _H, _W).permute(
-                0, 2, 3, 4, 1
-            )
-            joint_clean = joint_clean.reshape(B, _depth_dim, C, _H, _W).permute(0, 2, 3, 4, 1)
-
-        return corrupted_image, marker_prior, joint_clean
+        return corrupted_image
 
 
 __all__ = [
@@ -2680,6 +3039,7 @@ __all__ = [
     "simulate_b0_geometric_distortion",
     "simulate_b0_inhomogeneity",
     "simulate_b1_bias_field",
+    "chemical_shift_pixels",
     "simulate_chemical_shift",
     "simulate_eddy_current",
     "simulate_elastic_motion",
@@ -2692,5 +3052,20 @@ __all__ = [
     "simulate_rf_zipper",
     "simulate_rigid_motion_kspace",
     "simulate_spike_noise",
+    "simulate_spike_noise_volume",
+    "outer_line_count",
     "simulate_undersampling",
 ]
+
+
+# Imported last: the degradations package imports this module's primitives, so a first import
+# of this module must define them before the package's catalogue reads them.
+from spectramr.infrastructure.physics.degradations._common import readout_offset_px  # noqa: E402
+from spectramr.infrastructure.physics.degradations.conditions import (  # noqa: E402
+    b0_shift_sequence,
+)
+from spectramr.infrastructure.physics.degradations.geometry import (  # noqa: E402
+    AcquisitionGeometry,
+    AcquisitionMode,
+    resolve_geometry,
+)

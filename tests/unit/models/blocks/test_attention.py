@@ -11,6 +11,7 @@ contract for the residual family (zero-init output projections).
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from spectramr.models.blocks.attention import (
@@ -111,8 +112,10 @@ class TestResidualFamilyInitIdentity:
         attn = cls(32)
         x = torch.randn(2, 32, 16, 16, requires_grad=True)
         attn(x).square().mean().backward()
-        proj = attn.proj.weight.grad
-        assert proj is not None and proj.abs().sum() > 0
+        # LinearAttention's proj is a ComplexConv2d (weight_real/weight_imag), so
+        # read every proj parameter rather than a ``.weight`` attribute.
+        grads = [p.grad for p in attn.proj.parameters()]
+        assert all(g is not None for g in grads) and sum(g.abs().sum() for g in grads) > 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,13 +393,14 @@ def _favor_relative_error(attn: KernelizedAttention, x: torch.Tensor, *, prenorm
 
     b, c, h, w = x.shape
     seq = h * w
-    flat = x.view(b, c, seq).transpose(1, 2)
-    flat = attn.norm(flat) if prenorm else flat
+    tokens = x.view(b, c, seq).transpose(1, 2)
+    flat = attn.norm(tokens) if prenorm else tokens
     nh, hd = attn.num_heads, attn.head_dim
-    q, k, v = (
-        proj(flat).view(b, seq, nh, hd).transpose(1, 2)
-        for proj in (attn.q_proj, attn.k_proj, attn.v_proj)
+    q, k = (
+        proj(flat).view(b, seq, nh, hd).transpose(1, 2) for proj in (attn.q_proj, attn.k_proj)
     )
+    # Mirrors forward: the pre-norm feeds q/k only; V comes from the raw tokens.
+    v = attn.v_proj(tokens).view(b, seq, nh, hd).transpose(1, 2)
     with torch.no_grad():
         approx = attn._favor_attention(q, k, v)
         exact = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(hd), dim=-1) @ v
@@ -496,3 +500,326 @@ def test_channel_attention_handles_non_contiguous_feature_maps(make) -> None:
 
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# k-space geometry, DC dominance and complex equivariance
+#
+# The mask acquires whole phase-encode columns (PE axis = W, dim -1), k-space
+# magnitude follows a power law with a dominant DC peak at W // 2, and at R = 32
+# the gap from a missing column to the nearest acquired one reaches ~100 columns
+# at W = 256. Each test below carries the planted violation that turns it red.
+# ---------------------------------------------------------------------------
+
+
+def _rotate(x: torch.Tensor, theta: float) -> torch.Tensor:
+    """Multiply an interleaved ``[R1, I1, ...]`` map by ``e^{i theta}``."""
+    re, im = x[:, 0::2], x[:, 1::2]
+    c, s = torch.cos(torch.tensor(theta)), torch.sin(torch.tensor(theta))
+    return torch.stack([c * re - s * im, s * re + c * im], dim=2).flatten(1, 2)
+
+
+def _square_window_attention(block: WindowAttention, x: torch.Tensor, ws: int = 8) -> torch.Tensor:
+    """The pre-fix geometry: non-shifted ``ws x ws`` windows, same projections."""
+    b, c, h, w = x.shape
+    win = x.view(b, c, h // ws, ws, w // ws, ws).permute(0, 2, 4, 3, 5, 1).reshape(-1, ws * ws, c)
+    q, k, v = (
+        t.view(t.shape[0], t.shape[1], block.num_heads, -1).transpose(1, 2)
+        for t in block.qkv(win).chunk(3, dim=-1)
+    )
+    out = block.proj(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(win.shape))
+    out = out.view(b, h // ws, w // ws, ws, ws, c).permute(0, 5, 1, 3, 2, 4).reshape(b, c, h, w)
+    return x + out
+
+
+def _per_window_reference(block: WindowAttention, x: torch.Tensor) -> torch.Tensor:
+    """One window at a time, padded keys masked by hand: the definition, not the kernel."""
+    b, c, h, w = x.shape
+    ws = block.window_size
+    pad = (-h) % ws
+    xp = F.pad(x, (0, 0, 0, pad))
+    out = torch.zeros_like(xp)
+    cols = torch.arange(w)
+    tile = block.relative_position_bias[:, cols[:, None] - cols[None, :] + block.max_width - 1]
+    for i in range(b):
+        for r0 in range(0, h + pad, ws):
+            tok = xp[i, :, r0 : r0 + ws].reshape(c, ws * w).T[None]
+            q, k, v = block._qkv(tok)
+            logits = q @ k.transpose(-2, -1) + tile.repeat(1, ws, ws)
+            valid = (torch.arange(r0, r0 + ws) < h).repeat_interleave(w)
+            logits[..., ~valid] = float("-inf")
+            att = (logits.softmax(-1) @ v).transpose(1, 2).reshape(1, ws * w, c)
+            out[i, :, r0 : r0 + ws] = block.proj(att)[0].T.reshape(c, ws, w)
+    return x + out[:, :, :h]
+
+
+class TestWindowAttentionPEAxial:
+    W = 256
+
+    def _block(self, **kw) -> WindowAttention:
+        torch.manual_seed(0)
+        kw.setdefault("zero_init_output", False)
+        return WindowAttention(16, num_heads=2, **kw).eval()
+
+    def _single_column(self, col: int, h: int = 8) -> torch.Tensor:
+        x = torch.zeros(1, 16, h, self.W)
+        x[..., col] = torch.randn(1, 16, h)
+        return x
+
+    def test_an_acquired_column_100_plus_columns_away_reaches_the_target(self) -> None:
+        block = self._block()
+        acquired, target = 20, 200  # PE distance 180
+        x = self._single_column(acquired)
+        with torch.no_grad():
+            moved = (block(x) - block(torch.zeros_like(x)))[..., target].abs().max().item()
+            # Planted: the 8x8 geometry never puts the two columns in one window.
+            old = _square_window_attention(block, x) - _square_window_attention(
+                block, torch.zeros_like(x)
+            )
+        assert moved > 1e-4
+        assert old[..., target].abs().max().item() == 0.0
+
+    def test_scaling_the_dc_column_leaves_the_softmax_weights_unchanged(self) -> None:
+        block = self._block()
+        with torch.no_grad():
+            block.qkv.bias.zero_()  # bias-free: per-token rescaling is then exact
+        x = _kspace_feature(C=16, H=4, W=64)[:1]
+        hot = x.clone()
+        hot[..., 32] *= 1e3
+        with torch.no_grad():
+            torch.testing.assert_close(
+                block.attention_map(hot), block.attention_map(x), rtol=1e-4, atol=1e-5
+            )
+            # Planted: raw dot-product logits collapse onto the DC tokens.
+            tokens, _ = block._partition(hot)
+            q, k, _ = block.qkv(tokens).chunk(3, dim=-1)
+            raw = torch.softmax(q @ k.transpose(-2, -1) / 4.0, dim=-1)  # one head, d = 16
+            normed = block.attention_map(hot)
+        dc_tokens = torch.arange(32, raw.shape[-1], 64)
+        assert raw[..., dc_tokens].sum(-1).median().item() > 0.9
+        assert normed[..., dc_tokens].sum(-1).median().item() < 0.5
+
+    def test_padded_rows_are_masked_out_of_the_keys(self) -> None:
+        """H=7 with 2-row windows: the lone last row must attend only to itself."""
+        two_row = self._block(window_size=2)
+        one_row = self._block(window_size=1)
+        one_row.load_state_dict(two_row.state_dict())
+        x = torch.randn(1, 16, 7, 32)
+        with torch.no_grad():
+            out = two_row(x)
+            torch.testing.assert_close(out[:, :, 6:], one_row(x[:, :, 6:]))
+        assert out.shape == x.shape
+
+    @pytest.mark.parametrize(("h", "w", "ws"), [(8, 8, 2), (7, 10, 3), (5, 13, 4), (1, 9, 2), (255, 16, 2)])
+    def test_matches_a_per_window_reference(self, h: int, w: int, ws: int) -> None:
+        block = self._block(window_size=ws)
+        x = torch.randn(2, 16, h, w)
+        with torch.no_grad():
+            torch.testing.assert_close(block(x), _per_window_reference(block, x), rtol=1e-5, atol=1e-5)
+
+    def test_padding_mask_does_not_scale_with_batch(self, monkeypatch) -> None:
+        """Only the last window row-block holds padded keys, so no mask is per (batch, window)."""
+        import spectramr.models.blocks.attention as mod
+
+        sdpa, seen = F.scaled_dot_product_attention, []
+
+        def spy(q, k, v, attn_mask=None, **kw):
+            seen.append(attn_mask.numel())
+            return sdpa(q, k, v, attn_mask=attn_mask, **kw)
+
+        monkeypatch.setattr(mod.F, "scaled_dot_product_attention", spy)
+        block, (h, w, ws) = self._block(window_size=2), (7, 16, 2)
+        counts = {}
+        for batch in (1, 4):
+            seen.clear()
+            with torch.no_grad():
+                block(torch.randn(batch, 16, h, w))
+            counts[batch] = list(seen)
+        one_window = block.num_heads * (ws * w) ** 2
+        assert counts[1] == counts[4]
+        assert max(counts[4]) <= one_window
+
+    def test_width_beyond_the_bias_table_raises(self) -> None:
+        block = self._block(max_width=32)
+        with pytest.raises(ValueError, match="max_width"):
+            block(torch.randn(1, 16, 2, 33))
+
+    def test_relative_position_bias_and_temperature_receive_gradient(self) -> None:
+        block = self._block().train()
+        block(torch.randn(1, 16, 4, 32)).square().mean().backward()
+        assert block.relative_position_bias.grad.abs().sum() > 0
+        assert block.logit_scale.grad.abs().sum() > 0
+
+
+class TestComplexChannelAttention:
+    def test_gate_commutes_with_a_global_phase(self) -> None:
+        from spectramr.models.blocks.attention import ChannelAttention, ComplexChannelAttention
+
+        torch.manual_seed(0)
+        x = _kspace_feature(C=16, H=8, W=8)
+        gate = ComplexChannelAttention(16, reduction_ratio=4).eval()
+        with torch.no_grad():
+            torch.testing.assert_close(gate(_rotate(x, 0.7)), _rotate(gate(x), 0.7))
+            # Planted: per-real-channel gains rotate the phase.
+            old = ChannelAttention(16, reduction_ratio=4).eval()
+            assert not torch.allclose(old(_rotate(x, 0.7)), _rotate(old(x), 0.7), atol=1e-3)
+
+    def test_re_and_im_of_one_complex_channel_share_one_gain(self) -> None:
+        from spectramr.models.blocks.attention import ComplexChannelAttention
+
+        x = torch.rand(1, 8, 4, 4) + 0.5
+        with torch.no_grad():
+            gains = ComplexChannelAttention(8, reduction_ratio=1)(x) / x
+        torch.testing.assert_close(gains[:, 0::2], gains[:, 1::2])
+
+    def test_odd_channel_count_raises(self) -> None:
+        from spectramr.models.blocks.attention import ComplexChannelAttention
+
+        with pytest.raises(ValueError, match="even"):
+            ComplexChannelAttention(7)
+
+
+class _Const(nn.Module):
+    """Returns a pinned tensor, so a test can hold the q/k weights fixed."""
+
+    def __init__(self, value: torch.Tensor) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, _x: torch.Tensor) -> torch.Tensor:
+        return self.value
+
+
+class TestLinearAttentionComplexValues:
+    @pytest.mark.parametrize("name", ["v_proj", "proj"])
+    def test_value_and_output_maps_are_complex_linear(self, name: str) -> None:
+        torch.manual_seed(0)
+        layer = getattr(LinearAttention(16, zero_init_output=False), name)
+        x = torch.randn(2, 16, 4, 4)
+        with torch.no_grad():
+            torch.testing.assert_close(layer(_rotate(x, 1.1)), _rotate(layer(x), 1.1))
+            # Planted: a real 1x1 conv over interleaved channels mixes Re/Im freely.
+            real = nn.Conv2d(16, 16, 1, bias=False)
+            assert not torch.allclose(real(_rotate(x, 1.1)), _rotate(real(x), 1.1), atol=1e-3)
+
+    def test_fixed_weights_give_a_phase_equivariant_branch(self) -> None:
+        torch.manual_seed(0)
+        attn = LinearAttention(8, num_heads=2, norm_type="none", zero_init_output=False).eval()
+        x = torch.randn(1, 8, 4, 4)
+        with torch.no_grad():
+            attn.qk = _Const(attn.qk(x))  # same weights for both calls
+            torch.testing.assert_close(attn(_rotate(x, 0.4)), _rotate(attn(x), 0.4))
+
+    def test_unknown_norm_type_raises(self) -> None:
+        with pytest.raises(ValueError, match="norm_type"):
+            LinearAttention(16, norm_type="instnace")
+
+    def test_head_splitting_a_re_im_pair_raises(self) -> None:
+        with pytest.raises(ValueError, match="even head dim"):
+            LinearAttention(12, num_heads=4)
+
+
+class TestPhaseSafeDualAttentionNative:
+    @staticmethod
+    def _block(**kw):
+        from spectramr.models.blocks.attention import PhaseSafeDualAttention
+
+        torch.manual_seed(0)
+        block = PhaseSafeDualAttention(**{"in_channels": 2, "num_heads": 1, "reduction": 1, **kw})
+        with torch.no_grad():
+            block.gamma.fill_(1.0)
+        return block.eval()
+
+    def test_runs_at_native_resolution_without_pooling(self, monkeypatch) -> None:
+        import spectramr.models.blocks.attention as mod
+
+        def _forbidden(*_a, **_k):
+            raise AssertionError("complex k-space must not be pooled or resampled")
+
+        monkeypatch.setattr(mod.F, "adaptive_avg_pool2d", _forbidden)
+        monkeypatch.setattr(mod.F, "interpolate", _forbidden)
+        block = self._block()
+        x = torch.randn(1, 4, 64, 64)
+        with torch.no_grad():
+            out = block(x, torch.randn(1, 4, 64, 64))
+        assert out.shape == x.shape and torch.isfinite(out).all()
+
+    def test_output_has_no_block_constant_structure(self) -> None:
+        block = self._block()
+        x = torch.randn(1, 4, 64, 64)
+        with torch.no_grad():
+            branch = block(x, torch.randn(1, 4, 64, 64)) - x
+        # The pooled path upsampled a coarse grid, so neighbours inside a cell agreed.
+        step = (branch[..., 1::4] - branch[..., 0::4]).abs().mean()
+        assert step > 0.05 * branch.abs().mean()
+
+    def test_output_rotates_with_the_kspace_phase(self) -> None:
+        block = self._block()
+        xk, xi = torch.randn(2, 4, 16, 16), torch.randn(2, 4, 16, 16)
+        with torch.no_grad():
+            torch.testing.assert_close(
+                block(_rotate(xk, 2.0), xi), _rotate(block(xk, xi), 2.0), rtol=1e-4, atol=1e-5
+            )
+
+    def test_qk_norm_makes_weights_invariant_to_key_energy(self) -> None:
+        block = self._block(in_channels=4, num_heads=2)
+        xk, xi = _kspace_feature(C=8, H=16, W=16)[:1], torch.randn(1, 8, 16, 16)
+
+        def weights() -> torch.Tensor:
+            pq, pk = block.kernel_features(xk, xi)
+            w = torch.einsum("bhdn,bhdm->bhnm", pq, pk)
+            return w / w.sum(-1, keepdim=True)
+
+        with torch.no_grad():
+            before = weights()
+            block.key_proj[1].weight.mul_(100.0)
+            block.key_proj[1].bias.mul_(100.0)
+            torch.testing.assert_close(weights(), before, rtol=1e-4, atol=1e-6)
+            # Planted: the un-normalised ``elu + 1`` map follows the key energy.
+            mag = torch.sqrt(xk[:, 0::2] ** 2 + xk[:, 1::2] ** 2)
+            k = block.key_proj(torch.stack([mag, mag], dim=2).flatten(1, 2))
+            assert (F.elu(k) + 1.0).max() > 50.0
+
+    def test_wrong_channel_count_raises(self) -> None:
+        with pytest.raises(ValueError, match="interleaved channels"):
+            self._block()(torch.randn(1, 6, 8, 8), torch.randn(1, 6, 8, 8))
+
+
+def test_kernelized_values_keep_the_input_magnitude() -> None:
+    """q/k see the scale-free LayerNorm, so the branch must scale linearly with x."""
+    torch.manual_seed(0)
+    attn = KernelizedAttention(32, num_heads=4, num_features=64, zero_init_output=False).eval()
+    with torch.no_grad():
+        attn.out_proj.bias.zero_()
+    x = torch.randn(1, 32, 8, 8)
+    b, c, h, w = x.shape
+
+    def whitened_branch(inp: torch.Tensor) -> torch.Tensor:
+        flat = attn.norm(inp.view(b, c, h * w).transpose(1, 2))
+        q, k, v = (
+            p(flat).view(b, h * w, 4, 8).transpose(1, 2)
+            for p in (attn.q_proj, attn.k_proj, attn.v_proj)
+        )
+        return attn._favor_attention(q, k, v)
+
+    with torch.no_grad():
+        small, large = attn(x) - x, attn(10.0 * x) - 10.0 * x
+        torch.testing.assert_close(large, 10.0 * small, rtol=1e-3, atol=1e-4)
+        # Planted: values from the whitened tokens make the branch scale-free.
+        torch.testing.assert_close(
+            whitened_branch(10.0 * x), whitened_branch(x), rtol=1e-3, atol=1e-4
+        )
+
+
+def test_channel_attention_below_the_reduction_ratio_keeps_a_live_gate() -> None:
+    """8 channels at ratio 16 used to build a zero-width bottleneck: gate == 0.5."""
+    from spectramr.models.blocks.attention import ChannelAttention
+
+    block = ChannelAttention(8)
+    assert block.fc[0].out_channels == 1
+    x = torch.rand(2, 8, 4, 4) + 0.1
+    with torch.no_grad():
+        for layer in (block.fc[0], block.fc[2]):
+            layer.weight.fill_(0.1)  # a parameter setting the old 0-width gate could not express
+        gains = block(x) / x
+    assert not torch.allclose(gains, torch.full_like(gains, 0.5))

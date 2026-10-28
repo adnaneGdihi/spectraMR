@@ -38,6 +38,10 @@ NESTING_FAMILIES = [
     "fractional_variable_density",
     "random_cartesian",
     "nested",
+    # Golden-angle prefixes of one fixed ordering (#612); they re-drew per rung before.
+    "radial",
+    "golden_angle",
+    "spiral",
 ]
 
 
@@ -78,19 +82,6 @@ class TestNestingEnforcement:
         """Every existing run must be unaffected until it opts in."""
         acc = create_kspace_accelerator(acceleration_type="variable_density", **BASE_KWARGS)
         assert acc.enforce_nested is False
-
-    def test_collapsing_family_raises_rather_than_degrading(self) -> None:
-        """Coercion can only remove samples, so a re-drawing family collapses.
-
-        Radial re-rasterises its spokes per timestep, so intersecting the cascade
-        strips most of k-space. Training on that silently would be pitfall #9;
-        the flag must fail loudly instead.
-        """
-        acc = create_kspace_accelerator(
-            acceleration_type="radial", enforce_nested=True, **BASE_KWARGS
-        )
-        with pytest.raises(ValueError, match="collapsed the 'radial' cascade"):
-            _cascade(acc)
 
     @pytest.mark.parametrize("family", NESTING_FAMILIES)
     def test_strict_tolerance_accepts_a_family_that_nests_exactly(self, family: str) -> None:
@@ -163,13 +154,14 @@ class TestNestingEnforcement:
             declared_target = 1.0 / max(1.0, acc.get_acceleration_factor(t))
             assert enforced_frac >= declared_target * 0.9
 
-    @pytest.mark.parametrize("family", ["radial", "spiral", "multi_mask"])
+    @pytest.mark.parametrize("family", ["multi_mask"])
     def test_redrawing_families_still_raise_at_the_default_tolerance(self, family: str) -> None:
         """The fix must not defang the guard it repairs.
 
-        These three re-rasterise their pattern per timestep, so the intersection
-        strips most of k-space — a genuine collapse, which must still fail loudly
-        at the 0.5 default rather than train on a gutted cascade (pitfall #9).
+        ``multi_mask`` re-draws its pattern per timestep, so the intersection strips
+        most of k-space — a genuine collapse, which must still fail loudly at the 0.5
+        default rather than train on a gutted cascade (pitfall #9). Radial and spiral
+        left this list when they became prefixes of one ordering (#612).
         """
         acc = create_kspace_accelerator(
             acceleration_type=family, enforce_nested=True, **BASE_KWARGS
@@ -394,3 +386,27 @@ class TestTrajectoryFamiliesHonourACS:
                 min_center_fraction=0.08,
                 **kwargs,
             )
+
+
+class TestTrajectoryLadderRungs:
+    """The identity rung and the coverage ceiling of the trajectory families (#612)."""
+
+    @pytest.mark.parametrize("family", TRAJECTORY_FAMILIES)
+    def test_identity_rung_is_fully_sampled(self, family: str) -> None:
+        """R=1 is every bin, not the sparsest mask a failed search fell back to."""
+        kwargs = {**BASE_KWARGS, "base_acceleration": 1.0}
+        acc = create_kspace_accelerator(acceleration_type=family, **kwargs)
+        assert bool(acc.get_acceleration_mask((1, 48, 80), 0).all())
+
+    @pytest.mark.parametrize("family", TRAJECTORY_FAMILIES)
+    def test_rung_above_the_coverage_ceiling_raises_at_build(self, family: str) -> None:
+        """Planted: a 1.2x rung asks for 83% of k-space, more than any trajectory covers."""
+        kwargs = {**BASE_KWARGS, "base_acceleration": 1.2}
+        with pytest.raises(ValueError, match="covers at most"):
+            create_kspace_accelerator(acceleration_type=family, **kwargs)
+
+    @pytest.mark.parametrize("family", TRAJECTORY_FAMILIES)
+    def test_cascade_nests_on_a_non_square_grid(self, family: str) -> None:
+        acc = create_kspace_accelerator(acceleration_type=family, **BASE_KWARGS)
+        masks = [acc.get_acceleration_mask((1, 48, 80), t)[0] for t in range(TIMESTEPS)]
+        assert _violations(masks) == 0

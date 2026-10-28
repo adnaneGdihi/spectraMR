@@ -33,22 +33,18 @@ class TestProgressiveDegradationsAdvertisedSet:
             "description enumerates all 14; adding an axis must update it."
         )
 
-    def test_the_registry_size_claim_is_current(self) -> None:
-        """The description says '31 keys'. If the registry grows, the number in
-        the docs is wrong the moment it does."""
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+    def test_the_description_makes_no_registry_size_claim(self) -> None:
+        """A registry count in the docs is wrong the moment the registry grows, so
+        the description names the registry without counting it."""
+        import re
 
-        assert f"{len(DEGRADATION_REGISTRY)} keys" in self._description(), (
-            f"registry now has {len(DEGRADATION_REGISTRY)} entries; the "
-            "progressive_degradations description still claims a different count"
-        )
+        text = self._description()
+        assert "infrastructure.physics.degradations" in text
+        claims = re.findall(r"\b\d+\s+(?:keys|entries|operators)\b", text)
+        assert not claims, f"progressive_degradations description counts the registry: {claims}"
 
     def test_registry_examples_in_the_description_are_real_keys(self) -> None:
-        from spectramr.infrastructure.physics.digital_twin_extensions import (
-            DEGRADATION_REGISTRY,
-        )
+        from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 
         text = self._description()
         cited = [

@@ -59,6 +59,11 @@ class DummyEnvironment:
 
         c.model.in_channels = 1
         c.model.target_domain = "image"
+        # A real mapping: the strategy validates bloch_sequence_by_contrast and
+        # refuses a MagicMock in its place (#2611).
+        c.model.model_kwargs = {}
+        # Single-process: a bare MagicMock reads as an unknown parallel backend (#2629).
+        c.parallel = None
 
         self.config = c
 

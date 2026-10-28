@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from spectramr.core.metrics.quantitative.dice_risk import (
@@ -14,8 +15,8 @@ from spectramr.core.metrics.quantitative.dice_risk import (
 
 def test_identical_images_dice_one_risk_zero() -> None:
     x = torch.rand(2, 1, 16, 16)
-    d = SynthSegDiceMetric()(x, x, n_classes=5)
-    r = SynthSegDiceRiskMetric()(x, x, n_classes=5)
+    d = SynthSegDiceMetric()(x, x, segmenter_backend="label_dice", n_classes=5)
+    r = SynthSegDiceRiskMetric()(x, x, segmenter_backend="label_dice", n_classes=5)
     assert d > 0.99
     assert r < 0.01
     assert abs((d + r) - 1.0) < 1e-5
@@ -23,8 +24,56 @@ def test_identical_images_dice_one_risk_zero() -> None:
 
 def test_different_images_dice_below_one() -> None:
     torch.manual_seed(0)
-    d = SynthSegDiceMetric()(torch.rand(2, 1, 16, 16), torch.rand(2, 1, 16, 16), n_classes=5)
+    d = SynthSegDiceMetric()(
+        torch.rand(2, 1, 16, 16), torch.rand(2, 1, 16, 16),
+        segmenter_backend="label_dice", n_classes=5,
+    )
     assert d < 1.0
+
+
+def test_synthseg_dice_without_a_segmenter_raises() -> None:
+    """Planted violation (#1777 D11): no backend and no injected segmenter must not
+    fall back to the intensity-quantile proxy."""
+    import pytest
+
+    x = torch.rand(1, 1, 16, 16)
+    with pytest.raises(ValueError, match="intensity_quantile_dice_proxy"):
+        SynthSegDiceMetric()(x, x)
+    with pytest.raises(ValueError, match="intensity_quantile_dice_proxy"):
+        SynthSegDiceRiskMetric()(x, x)
+
+
+def test_proxies_reproduce_the_old_no_segmenter_numbers() -> None:
+    """Behaviour preserved for the migrated arms: the proxy equals the label_dice backend
+    that synthseg_dice used to fall back to (n_classes 5)."""
+    from spectramr.core.metrics.registry import get_metric
+
+    torch.manual_seed(0)
+    p, t = torch.rand(2, 1, 16, 16), torch.rand(2, 1, 16, 16)
+    old = SynthSegDiceMetric()(p, t, segmenter_backend="label_dice")
+    dice = get_metric("intensity_quantile_dice_proxy")
+    risk = get_metric("intensity_quantile_dice_risk_proxy")
+    assert dice.name == "intensity_quantile_dice_proxy" and dice.higher_is_better
+    assert risk.name == "intensity_quantile_dice_risk_proxy" and not risk.higher_is_better
+    assert dice(p, t) == pytest.approx(old)
+    assert risk(p, t) == pytest.approx(1.0 - old)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"n_classes": "5"},
+        {"n_classes": 1},
+        {"segmenter_backend": "synthseg"},
+        {"segmenter": MagicMock()},
+    ],
+)
+def test_proxy_refuses_what_it_cannot_honour(kwargs) -> None:
+    from spectramr.core.metrics.registry import get_metric
+
+    x = torch.rand(1, 1, 16, 16)
+    with pytest.raises(ValueError):
+        get_metric("intensity_quantile_dice_proxy")(x, x, **kwargs)
 
 
 def test_higher_is_better_flags() -> None:
@@ -49,7 +98,7 @@ def test_constructs_via_computer_path_with_device_kwarg() -> None:
 
     m = get_metric("synthseg_dice", device=_t.device("cpu"))
     x = _t.rand(1, 1, 16, 16)
-    val = m(x, x, domain="image", data_range=1.0)  # computer passes these kwargs
+    val = m(x, x, domain="image", data_range=1.0, segmenter_backend="label_dice")
     assert val == val and val > 0.99  # not NaN; identical -> ~1
 
 

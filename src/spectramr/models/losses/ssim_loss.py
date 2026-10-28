@@ -25,6 +25,25 @@ from spectramr.models.losses.registry import register_loss
 from .base_loss import BaseLoss
 
 
+def _resolve_twin(
+    name: str,
+    value: float | None,
+    twin_name: str,
+    twin: float | None,
+    *,
+    default: float,
+) -> float:
+    """Resolve a knob that has two accepted spellings; raise when they disagree."""
+    if value is not None and twin is not None and value != twin:
+        raise ValueError(
+            f"{name}={value!r} and {twin_name}={twin!r} name the same window parameter; "
+            "pass one of them"
+        )
+    if value is not None:
+        return value
+    return twin if twin is not None else default
+
+
 @register_loss(name="ssim", aliases=["SSIMLoss"], domain="image")
 class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
     """Structural Similarity Index Measure (SSIM) loss with optional metrics.
@@ -39,11 +58,11 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
     def __init__(
         self,
         window_size: int = 11,
-        sigma: float = 1.5,
+        sigma: float | None = None,
         data_range: float = 1.0,
-        win_sigma: float = 1.5,
-        K1: float = 0.01,
-        K2: float = 0.03,
+        win_sigma: float | None = None,
+        K1: float = 0.01,  # noqa: N803 - Wang et al. (2004) name the constants K1/K2
+        K2: float = 0.03,  # noqa: N803
         reduction: str = "mean",
         auto_range: bool = True,
         compute_metrics: bool = False,
@@ -51,15 +70,17 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
         """__init__.
 
         Args:
-            window_size (int): Description.
-            sigma (float): Description.
-            data_range (float): Description.
-            win_sigma (float): Description.
-            K1 (float): Description.
-            K2 (float): Description.
-            reduction (str): Description.
-            auto_range (bool): Description.
-            compute_metrics (bool): Description.
+            window_size (int): Gaussian window side (odd).
+            sigma (float | None): Gaussian window standard deviation (1.5).
+            data_range (float): Dynamic range L in C1=(K1 L)^2, C2=(K2 L)^2;
+                with ``auto_range`` it is the floor of the per-batch range.
+            win_sigma (float | None): Spelling of ``sigma`` shared with
+                ``MSSSIMLoss``; must agree with ``sigma`` when both are given.
+            K1 (float): Luminance stabiliser constant.
+            K2 (float): Contrast stabiliser constant.
+            reduction (str): ``'mean'``, ``'sum'`` or ``'none'``.
+            auto_range (bool): Resolve L from the batch instead of ``data_range``.
+            compute_metrics (bool): Also return a metrics dict (host syncs).
         """
         super().__init__(reduction=reduction)
         if window_size % 2 == 0:
@@ -68,11 +89,12 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
             raise ValueError(
                 "reduction must be 'mean', 'sum', or 'none'",
             )
+        sigma = _resolve_twin("sigma", sigma, "win_sigma", win_sigma, default=1.5)
 
         self.window_size = window_size
         self.sigma = sigma
         self.data_range = float(data_range)
-        self.win_sigma = win_sigma
+        self.win_sigma = sigma
         self.K1 = K1
         self.K2 = K2
         self.reduction = reduction
@@ -242,7 +264,7 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
             img2,
             window,
             self.window_size,
-            data_range,
+            data_range,  # type: ignore[arg-type]  # a 0-dim tensor range broadcasts in C1/C2
             self.K1,
             self.K2,
         )
@@ -258,7 +280,7 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
 
         return ssim_val.mean(dim=-1)  # Average over channels
 
-    def forward(
+    def forward(  # type: ignore[override]  # optionally returns (loss, metrics)
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
@@ -292,7 +314,7 @@ class SSIMLoss(MetricsAwareLossMixin, BaseLoss):
         target: torch.Tensor,
         loss_value: torch.Tensor,
         data_range: float | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict[str, float]:
         """Compute SSIM-specific metrics."""
         # Ensure real-valued inputs for metric computation
@@ -320,38 +342,45 @@ class MSSSIMLoss(BaseLoss):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{MSSSIM} = 1 - \\prod_j (\text{SSIM}_j)^{\beta_j}"""
+        \\mathcal{L}_{MSSSIM} = 1 - \\prod_j (\\text{SSIM}_j)^{\\beta_j}"""
+
+    scale_weights: torch.Tensor
 
     def __init__(
         self,
-        window_size: int = 11,
-        sigma: float = 1.5,
+        window_size: int | None = None,
+        sigma: float | None = None,
         data_range: float = 1.0,
-        win_size: int = 11,
-        win_sigma: float = 1.5,
+        win_size: int | None = None,
+        win_sigma: float | None = None,
         weights: list[float] | None = None,
-        K1: float = 0.01,
-        K2: float = 0.03,
+        K1: float = 0.01,  # noqa: N803 - Wang et al. (2004) name the constants K1/K2
+        K2: float = 0.03,  # noqa: N803
         reduction: str = "mean",
         auto_range: bool = True,
     ) -> None:
         """__init__.
 
         Args:
-            window_size (int): Description.
-            sigma (float): Description.
-            data_range (float): Description.
-            win_size (int): Description.
-            win_sigma (float): Description.
-            weights (Optional[list[float]]): Description.
-            K1 (float): Description.
-            K2 (float): Description.
-            reduction (str): Description.
-            auto_range (bool): Description.
+            window_size (int | None): Gaussian window side (odd, default 11).
+            sigma (float | None): Gaussian window standard deviation (default 1.5).
+            data_range (float): Dynamic range L (floor of the batch range
+                when ``auto_range``).
+            win_size (int | None): Spelling of ``window_size``; must agree
+                with it when both are given.
+            win_sigma (float | None): Spelling of ``sigma``; must agree with
+                it when both are given.
+            weights (Optional[list[float]]): Per-scale exponents (Wang 2003).
+            K1 (float): Luminance stabiliser constant.
+            K2 (float): Contrast stabiliser constant.
+            reduction (str): ``'mean'``, ``'sum'`` or ``'none'``.
+            auto_range (bool): Resolve L from the batch instead of ``data_range``.
         """
         super().__init__(reduction=reduction)
-        self.window_size = window_size
-        self.sigma = sigma
+        win_size = int(_resolve_twin("window_size", window_size, "win_size", win_size, default=11))
+        win_sigma = _resolve_twin("sigma", sigma, "win_sigma", win_sigma, default=1.5)
+        self.window_size = win_size
+        self.sigma = win_sigma
         self.data_range = float(data_range)
         self.win_size = win_size
         self.win_sigma = win_sigma
@@ -361,6 +390,10 @@ class MSSSIMLoss(BaseLoss):
         self.auto_range = auto_range
         self.weights = tuple(
             weights or [0.0448, 0.2856, 0.3001, 0.2363, 0.1333],
+        )
+        # Built once: a per-step torch.tensor(list, device=cuda) is a blocking copy.
+        self.register_buffer(
+            "scale_weights", torch.tensor(self.weights).unsqueeze(1), persistent=False
         )
         self._ssim = SSIMLoss(
             window_size=win_size,
@@ -435,11 +468,9 @@ class MSSSIMLoss(BaseLoss):
             raise RuntimeError("MS-SSIM requires at least one valid scale")
 
         ssim_stack = torch.stack(ssim_values, dim=0).clamp(min=1e-6)
-        weight_tensor = torch.tensor(
-            weights_used,
-            dtype=pred.dtype,
-            device=pred.device,
-        ).unsqueeze(1)
+        weight_tensor = self.scale_weights[: len(weights_used)].to(
+            device=pred.device, dtype=pred.dtype
+        )
 
         weighted = torch.pow(ssim_stack, weight_tensor)
         ms_ssim = torch.prod(weighted, dim=0)
@@ -462,7 +493,8 @@ def ssim_loss(
 ) -> torch.Tensor:
     """Convenience function for SSIM loss."""
     loss_fn = SSIMLoss(**kwargs)
-    return loss_fn(img1, img2)
+    loss: torch.Tensor = loss_fn(img1, img2)
+    return loss
 
 
 def msssim_loss(
@@ -472,19 +504,18 @@ def msssim_loss(
 ) -> torch.Tensor:
     """Convenience function for MS-SSIM loss."""
     loss_fn = MSSSIMLoss(**kwargs)
-    return loss_fn(img1, img2)
+    loss: torch.Tensor = loss_fn(img1, img2)
+    return loss
 
 
-def ssim(img1: torch.Tensor, img2: torch.Tensor, **kwargs) -> torch.Tensor:
+def ssim(img1: torch.Tensor, img2: torch.Tensor, **kwargs: Any) -> torch.Tensor:
     """Convenience function for SSIM metric (higher is better)."""
-    loss_fn = SSIMLoss(**kwargs)
-    return 1.0 - loss_fn(img1, img2)
+    return 1.0 - ssim_loss(img1, img2, **kwargs)
 
 
-def msssim(img1: torch.Tensor, img2: torch.Tensor, **kwargs) -> torch.Tensor:
+def msssim(img1: torch.Tensor, img2: torch.Tensor, **kwargs: Any) -> torch.Tensor:
     """Convenience function for MS-SSIM metric (higher is better)."""
-    loss_fn = MSSSIMLoss(**kwargs)
-    return 1.0 - loss_fn(img1, img2)
+    return 1.0 - msssim_loss(img1, img2, **kwargs)
 
 
 __all__ = [

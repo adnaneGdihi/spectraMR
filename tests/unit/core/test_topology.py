@@ -337,3 +337,74 @@ def test_gpu_facts_reach_provenance_and_the_startup_line():
     assert rec["visible_gpus"] == 4
     assert rec["allocated_gpus_on_node"] == 4
     assert "gpus_allocated_on_node=4" in t.describe()
+
+
+# --------------------------------------------------------------------------- #
+# RANK from SLURM_PROCID: a hand-rolled srun, no torchrun
+# --------------------------------------------------------------------------- #
+def test_rank_falls_back_to_slurm_procid_when_world_size_is_declared():
+    t = _resolve({"WORLD_SIZE": "4", "SLURM_PROCID": "3", "LOCAL_WORLD_SIZE": "4"})
+    assert (t.rank, t.sources["rank"]) == (3, "env:SLURM_PROCID")
+    assert not t.is_rank_zero
+
+
+def test_rank_env_outranks_slurm_procid():
+    t = _resolve({"WORLD_SIZE": "4", "RANK": "1", "SLURM_PROCID": "3"})
+    assert (t.rank, t.sources["rank"]) == (1, "env:RANK")
+
+
+def test_slurm_procid_is_ignored_without_a_declared_world_size():
+    """``srun -n 4 python train.py`` is four independent jobs, not four ranks."""
+    t = _resolve({"SLURM_PROCID": "3"})
+    assert (t.rank, t.world_size, t.sources["rank"]) == (0, 1, "default")
+
+
+def test_slurm_procid_outside_the_declared_world_is_refused():
+    with pytest.raises(TopologyResolutionError, match="outside WORLD_SIZE"):
+        _resolve({"WORLD_SIZE": "2", "SLURM_PROCID": "5"})
+
+
+# --------------------------------------------------------------------------- #
+# resolve_rank: the one rule the topology, the console gate and setup_distributed share
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({"RANK": "2", "WORLD_SIZE": "4"}, (2, "env:RANK")),
+        ({"RANK": "2"}, (2, "env:RANK")),
+        ({"WORLD_SIZE": "4", "SLURM_PROCID": "3"}, (3, "env:SLURM_PROCID")),
+        ({"WORLD_SIZE": "4", "RANK": "1", "SLURM_PROCID": "3"}, (1, "env:RANK")),
+        ({"SLURM_PROCID": "3"}, (None, "unresolved")),
+        ({}, (None, "unresolved")),
+        # Planted: LOCAL_RANK is a rank within one node, never a global rank.
+        ({"WORLD_SIZE": "4", "LOCAL_RANK": "1"}, (None, "unresolved")),
+    ],
+)
+def test_resolve_rank(environ, expected):
+    from spectramr.core.topology import resolve_rank
+
+    assert resolve_rank(environ) == expected
+
+
+def test_resolve_rank_refuses_a_malformed_rank():
+    from spectramr.core.topology import resolve_rank
+
+    with pytest.raises(TopologyResolutionError, match="not an integer"):
+        resolve_rank({"WORLD_SIZE": "2", "RANK": "abc"})
+
+
+def test_the_topology_and_the_console_gate_agree_on_every_launch(monkeypatch):
+    """Planted divergence guard: both consumers read ``resolve_rank``, so they cannot differ."""
+    from spectramr.core import env
+    from spectramr.core.topology import resolve_rank
+
+    for environ in (
+        {"WORLD_SIZE": "4", "RANK": "2"},
+        {"WORLD_SIZE": "4", "SLURM_PROCID": "3"},
+        {"WORLD_SIZE": "4", "LOCAL_RANK": "1"},
+    ):
+        for name in ("RANK", "SLURM_PROCID", "LOCAL_RANK", "WORLD_SIZE"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in environ.items():
+            monkeypatch.setenv(name, value)
+        assert env.distributed_rank() == resolve_rank(environ)[0]

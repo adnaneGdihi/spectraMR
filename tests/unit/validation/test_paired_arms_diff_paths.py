@@ -60,7 +60,25 @@ class TestNexTargetAblationIsRepresentable:
     """
 
     def test_the_nex_ablation_factors_are_exempt(self) -> None:
-        for path in ("data.target_mode", "data.r2r_alpha", "metadata.expected_outcome"):
+        for path in (
+            "data.target_mode",
+            "data.r2r_alpha",
+            "data.r2r_split_angle_deg",
+            "data.r2r_whitening",
+            "data.emit_alternate_input",
+            "data.processing.transforms",
+            "validation.scoring.coil_manifold_projection",
+            "losses.complex_losses",
+            "training.equivariant_imaging.measurement_target",
+            "training.strategy_class",
+            "training.ssdu.noise_std_source",
+            "data.coil_maps_root",
+            "data.coil_maps_missing",
+            "data.coil_maps_recipe",
+            "data.coil_maps_acs_size",
+            "validation.scoring.recorrupted_inference",
+            "metadata.expected_outcome",
+        ):
             assert path in DEFAULT_DIFF_PATHS, f"{path} is not exempt"
 
     def test_the_n2n_cohort_passes_on_every_pair(self) -> None:

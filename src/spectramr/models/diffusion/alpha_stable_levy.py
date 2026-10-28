@@ -140,9 +140,10 @@ def fractional_score_matching_loss(
     For α-stable noise the score :math:`\nabla\log p_{t\mid 0}` is the
     fractional-Laplacian Riesz-flux of the transition density; we use the
     *standard* DSM surrogate that targets :math:`-\mathrm{noise}/\sigma^\alpha`,
-    which matches the score at α=2 and provides a defensible surrogate at
-    other α (this is the practical Yoon-Choi-Yoon variant
-    [arXiv:2305.18044]).
+    which matches the score at alpha=2 and is only a surrogate at other alpha,
+    not the exact alpha-stable score (for alpha-stable score-based models see
+    E. Yoon, K. Park, S. Kim and S. Lim, "Score-based Generative Models with
+    Levy Processes", NeurIPS 2023).
 
     Args:
         score_model: A callable mapping ``x_t -> s_θ(x_t)`` with matching shape.

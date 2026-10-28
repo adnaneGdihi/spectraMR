@@ -17,6 +17,20 @@ import torch
 from spectramr.infrastructure.services.metrics_tracker import MetricsTracker
 
 
+@pytest.fixture(autouse=True)
+def _synchronous_image_writes(monkeypatch):
+    """These tests inspect files right after saving; the writer is asynchronous."""
+    real = MetricsTracker.save_images_batch
+
+    def save_then_drain(self, *args, **kwargs):
+        try:
+            return real(self, *args, **kwargs)
+        finally:
+            self.drain()
+
+    monkeypatch.setattr(MetricsTracker, "save_images_batch", save_then_drain)
+
+
 class TestMetricsTrackerImageSaving:
     """Test suite for MetricsTracker image saving."""
 
@@ -242,7 +256,7 @@ class TestMetricsTrackerImageSavingWithLogging:
 class TestMetricsTrackerMultiChannelImageSaving:
     """Test multi-channel tensor image saving (RSS magnitude fallback).
 
-    Verifies that _save_tensor_as_image handles tensors with >3 channels
+    Verifies that the image saver handles tensors with >3 channels
     by computing RSS magnitude instead of raising ValueError.
     """
 

@@ -16,6 +16,9 @@ import torch
 from spectramr.models.blocks.contrast_conditioning import (
     build_contrast_sequence,
     contrast_sequence_dim,
+    expand_contrast_over_slices,
+    fuse_contrast_embedding,
+    require_contrast_rows,
 )
 
 # --- contrast_sequence_dim ------------------------------------------------
@@ -236,3 +239,65 @@ def test_the_map_follows_the_image_dtype() -> None:
     image = torch.randn(2, 1, 4, 4, dtype=torch.float64)
     out = _map(image, torch.tensor([0, 1]), torch.tensor([0, 1]), projection=_proj().double())
     assert out.dtype == torch.float64
+
+
+# --- contrast-embedding row rule (#2055) ------------------------------------
+
+
+def test_matching_rows_add_onto_the_timestep_embedding() -> None:
+    t_emb, c_emb = torch.randn(3, 8), torch.randn(3, 8)
+    assert torch.equal(fuse_contrast_embedding(t_emb, c_emb, owner="X"), t_emb + c_emb)
+
+
+@pytest.mark.parametrize(("t_rows", "c_rows"), [(2, 3), (3, 2), (4, 1)])
+def test_a_row_mismatch_raises_naming_both_sizes(t_rows: int, c_rows: int) -> None:
+    """Larger contrast (the old truncation), larger timestep (the old add
+    crash), and a single broadcast row are all refused the same way."""
+    with pytest.raises(ValueError, match=f"contrast_emb batch {c_rows}") as exc:
+        fuse_contrast_embedding(torch.randn(t_rows, 8), torch.randn(c_rows, 8), owner="Owner")
+    message = str(exc.value)
+    assert f"{t_rows} row(s)" in message and "Owner" in message
+
+
+def test_an_absent_side_passes_the_other_through() -> None:
+    t_emb = torch.randn(2, 8)
+    assert fuse_contrast_embedding(t_emb, None, owner="X") is t_emb
+    assert fuse_contrast_embedding(None, t_emb, owner="X") is t_emb
+    assert fuse_contrast_embedding(None, None, owner="X") is None
+
+
+def test_require_contrast_rows_returns_the_tensor_it_accepts() -> None:
+    c_emb = torch.randn(2, 8)
+    assert require_contrast_rows(c_emb, 2, owner="X") is c_emb
+
+
+def test_the_retired_truncation_mispaired_where_the_owner_raises() -> None:
+    """Planted violation: three volumes' ids against a two-row batch.
+
+    The slice both generators used to apply keeps rows 0 and 1, so the shapes
+    agree and row 1 is conditioned on whatever id landed at position 1 -- no
+    error anywhere. The owner must refuse the same inputs.
+    """
+    embedding = torch.nn.Embedding(4, 8)
+    ids = torch.tensor([2, 0, 3])
+    c_emb, t_emb = embedding(ids), torch.zeros(2, 8)
+
+    truncated = c_emb[: t_emb.shape[0]]
+    assert torch.equal(t_emb + truncated, embedding(ids[:2])), "old path ran silently"
+
+    with pytest.raises(ValueError, match="contrast_emb batch 3"):
+        fuse_contrast_embedding(t_emb, c_emb, owner="X")
+
+
+def test_per_volume_rows_expand_volume_major_over_the_slices() -> None:
+    """``repeat`` would give the right length and the wrong assignment."""
+    c_emb = torch.tensor([[0.0], [2.0]])
+    out = expand_contrast_over_slices(c_emb, rows=6, depth=3)
+    assert out.flatten().tolist() == [0.0, 0.0, 0.0, 2.0, 2.0, 2.0]
+
+
+def test_rows_that_are_not_volumes_times_depth_are_left_for_the_owner_to_refuse() -> None:
+    c_emb = torch.randn(3, 8)
+    assert expand_contrast_over_slices(c_emb, rows=4, depth=2) is c_emb
+    with pytest.raises(ValueError, match="contrast_emb batch 3"):
+        require_contrast_rows(expand_contrast_over_slices(c_emb, 4, 2), 4, owner="X")

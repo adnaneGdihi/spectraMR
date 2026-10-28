@@ -210,3 +210,32 @@ def test_compute_returns_no_metrics_by_default(pair):
     _, metrics = WeightedLoss("l1", L1Loss(), 1.0).compute(pred, target)
 
     assert metrics is None
+
+
+class _MagnitudeL1(torch.nn.Module):
+    """A real-valued loss of complex inputs, as every complex-MRI loss is."""
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (pred - target).abs().mean()
+
+
+@pytest.mark.parametrize("cls", [ComposedLoss, ConditionalComposedLoss])
+def test_a_complex_prediction_yields_a_real_total_that_backpropagates(cls):
+    """The seed took ``pred.dtype``, so complex data made the total complex and
+    ``backward()`` raised "grad can be implicitly created only for real scalar outputs"."""
+    pred = torch.randn(2, 1, 4, 4, dtype=torch.complex64, requires_grad=True)
+    target = torch.randn(2, 1, 4, 4, dtype=torch.complex64)
+
+    total = cls([WeightedLoss("l1", _MagnitudeL1(), 2.0)])(pred, target)
+
+    assert total.dtype == torch.float32
+    assert float(total) == pytest.approx(2.0 * float(_MagnitudeL1()(pred, target)))
+    total.backward()
+    assert pred.grad is not None
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
+def test_a_real_prediction_keeps_its_dtype(dtype):
+    pred = torch.rand(2, 1, 4, 4, dtype=dtype)
+    total = ComposedLoss([WeightedLoss("l1", _MagnitudeL1(), 1.0)])(pred, pred.clone())
+    assert total.dtype == dtype

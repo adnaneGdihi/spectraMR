@@ -175,3 +175,55 @@ class TestIncompatiblePairsRaise:
         """All 105 arms that declare a strategy declare `image`."""
         for dataset_type in ("nifti", "kspace", "m4raw", "mrixfields"):
             assert self._select("image", dataset_type)[0] == "image"
+
+
+class TestStrategyKwargsTable:
+    """``_build_strategy_kwargs`` is a table of per-strategy builders, not an if-chain."""
+
+    @staticmethod
+    def _config(**over):
+        base = {
+            "padding_mode": "zeros",
+            "padding_value": 0.0,
+            "allow_variable_shapes": False,
+            "squeeze_depth_dim": None,
+            "validate_nans": True,
+            "slab_target_mode": "middle",
+        }
+        return SimpleNamespace(**{**base, **over})
+
+    def test_image_kwargs_keep_their_keys_and_order(self) -> None:
+        kwargs = CollationStrategySelector._build_strategy_kwargs(
+            "image", self._config(), False, (256, 256, 1)
+        )
+        assert list(kwargs) == [
+            "padding_mode",
+            "padding_value",
+            "allow_variable_shapes",
+            "squeeze_depth_dim",
+            "validate_nans",
+        ]
+        assert kwargs["squeeze_depth_dim"] is True  # derived from patch_size[-1] == 1
+
+    def test_slab_kwargs_add_target_mode_only_in_slab_mode(self) -> None:
+        plain = CollationStrategySelector._build_strategy_kwargs(
+            "slab", self._config(), False, None
+        )
+        slab = CollationStrategySelector._build_strategy_kwargs("slab", self._config(), True, None)
+        assert "target_mode" not in plain and "flat_input" not in plain
+        assert (slab["target_mode"], slab["flat_input"]) == ("middle", True)
+
+    def test_slab_still_refuses_a_config_that_asks_for_the_opposite(self) -> None:
+        with pytest.raises(ValueError, match="allow_variable_shapes"):
+            CollationStrategySelector._build_strategy_kwargs(
+                "slab", self._config(allow_variable_shapes=True), False, None
+            )
+        with pytest.raises(ValueError, match="squeeze_depth_dim"):
+            CollationStrategySelector._build_strategy_kwargs(
+                "slab", self._config(squeeze_depth_dim=True), False, None
+            )
+
+    def test_an_unlisted_strategy_takes_no_kwargs(self) -> None:
+        assert CollationStrategySelector._build_strategy_kwargs(
+            "anything_else", self._config(), True, None
+        ) == {}

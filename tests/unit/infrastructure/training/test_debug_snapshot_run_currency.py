@@ -95,9 +95,14 @@ def test_a_shorter_second_run_does_not_claim_the_first_runs_leftovers(
         "first_steps_step_000002",
     ], "steps 3-8 are the previous run's and must not be claimed by this one"
 
-    # Still on disk -- the marker states ownership, it does not delete evidence.
-    roots = {d.name for d in (tmp_path / "debug_snapshots").iterdir() if d.is_dir()}
-    assert "first_steps_step_000008" in roots
+    # Moved out of the root, not deleted: the readers' `*_step_*` globs see one run.
+    snap_root = tmp_path / "debug_snapshots"
+    roots = {d.name for d in snap_root.glob("*_step_*")}
+    assert roots == {"first_steps_step_000001", "first_steps_step_000002"}
+    archived = snap_root / "previous_runs" / first["run_id"]
+    assert (archived / "first_steps_step_000008").is_dir()
+    assert (archived / "first_steps_step_000001").is_dir(), "a same-named step is archived too"
+    assert json.loads((archived / "RUN.json").read_text())["run_id"] == first["run_id"]
 
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("from an earlier run" in w for w in warnings), warnings

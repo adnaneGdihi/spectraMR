@@ -21,6 +21,8 @@ k-space regulariser. Needs ≥ 2 coils (the cross-coil relation is the signal).
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,7 +64,8 @@ def _ridge_solve(s: torch.Tensor, t: torch.Tensor, ridge: float) -> torch.Tensor
     """Per-batch ridge least squares: ``G = (SᵀS + λI)⁻¹ Sᵀ T``, ``[B, D, F]``."""
     sts = s.transpose(1, 2) @ s  # [B, D, D]
     eye = ridge * torch.eye(sts.shape[-1], device=s.device, dtype=s.dtype)
-    return torch.linalg.solve(sts + eye, s.transpose(1, 2) @ t)
+    g: torch.Tensor = torch.linalg.solve(sts + eye, s.transpose(1, 2) @ t)
+    return g
 
 
 def pisco_self_consistency(
@@ -125,7 +128,7 @@ class PiscoSelfConsistencyLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         kspace = prediction

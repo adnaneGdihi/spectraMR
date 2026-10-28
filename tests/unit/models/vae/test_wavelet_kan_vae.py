@@ -62,3 +62,33 @@ class TestWaveletKANVAEMechanismFires:
         """The real layer rejects unknown wavelet types (no silent default)."""
         with pytest.raises((AssertionError, ValueError)):
             WavKANConv2DLayer(1, 8, kernel_size=3, padding=1, wavelet_type="db2")
+
+
+class TestExperiment24RunsTheWaveletModel:
+    """``wavelet_kan_vae`` is a registry alias of the plain KANVAEGenerator, which has no
+    wavelet layer; experiment_24 once named it and trained a plain KAN VAE."""
+
+    _YAML = "experiments/inprogress/vae_latent/experiment_24_wavelet_fourier_kan_vae.yaml"
+
+    def _model_block(self) -> dict:
+        from pathlib import Path
+
+        import yaml
+
+        root = Path(__file__).resolve().parents[4]
+        return yaml.safe_load((root / self._YAML).read_text())["model"]
+
+    def test_the_arm_resolves_to_the_wavelet_class(self) -> None:
+        from spectramr.models.init_registry import populate_model_registry
+        from spectramr.models.registry import get_model_class
+
+        populate_model_registry()
+        assert get_model_class(self._model_block()["model_type"]) is WaveletKANVAE
+
+    def test_every_declared_model_kwarg_is_a_parameter_the_constructor_reads(self) -> None:
+        """The constructor swallows ``**kwargs``, so an unread key would be discarded silently."""
+        import inspect
+
+        declared = set(self._model_block().get("model_kwargs") or {})
+        named = set(inspect.signature(WaveletKANVAE.__init__).parameters) - {"self", "kwargs"}
+        assert declared <= named, f"unread model_kwargs: {sorted(declared - named)}"

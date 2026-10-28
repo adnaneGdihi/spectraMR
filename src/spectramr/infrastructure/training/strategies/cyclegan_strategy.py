@@ -18,14 +18,22 @@ the container's hard-coded ``10.0`` / ``0.5``. The registered ``cyclegan_generat
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import (
+    OWNED_CALL,
+    OWNED_MODULE,
+    refuse_outside_forward_call,
+)
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.loss_folding import unpaired_source_terms
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
 )
@@ -36,7 +44,9 @@ from spectramr.infrastructure.training.strategies.mixins.adversarial import (
 from spectramr.models.discriminators.patchgan_discriminator import (  # noqa: F401
     PatchGANDiscriminator,
 )
+from spectramr.models.generators.b0_hypernetwork import B0ConditionedGenerator
 from spectramr.models.generators.cycle_gan import ResNetGenerator  # noqa: F401
+from spectramr.models.losses.domain_adversarial_grl import DomainAdversarialLoss
 from spectramr.models.registry import get_model_class
 
 logger = logging.getLogger(__name__)
@@ -56,6 +66,27 @@ def _lsgan_d_loss(pred_real: torch.Tensor, pred_fake: torch.Tensor) -> torch.Ten
     return 0.5 * (torch.mean((pred_real - 1.0) ** 2) + torch.mean(pred_fake**2))
 
 
+def _call_gen(gen: nn.Module, x: torch.Tensor, field: torch.Tensor | None) -> torch.Tensor:
+    """Run a generator, passing its output-domain B0 only when the batch carries one.
+
+    A B0-conditioned generator raises on ``field=None``, so a missing stamp fails loudly.
+    """
+    return gen(x) if field is None else gen(x, field_strength=field)
+
+
+def _call_gen_anat(
+    gen: nn.Module, x: torch.Tensor, field: torch.Tensor | None, want: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``_call_gen`` that also returns Z_anat when ``want`` (one pass, no extra forward)."""
+    if not want:
+        return _call_gen(gen, x, field), None
+    # A non-forward call: the inner module under dp; ddp and sharded backends are refused.
+    inner = unwrap_model(gen)
+    if field is None:
+        return inner.forward_with_anatomy(x)
+    return inner.forward_with_anatomy(x, field_strength=field)
+
+
 def compute_cyclegan_losses(
     gen_ab: nn.Module,
     gen_ba: nn.Module,
@@ -66,6 +97,11 @@ def compute_cyclegan_losses(
     *,
     lambda_cycle: float = 10.0,
     lambda_identity: float = 0.5,
+    source_fold: Callable[[torch.Tensor, torch.Tensor], tuple[Any, dict[str, Any]]] | None = None,
+    field_ab: torch.Tensor | None = None,
+    field_ba: torch.Tensor | None = None,
+    domain_fold: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, dict[str, Any]]]
+    | None = None,
 ) -> dict[str, torch.Tensor]:
     """CycleGAN losses for one unpaired batch.
 
@@ -82,16 +118,21 @@ def compute_cyclegan_losses(
         real_b: B-domain samples (the batch ``target``) -- used ONLY as a real
             B-domain example, never as a pixel target for ``fake_b``.
         lambda_cycle / lambda_identity: weights from ``config.losses.gan``.
+        field_ab / field_ba: output-domain B0 of ``gen_ab`` (domain B) and ``gen_ba``
+            (domain A), forwarded only to B0-conditioned generators.
+        domain_fold: optional ``(z_a, z_b) -> (weighted term, components)`` over the
+            bottleneck of ``gen_ab`` on the A and B samples; reuses the forwards below.
 
     Returns:
         ``{"g_total_loss", "adv_g", "adv_d", "cycle", "identity"}`` (all scalar
         tensors; ``cycle`` / ``identity`` are the raw sums, weighted into the
         total).
     """
-    fake_b = gen_ab(real_a)
-    rec_a = gen_ba(fake_b)
-    fake_a = gen_ba(real_b)
-    rec_b = gen_ab(fake_a)
+    want_anat = domain_fold is not None
+    fake_b, z_a = _call_gen_anat(gen_ab, real_a, field_ab, want_anat)
+    rec_a = _call_gen(gen_ba, fake_b, field_ba)
+    fake_a = _call_gen(gen_ba, real_b, field_ba)
+    rec_b = _call_gen(gen_ab, fake_a, field_ab)
 
     # Adversarial: generators try to fool the opposite-domain discriminator.
     adv_g = _lsgan_g_loss(disc_b(fake_b)) + _lsgan_g_loss(disc_a(fake_a))
@@ -101,8 +142,8 @@ def compute_cyclegan_losses(
 
     # Identity (raw L1; weighted by lambda_identity). Requires in==out channels
     # (the M4Raw 1-ch magnitude case), matching the container's id_A / id_B.
-    id_a = gen_ba(real_a)
-    id_b = gen_ab(real_b)
+    id_a = _call_gen(gen_ba, real_a, field_ba)
+    id_b, z_b = _call_gen_anat(gen_ab, real_b, field_ab, want_anat)
     identity = F.l1_loss(id_a, real_a) + F.l1_loss(id_b, real_b)
 
     # Discriminator loss on DETACHED fakes (no generator gradient path).
@@ -111,13 +152,30 @@ def compute_cyclegan_losses(
     )
 
     g_total = adv_g + lambda_cycle * cycle + lambda_identity * identity
-    return {
+    out = {
         "g_total_loss": g_total,
         "adv_g": adv_g,
         "adv_d": adv_d,
         "cycle": cycle,
         "identity": identity,
     }
+    if source_fold is not None:
+        # Declared ``role: source`` image losses compare the translation with the input.
+        extra, components = source_fold(fake_b, real_a)
+        if extra is not None:
+            out["g_total_loss"] = g_total + extra
+            out.update(components)
+    if domain_fold is not None:
+        assert z_a is not None and z_b is not None  # set by _call_gen_anat when want_anat
+        term, components = domain_fold(z_a, z_b)
+        out["g_total_loss"] = out["g_total_loss"] + term
+        out.update(components)
+    return out
+
+
+def _domain_grl_enabled(config: Any) -> bool:
+    gan = getattr(getattr(config, "losses", None), "gan", None)
+    return bool(getattr(getattr(gan, "domain_grl", None), "enabled", False))
 
 
 class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
@@ -128,6 +186,23 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     second discriminator ``disc_a`` itself, registering the owned modules on the
     generator / discriminator optimizers so all four networks train.
     """
+
+    # parallel_compat: gen_ba / disc_a (and the GRL head) are owned modules, DDP-wrapped and
+    # called through forward_of; the GRL bottleneck tap is a non-forward call, refused.
+    parallel_compat = frozenset({"replicated"})
+
+    #: ``(field_strength_t, field_strength_source_t)`` of the current training step.
+    _step_fields: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
+
+    #: Gradient-reversal domain head on gen_ab's bottleneck; built only when domain_grl is on.
+    domain_head: DomainAdversarialLoss | None = None
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own: tuple[tuple[str, str], ...] = (("gen_ba", OWNED_MODULE), ("disc_a", OWNED_MODULE))
+        if _domain_grl_enabled(config):
+            own += (("domain_head", OWNED_MODULE), ("gen_ab.forward_with_anatomy", OWNED_CALL))
+        return (*super().owned_module_declarations(config), *own)
 
     def _setup_strategy_specific_components(self) -> None:
         """Build/resolve the four networks (called from the base ``__init__``)."""
@@ -158,15 +233,43 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         self.gen_ab: nn.Module = (
             primary_gen if isinstance(primary_gen, nn.Module) else gen_cls(in_ch, out_ch)
         )
-        self.gen_ba: nn.Module = gen_cls(out_ch, in_ch)
+        # The env models arrive wrapped under dp/ddp, so their class and taps are read inside.
+        inner_ab = unwrap_model(self.gen_ab)
+        # A B0-conditioned primary carries its reverse twin, so each direction gets its own
+        # output-domain B0 (domain B for gen_ab, domain A for gen_ba).
+        if isinstance(inner_ab, B0ConditionedGenerator):
+            self.gen_ba: nn.Module = inner_ab.reverse(out_ch, in_ch)
+        else:
+            self.gen_ba = gen_cls(out_ch, in_ch)
         self.disc_b: nn.Module = (
             primary_disc if isinstance(primary_disc, nn.Module) else disc_cls(in_channels=out_ch)
         )
         self.disc_a: nn.Module = disc_cls(in_channels=in_ch)
 
+        gan_cfg = getattr(getattr(self.config, "losses", None), "gan", None)
+        self.domain_head = None
+        if gan_cfg is not None and gan_cfg.domain_grl.enabled:
+            refuse_outside_forward_call(
+                getattr(self.config, "parallel", None),
+                owner=type(self).__name__,
+                name="gen_ab.forward_with_anatomy",
+            )
+            if not hasattr(inner_ab, "forward_with_anatomy"):
+                raise ValueError(
+                    "losses.gan.domain_grl.enabled needs a generator with a bottleneck tap "
+                    f"(cyclegan_generator); gen_ab is {type(inner_ab).__name__}."
+                )
+            self.domain_head = DomainAdversarialLoss(
+                latent_dim=inner_ab.latent_channels,
+                alpha=1.0,
+                loss_weight=float(gan_cfg.lambda_domain),
+            )
+
         device = getattr(self, "device", torch.device("cpu"))
         for module in (self.gen_ab, self.gen_ba, self.disc_a, self.disc_b):
             module.to(device)
+        if self.domain_head is not None:
+            self.domain_head.to(device)
 
         # I2: ``base.__init__`` AMP-configures ``env.generator`` (gen_ab) and
         # ``env.discriminator`` (disc_b) BEFORE ``_setup_strategy_specific_components``
@@ -177,6 +280,18 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         if hasattr(self, "amp_helper") and self.amp_helper is not None:
             self.amp_helper.configure_model_for_amp(self.gen_ba)
             self.amp_helper.configure_model_for_amp(self.disc_a)
+            if self.domain_head is not None:
+                self.amp_helper.configure_model_for_amp(self.domain_head)
+
+        # The env models are wrapped by the parallel backend; everything built here is owned.
+        if self.gen_ab is not primary_gen:
+            self.register_owned_module("gen_ab", self.gen_ab)
+        self.register_owned_module("gen_ba", self.gen_ba)
+        self.register_owned_module("disc_a", self.disc_a)
+        if self.disc_b is not primary_disc:
+            self.register_owned_module("disc_b", self.disc_b)
+        if self.domain_head is not None:
+            self.register_owned_module("domain_head", self.domain_head)
 
         self._register_owned_params()
 
@@ -205,6 +320,13 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             disc_a_params = list(self.disc_a.parameters())
             if not self._params_in_optimizer(opt_d, disc_a_params):
                 opt_d.add_param_group({"params": disc_a_params})
+                self._sync_schedulers_after_param_group_addition(lr)
+
+        # The head's loss is in g_total, so its classifier trains in the generator step.
+        if opt_g is not None and self.domain_head is not None:
+            head_params = list(self.domain_head.parameters())
+            if not self._params_in_optimizer(opt_g, head_params):
+                opt_g.add_param_group({"params": head_params})
                 self._sync_schedulers_after_param_group_addition(lr)
 
     @staticmethod
@@ -268,16 +390,51 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         """Compute the CycleGAN losses for one unpaired batch."""
         real_a, real_b = self._resolve_domains(input_batch, target_batch, kwargs)
         lambda_cycle, lambda_identity = self._weights()
+        field_ab, field_ba = self._fields_from(kwargs.get("batch"))
+        if field_ab is None and field_ba is None:
+            field_ab, field_ba = self._step_fields
         return compute_cyclegan_losses(
-            self.gen_ab,
-            self.gen_ba,
-            self.disc_a,
-            self.disc_b,
+            self.forward_of("gen_ab"),
+            self.forward_of("gen_ba"),
+            self.forward_of("disc_a"),
+            self.forward_of("disc_b"),
             real_a,
             real_b,
             lambda_cycle=lambda_cycle,
             lambda_identity=lambda_identity,
+            source_fold=lambda pred, src: unpaired_source_terms(self, pred, src),
+            field_ab=field_ab,
+            field_ba=field_ba,
+            domain_fold=self._domain_term if self.domain_head is not None else None,
         )
+
+    def _domain_term(
+        self, z_a: torch.Tensor, z_b: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Weighted GRL domain loss on Z_anat, labelled A = batch input (0), B = target (1)."""
+        assert self.domain_head is not None
+        head = self.forward_of("domain_head")
+        z = torch.cat([z_a, z_b], dim=0)
+        labels = torch.cat([z_a.new_zeros(z_a.shape[0], 1), z_a.new_ones(z_b.shape[0], 1)], dim=0)
+        out = head(z, labels)
+        return out["domain_loss"], {
+            "loss_domain": out["domain_loss"].detach(),
+            "domain_acc": out["domain_acc"],
+        }
+
+    def _fields_from(self, batch: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return ``(field_strength_t, field_strength_source_t)`` stamped on a batch, or Nones."""
+        if batch is None or torch.is_tensor(batch) or not hasattr(batch, "get"):
+            return None, None
+        device = getattr(self, "device", None)
+
+        def _to(v: Any) -> torch.Tensor | None:
+            if v is None:
+                return None
+            t = torch.as_tensor(v, dtype=torch.float32).reshape(-1)
+            return t.to(device) if device is not None else t
+
+        return _to(batch.get("field_strength_t")), _to(batch.get("field_strength_source_t"))
 
     # ------------------------------------------------------------------ #
     # Two-optimizer alternating step (D on disc_a+disc_b, G on gen_ab+gen_ba)
@@ -301,8 +458,12 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         # during training after the first validation pass.
         for _m in (self.gen_ab, self.gen_ba, self.disc_a, self.disc_b):
             _m.train()
+        if self.domain_head is not None:
+            self.domain_head.train()
         first = input_batch if input_batch is not None else batch
         real_a, real_b = self._resolve_domains(first, target_batch, kwargs)
+        self._step_fields = self._fields_from(batch if batch is not None else first)
+        field_ab, field_ba = self._step_fields
         self._last_step_metrics: dict[str, torch.Tensor] = {}
         step_configs: list[dict[str, Any]] = []
 
@@ -311,11 +472,13 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         def d_closure() -> torch.Tensor:
             for disc in (self.disc_a, self.disc_b):
                 disc.requires_grad_(True)
+            gen_ab, gen_ba = self.forward_of("gen_ab"), self.forward_of("gen_ba")
+            disc_a, disc_b = self.forward_of("disc_a"), self.forward_of("disc_b")
             with torch.no_grad():
-                fake_b = self.gen_ab(real_a)
-                fake_a = self.gen_ba(real_b)
-            d_loss = _lsgan_d_loss(self.disc_a(real_a), self.disc_a(fake_a)) + _lsgan_d_loss(
-                self.disc_b(real_b), self.disc_b(fake_b)
+                fake_b = _call_gen(gen_ab, real_a, field_ab)
+                fake_a = _call_gen(gen_ba, real_b, field_ba)
+            d_loss = _lsgan_d_loss(disc_a(real_a), disc_a(fake_a)) + _lsgan_d_loss(
+                disc_b(real_b), disc_b(fake_b)
             )
             with torch.no_grad():
                 self._last_step_metrics["d_total_loss"] = d_loss.detach()
@@ -366,8 +529,8 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             # (cycle / identity / adv_g / adv_d / g_total_loss) that the reporter and
             # early-stopping consume -- NOT the old ``g_``-prefixed keys. ``update``
             # preserves ``d_total_loss`` written by the D-closure. No extra host sync
-            # is introduced: ``_handle_anomalies`` performs the single fused ``.cpu()``
-            # the base already does (metrics_mixin ``_convert_metrics_to_floats``).
+            # is introduced: ``_handle_anomalies`` keeps the tensors on the device
+            # for the training loop's log-gated conversion.
             detached = {k: v.detach() for k, v in losses.items()}
             self._last_step_metrics.update(self._handle_anomalies(detached, {}, epoch))
             return g_total
@@ -396,18 +559,23 @@ class CycleGANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     ) -> torch.Tensor:
         """Validation prediction is the A->B translation ``gen_ab(input)``."""
         self.gen_ab.eval()
-        return self.gen_ab(input_batch)
+        ctx = args[0] if args and isinstance(args[0], dict) else kwargs.get("batch_context") or {}
+        field_ab = self._fields_from(ctx)[0]
+        return _call_gen(self.gen_ab, input_batch, field_ab)
 
     @torch.no_grad()
     def validation_step(
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor | None = None,
+        field_strength_t: torch.Tensor | None = None,
+        field_strength_source_t: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Translate ``input`` A->B and score against ``target`` when a metrics
         computer is available (evaluation only -- NOT a training pixel loss)."""
-        pred = self._validation_forward(input_batch)
+        ctx = {"field_strength_t": field_strength_t, "field_strength_source_t": field_strength_source_t}
+        pred = self._validation_forward(input_batch, ctx)
         computer = getattr(self, "validation_metrics_computer", None)
         if computer is not None and target_batch is not None:
             try:

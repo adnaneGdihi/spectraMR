@@ -29,6 +29,7 @@ root; do not re-add a writer here.
 
 import logging
 import math
+from collections.abc import Iterator
 from typing import Any, NoReturn
 
 import numpy as np
@@ -37,6 +38,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.config.schemas.enums import Regime
+from spectramr.core.metrics.complex_input import as_phase_bearing
+from spectramr.core.metrics.data_range_contract import (
+    DataRangeContractError,
+    QuantileScaleContract,
+)
 from spectramr.core.metrics.outcome import (
     MetricNotApplicableError,
     NotApplicableReason,
@@ -57,20 +63,25 @@ try:
 except ImportError:
     torchvision = None
 
-try:
-    from torchmetrics.image import (
-        LearnedPerceptualImagePatchSimilarity,
-        MultiScaleStructuralSimilarityIndexMeasure,
-        UniversalImageQualityIndex,
-    )
-    from torchmetrics.image.fid import FrechetInceptionDistance
-    from torchmetrics.image.kid import KernelInceptionDistance
+# Resolved on first use: importing torchmetrics.image drags in matplotlib.pyplot
+# and transformers (~3 s), which the model-registry walk must not pay for.
+TORCHMETRICS_AVAILABLE: bool | None = None
+_TORCHMETRICS_IMPORT_ERROR: ImportError | None = None
 
-    TORCHMETRICS_AVAILABLE = True
-    _TORCHMETRICS_IMPORT_ERROR: ImportError | None = None
-except ImportError as _tm_exc:
-    TORCHMETRICS_AVAILABLE = False
-    _TORCHMETRICS_IMPORT_ERROR = _tm_exc
+
+def torchmetrics_available() -> bool:
+    """Whether torchmetrics imports; probes once, honours an explicit override."""
+    global TORCHMETRICS_AVAILABLE, _TORCHMETRICS_IMPORT_ERROR
+    if TORCHMETRICS_AVAILABLE is None:
+        try:
+            import torchmetrics.image  # noqa: F401
+
+            TORCHMETRICS_AVAILABLE = True
+        except ImportError as exc:
+            TORCHMETRICS_AVAILABLE = False
+            _TORCHMETRICS_IMPORT_ERROR = exc
+            logger.warning("torchmetrics unavailable: %r", exc)
+    return TORCHMETRICS_AVAILABLE
 
 
 def _require_torchmetrics(metric_name: str) -> NoReturn:
@@ -90,6 +101,7 @@ def _require_torchmetrics(metric_name: str) -> NoReturn:
     import can also fail on a version conflict (it requires ``huggingface-hub
     <1.0``); either way this fires. See ``docs/review_fixes_2026_07_01.rst``.
     """
+    torchmetrics_available()
     raise RuntimeError(
         f"Metric {metric_name!r} requires torchmetrics, which is unavailable "
         f"(TORCHMETRICS_AVAILABLE=False; root cause: {_TORCHMETRICS_IMPORT_ERROR!r}). "
@@ -99,7 +111,19 @@ def _require_torchmetrics(metric_name: str) -> NoReturn:
     )
 
 
-class BaseMetric(nn.Module):
+#: Images per network forward in the feature/perceptual metrics: a folded validation
+#: volume is hundreds of slices, and one pass over all of them holds tens of GiB.
+METRIC_CHUNK_IMAGES = 16
+
+
+def _image_chunks(*tensors: Tensor) -> Iterator[tuple[Tensor, ...]]:
+    """Yield aligned slices of at most ``METRIC_CHUNK_IMAGES`` images from each tensor."""
+    size = METRIC_CHUNK_IMAGES
+    for lo in range(0, tensors[0].shape[0], size):
+        yield tuple(t[lo : lo + size] for t in tensors)
+
+
+class BaseMetric(nn.Module):  # type: ignore[misc]
     """Base class for all metrics.
 
     Class attributes
@@ -174,7 +198,7 @@ class BaseMetric(nn.Module):
         self.device = torch.device(device) if isinstance(device, str) else device
         self.summarize = False  # Default: compute per batch
 
-    def to(self, *args, **kwargs):  # type: ignore[override]
+    def to(self, *args: Any, **kwargs: Any) -> Any:
         """Move the module *and* keep the ``self.device`` label truthful.
 
         ``self.device`` is not decoration: ``compute_metric`` implementations do
@@ -189,18 +213,18 @@ class BaseMetric(nn.Module):
             module.device = device
         return module
 
-    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs):
+    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> None:
         """Update metric state.
 
         Subclasses should override this for summary metrics (is_summary=True).
         """
         pass
 
-    def compute(self):
+    def compute(self) -> Any:
         """Compute metric."""
         pass
 
-    def forward(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def forward(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Default forward pass validation.
 
         forward method for BaseMetric.
@@ -259,7 +283,7 @@ class BaseMetric(nn.Module):
             "deliberately consumes a distribution head."
         )
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Compute metric for a batch."""
         raise NotImplementedError
 
@@ -289,14 +313,17 @@ def resolve_image_data_range(
     declared: float | None,
     *,
     metric_name: str,
+    contract: QuantileScaleContract | None = None,
 ) -> float:
     """Resolve ``data_range`` for an image-domain, range-sensitive metric.
 
     A declared range always wins -- ``metrics.data_range`` is the config surface
     for exactly this, and a user who states the scale is not overridden by a
-    guess. With nothing declared, the sign of the target selects the normalization
-    contract (``[-1, 1]`` vs ``[0, 1]``), which is what this code has always done
-    and is *correct whenever the data honours a contract*.
+    guess. Next, a declared percentile scale (``contract``) sets the range to the
+    level it pins, see :func:`_range_under_quantile_contract`. With neither, the
+    sign of the target selects the normalization contract (``[-1, 1]`` vs
+    ``[0, 1]``), which is what this code has always done and is *correct whenever
+    the data honours a contract*.
 
     What is new is that the choice is then **verified against the tensor** instead
     of assumed. The sign test is a proxy for a contract, and on data that honours
@@ -316,6 +343,7 @@ def resolve_image_data_range(
         target: Reference tensor the metric grades against.
         declared: Explicitly configured range, or ``None`` to derive one.
         metric_name: Name used in the not-applicable report.
+        contract: The percentile scale the data path declares, or ``None``.
 
     Returns:
         The data range to use.
@@ -324,16 +352,23 @@ def resolve_image_data_range(
         MetricNotApplicableError: The target honours no known normalization
             contract, so no range can be derived. Declare ``metrics.data_range``
             or normalize the data.
+        DataRangeContractError: ``contract`` is declared and the target
+            contradicts it.
     """
     if declared is not None:
         return declared
+
+    if contract is not None and not torch.is_complex(target):
+        resolved = _range_under_quantile_contract(target, contract, metric_name=metric_name)
+        if resolved is not None:
+            return resolved
 
     # One host transfer, not two: the sign test this replaces already paid one
     # sync for `target.min() < 0`, and the extent check needs the max as well.
     # Stacking keeps that at parity instead of doubling it (non-negotiable #9 --
     # this runs per range-sensitive metric per validation batch).
     lo, hi = torch.stack([target.min(), target.max()]).float().cpu().tolist()
-    contract = 2.0 if lo < 0.0 else 1.0
+    sign_range = 2.0 if lo < 0.0 else 1.0
 
     # Both contracts peak at magnitude 1.0; only their floor differs.
     peak = max(abs(lo), abs(hi))
@@ -348,7 +383,40 @@ def resolve_image_data_range(
             "`metrics.data_range` for this arm, or normalize the pipeline output.",
         )
 
-    return contract
+    return sign_range
+
+
+def _range_under_quantile_contract(
+    target: Tensor,
+    contract: QuantileScaleContract,
+    *,
+    metric_name: str,
+) -> float | None:
+    """The range a declared percentile scale establishes, verified against ``target``.
+
+    The scale pins a quantile of the magnitude image, not its peak, so the peak
+    test above is the wrong check here: it rejected every correctly scaled M4Raw
+    batch whose brightest voxels reach ~2.05 (#2241). The peak is still checked,
+    against the bound the declared quantile allows
+    (:attr:`QuantileScaleContract.max_peak`, where the derivation is).
+
+    A signed target is not the magnitude image the contract describes (a metric
+    reading raw interleaved k-space, say), so the contract says nothing about it
+    and ``None`` hands it back to the sign test, unchanged from before.
+    """
+    # One host transfer for both statistics (non-negotiable 9).
+    lo, hi = torch.stack([target.min(), target.max()]).float().cpu().tolist()
+    if lo < 0.0:
+        return None
+    if hi > contract.max_peak:
+        raise DataRangeContractError(
+            f"{metric_name}: the target peaks at {hi:.4g}, but the run declares "
+            f"{contract.describe()}, which tolerates a peak of at most {contract.max_peak:.4g}. "
+            "The normalization the configuration declares was not applied to this tensor, "
+            "or was applied to a different one. Fix the data path; declaring "
+            "`data.processing.data_range` would only hide it."
+        )
+    return contract.anchor
 
 
 def _guard_ssim_codomain(value: Tensor, *, metric_name: str) -> Tensor:
@@ -399,7 +467,7 @@ class PSNR(BaseMetric):
 
     def __init__(
         self,
-        data_range: float = None,
+        data_range: float | None = None,
         domain: str = "image",
         device: str | torch.device = "cpu",
         use_target_max: bool = False,
@@ -426,7 +494,8 @@ class PSNR(BaseMetric):
         target: Image,
         data_range: float | None = None,
         domain: str | None = None,
-        **kwargs,
+        scale_contract: QuantileScaleContract | None = None,
+        **kwargs: Any,
     ) -> Tensor:
         """Compute PSNR.
 
@@ -435,6 +504,8 @@ class PSNR(BaseMetric):
             target: Target image/k-space
             data_range: Override data range for this computation
             domain: Override domain for this computation
+            scale_contract: Declared percentile scale, see
+                :func:`resolve_image_data_range`. Image domain only.
             **kwargs: Additional arguments (ignored)
 
         Returns:
@@ -482,7 +553,9 @@ class PSNR(BaseMetric):
             # dataset as [0, 1] and halve its range. Residual, stated rather than
             # hidden: on mixed-sign data the contract can still differ between two
             # batch compositions. ``metrics.data_range`` is the declared escape.
-            dr = resolve_image_data_range(target, None, metric_name="psnr")
+            dr = resolve_image_data_range(
+                target, None, metric_name="psnr", contract=scale_contract
+            )
 
         if torch.is_complex(preds) or torch.is_complex(target):
             # ``F.mse_loss`` has no complex kernel ("mse_cpu"/"mse_cuda" not
@@ -601,7 +674,7 @@ class RobustMRI_PSNR(BaseMetric):
         target: Image,
         background_threshold: float | None = None,
         data_range_percentile: float | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Tensor:
         """Compute ROI-masked PSNR only within tissue support region.
 
@@ -652,40 +725,37 @@ class RobustMRI_PSNR(BaseMetric):
         else:
             robust_max = target_mag.max()
 
-        if robust_max > thresh:
-            adaptive_thresh = robust_max * 0.05
-            tissue_mask = target_mag > adaptive_thresh
-        else:
-            tissue_mask = target_mag > thresh
+        # Every branch below is a device-side `torch.where`, and the tissue mask is
+        # applied by masked sums rather than boolean indexing (a nonzero() sync):
+        # the result stays on the device so the metrics computer's fused host
+        # transfer is the only sync (#2163).
+        cutoff = torch.where(robust_max > thresh, robust_max * 0.05, thresh)
+        tissue_mask = target_mag > cutoff
+        n_tissue = tissue_mask.sum()
+        no_tissue = n_tissue == 0
 
-        # 3. Ensure mask has valid voxels
-        if tissue_mask.sum() == 0:
-            # No tissue detected - fallback to standard PSNR
-            mse = F.mse_loss(pred_mag, target_mag, reduction="mean")
-            data_range = robust_max.item() if robust_max > 0 else 1.0
-            # No mse == 0 sentinel -- see PSNR.compute_metric. The epsilon below
-            # regularizes the exact-match case and keeps the score monotone.
-            return 20 * torch.log10(
-                torch.tensor(data_range, device=self.device) / (torch.sqrt(mse) + 1e-10)
-            )
+        # 3. MSE on the tissue support; `where`, not `* mask`, so a non-finite
+        #    background voxel cannot leak NaN into the tissue average. With no
+        #    tissue the score falls back to whole-image PSNR.
+        sq_err = (pred_mag - target_mag) ** 2
+        mse_tissue = torch.where(tissue_mask, sq_err, 0).sum() / n_tissue.clamp_min(1)
+        mse = torch.where(no_tissue, F.mse_loss(pred_mag, target_mag, reduction="mean"), mse_tissue)
 
-        # 4. Compute MSE only on tissue mask
-        mse = torch.sum((pred_mag[tissue_mask] - target_mag[tissue_mask]) ** 2) / tissue_mask.sum()
-
-        # 5. Data Range: Use robust max of target magnitude (FIX for hallucination)
-        data_range = robust_max.item()
-        if data_range < 1e-10:
-            data_range = 1.0  # Fallback
-
-        # 6. Compute PSNR. No mse == 0 sentinel -- see PSNR.compute_metric: the
-        #    constant 100.0 belonged to the clamp that was removed, and outliving
-        #    it inverted the order between an exact match and a worse prediction.
-        psnr = 20 * torch.log10(
-            torch.tensor(data_range, device=self.device, dtype=mse.dtype)
-            / (torch.sqrt(mse) + 1e-10)
+        # 4. Data range: robust max of the target magnitude, which ignores DC
+        #    spikes. The two branches guard a degenerate maximum differently.
+        data_range = torch.where(
+            no_tissue,
+            torch.where(robust_max > 0, robust_max, 1.0),
+            torch.where(robust_max < 1e-10, 1.0, robust_max),
         )
 
-        # 7. NOT clamped -- see the note in PSNR.compute_metric. This is the
+        # 5. Compute PSNR. No mse == 0 sentinel -- see PSNR.compute_metric: the
+        #    constant 100.0 belonged to the clamp that was removed, and outliving
+        #    it inverted the order between an exact match and a worse prediction.
+        #    The epsilon regularizes the exact-match case.
+        psnr = 20 * torch.log10(data_range.to(mse.dtype) / (torch.sqrt(mse) + 1e-10))
+
+        # 6. NOT clamped -- see the note in PSNR.compute_metric. This is the
         #    metric the nine saturated `experiment_vf_*` arms actually monitored
         #    (issue #179), so the bound mattered most exactly here.
         return psnr
@@ -700,7 +770,7 @@ class MSE(BaseMetric):
         MSE = \\frac{1}{N} \\sum_{i=1}^{N} |x_i - y_i|^2
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -723,7 +793,7 @@ class MAE(BaseMetric):
         MAE = \\frac{1}{N} \\sum_{i=1}^{N} |x_i - y_i|
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -746,7 +816,7 @@ class RMSE(BaseMetric):
         RMSE = \\sqrt{\\frac{1}{N} \\sum_{i=1}^{N} |x_i - y_i|^2}
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -791,7 +861,17 @@ def compute_ssim_map(
     the model output still propagates (we upcast the *artifact* away, never a
     real signal -- pitfall #9). ``auto_range`` conditioning alone cannot help
     because the overflow precedes the SSIM ratio.
+
+    ``C1`` and ``C2`` are the only stabilisers: both are strictly positive for a
+    positive ``data_range``, so the denominator cannot vanish and SSIM(x, x) is
+    exactly 1 on a flat region, which covers most of an MRI slice's background.
+
+    Raises:
+        ValueError: A scalar ``data_range`` is not positive, which leaves 0/0 on
+            every flat window.
     """
+    if not isinstance(data_range, torch.Tensor) and data_range <= 0:
+        raise ValueError(f"SSIM data_range must be > 0; got {data_range!r}")
     device_type = "cuda" if img1.is_cuda else "cpu"
     with torch.autocast(device_type=device_type, enabled=False):
         img1 = img1.float()
@@ -821,7 +901,7 @@ def compute_ssim_map(
         C2 = (k2 * data_range) ** 2
 
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-            (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-8
+            (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
         )
     return ssim_map
 
@@ -844,7 +924,7 @@ class SSIMMetric(BaseMetric):
     def __init__(
         self,
         window_size: int = 11,
-        data_range: float = None,  # None means auto-detect
+        data_range: float | None = None,  # None means auto-detect
         sigma: float = 1.5,
         device: str | torch.device = "cpu",
     ):
@@ -869,9 +949,10 @@ class SSIMMetric(BaseMetric):
         target: Image,
         window_size: int | None = None,
         data_range: float | None = None,
-        **kwargs,
+        scale_contract: QuantileScaleContract | None = None,
+        **kwargs: Any,
     ) -> Tensor:
-        """Compute SSIM."""
+        """Compute SSIM; ``scale_contract`` as in :func:`resolve_image_data_range`."""
         assert preds.shape == target.shape
         # SSIM's luminance/contrast/structure terms are defined on a real
         # intensity field; there is no accepted complex form. Rather than
@@ -904,6 +985,7 @@ class SSIMMetric(BaseMetric):
             target,
             data_range if data_range is not None else self.data_range,
             metric_name="ssim",
+            contract=scale_contract,
         )
 
         # Recreate window if size changed
@@ -924,14 +1006,15 @@ class SSIMMetric(BaseMetric):
 class ClinicalSSIM(SSIMMetric):
     """Clinical SSIM with dynamic range masking."""
 
-    def compute_metric(
+    def compute_metric(  # type: ignore[override]
         self,
         preds: Image,
         target: Image,
         mask: Image | None = None,
         window_size: int | None = None,
         data_range: float | None = None,
-        **kwargs,
+        scale_contract: QuantileScaleContract | None = None,
+        **kwargs: Any,
     ) -> Tensor:
         """compute_metric.
 
@@ -941,6 +1024,7 @@ class ClinicalSSIM(SSIMMetric):
             mask (Union[Image, None]): Description.
             window_size (Optional[int]): Description.
             data_range (Optional[float]): Description.
+            scale_contract: Declared percentile scale, see :func:`resolve_image_data_range`.
         Returns:
             Tensor: Description.
         """
@@ -969,6 +1053,7 @@ class ClinicalSSIM(SSIMMetric):
             target,
             data_range if data_range is not None else self.data_range,
             metric_name="clinical_ssim",
+            contract=scale_contract,
         )
 
         if ws != self.window_size:
@@ -1035,7 +1120,9 @@ class HFEN(BaseMetric):
     resolves to ``spectramr.core.metrics.hfen.HFENMetric``) for any new code.
     """
 
-    def compute_metric(self, preds: Image, target: Image, sigma: float = 1.5, **kwargs) -> Tensor:
+    def compute_metric(
+        self, preds: Image, target: Image, sigma: float = 1.5, **kwargs: Any
+    ) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1068,12 +1155,12 @@ class HFEN(BaseMetric):
         return numerator / denominator
 
 
-@register_metric("complex_hfen", aliases=["ComplexHFEN"])
+@register_metric("complex_hfen", aliases=["ComplexHFEN"], requires_complex=True)
 class ComplexHFEN(BaseMetric):
     """Calculates HFEN on complex data to capture phase edge artifacts."""
 
     def compute_metric(
-        self, preds: torch.Tensor, target: torch.Tensor, sigma: float = 1.5, **kwargs
+        self, preds: torch.Tensor, target: torch.Tensor, sigma: float = 1.5, **kwargs: Any
     ) -> torch.Tensor:
         """compute_metric.
 
@@ -1091,6 +1178,8 @@ class ComplexHFEN(BaseMetric):
         if preds.dim() == 3:
             preds = preds.unsqueeze(1)  # [B, 1, H, W]
             target = target.unsqueeze(1)
+        preds = as_phase_bearing("complex_hfen", preds, "prediction")
+        target = as_phase_bearing("complex_hfen", target, "target")
 
         # Apply LoG to Real and Imag
         log_pred_real, log_target_real = apply_log_filter(preds.real, target.real, sigma)
@@ -1105,11 +1194,11 @@ class ComplexHFEN(BaseMetric):
         return numerator / denominator
 
 
-@register_metric("ipen", aliases=["IPEN"])
+@register_metric("ipen", aliases=["IPEN"], requires_complex=True)
 class IPEN(BaseMetric):
     """Image Phase Error Norm (IPEN)."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1121,15 +1210,9 @@ class IPEN(BaseMetric):
         preds = preds.to(self.device)
         target = target.to(self.device)
 
-        # Convert to complex if needed (assumes [B, 2, H, W] is real/imag)
-        if preds.dim() == 4 and preds.shape[1] == 2 and not preds.is_complex():
-            preds = torch.complex(preds[:, 0], preds[:, 1])
-            target = torch.complex(target[:, 0], target[:, 1])
-
-        if not torch.is_complex(preds) or not torch.is_complex(target):
-            # For real images, use Fourier phase
-            preds = fft2c(preds.float())
-            target = fft2c(target.float())
+        # No Fourier fallback: the phase of a magnitude image is not a phase error.
+        preds = as_phase_bearing("ipen", preds, "prediction")
+        target = as_phase_bearing("ipen", target, "target")
 
         phi_pred = torch.angle(preds)
         phi_gt = torch.angle(target)
@@ -1155,7 +1238,7 @@ class InceptionScoreMetric(BaseMetric):
             device (Union[str, torch.device]): Description.
         """
         super().__init__(device)
-        self.generated_features = []
+        self.generated_features: list[torch.Tensor] = []
         self.summarize = True  # Summary metric
         if torchvision is None:
             logger.warning("torchvision not found, IS will return 0.0")
@@ -1169,11 +1252,11 @@ class InceptionScoreMetric(BaseMetric):
         else:
             self.inception_model = None
 
-    def forward(self, generated: Image, target: Image, **kwargs):
+    def forward(self, generated: Image, target: Image, **kwargs: Any) -> Any:  # type: ignore[override]
         """Standard IS forward."""
         return self.update(generated, target, **kwargs)
 
-    def update(self, generated: Image, target: Image, **kwargs):
+    def update(self, generated: Image, target: Image, **kwargs: Any) -> Any:  # type: ignore[override]
         """Accumulate features during loop."""
         if self.inception_model is None:
             return
@@ -1192,9 +1275,8 @@ class InceptionScoreMetric(BaseMetric):
         generated = (generated - mean) / std
 
         with torch.no_grad():
-            logits = self.inception_model(generated)
-            probs = F.softmax(logits, dim=1)
-            self.generated_features.append(probs)
+            for (chunk,) in _image_chunks(generated):
+                self.generated_features.append(F.softmax(self.inception_model(chunk), dim=1))
 
     def compute(self) -> float:
         """compute.
@@ -1202,19 +1284,43 @@ class InceptionScoreMetric(BaseMetric):
         Returns:
             float: Description.
         """
-        if not self.generated_features:
+        # Every rank must reach the gather below, so the empty case cannot return early:
+        # a rank that skipped it would leave its peers waiting in the collective.
+        local = (
+            torch.cat(self.generated_features, dim=0).detach().cpu()
+            if self.generated_features
+            else None
+        )
+        pieces = self._gather_probs_across_ranks(local)
+        if not pieces:
             return 0.0
 
-        all_probs = torch.cat(self.generated_features, dim=0)
+        all_probs = torch.cat(pieces, dim=0).to(self.device)
         p_y = torch.mean(all_probs, dim=0)
         kl_divs = []
         for probs in all_probs:
             kl_div = torch.sum(probs * (torch.log(probs + 1e-16) - torch.log(p_y + 1e-16)))
             kl_divs.append(kl_div)
 
-        return torch.exp(torch.mean(torch.stack(kl_divs))).item()
+        return float(torch.exp(torch.mean(torch.stack(kl_divs))).item())
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    @staticmethod
+    def _gather_probs_across_ranks(local: torch.Tensor | None) -> list[torch.Tensor]:
+        """Every rank's class probabilities, so IS grades the whole validation set.
+
+        torchmetrics' FID and KID synchronise their own state inside ``compute()``; this
+        metric keeps a plain list, so each rank would otherwise report the IS of its own
+        shard and ranks would disagree on the early-stopping and best-checkpoint decision.
+        """
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+            return [] if local is None else [local]
+        gathered: list[Any] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        return [piece for piece in gathered if piece is not None]
+
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         # One-shot compute
         """compute_metric.
 
@@ -1259,8 +1365,10 @@ class FID(BaseMetric):
         self.feature_layer = feature_layer
         self.summarize = True  # Compute once at the end
 
-        self.use_torchmetrics = TORCHMETRICS_AVAILABLE
+        self.use_torchmetrics = torchmetrics_available()
         if self.use_torchmetrics:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+
             self.fid = FrechetInceptionDistance(feature=feature_layer, normalize=True).to(
                 self.device
             )
@@ -1273,7 +1381,7 @@ class FID(BaseMetric):
             logger.warning("FID unavailable (no torchvision/torchmetrics)")
             self.fid = None
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Compute FID."""
         if self.use_torchmetrics and self.fid:
             # Note: We do NOT reset here to allow accumulation if the object persists.
@@ -1306,10 +1414,6 @@ class FID(BaseMetric):
             preds = adapt_to_rgb(preds, mode=self.channel_mode)
             target = adapt_to_rgb(target, mode=self.channel_mode)
 
-            # Ensure range [0, 1] for normalize=True
-            self.fid.update(target.clamp(0, 1), real=True)
-            self.fid.update(preds.clamp(0, 1), real=False)
-
             # Log device once per session
             if not hasattr(self, "_device_logged"):
                 logger.info(f"[FID] Computing on device: {self.fid.device}")
@@ -1319,7 +1423,7 @@ class FID(BaseMetric):
 
         return torch.tensor(0.0, device=self.device)
 
-    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs):
+    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> Any:
         """Accumulate features for FID."""
         if not self.use_torchmetrics or not self.fid:
             return torch.tensor(0.0, device=self.device)
@@ -1335,8 +1439,9 @@ class FID(BaseMetric):
         target = adapt_to_rgb(target, mode=self.channel_mode)
 
         # Update both real and fake feature stacks
-        self.fid.update(target.clamp(0, 1), real=True)
-        self.fid.update(preds.clamp(0, 1), real=False)
+        for t_chunk, p_chunk in _image_chunks(target, preds):
+            self.fid.update(t_chunk.clamp(0, 1), real=True)
+            self.fid.update(p_chunk.clamp(0, 1), real=False)
 
         return torch.tensor(0.0, device=self.device)
 
@@ -1351,7 +1456,7 @@ class FID(BaseMetric):
 class NMSE(BaseMetric):
     """Normalized Mean Squared Error."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1371,7 +1476,7 @@ class NMSE(BaseMetric):
 class NRMSE(BaseMetric):
     """Normalized Root Mean Squared Error."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1402,7 +1507,7 @@ class NRMSE(BaseMetric):
 class GradientError(BaseMetric):
     """Gradient-based Error."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1474,7 +1579,9 @@ class KID(BaseMetric):
         self.summarize = True
         self.subset_size = subset_size
         self.channel_mode = ChannelMode(channel_mode)
-        if TORCHMETRICS_AVAILABLE:
+        if torchmetrics_available():
+            from torchmetrics.image.kid import KernelInceptionDistance
+
             self.kid = KernelInceptionDistance(subset_size=subset_size).to(self.device)
         else:
             # Construct cleanly (plumbing: subset_size / summarize) but refuse to
@@ -1486,7 +1593,7 @@ class KID(BaseMetric):
         self,
         preds: Image,
         target: Image,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Accumulate predictions and targets for KID computation.
 
@@ -1509,10 +1616,11 @@ class KID(BaseMetric):
                 target = (target * 255).clamp(0, 255).byte()
 
             # Accumulate into internal state (DO NOT RESET)
-            self.kid.update(target, real=True)
-            self.kid.update(preds, real=False)
+            for t_chunk, p_chunk in _image_chunks(target, preds):
+                self.kid.update(t_chunk, real=True)
+                self.kid.update(p_chunk, real=False)
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Accumulate per-batch data. Actual computation happens in compute().
 
         This is called for each validation batch and just delegates to update().
@@ -1561,13 +1669,13 @@ class MSSSIM(BaseMetric):
         ``TORCHMETRICS_AVAILABLE``) and reuse ``self._impl`` across calls.
         """
         super().__init__(device)
-        self._impl = (
-            MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-            if TORCHMETRICS_AVAILABLE
-            else None
-        )
+        self._impl = None
+        if torchmetrics_available():
+            from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+            self._impl = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1579,6 +1687,19 @@ class MSSSIM(BaseMetric):
         preds = preds.to(self.device)
         target = target.to(self.device)
         if self._impl is not None:
+            # 5-D input is scored with a 3-D window and pooled on every spatial axis, so the
+            # floor binds all of them; torchmetrics' own check reads only the last two.
+            from spectramr.core.metrics.regions.eligibility import min_side_for
+
+            floor = min_side_for("ms_ssim")
+            spatial = tuple(preds.shape[-3:] if preds.ndim == 5 else preds.shape[-2:])
+            if min(spatial) < floor:
+                raise MetricNotApplicableError(
+                    "ms_ssim",
+                    NotApplicableReason.IMAGE_TOO_SMALL_FOR_METRIC,
+                    f"spatial extent {spatial} is below the {floor} px/side floor of five "
+                    "dyadic scales with an 11-tap window",
+                )
             # ``.to`` on an nn.Module is in-place and returns self, so the
             # cached backbone object identity is preserved across calls.
             impl = self._impl.to(preds.device)
@@ -1597,11 +1718,13 @@ class UQI(BaseMetric):
         module a single time instead of re-allocating it per call.
         """
         super().__init__(device)
-        self._impl = (
-            UniversalImageQualityIndex().to(self.device) if TORCHMETRICS_AVAILABLE else None
-        )
+        self._impl = None
+        if torchmetrics_available():
+            from torchmetrics.image import UniversalImageQualityIndex
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+            self._impl = UniversalImageQualityIndex().to(self.device)
+
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1622,7 +1745,7 @@ class UQI(BaseMetric):
 class SNR(BaseMetric):
     """Signal-to-Noise Ratio."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1653,7 +1776,7 @@ class SNR(BaseMetric):
 class GMSD(BaseMetric):
     """Gradient Magnitude Similarity Deviation (GMSD)."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1700,7 +1823,7 @@ class GMSD(BaseMetric):
 class FSIM(BaseMetric):
     """Feature Similarity Index (FSIM)."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1769,7 +1892,9 @@ class FSIM(BaseMetric):
 class VIF(BaseMetric):
     """Visual Information Fidelity (VIF) - Multi-scale."""
 
-    def __init__(self, num_scales: int = 4, sigma_nsq: float = 2.0, device="cpu"):
+    def __init__(
+        self, num_scales: int = 4, sigma_nsq: float = 2.0, device: str | torch.device = "cpu"
+    ) -> None:
         """__init__.
 
         Args:
@@ -1791,7 +1916,7 @@ class VIF(BaseMetric):
         self.register_buffer("kernel", kernel.unsqueeze(0).unsqueeze(0))
         self.padding = kernel_size // 2
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1878,7 +2003,9 @@ class LPIPS(BaseMetric):
         from spectramr.core.metrics.channel_adapter import ChannelMode
 
         self.channel_mode = ChannelMode(channel_mode)
-        if TORCHMETRICS_AVAILABLE:
+        if torchmetrics_available():
+            from torchmetrics.image import LearnedPerceptualImagePatchSimilarity
+
             self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(self.device)
             # Pin to fp32 + eval + no-grad — matches DISTSMetric. The
             # VGG19 inside LPIPS must stay fp32 so stray outer
@@ -1888,7 +2015,7 @@ class LPIPS(BaseMetric):
             self.lpips.eval()
             for p in self.lpips.parameters():
                 p.requires_grad_(False)
-            self._backend = "torchmetrics"
+            self._backend: str | None = "torchmetrics"
         else:
             # torchmetrics unavailable — fall back to the `lpips` package (the reference
             # AlexNet impl already used by the lpips_alex challenge metric) so val_lpips is
@@ -1920,7 +2047,7 @@ class LPIPS(BaseMetric):
                 self.lpips = None
                 self._backend = None
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -1979,7 +2106,7 @@ class LPIPS(BaseMetric):
         # Normalize to [-1, 1] statically
         # LPIPS expects [-1, 1]. We assume data is statically normalized.
 
-        def static_normalize(x):
+        def static_normalize(x: torch.Tensor) -> torch.Tensor:
             """static_normalize.
 
             Args:
@@ -2023,7 +2150,14 @@ class LPIPS(BaseMetric):
             ):
                 # torchmetrics returns a scalar; the lpips-package net returns per-image
                 # [B,1,1,1]. .mean() is identity on a scalar and reduces the per-image case.
-                return self.lpips(preds.float(), target.float()).mean()
+                # A folded volume is hundreds of slices; one VGG pass over all of
+                # them holds tens of GiB of activations, so score bounded chunks.
+                n = preds.shape[0]
+                total = preds.new_zeros((), dtype=torch.float32)
+                for p_chunk, t_chunk in _image_chunks(preds, target):
+                    part = self.lpips(p_chunk.float(), t_chunk.float())
+                    total = total + part.mean() * p_chunk.shape[0]
+                return total / n
         except RuntimeError as e:
             # Handle cases where output becomes too small after downsampling
             if "Output size is too small" in str(e) or "output_size" in str(e).lower():
@@ -2035,7 +2169,7 @@ class LPIPS(BaseMetric):
 class PearsonCorrelation(BaseMetric):
     """Pearson Correlation Coefficient."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2069,7 +2203,7 @@ class PearsonCorrelation(BaseMetric):
 class CosineSimilarity(BaseMetric):
     """Cosine Similarity."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2097,7 +2231,7 @@ class CosineSimilarity(BaseMetric):
 class KSpaceError(BaseMetric):
     """K-Space Error (Frequency Domain MSE)."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2119,11 +2253,11 @@ class KSpaceError(BaseMetric):
         return torch.abs(pred_k - target_k).mean()
 
 
-@register_metric("phase_mse", aliases=["PhaseMSE"])
+@register_metric("phase_mse", aliases=["PhaseMSE"], requires_complex=True)
 class PhaseMSE(BaseMetric):
     """Phase MSE masked by magnitude."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2135,15 +2269,9 @@ class PhaseMSE(BaseMetric):
         preds = preds.to(self.device)
         target = target.to(self.device)
 
-        if preds.dim() == 4 and preds.size(1) == 2:
-            pred_c = torch.complex(preds[:, 0], preds[:, 1])
-            target_c = torch.complex(target[:, 0], target[:, 1])
-        elif torch.is_complex(preds):
-            pred_c = preds
-            target_c = target
-        else:
-            pred_c = fft2c(preds)
-            target_c = fft2c(target)
+        # No Fourier fallback: the phase of a magnitude image is not a phase error.
+        pred_c = as_phase_bearing("phase_mse", preds, "prediction")
+        target_c = as_phase_bearing("phase_mse", target, "target")
 
         pred_phase = torch.angle(pred_c)
         target_phase = torch.angle(target_c)
@@ -2151,17 +2279,19 @@ class PhaseMSE(BaseMetric):
         magnitude_mask = torch.abs(target_c) > 0.05
         diff = torch.angle(torch.exp(1j * (pred_phase - target_phase)))
 
-        if magnitude_mask.sum() == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        return (diff[magnitude_mask] ** 2).mean()
+        # Masked mean by `where` + count rather than boolean indexing and a host
+        # branch, so the result stays on the device for the computer's single
+        # fused transfer (#2163). An empty mask scores 0.
+        n_masked = magnitude_mask.sum()
+        masked_sq = torch.where(magnitude_mask, diff**2, 0).sum()
+        return torch.where(n_masked == 0, 0.0, masked_sq / n_masked.clamp_min(1))
 
 
 @register_metric("gradient_entropy", aliases=["GradientEntropy"], requires_reference=False)
 class GradientEntropy(BaseMetric):
     """Gradient Entropy."""
 
-    def compute_metric(self, preds: Image, target: Image, bins: int = 256, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, bins: int = 256, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2224,7 +2354,7 @@ class NormalizedGradientSquared(BaseMetric):
     blur / smoothing lowers it. ``target`` is ignored (no-reference).
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         preds = preds.to(self.device)
         if preds.is_complex():
             preds = preds.abs()
@@ -2250,7 +2380,7 @@ class NormalizedGradientSquared(BaseMetric):
 class EFC(BaseMetric):
     """Entropy Focus Criterion."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2282,7 +2412,7 @@ class EFC(BaseMetric):
 class FBER(BaseMetric):
     """Foreground-Background Energy Ratio."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2333,7 +2463,7 @@ class CNR(BaseMetric):
         target: Image,
         mask1: Mask | None = None,
         mask2: Mask | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> Tensor:
         """compute_metric.
 
@@ -2354,6 +2484,8 @@ class CNR(BaseMetric):
             mask1 = preds < thresh  # BG
             mask2 = preds >= thresh  # Signal
 
+        if mask2 is None:
+            raise ValueError("mask2 is required when mask1 is given")
         if mask1.sum() == 0 or mask2.sum() == 0:
             return torch.tensor(0.0, device=self.device)
 
@@ -2384,7 +2516,7 @@ class CJV(BaseMetric):
     than a number. See :meth:`compute_metric`.
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Coefficient of joint variation, or ``NaN`` if it is not measurable.
 
         The degenerate branches return ``NaN`` rather than a sentinel, matching
@@ -2433,7 +2565,7 @@ class Dice(BaseMetric):
         No specific instance attributes.
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         # Simple dice implementation to avoid monai dependency if not needed
         """compute_metric.
 
@@ -2461,7 +2593,7 @@ class IoU(BaseMetric):
         No specific instance attributes.
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2482,7 +2614,7 @@ class IoU(BaseMetric):
 class GhostingRatio(BaseMetric):
     """Ghost-to-Signal Ratio."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         # Based on _compute_gsr logic
         """compute_metric.
 
@@ -2504,7 +2636,7 @@ class GhostingRatio(BaseMetric):
         )
         signal_mask = preds > thresh
 
-        def get_ratio(axis):
+        def get_ratio(axis: int) -> torch.Tensor:
             """get_ratio.
 
             Args:
@@ -2530,7 +2662,7 @@ class GhostingRatio(BaseMetric):
 class SpikeDetection(BaseMetric):
     """Detect K-Space Spikes (Global Z-score > 5)."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2584,7 +2716,7 @@ class ZipperDetection(BaseMetric):
     with the artifact. Lower is better.
     """
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Directional gradient-variance ratio of ``preds``.
 
         Args:
@@ -2622,7 +2754,7 @@ class ZipperDetection(BaseMetric):
 class NRIQA(BaseMetric):
     """No-Reference Image Quality Assessment."""
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2700,17 +2832,18 @@ class PowerSpectrumConsistency(BaseMetric):
         max_r = min(cy, cx)
         bin_edges = torch.linspace(0, max_r, self.num_bins + 1, device=img.device)
 
-        profile = torch.zeros(B, self.num_bins, device=img.device)
-
-        for i in range(self.num_bins):
-            mask = (r >= bin_edges[i]) & (r < bin_edges[i + 1])
-            for b in range(B):
-                if mask.sum() > 0:
-                    profile[b, i] = power[b][mask].mean()
+        # Bin i holds edge[i] <= r < edge[i+1]; pixels at or past max_r land in a spill bin
+        # that is dropped. One scatter replaces the per-bin, per-sample mask loop.
+        nb = self.num_bins
+        idx = (torch.bucketize(r, bin_edges, right=True) - 1).clamp(max=nb).flatten()
+        sums = torch.zeros(B, nb + 1, device=img.device, dtype=power.dtype)
+        sums.scatter_add_(1, idx.expand(B, -1), power.reshape(B, -1))
+        counts = torch.bincount(idx, minlength=nb + 1).clamp_min(1).to(power.dtype)
+        profile = (sums / counts)[:, :nb].float()
 
         return profile
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """compute_metric.
 
         Args:
@@ -2766,13 +2899,13 @@ class MedFID(BaseMetric):
         self.summarize = True  # Summary-based
 
         # Accumulate features for batch computation
-        self.pred_features = []
-        self.target_features = []
+        self.pred_features: list[torch.Tensor] = []
+        self.target_features: list[torch.Tensor] = []
 
         # Try to load feature extractor
         self._setup_extractor()
 
-    def _setup_extractor(self):
+    def _setup_extractor(self) -> None:
         """Setup feature extractor (RadImageNet or fallback)."""
         # Placeholder: Use standard InceptionV3 with note about RadImageNet
         if torchvision is not None:
@@ -2797,19 +2930,17 @@ class MedFID(BaseMetric):
             img = F.adaptive_avg_pool2d(img, (7, 7))
             return img.view(img.shape[0], -1)
 
-        # Resize to InceptionV3 input size
-        img = F.interpolate(img, size=(299, 299), mode="bilinear", align_corners=False)
-
-        # Repeat channel if grayscale
-        if img.shape[1] == 1:
-            img = img.repeat(1, 3, 1, 1)
-
+        features = []
         with torch.no_grad():
-            features = self.model(img)
+            for (chunk,) in _image_chunks(img):
+                chunk = F.interpolate(chunk, size=(299, 299), mode="bilinear", align_corners=False)
+                if chunk.shape[1] == 1:
+                    chunk = chunk.repeat(1, 3, 1, 1)
+                features.append(self.model(chunk))
 
-        return features
+        return torch.cat(features, dim=0)
 
-    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs):
+    def update(self, preds: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> None:
         """Accumulate features for FID computation."""
         """Accumulate features for FID computation."""
         pred_feat = self.extract_features(preds.to(self.device))
@@ -2856,12 +2987,12 @@ class MedFID(BaseMetric):
 
         return torch.tensor(fid_np, device=self.device, dtype=torch.float32)
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset accumulated features."""
         self.pred_features = []
         self.target_features = []
 
-    def compute_metric(self, preds: Image, target: Image, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
         """Single-batch FID approximation."""
         self.reset()
         self.update(preds, target)

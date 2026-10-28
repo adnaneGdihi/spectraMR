@@ -22,6 +22,7 @@ import pytest
 
 from spectramr.infrastructure.validation.witness.checks.schedule_certification_common import (
     _PROCESS_MEMO,
+    _timesteps,
     build_process_from_config,
 )
 
@@ -98,3 +99,33 @@ def test_a_non_cold_diffusion_config_still_builds_nothing():
     doc = _doc()
     doc["model"]["model_type"] = "unet"
     assert build_process_from_config(doc) is None
+
+
+@pytest.mark.parametrize(
+    ("doc", "expected"),
+    [
+        # The builder injects training.diffusion.timesteps over a disagreeing copy (#2468).
+        ({"model": {"model_kwargs": {"timesteps": 1000}}, "training": {"diffusion": {"timesteps": 29}}}, 29),
+        # A declared block without the key takes the schema default, not the model_kwargs copy.
+        ({"model": {"model_kwargs": {"timesteps": 29}}, "training": {"diffusion": {}}}, 1000),
+        # Without the block the generator reads its own copy.
+        ({"model": {"model_kwargs": {"timesteps": 31}}}, 31),
+        # And with neither, the generator's default -- never a witness-local literal.
+        ({"model": {"model_kwargs": {}}}, 1000),
+    ],
+)
+def test_the_horizon_follows_the_builder(doc, expected):
+    assert _timesteps(doc) == expected
+
+
+def test_a_rician_forward_process_has_no_mask_ladder_to_certify():
+    """Planted: a Rician arm reads no cascade, so the schedule witnesses do not apply."""
+    doc = _doc()
+    doc["training"]["diffusion"]["degradation"] = "rician"
+    assert build_process_from_config(doc) is None
+
+
+def test_a_declared_mask_degradation_still_builds_the_ladder():
+    doc = _doc()
+    doc["training"]["diffusion"]["degradation"] = "kspace_mask"
+    assert build_process_from_config(doc) is not None

@@ -24,7 +24,7 @@ import torch
 from scipy.optimize import differential_evolution, minimize
 
 from spectramr.infrastructure.physics.degradation_chain import ChainLink, DegradationChain
-from spectramr.infrastructure.physics.digital_twin_extensions import DEGRADATION_REGISTRY
+from spectramr.infrastructure.physics.degradations import DEGRADATION_REGISTRY
 from spectramr.infrastructure.physics.quality_descriptors import measure_attributes
 
 __all__ = [
@@ -154,6 +154,7 @@ def fit_chain(
     max_evals: int = 400,
     method: str = "differential_evolution",
     min_gap_closed: float = 0.5,
+    max_residual: float | None = None,
 ) -> FitResult:
     """Fit per-axis severities so ``x_hq``'s attributes match ``target``.
 
@@ -165,6 +166,7 @@ def fit_chain(
         weights: per-attribute residual weights; defaults to reciprocal-square target.
         theta0: optional warm start in ``[0, 1]^K``; defaults to mid-box.
         min_gap_closed: minimum fraction of the initial gap the fit must close.
+        max_residual: absolute ceiling on the final weighted residual, or ``None``.
 
     Raises:
         DegenerateFitError: the chain ran but closed less than ``min_gap_closed`` of
@@ -265,6 +267,13 @@ def fit_chain(
             f"(residual {initial_residual:.4g} -> {residual:.4g}), below the required "
             f"{min_gap_closed:.0%}. Either the target is unreachable by degradation, "
             f"or the declared axis set {list(axes)} cannot express it."
+        )
+    if max_residual is not None and residual > max_residual:
+        # Relative: the weights are 1/target^2, so the residual is a relative error norm.
+        raise DegenerateFitError(
+            f"the fitted chain's residual {residual:.4g} exceeds the absolute ceiling "
+            f"{max_residual:.4g}. The gap closed ({gap_closed:.1%}) is relative only, so "
+            "a fit can halve a large gap and still miss the target."
         )
     if all(t <= 1e-6 or t >= 1.0 - 1e-6 for t in best):
         raise DegenerateFitError(

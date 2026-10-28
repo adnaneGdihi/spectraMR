@@ -4,7 +4,10 @@ import torch
 import torch.fft
 
 from spectramr.infrastructure.physics.motion_simulation import (
+    RESPIRATORY_HYSTERESIS,
     apply_elastic_respiratory_motion,
+    respiratory_trace,
+    respiratory_trace_peak,
 )
 
 
@@ -96,6 +99,46 @@ class TestMotionSimulation(unittest.TestCase):
         self.assertGreater(
             diff_feet.item(), 1.0, "Slice 7 (lower body) should be deformed (moved)."
         )
+
+
+class TestRespiratoryTrace(unittest.TestCase):
+    def test_is_the_hysteresis_formula(self):
+        t = torch.linspace(0, 8, 101)
+        phase = 2 * torch.pi / 4.0 * t
+        ref = torch.cos(phase) ** 2 * torch.exp(-RESPIRATORY_HYSTERESIS * torch.sin(phase))
+        self.assertTrue(torch.equal(respiratory_trace(t, 4.0), ref))
+
+    def test_closed_form_peak_is_the_maximum(self):
+        t = torch.linspace(0, 4, 400_001, dtype=torch.float64)
+        peak = float(respiratory_trace(t, 4.0).max())
+        self.assertAlmostEqual(respiratory_trace_peak(), peak, places=9)
+        self.assertGreater(respiratory_trace_peak(), 1.0)
+
+    def test_one_breath_per_cycle_has_its_closed_form_peak_and_one_lobe(self):
+        t = torch.linspace(0, 4, 400_001, dtype=torch.float64)
+        u = respiratory_trace(t, 4.0, breaths_per_cycle=1)
+        self.assertAlmostEqual(respiratory_trace_peak(breaths_per_cycle=1), float(u.max()), places=9)
+        # One zero per period (at t = T/2), so the fundamental is 1 / T.
+        self.assertLess(float(u[190_000:210_000].min()), 1e-9)
+        self.assertGreater(float(u[:150_000].min()), 0.1)
+
+    def test_one_breath_per_cycle_puts_the_spectrum_at_one_over_t(self):
+        t = torch.arange(0, 40, 0.05, dtype=torch.float64)
+        spec = torch.fft.rfft(respiratory_trace(t, 4.0, breaths_per_cycle=1)).abs()  # real trace
+        freqs = torch.fft.rfftfreq(t.numel(), d=0.05)
+        assert abs(float(freqs[1 + int(spec[1:].argmax())]) - 0.25) < 1e-9
+
+    def test_breaths_per_cycle_is_validated(self):
+        with self.assertRaises(ValueError):
+            respiratory_trace(torch.zeros(3), 4.0, breaths_per_cycle=3)
+        with self.assertRaises(ValueError):
+            respiratory_trace_peak(breaths_per_cycle=0)
+
+    def test_inhale_and_exhale_differ(self):
+        # Hysteresis: the trace is not symmetric about its peak at phase 0.
+        t = torch.tensor([-0.5, 0.5])
+        a, b = respiratory_trace(t, 4.0)
+        self.assertNotAlmostEqual(float(a), float(b), places=4)
 
 
 if __name__ == "__main__":

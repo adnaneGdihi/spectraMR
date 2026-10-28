@@ -98,7 +98,7 @@ misspelled key is an error, never a silently ignored one.
       out_subdir: report          # subdirectory of <experiment_dir> to write into
 
       # House style and output formats
-      style: nature               # nature (default) | ieee
+      style: nature               # nature (default) | ieee | poster | slides
       formats: [pdf, png]         # subset of {pdf, png, tiff, eps, svg}
       dpi: 600
       panel_labels: true
@@ -197,7 +197,7 @@ Schema field reference
    * - ``style``
      - enum
      - ``nature``
-     - House style: ``nature`` or ``ieee``.
+     - House style: ``nature``, ``ieee``, ``poster`` or ``slides``.
    * - ``formats``
      - list[str]
      - ``[pdf, png]``
@@ -353,6 +353,34 @@ against an existing output directory:
      - Emit or skip the interactive plotly layer.
    * - ``--qc`` / ``--no-qc``
      - Include or skip the QC figures.
+   * - ``--style``
+     - House style (``nature``, ``ieee``, ``poster``, ``slides``); overrides
+       the config's ``reporting.style``.
+   * - ``--view``
+     - Which validation pass each run is read at: ``selected`` (default),
+       ``final`` or ``common``. See :ref:`reporting-views`.
+   * - ``--catalog``
+     - Render every registered figure and table from built-in synthetic examples
+       into ``--exp-dir`` (created if missing). See :ref:`reporting-catalog`.
+   * - ``--compare``
+     - Write the cross-run report for every run under ``--exp-dir`` into
+       ``<exp-dir>/comparison/``. See :ref:`reporting-compare`.
+   * - ``--arms``, ``--labels``, ``--baseline``
+     - With ``--compare``: the runs to compare (default: every run discovered
+       under ``--exp-dir``), their labels (default: run names with the shared
+       prefix and suffix removed), and the arm the others are tested against.
+   * - ``--metrics``, ``--phases``, ``--max-panels``, ``--train-window``
+     - With ``--compare`` or the contrast options: ``--metrics all`` (or a comma
+       list of base names) draws and tabulates every metric any phase logged,
+       not only the headline panels; ``--phases`` picks from ``val``, ``train``
+       and ``test`` (inference); ``--max-panels`` splits a long figure into
+       ``<figure>_2``, ``_3``; ``--train-window`` is how many training rows are
+       averaged. See :ref:`reporting-all-metrics`.
+   * - ``--contrasts``, ``--contrast-pairs``, ``--out-root``, ``--only``, ``--results-root``
+     - Write one self-contained folder per comparison: declared in a file
+       (``--contrasts``) or drawn from any cohort directory
+       (``--contrast-pairs vs_baseline|pairs`` with ``--exp-dir``). See
+       :ref:`reporting-contrasts`. ``--exp-dir`` is optional with ``--contrasts``.
 
 ``--config`` reuses that YAML's ``reporting:`` block — style, formats, dpi,
 panel labels, method name, tables, metrics, hyperparameters, extra runs, output
@@ -366,6 +394,336 @@ because the ``report`` command is the plotting SSOT: it renders the task preset
 ``--figures``. The end-of-training hook still honours ``reporting.figures``
 per run.
 
+.. _reporting-views:
+
+Which validation pass a report reads
+------------------------------------
+
+A validation log holds one row per validation *pass*, so every number a table
+quotes and every per-case spread a figure draws is read at one pass, chosen by
+:mod:`spectramr.infrastructure.reporting.views`:
+
+``selected`` (default)
+    The pass the run's early stopping chose (``early_stopping_best_iteration`` in
+    ``final_metrics.json``), i.e. what the best checkpoint holds. A run that
+    recorded none is read at its final pass, and the fallback is logged.
+``final``
+    Each run's last pass.
+``common``
+    The last iteration every compared run reached: one training budget for all
+    arms, which is the fair reading when arms ran for different lengths.
+
+``final_metrics.json``'s ``best`` block is not used for tables: it holds each
+metric's own optimum, and for different metrics those lie at different
+checkpoints, so together they describe no model that was ever saved.
+
+Error bars are drawn only from per-case rows of one pass
+(``per_call_metrics.csv`` cut to that pass by
+:mod:`~spectramr.infrastructure.reporting.per_case`). A spread taken across
+passes measures training progress, not variation across cases; when a run
+recorded no per-case rows the figures show one value per run and say so.
+Logged names are parsed once by
+:mod:`~spectramr.infrastructure.reporting.metric_names`: ``val_psnr_8x`` is the
+base metric ``psnr`` at ``R = 8``, and ``val_psnr_mean`` is the cascade mean.
+
+.. _reporting-catalog:
+
+Seeing every figure the report can draw
+---------------------------------------
+
+``spectramr report -e <dir> --catalog`` renders all registered figures and
+tables from :mod:`spectramr.infrastructure.reporting.catalog`, a set of synthetic
+inputs (an ellipse phantom undersampled through ``fft2c``, long metric frames,
+two comparison arms, certificate payloads). The same examples drive the plotter
+smoke test, so a figure that cannot render from well-formed input fails CI before
+it reaches the catalog. The catalog shows what each plotter draws; its numbers
+describe no run.
+
+.. _reporting-compare:
+
+Comparing runs
+--------------
+
+``spectramr report --compare`` renders the figures a paper, poster or slide deck
+compares arms with:
+
+.. code-block:: bash
+
+    spectramr report -e experiments/outputs/attention_cohort --compare \
+      --baseline mlp_baseline --view selected --style nature
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Figure / table
+     - Content
+   * - ``cmp_metric_bars``
+     - One panel per metric (headline metrics by default, every metric with
+       ``--metrics``), x = acceleration, one colour per arm. More than
+       ``--max-panels`` panels continue in ``cmp_metric_bars_2``, ``_3``.
+       Every case is a point; the arm mean carries a bootstrap 95 % CI and ``n``
+       is printed. Arms are tested against ``--baseline`` with a paired
+       bootstrap on the shared validation cases, Holm-corrected within each
+       (metric, R). The zero-filled score (``zf_<metric>``) is a dotted
+       reference. Without per-case rows: one value per arm, no bar.
+   * - ``cmp_phase_metrics``
+     - With ``--metrics``: one panel per metric, x = training, validation,
+       inference, one colour per arm. Validation is the selected pass; training
+       is the mean of its last rows and inference the mean over its cases, each
+       with a bar of one standard deviation of those rows or cases (spread, not
+       an interval).
+   * - ``cmp_phase_bars``
+     - With ``--metrics``: raw metric bars by phase (training, validation, inference),
+       one panel per metric, one bar per arm; the inference bar is hatched. Bars start at
+       zero. Validation is one pass and has no whisker; training and inference carry one
+       standard deviation of their rows or cases. The phases are not on one footing, so
+       read differences between arms, not between phases.
+   * - ``cmp_group_bars``
+     - With ``--metrics``: raw validation bars, arms grouped by the ``group`` declared in
+       the contrast file, one panel per metric. Bars start at zero and a dotted line carries
+       the baseline arm's value. Arms with no group share the group ``arms``; in
+       ``--contrast-pairs`` the baseline is its own group.
+   * - ``cmp_effect_bars``
+     - Contrast folders: the change from the baseline as bars, arms grouped, one panel per
+       metric. Bar = mean paired difference, whisker = bootstrap 95 % interval (both from
+       ``data/paired_stats.csv``), points = subject differences. Validation solid, inference
+       hatched, faded when p >= 0.05 (Holm-adjusted within a declared family).
+   * - ``cmp_metric_group_bars``
+     - Contrast folders: improvement over the baseline in percent, metrics grouped on x and
+       one bar per arm, one panel per phase. Up is better by each metric's declared
+       direction (a reciprocal metric is read on ``1/N_eq``); a metric with no declared
+       direction or a zero baseline mean has no percentage and is named in the note.
+   * - ``cmp_coverage``
+     - With ``--metrics``: arms by metrics, one panel per phase. A cell is
+       measured, not computed (the run declared the metric and recorded that it
+       could not compute it) or not logged. Read it before any ranking: an arm
+       with no value on a metric cannot be ranked on it.
+   * - ``cmp_rank_reversal``
+     - With ``--metrics``: the rank of each arm on each metric with a declared
+       direction (1 = best), joined by lines across metrics; a crossing is a
+       disagreement. Metrics with no declared direction are left out and named.
+   * - ``cmp_effect_forest``
+     - Contrast folders: one panel per metric, one row per arm. The point is the
+       mean paired difference to the baseline and the bar its bootstrap 95 %
+       interval, read from ``data/paired_stats.csv`` so figure and table agree.
+       Circle = validation, square = inference; filled = p < 0.05 (Holm-adjusted
+       within a declared family, else uncorrected).
+   * - ``cmp_subject_lines``
+     - Contrast folders: one grey polyline per subject (inference: per case), at
+       zero for the baseline and at that subject's difference under each arm. The
+       marker is the mean difference. Parallel lines are a uniform effect; fanning
+       lines mean it depends on the subject.
+   * - ``cmp_metric_ladder``
+     - Contrast folders that declare ``ladder``: one metric per arm as a mean with
+       a bootstrap 95 % interval over subjects, with the subject values behind it,
+       against named reference values (for ``nex_equivalent``: the identity at 1
+       and the averages at 2 and 3). A reciprocal metric is averaged on ``1/N_eq``
+       and shown back on its own scale.
+   * - ``cmp_mosaic``
+     - The reference and every arm's reconstruction, then every arm's
+       ``|error|`` beneath, for one slice per acceleration. Slices are aligned
+       across arms by reference *content*, so arms are never compared on
+       different anatomy; each slice's error maps share one scale and colour
+       bar, and the zoom box sits where the arms' mean error is largest.
+   * - ``fig_1_2_learning_curves``
+     - Validation PSNR / SSIM / loss of every arm on shared axes, each arm's
+       selected pass starred.
+   * - ``acceleration_sweep``
+     - Metric against R for every arm, with bootstrap CI bands from per-case
+       rows.
+   * - ``tab_2_1_main_results``
+     - Headline metrics of every arm at its ``--view`` pass, best in bold,
+       with direction arrows and a caption stating the spread reported.
+
+Image cases come from the validation PNG drops when every arm has them (the
+same slices in every arm, rendered with a window shared with the reference) and
+from ``report_cases/`` otherwise. A PSNR printed on a PNG tile is computed on the
+8-bit display and marked ``≈``; it is not the logged metric.
+
+Crashed and unconfirmed arms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every arm's ``run_summary.json`` ``success`` flag is read before anything else
+(``reporting/run_status.py`` is the only reader). The metric files of a crashed
+run can belong to an earlier attempt, so the flag decides what is tabulated:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - ``success``
+     - Treatment
+   * - ``true``
+     - Compared as usual.
+   * - ``false``
+     - Excluded from every table and figure. A warning is logged, and the arm
+       is named with its ``error_type`` under the main-results table, in its
+       LaTeX caption, in an *Excluded arms* section of
+       ``comparison_summary.md``, and in the manifest's ``runs`` list with
+       ``included: false``. A crashed ``--baseline`` raises, as does a cohort
+       with fewer than two finished arms.
+   * - absent, ``null``, no file, unreadable
+     - Kept but never treated as finished. The arm is marked ``‡`` in the
+       main-results table, with the reason under it and in the caption, and
+       has ``status: unknown`` in the manifest. Runs downloaded before the flag
+       existed fall here, which is why they are marked rather than dropped.
+   * - any other value
+     - Raises.
+
+A per-run report is still written for a crashed run, since that report is how
+the crash gets read. Its ``report_summary.md`` opens with ``Run status:`` and
+its manifest carries the same ``runs`` entry.
+
+.. _reporting-all-metrics:
+
+Every metric, every phase
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Training, validation and inference results are read into one frame, and nothing
+in it favours PSNR or SSIM. ``--metrics all`` (the default for contrast folders)
+reports each base metric any phase logged; a list restricts it and a name no
+phase logged raises. Always written, with or without ``--metrics``:
+
+* ``data/metrics_long.csv``: one row per arm, phase and metric with mean, spread,
+  ``n``, unit, the step, and the direction from the metric SSOT (empty when it
+  declares none). ``data/metrics_<phase>.csv`` is the same, one row per arm.
+* With ``--metrics``: ``tables/metrics_<phase>.tex`` (best in bold only where the
+  direction is declared and the arms do not tie), ``cmp_phase_metrics``, and one
+  ``acceleration_sweep_<metric>`` per metric that has two or more accelerations.
+
+What each phase reads:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 16 40 44
+
+   * - Phase
+     - Source
+     - Value
+   * - ``val``
+     - ``logs/validation_metrics.csv``, per-slice ``validation_batches.csv``
+     - The selected pass. Paired tests use the per-slice rows, over subjects.
+   * - ``train``
+     - ``logs/training_metrics.csv``
+     - Mean of the last ``--train-window`` rows at or before that pass; a step
+       logged twice (a resumed run) keeps its last row. Training writes no
+       per-item rows, so there is no paired test.
+   * - ``test``
+     - ``final_eval.json`` written by ``infer``
+     - Mean over cases. Paired tests join arms on the case id. A metric the
+       run skipped (a full-reference metric on a run given no reference image)
+       is listed in ``data/unavailable.json`` with the reason from
+       ``inference_metrics.csv``.
+
+A metric with no declared direction is shown but not ranked: the results table
+does not bold it and the header carries no arrow.
+
+.. _reporting-contrasts:
+
+Named contrasts: one folder per comparison
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--compare`` writes one ``comparison/`` directory, so a second comparison
+overwrites the first. A paper compares many pairs, and each pair's figures,
+tables and numbers should travel together. The contrast folders work for any
+cohort and any metric the runs logged. Two ways to name the comparisons, each
+writing into ``<out-root>/<name>/``:
+
+.. code-block:: bash
+
+    # no file: every arm of a cohort against one arm, or every pair of arms
+    spectramr report -e experiments/results/<cohort> --contrast-pairs vs_baseline \
+      --baseline <arm> [--out-root DIR]          # default DIR: <cohort>/contrasts
+    spectramr report -e experiments/results/<cohort> --contrast-pairs pairs
+
+``vs_baseline`` Holm-corrects the arms together. ``pairs`` writes each pair
+alone and uncorrected: a pair picked after seeing the data has no family. For a
+paper whose comparisons are chosen in advance, declare them in a file:
+
+.. code-block:: bash
+
+    spectramr report --contrasts <contrasts.yaml> \
+      --out-root <out-root> [--only a_vs_b,g_vs_a] [--results-root DIR]
+
+.. code-block:: yaml
+
+    results_root: experiments/results/n2n_v2   # relative run paths resolve here
+    view: selected                              # selected | final | common
+    metrics: [psnr]         # optional base names; omit to test every metric
+    phases: [val, test]     # optional; default val, train, test
+    contrasts:
+      - name: a_vs_b                            # the folder name
+        baseline: B                             # default: the first arm
+        family: primary                         # Holm group; omit for uncorrected
+        ladder:                                 # optional: cmp_metric_ladder
+          metric: nex_equivalent
+          references: {identity: 1, two averages: 2, three averages: 3}
+        arms:
+          - {run: n2n_b_rep_pair_m4raw, label: B}
+          - {run: n2n_a_r2r_single_ex_m4raw, label: A, group: single excitation}  # group: optional
+
+Unknown keys, duplicate names, a baseline that is not an arm and a name that is
+not a safe folder name raise at load. Each folder holds only its own arms:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
+
+   * - Path
+     - Content
+   * - ``figures/``, ``tables/``, ``comparison_summary.md``, ``report_manifest.json``
+     - What ``--compare`` renders for these arms, including ``cmp_mosaic`` from the
+       validation slices the experiments saved (aligned by reference content). A
+       figure that cannot be drawn is listed in the manifest with its reason.
+   * - ``data/arm_metrics.csv``, ``data/all_metrics.csv``, ``data/per_case.csv``
+     - Every metric the arms logged: the tidy frame, one wide row per arm at the
+       pass read, and the per-case rows behind the bar and sweep figures.
+   * - ``data/metrics_long.csv``, ``data/metrics_<phase>.csv``
+     - Every metric by arm and phase (validation, training, inference); see
+       :ref:`reporting-all-metrics`.
+   * - ``data/paired_stats.csv``
+     - One row per (phase, metric, arm) against the baseline, over subjects
+       (validation, from per-slice rows) or cases (inference): mean difference, bootstrap
+       interval, Cohen's d, paired t and Wilcoxon p, the Holm family, its size and
+       the adjusted p. Differences are ``arm - baseline``; a reciprocal metric
+       (``nex_equivalent``) is compared on ``1/N_eq``, and ``scale`` says so.
+   * - ``data/paired_subjects/``
+     - The per-subject values behind each test, with their difference.
+   * - ``data/unavailable.json``
+     - Comparisons that could not be made, each with the reason: a run without
+       per-slice rows, a metric its rows lack, or fewer than two shared subjects.
+       None is reported as a p-value.
+   * - ``contrast.json``
+     - The declared contrast, the run directory and pass read for each arm, the
+       dataset and config hash each run recorded, and any excluded run.
+
+``INDEX.csv`` in the out-root lists the folders; ``--only`` rewrites its own
+rows and keeps the rest. Statistics are per subject: matched slices are paired
+on ``(subject, contrast, slice, repetition group)`` and averaged within a
+subject, because slices of one subject are not independent. Holm correction
+spans every contrast of the file that shares a ``family``, so an adjusted p-value
+depends on the other folders; the family and its size are written in each row so
+a folder read alone says what it was corrected against. Run ``--only`` with the
+whole family, or the size changes. The pass of each arm is the one the aggregate
+tables read (``--view``), so the statistics and the figures describe one checkpoint.
+``experiments/contrasts/n2n_paper.yaml`` is a worked example for one cohort; it
+mirrors the n2n paper script's ``CONTRASTS``, and a unit test pins the two.
+Holm runs across contrasts within one metric; metrics are not corrected against
+each other.
+
+Arm notes
+~~~~~~~~~
+
+An arm whose numbers need a caveat states it in its own YAML as
+``metadata.comparison_note``, one sentence. The comparison reads it from each
+run's ``resolved_config.json`` and marks the arm ``§`` in the main-results
+table, with the note under the table, in the LaTeX caption and in the CSV's
+``arm_note`` column. Example: the attention shoot-out's ``dual_domain`` arm
+records that it carries two attention blocks where every other arm carries one
+(#2101). A note that is not a string raises. Runs trained before the field
+existed have no note, because their resolved config does not contain one.
+
 House style
 -----------
 
@@ -376,11 +734,27 @@ raster output. Figure widths follow Nature columns (89 mm single, 120 mm 1.5,
 183 mm double) via
 :func:`spectramr.infrastructure.reporting.style.column_width`.
 
+``poster`` and ``slides`` keep the Nature column geometry, since a figure is
+scaled up where it is placed, and change what reading distance demands: a
+larger text-to-figure ratio and heavier strokes and markers (``slides`` adds a
+light y-grid and saves PNG by default). No plotter may pin a style; each calls
+``use_default_style()`` and inherits the one the report selected, which
+``tests/unit/infrastructure/reporting/test_style_not_hardcoded.py`` enforces.
+
 Axis labels and panel titles resolve through
 :func:`spectramr.infrastructure.reporting.style.pretty_label`, the same SSOT idea
 as ``METHOD_COLOURS``: ``psnr`` renders as "PSNR (dB)" and ``val_ssim`` as
 "validation SSIM" in every figure. Unknown keys degrade to lowercase words; this
 is a cosmetic fallback, since labels are not a registered-option enum.
+
+A figure carries its axes, panel letters and at most one legend. The legend and
+the arm palette come from :mod:`spectramr.infrastructure.reporting.legend`:
+``shared_legend`` puts one frameless legend under the panels and collapses entries
+beyond six into ``+k more``; ``arm_palette`` keeps an arm's colour fixed across
+figures. Counts, test results and provenance are not drawn on the canvas — they
+go to the figure's ``.meta.json`` sidecar or, for ``cmp_metric_bars``, to a
+``.stats.csv`` beside it. The best-checkpoint star appears only for a run that
+recorded an early-stopping selection.
 
 Every figure passes through
 :func:`spectramr.infrastructure.reporting.style.save_figure`, which scrubs
@@ -563,6 +937,53 @@ rather than a fixed IQM list. The mosaic and carpet consume the recorded
 recovered ``real_images`` / ``fake_images`` PNG pairs). All three are bundled
 into ``qc_report.html`` when ``reporting.html_report`` is on, and gated per run by
 ``reporting.qc_figures``.
+
+*Per-slice distributions, bivariate and embedding figures* (built on the per-slice
+rows of ``validation_batches.csv`` via :mod:`spectramr.infrastructure.reporting.plotters.distributions`):
+
+==================================  ====================================================
+``fig_3_1_metric_violin``           Per-slice violins per metric (per arm, or per contrast
+                                    for one run), median and quartiles inside
+``fig_3_2_subject_bars``            Per-subject means, sorted, one line per arm
+``fig_3_3_metric_scatter``          Hexbin of one metric against another, per slice
+``cmp_paired_slice_scatter``        Arm against baseline on the same slice, identity line
+``cmp_rank_heatmap``                Arm rank per metric (best to worst), no cell numbers
+``fig_3_6_error_decomposition``     Squared bias against repetition variance, per slice
+``fig_3_7_metric_embedding``        t-SNE of per-slice metric vectors (``scikit-learn``),
+                                    coloured by arm or contrast
+``fig_3_8_intensity_joint``         Prediction against target pixel density for one case
+``fig_3_9_background_zoom``              Prediction and target stretched to the background
+                                    noise; EFC/FBER/SNR to ``<figure>.iqm.csv``
+==================================  ====================================================
+
+The first four, ``fig_3_6`` and ``fig_3_7`` read the per-slice frame and soft-skip
+for a run without ``validation.per_batch_rows``; ``fig_3_8`` and ``fig_3_9_background_zoom``
+read the report cases. ``cmp_*`` need two or more arms and are drawn by
+``spectramr report --compare``, which also renders the others across arms. Counts and
+test results are not drawn on the canvas.
+
+*Checkpoint and saved-image figures* (a run's ``checkpoints/*.safetensors`` and the
+validation PNG pairs in ``logs/metrics``):
+
+==================================  ====================================================
+``fig_4_1_weight_trajectory``       Checkpoints in weight space (PCA of a fixed parameter
+                                    subset): one run by step, several runs by arm; star =
+                                    ``best``
+``fig_4_2_layer_drift``             Relative drift per layer group from the first
+                                    checkpoint (a column per checkpoint, or per arm)
+``fig_4_3_progress_strip``          Target, prediction and error at evenly spaced passes
+                                    (each pass its own sample); from the saved PNGs
+``fig_4_4_image_embedding``         Target and prediction of each recorded case in a
+                                    spectral-descriptor space (radial log power spectrum
+                                    and gradient histogram), t-SNE
+==================================  ====================================================
+
+``fig_4_1`` and ``fig_4_2`` read the checkpoints through
+:mod:`spectramr.infrastructure.reporting.weights` without building a model or reading data:
+a name-seeded subset of the float ``models.*`` tensors, the same positions in every
+checkpoint, at most 12 checkpoints per run. They soft-skip for a run with fewer than two.
+``fig_4_4`` reads the recorded ``report_cases/``; a run validated before the recorder
+existed has none and soft-skips.
 
 To report a whole cohort at once,
 :func:`spectramr.infrastructure.reporting.generate_reports` (CLI:
@@ -826,7 +1247,9 @@ Artifacts and provenance
 ------------------------
 
 ``report_manifest.json`` records every emitted artifact (id, path, format,
-sha256) plus provenance (git commit, seed, dataset, timestamp).
+sha256) plus provenance (git commit, seed, dataset, timestamp), and a ``runs``
+list giving each run's completion status and whether it was tabulated (see
+:ref:`reporting-compare`).
 ``submission_bundle: true`` additionally writes ``submission/`` with a 600-dpi
 TIFF and a caption ``.txt`` per figure.
 

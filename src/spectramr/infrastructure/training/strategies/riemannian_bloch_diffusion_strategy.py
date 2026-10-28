@@ -52,7 +52,7 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
         self.metric_refresh_interval = (
             int(getattr(rbd, "metric_refresh_interval", 50)) if rbd else 50
         )
-        use_ckpt = bool(getattr(rbd, "use_bloch_checkpoint", False)) if rbd else False
+        use_ckpt = bool(getattr(rbd, "enable_bloch_checkpoint", False)) if rbd else False
         self.manifold = BlochRelaxationManifold(
             cache_resolution=cache_res,
             use_bloch_checkpoint=use_ckpt,
@@ -182,7 +182,7 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
         theta_t = self.manifold.exp_map(theta0, v, n_steps=4)
         # Heat-kernel approximation: ∇_θ_t log p_{t|0} ≈ -log_map(θ_t, θ_0) / t.
         target_tangent = -self.manifold.log_map(theta_t, theta0) / t.unsqueeze(-1)
-        self._declare_model_input({"theta_t": theta_t, "t": t})
+        self._declare_model_input({"theta_t": theta_t, "t": t}, extra={"model_input_key": "theta_t"})
         predicted_tangent = self.generator_model(theta_t, t, None)
         # Inner product is in the Fisher metric; we use a per-point linearisation.
         G = self.manifold.metric_tensor(theta_t)  # [B, 3, 3]

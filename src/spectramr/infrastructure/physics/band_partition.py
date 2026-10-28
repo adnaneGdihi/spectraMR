@@ -72,7 +72,7 @@ def acquisition_rho(
     """Radial frequency normalised so ``1.0`` is the acquisition Nyquist.
 
     Args:
-        size: Spatial extent, 2-D ``(H, W)`` or 3-D ``(H, W, D)``.
+        size: Spatial extent, 2-D ``(H, W)`` or 3-D ``(D, H, W)``.
         device: Where to build the map.
         dtype: Real floating dtype of the result.
         sr_scale: Decimation factor, for the synthetic path. Mutually exclusive

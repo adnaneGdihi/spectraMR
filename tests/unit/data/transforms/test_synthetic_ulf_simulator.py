@@ -67,11 +67,69 @@ def test_ulf_is_blurrier_than_hf() -> None:
     assert _hf_energy(ulf) < _hf_energy(hf)
 
 
-def test_skips_when_source_missing() -> None:
+def test_missing_source_raises() -> None:
     subject = tio.Subject(other=tio.ScalarImage(tensor=torch.rand(1, 8, 8, 8)))
-    transform = SimulateULFFromHF()
-    out = transform(subject)
-    assert "input" not in out
+    with pytest.raises(KeyError, match="target"):
+        SimulateULFFromHF()(subject)
+
+
+def test_unknown_sequence_and_pe_axis_raise() -> None:
+    with pytest.raises(ValueError, match="sequence"):
+        SimulateULFFromHF(sequence="gre")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pe_axis"):
+        SimulateULFFromHF(pe_axis="D")  # type: ignore[arg-type]
+
+
+def test_sequence_is_stamped() -> None:
+    t = SimulateULFFromHF(sequence="epi")
+    assert "sequence" in t.args_names
+    assert t.sequence == "epi"
+
+
+def _geometry_only(**kw: object) -> SimulateULFFromHF:
+    return SimulateULFFromHF(
+        target_snr_db=200.0,
+        t2_star_blur_sigma=0.0,
+        b0_distortion_strength=0.1,
+        enable_maxwell=False,
+        pe_axis="H",
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def _stripes(axis: str) -> tio.Subject:
+    """Stripe phantom, constant along the other in-plane axis. TorchIO is (C,W,H,D)."""
+    D, H, W = 8, 32, 32
+    ramp = (torch.arange(32) % 8 < 4).float() * 0.8 + 0.1
+    if axis == "W":  # varies along readout (W), constant along H
+        data = ramp.view(1, W, 1, 1).expand(1, W, H, D)
+    else:  # varies along PE (H), constant along W
+        data = ramp.view(1, 1, H, 1).expand(1, W, H, D)
+    return tio.Subject(target=tio.ScalarImage(tensor=data.contiguous()))
+
+
+def test_spin_warp_shifts_readout_only() -> None:
+    """Readout-stripe phantom moves under spin-warp; PE-stripe phantom does not."""
+    ro = _geometry_only(sequence="spin_warp")(_stripes("W"))
+    pe = _geometry_only(sequence="spin_warp")(_stripes("H"))
+    assert (ro["input"].data - ro["target"].data).abs().max() > 0.05
+    assert (pe["input"].data - pe["target"].data).abs().max() < 1e-3
+
+
+def test_epi_shifts_pe_only() -> None:
+    ro = _geometry_only(sequence="epi")(_stripes("W"))
+    pe = _geometry_only(sequence="epi")(_stripes("H"))
+    assert (pe["input"].data - pe["target"].data).abs().max() > 0.05
+    assert (ro["input"].data - ro["target"].data).abs().max() < 1e-3
+
+
+def test_zero_shift_warp_is_identity() -> None:
+    from spectramr.data.transforms.synthetic_ulf_simulator import _apply_axis_shift
+
+    vol = torch.rand(1, 2, 5, 9, 11)
+    for axis in ("H", "W"):
+        out = _apply_axis_shift(vol, torch.zeros(5, 9, 11), axis=axis)  # type: ignore[arg-type]
+        assert torch.allclose(out, vol, atol=1e-6)
 
 
 def test_field_strength_validation() -> None:

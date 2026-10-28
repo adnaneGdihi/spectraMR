@@ -84,8 +84,8 @@ LAYER_FORBIDDEN: dict[str, list[str]] = {
         "spectramr.pipelines",
         "spectramr.cli",
     ],
-    # data/ sits logically between domain and infrastructure; it may NOT reach
-    # up into infrastructure (physics primitives should be exposed via a port)
+    # data/ sits logically between domain and infrastructure; it may not reach
+    # up into infrastructure, except the physics SSOT (see LAYER_EXEMPT below).
     "spectramr.data": [
         "spectramr.application",
         "spectramr.pipelines",
@@ -113,6 +113,15 @@ LAYER_FORBIDDEN: dict[str, list[str]] = {
     "spectramr.pipelines": [
         "spectramr.cli",
     ],
+}
+
+#: Carve-outs from a forbidden prefix, by source layer. ``infrastructure.physics``
+#: is the physics SSOT (``.claude/rules/physics.md``); a data transform that
+#: simulates noise, estimates coil maps or applies a forward operator needs it,
+#: and no port for it exists. The rest of ``infrastructure`` stays forbidden.
+#: ``core``/``domain`` are left as they are pending #1398.
+LAYER_EXEMPT: dict[str, list[str]] = {
+    "spectramr.data": ["spectramr.infrastructure.physics"],
 }
 
 
@@ -165,11 +174,14 @@ def _scan_violations(src_root: Path = SRC_ROOT) -> list[dict[str, str]]:
         if layer is None:
             continue
         forbidden = LAYER_FORBIDDEN[layer]
+        exempt = LAYER_EXEMPT.get(layer, [])
         try:
             tree = ast.parse(py_file.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
         for imp in _collect_imports(tree):
+            if any(imp == e or imp.startswith(e + ".") for e in exempt):
+                continue
             for f in forbidden:
                 if imp == f or imp.startswith(f + "."):
                     violations.append(

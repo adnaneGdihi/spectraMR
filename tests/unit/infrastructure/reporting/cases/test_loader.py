@@ -99,8 +99,29 @@ def test_png_pair_fallback_recovers_cases(tmp_path):
     cases = load_image_pair_cases(tmp_path)
     assert len(cases) == 3
     c = cases[0]
-    assert {"prediction", "target", "input"} <= set(c)
+    assert {"prediction", "target"} <= set(c)
     assert c["prediction"].ndim == 2
+
+
+def test_png_fallback_invents_no_input_and_no_baseline(tmp_path):
+    """No input PNG is saved. Copying the target into ``input`` showed the answer
+    under the label "input", and aliasing ``baseline`` onto it titled the
+    zero-filled image "CG-SENSE" for a baseline that never ran."""
+    _write_png_pairs(tmp_path)
+    c = load_image_pair_cases(tmp_path)[0]
+    assert "input" not in c and "zero_filled" not in c and "baseline" not in c
+
+
+def test_png_fallback_reads_the_requested_pass(tmp_path):
+    _write_png_pairs(tmp_path, epoch=1, step=50, n=2)
+    _write_png_pairs(tmp_path, epoch=3, step=300, n=4)
+    cases = load_image_pair_cases(tmp_path, step=120)
+    assert len(cases) == 2 and cases[0]["case_id"].startswith("epoch001_step000050")
+
+
+def test_unranked_png_cases_are_not_failures(tmp_path):
+    _write_png_pairs(tmp_path)
+    assert load_report_cases(tmp_path, task="reconstruction")["cases_failure"] == []
 
 
 def test_loader_falls_back_to_png_pairs_when_no_npz(tmp_path):
@@ -177,3 +198,30 @@ def test_a_real_run_beside_a_profiling_run_still_reports_its_own_images(tmp_path
     real, fake = _write_pair(arm / "metrics")
 
     assert _find_image_dirs(arm) == (real, fake)
+
+def test_png_fallback_reads_nothing_when_every_pass_is_later(tmp_path):
+    _write_png_pairs(tmp_path, epoch=1, step=500, n=2)
+    assert load_image_pair_cases(tmp_path, step=100) == []
+
+
+def test_recorded_cases_are_read_at_one_pass():
+    """The recorder pools cases over every pass; a panel must show one model (#2503)."""
+    from spectramr.infrastructure.reporting.cases.loader import _cases_at_pass
+
+    cases = [{"case_id": cid} for cid in (
+        "val_step70000_R2x", "val_step70000_R8x", "val_step35000_R32x", "val_step17500_R2x"
+    )]
+    assert [c["case_id"] for c in _cases_at_pass(cases, 70000)] == [
+        "val_step70000_R2x", "val_step70000_R8x"
+    ]
+    assert [c["case_id"] for c in _cases_at_pass(cases, 40000)] == ["val_step35000_R32x"]
+    assert _cases_at_pass(cases, 100) == []
+    assert _cases_at_pass([{"case_id": "c0"}], 100) == [{"case_id": "c0"}]
+
+def test_without_a_step_the_latest_recorded_pass_is_read():
+    from spectramr.infrastructure.reporting.cases.loader import _cases_at_pass
+
+    cases = [{"case_id": c} for c in ("val_step100_R2x", "val_step300_R2x", "val_step300_R8x")]
+    assert [c["case_id"] for c in _cases_at_pass(cases, 10**12)] == [
+        "val_step300_R2x", "val_step300_R8x"
+    ]

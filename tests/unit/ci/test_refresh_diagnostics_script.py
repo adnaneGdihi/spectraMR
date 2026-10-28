@@ -147,9 +147,9 @@ def test_makefile_exposes_the_tree_and_cohort_selectors() -> None:
         "scripts/diagnostics/render_report_cases.py",
         "scripts/diagnostics/debug_snapshot_audit.py",
         "scripts/generate_validation_mosaic.py",
-        "scratch/batch_scientific_audit.py",
-        "scratch/batch_probe.py",
-        "scratch/compile_diagnostics.py",
+        "tools/audit/batch_scientific_audit.py",
+        "tools/diagnostics/batch_probe.py",
+        "tools/triage/compile_diagnostics.py",
     ],
 )
 def test_every_diagnostic_pass_runs_inside_refresh_one(pass_script: str) -> None:

@@ -253,6 +253,10 @@ def test_a_divergent_metric_transform_is_reported_not_silently_compared():
 
     arm = "experiments/inprogress/kspace_filling/experiment_11_kfn_none.yaml"
     cfg = TrainingSettings.from_yaml(arm)
+    # The cohort now agrees; planting the old RSS validation transform recreates the divergence.
+    assert cfg.metrics.transform == cfg.validation.scoring.output_transform
+    diverged = cfg.validation.scoring.model_copy(update={"output_transform": "ifft_magnitude"})
+    cfg = cfg.model_copy(update={"validation": cfg.validation.model_copy(update={"scoring": diverged})})
     assert cfg.metrics.transform != cfg.validation.scoring.output_transform
     result = ConfigHealthChecker().check_metric_transforms_agree(cfg)
     assert "different measurements under one name" in result.message

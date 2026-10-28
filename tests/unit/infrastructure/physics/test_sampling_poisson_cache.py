@@ -28,7 +28,7 @@ def test_cached_pattern_equals_regenerated_pattern() -> None:
     With a seed the generator is a pure function of ``(height, width)``, so the
     regenerated pattern is the oracle for the cached one.
     """
-    accel = PoissonDiskKSpaceAccelerator(seed=0)
+    accel = PoissonDiskKSpaceAccelerator(num_timesteps=1000, seed=0)
     for size in (48, 64):
         regenerated = accel._generate_master_pattern(size, size, CPU)
         assert accel._generate_master_pattern(size, size, CPU) == regenerated
@@ -37,7 +37,7 @@ def test_cached_pattern_equals_regenerated_pattern() -> None:
 
 def test_repeated_masks_are_identical() -> None:
     """The per-sample call is what ``generate_batch_masks`` repeats."""
-    accel = PoissonDiskKSpaceAccelerator(seed=0)
+    accel = PoissonDiskKSpaceAccelerator(num_timesteps=1000, seed=0)
     first = accel.get_acceleration_mask((1, 64, 64), 500, CPU)
     for _ in range(3):
         assert torch.equal(accel.get_acceleration_mask((1, 64, 64), 500, CPU), first)
@@ -45,7 +45,7 @@ def test_repeated_masks_are_identical() -> None:
 
 def test_cache_holds_no_device_tensors() -> None:
     """The disabled-cache rationale claimed GPU accumulation; refute it."""
-    accel = PoissonDiskKSpaceAccelerator(seed=0)
+    accel = PoissonDiskKSpaceAccelerator(num_timesteps=1000, seed=0)
     accel.get_acceleration_mask((1, 48, 48), 100, CPU)
     assert accel._cached_patterns, "the pattern should have been cached"
     for value in accel._cached_patterns.values():
@@ -56,7 +56,7 @@ def test_cache_holds_no_device_tensors() -> None:
 
 def test_cache_is_bounded() -> None:
     """Distinct shapes must not grow the cache without limit."""
-    accel = PoissonDiskKSpaceAccelerator(seed=0)
+    accel = PoissonDiskKSpaceAccelerator(num_timesteps=1000, seed=0)
     limit = accel._PATTERN_CACHE_MAX
     for size in range(24, 24 + 4 * (limit + 2), 4):
         accel._get_master_pattern(size, size, CPU)
@@ -65,7 +65,7 @@ def test_cache_is_bounded() -> None:
 
 def test_distinct_shapes_get_distinct_patterns() -> None:
     """A shape-keyed cache must not serve one shape's pattern for another."""
-    accel = PoissonDiskKSpaceAccelerator(seed=0)
+    accel = PoissonDiskKSpaceAccelerator(num_timesteps=1000, seed=0)
     small = accel._get_master_pattern(48, 48, CPU)
     large = accel._get_master_pattern(96, 96, CPU)
     assert small != large

@@ -72,6 +72,9 @@ class TropicalSemiringConsistencyLoss(nn.Module):
             reproducible across runs. Default 0.
     """
 
+    _slopes: torch.Tensor
+    _intercepts: torch.Tensor
+
     def __init__(
         self,
         n_monomials: int = 8,

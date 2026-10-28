@@ -400,3 +400,88 @@ class TestGetLossClass:
         for name in LossRegistry.list_available():
             assert LossRegistry.is_registered(name)
             assert LossRegistry.get_loss_class(name) is not None
+
+
+class TestAliasesCannotShadowCanonicalNames:
+    """``create`` reads the alias table first, so an alias equal to another loss's
+    canonical name hijacks it, and a canonical name equal to an existing alias is
+    unreachable. Which one wins depended on import order.
+    """
+
+    @staticmethod
+    def _cleanup(*names: str) -> None:
+        for name in names:
+            LossRegistry._custom_losses.pop(name, None)
+            LossRegistry._loss_domains.pop(name, None)
+            for alias, canon in list(LossRegistry._aliases.items()):
+                if canon == name:
+                    LossRegistry._aliases.pop(alias)
+
+    def test_an_alias_naming_another_loss_is_refused(self) -> None:
+        import torch.nn as nn
+
+        from spectramr.models.losses.registry import register_loss
+
+        l1_cls = LossRegistry.get_loss_class("l1")
+        try:
+            with pytest.raises(ValueError, match="hijack create"):
+                register_loss("_probe_hijack", aliases=["l1"])(type("PH", (nn.Module,), {}))
+            assert LossRegistry.get_loss_class("l1") is l1_cls
+            assert "_probe_hijack" not in LossRegistry._custom_losses
+        finally:
+            self._cleanup("_probe_hijack")
+
+    def test_a_canonical_name_that_is_already_an_alias_is_refused(self) -> None:
+        import torch.nn as nn
+
+        from spectramr.models.losses.registry import register_loss
+
+        assert LossRegistry.canonical_name("mae") == "l1"
+        try:
+            with pytest.raises(ValueError, match="already an alias of 'l1'"):
+                register_loss("mae")(type("PM", (nn.Module,), {}))
+            assert "mae" not in LossRegistry._custom_losses
+        finally:
+            LossRegistry._custom_losses.pop("mae", None)
+
+    def test_a_refused_alias_remap_leaves_no_partial_entry(self) -> None:
+        """The remap check used to run after the class was already stored."""
+        import torch.nn as nn
+
+        from spectramr.models.losses.registry import register_loss
+
+        try:
+            with pytest.raises(ValueError, match="refusing to remap"):
+                register_loss("_probe_remap", aliases=["mse"])(type("PR", (nn.Module,), {}))
+            assert "_probe_remap" not in LossRegistry._custom_losses
+            assert LossRegistry.canonical_name("mse") == "l2"
+        finally:
+            self._cleanup("_probe_remap")
+
+    def test_reregistering_the_same_class_stays_idempotent(self) -> None:
+        """Control: a module reload re-runs every decorator with identical arguments."""
+        from spectramr.models.losses.registry import register_loss
+
+        l1_cls = LossRegistry.get_loss_class("l1")
+        assert l1_cls is not None
+        register_loss("l1", aliases=["mae", "mean_absolute_error"], domain="agnostic")(l1_cls)
+        assert LossRegistry.get_loss_class("mae") is l1_cls
+
+    def test_no_live_alias_collides_with_a_canonical_name(self) -> None:
+        collisions = {
+            alias: canon
+            for alias, canon in LossRegistry._aliases.items()
+            if alias in LossRegistry._custom_losses and alias != canon
+        }
+        assert collisions == {}
+
+
+class TestGetLossInfoResolvesAliases:
+    def test_an_alias_returns_the_canonical_losses_info(self) -> None:
+        info = LossRegistry.get_loss_info("mae")
+        assert info["description"] == LossRegistry.get_loss_info("l1")["description"]
+        assert "mae" in info["aliases"]
+
+    def test_an_unknown_name_still_raises(self) -> None:
+        with pytest.raises(KeyError):
+            LossRegistry.get_loss_info("definitely_not_a_loss")

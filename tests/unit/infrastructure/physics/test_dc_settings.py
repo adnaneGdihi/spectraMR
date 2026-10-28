@@ -23,14 +23,17 @@ from spectramr.infrastructure.physics.dc_settings import (
 
 
 def _dc(**overrides):
+    """A physics.data_consistency block at the SCHEMA's defaults, plus overrides.
+
+    Built from the real schema so a fixture cannot restate a default the schema
+    has since moved, which is how the stale noise-level defaults went unseen.
+    """
+    from spectramr.config.schemas.physics import DataConsistencyConfig
+
     base = {
-        "enabled": True,
-        "method": "hard",
-        "weight": 1.0,
-        "train_noise_level": 0.01,
-        "eval_noise_level": 0.005,
-        "noise_type": "gaussian",
+        field: info.default for field, info in DataConsistencyConfig.model_fields.items()
     }
+    base.update({"enabled": True, "method": "hard"})
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -71,6 +74,7 @@ class TestReadsKnob:
             ("noise_adjusted", True),  # maps to soft
             ("noise_adaptive", True),  # beta
             ("target_aware_fsdc", True),  # hf_lambda
+            ("wiener_gain", True),  # beta
             ("projection_2d_consistency", True),  # SimpleDataConsistency fallback
         ],
     )
@@ -79,7 +83,13 @@ class TestReadsKnob:
 
     @pytest.mark.parametrize(
         "method,expected",
-        [("hard", True), ("soft", False), ("adaptive", False), ("kan_adaptive", False)],
+        [
+            ("hard", True),
+            ("soft", False),
+            ("adaptive", False),
+            ("kan_adaptive", False),
+            ("wiener_gain", False),
+        ],
     )
     def test_noise_level_readership(self, method: str, expected: bool) -> None:
         assert reads_knob(method, "train_noise_level") is expected
@@ -145,6 +155,21 @@ class TestInertKnobDetection:
     def test_hard_plus_non_default_noise_is_silent(self) -> None:
         """hard DC DOES simulate noise, so these are live knobs under it."""
         assert inert_dc_knobs(_config(_dc(method="hard", train_noise_level=0.09))) == ()
+
+    @pytest.mark.parametrize(
+        "method", ["soft", "adaptive", "kan_adaptive", "noise_adaptive", "target_aware_fsdc"]
+    )
+    def test_undeclared_noise_levels_are_silent_under_every_method(self, method: str) -> None:
+        """PLANTED: the schema-default block the detector reported on every non-hard arm."""
+        found = inert_dc_knobs(_config(_dc(method=method)))
+        assert [k for k, _, _ in found if "noise" in k] == []
+
+    def test_defaults_are_read_from_the_schema(self) -> None:
+        from spectramr.config.schemas.physics import DataConsistencyConfig
+        from spectramr.infrastructure.physics.dc_settings import schema_defaults
+
+        fields = DataConsistencyConfig.model_fields
+        assert schema_defaults() == {kw: fields[f].default for kw, f in DC_SSOT_KEYS}
 
     def test_disabled_dc_reports_nothing(self) -> None:
         assert inert_dc_knobs(_config(_dc(enabled=False, method="hard", weight=0.5))) == ()

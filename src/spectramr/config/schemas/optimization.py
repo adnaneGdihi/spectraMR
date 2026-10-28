@@ -45,7 +45,7 @@ while Python reads one path only. ``config.optimization.learning_rate`` raises
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import OPTIMIZER_ALIASES, OPTIMIZER_NAMES
 from .renames import (
@@ -107,7 +107,7 @@ _INERT_UNDER_DISABLED_COMPILE: tuple[str, ...] = (
 #: Shared by every sub-block below. ``forbid`` because a new block has no legacy
 #: corpus to protect: a typo inside ``precision:`` has never worked, so there is
 #: nothing to break by rejecting it.
-_SUBBLOCK = {"extra": "forbid", "frozen": True}
+_SUBBLOCK: ConfigDict = ConfigDict(extra="forbid", frozen=True)
 
 
 class ParamGroupOverrideSchema(BaseModel):
@@ -206,7 +206,7 @@ class OptimizerConfigSchema(BaseModel):
     was in fact read by nothing at all while 27 experiment YAMLs set it.
     """
 
-    model_config = {"protected_namespaces": (), **_SUBBLOCK}
+    model_config = ConfigDict(protected_namespaces=(), **_SUBBLOCK)
 
     type: str = Field(
         default="adamw",
@@ -224,7 +224,13 @@ class OptimizerConfigSchema(BaseModel):
     # declaring both with different values is an error), and 579 arms set beta1
     # while 484 set beta2 -- collapsing them is a value transform over ~600 files,
     # not a key move, so it needs its own migrator record and its own PR.
-    beta1: float = Field(default=0.5, ge=0, le=1)
+    beta1: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Adam-family beta1. Unset means the optimizer's own default "
+        "(0.9 for torch's Adam family); the resolved pair is stamped into provenance.",
+    )
     beta2: float = Field(default=0.999, ge=0, le=1)
     betas: tuple[float, float] | None = Field(
         default=None,
@@ -318,7 +324,7 @@ class OptimizerConfigSchema(BaseModel):
 class GradientClipConfigSchema(BaseModel):
     """Gradient clipping. ``enabled`` is the block's own gate, so it is bare."""
 
-    model_config = dict(_SUBBLOCK)
+    model_config = _SUBBLOCK
 
     enabled: bool = Field(default=False)
     method: str = Field(default="norm", description="`norm` or `value`.")
@@ -335,7 +341,7 @@ class GradientConfigSchema(BaseModel):
     ``clip.value``.
     """
 
-    model_config = dict(_SUBBLOCK)
+    model_config = _SUBBLOCK
 
     accumulation_steps: int = Field(
         default=1, gt=0, description="Number of gradient accumulation steps."
@@ -363,7 +369,7 @@ class PrecisionConfigSchema(BaseModel):
     opposite ends of a 44-field wall.
     """
 
-    model_config = dict(_SUBBLOCK)
+    model_config = _SUBBLOCK
 
     enabled: bool = Field(default=False)
     dtype: str | None = Field(
@@ -398,7 +404,7 @@ class CompileConfigSchema(BaseModel):
     lie about what ran. ``enabled: false`` is how you ask for eager.
     """
 
-    model_config = dict(_SUBBLOCK)
+    model_config = _SUBBLOCK
 
     enabled: bool = Field(default=False)
     mode: CompileMode = Field(
@@ -436,6 +442,13 @@ class CompileConfigSchema(BaseModel):
         "of them, which is what shipped. A GAN can name only its generator: the "
         "discriminator is discarded at inference, and under regional an arm whose "
         "discriminator exposes no uniform block list is refused entirely.",
+    )
+    channels_last: list[CompileTarget] | None = Field(
+        default=None,
+        description="Convert these models to the channels-last (NHWC) memory format, which "
+        "cuDNN/oneDNN run 2-D convolutions fastest in. Same target names as apply_to, and "
+        "independent of enabled. A model with no 4-D real weight (a k-space or 3-D model) "
+        "is refused rather than reported as converted.",
     )
     recompile_limit: int | None = Field(
         default=None,
@@ -526,6 +539,11 @@ class CompileConfigSchema(BaseModel):
         Omit the key for "all models"; the empty list can only mean "compile
         nothing", which the switch above already says plainly.
         """
+        if self.channels_last is not None and not self.channels_last:
+            raise ValueError(
+                "optimization.compile.channels_last is an empty list, which converts "
+                "nothing. Omit the key to leave every model in the default layout."
+            )
         if self.apply_to is not None and not self.apply_to:
             raise ValueError(
                 "optimization.compile.apply_to is an empty list, which would compile "
@@ -589,7 +607,7 @@ class CompileConfigSchema(BaseModel):
 class MemoryConfigSchema(BaseModel):
     """Memory monitoring and mitigation. Diagnostics, not a training decision."""
 
-    model_config = dict(_SUBBLOCK)
+    model_config = _SUBBLOCK
 
     enable_monitoring: bool = Field(default=False)
     monitoring_interval: int = Field(default=50, gt=0)
@@ -644,7 +662,7 @@ class OptimizationConfigSchema(BaseModel):
     lr_scheduler_strategy: str = Field(
         default="cosine",
         description="Scheduler family: cosine / cosine_annealing / "
-        "cosine_annealing_warm_restarts / step / linear_decay / plateau / "
+        "cosine_annealing_warm_restarts / step / linear_decay / "
         "warmup / linear_warmup / constant. Read by resolve_scheduler_spec "
         "whenever scheduler.type is absent, including when there is no "
         "`scheduler:` dict at all — but only when this key is DECLARED. Its "
@@ -680,7 +698,8 @@ class OptimizationConfigSchema(BaseModel):
         default=None,
         gt=0,
         description="CosineAnnealingLR period. Takes effect; conflicting with "
-        "scheduler.T_max raises. Defaults to training.max_iterations.",
+        "scheduler.T_max raises. Defaults to the optimizer steps left after "
+        "warmup: training.max_iterations // gradient.accumulation_steps - warmup_steps.",
     )
     eta_min: float | None = Field(
         default=None,
@@ -715,6 +734,8 @@ class OptimizationConfigSchema(BaseModel):
     # driven to zero; `fold_renamed_keys` moves the rest into their sub-block so
     # the corpus can migrate on its own schedule. Both read one table.
     _reject_renamed = model_validator(mode="before")(
-        classmethod(reject_renamed_keys("optimization"))
+        classmethod(reject_renamed_keys("optimization"))  # type: ignore[arg-type]
     )
-    _fold_renamed = model_validator(mode="before")(classmethod(fold_renamed_keys("optimization")))
+    _fold_renamed = model_validator(mode="before")(
+        classmethod(fold_renamed_keys("optimization"))  # type: ignore[arg-type]
+    )

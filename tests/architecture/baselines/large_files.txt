@@ -124,7 +124,6 @@ src/spectramr/domain/services/generation_3d_orchestration_service.py  # 650 loc
 src/spectramr/domain/services/services.py  # 341 loc
 src/spectramr/domain/workflows/profiles.py  # 363 loc
 src/spectramr/infrastructure/builders/core/base_builder.py  # 406 loc
-src/spectramr/infrastructure/builders/directors/checkpoint_director.py  # 833 loc
 src/spectramr/infrastructure/builders/directors/data_pipeline_director.py  # 847 loc
 src/spectramr/infrastructure/builders/leaf/data_builders.py  # 689 loc
 src/spectramr/infrastructure/builders/leaf/model_builders.py  # 719 loc
@@ -158,7 +157,6 @@ src/spectramr/infrastructure/physics/coil_sensitivity.py  # 1270 loc
 src/spectramr/infrastructure/physics/conformal_geometry.py  # 454 loc
 src/spectramr/infrastructure/physics/data_consistency.py  # 1386 loc
 src/spectramr/infrastructure/physics/degradation_generators.py  # 317 loc
-src/spectramr/infrastructure/physics/digital_twin_extensions.py  # 2178 loc
 src/spectramr/infrastructure/physics/digital_twin_simulator.py  # 2729 loc
 src/spectramr/infrastructure/physics/dispersion.py  # 311 loc
 src/spectramr/infrastructure/physics/engine.py  # 405 loc
@@ -184,14 +182,11 @@ src/spectramr/infrastructure/physics/vf_field_extraction.py  # 1102 loc
 src/spectramr/infrastructure/physics/vf_operators.py  # 806 loc
 src/spectramr/infrastructure/physics/vf_physics_operators.py  # 596 loc
 src/spectramr/infrastructure/physics/virtual_fiducial.py  # 433 loc
-src/spectramr/infrastructure/reporting/advanced_reporting.py  # 652 loc
 src/spectramr/infrastructure/reporting/cohort_ablation.py  # 388 loc
 src/spectramr/infrastructure/reporting/interactive/figures.py  # 335 loc
-src/spectramr/infrastructure/reporting/metrics_report_generator.py  # 614 loc
 src/spectramr/infrastructure/reporting/pipeline.py  # 630 loc
 src/spectramr/infrastructure/reporting/style.py  # 805 loc
 src/spectramr/infrastructure/services/__init__.py  # 455 loc
-src/spectramr/infrastructure/services/checkpoint_service.py  # 1156 loc
 src/spectramr/infrastructure/services/coil_sensitivity_service.py  # 568 loc
 src/spectramr/infrastructure/services/device_policy.py  # 401 loc
 src/spectramr/infrastructure/services/iteration_counter_service.py  # 356 loc
@@ -241,7 +236,6 @@ src/spectramr/infrastructure/training/strategies/mixins/adversarial.py  # 362 lo
 src/spectramr/infrastructure/training/strategies/mixins/kspace.py  # 641 loc
 src/spectramr/infrastructure/training/strategies/mixins/metrics_mixin.py  # 1423 loc
 src/spectramr/infrastructure/training/strategies/mixins/model_validation.py  # 319 loc
-src/spectramr/infrastructure/training/strategies/mixins/reconstruction.py  # 522 loc
 src/spectramr/infrastructure/training/strategies/motion_meta_strategy.py  # 360 loc
 src/spectramr/infrastructure/training/strategies/mrf_acquisition_strategies.py  # 305 loc
 src/spectramr/infrastructure/training/strategies/mrs_quantification_strategy.py  # 329 loc
@@ -308,7 +302,6 @@ src/spectramr/models/classifiers/guidance_free_classifier.py  # 675 loc
 src/spectramr/models/components/siren.py  # 420 loc
 src/spectramr/models/components/wav_unet.py  # 308 loc
 src/spectramr/models/conditioning/encoders.py  # 317 loc
-src/spectramr/models/diffusion/architectures/enhanced_deep_unet.py  # 758 loc
 src/spectramr/models/diffusion/architectures/transformer_hybrid_unets.py  # 648 loc
 src/spectramr/models/diffusion/base_diffusion.py  # 571 loc
 src/spectramr/models/diffusion/bloch_manifold_dps_sampler.py  # 389 loc
@@ -488,7 +481,6 @@ src/spectramr/models/model_compression.py  # 694 loc
 src/spectramr/models/motion/lagrange_euler.py  # 398 loc
 src/spectramr/models/motion/score_disentangle.py  # 315 loc
 src/spectramr/models/navigation/se3_equivariant_dc_navigator.py  # 312 loc
-src/spectramr/models/parameter_normalization.py  # 584 loc
 src/spectramr/models/physics/bloch_manifold_projector.py  # 491 loc
 src/spectramr/models/physics/diff_seq.py  # 410 loc
 src/spectramr/models/physics/therm_pinn.py  # 353 loc

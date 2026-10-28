@@ -91,3 +91,38 @@ class TestMarkerConditionedVAELoss:
         loss.backward()
         assert pred.grad is not None
         assert mu.grad is not None
+
+
+class TestDiffusionVarianceCalibrationLoss:
+    """The measured marker variance is a calibration target, not a trainable term."""
+
+    def _inputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target = torch.ones(1, 1, 4, 4)
+        pred = (target + 0.1).requires_grad_(True)
+        est = torch.tensor([0.5], requires_grad=True)
+        return pred, target, est, torch.ones(1, 1, 4, 4)
+
+    def test_calibration_term_sends_no_gradient_to_the_prediction(self) -> None:
+        """With est > measured it pushed the marker residual up, away from the target."""
+        from spectramr.models.losses.vf_losses import DiffusionVarianceCalibrationLoss
+
+        pred, target, est, mask = self._inputs()
+        loss = DiffusionVarianceCalibrationLoss(lambda_cal=1.0)(
+            pred, target, estimated_noise_var=est, marker_mask=mask
+        )
+        loss.backward()
+        # Only the L1 term reaches the prediction: sign(0.1) / 16 per pixel.
+        assert pred.grad is not None
+        torch.testing.assert_close(pred.grad, torch.full_like(pred, 1.0 / 16.0))
+
+    def test_calibration_term_trains_the_estimate(self) -> None:
+        from spectramr.models.losses.vf_losses import DiffusionVarianceCalibrationLoss
+
+        pred, target, est, mask = self._inputs()
+        loss = DiffusionVarianceCalibrationLoss(lambda_cal=1.0)(
+            pred, target, estimated_noise_var=est, marker_mask=mask
+        )
+        loss.backward()
+        # d/d est of (est - 0.01)^2 at est = 0.5.
+        assert est.grad is not None
+        torch.testing.assert_close(est.grad, torch.tensor([2.0 * (0.5 - 0.01)]))

@@ -86,3 +86,14 @@ class TestTissueDiffusionGenerator:
         assert model.in_channels == 1
         assert isinstance(model.get_parameter_count(), int)
         assert model.get_parameter_count() > 0
+
+
+@pytest.mark.parametrize("n_steps", [10, 1000])
+def test_the_denoiser_divides_by_the_generators_own_horizon(n_steps):
+    """PLANTED (#2442): the denoiser divided by 1000 while the generator ran n_steps."""
+    model = TissueDiffusionGenerator(tissue_channels=6, base_dim=16, n_diffusion_steps=n_steps)
+    seen = []
+    model.denoiser.time_embed.register_forward_pre_hook(lambda _m, args: seen.append(args[0]))
+    x, t = torch.randn(2, 6, 16, 16), torch.tensor([0, n_steps - 1])
+    model(x, t=t, tissue_maps=x)
+    assert torch.equal(seen[0], t.float() / n_steps)

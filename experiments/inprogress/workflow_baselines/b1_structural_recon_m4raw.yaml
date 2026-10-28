@@ -47,6 +47,7 @@ metadata:
 data:
   dataset_type: m4raw
   target_mode: phase_aligned_mean
+  nex_registration: translation  # register repetitions onto the input before averaging (#2849)
   # FACTOR 1 of 2 (absent in b0). Selects the Cartesian physics slot. Combined
   # with acceleration.base_acceleration > 1 below this yields
   # PhysicsInformedMasking, which masks `kspace` into `input` and emits the

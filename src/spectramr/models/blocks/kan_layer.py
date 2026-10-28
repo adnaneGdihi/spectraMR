@@ -11,10 +11,13 @@ disables it locally.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 from torch import nn
+
+_logger = logging.getLogger(__name__)
 
 
 def _gather_samples_across_ranks(x_flat: torch.Tensor) -> torch.Tensor:
@@ -276,6 +279,17 @@ class KANLayer(nn.Module):
             return
 
         new_W = W_flat.T.reshape(self.out_dim, D, C).contiguous()
+        # CUDA lstsq is QR-only ('gels', full rank assumed) and returns NaN/Inf rather
+        # than raising when tied quantile knots make A rank-deficient, which the
+        # ``except`` above cannot see. A non-finite fit would NaN every later forward.
+        if not bool(torch.isfinite(new_W).all()):
+            self.grid.copy_(old_grid)
+            self._collected_samples.clear()
+            _logger.warning(
+                "[KANLayer] Grid refit produced a non-finite least-squares solution "
+                "(rank-deficient design matrix); keeping the previous grid and weights."
+            )
+            return
         # Replace spline_weight in-place to preserve optimizer state.
         self.spline_weight.data.copy_(new_W)
         # Buffer was consumed; clear it so the next collection cycle is fresh.

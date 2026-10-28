@@ -75,12 +75,13 @@ class FieldDomainClassifier(nn.Module):
         if z.ndim == 4:
             # Global average pool spatial dims
             z = z.mean(dim=(-2, -1))
-        return self.net(z)
+        logits: torch.Tensor = self.net(z)
+        return logits
 
 
 @register_loss(name="domain_adversarial_grl", aliases=["domain_adv_grl"], domain="latent")
 class DomainAdversarialLoss(nn.Module):
-    """Domain-adversarial loss combining GRL + field classifier.
+    r"""Domain-adversarial loss combining GRL + field classifier.
 
     Optimized jointly with the main reconstruction loss. The GRL
     negates classifier gradients, forcing the encoder to produce
@@ -94,7 +95,7 @@ class DomainAdversarialLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
+        \mathcal{L}_{DomainAdversarial} = \text{BCE}(D_{domain}(GRL(z)), y_{domain})"""
 
     def __init__(
         self,

@@ -132,6 +132,23 @@ def test_cooldown_suppresses_immediate_refire() -> None:
     assert m.fire_if_plateaued(9.0, iteration=50) is True  # cooldown elapsed -> FIRE again
 
 
+def test_a_sustained_plateau_fires_once_per_cooldown_plus_patience() -> None:
+    """Bad checks inside the cooldown counted toward the next plateau, so it
+    re-fired every ``cooldown + 1`` checks: [6, 12, 18, ...] here."""
+    m = PlateauMonitor(mode=MetricMode.MIN, patience=5, cooldown=5)
+    fired = [check for check in range(1, 40) if m.fire_if_plateaued(1.0, iteration=check)]
+    assert fired == [6, 16, 26, 36]
+
+
+def test_no_fire_on_a_nan_right_after_the_cooldown() -> None:
+    m = PlateauMonitor(mode=MetricMode.MIN, patience=2, cooldown=3)
+    for check, value in enumerate([1.0, 2.0, 2.0], start=1):  # fires on check 3
+        m.fire_if_plateaued(value, iteration=check)
+    for check in (4, 5, 6):  # cooldown, non-improving
+        assert m.fire_if_plateaued(2.0, iteration=check) is False
+    assert m.fire_if_plateaued(float("nan"), iteration=7) is False
+
+
 # ---------------------------------------------------------------------------
 # reset
 # ---------------------------------------------------------------------------

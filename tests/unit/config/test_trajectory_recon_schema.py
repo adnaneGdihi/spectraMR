@@ -35,7 +35,6 @@ def test_trajectory_recon_mounted_on_training_schema():
 
 def test_trajectory_recon_in_valid_modes_constraints_and_strategy_paths():
     from spectramr.config.validation_constants import (
-        TRAINING_MODE_CONSTRAINTS,
         VALID_TRAINING_MODES,
     )
     from spectramr.infrastructure.training.strategy_factory import (
@@ -44,6 +43,5 @@ def test_trajectory_recon_in_valid_modes_constraints_and_strategy_paths():
 
     paths = TrainingStrategyFactory.STRATEGY_CLASS_PATHS
     assert "trajectory_recon" in VALID_TRAINING_MODES
-    assert "trajectory_recon" in TRAINING_MODE_CONSTRAINTS
     assert "trajectory_recon" in paths
     assert paths["trajectory_recon"].startswith("spectramr.")

@@ -108,6 +108,27 @@ Then either set ``SPECTRAMR_PLUGINS=my_pkg.models.my_unet``, add it to
 ``plugins.paths``, or declare the entry-point — and use ``model_type: my_unet``
 in any config, or build it directly via :doc:`scripting_api`.
 
+In-repo example: the prior-method baselines
+-------------------------------------------
+
+The CDiffMR, FDB and Shen 2024 adapters live in ``plugins/spectramr_baselines/``
+rather than in ``src/spectramr/``: they wrap third-party code vendored as
+submodules under ``external/baselines/``, and the framework should not carry it.
+The distribution declares its three models under ``spectramr.models`` and its
+``UpstreamProcessStrategy`` under ``spectramr.strategies``, and each
+``kspace_filling`` baseline arm also names its adapter module in
+``plugins.paths`` and its strategy by dotted ``strategy_class``, so the arm loads
+whether the plugin is installed or only on ``PYTHONPATH``:
+
+.. code-block:: bash
+
+   git submodule update --init external/baselines
+   pip install -e plugins/spectramr_baselines
+
+The contract every adapter satisfies, ``BaselineAdapter``, stays in-tree in
+:mod:`spectramr.models.baselines` so provenance and the config health checks can
+read it without importing the plugin.
+
 .. seealso::
 
    * :doc:`scripting_api` — the in-process scripting mode and public API.

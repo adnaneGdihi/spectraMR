@@ -7,7 +7,7 @@ declared none, and the snapshot alone cannot tell the two apart. This module
 answers that in the artifact itself, recording two things side by side:
 
 * ``declared`` — the knobs the user set (config SSOT: normalization, NEX target
-  construction, augmentation).
+  construction, augmentation, undersampling).
 * ``applied`` — what the pipeline actually built (the real dataset wrapper chain
   and the real ``tio.Compose``), plus any model-side space-filling-curve
   reordering (Hilbert / Morton / snake / zigzag / raster) read off the
@@ -36,6 +36,8 @@ _NORMALIZATION_FIELDS = (
     "enable_kspace_normalization",
     "kspace_percentile",
     "kspace_scale_domain",
+    "kspace_scale_reference",
+    "image_domain_crop_or_pad",
     "enable_log_scaling",
     "log_scaling_center_fraction",
     "normalization_type",
@@ -45,6 +47,41 @@ _NORMALIZATION_FIELDS = (
     "rescale_range",
     "rescale_percentiles",
 )
+
+#: ``config.undersampling`` fields that decide whether ``input_prepared`` should
+#: look undersampled, the question the snapshot contract sends a reader here to
+#: answer.
+_UNDERSAMPLING_FIELDS = (
+    "base_acceleration",
+    "max_acceleration",
+    # The step schedule indexes acceleration_range; base/max alone misstate the ladder.
+    "acceleration_range",
+    "acceleration_schedule",
+    "schedule_type",
+    "schedule_steps",
+    "enforce_nested",
+    "min_center_fraction",
+    "acceleration_type",
+    "undersampling_pattern",
+    "mask_direction",
+    "center_fraction",
+    "enable_dynamic_mask",
+    "mask_seed",
+    "train_identity_rung",
+)
+
+#: Undersampling fields that name a mask family. The loader's
+#: ``PhysicsInformedMasking`` reads neither, so a schema default here described
+#: a mask nobody built; unless the YAML set one, it is stamped
+#: :data:`NOT_DECLARED` and the applied pattern comes from the transform (#2508).
+_MASK_FAMILY_FIELDS = ("acceleration_type", "undersampling_pattern")
+
+#: Marker for a field the config left at its schema default.
+NOT_DECLARED = "<not declared: schema default, not stated by the config>"
+
+#: Marker for a batch that carries no realised acceleration. It does not mean
+#: "unmasked": strategy-side and non-Cartesian masking do not record it either.
+REALISED_NOT_RECORDED = "<not recorded by the loader transform>"
 
 #: ``config.data`` fields describing how input and target were *constructed*.
 #: ``target_mode`` produced the original report: a ``phase_aligned_mean`` target
@@ -65,8 +102,36 @@ _CONSTRUCTION_FIELDS = (
     # different constructions -- the committed matrix is scoped to one M4Raw
     # study series -- and nothing else stamped would tell them apart.
     "r2r_covariance_source",
+    # nullspace_r2r-only: tau = tan(angle), and the whitener whose shape decides
+    # whether the halves are uncorrelated. No other stamped field separates two
+    # runs that differ only here.
+    "r2r_split_angle_deg",
+    "r2r_whitening",
+    # Whether validation batches also carry `input_alt`, a second repetition;
+    # every metric computed from it exists only when this is true.
+    "emit_alternate_input",
+    # Whether the training split served a target at all, or a repetition stack
+    # the Noise2Noise strategy paired from, and which pairing.
+    "n2n_pairing",
+    # Where the coil maps came from (precomputed files, or the loader's estimate
+    # on a miss), which repetitions and ACS width made them, and which columns the per-scan Sigma_n was fitted on: each
+    # changes the split, the whitener or the metrics that read the maps.
+    "coil_maps_root",
+    "coil_maps_missing",
+    "coil_maps_recipe",
+    "coil_maps_acs_size",
+    "noise_fit_support_policy",
+    "noise_covariance_root",
+    "noise_covariance_missing",
     "nex_target_exclude_input",
     "nex_fallback",
+    # Whether the repetitions were translated onto the input before averaging.
+    "nex_registration",
+    "nex_shift_root",
+    "nex_shifts_missing",
+    # Which repetition the TRAINING input is; the validation split serves
+    # repetition 0 whatever this says, so a validation snapshot shows rep 0.
+    "input_repetition",
     # One record per slice (depth-1 subjects, one slice read per repetition)
     # or one per group (#1757): the record must say which index built the
     # sample it shows.
@@ -163,6 +228,40 @@ def _read_block(
     return out
 
 
+#: ``validation.selection`` knobs that change which checkpoint a run selects.
+_SELECTION_FIELDS: tuple[str, ...] = (
+    "rule",
+    "fabrication_max",
+    "nse_hall_max",
+    "power_ratio_max",
+    "penalty",
+)
+
+
+def _scoring(config: Any) -> dict[str, Any] | None:
+    """``validation.scoring`` knobs that change what a validation number is.
+
+    ``recorrupted_inference`` replaces the model by its Monte-Carlo mean and
+    ``coil_manifold_projection`` grades the projected output; two runs differing
+    only there report different estimators under the same metric names.
+    ``measurement_maps`` decides whether the ``_measmaps`` family was declared.
+    """
+    scoring = getattr(getattr(config, "validation", None), "scoring", None)
+    if scoring is None or _is_mock(scoring):
+        return None
+    out: dict[str, Any] = {}
+    projection = getattr(scoring, "coil_manifold_projection", None)
+    if isinstance(projection, bool):
+        out["coil_manifold_projection"] = projection
+    measurement_maps = getattr(scoring, "measurement_maps", None)
+    if isinstance(measurement_maps, str):
+        out["measurement_maps"] = measurement_maps
+    recorrupted = getattr(scoring, "recorrupted_inference", None)
+    dump = getattr(recorrupted, "model_dump", None)
+    out["recorrupted_inference"] = _scalarize(dump()) if callable(dump) else None
+    return out
+
+
 def _declared(config: Any, incomplete: list[str]) -> dict[str, Any]:
     """The half of the record that comes from the config SSOT."""
     data = getattr(config, "data", None)
@@ -182,6 +281,33 @@ def _declared(config: Any, incomplete: list[str]) -> dict[str, Any]:
         enabled = _scalarize(getattr(augmentation, "enabled", None))
         if enabled is not None:
             declared["augmentation_enabled"] = enabled
+    scoring = _scoring(config)
+    if scoring is not None:
+        declared["validation_scoring"] = scoring
+    selection = getattr(getattr(config, "validation", None), "selection", None)
+    if selection is not None and not _is_mock(selection):
+        declared["validation_selection"] = _read_block(
+            selection, _SELECTION_FIELDS, incomplete, label="validation.selection."
+        )
+    # The phase-encode axis and acquired-line count a line mask resolves
+    # through (#2160); null is the declaration "not stated".
+    acquisition = getattr(data, "acquisition", None)
+    declared["acquisition"] = (
+        acquisition.model_dump() if hasattr(acquisition, "model_dump") else None
+    )
+    # An absent block is itself the declaration "no acceleration", so it is
+    # recorded as null rather than omitted.
+    undersampling = getattr(config, "undersampling", None)
+    if undersampling is None:
+        declared["undersampling"] = None
+        return declared
+    block = _read_block(undersampling, _UNDERSAMPLING_FIELDS, incomplete, label="undersampling.")
+    fields_set = getattr(undersampling, "model_fields_set", None)
+    if isinstance(fields_set, (set, frozenset)):
+        for name in _MASK_FAMILY_FIELDS:
+            if name in block and name not in fields_set:
+                block[name] = NOT_DECLARED
+    declared["undersampling"] = block
     return declared
 
 
@@ -255,6 +381,11 @@ def _flatten_transforms(transform: Any, out: list[dict[str, Any]], depth: int) -
     params = _transform_params(transform)
     if params:
         record["params"] = params
+    # Behaviour a transform states beyond its arguments, such as the mask pattern
+    # PhysicsInformedMasking applies regardless of the config's pattern fields.
+    applied_record = getattr(transform, "applied_record", None)
+    if callable(applied_record) and not _is_mock(transform):
+        record["applied"] = _scalarize(applied_record())
     out.append(record)
 
 
@@ -402,12 +533,93 @@ def _timestep_floor(config: Any, model: Any, incomplete: list[str]) -> dict[str,
     }
 
 
+def _line_axis_gate(model: Any) -> dict[str, Any] | None:
+    """The k-space process's first-batch line-axis verdicts, per split (#2160).
+
+    The applied half of ``declared.acquisition``: whether the mask's line axis
+    matched the data's never-acquired lines (``agree``), or the data could not
+    say (``inconclusive``). None on an arm with no k-space process.
+    """
+    if model is None or _is_mock(model):
+        return None
+    process = getattr(unwrap_model(model), "kspace_process", None)
+    gate = getattr(process, "line_axis_gate", None)
+    if not isinstance(gate, dict):
+        return None
+    return {split: {k: _scalarize(v) for k, v in rec.items()} for split, rec in gate.items()}
+
+
+def mask_scope(config: Any, model: Any) -> dict[str, Any] | None:
+    """``enforce_nested`` and ``mask_seed`` as declared, beside the masks each governed (#1240).
+
+    An arm declaring both reads as if they shaped training; under
+    ``enable_dynamic_mask`` they shape only the fixed cascade. None on an arm with
+    no k-space process.
+    """
+    if model is None or _is_mock(model):
+        return None
+    process = getattr(unwrap_model(model), "kspace_process", None)
+    scope = getattr(process, "mask_scope", None)
+    if not callable(scope):
+        return None
+    record = scope()
+    accel = getattr(config, "undersampling", None)
+    for knob in ("enforce_nested", "mask_seed"):
+        record[knob] = {"declared": _scalarize(getattr(accel, knob, None)), **record[knob]}
+    return record
+
+
+def forward_noise_scope(model: Any) -> dict[str, Any] | None:
+    """``forward_noise_sigma`` and its schedule as declared, beside ``mask_scope``; None off k-space arms."""
+    if model is None or _is_mock(model):
+        return None
+    process = getattr(unwrap_model(model), "kspace_process", None)
+    record = getattr(process, "forward_noise_record", None)
+    if not callable(record):
+        return None
+    return record()
+
+
+def realised_acceleration(batch: Any) -> float | str:
+    """The realised factor the loader's mask stamped on ``batch``.
+
+    ``N / sampled lines`` for a line mask; ``complementary_rep_masking`` stamps
+    supported bins over sampled bins, which is the same ratio for its 1-D lines
+    and the definition of R for its 2-D patterns.
+
+    Read off the batch rather than off the transform object, because with
+    loader workers the main process's copy of the transform never builds a mask
+    (#2382). Called only once a snapshot is going to be written, so the host
+    read below is off the per-step path. A batch mixing line counts yields the
+    distinct factors joined into one string, which the snapshot's scalar
+    ``extra`` can carry.
+    """
+    from spectramr.data.transforms.tio_physics import REALISED_ACCELERATION_KEY
+
+    if isinstance(batch, dict):
+        value = batch.get(REALISED_ACCELERATION_KEY)
+    else:
+        metadata = getattr(batch, "metadata", None)
+        value = metadata.get(REALISED_ACCELERATION_KEY) if isinstance(metadata, dict) else None
+    if value is None:
+        return REALISED_NOT_RECORDED
+    values = value.tolist() if hasattr(value, "tolist") else value
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    distinct = sorted({round(float(v), 3) for v in values})
+    if len(distinct) == 1:
+        return distinct[0]
+    return ", ".join(f"{v:.3f}" for v in distinct)
+
+
 def build_snapshot_provenance(
     config: Any,
     *,
     dataset: Any | None = None,
     model: Any | None = None,
     source: str = "train",
+    mask_generator: Any | None = None,
+    mask_pattern: str | None = None,
 ) -> dict[str, Any]:
     """Record what was done to the data, as declared and as applied.
 
@@ -419,11 +631,17 @@ def build_snapshot_provenance(
         source: Which split the batch came from (``"train"`` / ``"val"``), so a
             val-tagged snapshot cannot silently claim train augmentation --
             they are built by *different* Compose objects.
+        mask_generator: The strategy's ``KSpaceMaskGenerator``, recorded as
+            ``applied.mask_generator``: on strategy-masked arms it resolves the
+            mask family, which the config's pattern fields do not name.
+        mask_pattern: The pattern the strategy passes on each mask call;
+            ``None`` when it relies on the generator's default.
 
     Returns:
         A JSON-serialisable dict with ``source``, ``declared``, ``applied``,
         ``model_input_linearization`` and ``incomplete``, plus
-        ``timestep_floor`` on diffusion arms. Never raises.
+        ``timestep_floor``, ``line_axis_gate`` and ``mask_scope`` on k-space
+        diffusion arms. Never raises.
     """
     incomplete: list[str] = []
     try:
@@ -433,9 +651,24 @@ def build_snapshot_provenance(
             "applied": _applied(dataset, incomplete),
             "model_input_linearization": _linearization(model, incomplete),
         }
+        reader = getattr(mask_generator, "applied_record", None)
+        if callable(reader) and not _is_mock(mask_generator):
+            try:
+                record["applied"]["mask_generator"] = _scalarize(reader(mask_pattern))
+            except Exception as exc:  # a provenance probe must never kill a run
+                incomplete.append(f"mask generator record failed: {exc}")
         floor = _timestep_floor(config, model, incomplete)
         if floor is not None:
             record["timestep_floor"] = floor
+        gate = _line_axis_gate(model)
+        if gate is not None:
+            record["line_axis_gate"] = gate
+        scope = mask_scope(config, model)
+        if scope is not None:
+            record["mask_scope"] = scope
+        noise = forward_noise_scope(model)
+        if noise is not None:
+            record["forward_noise"] = noise
     except Exception as exc:
         logger.debug("snapshot provenance build failed: %s", exc)
         return {"source": source, "error": f"{type(exc).__name__}: {exc}"}
@@ -562,7 +795,10 @@ def run_identity() -> dict[str, Any]:
 __all__ = [
     "IDENTITY_FALLBACK",
     "IDENTITY_FROM_RUN",
+    "NOT_DECLARED",
+    "REALISED_NOT_RECORDED",
     "build_snapshot_provenance",
+    "realised_acceleration",
     "reset_run_identity",
     "run_identity",
     "set_run_identity",

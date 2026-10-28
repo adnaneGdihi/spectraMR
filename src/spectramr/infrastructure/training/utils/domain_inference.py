@@ -18,7 +18,7 @@ See docs/DOMAIN_HANDLING_RULES.md, Rule 2.
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -254,12 +254,34 @@ def _registry_output_domain(model_type: str) -> str | None:
     return None
 
 
+class OutputDomainDecision(NamedTuple):
+    """An output domain together with the cascade tier that decided it."""
+
+    domain: Literal["image", "kspace"]
+    tier: int
+
+    @property
+    def declared(self) -> bool:
+        """Whether a declaration (tiers 1-3) decided, rather than a table or a heuristic."""
+        return self.tier <= _LAST_DECLARED_TIER
+
+
+#: Tiers 1-3 are statements the model or the arm makes about itself; 4-7 are guesses.
+_LAST_DECLARED_TIER = 3
+
+
 def infer_output_domain(
     config: Any,
 ) -> Literal["image", "kspace"]:
-    """Determine the output domain of the generator using a priority cascade.
+    """The generator's output domain; see :func:`resolve_output_domain` for the cascade."""
+    return resolve_output_domain(config).domain
 
-    This is the SINGLE authoritative function for domain inference.
+
+def resolve_output_domain(config: Any) -> OutputDomainDecision:
+    """Determine the output domain of the generator, and the tier that decided it.
+
+    This is the SINGLE authoritative cascade for domain inference;
+    :func:`infer_output_domain` returns its ``domain`` alone.
     All image logging, metric computation, and visualization code should
     call this instead of implementing ad-hoc heuristics.
 
@@ -289,7 +311,7 @@ def infer_output_domain(
         config: TrainingSettings or any object with model/data/physics attributes.
 
     Returns:
-        "image" or "kspace" indicating the generator's output domain.
+        The domain and the 1-based cascade tier that produced it.
     """
     model_cfg = _get_attr_safe(config, "model")
     data_cfg = _get_attr_safe(config, "data")
@@ -300,7 +322,7 @@ def infer_output_domain(
     if target_domain is not None and str(target_domain).lower() in ("image", "kspace"):
         result = str(target_domain).lower()
         logger.debug("[DomainInference] P1 explicit target_domain='%s'", result)
-        return result  # type: ignore[return-value]
+        return OutputDomainDecision(result, 1)  # type: ignore[arg-type]
 
     # ── Priority 2: ``@register_model`` decorator metadata (SSOT) ──
     model_type = _get_attr_safe(model_cfg, "model_type", "")
@@ -313,7 +335,7 @@ def infer_output_domain(
                 model_type,
                 registry_domain,
             )
-            return registry_domain  # type: ignore[return-value]
+            return OutputDomainDecision(registry_domain, 2)  # type: ignore[arg-type]
 
     # ── Priority 3: Data output_domain declaration ──
     #
@@ -336,7 +358,7 @@ def infer_output_domain(
     ):
         result = str(data_output_domain).lower()
         logger.debug("[DomainInference] P3 data.domain.output='%s'", result)
-        return result  # type: ignore[return-value]
+        return OutputDomainDecision(result, 3)  # type: ignore[arg-type]
 
     # ── Priority 4: Hardcoded model-type sets (legacy fallback) ──
     #
@@ -356,13 +378,13 @@ def infer_output_domain(
                 "[DomainInference] P4 model_type='%s' → kspace (legacy set)",
                 model_type,
             )
-            return "kspace"
+            return OutputDomainDecision("kspace", 4)
         if model_type_lower in KNOWN_IMAGE_OUTPUT_MODELS:
             logger.debug(
                 "[DomainInference] P4 model_type='%s' → image (legacy set)",
                 model_type,
             )
-            return "image"
+            return OutputDomainDecision("image", 4)
 
     # ── Priority 5: Physics config heuristic ──
     if physics_cfg is not None:
@@ -373,7 +395,7 @@ def infer_output_domain(
                 logger.debug(
                     "[DomainInference] P5 physics.kspace.enable_kspace_recon=True → kspace"
                 )
-                return "kspace"
+                return OutputDomainDecision("kspace", 5)
 
     # ── Priority 6: Data pipeline heuristic ──
     # If dataset is k-space, the model likely outputs k-space too.
@@ -400,18 +422,18 @@ def infer_output_domain(
             dataset_type,
             coil_processing_mode or "none",
         )
-        return "kspace"
+        return OutputDomainDecision("kspace", 6)
 
     if coil_processing_mode in IMAGE_DOMAIN_COIL_MODES:
         logger.debug(
             "[DomainInference] P6 coil_processing_mode='%s' forces image",
             coil_processing_mode,
         )
-        return "image"
+        return OutputDomainDecision("image", 6)
 
     # ── Priority 7: Default fallback ──
     logger.debug("[DomainInference] P7 default → image")
-    return "image"
+    return OutputDomainDecision("image", 7)
 
 
 def loader_serves_kspace(config: Any) -> bool:
@@ -426,6 +448,10 @@ def loader_serves_kspace(config: Any) -> bool:
     ``coil_processing_mode`` in ``rss_image`` / ``magnitude`` wins over
     ``dataset_type: kspace``: those modes IFFT inside the dataset's TorchIO chain,
     so the tensor that reaches the model is already an image.
+
+    A declared ``data.domain.output: kspace`` counts on its own, because the dataset
+    obeys it (``dataset_instantiator`` passes it as ``output_domain``): an m4raw arm
+    with k-space normalisation off otherwise reads as image while receiving k-space.
 
     Args:
         config: the resolved training config.
@@ -445,8 +471,9 @@ def loader_serves_kspace(config: Any) -> bool:
     coil_processing_mode = str(
         _data_leaf(data_cfg, "coils", "processing_mode", "coil_processing_mode", "") or ""
     ).lower()
+    declares_kspace = str(_get_declared_path(data_cfg, "domain.output") or "").lower() == "kspace"
     return (
-        dataset_type in ("kspace", "kspace_paired") or bool(normalize_kspace)
+        dataset_type in ("kspace", "kspace_paired") or bool(normalize_kspace) or declares_kspace
     ) and coil_processing_mode not in IMAGE_DOMAIN_COIL_MODES
 
 
@@ -646,10 +673,12 @@ def metric_transform_produced_image(before: Any, after: Any) -> bool:
 __all__ = [
     "KNOWN_IMAGE_OUTPUT_MODELS",
     "KNOWN_KSPACE_OUTPUT_MODELS",
+    "OutputDomainDecision",
     "infer_output_domain",
     "loader_serves_kspace",
     "looks_like_kspace",
     "metric_transform_produced_image",
     "needs_ifft_for_visualization",
     "needs_kspace_to_image_bridge",
+    "resolve_output_domain",
 ]

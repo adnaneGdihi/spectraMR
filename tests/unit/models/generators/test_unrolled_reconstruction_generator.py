@@ -86,7 +86,98 @@ class TestVariationalNetworkOutputActivation:
 
     @pytest.mark.parametrize("value", ["swish", "identity", "leaky_relu"])
     def test_unknown_output_activation_raises(self, value):
-        with pytest.raises(
-            ValueError, match="'none', 'tanh', 'sigmoid', 'relu'"
-        ):
+        with pytest.raises(ValueError, match="'none', 'tanh', 'sigmoid', 'relu'"):
             self._build(value)
+
+
+class TestTheUnrolledModelCanRunDataConsistency:
+    """#2327 blocker 2: DC returned complex, assumed unbatched maps, ignored num_coils."""
+
+    @staticmethod
+    def _inputs(batch: int = 2, coils: int = 4, size: int = 16):
+        import torch
+
+        torch.manual_seed(0)
+        maps = torch.randn(batch, coils, size, size, dtype=torch.complex64)
+        maps = maps / maps.abs().pow(2).sum(1, keepdim=True).sqrt()
+        mask = torch.zeros(batch, 1, size, size)
+        mask[..., ::2, :] = 1.0
+        kspace = torch.randn(batch, coils, size, size, dtype=torch.complex64) * mask
+        return torch.randn(batch, 2, size, size), kspace, mask, maps
+
+    def test_a_multicoil_forward_runs_and_stays_real_interleaved(self) -> None:
+        model = UnrolledReconstructionGenerator(
+            in_channels=2,
+            out_channels=2,
+            img_size=(16, 16),
+            num_unrolls=2,
+            features=8,
+            num_coils=4,
+            output_activation="none",
+        )
+        x, kspace, mask, maps = self._inputs()
+        out = model(x, kspace_measured=kspace, mask=mask, sensitivity_maps=maps)
+        assert out.shape == (2, 2, 16, 16) and not out.is_complex()
+
+    def test_a_coil_count_the_model_was_not_built_for_raises(self) -> None:
+        model = UnrolledReconstructionGenerator(
+            in_channels=2, out_channels=2, img_size=(16, 16), num_unrolls=1, features=8, num_coils=1
+        )
+        x, kspace, mask, maps = self._inputs()
+        with pytest.raises(ValueError, match="num_coils=1"):
+            model(x, kspace_measured=kspace, mask=mask, sensitivity_maps=maps)
+
+    def test_multicoil_dc_without_maps_raises(self) -> None:
+        model = UnrolledReconstructionGenerator(
+            in_channels=2, out_channels=2, img_size=(16, 16), num_unrolls=1, features=8, num_coils=4
+        )
+        x, kspace, mask, _ = self._inputs()
+        with pytest.raises(ValueError, match="needs sensitivity_maps"):
+            model(x, kspace_measured=kspace, mask=mask)
+
+    @pytest.mark.parametrize("missing", ["kspace_measured", "mask"])
+    def test_a_half_supplied_dc_pair_raises(self, missing) -> None:
+        model = UnrolledReconstructionGenerator(
+            in_channels=2, out_channels=2, img_size=(16, 16), num_unrolls=1, features=8, num_coils=4
+        )
+        x, kspace, mask, maps = self._inputs()
+        given = {"kspace_measured": kspace, "mask": mask}
+        given.pop(missing)
+        with pytest.raises(ValueError, match="needs both kspace_measured and mask"):
+            model(x, sensitivity_maps=maps, **given)
+
+    def test_image_only_forward_still_runs(self) -> None:
+        model = UnrolledReconstructionGenerator(
+            in_channels=2, out_channels=2, img_size=(16, 16), num_unrolls=1, features=8, num_coils=1
+        )
+        out = model(self._inputs()[0])
+        assert out.shape == (2, 2, 16, 16)
+
+    @pytest.mark.parametrize(("name", "expected"), [("tanh", nn.Tanh), ("none", nn.Identity)])
+    def test_the_output_activation_is_declared(self, name, expected) -> None:
+        model = UnrolledReconstructionGenerator(num_unrolls=1, features=8, output_activation=name)
+        assert isinstance(model.output_activation, expected)
+
+    def test_the_default_keeps_what_every_existing_arm_ran(self) -> None:
+        assert isinstance(UnrolledReconstructionGenerator(num_unrolls=1).output_activation, nn.Tanh)
+
+    def test_an_unknown_output_activation_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown output_activation"):
+            UnrolledReconstructionGenerator(num_unrolls=1, output_activation="softplus")
+
+
+def test_varnet_does_not_turn_a_nan_input_into_zeros() -> None:
+    import torch
+
+    from spectramr.models.generators.unrolled_reconstruction_generator import (
+        VariationalNetworkGenerator,
+    )
+
+    model = VariationalNetworkGenerator(
+        in_channels=2, out_channels=2, img_size=(16, 16), num_stages=1, features=8
+    ).eval()
+    x = torch.randn(1, 2, 16, 16)
+    x[0, 0, 0, 0] = float("nan")
+    with torch.no_grad():
+        out = model(x)
+    assert torch.isnan(out).any()

@@ -5,14 +5,14 @@ Provides a base class for loss functions to standardize
 input validation and reduction operations.
 """
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from torch import Tensor, nn
 
 
 @runtime_checkable
 class IComputableLoss(Protocol):
-    """Protocol for loss functions.
+    r"""Protocol for loss functions.
 
     All loss functions should implement this interface to ensure consistent
     behavior across the framework. The forward method must return a dict
@@ -26,9 +26,9 @@ class IComputableLoss(Protocol):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{IComputableLoss} = \text{abstract}"""
+        \mathcal{L}_{IComputableLoss} = \text{abstract}"""
 
-    def forward(self, pred: Tensor, target: Tensor, **context) -> dict[str, Tensor]:
+    def forward(self, pred: Tensor, target: Tensor, **context: Any) -> dict[str, Tensor]:
         """
         Compute the loss.
 
@@ -44,7 +44,7 @@ class IComputableLoss(Protocol):
 
 
 class BaseLoss(nn.Module):
-    """Base class for loss functions with common validation and reduction logic.
+    r"""Base class for loss functions with common validation and reduction logic.
 
     This class provides a standardized structure for loss functions, handling
     common boilerplate such as input tensor validation (shape, device) and
@@ -58,7 +58,7 @@ class BaseLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{BaseLoss} = \text{abstract}"""
+        \mathcal{L}_{BaseLoss} = \text{abstract}"""
 
     def __init__(self, reduction: str = "mean"):
         """Initialize the BaseLoss.

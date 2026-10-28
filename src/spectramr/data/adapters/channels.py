@@ -28,16 +28,8 @@ from spectramr.data.adapters.registry import register_adapter
     # ``[CoilAdapter]`` block in ``BaseTrainingStrategy.train_step`` and
     # the change discipline note in ``docs/losses_reference.rst``.
     #
-    # ``pre_loss_pred`` added 2026-05-15 (audit E18): the RSS reduction
-    # is a side-effect-free squashing of arbitrary-channel real tensors
-    # to single-channel magnitude — equally valid at any prediction
-    # hook (model output side AND target side), and several YAMLs
-    # declare it under ``adapters.pre_loss_pred``. Rejecting the hook
-    # was a configuration-side correctness blocker, not a contract
-    # invariant.
     insertion_points=(
         "pre_model",
-        "pre_loss_pred",
         "pre_loss_target",
         "pre_metric",
     ),
@@ -71,7 +63,7 @@ class RSSCoilsToMagnitude(nn.Module):
     # it under ``adapters.pre_model`` (eval_c7, exp_c4/c6, exp_p1/p2/p7);
     # rejecting the hook was a configuration-side blocker, not a contract
     # invariant. Phase loss is the documented ``discards_phase`` side-effect.
-    insertion_points=("pre_model", "pre_loss_pred", "pre_loss_target", "pre_metric"),
+    insertion_points=("pre_model", "pre_loss_target", "pre_metric"),
     invertible=False,
     side_effects=("discards_phase",),
 )
@@ -137,7 +129,7 @@ class RealImagInterleaveToComplex(nn.Module):
     # ``complex_to_real_imag_interleave`` chain can bridge a k-space
     # dataset to an image-domain model that wants 2-channel real input
     # (e.g. ``graph_unet`` consuming spiral k-space samples).
-    insertion_points=("pre_model", "post_model", "pre_loss_pred"),
+    insertion_points=("pre_model", "post_model"),
     invertible=True,
     side_effects=(),
 )

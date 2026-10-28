@@ -240,15 +240,14 @@ class DomainAdaptedCritic:
         for a whole run. The strategy decides whether to send a payload at all
         (``_critic_conditioning``); this wrapper only refuses to lose it.
         """
-        return self.critic(
-            to_critic_input(
-                x,
-                from_domain=self.from_domain,
-                to_domain=self.to_domain,
-                takes_complex=self.takes_complex,
-            ),
-            **cond,
+        critic_input = to_critic_input(
+            x,
+            from_domain=self.from_domain,
+            to_domain=self.to_domain,
+            takes_complex=self.takes_complex,
         )
+        scores: torch.Tensor = self.critic(critic_input, **cond)
+        return scores
 
 
 def critic_component_name(config: Any) -> str | None:
@@ -290,7 +289,7 @@ def critic_component_name(config: Any) -> str | None:
     component = model.discriminator_component if model is not None else None
     if component is None or not component.name:
         return None
-    return component.name
+    return str(component.name)
 
 
 def critic_accepts_complex(config: Any) -> bool:

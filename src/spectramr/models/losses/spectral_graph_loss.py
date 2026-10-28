@@ -1,5 +1,8 @@
+from typing import Any
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spectramr.models.losses.registry import register_loss
 
@@ -24,69 +27,47 @@ class SpectralGraphLoss(nn.Module):
     row-wise (directed / not symmetrised), which is still a valid non-negative
     Dirichlet energy since ``||x_i - x_j||²`` is symmetric."""
 
-    def __init__(self, k=8, patch_size=None, lambda_val=1.0):
+    def __init__(self, k: int = 8, patch_size: int | None = None, lambda_val: float = 1.0) -> None:
         """__init__.
 
         Args:
-            k (Any): Description.
-            patch_size (Any): Description.
-            lambda_val (Any): Description.
+            k: Neighbours per node in the k-NN graph.
+            patch_size: Side of the non-overlapping patches used as nodes; ``None``
+                makes every pixel a node.
+            lambda_val: Multiplier on the Dirichlet energy.
         """
         super().__init__()
         self.k = k
         self.patch_size = patch_size
         self.lambda_val = lambda_val
 
-    def knn_graph(self, x, k):
-        # x: [B, N, D]
-        # dist = (x_i - x_j)^2
-        """knn_graph.
+    def knn_graph(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        """Indices ``[B, N, k]`` of each node's ``k`` nearest neighbours (self excluded).
 
         Args:
-            x (Any): Description.
-            k (Any): Description.
-        Returns:
-            Any: Description.
+            x: Node features ``[B, N, D]``.
+            k: Neighbours per node.
         """
         dist = torch.cdist(x, x, p=2)
         _, indices = torch.topk(dist, k=k + 1, largest=False)
         return indices[:, :, 1:]  # [B, N, k]
 
-    def forward(self, pred, target=None):
-        # pred: [B, C, H, W] or [B, N, C]
-        # We compute graph on patches or pixels?
-        # User blueprint says "Construct the graph in k-space patches" for the model.
-        # For loss, we can do the same.
-
-        """forward.
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor | None = None, **kwargs: Any
+    ) -> torch.Tensor:
+        """Dirichlet energy of ``pred`` on its own k-NN graph.
 
         Args:
-            pred (Any): Description.
-            target (Any): Description.
-        Returns:
-            Any: Description.
-
-        forward method for SpectralGraphLoss.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            pred (torch.Tensor, shape (B, C, H, W) [inferred]): Expected input tensor.
-            target (torch.Tensor, shape (B, C, H, W) [inferred]): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor with shape matching the operation.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+            pred: ``[B, C, H, W]`` (pixels or patches become nodes) or ``[B, N, C]``
+                node features.
+            target: Unused; the energy is a regulariser on the prediction alone.
+        """
         if pred.dim() == 4:
             B, C, H, W = pred.shape
             if self.patch_size:
                 p = self.patch_size
                 # Ensure H, W are divisible by p
                 if H % p != 0 or W % p != 0:
-                    import torch.nn.functional as F
-
                     new_h = ((H + p - 1) // p) * p
                     new_w = ((W + p - 1) // p) * p
                     pred = F.interpolate(
@@ -102,7 +83,7 @@ class SpectralGraphLoss(nn.Module):
                 )  # [B, N, D]
             else:
                 # Flatten spatial dims
-                x_flat = pred.view(B, C, -1).permute(0, 2, 1)  # [B, N, C]
+                x_flat = pred.reshape(B, C, -1).permute(0, 2, 1)  # [B, N, C]
         else:
             # Already node features
             B, N, C = pred.shape
@@ -127,7 +108,7 @@ class SpectralGraphLoss(nn.Module):
             dirichlet_energy = val[:, :, 1:].sum() / B
         else:
             # Memory-efficient path for large graphs
-            total_energy = 0.0
+            total_energy = x.new_zeros(())
             block_size = 1024
             for i in range(0, N, block_size):
                 end_i = min(i + block_size, N)

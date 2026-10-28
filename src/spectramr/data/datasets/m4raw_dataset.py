@@ -40,7 +40,10 @@ count, every epoch. With the knob on, :mod:`.m4raw_slice_records` expands each
 group into one record per slice from a header-only shape read, ``__len__`` is
 the slice count, and ``_load_item`` reads ``f["kspace"][slice]`` for every
 repetition of that record, so the subject it yields has depth 1. The NEX
-average is per slice already, so the target path is unchanged. The queue is
+average is per slice already, so the target path is unchanged. A self-calibrated
+``Sigma_n`` stays a property of the scan: a record reads the input repetition's
+central slices (:func:`sigma_fit_window`) to fit it, never its own slice. The
+k-space scale does follow the record, so it is per slice. The queue is
 not bypassed: ``samples_per_volume: 1`` with a depth-1 patch serves every slice
 exactly once per epoch (see the module docstring of ``m4raw_slice_records`` for
 why any other value double-samples).
@@ -54,7 +57,7 @@ when ``data.use_repetitions: true`` is set in the training config.
 import contextlib
 import logging
 import pickle
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -64,12 +67,31 @@ import torch
 import torchio as tio
 from torch.utils.data import Dataset
 
+from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
+from spectramr.data.datasets.h5_handle_cache import open_h5
+from spectramr.data.datasets.m4raw_coil_map_recipe import DEFAULT_RECIPE
 from spectramr.data.datasets.m4raw_identity import (
     parse_m4raw_file_id,
     repetition_group_key,
 )
+from spectramr.data.datasets.m4raw_input_repetition import (
+    InputRepetitionDraw,
+    validate_input_repetition,
+)
+from spectramr.data.datasets.m4raw_nex_shift_store import NexShiftStore
+from spectramr.data.datasets.m4raw_noise_covariance_store import NoiseCovarianceStore
+from spectramr.data.datasets.m4raw_registration import (
+    VALID_NEX_REGISTRATIONS,
+    group_shifts,
+    registration_window,
+    shift_kspace,
+)
 from spectramr.data.datasets.m4raw_slice_records import expand_to_slice_records, retry_step
 from spectramr.data.io_strategies import read_h5_kspace
+from spectramr.data.transforms.normalization import (
+    MEASURED_INPUT_KEY,
+    consumes_measured_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +163,14 @@ M4RAW_REPETITIONS_BY_CONTRAST: dict[str, int] = {
 # worker safety.
 _VALID_COIL_MODES: frozenset[str] = frozenset({"none", "rss", "svd", "flatten"})
 
+#: How the cross-contrast route hands the source contrast to the model.
+#: ``stacked`` concatenates it onto the target along the channel axis;
+#: ``separate`` serves the target alone and the source as ``kspace_source``,
+#: so nothing downstream can degrade, overwrite or score the source (#2452).
+#: ``target_only`` serves the same target and drops the source: the no-prior
+#: control, on exactly the treated arm's pairs, targets and normalization.
+VALID_SOURCE_LAYOUTS: frozenset[str] = frozenset({"stacked", "separate", "target_only"})
+
 # Recognized but NOT acted on by this path: only ``rss`` is applied downstream
 # (``__getitem__``), so ``svd`` would silently pass raw multi-coil k-space through
 # uncompressed (facade, CLAUDE.md pitfall #16 / #15b). SVD virtual-coil
@@ -154,13 +184,45 @@ _UNIMPLEMENTED_COIL_MODES: frozenset[str] = frozenset({"svd"})
 # signal (SNR below a single rep). ``phase_aligned_mean`` corrects each rep's
 # global phase to rep0 first, recovering the coherent sqrt(N) gain.
 _VALID_TARGET_MODES: frozenset[str] = frozenset(
-    {"complex_mean", "phase_aligned_mean", "rep_pair", "r2r"}
+    {"complex_mean", "phase_aligned_mean", "rep_pair", "r2r", "nullspace_r2r"}
 )
+
+#: Modes that build BOTH halves from the input repetition, mapped to the method
+#: that builds them. They never average, never leave anything out, and are
+#: served on a one-repetition group; one set, so a guard written for r2r cannot
+#: silently miss its sibling.
+_SPLIT_METHODS: dict[str, str] = {"r2r": "_recorrupt_r2r", "nullspace_r2r": "_nullspace_split"}
+_SINGLE_REP_SPLIT_MODES: frozenset[str] = frozenset(_SPLIT_METHODS)
+
+#: How a Noise2Noise strategy forms its training target from the published
+#: repetition stack (``data.n2n_pairing``), and the training ``target_mode`` each
+#: one requires. ``ordered`` keeps a split mode's two halves in order, since at a
+#: split angle other than 45 degrees they carry different noise variances.
+N2N_PAIRINGS: dict[str, frozenset[str]] = {
+    "random_pair": frozenset({"rep_pair"}),
+    "one_vs_rest_mean": frozenset({"phase_aligned_mean"}),
+    "ordered": frozenset({"r2r", "nullspace_r2r"}),
+}
+
+#: The subject key holding the repetition stack: slot 0 is the served input,
+#: slots 1.. the repetitions (or the split's target half) a pairing draws from.
+REPETITION_STACK_KEY = "kspace_reps"
+
+#: Modes whose target is an average of repetitions; the only ones under which
+#: ``emit_alternate_input`` publishes a second repetition.
+_AVERAGING_TARGET_MODES: frozenset[str] = frozenset({"complex_mean", "phase_aligned_mean"})
 
 #: Where r2r draws its Sigma_n. 'committed' is the matrix measured on one M4Raw
 #: study series; 'self_calibrated' fits one per scan from its own coil null
 #: space, which needs no second repetition and so costs the arm no excitation.
 _VALID_R2R_COVARIANCE_SOURCES: frozenset[str] = frozenset({"committed", "self_calibrated"})
+
+#: Central slices the per-scan Sigma_n is fitted on. Sigma_n is a receive-chain
+#: property, one slice already offers ~65,000 null-space observations (~1%
+#: error), and ESPIRiT costs ~2.3 s per 256x256 slice in a one-thread loader
+#: worker -- 42 s for an 18-slice volume, paid per group per epoch because the
+#: Queue respawns its workers and their caches with them.
+_SIGMA_FIT_SLICES: int = 2
 #: ``rep_pair`` needs one input repetition and one other; the averaged modes need
 #: two others so leave-one-out still averages (``_MIN_REPS_FOR_LOO``).
 _MIN_REPS_FOR_REP_PAIR: int = 2
@@ -189,25 +251,107 @@ _MIN_REPS_FOR_LOO: int = 3
 #: all-reps average for those groups as a DECLARED choice and logs it once.
 _VALID_NEX_FALLBACKS: frozenset[str] = frozenset({"error", "all_reps"})
 
-#: Contrast on the *source* side of a federated pair. T1 by construction --
+#: Default contrast on the *source* side of a federated pair.
 #: :meth:`M4RawRepetitionDataset._build_federated_pairs` skips any patient
-#: without one and pairs that T1 against every other contrast. Declared here and
-#: stamped onto the record so :meth:`_index_stats` can attribute a file to a
-#: contrast by *reading* the record, rather than re-deriving it from the
-#: filename -- which would be a third copy of the ``stem.split("_")`` convention
-#: already spelled in ``_build_index`` and ``_build_federated_pairs``.
+#: without the source and pairs it against every other (or every declared)
+#: contrast. Stamped onto the record so :meth:`_index_stats` can attribute a
+#: file to a contrast by *reading* the record, rather than re-deriving it from
+#: the filename -- which would be a third copy of the ``stem.split("_")``
+#: convention already spelled in ``_build_index`` and ``_build_federated_pairs``.
 _FEDERATED_SOURCE_CONTRAST: str = "T1"
+
+#: Contrasts the M4Raw release ships; a pairing naming anything else is a typo.
+M4RAW_CONTRASTS: frozenset[str] = frozenset({"T1", "T2", "FLAIR"})
+
+
+def _phase_align(rep: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """``rep`` rotated by the global phase that best aligns it to ``ref``.
+
+    One phase per ``(slice, coil)`` plane: a repetition's receiver reference
+    phase is a per-acquisition scalar, which is what this removes.
+    """
+    dot = (rep * ref.conj()).sum(dim=(-2, -1), keepdim=True)
+    return rep * torch.exp(-1j * torch.angle(dot))
+
+
+def _pe_support(kspace: torch.Tensor) -> torch.Tensor:
+    """1-D bool over the phase-encode (last) axis: the columns that were acquired.
+
+    Derived from the DATA, not the header: M4Raw ships ~24 % of its phase-encode
+    columns as exact zeros (partial phase FOV), and its ``encodingLimits`` report
+    a COUNT where ISMRMRD specifies an INCLUSIVE maximum -- measured over all 52
+    files on this host, ``kspace_encoding_step_1/maximum`` equals the number of
+    sampled columns exactly (195 for T1/T2, 198 for FLAIR). Sampled columns always
+    carry noise, so a zero column-sum discriminates them exactly.
+    """
+    if kspace.dim() < 3:
+        raise ValueError(
+            f"[M4Raw] a split target needs at least (C, H, W) k-space, got "
+            f"{tuple(kspace.shape)}."
+        )
+    support = kspace.abs().sum(dim=tuple(range(kspace.dim() - 1))) > 0
+    if not bool(support.any()):
+        raise ValueError(
+            "[M4Raw] found no sampled phase-encode columns in this group (the whole "
+            "k-space is zero). Splitting it would train on noise alone."
+        )
+    return support
+
+
+def fit_scan_noise_covariance(
+    kspace: torch.Tensor, *, support_policy: str = "band"
+) -> tuple[torch.Tensor, int]:
+    """One repetition's ``Sigma_n`` in raw units, fitted from its own coil null space.
+
+    Fitted on the central :data:`_SIGMA_FIT_SLICES` slices over the acquired
+    columns (:func:`_pe_support`), corrected for the sampled phase-encode
+    fraction (:mod:`~spectramr.infrastructure.physics.scan_coil_calibration`).
+    The loader's per-scan fit and the predict path both call this, so a
+    deployed self-calibrated arm draws from the matrix it was validated with.
+
+    Returns:
+        ``(covariance, slices_fitted)``: ``(C, C)`` complex and the slice count.
+    """
+    from spectramr.infrastructure.physics.scan_coil_calibration import (
+        as_slice_batch,
+        fit_scan_covariance,
+    )
+
+    support = _pe_support(kspace)
+    slices = as_slice_batch(kspace)
+    window = sigma_fit_window(slices.shape[0])
+    central = slices[window.start : window.stop]
+    return fit_scan_covariance(central, support, support_policy=support_policy), int(
+        central.shape[0]
+    )
+
+
+def sigma_fit_window(num_slices: int) -> range:
+    """The slices of a ``num_slices`` volume that :func:`fit_scan_noise_covariance` fits on.
+
+    Owned here so the slice-level route reads the same central slices from disk
+    that the per-group route slices out of a loaded volume.
+    """
+    lo = max(0, (int(num_slices) - _SIGMA_FIT_SLICES) // 2)
+    return range(lo, min(int(num_slices), lo + _SIGMA_FIT_SLICES))
+
+
+def load_sigma_fit_slices(path: Path | str, num_slices: int) -> torch.Tensor:
+    """The :func:`sigma_fit_window` slices of ``path``, read one slice at a time.
+
+    The slice route's fit input; ``scripts/precompute_m4raw_noise_covariance.py``
+    reads through it too, so a stored ``Sigma_n`` is the fit the loader would run.
+    """
+    return torch.cat([_load_kspace(Path(path), s) for s in sigma_fit_window(num_slices)])
 
 
 def _average_reps(
     reps: list[torch.Tensor],
     mode: str,
     exclude_index: int | None = None,
-    anchor: torch.Tensor | None = None,
+    shifts: Sequence[tuple[float, float]] | None = None,
 ) -> torch.Tensor:
     """Combine complex k-space repetitions per :data:`_VALID_TARGET_MODES`.
-
-    Convention: ``.claude/rules/data.md`` §"M4Raw handling".
 
     Args:
         reps: The per-repetition complex k-space tensors.
@@ -218,31 +362,41 @@ def _average_reps(
             independent of the input's — otherwise input and target share the
             input rep's noise at amplitude ``1/N`` and the supervision is biased
             toward preserving that noise. ``None`` (default) averages all reps
-            (byte-identical to the legacy behaviour). Phase alignment, when
-            applicable, is always anchored to the FIRST retained rep so the
-            excluded rep never seeds the reference phase.
+            (byte-identical to the legacy behaviour).
+        shifts: When set, the ``(dy, dx)`` displacement in pixels of each of
+            ``reps`` in one common frame (:mod:`m4raw_registration`, #2849). Every
+            repetition is translated onto the anchor before its phase is aligned,
+            so subject motion between repetitions does not superpose shifted
+            images. ``None`` averages them as acquired.
+
+    Phase alignment is anchored to the excluded repetition when there is one,
+    else to ``reps[0]``: in both cases the input's frame. Anchoring to the first
+    *retained* repetition left the leave-one-out target at that repetition's
+    receiver phase (median 113 deg from the input on M4Raw, #1863), which a
+    phase-equivariant network cannot produce. The anchor contributes its frame,
+    not its noise, which is also how ``rep_pair`` aligns.
     """
     if mode not in _VALID_TARGET_MODES:
         raise ValueError(
             f"[M4Raw] Unknown target_mode: {mode!r}. Valid: {sorted(_VALID_TARGET_MODES)}"
         )
-    if mode == "r2r":
-        # R2R sets input AND target together from ONE repetition, so it cannot be
-        # expressed as "combine these repetitions into a target". It branches at
-        # the construction site instead. Reaching here means the branch was
-        # bypassed and the caller is about to get an average where it asked for a
-        # recorruption -- raise rather than return a plausible wrong tensor.
+    if mode in _SINGLE_REP_SPLIT_MODES:
+        # These set input AND target together from ONE repetition, so they cannot
+        # be expressed as "combine these repetitions into a target". Reaching here
+        # means the construction-site branch was bypassed and the caller is about
+        # to get an average where it asked for a split.
         raise ValueError(
-            "[M4Raw] target_mode='r2r' builds both halves from the input repetition "
+            f"[M4Raw] target_mode={mode!r} builds both halves from the input repetition "
             "and must be handled at the construction site, not by _average_reps."
         )
+    excluding = exclude_index is not None and 0 <= exclude_index < len(reps)
+    if shifts is not None:
+        reps = _register_to_anchor(reps, shifts, exclude_index if excluding else 0)
     if mode == "rep_pair":
         # Noise2Noise: the target is ONE other repetition, never an average, so
-        # its noise is independent of the input's. ``anchor`` is the input
-        # repetition; the pair is phase-aligned to it (a global inter-rep phase
-        # offset would otherwise be learned as a phase drift). ``exclude_index``
-        # is mandatory: a pair that may contain the input is the identity task.
-        if exclude_index is None or not 0 <= exclude_index < len(reps):
+        # its noise is independent of the input's. ``exclude_index`` is
+        # mandatory: a pair that may contain the input is the identity task.
+        if not excluding:
             raise ValueError(
                 "[M4Raw] target_mode='rep_pair' needs the input repetition's index "
                 "(exclude_index) so the pair never contains it."
@@ -252,26 +406,33 @@ def _average_reps(
             raise ValueError(
                 "[M4Raw] target_mode='rep_pair' needs at least one repetition besides the input."
             )
-        pair = others[0]
-        ref = reps[exclude_index] if anchor is None else anchor
-        dot = (pair * ref.conj()).sum(dim=(-2, -1), keepdim=True)
-        return pair * torch.exp(-1j * torch.angle(dot))
-    if exclude_index is not None and 0 <= exclude_index < len(reps):
-        reps = [r for i, r in enumerate(reps) if i != exclude_index]
-    if len(reps) == 1:
-        return reps[0].clone()
+        return _phase_align(others[0], reps[exclude_index])
     if not reps:
+        raise ValueError("[M4Raw] _average_reps received no repetitions to average.")
+    anchor = reps[exclude_index] if excluding else reps[0]
+    kept = [r for i, r in enumerate(reps) if i != exclude_index] if excluding else list(reps)
+    if not kept:
         # Defensive: exclude_index dropped the only rep. Caller guards against
         # this (LOO only engages with >=2 reps), but never return an empty mean.
         raise ValueError("[M4Raw] _average_reps received no repetitions to average.")
     if mode == "complex_mean":
-        return torch.stack(reps, dim=0).mean(dim=0)
-    ref = reps[0]
-    aligned = [ref]
-    for r in reps[1:]:
-        dot = (r * ref.conj()).sum(dim=(-2, -1), keepdim=True)
-        aligned.append(r * torch.exp(-1j * torch.angle(dot)))
-    return torch.stack(aligned, dim=0).mean(dim=0)
+        return kept[0].clone() if len(kept) == 1 else torch.stack(kept, dim=0).mean(dim=0)
+    return torch.stack([_phase_align(r, anchor) for r in kept], dim=0).mean(dim=0)
+
+
+def _register_to_anchor(
+    reps: list[torch.Tensor], shifts: Sequence[tuple[float, float]], anchor: int
+) -> list[torch.Tensor]:
+    """``reps`` translated onto ``reps[anchor]``, given each one's displacement ``shifts``."""
+    if len(shifts) != len(reps):
+        raise ValueError(
+            f"[M4Raw] {len(reps)} repetitions but {len(shifts)} registration shifts."
+        )
+    ay, ax = shifts[anchor]
+    return [
+        rep if i == anchor else shift_kspace(rep, ay - dy, ax - dx)
+        for i, (rep, (dy, dx)) in enumerate(zip(reps, shifts, strict=True))
+    ]
 
 
 class _SkipSampleError(Exception):
@@ -283,7 +444,10 @@ class _SkipSampleError(Exception):
 
 
 def _load_reps_or_skip(
-    rep_paths: list[Path], context: str, slice_index: int | None = None
+    rep_paths: list[Path],
+    context: str,
+    slice_index: int | None = None,
+    loaded: list[int] | None = None,
 ) -> list[torch.Tensor]:
     """Load every repetition of a NEX group, or raise ``_SkipSampleError``.
 
@@ -307,6 +471,8 @@ def _load_reps_or_skip(
         context: Human-readable identifier for the log/error message.
         slice_index: ``None`` loads whole volumes; an int loads that one slice
             of every repetition (the slice-level route, #1757).
+        loaded: when given, receives the ``rep_paths`` index of each returned
+            repetition, so a caller can name the file behind ``result[i]``.
 
     Returns:
         The repetitions that loaded, in manifest order.
@@ -320,7 +486,7 @@ def _load_reps_or_skip(
     """
     kspace_reps: list[torch.Tensor] = []
     failures: list[str] = []
-    for path in rep_paths:
+    for position, path in enumerate(rep_paths):
         try:
             if not path.exists():
                 raise FileNotFoundError(f"No such file or directory: '{path}'")
@@ -329,6 +495,8 @@ def _load_reps_or_skip(
             kspace_reps.append(
                 _load_kspace(path) if slice_index is None else _load_kspace(path, slice_index)
             )
+            if loaded is not None:
+                loaded.append(position)
         except IndexError:
             raise
         except Exception as exc:  # censused below, never silent
@@ -358,6 +526,37 @@ def _load_reps_or_skip(
     return kspace_reps
 
 
+def _validate_federated_contrasts(
+    source: str, targets: Sequence[str] | None, single_contrast: bool
+) -> tuple[str, frozenset[str] | None]:
+    """Normalise and check the cross-contrast pairing; raise on anything unread or unknown."""
+    source = str(source).upper()
+    target_set = None if targets is None else frozenset(str(t).upper() for t in targets)
+    if single_contrast and (source != _FEDERATED_SOURCE_CONTRAST or target_set is not None):
+        raise ValueError(
+            "[M4Raw] source_contrast/target_contrasts choose the cross-contrast "
+            "pairing; single_contrast=True pairs nothing."
+        )
+    unknown = sorted(({source} | (target_set or set())) - M4RAW_CONTRASTS)
+    if unknown:
+        raise ValueError(f"[M4Raw] Unknown contrast(s) {unknown}; M4Raw ships {sorted(M4RAW_CONTRASTS)}.")
+    if target_set is not None and (not target_set or source in target_set):
+        raise ValueError(
+            f"[M4Raw] target_contrasts={sorted(target_set)} must be non-empty and "
+            f"exclude the source contrast {source!r}."
+        )
+    return source, target_set
+
+
+def contrast_index_for_filename(filename: str) -> int | None:
+    """Index of the contrast keyword (T1/T2/FLAIR/PD) found in *filename*, else ``None``."""
+    name_upper = filename.upper()
+    for key, idx in CONTRAST_MAP.items():
+        if key in name_upper:
+            return idx
+    return None
+
+
 def _extract_contrast_idx(filename: str) -> int:
     """Return integer contrast index by keyword search in *filename*.
 
@@ -367,10 +566,9 @@ def _extract_contrast_idx(filename: str) -> int:
     Returns:
         Integer in ``[0, len(CONTRAST_MAP))``; defaults to 0 (T1) if no match.
     """
-    name_upper = filename.upper()
-    for key, idx in CONTRAST_MAP.items():
-        if key in name_upper:
-            return idx
+    found = contrast_index_for_filename(filename)
+    if found is not None:
+        return found
     # No contrast keyword (T1/T2/FLAIR/PD) in the filename. Surfaced at WARNING
     # (was a silent DEBUG): under multi-contrast conditioning a missed keyword
     # silently mislabels the scan as T1. A full raise is deferred because this
@@ -405,16 +603,17 @@ def _load_kspace(path: Path, slice_index: int | None = None) -> torch.Tensor:
     """
     # ``swmr``: the single-writer/multiple-reader mode every other HDF5 reader
     # under ``data/`` opens with (``io_strategies.py``), so the loader workers
-    # share a file that is still being written and never block one another.
-    with h5py.File(str(path), "r", swmr=True) as f:
-        if "kspace" not in f:
-            raise KeyError(f"No 'kspace' dataset found in {path}. Available keys: {list(f.keys())}")
-        # The read is the one shared with ``FastMRIH5Strategy`` (numpy, may be
-        # complex or float32 with trailing 2); h5py drops the indexed axis, so
-        # the slice read re-adds it as a length-1 leading dim.
-        raw = read_h5_kspace(f["kspace"], slice_index)
-        if slice_index is not None:
-            raw = raw[None]
+    # share a file that is still being written and never block one another. The
+    # handle is cached per process, since every slice of every repetition reads here.
+    f = open_h5(path)
+    if "kspace" not in f:
+        raise KeyError(f"No 'kspace' dataset found in {path}. Available keys: {list(f.keys())}")
+    # The read is the one shared with ``FastMRIH5Strategy`` (numpy, may be
+    # complex or float32 with trailing 2); h5py drops the indexed axis, so
+    # the slice read re-adds it as a length-1 leading dim.
+    raw = read_h5_kspace(f["kspace"], slice_index)
+    if slice_index is not None:
+        raw = raw[None]
 
     t = torch.from_numpy(raw)
 
@@ -549,6 +748,29 @@ def _to_torchio_tensor(kspace: torch.Tensor) -> torch.Tensor:
     return torch.stack([real, imag], dim=0).float()  # (2, H, W, Slices)
 
 
+def _attach_coil_maps(
+    subject: tio.Subject,
+    maps: torch.Tensor,
+    source: str,
+    calibration: dict[str, Any],
+    affine: np.ndarray,
+) -> None:
+    """Publish ``(S, C, H, W)`` complex maps the way ``espirit_sensitivity`` does.
+
+    ``sensitivity_complex`` for phase-sensitive consumers, ``sensitivity`` for the
+    magnitude convention, both ``(C, H, W, S)`` so the patch sampler crops them
+    with the k-space. The two stamps tell a declared ``espirit_sensitivity``
+    that the maps are already there and which calibration made them.
+    """
+    from spectramr.data.datasets.m4raw_coil_maps import calibration_tag
+
+    complex_maps = maps.permute(1, 2, 3, 0).contiguous()
+    subject.add_image(tio.ScalarImage(tensor=complex_maps, affine=affine), "sensitivity_complex")
+    subject.add_image(tio.ScalarImage(tensor=complex_maps.abs(), affine=affine), "sensitivity")
+    subject["coil_maps_source"] = source
+    subject["coil_maps_calibration"] = calibration_tag(calibration)
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -581,13 +803,32 @@ class M4RawRepetitionDataset(Dataset):
         coil_processing_mode: str = "rss",
         num_virtual_coils: int = 4,
         single_contrast: bool = False,
+        source_layout: str = "stacked",
+        source_contrast: str = _FEDERATED_SOURCE_CONTRAST,
+        target_contrasts: Sequence[str] | None = None,
         log_scaling: bool = False,
         target_mode: str = "complex_mean",
         r2r_alpha: float = 1.0,
         r2r_covariance_source: str = "committed",
         nex_target_exclude_input: bool = False,
         nex_fallback: str = "error",
+        nex_registration: str = "none",
+        nex_shift_root: str | Path | None = None,
+        nex_shifts_missing: str = "raise",
         slice_level_records: bool = False,
+        r2r_split_angle_deg: float = 45.0,
+        r2r_whitening: str = "committed",
+        emit_alternate_input: bool = False,
+        n2n_pairing: str | None = None,
+        coil_maps_root: str | Path | None = None,
+        coil_maps_reference_root: str | Path | None = None,
+        coil_maps_missing: str = "raise",
+        noise_fit_support_policy: str = "band",
+        noise_covariance_root: str | Path | None = None,
+        noise_covariance_missing: str = "raise",
+        coil_maps_recipe: str = DEFAULT_RECIPE,
+        coil_maps_acs_size: int | None = None,
+        input_repetition: str = "first",
     ) -> None:
         """Initialize M4Raw dataset.
 
@@ -602,6 +843,16 @@ class M4RawRepetitionDataset(Dataset):
             single_contrast: If True, each contrast is loaded independently
                 (no cross-contrast pairing). Each sample = 1 contrast with
                 repetition averaging. For contrast-agnostic training.
+            source_layout: cross-contrast route only, one of
+                :data:`VALID_SOURCE_LAYOUTS`. ``separate`` serves the source
+                contrast's acquired repetition as ``kspace_source`` beside a
+                target-only ``input``/``target``/``kspace``; ``target_only``
+                serves the same target without the source.
+            source_contrast: cross-contrast route only, the contrast every
+                pair takes its source from (``T1`` by default; ``T2`` for
+                T2-guided FLAIR).
+            target_contrasts: cross-contrast route only, the contrasts paired
+                against the source; ``None`` pairs every other contrast.
             log_scaling: After the (Parseval/image-RSS) percentile divide, apply
                 phase-preserving log1p magnitude compression
                 (``compress_kspace_log``, the SSOT primitive) to tame the DC
@@ -609,6 +860,48 @@ class M4RawRepetitionDataset(Dataset):
             slice_level_records: Expand the index to one record per slice and
                 read one slice per repetition per item (#1757). ``False``
                 keeps the per-group index byte-identical.
+            r2r_split_angle_deg: ``nullspace_r2r`` split angle in (0, 90);
+                ``tan`` of it is the R2R ``tau``.
+            r2r_whitening: ``nullspace_r2r`` whitener, one of
+                :data:`~spectramr.infrastructure.physics.coil_split_r2r.VALID_WHITENING`.
+            emit_alternate_input: under an averaging target, also publish
+                ``input_alt`` -- repetition 1, phase-aligned to the input
+                repetition. A split-mode (r2r) training split has no second
+                repetition to publish and emits nothing.
+            nex_registration: one of
+                :data:`~spectramr.data.datasets.m4raw_registration.VALID_NEX_REGISTRATIONS`.
+                ``translation`` registers every repetition onto the input before
+                the NEX target (and ``input_alt``) is built from it (#2849).
+            nex_shift_root: directory holding the shifts written by
+                ``scripts/precompute_m4raw_nex_shifts.py``; read instead of estimating
+                them in every worker (#2977). Needs ``nex_registration: translation``.
+            nex_shifts_missing: ``raise`` (default) or ``estimate`` -- what a group
+                absent from the store does.
+            coil_maps_root: directory of per-group ESPIRiT maps written by
+                ``scripts/precompute_m4raw_coil_maps.py``. When set, every
+                subject carries ``sensitivity_complex``/``sensitivity`` from
+                ``<root>/<patient>_<contrast>.pt`` and ``nullspace_r2r`` splits
+                with them instead of estimating per load (#2339).
+            coil_maps_missing: ``raise`` (default) or ``estimate`` -- what a
+                group without a map file does. A file that exists but does not
+                match always raises.
+            coil_maps_recipe: which repetitions the maps are estimated from, one
+                of :data:`~spectramr.data.datasets.m4raw_coil_map_recipe.VALID_RECIPES`;
+                checked against every file and used by the ``estimate`` fallback.
+            coil_maps_acs_size: the ESPIRiT ACS width the maps were estimated
+                with; ``None`` keeps the per-scan default calibration.
+            noise_fit_support_policy: the per-scan Sigma_n fit's phase-encode
+                support policy, one of
+                :data:`~spectramr.infrastructure.physics.pe_support.VALID_SUPPORT_POLICIES`.
+            noise_covariance_root: directory holding the per-group Sigma_n written by
+                ``scripts/precompute_m4raw_noise_covariance.py``; read instead of fitting
+                in every worker (#3117). Needs a self-calibrated r2r draw or whitener.
+            noise_covariance_missing: ``raise`` (default) or ``fit`` -- what a group
+                absent from the store does.
+            input_repetition: which loaded repetition is the input, one of
+                :data:`~spectramr.data.datasets.m4raw_input_repetition.VALID_INPUT_REPETITIONS`.
+                ``random`` draws one per sample and aligns the NEX target to it;
+                the instantiator passes it to the training split only.
         """
         self.normalize_kspace = normalize_kspace
         self.kspace_percentile = kspace_percentile
@@ -646,6 +939,21 @@ class M4RawRepetitionDataset(Dataset):
             )
         self.num_virtual_coils = num_virtual_coils
         self.single_contrast = single_contrast
+        if source_layout not in VALID_SOURCE_LAYOUTS:
+            raise ValueError(
+                f"[M4Raw] Unknown source_layout: {source_layout!r}. "
+                f"Valid layouts: {sorted(VALID_SOURCE_LAYOUTS)}"
+            )
+        if single_contrast and source_layout != "stacked":
+            raise ValueError(
+                f"[M4Raw] source_layout={source_layout!r} describes the "
+                "cross-contrast route and single_contrast=True has no source "
+                "contrast to serve."
+            )
+        self.source_layout = source_layout
+        self.source_contrast, self.target_contrasts = _validate_federated_contrasts(
+            source_contrast, target_contrasts, single_contrast
+        )
         if target_mode not in _VALID_TARGET_MODES:
             raise ValueError(
                 f"[M4Raw] Unknown target_mode: {target_mode!r}. "
@@ -662,17 +970,85 @@ class M4RawRepetitionDataset(Dataset):
                 f"Valid: {sorted(_VALID_R2R_COVARIANCE_SOURCES)}."
             )
         self.r2r_covariance_source = r2r_covariance_source
-        #: Per-scan Sigma_n under 'self_calibrated', keyed by repetition group.
-        #: Sigma_n is a property of the RECEIVE CHAIN, not of a slice, so one fit
-        #: serves every slice of a scan -- which is also what makes the knob
-        #: affordable: the ESPIRiT eigendecomposition behind it costs ~1 s per
-        #: slice on CPU, against `samples_per_volume` draws per volume.
-        self._r2r_cov_cache: dict[str, Any] = {}
+        #: Per-scan Sigma_n (a ``(C, C)`` tensor), keyed by repetition group. A
+        #: receive-chain property, so one fit serves every slice of a scan; the
+        #: ``self_calibrated`` R2R draw and the null-space whitener share it.
+        self._r2r_cov_cache: dict[str, torch.Tensor] = {}
         self._r2r_sampler: Any = None
         if target_mode == "r2r" and r2r_covariance_source == "committed":
             from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
 
             self._r2r_sampler = M4RawNoiseSampler(alpha=self.r2r_alpha)
+        from spectramr.infrastructure.physics.coil_split_r2r import (
+            VALID_WHITENING,
+            check_split_angle,
+        )
+
+        check_split_angle(r2r_split_angle_deg)
+        if r2r_whitening not in VALID_WHITENING:
+            raise ValueError(
+                f"[M4Raw] Unknown r2r_whitening: {r2r_whitening!r}. "
+                f"Valid: {sorted(VALID_WHITENING)}."
+            )
+        self.r2r_split_angle_deg = float(r2r_split_angle_deg)
+        self.r2r_whitening = r2r_whitening
+        from spectramr.infrastructure.physics.scan_coil_calibration import VALID_SUPPORT_POLICIES
+
+        if noise_fit_support_policy not in VALID_SUPPORT_POLICIES:
+            raise ValueError(
+                f"[M4Raw] Unknown noise_fit_support_policy: {noise_fit_support_policy!r}. "
+                f"Valid: {sorted(VALID_SUPPORT_POLICIES)}."
+            )
+        self.noise_fit_support_policy = noise_fit_support_policy
+        self._noise_covariance_store = (
+            None
+            if noise_covariance_root is None
+            else NoiseCovarianceStore.declared(
+                noise_covariance_root, noise_covariance_missing, noise_fit_support_policy
+            )
+        )
+        if target_mode == "nullspace_r2r" and coil_processing_mode != "none":
+            raise ValueError(
+                "[M4Raw] target_mode='nullspace_r2r' splits the PHYSICAL coil vector "
+                f"and needs coil_processing_mode='none', got {coil_processing_mode!r}."
+            )
+        # Scoring-only maps (#2664): published under a key no operator, loss or
+        # model input reads; the instantiator passes them to the validation split.
+        from spectramr.data.datasets.m4raw_coil_map_source import CoilMapSource
+
+        self._reference_maps = (
+            None
+            if coil_maps_reference_root is None
+            else CoilMapSource.declared(Path(coil_maps_reference_root), "raise")
+        )
+        self._coil_maps = self._coil_map_source(
+            coil_maps_root,
+            coil_maps_missing,
+            coil_processing_mode,
+            single_contrast,
+            recipe=coil_maps_recipe,
+            acs_size=coil_maps_acs_size,
+        )
+        if n2n_pairing is not None:
+            allowed = N2N_PAIRINGS.get(n2n_pairing)
+            if allowed is None:
+                raise ValueError(
+                    f"[M4Raw] Unknown n2n_pairing: {n2n_pairing!r}. Valid: {sorted(N2N_PAIRINGS)}"
+                )
+            if target_mode not in allowed or not single_contrast or not use_repetitions:
+                raise ValueError(
+                    f"[M4Raw] n2n_pairing={n2n_pairing!r} needs the single-contrast route "
+                    f"with repetitions and target_mode in {sorted(allowed)}; got "
+                    f"target_mode={target_mode!r}, single_contrast={single_contrast}, "
+                    f"use_repetitions={use_repetitions}."
+                )
+        self.n2n_pairing = n2n_pairing
+        self.emit_alternate_input = bool(emit_alternate_input)
+        if self.emit_alternate_input and not use_repetitions:
+            raise ValueError(
+                "[M4Raw] emit_alternate_input publishes a SECOND repetition, and "
+                "use_repetitions=False loads only the first."
+            )
         # Leave-one-out NEX target: exclude the input rep (rep 0) from the
         # averaged target so target and input noise are uncorrelated. Default
         # False keeps the all-reps average (byte-identical legacy behaviour).
@@ -694,6 +1070,38 @@ class M4RawRepetitionDataset(Dataset):
                 f"Valid: {sorted(_VALID_NEX_FALLBACKS)}"
             )
         self.nex_fallback = nex_fallback
+        if nex_registration not in VALID_NEX_REGISTRATIONS:
+            raise ValueError(
+                f"[M4Raw] Unknown nex_registration: {nex_registration!r}. "
+                f"Valid: {sorted(VALID_NEX_REGISTRATIONS)}"
+            )
+        if nex_registration != "none" and target_mode in _SINGLE_REP_SPLIT_MODES:
+            raise ValueError(
+                f"[M4Raw] nex_registration={nex_registration!r} registers repetitions "
+                f"against each other, and target_mode={target_mode!r} builds both halves "
+                "from one repetition; there is nothing to register."
+            )
+        self.nex_registration = nex_registration
+        if nex_shift_root is not None and nex_registration == "none":
+            raise ValueError(
+                "[M4Raw] nex_shift_root holds registration shifts and nex_registration is "
+                "'none'; nothing would read them. Declare nex_registration: translation."
+            )
+        self._shift_store = (
+            None if nex_shift_root is None else NexShiftStore.declared(nex_shift_root, nex_shifts_missing)
+        )
+        # One group's shifts, keyed by the repetition files that loaded; a group
+        # is estimated once per worker however many of its slices are drawn.
+        self._shift_cache: dict[tuple[str, ...], list[tuple[float, float]]] = {}
+        self.input_repetition = validate_input_repetition(
+            input_repetition,
+            target_mode=target_mode,
+            use_repetitions=use_repetitions,
+            single_contrast=single_contrast,
+            nex_target_exclude_input=nex_target_exclude_input,
+            has_coil_maps=self._coil_maps is not None or self._reference_maps is not None,
+        )
+        self._draw_input = InputRepetitionDraw(self.input_repetition)
         self.slice_level_records = bool(slice_level_records)
 
         # Build groups: base_stem → sorted list of rep paths (as strings for pickle safety)
@@ -714,8 +1122,10 @@ class M4RawRepetitionDataset(Dataset):
                 for entry in single_index
             ]
         else:
-            # Cross-contrast mode: Pair T1 (source) with T2/FLAIR (target)
-            self._federated_pairs = self._build_federated_pairs(raw_groups)
+            # Cross-contrast mode: pair the source contrast with each target contrast.
+            self._federated_pairs = self._build_federated_pairs(
+                raw_groups, source=self.source_contrast, targets=self.target_contrasts
+            )
 
             # DEBUG: Log first path before conversion to detect corruption
             if self._federated_pairs and self._federated_pairs[0]["target"]:
@@ -756,6 +1166,14 @@ class M4RawRepetitionDataset(Dataset):
         # serve; refuse here, before any GPU time, rather than at the first
         # short group mid-epoch (or -- the #695 shape -- never).
         self._refuse_undersized_loo_groups()
+        self._refuse_groups_without_an_alternate()
+        # The same for the precomputed coil maps: every group's file must exist now, not when
+        # the first affected sample is drawn.
+        for source in (self._coil_maps, self._reference_maps):
+            if source is not None:
+                source.refuse_absent_maps(
+                    Path(g["paths"][0]).stem for g in self._groups if g.get("paths")
+                )
 
         # F1: stamp each group with its raw k-space shape (header read only) so
         # the queue-build patch-compat filter can run its no-voxel-load fast
@@ -780,6 +1198,48 @@ class M4RawRepetitionDataset(Dataset):
             len(self._groups),
         )
 
+    @staticmethod
+    def _coil_map_source(
+        root: str | Path | None,
+        missing: str,
+        coil_mode: str,
+        single_contrast: bool,
+        *,
+        recipe: str = DEFAULT_RECIPE,
+        acs_size: int | None = None,
+    ) -> Any:
+        """The precomputed-map source, or ``None``; refuses the routes that cannot use one.
+
+        The calibration is the per-scan default the loader would estimate with,
+        with ``acs_size`` replacing its ACS width when declared, so a file written
+        with any other ACS/kernel/threshold or recipe raises at load.
+        """
+        from spectramr.data.datasets.m4raw_coil_map_recipe import check_recipe
+        from spectramr.data.datasets.m4raw_coil_map_source import (
+            VALID_MISSING_POLICIES,
+            CoilMapSource,
+        )
+
+        if missing not in VALID_MISSING_POLICIES:
+            raise ValueError(
+                f"[M4Raw] Unknown coil_maps_missing: {missing!r}. "
+                f"Valid: {sorted(VALID_MISSING_POLICIES)}."
+            )
+        check_recipe(recipe)
+        if root is None:
+            return None
+        if coil_mode != "none":
+            raise ValueError(
+                "[M4Raw] coil_maps_root publishes maps of the PHYSICAL coils and needs "
+                f"coil_processing_mode='none', got {coil_mode!r}."
+            )
+        if not single_contrast:
+            raise ValueError(
+                "[M4Raw] coil_maps_root is implemented on the single-contrast route "
+                "only; the cross-contrast input stacks two contrasts' coils."
+            )
+        return CoilMapSource.declared(root, missing, recipe=recipe, acs_size=acs_size)
+
     # ------------------------------------------------------------------
     # Leave-one-out NEX reference: construction-time contract
     # ------------------------------------------------------------------
@@ -787,40 +1247,38 @@ class M4RawRepetitionDataset(Dataset):
     def _refuse_undersized_loo_groups(self) -> None:
         """Refuse a leave-one-out run whose groups cannot all honour it.
 
-        Only the single-contrast path applies leave-one-out (the input rep is
-        one of the averaged reps there); in cross-contrast mode the input is a
-        different contrast, so ``nex_target_exclude_input`` is not applied and
-        this check does not fire. With ``nex_fallback='all_reps'`` the short
-        groups are served with the correlated all-reps average and
-        ``_note_loo_declined`` reports it once per rep count at load time.
+        Both routes apply leave-one-out: in cross-contrast mode each side's input is
+        repetition 0 of that side's own group, so every source and target group is
+        checked. With ``nex_fallback='all_reps'`` the short groups are served with
+        the correlated all-reps average and ``_note_loo_declined`` reports it once
+        per rep count at load time.
         """
         if not (self.use_repetitions and self.nex_target_exclude_input):
             return
-        if self.target_mode == "r2r":
-            # R2R builds both halves from the input repetition alone -- it never
-            # averages, so it never leaves anything out and a 1-rep group is the
-            # POINT of the mode. `nex_target_exclude_input` still arrives True
-            # here because it is ONE config knob shared by both splits, and the
-            # VALIDATION dataset (built with `data.val_target_mode`, an averaging
-            # mode) is the half that needs it. Without this return, an r2r arm
-            # would be refused for a leave-one-out its training split does not do.
-            return
-        if not self.single_contrast:
-            logger.warning(
-                "[M4Raw] nex_target_exclude_input=True has no effect in cross-contrast "
-                "mode: the input is a different contrast's repetition, so it is never "
-                "part of the averaged target."
-            )
+        if self.target_mode in _SINGLE_REP_SPLIT_MODES:
+            # These build both halves from the input repetition alone -- they
+            # never average, so they never leave anything out and a 1-rep group
+            # is the POINT of the mode. `nex_target_exclude_input` still arrives
+            # True because it is ONE config knob shared by both splits, and the
+            # VALIDATION dataset (built with `data.val_target_mode`) needs it.
             return
         if self.nex_fallback != "error" and self.target_mode != "rep_pair":
             return
         short: dict[str, int] = {}
         min_reps = _min_reps_for_leave_one_out(self.target_mode)
         for group in self._groups:
-            n_reps = len(group.get("paths") or [])
-            if n_reps < min_reps:
-                label = str(group.get("contrast") or "UNKNOWN")
-                short[label] = max(short.get(label, 0), 0) + 1
+            sides = (
+                [(group.get("paths"), group.get("contrast"))]
+                if self.single_contrast
+                else [
+                    (group.get("source"), group.get("source_contrast", _FEDERATED_SOURCE_CONTRAST)),
+                    (group.get("target"), group.get("target_contrast")),
+                ]
+            )
+            for paths, contrast in sides:
+                if len(paths or []) < min_reps:
+                    label = str(contrast or "UNKNOWN")
+                    short[label] = short.get(label, 0) + 1
         if not short:
             return
         detail = ", ".join(f"{label}: {count} group(s)" for label, count in sorted(short.items()))
@@ -834,6 +1292,40 @@ class M4RawRepetitionDataset(Dataset):
             "to accept that for the short contrasts, or exclude them via "
             "data.pairing.contrasts."
         )
+
+    def _publishes_noise_covariance(self) -> bool:
+        """An averaging split of an arm whose R2R noise model is the scan's own fit.
+
+        That is the validation split of a self-calibrated ``r2r``/``nullspace_r2r``
+        arm; ``validation.scoring.recorrupted_inference`` reads the published
+        ``noise_covariance`` there. One fit per group per worker, cached.
+        """
+        return self.target_mode not in _SINGLE_REP_SPLIT_MODES and "self_calibrated" in (
+            self.r2r_covariance_source,
+            self.r2r_whitening,
+        )
+
+    def _emits_alternate_input(self) -> bool:
+        """``input_alt`` is published only where the target averages repetitions."""
+        return self.emit_alternate_input and self.target_mode in _AVERAGING_TARGET_MODES
+
+    def _refuse_groups_without_an_alternate(self) -> None:
+        """Every group this dataset serves ``input_alt`` from needs a repetition 1."""
+        if not self._emits_alternate_input():
+            return
+        if not self.single_contrast:
+            raise ValueError(
+                "[M4Raw] emit_alternate_input is implemented on the single-contrast "
+                "route only; the cross-contrast input is a different contrast's "
+                "repetition and has no alternate to publish."
+            )
+        short = sum(1 for group in self._groups if len(group.get("paths") or []) < 2)
+        if short:
+            raise ValueError(
+                f"[M4Raw] emit_alternate_input needs >= 2 repetitions per group, but "
+                f"{short} group(s) have fewer. Exclude them via data.pairing.contrasts "
+                "or drop the knob."
+            )
 
     # ------------------------------------------------------------------
     # Index / shape metadata (queue-build fast path — F1)
@@ -946,11 +1438,17 @@ class M4RawRepetitionDataset(Dataset):
         return entries
 
     @staticmethod
-    def _build_federated_pairs(groups_list: list[list[Path]]) -> list[dict]:
-        """Pair Source (T1) with Target (FLAIR/T2/PD) from the grouped list.
+    def _build_federated_pairs(
+        groups_list: list[list[Path]],
+        source: str = _FEDERATED_SOURCE_CONTRAST,
+        targets: frozenset[str] | None = None,
+    ) -> list[dict]:
+        """Pair the source contrast with each target contrast from the grouped list.
 
         Args:
             groups_list: List of Path lists from _build_groups.
+            source: Source contrast; patients without it are skipped.
+            targets: Target contrasts; ``None`` pairs every other contrast.
 
         Returns:
             List of dicts {"source": [...T1 paths...], "target": [...Target paths...], "patient_id": str, "target_contrast": str, "source_contrast": "T1"}.
@@ -979,13 +1477,14 @@ class M4RawRepetitionDataset(Dataset):
 
         federated_pairs = []
         for patient_id, contrasts in inventory.items():
-            if _FEDERATED_SOURCE_CONTRAST not in contrasts:
-                continue  # We must have a T1 source
+            if source not in contrasts:
+                continue
 
-            # Pair T1 with any non-T1 contrast (e.g. FLAIR, T2, PD)
-            source_group = contrasts[_FEDERATED_SOURCE_CONTRAST]
+            source_group = contrasts[source]
             for contrast_name, target_group in contrasts.items():
-                if contrast_name == _FEDERATED_SOURCE_CONTRAST:
+                if contrast_name == source or (
+                    targets is not None and contrast_name not in targets
+                ):
                     continue
                 federated_pairs.append(
                     {
@@ -998,7 +1497,7 @@ class M4RawRepetitionDataset(Dataset):
                         # filename, and a reader that keyed them off
                         # ``target_contrast`` instead would file every T1
                         # repetition under T2/FLAIR.
-                        "source_contrast": _FEDERATED_SOURCE_CONTRAST,
+                        "source_contrast": source,
                     }
                 )
 
@@ -1085,7 +1584,11 @@ class M4RawRepetitionDataset(Dataset):
             K-space from a single repetition, shape ``(2, H, W, Slices)``.
         ``target`` : :class:`tio.ScalarImage`
             Averaged k-space from all repetitions, shape ``(2, H, W, Slices)``.
-        ``kspace`` : alias for ``input`` (backward-compatible with strategy).
+        ``kspace`` : the fully sampled reference, the same tensor as ``target``;
+            the coil-map estimator and renderers read it there.
+        ``measured_kspace`` : the measurement the model is handed, the same tensor
+            as ``input`` (after an r2r / null-space split, the split half). A
+            masking transform downstream overwrites it with the masked input.
         ``contrast_idx`` : ``torch.long`` scalar (0=T1, 1=T2, 2=FLAIR, 3=PD).
         """
         max_retries = min(5, len(self._groups))
@@ -1127,87 +1630,273 @@ class M4RawRepetitionDataset(Dataset):
             f"refusing to substitute a zero-filled sample and train on garbage."
         )
 
-    def _sampler_for_scan(self, kspace: torch.Tensor, scan_key: str) -> Any:
-        """The R2R sampler for this scan, fitting Sigma_n when self-calibrating.
+    def _scan_covariance(
+        self,
+        kspace: torch.Tensor,
+        scan_key: str,
+        *,
+        fit_kspace: Callable[[], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """This scan's ``Sigma_n`` (:func:`fit_scan_noise_covariance`), cached per group.
 
-        Sigma_n describes the RECEIVE CHAIN, not a slice, so one fit serves every
-        slice of a scan and the result is cached per repetition group. That is
-        also what makes the mode affordable: the ESPIRiT eigendecomposition it
-        rests on costs ~1 s per slice on CPU, against `samples_per_volume` draws
-        per volume and several epochs.
+        ``fit_kspace`` supplies the k-space to fit on a cache miss; ``None`` fits
+        ``kspace`` itself, which is the whole volume on the per-group route. A
+        slice record must pass :meth:`_sigma_fit_source`, or the fit would use
+        that one slice and differ with whichever slice a worker loaded first.
 
         A failed fit RAISES rather than falling back to the committed matrix
-        (pitfall #9): the arm exists to test the self-calibrated draw, and
-        silently serving it the constant would make the comparison vacuous while
-        the YAML still said `self_calibrated`.
+        (pitfall #9): serving the constant would make an A-vs-E comparison
+        vacuous while the YAML still said ``self_calibrated``.
         """
+        cached = self._r2r_cov_cache.get(scan_key)
+        if cached is not None:
+            return cached
+        stored = (
+            None
+            if self._noise_covariance_store is None
+            else self._noise_covariance_store.get(scan_key)
+        )
+        if stored is not None:
+            self._r2r_cov_cache[scan_key] = stored
+            return stored
+        if fit_kspace is not None:
+            kspace = fit_kspace()
+        covariance, fitted = fit_scan_noise_covariance(
+            kspace, support_policy=self.noise_fit_support_policy
+        )
+        self._r2r_cov_cache[scan_key] = covariance
+        logger.info(
+            "[M4Raw] self-calibrated Sigma_n for scan %s: trace=%.4g over %d coils "
+            "(%d central slice(s), sampled PE fraction %.3f)",
+            scan_key,
+            float(covariance.diagonal().real.sum()),
+            int(covariance.shape[0]),
+            fitted,
+            float(_pe_support(kspace).float().mean()),
+        )
+        return covariance
+
+    @staticmethod
+    def _sigma_fit_source(
+        input_path: Path, input_kspace: torch.Tensor, record: dict[str, Any]
+    ) -> Callable[[], torch.Tensor]:
+        """The k-space a scan's ``Sigma_n`` is fitted on, read only on a cache miss.
+
+        A group record already holds the input volume. A slice record reads the
+        input repetition's :func:`sigma_fit_window` slices from disk, so both
+        routes fit the same central slices and every slice of a scan draws from
+        one matrix.
+        """
+        if record.get("slice_index") is None:
+            return lambda: input_kspace
+
+        def central() -> torch.Tensor:
+            try:
+                return load_sigma_fit_slices(input_path, int(record["num_slices"]))
+            except (OSError, KeyError) as exc:
+                raise _SkipSampleError(
+                    f"[M4Raw] {input_path.name}: the central slices "
+                    f"{list(sigma_fit_window(int(record['num_slices'])))} the "
+                    f"scan's Sigma_n is fitted on could not be read: {exc}"
+                ) from exc
+
+        return central
+
+    def _sampler_for_scan(
+        self,
+        kspace: torch.Tensor,
+        scan_key: str,
+        *,
+        fit_kspace: Callable[[], torch.Tensor] | None = None,
+    ) -> Any:
+        """The R2R sampler for this scan: the committed matrix or its own fit."""
         if self.r2r_covariance_source == "committed":
             if self._r2r_sampler is None:  # pragma: no cover - guarded in __init__
                 raise RuntimeError("[M4Raw] r2r requested but no sampler was built.")
             return self._r2r_sampler
+        from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
 
-        cached = self._r2r_cov_cache.get(scan_key)
-        if cached is None:
-            from spectramr.infrastructure.physics.coil_noise_fit import (
-                estimate_covariance_from_nullspace,
-            )
-            from spectramr.infrastructure.physics.coil_sensitivity import estimate_csm_espirit
-            from spectramr.infrastructure.physics.fft_ops import ifft2c
-            from spectramr.infrastructure.physics.m4raw_noise import M4RawNoiseSampler
-
-            coils = kspace.reshape(-1, *kspace.shape[-2:]).unsqueeze(0)
-            subspace = estimate_csm_espirit(
-                coils, num_coils=coils.shape[1], return_subspace=True
-            )
-            covariance = estimate_covariance_from_nullspace(ifft2c(coils), subspace.null_projector)
-            cached = M4RawNoiseSampler(covariance=covariance, alpha=self.r2r_alpha)
-            self._r2r_cov_cache[scan_key] = cached
-            logger.info(
-                "[M4Raw] self-calibrated Sigma_n for scan %s: trace=%.4g over %d coils",
-                scan_key,
-                float(covariance.diagonal().real.sum()),
-                int(covariance.shape[0]),
-            )
-        return cached
+        covariance = self._scan_covariance(kspace, scan_key, fit_kspace=fit_kspace)
+        return M4RawNoiseSampler(covariance=covariance, alpha=self.r2r_alpha)
 
     def _recorrupt_r2r(
-        self, kspace: torch.Tensor, scan_key: str = ""
+        self,
+        kspace: torch.Tensor,
+        scan_key: str = "",
+        *,
+        maps: torch.Tensor | None = None,
+        fit_kspace: Callable[[], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Split ONE acquired repetition into an R2R ``(input, target)`` pair.
 
+        ``maps`` is accepted so both split methods share one call and is unused:
+        the draw needs a covariance, not a coil geometry.
+
         ``input = y + alpha*z``, ``target = y - z/alpha`` with
         ``z ~ CN(0, Sigma_n)`` drawn fresh per sample, so
-        ``Cov(input, target) = Sigma_n - Sigma_z = 0`` and the L1/L2 minimiser is
-        the clean image -- from a single excitation, with no clean reference.
-
-        The support mask is derived from the DATA, not the header: M4Raw ships
-        ~24 % of its phase-encode columns as exact zeros (partial phase FOV), and
-        its ``encodingLimits`` report a COUNT where ISMRMRD specifies an
-        INCLUSIVE maximum -- measured over all 52 files on this host,
-        ``kspace_encoding_step_1/maximum`` equals the number of sampled columns
-        exactly (195 for T1/T2, 198 for FLAIR) and ``slice/maximum`` equals the
-        slice count (18), so a spec-conforming ``range(min, max + 1)`` over-reads
-        by one. Trusting it would put noise in a column the scanner never sampled.
-        Sampled columns always carry noise, so a zero column-sum discriminates
-        them exactly.
+        ``Cov(input, target) = Sigma_n - Sigma_z = 0`` and the L2 minimiser is the
+        supervised one -- from a single excitation, with no clean reference. The
+        identity is an L2 one: under L1 the minimiser is the median of
+        ``x + e2`` given the input, not the median of ``x``.
+        Noise goes only into acquired columns (:func:`_pe_support`).
 
         The draw uses the global RNG, which ``DataLoader`` seeds per worker, so a
         run is reproducible from ``run.seed`` and every sample sees a different
         recorruption across epochs (which is the point -- it is an augmentation
         over the noise, not a fixed second copy).
         """
-        if kspace.dim() < 3:
+        support = _pe_support(kspace)
+        return self._sampler_for_scan(kspace, scan_key, fit_kspace=fit_kspace).recorrupt(
+            kspace, support_mask=support
+        )
+
+    def _nullspace_split(
+        self,
+        kspace: torch.Tensor,
+        scan_key: str = "",
+        *,
+        maps: torch.Tensor | None = None,
+        fit_kspace: Callable[[], torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split ONE repetition along its own coil null space (``nullspace_r2r``).
+
+        No noise is drawn: the two halves are orthogonal projections of the
+        whitened coil vector, independent given the image (see
+        :mod:`~spectramr.infrastructure.physics.coil_split_r2r`). ``maps`` are
+        the group's precomputed ones under ``coil_maps_root``; without them the
+        maps are estimated per slice from this repetition on every load, ~2.3 s
+        per 256x256 slice in a one-thread worker, since the Queue respawns its
+        workers each epoch and a worker cache would never be read back.
+        """
+        from spectramr.infrastructure.physics.coil_split_r2r import split_kspace, whitener
+        from spectramr.infrastructure.physics.m4raw_noise import single_repetition_covariance
+        from spectramr.infrastructure.physics.scan_coil_calibration import (
+            as_slice_batch,
+            calibrate_scan,
+        )
+
+        support = _pe_support(kspace)
+        slices = as_slice_batch(kspace)
+        if maps is None:
+            maps = calibrate_scan(slices, support, fit_covariance=False).maps
+        elif maps.shape != slices.shape:
             raise ValueError(
-                f"[M4Raw] r2r needs at least (C, H, W) k-space, got {tuple(kspace.shape)}."
+                f"[M4Raw] coil maps {tuple(maps.shape)} do not describe k-space "
+                f"{tuple(slices.shape)}."
             )
-        support = kspace.abs().sum(dim=tuple(range(kspace.dim() - 1))) > 0
-        if not bool(support.any()):
-            raise ValueError(
-                "[M4Raw] r2r found no sampled phase-encode columns in this group "
-                "(the whole k-space is zero). Recorrupting it would train on noise "
-                "alone."
+        # Keys are VALID_WHITENING, checked in __init__; lazy, so only the
+        # declared source is ever computed.
+        sources: dict[str, Callable[[], torch.Tensor | None]] = {
+            "none": lambda: None,
+            "committed": single_repetition_covariance,
+            "self_calibrated": lambda: self._scan_covariance(
+                kspace, scan_key, fit_kspace=fit_kspace
+            ),
+        }
+        first, second = split_kspace(
+            slices,
+            maps,
+            support,
+            whitening=whitener(sources[self.r2r_whitening](), slices.shape[1]),
+            angle_deg=self.r2r_split_angle_deg,
+        )
+        return first.reshape(kspace.shape), second.reshape(kspace.shape)
+
+    def _refuse_identity_target(
+        self, kspace_reps: list[torch.Tensor], n_paths: int, context: str
+    ) -> None:
+        """Skip a group whose NEX target would be its own input.
+
+        With one surviving repetition the average is repetition 0, which is also the
+        input, so the sample would teach the identity while the config says
+        denoising. ``__getitem__`` retries the next group. The split modes are exempt:
+        a one-repetition group is the case they exist for.
+        """
+        if (
+            self.use_repetitions
+            and self.target_mode not in _SINGLE_REP_SPLIT_MODES
+            and len(kspace_reps) < 2
+        ):
+            raise _SkipSampleError(
+                f"[M4Raw] {context}: only {len(kspace_reps)} of {n_paths} repetitions "
+                "loaded. The NEX target would be the input itself (SNR boost "
+                "sqrt(1)=1.0), so the sample teaches the identity rather than "
+                "denoising. Fix the unreadable file(s), or set "
+                "data.use_repetitions: false to declare that intent."
             )
-        return self._sampler_for_scan(kspace, scan_key).recorrupt(kspace, support_mask=support)
+
+    def _nex_target(
+        self,
+        kspace_reps: list[torch.Tensor],
+        context: str,
+        input_index: int = 0,
+        shifts: list[tuple[float, float]] | None = None,
+    ) -> torch.Tensor:
+        """The target for one repetition group, per ``target_mode``.
+
+        ``kspace_reps[input_index]`` is the input. It is moved to the front, because
+        :func:`_average_reps` anchors the phase frame to (and leave-one-out excludes)
+        position 0; with ``input_index == 0`` the list is passed through unchanged.
+        Leave-one-out drops the input only when at least two repetitions remain;
+        otherwise ``nex_fallback`` decides between refusing and the all-reps average.
+        ``shifts``, one per repetition, registers them onto the input first.
+        """
+        if input_index:
+            order = [input_index] + [i for i in range(len(kspace_reps)) if i != input_index]
+            kspace_reps = [kspace_reps[i] for i in order]
+            shifts = None if shifts is None else [shifts[i] for i in order]
+        if not (self.use_repetitions and len(kspace_reps) > 1):
+            return kspace_reps[0].clone()
+        min_reps = _min_reps_for_leave_one_out(self.target_mode)
+        loo_requested = self.nex_target_exclude_input
+        exclude = 0 if (loo_requested and len(kspace_reps) >= min_reps) else None
+        if loo_requested and exclude is None:
+            if self.nex_fallback == "error" or self.target_mode == "rep_pair":
+                # rep_pair is refused regardless: the all-reps fallback would serve
+                # the input as its own target.
+                raise ValueError(
+                    f"[M4Raw] {context}: leave-one-out NEX target requested but only "
+                    f"{len(kspace_reps)} repetition(s) loaded (needs >= {min_reps}); "
+                    "data.nex_fallback='error' refuses the correlated all-reps "
+                    "reference. Declare data.nex_fallback: all_reps to accept it."
+                )
+            self._note_loo_declined(len(kspace_reps))
+        return _average_reps(kspace_reps, self.target_mode, exclude_index=exclude, shifts=shifts)
+
+    def _group_shifts(
+        self, rep_paths: list[Path], kspace_reps: list[torch.Tensor], record: dict[str, Any]
+    ) -> list[tuple[float, float]] | None:
+        """Each loaded repetition's displacement against the first, or ``None`` unregistered.
+
+        Estimated on the :func:`registration_window` slices of the volume, read from
+        disk on the slice-level route, so both routes and every slice of a group use
+        one set of shifts. ``rep_paths`` are the files ``kspace_reps`` came from.
+        """
+        if self.nex_registration == "none" or len(kspace_reps) == 1:
+            return None
+        key = tuple(str(p) for p in rep_paths)
+        cached = self._shift_cache.get(key)
+        if cached is not None:
+            return cached
+        stored = None if self._shift_store is None else self._shift_store.get(rep_paths)
+        if stored is not None:
+            self._shift_cache[key] = stored
+            return stored
+        if record.get("slice_index") is None:
+            window = registration_window(kspace_reps[0].shape[0])
+            volumes = [r[window.start : window.stop] for r in kspace_reps]
+        else:
+            window = registration_window(int(record["num_slices"]))
+            try:
+                volumes = [torch.cat([_load_kspace(p, s) for s in window]) for p in rep_paths]
+            except (OSError, KeyError, IndexError) as exc:
+                raise _SkipSampleError(
+                    f"[M4Raw] {rep_paths[0].name}: the slices {list(window)} the "
+                    f"repetitions are registered on could not be read: {exc}"
+                ) from exc
+        shifts = group_shifts(volumes)
+        self._shift_cache[key] = shifts
+        return shifts
 
     def _note_loo_declined(self, n_reps: int) -> None:
         """Report that the leave-one-out NEX gate declined, once per rep count.
@@ -1295,82 +1984,99 @@ class M4RawRepetitionDataset(Dataset):
             # ImageCollateStrategy, which has no _filter_none, so the None died
             # as `TypeError: 'NoneType' object is not subscriptable` naming
             # neither the index nor the file (B14).
+            context = f"idx={idx} contrast={contrast_name}"
+            loaded: list[int] = []
             kspace_reps = _load_reps_or_skip(
                 rep_paths,
-                f"idx={idx} contrast={contrast_name}"
-                + (f" slice={slice_index}" if slice_index is not None else ""),
+                context + (f" slice={slice_index}" if slice_index is not None else ""),
                 slice_index,
+                loaded,
             )
 
-            # A NEX target is the AVERAGE of the repetitions. With exactly one
-            # surviving rep the code below falls to `target = kspace_reps[0]`,
-            # which is the INPUT -- the arm would train the identity while the
-            # config says denoising (pitfall #16). Refuse the group instead;
-            # __getitem__ retries the next one. Arms that deliberately want
-            # input==target set `use_repetitions: false` and never reach here.
-            # R2R is exempt: it builds BOTH halves from the input repetition, so a
-            # one-repetition group is not a degenerate case for it -- it is the
-            # case it exists to serve. Skipping here would discard exactly the
-            # single-excitation data the arm is meant to prove it can use.
-            if self.use_repetitions and self.target_mode != "r2r" and len(kspace_reps) < 2:
-                raise _SkipSampleError(
-                    f"[M4Raw] idx={idx} contrast={contrast_name}: only "
-                    f"{len(kspace_reps)} of {len(rep_paths)} repetitions loaded. "
-                    "The NEX target would be the input itself (SNR boost "
-                    "sqrt(1)=1.0), so the sample teaches the identity rather "
-                    "than denoising. Fix the unreadable file(s), or set "
-                    "data.use_repetitions: false to declare that intent."
+            self._refuse_identity_target(kspace_reps, len(rep_paths), context)
+            # Repetition 0 unless the training split declared `input_repetition:
+            # random`; the target below is aligned to whichever is chosen.
+            k = self._draw_input(len(kspace_reps))
+
+            # The group's coil maps, read once per load when the arm declares a
+            # map root; the split and every consumer downstream share them.
+            maps, maps_source = (
+                self._coil_maps.maps_for(rep_paths[0].stem, kspace_reps, slice_index=slice_index)
+                if self._coil_maps is not None
+                else (None, None)
+            )
+
+            # Input = one repetition (noisy), Target = averaged reps (high-SNR)
+            input_kspace = kspace_reps[k].clone()
+            # The repetition as acquired, kept when the split below replaces the
+            # input and this dataset's own chain measures the k-space scale on it
+            # (deployment sees y, not y + alpha*z). Nothing else reads the key.
+            measured_kspace = None
+            shifts = None
+            # Sigma_n is a receive-chain property, so it is keyed on the group's
+            # repetition 0, the file it is fitted on, never on the slice.
+            scan_key = str(rep_paths[0])
+            fit_kspace = self._sigma_fit_source(rep_paths[0], kspace_reps[0], stored_paths)
+            if self.target_mode in _SINGLE_REP_SPLIT_MODES:
+                if consumes_measured_input(self.transform):
+                    measured_kspace = kspace_reps[0]
+                # Both halves come from THIS single repetition, split here on raw
+                # k-space: registry transforms run AFTER normalization, which
+                # would rescale an r2r draw away from Sigma_n.
+                split = getattr(self, _SPLIT_METHODS[self.target_mode])
+                input_kspace, target_kspace = split(
+                    input_kspace, scan_key=scan_key, maps=maps, fit_kspace=fit_kspace
+                )
+            else:
+                loaded_paths = [rep_paths[i] for i in loaded]
+                shifts = self._group_shifts(loaded_paths, kspace_reps, stored_paths)
+                # Under a Noise2Noise pairing the strategy forms the target from the
+                # stack below, so no averaged target is built for this split.
+                target_kspace = (
+                    None
+                    if self.n2n_pairing is not None
+                    else self._nex_target(kspace_reps, context, input_index=k, shifts=shifts)
                 )
 
-            # Input = first repetition (noisy), Target = averaged reps (high-SNR)
-            input_kspace = kspace_reps[0].clone()
-            if self.target_mode == "r2r":
-                # Recorrupted-to-Recorrupted: both halves come from THIS single
-                # repetition. Injected here, on raw k-space, for two reasons a
-                # registered transform could not satisfy:
-                #   * registry transforms are appended AFTER normalization, so the
-                #     draw would be scaled by a per-subject factor and no longer
-                #     match Sigma_n;
-                #   * with ~24 % of phase-encode columns zero-filled, image-space
-                #     noise is spatially correlated, so it cannot be drawn there.
-                # Keyed on the GROUP, not the slice: Sigma_n is a receive-chain
-                # property, so one fit per scan serves every slice of it.
-                input_kspace, target_kspace = self._recorrupt_r2r(
-                    input_kspace, scan_key=str(rep_paths[0].parent / rep_paths[0].stem[:-2])
-                )
-            elif self.use_repetitions and len(kspace_reps) > 1:
-                # Leave-one-out only when it leaves >=2 reps to average (>=3
-                # total); with exactly 2 reps LOO would yield a single noisy
-                # rep, so fall back to the all-reps average.
-                _loo_requested = self.nex_target_exclude_input
-                _min_reps = _min_reps_for_leave_one_out(self.target_mode)
-                _exclude = 0 if (_loo_requested and len(kspace_reps) >= _min_reps) else None
-                if _loo_requested and _exclude is None:
-                    if self.nex_fallback == "error" or self.target_mode == "rep_pair":
-                        # A rep_pair group with one repetition has no pair at all:
-                        # the all-reps fallback would serve the input as its own
-                        # target (an identity task), so it is refused regardless.
-                        # The construction-time check covers declared groups; this
-                        # covers a group that lost reps to unreadable files.
-                        raise ValueError(
-                            f"[M4Raw] idx={idx} contrast={contrast_name}: leave-one-out "
-                            f"NEX target requested but only {len(kspace_reps)} "
-                            f"repetition(s) loaded (needs >= {_min_reps}); "
-                            "data.nex_fallback='error' refuses the correlated all-reps "
-                            "reference. Declare data.nex_fallback: all_reps to accept it."
-                        )
-                    self._note_loo_declined(len(kspace_reps))
-                target_kspace = _average_reps(kspace_reps, self.target_mode, exclude_index=_exclude)
-            else:
-                # Single clone suffices: input_kspace is already an independent
-                # clone of kspace_reps[0], so one clone keeps target independent
-                # too. backlog_wasted_compute_audit_2026_05_29 DATA-10.
-                target_kspace = kspace_reps[0].clone()
+            # Slot 0 is the served input; the rest are the split's target half or
+            # every other repetition in the input's frame, as `input_alt` is built.
+            rep_stack: list[torch.Tensor] | None = None
+            if self.n2n_pairing is not None:
+                if self.target_mode in _SINGLE_REP_SPLIT_MODES:
+                    rep_stack = [input_kspace, target_kspace]
+                else:
+                    rep_stack = [input_kspace]
+                    for j, other in enumerate(kspace_reps):
+                        if j == k:
+                            continue
+                        if shifts is not None:
+                            other = _register_to_anchor(
+                                [kspace_reps[k], other], [shifts[k], shifts[j]], 0
+                            )[1]
+                        rep_stack.append(_phase_align(other, kspace_reps[k]))
+                target_kspace = None
+
+            # A second noisy view of the input, in the input's frame, so a
+            # consumer can measure what the model does across repetitions.
+            alt_kspace = None
+            if self._emits_alternate_input():
+                j = (k + 1) % len(kspace_reps)
+                alt = kspace_reps[j]
+                if shifts is not None:
+                    alt = _register_to_anchor([kspace_reps[k], alt], [shifts[k], shifts[j]], 0)[1]
+                alt_kspace = _phase_align(alt, kspace_reps[k])
 
             # Apply coil processing (RSS combine if needed)
             if input_kspace.dim() == 4 and self.coil_processing_mode == "rss":
                 input_kspace = _rss_combine(input_kspace)
-                target_kspace = _rss_combine(target_kspace)
+                if target_kspace is not None:
+                    target_kspace = _rss_combine(target_kspace)
+                if rep_stack is not None:
+                    rep_stack = [_rss_combine(r) for r in rep_stack]
+                if alt_kspace is not None:
+                    alt_kspace = _rss_combine(alt_kspace)
+                if measured_kspace is not None:
+                    measured_kspace = _rss_combine(measured_kspace)
 
             # NOTE: k-space normalization is NOT applied here. The dataset
             # matches and serves; morphing belongs to the transform layer
@@ -1399,15 +2105,52 @@ class M4RawRepetitionDataset(Dataset):
                 return interleaved.permute(1, 2, 3, 0)  # (2C, H, W, S)
 
             input_t = _to_torchio_stacked(input_kspace)
-            target_t = _to_torchio_stacked(target_kspace)
 
             contrast_idx = _extract_contrast_idx(rep_paths[0].name)
             affine = np.eye(4)
             subject = tio.Subject(
                 input=tio.ScalarImage(tensor=input_t, affine=affine),
-                target=tio.ScalarImage(tensor=target_t, affine=affine),
-                kspace=tio.ScalarImage(tensor=target_t, affine=affine),
+                # Published explicitly because the batch context otherwise falls back
+                # to `kspace`, the target, and hands it to the model as y (#2761).
+                # Under r2r it is the split input, not the acquired repetition, since
+                # the two together determine the target exactly.
+                measured_kspace=tio.ScalarImage(tensor=input_t, affine=affine),
             )
+            if rep_stack is None:
+                target_t = _to_torchio_stacked(target_kspace)
+                subject.add_image(tio.ScalarImage(tensor=target_t, affine=affine), "target")
+                subject.add_image(tio.ScalarImage(tensor=target_t, affine=affine), "kspace")
+            else:
+                # No target is served: nothing downstream of the loader, ESPIRiT
+                # included, sees target information for this training sample.
+                stack_t = torch.cat([_to_torchio_stacked(r) for r in rep_stack], dim=0)
+                subject.add_image(tio.ScalarImage(tensor=stack_t, affine=affine), REPETITION_STACK_KEY)
+            if alt_kspace is not None:
+                subject.add_image(
+                    tio.ScalarImage(tensor=_to_torchio_stacked(alt_kspace), affine=affine),
+                    "input_alt",
+                )
+            if measured_kspace is not None:
+                subject.add_image(
+                    tio.ScalarImage(tensor=_to_torchio_stacked(measured_kspace), affine=affine),
+                    MEASURED_INPUT_KEY,
+                )
+            if maps is not None:
+                _attach_coil_maps(subject, maps, maps_source, self._coil_maps.calibration, affine)
+            if self._reference_maps is not None:
+                reference, _ = self._reference_maps.maps_for(
+                    rep_paths[0].stem, kspace_reps, slice_index=slice_index
+                )
+                subject.add_image(
+                    tio.ScalarImage(tensor=reference.permute(1, 2, 3, 0).contiguous(), affine=affine),
+                    REFERENCE_MAPS_KEY,
+                )
+            if self._publishes_noise_covariance():
+                # The scan's own Sigma_n in raw units, so a validation-time
+                # recorruption draws from the source the training split used.
+                subject["noise_covariance"] = self._scan_covariance(
+                    kspace_reps[0], scan_key, fit_kspace=fit_kspace
+                )
             subject["contrast_idx"] = torch.tensor(contrast_idx, dtype=torch.long)
             subject["file_id"] = rep_paths[0].stem
             # The identities latent in that name, made explicit. `subject_id` is
@@ -1419,7 +2162,9 @@ class M4RawRepetitionDataset(Dataset):
             _identity = parse_m4raw_file_id(rep_paths[0].stem)
             subject["subject_id"] = _identity.subject
             subject["repetition_group"] = _identity.repetition_group
-            subject["repetition_index"] = _identity.repetition
+            # The served input's repetition, which `input_repetition: random` makes
+            # differ from the group's first file.
+            subject["repetition_index"] = parse_m4raw_file_id(rep_paths[loaded[k]].stem).repetition
             # The contrast NAME, beside the index. `contrast_idx` alone forces
             # every consumer to carry a copy of the 0=T1/1=T2/2=FLAIR mapping,
             # and the per-case CSV writer is a generic reporting component that
@@ -1461,29 +2206,21 @@ class M4RawRepetitionDataset(Dataset):
             )
 
         # ---- Load and fuse source & target repetitions ------------------------------------
-        def process_reps(rep_paths: list[Path]) -> tuple[torch.Tensor, torch.Tensor]:
-            """process_reps.
+        def process_reps(rep_paths: list[Path], side: str) -> tuple[torch.Tensor, torch.Tensor]:
+            """Input (repetition 0) and NEX target of one side of the pair.
 
-            Args:
-                rep_paths (list[Path]): Description.
-            Returns:
-                tuple[torch.Tensor, torch.Tensor]: Description.
+            The target goes through the same builder as the single-contrast route,
+            so ``target_mode`` and ``nex_target_exclude_input`` hold here too (#2450).
             """
-            kspace_reps = _load_reps_or_skip(rep_paths, "cross-contrast group", slice_index)
-
-            # Pre-UNet Complex Repetition Fusion (Target 1.2) - fuse natively,
-            # or average them here since complex spatial repetition filters belong in the network.
-            # However, the network expects 16 channels total (8 T1 + 8 Target).
-            # M4Raw is 4 virtual coils = 8 real/imag channels.
-            # For data loader, we load all reps and average them to provide the max SNR k-space.
-            # (If the network dynamically handles reps via 1x1 conv, we would stack them along the coil dim,
-            # but standard models expect fixed channel counts).
-            # We will follow the existing averaging strategy for robust SNR.
+            context = f"idx={idx} {side}={rep_paths[0].stem[:-2]}"
+            loaded: list[int] = []
+            kspace_reps = _load_reps_or_skip(rep_paths, context, slice_index, loaded)
+            self._refuse_identity_target(kspace_reps, len(rep_paths), context)
             input_kspace = kspace_reps[0].clone()
-            if self.use_repetitions and len(kspace_reps) > 1:
-                target_kspace = torch.stack(kspace_reps, dim=0).mean(dim=0)
-            else:
-                target_kspace = kspace_reps[0].clone()
+            shifts = self._group_shifts(
+                [rep_paths[i] for i in loaded], kspace_reps, stored_paths
+            )
+            target_kspace = self._nex_target(kspace_reps, context, shifts=shifts)
 
             if kspace_reps[0].dim() == 4 and self.coil_processing_mode == "rss":
                 input_kspace = _rss_combine(input_kspace)
@@ -1491,19 +2228,20 @@ class M4RawRepetitionDataset(Dataset):
 
             return input_kspace, target_kspace
 
-        if self.target_mode == "r2r":
+        if self.target_mode in _SINGLE_REP_SPLIT_MODES:
             # The cross-contrast route pairs a SOURCE contrast with a different
-            # TARGET contrast; R2R's two halves are one contrast recorrupted
+            # TARGET contrast; a split's two halves are one contrast split
             # against itself. Composing them would silently produce a
             # contrast-translation target the arm never asked for.
             raise ValueError(
-                "[M4Raw] target_mode='r2r' is a single-contrast denoising target and "
-                "has no meaning in the cross-contrast route (which pairs two "
-                "different contrasts). Declare data.pairing.single_contrast: true."
+                f"[M4Raw] target_mode={self.target_mode!r} is a single-contrast "
+                "denoising target and has no meaning in the cross-contrast route "
+                "(which pairs two different contrasts). Declare "
+                "data.pairing.single_contrast: true."
             )
 
-        source_in, source_tgt = process_reps(source_paths)
-        target_in, target_tgt = process_reps(target_paths)
+        source_in, source_tgt = process_reps(source_paths, "source")
+        target_in, target_tgt = process_reps(target_paths, "target")
 
         # Log SNR improvement if multiple reps
         if self.use_repetitions:
@@ -1518,18 +2256,13 @@ class M4RawRepetitionDataset(Dataset):
         # transform (both driven by ``data.normalize_kspace``) double-divided
         # and double-log1p'd the k-space. See the single-contrast branch above.
 
-        # ---- Federated Channel Stacking (Target 1.1) -------------------
-        # Stack along coil dimension for network inputs.
-        # kspaces are (Slices, Coils, H, W). We cat on the Coils dimension.
-        # If dataset is RSS combined, dim is 3 (Slices, H, W), so we add a channel dim.
+        # RSS-combined k-space is (Slices, H, W); give it the coil axis the
+        # channel layout below expects.
         if source_in.dim() == 3:
             source_in = source_in.unsqueeze(1)
             target_in = target_in.unsqueeze(1)
             source_tgt = source_tgt.unsqueeze(1)
             target_tgt = target_tgt.unsqueeze(1)
-
-        input_kspace = torch.cat([source_in, target_in], dim=1)
-        target_kspace = torch.cat([source_tgt, target_tgt], dim=1)
 
         # Convert to TorchIO format (Real/Imag, Coils, H, W, Slices)
         # However, TorchIO is (Channels, H, W, Depth). We will treat Coils*2 as Channels.
@@ -1555,21 +2288,33 @@ class M4RawRepetitionDataset(Dataset):
 
             return interleaved.permute(1, 2, 3, 0)  # (2*Coils, H, W, Slices)
 
-        input_t = _to_torchio_multicoil_stacked(input_kspace)
-        target_t = _to_torchio_multicoil_stacked(target_kspace)
+        if self.source_layout != "stacked":
+            input_t = _to_torchio_multicoil_stacked(target_in)
+            target_t = _to_torchio_multicoil_stacked(target_tgt)
+        else:
+            input_t = _to_torchio_multicoil_stacked(torch.cat([source_in, target_in], dim=1))
+            target_t = _to_torchio_multicoil_stacked(torch.cat([source_tgt, target_tgt], dim=1))
 
-        # ---- Extract contrast index from target filename ----------
         contrast_idx = _extract_contrast_idx(target_paths[0].name)
 
-        # ---- Build TorchIO Subject -----------------------------------
         affine = np.eye(4)
-        subject = tio.Subject(
-            input=tio.ScalarImage(tensor=input_t, affine=affine),
-            target=tio.ScalarImage(tensor=target_t, affine=affine),
-            # 'kspace' alias should point to target (averaged) for consistency
-            # Some strategy code may use this as an alias
-            kspace=tio.ScalarImage(tensor=target_t, affine=affine),
-        )
+        images = {
+            "input": tio.ScalarImage(tensor=input_t, affine=affine),
+            "target": tio.ScalarImage(tensor=target_t, affine=affine),
+            # The strategy's coil-map estimator and several renderers read the
+            # fully sampled target under this alias.
+            "kspace": tio.ScalarImage(tensor=target_t, affine=affine),
+            # Without it the batch context resolves the measurement from `kspace`,
+            # the target (#2761).
+            "measured_kspace": tio.ScalarImage(tensor=input_t, affine=affine),
+        }
+        if self.source_layout == "separate":
+            # The source is the acquired repetition, not its NEX average: a
+            # deployed model receives one fully sampled source scan.
+            images["kspace_source"] = tio.ScalarImage(
+                tensor=_to_torchio_multicoil_stacked(source_in), affine=affine
+            )
+        subject = tio.Subject(**images)
         # Scalar metadata — preserved through TorchIO Queue patch sampling
         # and stacked automatically by ImageCollateStrategy
         subject["contrast_idx"] = torch.tensor(contrast_idx, dtype=torch.long)
@@ -1584,20 +2329,12 @@ class M4RawRepetitionDataset(Dataset):
         # it here would label all of them "T1" and make the column useless.
         subject["contrast"] = str(stored_paths.get("target_contrast", "UNKNOWN"))
 
-        # Federated cross-contrast split: input_kspace / target_kspace are built
-        # as ``cat([source, target], dim=coils)`` and then interleaved
-        # real/imag per coil. The downstream visualization needs to know where
-        # the TARGET-contrast portion starts so it can RSS only that half —
-        # otherwise it mixes T1 (source) and T2/FLAIR (target) anatomy into one
-        # PNG, which renders as a doubled / superimposed brain (the
-        # experiment_11 mosaic finding from 2026-05-13). The boundary is the
-        # midpoint of the channel axis because source and target carry the
-        # same coil count; we still expose it as an explicit index so future
-        # asymmetric layouts can override.
-        total_channels = int(target_t.shape[0])
-        subject["federated_target_channel_start"] = torch.tensor(
-            total_channels // 2, dtype=torch.long
-        )
+        if self.source_layout == "stacked":
+            # Source and target carry the same coil count, so the target starts
+            # at the channel midpoint; the image renderer slices there.
+            subject["federated_target_channel_start"] = torch.tensor(
+                int(target_t.shape[0]) // 2, dtype=torch.long
+            )
         if slice_index is not None:
             subject["slice_index"] = torch.tensor(slice_index, dtype=torch.long)
 
@@ -1747,86 +2484,3 @@ class M4RawRepetitionDataset(Dataset):
         if self.slice_level_records:
             counts["slice_records"] = len(self._groups)
         return counts
-
-
-# ---------------------------------------------------------------------------
-# Convenience factory
-# ---------------------------------------------------------------------------
-
-
-def build_m4raw_datasets(
-    manifest_path: str | Path,
-    data_root: str | Path = "",
-    train_split: float = 0.9,
-    # See M4RawRepetitionDataset.__init__ — normalization is the transform's job.
-    normalize_kspace: bool = False,
-    kspace_percentile: float = 0.99,
-    use_repetitions: bool = True,
-    train_transform=None,
-    val_transform=None,
-    log_scaling: bool = False,
-) -> tuple["M4RawRepetitionDataset", "M4RawRepetitionDataset"]:
-    """Load manifest and split into train/val datasets.
-
-    Args:
-        manifest_path: Path to ``.pkl`` manifest.
-        data_root: Base path for relative manifest entries.
-        train_split: Fraction of groups assigned to training (default 0.9).
-        normalize_kspace: Enable k-space magnitude normalization.
-        kspace_percentile: Normalization percentile.
-        use_repetitions: Enable rep averaging.
-        train_transform: TorchIO transform for training subjects.
-        val_transform: TorchIO transform for validation subjects.
-
-    Returns:
-        Tuple of (train_dataset, val_dataset).
-    """
-    from spectramr.data.metadata.path_resolver import PathResolver
-
-    manifest_path = Path(manifest_path)
-    with open(manifest_path, "rb") as fh:
-        manifest = pickle.load(fh)
-
-    if isinstance(manifest, dict):
-        raw_files = manifest.get("files", [])
-        manifest_root = manifest.get("data_root", "")
-    else:
-        raw_files = manifest
-        manifest_root = ""
-
-    effective_root = Path(data_root or manifest_root or ".")
-
-    h5_files: list[Path] = []
-    for entry in raw_files:
-        rel_path = entry.get("path", "") if isinstance(entry, dict) else str(entry)
-        if not rel_path:
-            continue
-        resolved = PathResolver.resolve(str(rel_path))
-        candidate = Path(resolved)
-        if not candidate.is_absolute():
-            candidate = effective_root / candidate
-        if candidate.exists():
-            h5_files.append(candidate)
-
-    split_n = max(1, int(train_split * len(h5_files)))
-    train_files = h5_files[:split_n]
-    val_files = h5_files[split_n:]
-
-    train_ds = M4RawRepetitionDataset(
-        train_files,
-        normalize_kspace=normalize_kspace,
-        kspace_percentile=kspace_percentile,
-        transform=train_transform,
-        use_repetitions=use_repetitions,
-        log_scaling=log_scaling,
-    )
-    val_ds = M4RawRepetitionDataset(
-        val_files or train_files,  # fallback for small datasets
-        normalize_kspace=normalize_kspace,
-        kspace_percentile=kspace_percentile,
-        transform=val_transform,
-        use_repetitions=use_repetitions,
-        log_scaling=log_scaling,
-    )
-
-    return train_ds, val_ds

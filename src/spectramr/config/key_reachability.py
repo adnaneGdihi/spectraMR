@@ -40,8 +40,7 @@ declaration, not consumption, which is the same zone rule the rg index uses.
 *Liveness evidence* (constructions, references, registry escapes) additionally
 reads ``runners/``, ``scripts/`` and ``tools/`` when they exist. Those are not
 entry points of the shipped package, but a class they construct is demonstrably
-alive, and ignoring them is exactly the trap that would delete live code:
-``runners/run_explicit.py`` constructs ``ComprehensiveLoggingService``.
+alive, and ignoring them is exactly the trap that would delete live code.
 ``tests/`` is excluded -- a test constructing a class does not make it reachable
 in production, and including it would make every class live.
 

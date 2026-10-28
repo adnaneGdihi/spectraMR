@@ -170,3 +170,37 @@ def test_window_attention_still_applies_a_correct_mask():
         unmasked = attention(tokens, mask=None)
     assert masked.shape == tokens.shape
     assert not torch.allclose(masked, unmasked)
+
+
+def _explicit_window_attention(m, x, mask):
+    """The pre-SDPA reference: scores + relative bias (+ shift mask), softmax, weighted sum."""
+    import torch
+
+    b_, N, C = x.shape
+    qkv = m.qkv(x).reshape(b_, N, 3, m.num_heads, C // m.num_heads).permute(2, 0, 3, 1, 4)
+    q, k, v = qkv[0] * m.scale, qkv[1], qkv[2]
+    attn = q @ k.transpose(-2, -1)
+    bias = m.relative_position_bias_table[m.relative_position_index.view(-1)].view(N, N, -1)
+    attn = attn + bias.permute(2, 0, 1).unsqueeze(0)
+    if mask is not None:
+        n_win = mask.shape[0]
+        attn = attn.view(b_ // n_win, n_win, m.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+        attn = attn.view(-1, m.num_heads, N, N)
+    out = (torch.softmax(attn, dim=-1) @ v).transpose(1, 2).reshape(b_, N, C)
+    return m.proj(out)
+
+
+def test_window_attention_sdpa_matches_explicit_softmax() -> None:
+    import torch
+
+    from spectramr.models.blocks.swin import WindowAttention
+
+    torch.manual_seed(0)
+    m = WindowAttention(dim=16, window_size=4, num_heads=2).eval()
+    torch.nn.init.normal_(m.relative_position_bias_table, std=0.5)
+    x = torch.randn(6, 16, 16)  # 3 images x n_win=2 windows, N = 4*4
+    shift_mask = torch.where(torch.rand(2, 16, 16) > 0.7, -100.0, 0.0)
+    for mask in (None, shift_mask):
+        torch.testing.assert_close(
+            m(x, mask), _explicit_window_attention(m, x, mask), rtol=1e-4, atol=1e-5
+        )

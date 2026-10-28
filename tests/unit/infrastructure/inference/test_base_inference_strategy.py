@@ -20,6 +20,7 @@ from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.inference import predict_data_consistency as pdc
 from spectramr.infrastructure.inference.base_inference_strategy import BaseInferenceStrategy
 from spectramr.models.capabilities import ModelCapabilities
+from tests.fixtures.run_state_files import write_run_state
 
 KNOB = "physics.data_consistency.apply_at_predict"
 
@@ -217,3 +218,91 @@ class TestConstructionRefusals:
         }
         with pytest.raises(ConfigurationError, match="must be a boolean"):
             _Plain(_Perturb(), torch.device("cpu"), cfg)
+
+
+def test_the_pipeline_owns_kspace_normalisation_by_default() -> None:
+    """Only a strategy that normalises inside ``infer`` opts out (#2581)."""
+    from spectramr.infrastructure.inference.base_inference_strategy import BaseInferenceStrategy
+    from spectramr.infrastructure.inference.reconstruction_inference_strategy import (
+        ReconstructionInferenceStrategy,
+    )
+
+    assert BaseInferenceStrategy.owns_kspace_normalization is False
+    assert ReconstructionInferenceStrategy.owns_kspace_normalization is False
+
+
+class TestEmaPartIsPreferred:
+    """Inference loads the run's ``ema`` part when ``use_ema`` (default on) and the
+    file kept one, else its ``generator``; both strict, into the bare model."""
+
+    @staticmethod
+    def _write(tmp_path, *, ema=None, generator=None):
+        return write_run_state(
+            tmp_path / "best.pt",
+            {"generator": generator or {"weight": torch.zeros(2, 2)}},
+            ema=ema,
+        )
+
+    def test_loads_the_ema_weights_by_default(self, tmp_path) -> None:
+        path = self._write(tmp_path, ema={"weight": torch.ones(2, 2)})
+        strategy = _Plain(nn.Linear(2, 2, bias=False), torch.device("cpu"), {})
+        strategy.load_checkpoint(str(path))
+        assert torch.equal(strategy.model.weight, torch.ones(2, 2))
+
+    def test_use_ema_false_loads_the_generator(self, tmp_path) -> None:
+        path = self._write(tmp_path, ema={"weight": torch.ones(2, 2)})
+        strategy = _Plain(nn.Linear(2, 2, bias=False), torch.device("cpu"), {"use_ema": False})
+        strategy.load_checkpoint(str(path))
+        assert torch.equal(strategy.model.weight, torch.zeros(2, 2))
+
+    def test_without_an_ema_part_the_generator_loads(self, tmp_path) -> None:
+        path = self._write(tmp_path, generator={"weight": torch.full((2, 2), 5.0)})
+        model = nn.Linear(2, 2, bias=False)
+        _Plain(model, torch.device("cpu"), {}).load_checkpoint(str(path))
+        assert torch.equal(model.weight, torch.full((2, 2), 5.0))
+
+    def test_a_partitioned_shadow_raises_instead_of_loading_garbage(self, tmp_path) -> None:
+        """ZeRO-3 builds the shadow from local partitions; the strict load must refuse it."""
+        path = self._write(tmp_path, ema={"weight": torch.ones(1, 2)})
+        strategy = _Plain(nn.Linear(2, 2, bias=False), torch.device("cpu"), {})
+        with pytest.raises(RuntimeError):
+            strategy.load_checkpoint(str(path))
+
+    def test_the_gan_loader_makes_the_same_choice(self, tmp_path) -> None:
+        from spectramr.infrastructure.inference.gan_inference_strategy import (
+            GANInferenceStrategy,
+        )
+
+        path = self._write(tmp_path, ema={"weight": torch.ones(2, 2)})
+        model = nn.Linear(2, 2, bias=False)
+        GANInferenceStrategy(model, torch.device("cpu"), {}).load_checkpoint(str(path))
+        assert torch.equal(model.weight, torch.ones(2, 2))
+
+        model = nn.Linear(2, 2, bias=False)
+        GANInferenceStrategy(model, torch.device("cpu"), {"use_ema": False}).load_checkpoint(
+            str(path)
+        )
+        assert torch.equal(model.weight, torch.zeros(2, 2))
+
+    def test_the_gan_loader_restores_a_configured_discriminator(self, tmp_path, monkeypatch) -> None:
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.inference.gan_inference_strategy import (
+            GANInferenceStrategy,
+        )
+        from spectramr.models.factories import model_factory
+
+        fake = SimpleNamespace(create_discriminator=lambda *_a, **_k: nn.Linear(2, 1, bias=False))
+        monkeypatch.setattr(model_factory, "get_model_factory", lambda: fake)
+        path = write_run_state(
+            tmp_path / "best.pt",
+            {"generator": {"weight": torch.zeros(2, 2)}, "discriminator": {"weight": torch.ones(1, 2)}},
+        )
+        strategy = GANInferenceStrategy(
+            nn.Linear(2, 2, bias=False),
+            torch.device("cpu"),
+            {"gan": {"discriminator": {"type": "patch_gan"}}},
+        )
+        strategy.load_checkpoint(str(path))
+        assert torch.equal(strategy.discriminator.weight, torch.ones(1, 2))
+        assert not strategy.discriminator.training

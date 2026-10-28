@@ -120,3 +120,13 @@ def test_single_channel_prediction_raises_instead_of_returning_nan() -> None:
     loss = HeteroscedasticULFLoss()
     with pytest.raises(ValueError, match="2-channel"):
         loss(prediction=torch.zeros(2, 1, 8, 8), target=torch.zeros(2, 1, 8, 8))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("sigma_target", "0.05"), ("lambda_var_prior", "0.1")]
+)
+def test_registered_loss_rejects_non_numeric_kwargs(key: str, value: str) -> None:
+    prediction = torch.zeros(2, 2, 4, 4)
+    target = torch.zeros(2, 1, 4, 4)
+    with pytest.raises(TypeError, match=key):
+        HeteroscedasticULFLoss()(prediction, target, **{key: value})

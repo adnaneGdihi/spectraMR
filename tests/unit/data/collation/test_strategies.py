@@ -139,6 +139,13 @@ class TestNonFiniteGuardDoesNotOverreach:
             result["target"]
         ).any(), "validate_nans=False must pass the inf through, not clamp it"
 
+    def test_finite_values_whose_sum_overflows_are_not_refused(self):
+        """The one-reduction fast path overflows here; the exact pass must clear it."""
+        strategy = ImageCollateStrategy()
+        big = torch.finfo(torch.float32).max
+        result = strategy.collate([{"target": torch.tensor([big, big])}])
+        assert torch.isfinite(result["target"]).all()
+
     def test_integer_tensor_is_not_checked_and_does_not_raise(self):
         """The guard skips non-float, non-complex dtypes.
 

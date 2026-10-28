@@ -117,7 +117,7 @@ def resolve_generator_kwargs(
     Raises:
         ValueError: If ``model_kwargs`` contradicts an SSOT block -- a declared
             ``kspace_log_scaled`` disagreeing with
-            ``data.processing.enable_log_scaling``, or a DC key disagreeing
+            :attr:`KSpaceNormalizationSpec.log_compressed`, or a DC key disagreeing
             with ``physics.data_consistency``. Both describe the same fact
             twice; silent divergence here previously disabled experiment-32a's
             adversarial training (pitfall #9).
@@ -139,45 +139,91 @@ def resolve_generator_kwargs(
     # 3a. Global acceleration config, only if the constructor accepts it.
     if hasattr(config, "undersampling") and "acceleration_config" in contract.accepted:
         kwargs["acceleration_config"] = config.undersampling
+        # The phase-encode axis the undersampling block's ``mask_direction``
+        # resolves through lives in ``data.acquisition`` (#2160); it reaches
+        # ``resolve_undersampling_kwargs`` beside the block, never inside it.
+        # Gated on EXPLICIT naming, as for ``device`` (3d): a key absorbed by
+        # ``**kwargs`` is recorded as unconsumed and can reach a strict sub-config.
+        acquisition = getattr(getattr(config, "data", None), "acquisition", None)
+        if acquisition is not None and "phase_encode_axis" in contract.accepted:
+            declared_axis = kwargs.get("phase_encode_axis")
+            if declared_axis is not None and declared_axis != acquisition.phase_encode_axis:
+                raise ValueError(
+                    f"model_kwargs.phase_encode_axis={declared_axis!r} disagrees with "
+                    f"data.acquisition.phase_encode_axis={acquisition.phase_encode_axis!r}; "
+                    "the data block is the single source of truth."
+                )
+            kwargs["phase_encode_axis"] = acquisition.phase_encode_axis
 
-    # 3a-bis. training.diffusion.sampler. The generator resolved this only from
-    #     model_kwargs, which nothing wrote, so the declared value never left
-    #     the config and every arm fell through to the `cold_mri` literal. The
-    #     value is injected here and validated by the generator that consumes
-    #     it -- a model that never reads `sampler` must not be refused for a
-    #     name its own reverse loop would never look up.
+    # 3a-bis. training.diffusion.sampler, only when the arm declared it: the schema
+    #     default names no sampler every generator registers (#2445). The consumer
+    #     validates it, since a model whose reverse loop never looks it up must not be refused.
     _diffusion = getattr(getattr(config, "training", None), "diffusion", None)
-    _declared_sampler = getattr(_diffusion, "sampler", None) if _diffusion else None
+    _declared_sampler = (
+        _diffusion.sampler
+        if _diffusion and "sampler" in getattr(_diffusion, "model_fields_set", ())
+        else None
+    )
     if _declared_sampler and "sampler" not in kwargs and (
         "sampler" in contract.accepted or contract.accepts_var_kwargs
     ):
         kwargs["sampler"] = str(_declared_sampler)
 
-    # 3b. data.processing.enable_log_scaling. The magnitude ceilings in the
-    #     cold-diffusion path enforce a PHYSICAL ratio, so they must know
-    #     whether the k-space they bound is log1p-compressed; without this a
-    #     declared reverse_clip_ratio of 1.3 realised 29.8x on real M4Raw data
-    #     (#1281). Reading the existing data-block knob keeps ONE source of
-    #     truth and adds no new YAML key.
+    # 3a-ter. training.diffusion.timesteps is the horizon the strategy samples t
+    #     from, so a generator that names ``num_timesteps`` takes its mask ladder
+    #     and time embedding from it; a model_kwargs copy must agree, and an agreeing
+    #     ``timesteps`` copy is folded in because x_diffusion's **kwargs would drop it.
+    _horizon = getattr(_diffusion, "timesteps", None) if _diffusion else None
+    if isinstance(_horizon, int) and "num_timesteps" in contract.accepted:
+        for key in ("timesteps", "num_timesteps"):
+            if key in kwargs and int(kwargs[key]) != _horizon:
+                raise ValueError(
+                    f"model_kwargs.{key}={kwargs[key]} disagrees with "
+                    f"training.diffusion.timesteps={_horizon}; the strategy samples t "
+                    "from the latter, so the generator's mask ladder and time "
+                    "embedding must use the same horizon. Declare it once."
+                )
+        if "timesteps" not in contract.accepted:
+            kwargs.pop("timesteps", None)
+        kwargs["num_timesteps"] = _horizon
+
+    # 3a-quater. training.diffusion.sampling_steps is the reverse budget validation resolves,
+    #     so a generator that names ``sampling_steps`` takes it and a model_kwargs copy must agree (#566).
+    _steps = getattr(_diffusion, "sampling_steps", None) if _diffusion else None
+    if isinstance(_steps, int) and "sampling_steps" in contract.accepted:
+        if "sampling_steps" in kwargs and int(kwargs["sampling_steps"]) != _steps:
+            raise ValueError(
+                f"model_kwargs.sampling_steps={kwargs['sampling_steps']} disagrees with "
+                f"training.diffusion.sampling_steps={_steps}; validation samples with the "
+                "latter. Declare it once."
+            )
+        kwargs["sampling_steps"] = _steps
+
+    # 3b. Whether the data path log1p-compresses k-space. The cold-diffusion
+    #     magnitude ceilings enforce a PHYSICAL ratio, so they must know what
+    #     they bound (#1281); KSpaceNormalizationSpec owns the answer (#2353).
     if "kspace_log_scaled" in contract.accepted:
-        try:
-            ssot = bool(config.data.processing.enable_log_scaling)
-        except AttributeError:
+        data = getattr(config, "data", None)
+        if getattr(data, "processing", None) is None:
             # No data.processing block: leave the kwarg unset. The generator
             # then raises at the point of use if (and only if) a magnitude
             # bound is actually enabled -- never a silent default.
             logger.debug(
-                "No data.processing.enable_log_scaling for %s; kspace_log_scaled left unset.",
+                "No data.processing block for %s; kspace_log_scaled left unset.",
                 model_type,
             )
         else:
+            from spectramr.data.transforms.normalization import KSpaceNormalizationSpec
+
+            ssot = KSpaceNormalizationSpec.from_data_config(data).log_compressed
             declared = kwargs.get("kspace_log_scaled")
             if declared is not None and bool(declared) != ssot:
                 raise ValueError(
                     "kspace_log_scaled is declared in model_kwargs as "
-                    f"{bool(declared)} but data.processing.enable_log_scaling "
-                    f"is {ssot}. These describe the same fact; remove the "
-                    "model_kwargs copy and let the data block be the single "
+                    f"{bool(declared)} but the data path compresses k-space: "
+                    f"{ssot} (data.processing.enable_kspace_normalization and "
+                    "enable_log_scaling). These describe the same fact; remove "
+                    "the model_kwargs copy and let the data block be the single "
                     "source of truth."
                 )
             kwargs["kspace_log_scaled"] = ssot

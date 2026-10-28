@@ -152,9 +152,11 @@ def _model_with_process(undersampling=None, *, timesteps: int = 28):
         resolve_undersampling_kwargs,
     )
 
+    # ``phase_encode_axis`` rides in the generator's kwargs, as
+    # ``resolve_generator_kwargs`` injects it from ``data.acquisition``.
     process = KSpaceUndersamplingProcess(
         num_timesteps=timesteps,
-        **resolve_undersampling_kwargs(undersampling or {}, {}),
+        **resolve_undersampling_kwargs(undersampling or {}, {"phase_encode_axis": -1}),
     )
     return SimpleNamespace(dc_layer=None, kspace_process=process)
 
@@ -279,6 +281,7 @@ def test_declared_values_survive_the_handoff():
     assert kwargs["min_center_fraction"] == 0.02
     assert kwargs["acceleration_schedule"] == "step"
     assert kwargs["mask_direction"] == "phase"
+    assert kwargs["phase_encode_axis"] == -1
     assert kwargs["enforce_nested"] is True
     assert kwargs["acceleration_range"] == [2.0, 4.0, 8.0, 10.0, 12.0, 16.0, 32.0]
 
@@ -297,6 +300,35 @@ def test_an_absent_undersampling_block_still_yields_one_owner():
     h.setup_kspace_components()
     assert h.mask_generator is model.kspace_process.mask_generator
 
+
+
+def test_the_acceleration_log_line_stamps_the_applied_schedule_power():
+    """The log line is the run's only record of the built ramp, so a declared
+    ``schedule_power`` must appear there as the value the accelerator took."""
+    from types import SimpleNamespace
+
+    from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+    lines: list[str] = []
+    h = _AccelHarness(
+        _model_with_process(
+            AccelerationConfigSchema(
+                acceleration_type="density_nested",
+                schedule_type="power_law",
+                schedule_power=0.5,
+                base_acceleration=1.0,
+                max_acceleration=32.0,
+            )
+        )
+    )
+    h.logging_service = SimpleNamespace(
+        log_info=lambda msg, **_: lines.append(msg), log_warning=lambda *a, **k: None
+    )
+    h.setup_kspace_components()
+    stamped = [ln for ln in lines if "Acceleration config" in ln]
+    assert stamped, lines
+    assert "schedule=power_law" in stamped[0]
+    assert "schedule_power=0.5" in stamped[0]
 
 # ---------------------------------------------------------------------------
 # _prepare_validation_data: the published scale must match the tensor it scales
@@ -399,6 +431,59 @@ def test_a_scalar_published_scale_still_covers_the_batch():
     assert scale_factor.flatten().tolist() == [9.0] * 4
 
 
+def _gated_harness(phase_encode_axis: int):
+    """A validation harness whose generator carries a real row- or column-mask process."""
+    from types import SimpleNamespace
+
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+    h = _ValidationHarness(enable_kspace_normalization=False)
+    h.config.model.in_channels = 2
+    process = KSpaceUndersamplingProcess(
+        num_timesteps=4,
+        max_acceleration=8.0,
+        base_acceleration=2.0,
+        center_fraction=0.08,
+        mask_type="equispaced",
+        schedule_type="linear",
+        mask_direction="phase",
+        phase_encode_axis=phase_encode_axis,
+    )
+    h.generator_model = SimpleNamespace(kspace_process=process)
+    return h, process
+
+
+def _partial_fov_val_batch() -> torch.Tensor:
+    """``(B, C, H, W, D)`` k-space, 40x64 plane, never-acquired columns at both edges.
+
+    D=3 differs from both plane sizes, so a gate that read the depth axis as
+    the plane's last would find no zero line and pass as inconclusive.
+    """
+    x = torch.randn(1, 2, 40, 64, 3)
+    x[:, :, :, :7] = 0
+    x[:, :, :, -5:] = 0
+    return x
+
+
+def test_the_validation_gate_raises_when_the_mask_removes_readout_lines():
+    """PLANTED (#2160): a row mask on data whose unacquired lines are columns."""
+    from spectramr.infrastructure.physics.line_axis_gate import LineAxisMismatchError
+
+    h, _ = _gated_harness(phase_encode_axis=-2)
+    batch = _partial_fov_val_batch()
+    with pytest.raises(LineAxisMismatchError, match="dim -1"):
+        h._prepare_validation_data(None, batch, batch.clone(), None)
+
+
+def test_the_validation_gate_records_agreement_once():
+    h, process = _gated_harness(phase_encode_axis=-1)
+    batch = _partial_fov_val_batch()
+    h._prepare_validation_data(None, batch, batch.clone(), None)
+    record = process.line_axis_gate["validation"]
+    assert record["verdict"] == "agree" and record["zero_lines_dim_-1"] == 12
+    assert record["shape"] == [40, 64]
+
+
 def test_an_unalignable_scale_raises_instead_of_reaching_the_multiply():
     """A length that does not divide has no benign reading (non-negotiable 3).
 
@@ -416,17 +501,13 @@ def test_an_unalignable_scale_raises_instead_of_reaching_the_multiply():
 
 
 # ---------------------------------------------------------------------------
-# #1917 -- the asymmetric-degradation write in ``generate_and_process_mask``
-#
-# ``expand_mask_to_channels`` widens [B, 1, H, W] -> [B, C, H, W] with
-# ``Tensor.expand``, i.e. a stride-0 broadcast view: all C channels alias one
-# row of memory. Ten of its eleven callers only multiply by the mask, so the
-# cheap view is the right contract and must stay. The eleventh writes into it,
-# and therefore owns the copy. These pin both halves of that split.
+# #2452 -- the diffusion state holds the target contrast alone, so the mask
+# builder degrades every channel it is given. A source contrast reaches the
+# generator as its reference and never passes through here.
 # ---------------------------------------------------------------------------
 
 
-class _AsymMaskHarness(KspaceMixin):
+class _MaskHarness(KspaceMixin):
     """Carrier exposing only what ``generate_and_process_mask`` reads."""
 
     def __init__(self, target_channels: int | None, out_channels: int) -> None:
@@ -441,10 +522,10 @@ class _AsymMaskHarness(KspaceMixin):
             data=SimpleNamespace(domain=SimpleNamespace(target_channels=target_channels)),
             model=SimpleNamespace(out_channels=out_channels),
         )
-        self.mask_generator = KSpaceMaskGenerator()
+        self.mask_generator = KSpaceMaskGenerator(num_timesteps=1000)
 
 
-def _run_mask(h: "_AsymMaskHarness", mask: torch.Tensor, c_total: int) -> torch.Tensor:
+def _run_mask(h: "_MaskHarness", mask: torch.Tensor, c_total: int) -> torch.Tensor:
     b, _, height, width = mask.shape
     return h.generate_and_process_mask(
         batch_size=b,
@@ -455,57 +536,31 @@ def _run_mask(h: "_AsymMaskHarness", mask: torch.Tensor, c_total: int) -> torch.
     )
 
 
-def test_asymmetric_write_survives_the_expanded_broadcast_view():
-    """Shape 1: a [B, 1, H, W] mask widened to C_total is a stride-0 view.
+@pytest.mark.parametrize("target_channels", [8, None])
+def test_no_channel_is_forced_fully_sampled(target_channels):
+    """A channel count wider than target_channels no longer marks a source half.
 
-    Before the fix this raised ``RuntimeError: ... more than one element of the
-    written-to tensor refers to a single memory location``. The TI-CCD split
-    (C_total=16, target_channels=8) is the shape the k-space cohort delivers.
+    The carve-out that wrote 1.0 into the leading channels was one of four
+    spellings of the source split (#2452); planted here on the shape it fired on.
     """
-    h = _AsymMaskHarness(target_channels=8, out_channels=8)
+    h = _MaskHarness(target_channels=target_channels, out_channels=4)
     mask = torch.zeros(2, 1, 8, 8)
     mask[:, :, :, ::2] = 1.0
 
     out = _run_mask(h, mask, c_total=16)
 
     assert out.shape == (2, 16, 8, 8)
-    # Source half forced fully sampled, target half left at the sampled pattern.
-    assert bool(out[:, :8].eq(1.0).all())
-    assert torch.equal(out[:, 8:], mask.expand(-1, 8, -1, -1))
+    assert torch.equal(out, mask.expand(-1, 16, -1, -1))
 
 
-def test_asymmetric_write_does_not_mutate_the_caller_s_batch():
-    """Shape 2: a mask that ALREADY has C_total channels is returned unchanged.
-
-    ``.to(device).float()`` is a no-op for an already-float tensor on the same
-    device, so without the copy the write reached through into
-    ``batch_data["mask"]`` and pinned the source channels to 1.0 for every later
-    consumer of that batch. That failure is silent -- no exception, wrong data.
-    """
-    h = _AsymMaskHarness(target_channels=8, out_channels=8)
+def test_mask_builder_does_not_mutate_the_caller_s_batch():
+    h = _MaskHarness(target_channels=8, out_channels=8)
     mask = torch.zeros(2, 16, 8, 8)
     before = mask.clone()
 
-    out = _run_mask(h, mask, c_total=16)
+    _run_mask(h, mask, c_total=16)
 
-    assert bool(out[:, :8].eq(1.0).all())
     assert torch.equal(mask, before), "generate_and_process_mask mutated its input"
-
-
-def test_asymmetric_write_survives_on_the_legacy_equal_split_branch():
-    """Shape 3: ``target_channels=None`` falls to the C_total // 2 branch.
-
-    That branch carries the same in-place write, so it needs the same copy; a
-    fix applied to only the first branch would leave it crashing.
-    """
-    h = _AsymMaskHarness(target_channels=None, out_channels=4)
-    mask = torch.zeros(2, 1, 8, 8)
-    mask[:, :, :, ::2] = 1.0
-
-    out = _run_mask(h, mask, c_total=16)
-
-    assert out.shape == (2, 16, 8, 8)
-    assert bool(out[:, :8].eq(1.0).all())
 
 
 def test_expand_mask_to_channels_still_returns_a_cheap_broadcast_view():
@@ -520,7 +575,111 @@ def test_expand_mask_to_channels_still_returns_a_cheap_broadcast_view():
         KSpaceMaskGenerator,
     )
 
-    widened = KSpaceMaskGenerator().expand_mask_to_channels(torch.zeros(2, 1, 8, 8), 16)
+    widened = KSpaceMaskGenerator(num_timesteps=1000).expand_mask_to_channels(torch.zeros(2, 1, 8, 8), 16)
 
     assert widened.shape == (2, 16, 8, 8)
     assert widened.stride()[1] == 0, "channel dim must still alias, not be copied"
+
+
+def _declared(h, acquired_pe_lines):
+    from types import SimpleNamespace
+
+    h.config.data.acquisition = SimpleNamespace(
+        phase_encode_axis=-1, acquired_pe_lines=acquired_pe_lines
+    )
+    return h
+
+
+def test_a_declared_count_that_disagrees_with_the_validation_batch_raises():
+    """PLANTED (#2160): the batch acquires 52 of 64 columns, the arm declares 60."""
+    h, _ = _gated_harness(phase_encode_axis=-1)
+    _declared(h, {"T1": 60})
+    batch = _partial_fov_val_batch()
+    with pytest.raises(ValueError, match="T1: declared 60, measured 52"):
+        h._prepare_validation_data(None, batch, batch.clone(), {"contrast": ["T1"]})
+
+
+def test_a_matching_declared_count_is_recorded_once():
+    h, process = _gated_harness(phase_encode_axis=-1)
+    _declared(h, {"T1": 52})
+    batch = _partial_fov_val_batch()
+    h._prepare_validation_data(None, batch, batch.clone(), {"contrast": ["T1"]})
+    assert process.line_axis_gate["validation_acquired_lines"]["measured"] == [52]
+
+
+def test_the_validation_measurement_mask_counts_r_over_acquired_lines():
+    """The rung that builds ``masked_input`` uses the same support as training."""
+    h, process = _gated_harness(phase_encode_axis=-1)
+    h.mask_generator = process.mask_generator
+    batch = _partial_fov_val_batch().movedim(-1, 1).flatten(0, 1)
+    acquired = process.acquired_lines(batch)
+    mask = h.generate_and_process_mask(
+        batch.shape[0], torch.full((batch.shape[0],), 3), batch.shape, acquired=acquired
+    )
+    lines = (mask[:, 0] > 0).any(dim=-2)
+    assert not bool((lines & ~acquired).any())
+
+
+# ---------------------------------------------------------------------------
+# The mask INFO line (and its ``mask.sum().item()``) fires on a real step only:
+# validation passes ``current_step=0``, which satisfied the modulo every call.
+# ---------------------------------------------------------------------------
+
+
+class _LogHarness(KspaceMixin):
+    def __init__(self) -> None:
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        self.device = torch.device("cpu")
+        self.config = SimpleNamespace(
+            data=SimpleNamespace(domain=SimpleNamespace(target_channels=None)),
+            model=SimpleNamespace(out_channels=1),
+        )
+        self.mask_generator = SimpleNamespace(
+            default_pattern="stub",
+            generate_batch_masks=lambda batch_size, timesteps, image_shape, pattern: torch.ones(
+                batch_size, 1, *image_shape
+            ),
+            expand_mask_to_channels=lambda m, c: m,
+        )
+        self._cached_log_interval = 10
+        self.logging_service = MagicMock()
+        self.logging_service.logger.isEnabledFor = lambda lvl: lvl >= logging.INFO
+
+
+def _gen_mask(h: "_LogHarness", step: int) -> int:
+    """Run the generator; return how many ``Tensor.item`` calls it made."""
+    calls = 0
+    original = torch.Tensor.item
+
+    def _counted(self):
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    torch.Tensor.item = _counted
+    try:
+        h.generate_and_process_mask(
+            batch_size=2,
+            timesteps=torch.zeros(2, dtype=torch.long),
+            target_shape=(2, 1, 8, 8),
+            current_step=step,
+            batch_data=None,
+        )
+    finally:
+        torch.Tensor.item = original
+    return calls
+
+
+def test_step_zero_neither_syncs_nor_logs_the_mask_line():
+    h = _LogHarness()
+    assert _gen_mask(h, 0) == 0
+    h.logging_service.log_info.assert_not_called()
+
+
+def test_a_real_step_on_the_interval_still_logs_the_mask_line():
+    h = _LogHarness()
+    assert _gen_mask(h, 10) > 0
+    h.logging_service.log_info.assert_called_once()

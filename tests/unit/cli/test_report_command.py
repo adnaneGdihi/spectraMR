@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 
 from spectramr.cli import app
+from spectramr.config.schemas.logging import LoggingConfigSchema
 
 
 class _Rep:
@@ -39,6 +40,7 @@ class _Run:
 
 
 class _Settings:
+    logging = LoggingConfigSchema()
     reporting = _Rep()
     run = _Run()
     # The RETIRED top-level spelling, kept as a decoy. `RENAMES` moved `seed`
@@ -136,3 +138,82 @@ def test_recursive_no_runs_found(tmp_path, monkeypatch):
                         lambda root, **kw: {"runs": [], "index": None,
                                             "n_runs": 0, "n_ok": 0})
     assert app.report(_ns(exp, recursive=True)) == 0
+
+
+# ---- contrast folders and the all-metrics flags ------------------------------------
+
+
+def _cohort(root):
+    from tests.unit.infrastructure.reporting.comparison._runs import (
+        add_inference_results,
+        add_slice_rows,
+        make_run,
+    )
+
+    for seed, (name, shift) in enumerate((("arm_base", 0.0), ("arm_better", 1.0))):
+        run = make_run(root, name, shift=shift)
+        add_slice_rows(run, offset=shift, seed=seed)
+        add_inference_results(run, offset=shift)
+    return root
+
+
+def _contrast_ns(**over):
+    base = {
+        "exp_dir": None, "contrasts": None, "contrast_pairs": None, "out_root": None,
+        "only": None, "results_root": None, "baseline": None, "view": "selected",
+        "style": None, "html": False, "metrics": None, "phases": None,
+        "max_panels": 12, "train_window": 50,
+    }
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def test_exp_dir_is_required_without_contrasts(capsys):
+    from spectramr.cli.app import report
+
+    assert report(_ns(None)) == 2
+    assert "--exp-dir is required" in capsys.readouterr().out
+
+
+def test_contrast_pairs_write_one_folder_per_arm_for_any_cohort(tmp_path, capsys):
+    from spectramr.cli.app import report
+
+    cohort = _cohort(tmp_path / "cohort")
+    code = report(
+        _contrast_ns(exp_dir=cohort, contrast_pairs="vs_baseline", baseline="arm_base",
+                     phases="val,test")
+    )
+    assert code == 0
+    folder = cohort / "contrasts" / "arm_better__vs__arm_base"
+    assert (folder / "data" / "paired_stats.csv").is_file()
+    assert (folder / "data" / "metrics_test.csv").is_file()
+    assert not (folder / "data" / "metrics_train.csv").exists()
+    assert "arm_better__vs__arm_base" in capsys.readouterr().out
+
+
+def test_contrasts_and_contrast_pairs_together_are_refused(tmp_path, capsys):
+    from spectramr.cli.app import report
+
+    code = report(_contrast_ns(contrasts=tmp_path / "x.yaml", contrast_pairs="pairs"))
+    assert code == 2 and "not both" in capsys.readouterr().out
+
+
+def test_a_contrast_file_needs_an_out_root(tmp_path, capsys):
+    import yaml
+
+    from spectramr.cli.app import report
+
+    spec = tmp_path / "set.yaml"
+    spec.write_text(yaml.safe_dump({"contrasts": [{"name": "c", "arms": ["a", "b"]}]}))
+    assert report(_contrast_ns(contrasts=spec)) == 2
+    assert "--out-root" in capsys.readouterr().out
+
+
+def test_metric_flags_become_keyword_arguments():
+    from spectramr.cli.app import _metric_flags
+
+    assert _metric_flags(_contrast_ns(metrics="all", phases="val, test")) == {
+        "metrics": "all", "phases": ("val", "test"), "max_panels": 12, "train_window": 50,
+    }
+    assert _metric_flags(_contrast_ns(metrics="psnr, cjv"))["metrics"] == ["psnr", "cjv"]
+    assert "metrics" not in _metric_flags(_contrast_ns())

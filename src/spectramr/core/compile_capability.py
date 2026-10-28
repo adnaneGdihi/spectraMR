@@ -15,6 +15,7 @@ own ``_CUDA_ONLY`` check.
 from __future__ import annotations
 
 __all__ = [
+    "MIN_TRITON_CAPABILITY",
     "CompileUnsupportedError",
     "compile_backend_for",
     "triton_available",
@@ -29,17 +30,30 @@ _TRITON_BACKED = frozenset({"cuda"})
 
 _KNOWN_DEVICE_TYPES = frozenset({"cuda", "cpu", "mps"})
 
+#: Triton emits no kernels below sm_70 (``torch._inductor.exc.GPUTooOldForTriton``),
+#: so Inductor fails on the P100 (sm_60) nodes the sbatch scripts can land on.
+MIN_TRITON_CAPABILITY = (7, 0)
+
 
 class CompileUnsupportedError(RuntimeError):
     """Compilation was requested where this device cannot support it."""
 
 
-def compile_backend_for(device_type: str, *, triton: bool) -> str:
+def compile_backend_for(
+    device_type: str, *, triton: bool, capability: tuple[int, int] | None
+) -> str:
     """The ``torch.compile`` backend for *device_type*, or raise.
 
     Raises rather than returning a fallback: a run that asked to be compiled and
     silently was not reports throughput belonging to a different configuration —
     the reasoning that made ``ModelBuilder.compile`` stop swallowing failures.
+
+    Args:
+        device_type: ``"cuda"`` / ``"cpu"`` / ``"mps"``.
+        triton: Whether Triton can emit device kernels in this process.
+        capability: The CUDA compute capability of the device the run compiles
+            on. Required on CUDA, where an unknown capability raises: the
+            Triton floor cannot be checked against a device nobody could read.
     """
     if device_type not in _KNOWN_DEVICE_TYPES:
         raise ValueError(
@@ -53,6 +67,22 @@ def compile_backend_for(device_type: str, *, triton: bool) -> str:
             "usually means a CPU-only build. Install a CUDA wheel, or set "
             "optimization.compile.enabled: false to run eager on purpose."
         )
+    if device_type in _TRITON_BACKED:
+        if capability is None:
+            raise CompileUnsupportedError(
+                f"torch.compile on {device_type!r} needs the device's compute capability to "
+                f"check Triton's sm_{MIN_TRITON_CAPABILITY[0]}{MIN_TRITON_CAPABILITY[1]} "
+                "floor, and it could not be read. Set SPECTRAMR_TARGET_COMPUTE_CAPABILITY, "
+                "or disable compilation."
+            )
+        if tuple(capability) < MIN_TRITON_CAPABILITY:
+            raise CompileUnsupportedError(
+                f"torch.compile/DeepCompile (Inductor) on compute capability "
+                f"{capability[0]}.{capability[1]}: Triton supports only "
+                f">= {MIN_TRITON_CAPABILITY[0]}.{MIN_TRITON_CAPABILITY[1]}, so this node "
+                "(e.g. a P100) cannot compile. Request a V100/Ada node, or set "
+                "optimization.compile.enabled / parallel.deepspeed.compile.enabled: false."
+            )
     return _COMPILE_BACKEND
 
 

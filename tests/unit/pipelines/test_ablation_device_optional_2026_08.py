@@ -69,3 +69,42 @@ def test_train_and_score_forwards_an_explicit_device(monkeypatch):
 
     ablation_mod.train_and_score(config=object(), device="cpu")
     assert seen["device"] == "cpu"
+
+
+def test_a_result_without_a_success_flag_is_not_scored(monkeypatch):
+    """#181: an absent flag used to default to True and the variant was scored."""
+    import spectramr.pipelines.train as train_mod
+
+    monkeypatch.setattr(train_mod, "run_training_pipeline", lambda *a, **k: {})
+    result = ablation_mod.train_and_score(config=object())
+    assert result["success"] is False
+    assert "no success flag" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("final_loss", "expected"),
+    [(None, "absent"), (0.25, 0.25)],
+    ids=["none_is_omitted", "float_passes_through"],
+)
+def test_final_loss_none_does_not_raise(monkeypatch, tmp_path, final_loss, expected):
+    """The training result carries ``final_loss=None`` when no g_total_loss was recorded."""
+    import spectramr.pipelines.train as train_mod
+
+    monkeypatch.setattr(
+        train_mod,
+        "run_training_pipeline",
+        lambda *a, **k: {"success": True, "final_loss": final_loss},
+    )
+    monkeypatch.setattr(
+        ablation_mod, "_resolve_validation_metrics_csv", lambda cfg: tmp_path / "none.csv"
+    )
+    monkeypatch.setattr(train_mod, "_summarise_best_metrics_from_csv", lambda p: {})
+
+    metrics = ablation_mod.train_and_score(config=object())
+
+    assert metrics["success"] is True
+    if expected == "absent":
+        assert "final_loss" not in metrics
+    else:
+        assert metrics["final_loss"] == expected
+        assert isinstance(metrics["final_loss"], float)

@@ -170,3 +170,43 @@ def test_spec_rejects_unknown_scale_domain():
         KSpaceNormalizationSpec.from_data_config(
             dict(ARM_DATA_CFG, kspace_scale_domain="parseval")
         )
+
+
+def test_the_volume_scale_does_not_depend_on_the_batch_size():
+    """Training measures one scale per volume; predict measured one per batch.
+
+    Normalising a 4-slice volume in batches of 1 and of 2 with the volume's scale gives
+    the slices the full-volume normalisation. Planted: the per-batch scale does not.
+    """
+    strategy = _cold_strategy(ARM_DATA_CFG)
+    volume = _multicoil_kspace(batch=4)
+    volume[2:] *= 5.0  # slices of one volume at different intensities
+    scale = strategy.volume_kspace_scale(volume, per_slice=False)
+    assert scale.shape == (4,) and torch.all(scale == scale[0])
+
+    full = strategy.preprocess_input(volume.clone(), kspace_scale=scale)
+    for size in (1, 2):
+        parts = [
+            strategy.preprocess_input(volume[i : i + size].clone(), kspace_scale=scale[i : i + size])
+            for i in range(0, 4, size)
+        ]
+        torch.testing.assert_close(torch.cat(parts), full)
+    per_batch = torch.cat([strategy.preprocess_input(volume[i : i + 2].clone()) for i in (0, 2)])
+    assert not torch.allclose(per_batch, full)
+
+
+def test_a_slice_level_arm_gets_one_scale_per_slice():
+    strategy = _cold_strategy(ARM_DATA_CFG)
+    volume = _multicoil_kspace(batch=3)
+    volume[1] *= 4.0
+    scale = strategy.volume_kspace_scale(volume, per_slice=True)
+    assert scale[1] == pytest.approx(4.0 * scale[0], rel=1e-2)
+
+
+def test_the_volume_scale_round_trips_through_denormalize():
+    strategy = _cold_strategy(ARM_DATA_CFG)
+    volume = _multicoil_kspace(batch=2)
+    scale = strategy.volume_kspace_scale(volume, per_slice=False)
+    normed = strategy.preprocess_input(volume.clone(), kspace_scale=scale)
+    restored = strategy.denormalize_kspace(normed)
+    assert torch.allclose(restored, volume, rtol=1e-3, atol=1e-4 * volume.abs().max())

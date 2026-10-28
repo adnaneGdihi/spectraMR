@@ -377,6 +377,56 @@ def test_an_unrecognised_allowlist_key_is_named_not_silently_dropped(tmp_path, m
         det._load_allowlist()
 
 
+# ---------------------------------------------------------------------------
+# #2340: data/ may import the physics SSOT, and nothing else from infrastructure.
+# Each carve-out plant comes with its mutation: with LAYER_EXEMPT emptied, the
+# same physics import must be caught again.
+# ---------------------------------------------------------------------------
+
+DATA_PHYSICS = [
+    "spectramr.infrastructure.physics.fft_ops",
+    "spectramr.infrastructure.physics.coil_sensitivity",
+]
+DATA_STILL_FORBIDDEN = [
+    "spectramr.infrastructure.errors",
+    "spectramr.infrastructure.io.adapters",
+    "spectramr.infrastructure.training.utils.kspace_masks",
+    # A sibling whose name merely STARTS with "physics" is not the SSOT.
+    "spectramr.infrastructure.physics_extras",
+]
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+@pytest.mark.parametrize("module", DATA_PHYSICS)
+def test_data_may_import_the_physics_ssot(tmp_path, module: str, shape: str) -> None:
+    assert _scan(_plant(tmp_path, {"data/planted.py": SHAPES[shape](module)})) == set()
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+@pytest.mark.parametrize("module", DATA_STILL_FORBIDDEN)
+def test_the_carve_out_does_not_widen_past_physics(tmp_path, module: str, shape: str) -> None:
+    found = _scan(_plant(tmp_path, {"data/planted.py": SHAPES[shape](module)}))
+    assert ("spectramr/data/planted.py", module) in found
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+@pytest.mark.parametrize("module", DATA_PHYSICS)
+def test_removing_the_carve_out_catches_the_physics_import_again(
+    tmp_path, monkeypatch, module: str, shape: str
+) -> None:
+    monkeypatch.setattr(det, "LAYER_EXEMPT", {})
+    found = _scan(_plant(tmp_path, {"data/planted.py": SHAPES[shape](module)}))
+    assert ("spectramr/data/planted.py", module) in found
+
+
+@pytest.mark.parametrize("layer", ["core", "domain"])
+def test_the_carve_out_is_scoped_to_data(tmp_path, layer: str) -> None:
+    """core/ and domain/ keep forbidding all of infrastructure pending #1398."""
+    module = "spectramr.infrastructure.physics.fft_ops"
+    found = _scan(_plant(tmp_path, {f"{layer}/planted.py": _top_level(module)}))
+    assert (f"spectramr/{layer}/planted.py", module) in found
+
+
 def test_the_key_guard_accepts_the_real_file() -> None:
     """Discrimination: the guard above must not fire on the committed allowlist."""
     layer_known, nonpackage_known = det._load_allowlist()

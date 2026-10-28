@@ -281,7 +281,6 @@ def _format_card(
     adapter_hooks = (
         "pre_model",
         "post_model",
-        "pre_loss_pred",
         "pre_loss_target",
         "pre_metric",
     )

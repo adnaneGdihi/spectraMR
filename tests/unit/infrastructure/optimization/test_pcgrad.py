@@ -82,6 +82,34 @@ class TestPCGrad:
         assert torch.allclose(projected[0], g_secondary[0])
 
 
+    def test_non_contiguous_gradients_are_projected(self):
+        """autograd.grad can return a non-contiguous gradient (e.g. through a transpose).
+
+        ``view(-1)`` raised on it and killed physics 50 and 51 at step 1 once their
+        discriminator was built (sabine job 17886489).
+        """
+        g_p = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).t()
+        g_s = -torch.tensor([[1.0, 0.5], [0.0, 1.0], [1.0, 0.0]]).t()
+        assert not g_p.is_contiguous() and not g_s.is_contiguous()
+        (out,) = project_conflicting_gradients([g_p], [g_s])
+        assert out.shape == g_s.shape
+        assert torch.dot(out.reshape(-1), g_p.reshape(-1)).abs() < 1e-5
+
+    def test_projection_never_syncs_to_the_host(self, monkeypatch):
+        """The conflict test is a tensor op: no ``bool(tensor)`` per parameter per step."""
+
+        def no_sync(self):
+            raise AssertionError("host sync in project_conflicting_gradients")
+
+        g_p = [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 0.0])]
+        g_s = [torch.tensor([-1.0, 1.0]), torch.tensor([1.0, 1.0])]
+        monkeypatch.setattr(torch.Tensor, "__bool__", no_sync)
+        out = project_conflicting_gradients(g_p, g_s)
+        monkeypatch.undo()
+        assert torch.allclose(out[0], torch.tensor([0.0, 1.0]))
+        assert torch.allclose(out[1], torch.tensor([1.0, 1.0]))  # zero primary: unchanged
+
+
 class TestApplyPCGradToLosses:
     """apply_pcgrad_to_losses must not crash when the two losses touch
     different parameter sets (allow_unused=True yields None secondary grads)."""

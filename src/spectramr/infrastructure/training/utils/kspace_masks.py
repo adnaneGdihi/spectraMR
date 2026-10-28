@@ -33,7 +33,7 @@ class KSpaceMaskGenerator:
 
     def __init__(
         self,
-        num_timesteps: int = 1000,
+        num_timesteps: int,
         device: torch.device | None = None,
         default_pattern: str = "linear",
         accelerator_kwargs: dict[str, Any] | None = None,
@@ -91,6 +91,34 @@ class KSpaceMaskGenerator:
         if overrides:
             merged.update(overrides)
         return merged
+
+    def applied_record(self, pattern: str | None = None) -> dict[str, Any]:
+        """The family and parameters this generator masks with, for the snapshot provenance.
+
+        ``pattern`` is what the caller passes on every mask call; ``None`` means
+        the generator's default. Read from the kwargs it forwards, not from built
+        accelerators, because the first snapshot precedes the first mask.
+        """
+        declared = pattern or self.default_pattern
+        kwargs = self._accelerator_kwargs_for(declared)
+        unset = "<accelerator default>"
+        base, peak = kwargs.get("base_acceleration"), kwargs.get("max_acceleration")
+        seed = kwargs.get("seed", unset)
+        record = {
+            "pattern": declared,
+            "family": self._resolve_acceleration_type(declared),
+            "acceleration": unset if base is None or peak is None else [base, peak],
+            "center_fraction": kwargs.get("center_fraction", unset),
+            "min_center_fraction": kwargs.get("min_center_fraction", unset),
+            "acceleration_schedule": kwargs.get("acceleration_schedule", unset),
+            "enforce_nested": kwargs.get("enforce_nested", unset),
+            "mask_seed": "None: global RNG, redrawn per call" if seed is None else seed,
+        }
+        # A step schedule indexes the ladder, so [base, max] alone misstates it.
+        for key in ("acceleration_range", "density_power", "schedule_power"):
+            if key in kwargs:
+                record[key] = kwargs[key]
+        return record
 
     def _get_accelerator(
         self,
@@ -488,48 +516,8 @@ class KSpaceMaskGenerator:
         return undersampled_kspace, acceleration_masks
 
 
-class MaskScheduler:
-    """Scheduler for managing mask evolution across diffusion timesteps.
-
-    This class handles the progression of undersampling patterns
-    as training progresses through diffusion timesteps.
-    """
-
-    def __init__(self, num_timesteps: int = 1000):
-        """__init__.
-
-        Args:
-            num_timesteps (int): Description.
-        """
-        self.num_timesteps = num_timesteps
-
-    def get_acceleration_factor(self, timestep: int) -> float:
-        """Get acceleration factor for a given timestep.
-
-        Higher timesteps (more noise) can use higher acceleration factors.
-        """
-        # Linear progression from factor 2 to factor 8
-        progress = timestep / self.num_timesteps
-        factor = 2.0 + progress * 6.0
-        return min(factor, 8.0)
-
-    def get_mask_pattern(self, timestep: int) -> str:
-        """Get mask pattern for a given timestep.
-
-        Early timesteps use simple patterns, later timesteps
-        use complex patterns.
-        """
-        progress = timestep / self.num_timesteps
-
-        if progress < 0.3:
-            return "linear"
-        if progress < 0.7:
-            return "variable_density"
-        return "poisson_disk"
-
-
 def create_kspace_mask_generator(
-    num_timesteps: int = 1000,
+    num_timesteps: int,
     device: torch.device | None = None,
     default_pattern: str = "linear",
     accelerator_kwargs: dict[str, Any] | None = None,

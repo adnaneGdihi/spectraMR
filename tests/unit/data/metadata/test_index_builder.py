@@ -121,9 +121,23 @@ def _loso_cfg(**kw):
 
 
 def _load(path, split, **kw):
-    from spectramr.data.metadata.index_builder import IndexBuilder
+    """The LOSO partition is owned by ``paired_partition``; the reader only pools records."""
+    from spectramr.config.schemas.data import DataPairingConfigSchema, DataSplitConfigSchema
+    from spectramr.data.metadata.paired_partition import partition_paired_records
 
-    return IndexBuilder.load_paired_bids_manifest(path, split, _loso_cfg(**kw))
+    pool = IndexBuilder.load_paired_bids_manifest(path, None, _loso_cfg(**kw))
+    data = SimpleNamespace(
+        split=DataSplitConfigSchema(
+            type="loso_subject",
+            loso_fold=kw.get("loso_fold"),
+            holdout_subject=kw.get("holdout_subject"),
+        ),
+        pairing=DataPairingConfigSchema(),
+        enable_test_split=False,
+        test_split=0.0,
+    )
+    part = partition_paired_records(pool, data)
+    return {"train": part.train, "val": part.val, "test": part.test}[split]
 
 
 def test_loso_folds_partition_by_subject_without_overlap(tmp_path) -> None:

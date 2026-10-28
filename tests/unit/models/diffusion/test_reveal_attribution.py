@@ -146,7 +146,7 @@ def test_terminal_band_is_empty_once_an_earlier_step_saw_the_full_mask() -> None
     ``mask(0)`` is all-ones on an arm with ``train_identity_rung``, so the step
     whose ``mask_next`` is ``mask(0)`` — the one at t=1 — writes the entire
     remainder, and the terminal t=0 step has nothing left to reveal. That is why
-    ``_step_reveals_anything`` returns False there and the model is never called
+    ``RevealPlan.active`` is False there and the model is never called
     at the rung that IS R=1.
 
     At R=2 the schedule is ``[1, 0]`` and this is the whole trajectory: one
@@ -293,13 +293,8 @@ def test_additive_is_excluded_from_the_partitioned_modes():
     assert "additive" not in PARTITIONED_REVERSE_MODES
     # Pinned as a set, not a membership test: a new reverse mode has to make the
     # partition decision explicitly rather than inherit one. `replace_freeze_dc_t0`
-    # keys its reveal off a different rung but writes each coefficient once and
-    # freezes it, so it partitions for the same reason the other two do.
-    assert set(PARTITIONED_REVERSE_MODES) == {
-        "replace_freeze",
-        "replace_freeze_dc",
-        "replace_freeze_dc_t0",
-    }
+    # is absent because its terminal t=0 call rewrites committed bins.
+    assert set(PARTITIONED_REVERSE_MODES) == {"replace_freeze", "replace_freeze_dc"}
     # Every partitioned mode must be a mode the sampler will actually accept.
     assert PARTITIONED_REVERSE_MODES <= VALID_REVERSE_MODES
 

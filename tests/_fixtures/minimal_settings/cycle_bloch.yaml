@@ -25,7 +25,6 @@ training:
   task: reconstruction
   output_dir: /tmp/spectramr_test/cycle_bloch
   enable_mixed_precision: false
-  enable_gradient_checkpointing: false
   physics_informed: false
 
 data:

@@ -39,6 +39,8 @@ def _config(**processing_overrides):
             r2r_alpha=1.0,
             nex_target_exclude_input=False,
             nex_fallback="error",
+            nex_registration="translation",
+            input_repetition="random",
             slice_level_records=False,
             processing=processing,
             augmentation=SimpleNamespace(enabled=True),
@@ -93,6 +95,49 @@ class TestDeclaredHalf:
         assert declared["normalization"]["enable_kspace_normalization"] is True
         assert declared["normalization"]["normalization_kwargs"] == {"percentile": 0.99}
         assert declared["augmentation_enabled"] is True
+
+    def test_it_records_which_image_the_kspace_scale_was_measured_on(self) -> None:
+        """Input- and target-scaled runs differ by a constant gain; say which."""
+        record = build_snapshot_provenance(_config(kspace_scale_reference="input"))
+        assert record["declared"]["normalization"]["kspace_scale_reference"] == "input"
+
+    def test_it_records_the_image_domain_field_of_view(self) -> None:
+        """A fastMRI target cropped to 320 must say so beside the snapshot."""
+        record = build_snapshot_provenance(_config(image_domain_crop_or_pad=(320, 320)))
+        assert record["declared"]["normalization"]["image_domain_crop_or_pad"] == [320, 320]
+
+    def test_it_records_the_declared_acceleration(self) -> None:
+        """The contract: a fully sampled-looking ``input_prepared`` is a defect
+        only if acceleration was declared, and the record did not say."""
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        config = _config()
+        config.undersampling = AccelerationConfigSchema(
+            base_acceleration=4.0, center_fraction=0.08
+        )
+        declared = build_snapshot_provenance(config)["declared"]
+        assert declared["undersampling"]["base_acceleration"] == 4.0
+        assert declared["undersampling"]["center_fraction"] == 0.08
+        assert "acceleration_type" in declared["undersampling"]
+
+    def test_it_records_the_acceleration_ladder(self) -> None:
+        """Under the step schedule the realized rungs come from acceleration_range,
+        which base/max alone do not name."""
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        config = _config()
+        config.undersampling = AccelerationConfigSchema(
+            base_acceleration=2.0, acceleration_range=[2.0, 4.0, 8.0]
+        )
+        declared = build_snapshot_provenance(config)["declared"]["undersampling"]
+        assert declared["acceleration_range"] == [2.0, 4.0, 8.0]
+        assert declared["schedule_steps"] == 10000
+        assert declared["enforce_nested"] is False
+
+    def test_no_undersampling_block_is_recorded_as_none_declared(self) -> None:
+        declared = build_snapshot_provenance(_config())["declared"]
+        assert "undersampling" in declared
+        assert declared["undersampling"] is None
 
     def test_a_missing_processing_block_is_reported_not_silently_empty(self) -> None:
         config = SimpleNamespace(data=SimpleNamespace(target_mode="complex_mean"))
@@ -685,6 +730,103 @@ def test_declared_block_stamps_the_nex_fallback_policy() -> None:
     assert record["declared"]["nex_target_exclude_input"] is False
 
 
+def test_declared_block_stamps_the_nex_registration() -> None:
+    """Whether the repetitions were registered changes the target (#2849)."""
+    assert build_snapshot_provenance(_config())["declared"]["nex_registration"] == "translation"
+
+
+def test_declared_block_stamps_the_input_repetition() -> None:
+    """Two runs differing only in which repetition the training input is train on
+    different noise draws; nothing else stamped separates them (non-negotiable 8)."""
+    record = build_snapshot_provenance(_config())
+    assert record["declared"]["input_repetition"] == "random"
+
+
+def test_declared_block_stamps_the_nullspace_split_and_the_alternate_input() -> None:
+    """(v) nullspace_r2r's angle and whitener, and whether ``input_alt`` exists.
+
+    Two runs differing only in the whitener draw no noise differently, so
+    nothing else stamped separates them; ``emit_alternate_input`` decides
+    whether any metric computed from ``input_alt`` can exist at all.
+    """
+    config = _config()
+    config.data.target_mode = "nullspace_r2r"
+    config.data.val_target_mode = "phase_aligned_mean"
+    config.data.r2r_split_angle_deg = 30.0
+    config.data.r2r_whitening = "committed"
+    config.data.emit_alternate_input = True
+
+    record = build_snapshot_provenance(config)
+    declared = record["declared"]
+
+    assert declared["target_mode"] == "nullspace_r2r"
+    assert declared["r2r_split_angle_deg"] == 30.0
+    assert declared["r2r_whitening"] == "committed"
+    assert declared["emit_alternate_input"] is True
+    assert not any("r2r_whitening" in entry for entry in record["incomplete"])
+
+
+def test_declared_block_stamps_the_n2n_pairing() -> None:
+    """Whether the training split served a target or a stack the strategy paired from."""
+    config = _config()
+    config.data.n2n_pairing = "random_pair"
+    assert build_snapshot_provenance(config)["declared"]["n2n_pairing"] == "random_pair"
+
+
+def test_declared_block_stamps_where_the_coil_maps_and_the_noise_fit_came_from() -> None:
+    """``coil_maps_root``/``coil_maps_missing`` decide which maps the split and the
+    metrics used; ``noise_fit_support_policy`` which columns fitted Sigma_n."""
+    config = _config()
+    config.data.coil_maps_root = "databases/m4raw/coil_maps"
+    config.data.coil_maps_missing = "estimate"
+    config.data.noise_fit_support_policy = "acs"
+    config.data.coil_maps_recipe = "input_repetition"
+    config.data.coil_maps_acs_size = 20
+
+    declared = build_snapshot_provenance(config)["declared"]
+
+    assert declared["coil_maps_root"] == "databases/m4raw/coil_maps"
+    assert declared["coil_maps_missing"] == "estimate"
+    assert declared["coil_maps_recipe"] == "input_repetition"
+    assert declared["coil_maps_acs_size"] == 20
+    assert declared["noise_fit_support_policy"] == "acs"
+
+
+def test_declared_block_stamps_the_scoring_estimator() -> None:
+    """``recorrupted_inference`` and ``coil_manifold_projection`` change what a
+    validation number is an estimate of; two runs differing only there report
+    different estimators under one metric name."""
+    from spectramr.config.schemas.validation import ValidationScoringConfigSchema
+
+    config = _config()
+    config.validation = SimpleNamespace(
+        scoring=ValidationScoringConfigSchema(
+            coil_manifold_projection=True,
+            recorrupted_inference={"samples": 5},
+            measurement_maps="metrics",
+        )
+    )
+    declared = build_snapshot_provenance(config)["declared"]
+    assert declared["validation_scoring"] == {
+        "coil_manifold_projection": True,
+        "measurement_maps": "metrics",
+        "recorrupted_inference": {"samples": 5, "alpha": None, "angle_deg": None},
+    }
+
+
+def test_the_scoring_stamp_records_an_absent_estimator_as_null() -> None:
+    from spectramr.config.schemas.validation import ValidationScoringConfigSchema
+
+    config = _config()
+    config.validation = SimpleNamespace(scoring=ValidationScoringConfigSchema())
+    declared = build_snapshot_provenance(config)["declared"]
+    assert declared["validation_scoring"] == {
+        "coil_manifold_projection": False,
+        "measurement_maps": "off",
+        "recorrupted_inference": None,
+    }
+
+
 def test_declared_block_stamps_both_splits_targets_and_the_alpha() -> None:
     """Under r2r the two splits are built DIFFERENTLY, and the snapshot must say so.
 
@@ -719,3 +861,310 @@ def test_declared_block_stamps_the_slice_level_index() -> None:
     on = _config()
     on.data.slice_level_records = True
     assert build_snapshot_provenance(on)["declared"]["slice_level_records"] is True
+
+
+# ---------------------------------------------------------------------------
+# #2160: the phase-encode axis a line mask resolves through, declared and applied
+# ---------------------------------------------------------------------------
+
+
+def test_the_declared_acquisition_block_is_stamped() -> None:
+    from spectramr.config.schemas.data_acquisition import DataAcquisitionSchema
+
+    config = _config()
+    config.data.acquisition = DataAcquisitionSchema(
+        phase_encode_axis=-1, acquired_pe_lines={"FLAIR": 198, "T1": 195, "T2": 195}
+    )
+    record = build_snapshot_provenance(config)
+    assert record["declared"]["acquisition"] == {
+        "phase_encode_axis": -1,
+        "acquired_pe_lines": {"FLAIR": 198, "T1": 195, "T2": 195},
+    }
+
+
+def test_an_undeclared_acquisition_block_is_stamped_as_null() -> None:
+    assert build_snapshot_provenance(_config())["declared"]["acquisition"] is None
+
+
+def test_the_first_batch_gate_verdict_is_the_applied_half() -> None:
+    """Read off the constructed process, through the training wrapper."""
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+    process = KSpaceUndersamplingProcess(
+        num_timesteps=4,
+        max_acceleration=8.0,
+        base_acceleration=2.0,
+        mask_type="equispaced",
+        mask_direction="phase",
+        phase_encode_axis=-1,
+    )
+    x = torch.randn(2, 4, 40, 64)
+    x[..., :6] = 0
+    process.train(True)
+    process.q_sample(x, torch.tensor([3, 3]))
+    model = _Wrapper(SimpleNamespace(kspace_process=process))
+    gate = build_snapshot_provenance(_accel_config(False), model=model)["line_axis_gate"]
+    assert gate["train"]["verdict"] == "agree"
+    assert gate["train"]["data_axis"] == -1 and gate["train"]["mask_axis"] == -1
+    assert gate["train"]["zero_lines_dim_-1"] == 6
+
+
+# ---------------------------------------------------------------------------
+# #1240 -- enforce_nested and mask_seed govern the fixed cascade only
+# ---------------------------------------------------------------------------
+
+
+def _scoped(dynamic: bool, *, enforce: bool = True, seed: int = 42):
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+    process = KSpaceUndersamplingProcess(
+        num_timesteps=4,
+        max_acceleration=8.0,
+        base_acceleration=2.0,
+        mask_type="random",
+        seed=seed,
+        enable_dynamic_mask=dynamic,
+        enforce_nested=enforce,
+    )
+    config = SimpleNamespace(
+        data=None,
+        undersampling=SimpleNamespace(
+            train_identity_rung=False, enforce_nested=enforce, mask_seed=seed
+        ),
+    )
+    return config, _Wrapper(SimpleNamespace(kspace_process=process))
+
+
+def test_a_dynamic_arm_records_that_neither_knob_reached_training() -> None:
+    """The divergence the issue reports: declared true/42, applied to the cascade only."""
+    config, model = _scoped(dynamic=True)
+    scope = build_snapshot_provenance(config, model=model)["mask_scope"]
+    assert scope == {
+        "training_masks": "per_sample_draw",
+        "enforce_nested": {"declared": True, "fixed_cascade": True, "training": False},
+        "mask_seed": {
+            "declared": 42,
+            "fixed_cascade": 42,
+            "training": "per_sample_global_rng",
+        },
+    }
+
+
+def test_a_fixed_mask_arm_records_both_knobs_on_the_training_path() -> None:
+    config, model = _scoped(dynamic=False, seed=7)
+    scope = build_snapshot_provenance(config, model=model)["mask_scope"]
+    assert scope["training_masks"] == "fixed_cascade"
+    assert scope["enforce_nested"]["training"] is True
+    assert scope["mask_seed"]["training"] == 7
+
+
+def test_the_applied_half_is_read_off_the_process_not_the_config() -> None:
+    """A process built with a different seed than declared shows both, not the declaration."""
+    config, model = _scoped(dynamic=False, seed=7)
+    config.undersampling.mask_seed = None
+    scope = snapshot_provenance.mask_scope(config, model)
+    assert scope["mask_seed"]["declared"] is None
+    assert scope["mask_seed"]["fixed_cascade"] == 7
+
+
+def test_mask_scope_is_absent_without_a_kspace_process() -> None:
+    record = build_snapshot_provenance(_accel_config(False), model=SimpleNamespace())
+    assert "mask_scope" not in record
+
+
+def test_the_training_pipeline_stamps_mask_scope_into_run_provenance() -> None:
+    """Wiring, by AST: the record is inert unless ``train.py`` calls it."""
+    import ast
+    import inspect
+
+    from spectramr.pipelines import train as train_mod
+
+    tree = ast.parse(inspect.getsource(train_mod))
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "mask_scope" in called
+
+
+# --- The mask family is reported as applied, never as a schema default (#2508) ---
+
+
+def _undersampling_config(**fields):
+    from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+    config = _config()
+    config.undersampling = AccelerationConfigSchema.model_validate(fields)
+    return config
+
+
+def test_a_schema_default_pattern_is_not_reported_as_declared() -> None:
+    """The planted case: the EI snapshot read ``variable_density`` / ``random``
+    for an arm whose YAML named neither and whose loader applied uniform-random
+    lines. The old record carried those defaults as though they were stated."""
+    from spectramr.infrastructure.training.snapshot_provenance import NOT_DECLARED
+
+    record = build_snapshot_provenance(_undersampling_config(base_acceleration=4.0))
+    declared = record["declared"]["undersampling"]
+    assert declared["acceleration_type"] == NOT_DECLARED
+    assert declared["undersampling_pattern"] == NOT_DECLARED
+    assert "variable_density" not in declared.values()
+    assert "random" not in declared.values()
+
+
+def test_the_marker_survives_the_production_settings_and_override_path() -> None:
+    """``model_fields_set`` is what tells a default from a declaration, so it
+    must survive ``TrainingSettings`` validation and the ``--override`` rebuild
+    every smoke launch goes through; a full-dump round trip would mark every
+    default as set and the marker would never fire on a real run."""
+    from spectramr.config.overrides import apply_overrides
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.training.snapshot_provenance import NOT_DECLARED
+
+    settings = TrainingSettings.model_validate(
+        {
+            "model": {"model_type": "unet"},
+            "data": {},
+            "optimization": {},
+            "logging": {},
+            "undersampling": {"base_acceleration": 4.0},
+        }
+    )
+    settings = apply_overrides(settings, ["undersampling.center_fraction=0.08"])
+    declared = build_snapshot_provenance(settings)["declared"]["undersampling"]
+    assert declared["acceleration_type"] == NOT_DECLARED
+    assert declared["undersampling_pattern"] == NOT_DECLARED
+    assert declared["center_fraction"] == 0.08
+
+
+def test_a_pattern_the_config_states_is_reported_verbatim() -> None:
+    record = build_snapshot_provenance(
+        _undersampling_config(base_acceleration=4.0, acceleration_type="equispaced")
+    )
+    assert record["declared"]["undersampling"]["acceleration_type"] == "equispaced"
+
+
+def test_the_applied_half_states_what_the_loader_mask_did() -> None:
+    """The applied pattern comes from the transform that ran, with its arguments."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    dataset = _FakeDataset(
+        _FakeCompose([PhysicsInformedMasking(acceleration=4, center_fraction=0.08)])
+    )
+    (record,) = build_snapshot_provenance(_config(), dataset=dataset)["applied"]["transforms"]
+    assert record["name"] == "PhysicsInformedMasking"
+    assert record["params"]["acceleration"] == 4
+    assert record["params"]["center_fraction"] == 0.08
+    assert record["applied"]["pattern"] == "uniform_random_outer_lines"
+    assert record["applied"]["acceleration_applies_to"] == "non_acs_lines"
+
+
+class TestRealisedAcceleration:
+    """The factor the mask realised is read off the batch the step received (#2382)."""
+
+    def test_a_collated_batch_yields_the_realised_factor(self) -> None:
+        from spectramr.infrastructure.training.snapshot_provenance import (
+            realised_acceleration,
+        )
+
+        value = torch.tensor([256 / 79, 256 / 79], dtype=torch.float64)
+        assert realised_acceleration({"realised_acceleration": value}) == 3.241
+
+    def test_a_training_batch_carries_it_in_metadata(self) -> None:
+        from spectramr.infrastructure.training.snapshot_provenance import (
+            realised_acceleration,
+        )
+
+        batch = SimpleNamespace(metadata={"realised_acceleration": torch.tensor([256 / 79])})
+        assert realised_acceleration(batch) == 3.241
+
+    def test_mixed_line_counts_are_all_named(self) -> None:
+        from spectramr.infrastructure.training.snapshot_provenance import (
+            realised_acceleration,
+        )
+
+        batch = {"realised_acceleration": torch.tensor([256 / 79, 320 / 98])}
+        assert realised_acceleration(batch) == "3.241, 3.265"
+
+    def test_a_two_dimensional_rep_mask_reports_its_bin_ratio(self) -> None:
+        import torchio as tio
+
+        from spectramr.data.transforms.complementary_rep_masking import ComplementaryRepMasking
+        from spectramr.infrastructure.training.snapshot_provenance import (
+            realised_acceleration,
+        )
+
+        data = torch.randn(8, 64, 64, 1)
+        subject = tio.Subject(input=tio.ScalarImage(tensor=data), file_id="2022_T101")
+        out = ComplementaryRepMasking(4.0, 0.125, mode="same", pattern="poisson_disk")(subject)
+        stamped = out["realised_acceleration"][None]  # as collation stacks it
+        assert realised_acceleration({"realised_acceleration": stamped}) == 4.0
+
+    def test_an_absent_value_is_named_without_claiming_no_mask(self) -> None:
+        from spectramr.infrastructure.training.snapshot_provenance import (
+            REALISED_NOT_RECORDED,
+            realised_acceleration,
+        )
+
+        assert realised_acceleration({"input": torch.zeros(1)}) == REALISED_NOT_RECORDED
+        assert "unmasked" not in REALISED_NOT_RECORDED
+
+
+class TestStrategyMaskGenerator:
+    """Strategy-side masks resolve their family inside ``KSpaceMaskGenerator``,
+    so the declared half reads "not declared" and only this record names it."""
+
+    def _generator(self):
+        from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
+
+        return KSpaceMaskGenerator(
+            num_timesteps=8,
+            default_pattern="linear",
+            accelerator_kwargs={"base_acceleration": 2.0, "max_acceleration": 8.0, "seed": 3},
+        )
+
+    def test_the_generator_is_recorded_under_the_applied_half(self) -> None:
+        record = build_snapshot_provenance(
+            _config(), mask_generator=self._generator(), mask_pattern="random"
+        )
+        applied = record["applied"]["mask_generator"]
+        assert (applied["pattern"], applied["family"]) == ("random", "random_cartesian")
+        assert applied["acceleration"] == [2.0, 8.0]
+
+    def test_it_survives_an_unreachable_dataset(self) -> None:
+        record = build_snapshot_provenance(
+            _config(), dataset=None, mask_generator=self._generator()
+        )
+        assert record["applied"]["mask_generator"]["family"] == "linear"
+
+    def test_an_arm_without_one_records_nothing(self) -> None:
+        assert "mask_generator" not in build_snapshot_provenance(_config())["applied"]
+        record = build_snapshot_provenance(_config(), mask_generator=MagicMock())
+        assert "mask_generator" not in record["applied"]
+
+    def test_a_failing_record_is_named_and_the_rest_survives(self) -> None:
+        class _Raising:
+            def applied_record(self, _pattern):
+                raise ValueError("unknown pattern 'bogus'")
+
+        record = build_snapshot_provenance(_config(), mask_generator=_Raising())
+        assert "declared" in record and "applied" in record
+        assert any("mask generator record failed" in gap for gap in record["incomplete"])
+
+
+def test_forward_noise_is_stamped_from_the_process_it_trained_with() -> None:
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+
+    process = KSpaceUndersamplingProcess(
+        num_timesteps=10,
+        max_acceleration=4.0,
+        forward_noise_sigma=0.2,
+        forward_noise_schedule="sqrt_t",
+    )
+    model = _Wrapper(SimpleNamespace(kspace_process=process))
+    assert snapshot_provenance.forward_noise_scope(model) == {"sigma": 0.2, "schedule": "sqrt_t"}
+
+
+def test_forward_noise_is_absent_without_a_kspace_process() -> None:
+    assert snapshot_provenance.forward_noise_scope(SimpleNamespace()) is None

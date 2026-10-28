@@ -32,6 +32,9 @@ def _make_strategy() -> DisentangledDiffusionStrategy:
 
     # Generator: tracks ddpm_sample invocation and returns a tissue dict.
     generator = MagicMock()
+    # A bare module: unwrap_model must stop here, not descend into an auto-created mock child.
+    for attr in ("module", "_orig_mod", "_fsdp_wrapped_module", "_checkpoint_wrapped_module"):
+        setattr(generator, attr, None)
     generator.tissue_channels = 6
     generator.ddpm_sample = MagicMock(
         return_value={"rho": torch.zeros(2, 6, 8, 8)}

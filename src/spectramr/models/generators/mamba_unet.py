@@ -5,10 +5,12 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 from spectramr.infrastructure.physics.fft_ops import _to_complex, ifft2c
 from spectramr.models.blocks.mamba_block import MambaBlock
+from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.registry import register_model
 
 if TYPE_CHECKING:
@@ -331,7 +333,7 @@ class MambaLayer2D(nn.Module):
 
 
 @register_model(name="mamba_unet", training_mode="reconstruction", spatial_dims=(2,))
-class MambaUNet(nn.Module):
+class MambaUNet(GradCheckpointingMixin, nn.Module):
     """
     U-Net with Mamba (State Space Model) blocks in the encoder and decoder.
     Designed for efficient long-range dependency modeling in MRI.
@@ -593,7 +595,7 @@ class MambaUNet(nn.Module):
             if ssm_params is not None and ssm_idx < len(ssm_params):
                 ssm_override = ssm_params[ssm_idx]
                 ssm_idx += 1
-            feat = down_layer(feat, emb, ssm_override=ssm_override)
+            feat = self._run_block(down_layer, feat, emb, ssm_override)
             skips.append(feat)
 
         # Bottleneck — standalone MambaLayer2D (no SSM override in bottleneck)
@@ -621,10 +623,16 @@ class MambaUNet(nn.Module):
             if ssm_params is not None and ssm_idx < len(ssm_params):
                 ssm_override = ssm_params[ssm_idx]
                 ssm_idx += 1
-            x = conv_block(concat, emb, ssm_override=ssm_override)
+            x = self._run_block(conv_block, concat, emb, ssm_override)
 
         out = self.final_conv(x)
         return out
+
+    def _run_block(self, block, x, emb, ssm_override):
+        """Run one encoder/decoder stage, recomputing its interior in backward when enabled."""
+        if self._checkpointing_active():
+            return checkpoint(block, x, emb, ssm_override=ssm_override, use_reentrant=False)
+        return block(x, emb, ssm_override=ssm_override)
 
     def _get_sinusoidal_embedding(self, timesteps: torch.Tensor, dim: int) -> torch.Tensor:
         """Create sinusoidal time embeddings.

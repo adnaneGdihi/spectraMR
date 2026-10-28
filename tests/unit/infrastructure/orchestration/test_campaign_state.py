@@ -359,3 +359,26 @@ class TestArrayTaskId:
         assert reloaded.get_experiment("b").array_task_id == 1
         # Same array job id shared by both arms.
         assert {e.slurm_job_id for e in reloaded.experiments} == {9001}
+
+
+# ── resume_mode provenance (#2542) ──────────────────────────────────
+
+
+class TestResumeMode:
+    def test_round_trips_through_save_and_load(self, tmp_path: Path) -> None:
+        state = _make_state(tmp_path)
+        state.resume_mode = "fresh"
+        path = state.save()
+        assert CampaignState.load(path).resume_mode == "fresh"
+
+    def test_a_pre_field_state_loads_as_empty(self, tmp_path: Path) -> None:
+        path = _make_state(tmp_path).save()
+        data = json.loads(Path(path).read_text())
+        data.pop("resume_mode", None)
+        Path(path).write_text(json.dumps(data))
+        assert CampaignState.load(path).resume_mode == ""
+
+    def test_an_unknown_mode_is_refused(self, tmp_path: Path) -> None:
+        """Planted: a misspelt mode must not be recorded as provenance."""
+        with pytest.raises(ValueError):
+            CampaignState(campaign_name="c", campaign_dir=str(tmp_path), resume_mode="fersh")

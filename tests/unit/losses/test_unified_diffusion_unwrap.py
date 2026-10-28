@@ -12,13 +12,13 @@ which called ``.shape`` / ``.device`` on them and raised
 
 The fix introduced ``_unwrap_tensor_arg(name, value)`` which probes a
 fixed list of common prediction keys (``pred`` / ``image`` / ``x0`` /
-…) and falls back to the first tensor-valued entry. This test pins:
+…) and raises when none is present. This test pins:
 
 1. Each probed key resolves correctly.
 2. Tuples / lists are unwrapped to their first element.
-3. Dict-of-non-tensors raises a typed ``TypeError`` (CLAUDE.md #9
-   fail-loud) — the orchestrator should not see a confusing
-   AttributeError from inside MSE.
+3. A dict without a prediction key raises a typed ``TypeError``
+   (CLAUDE.md #3 fail-loud): grading its first tensor trained exp 32a on
+   the proton-density map against the image (#2606).
 4. ``_complex_safe_mse`` and ``_complex_safe_l1`` accept dict inputs
    end-to-end.
 """
@@ -54,16 +54,15 @@ def test_unwrap_known_prediction_keys(key: str) -> None:
     assert out is x, f"key {key!r} did not unwrap correctly"
 
 
-def test_unwrap_dict_unknown_key_falls_back_to_first_tensor() -> None:
-    """Unknown keys still resolve via the tensor-fallback path."""
-    x = torch.randn(2, 3)
-    out = _unwrap_tensor_arg("pred", {"weird_name": x})
-    assert out is x
+def test_unwrap_dict_unknown_key_raises() -> None:
+    """A dict with no prediction key is a strategy bug, not a guess (#2606)."""
+    with pytest.raises(TypeError, match="no known prediction key"):
+        _unwrap_tensor_arg("pred", {"rho": torch.randn(2, 3), "t1": torch.randn(2, 3)})
 
 
 def test_unwrap_dict_no_tensor_raises() -> None:
-    """Dict-of-non-tensors raises ``TypeError`` (CLAUDE.md #9 fail-loud)."""
-    with pytest.raises(TypeError, match="dict with no tensor entry"):
+    """Dict-of-non-tensors raises ``TypeError`` (CLAUDE.md #3 fail-loud)."""
+    with pytest.raises(TypeError, match="no known prediction key"):
         _unwrap_tensor_arg("pred", {"a": 1, "b": "two"})
 
 

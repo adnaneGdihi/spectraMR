@@ -56,6 +56,7 @@ def _args(**over) -> argparse.Namespace:
         "base_dir": None,
         "dry_run": True,
         "resume": False,
+        "fresh": False,
         "where": "slurm",
         "only": None,
         "include": None,
@@ -113,3 +114,36 @@ def test_an_orchestrator_rejection_stops_the_submit(monkeypatch) -> None:
 
     monkeypatch.setattr(mod, "CampaignOrchestrator", _boom)
     assert campaign_submit(_args(slurm=["gpu=4"])) == 1
+
+
+# ── --fresh / --resume (#2542) ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("argv", "resume", "fresh"),
+    [([], False, False), (["--resume"], True, False), (["--fresh"], False, True)],
+)
+def test_resume_intent_reaches_the_orchestrator(recorder, argv, resume, fresh) -> None:
+    from spectramr.cli.app import build_parser
+
+    args = build_parser().parse_args(["campaign", "submit", "c.yaml", "--dry-run", *argv])
+    assert campaign_submit(args) == 0
+    assert (recorder.last_kwargs["resume"], recorder.last_kwargs["fresh"]) == (resume, fresh)
+
+
+def test_fresh_and_resume_together_are_refused_by_the_parser() -> None:
+    """Planted: two opposing intents must not let one win by order."""
+    from spectramr.cli.app import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["campaign", "submit", "c.yaml", "--fresh", "--resume"])
+
+
+def test_time_and_concurrency_flags_reach_the_orchestrator(recorder) -> None:
+    assert campaign_submit(_args(time="48:00:00", concurrency=3)) == 0
+    assert recorder.last_kwargs["slurm_overrides"] == {"time": "48:00:00"}
+    assert recorder.last_kwargs["array_concurrency"] == 3
+
+
+def test_conflicting_time_spellings_are_refused(recorder) -> None:
+    assert campaign_submit(_args(time="48:00:00", slurm=["time=24:00:00"])) == 1

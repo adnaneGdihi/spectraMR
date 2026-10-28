@@ -352,6 +352,32 @@ def test_collect_run_provenance_stamps_node_hardware():
     assert "count" in node["gpu"]
 
 
+def _min_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        data=SimpleNamespace(batch_size=1),
+        optimization=SimpleNamespace(gradient_accumulation_steps=1),
+        model=SimpleNamespace(model_type="unet"),
+        training=SimpleNamespace(training_mode="reconstruction"),
+        model_dump=lambda mode="json": {"a": 1},
+    )
+
+
+def test_collect_run_provenance_stamps_the_dispatch_snapshot(monkeypatch, tmp_path):
+    """An array task's snapshot verdict, drift included, reaches the run record (#2662)."""
+    verdict = {"status": "drift_allowed", "drift": ["HEAD moved"], "current_head": "f" * 40}
+    path = tmp_path / "snapshot_arm_0.json"
+    path.write_text(json.dumps(verdict))
+    monkeypatch.setenv("SPECTRAMR_DISPATCH_SNAPSHOT_RECORD", str(path))
+    rec = prov.collect_run_provenance(_min_config(), seed=1, device="cpu", run_name="r")
+    assert rec["dispatch_snapshot"] == verdict
+
+
+def test_collect_run_provenance_omits_the_snapshot_outside_an_array(monkeypatch):
+    monkeypatch.delenv("SPECTRAMR_DISPATCH_SNAPSHOT_RECORD", raising=False)
+    rec = prov.collect_run_provenance(_min_config(), seed=1, device="cpu", run_name="r")
+    assert "dispatch_snapshot" not in rec
+
+
 def test_provenance_record_is_json_serialisable():
     """``provenance.json`` is written with ``json.dumps`` — a torch ``uuid``
     object or a numpy scalar leaking into the record would break the stamp."""
@@ -976,7 +1002,9 @@ class TestWorkerDecisionsReachDisk:
     @staticmethod
     def _config(*, train_workers: int, val_workers: int):
         return SimpleNamespace(
-            data=SimpleNamespace(loader=SimpleNamespace(num_workers=train_workers)),
+            data=SimpleNamespace(
+                loader=SimpleNamespace(num_workers=train_workers, reserved_cores=2)
+            ),
             validation=SimpleNamespace(loader=SimpleNamespace(num_workers=val_workers)),
         )
 
@@ -986,9 +1014,25 @@ class TestWorkerDecisionsReachDisk:
             self._topology(world_size=4, local_world_size=4, cpus=16),
         )
         assert record["train"]["declared"] == 8
-        assert record["train"]["workers"] == 4
+        # share 4 per rank minus the default reserve of 2
+        assert record["train"]["workers"] == 2
+        assert record["train"]["reserved_cores"] == 2
         assert record["train"]["clamped"] is True
         assert record["train"]["reason"] == "clamped-to-cpu-share"
+
+    def test_records_whether_each_loader_actually_persists(self):
+        topology = self._topology(world_size=1, local_world_size=1, cpus=16)
+        config = self._config(train_workers=4, val_workers=0)
+        config.data.loader.persistent_workers = True
+        record = prov.worker_provenance(config, topology)
+        assert record["train"]["persistent"] is True
+        # a serial loader cannot persist whatever the knob says
+        assert record["val"]["persistent"] is False
+
+    def test_a_missing_reserved_cores_read_does_not_raise(self):
+        config = SimpleNamespace(data=SimpleNamespace(loader=SimpleNamespace(num_workers=2)))
+        topology = self._topology(world_size=1, local_world_size=1, cpus=16)
+        assert prov.worker_provenance(config, topology)["train"]["reserved_cores"] == 0
 
     def test_a_single_gpu_run_records_the_declared_value_untouched(self):
         record = prov.worker_provenance(
@@ -1011,7 +1055,9 @@ class TestWorkerDecisionsReachDisk:
         from spectramr.core.worker_policy import clamp_worker_count
 
         topology = self._topology(world_size=4, local_world_size=4, cpus=16)
-        direct = clamp_worker_count(8, topology, role="train").to_dict()
+        direct = clamp_worker_count(
+            8, topology, role="train", reserved_cores=2
+        ).to_dict()
         config = self._config(train_workers=8, val_workers=0)
         assert prov.worker_provenance(config, topology)["train"] == direct
 
@@ -1855,3 +1901,69 @@ def test_a_compile_block_without_a_schema_still_records_the_core_knobs():
     record = prov.compile_provenance(_compile_config(), {})
     assert record["declared"]["enabled"] is True
     assert set(record["declared"]) >= {"enabled", "mode", "backend"}
+
+
+@pytest.mark.parametrize(
+    ("optimization", "expected"),
+    [
+        ({"learning_rate": 1e-4}, None),
+        ({"learning_rate": 1e-4, "lr_scheduler_strategy": "cosine"}, "cosine_annealing"),
+    ],
+)
+def test_lr_schedule_stamps_the_built_scheduler_not_the_default(optimization, expected):
+    """#2760: an optimizer-only arm trains at a constant LR, and provenance must say so."""
+    from spectramr.config.settings import TrainingSettings
+
+    settings = TrainingSettings.settings_from_dict(
+        {
+            "model": {"model_type": "unet"},
+            "data": {"batch_size": 2},
+            "training": {"max_iterations": 10},
+            "optimization": optimization,
+            "logging": {},
+        }
+    )
+    assert settings.optimization.lr_scheduler_strategy == "cosine", "precondition"
+    record = prov.collect_run_provenance(settings, seed=1, device="cpu", run_name="t")
+    assert record["lr_schedule"]["scheduler"] == expected
+
+
+def test_count_parameters_stamps_a_solver_record() -> None:
+    """A parameter-free solver's knobs ride with its (zero) parameter count."""
+    import torch.nn as nn
+
+    count_parameters = prov.count_parameters
+
+    class _Solver(nn.Module):
+        @property
+        def solver_record(self) -> dict:
+            return {"solver": "fista", "lambda_reg": 0.01}
+
+    record = count_parameters(_Solver())
+    assert record["total"] == 0 and record["solver"] == {"solver": "fista", "lambda_reg": 0.01}
+    assert "solver" not in count_parameters(nn.Linear(2, 2))
+
+
+def test_data_split_provenance_writes_the_applied_partition():
+    """The director's partition stamp reaches provenance.json intact (subjects, counts, sha256)."""
+    from spectramr.data.metadata.paired_partition import build_partition_stamp
+
+    records = [{"subject_id": s} for s in ("01", "01", "02", "03")]
+    stamp = build_partition_stamp(
+        route="config_owned",
+        strategy="subjects",
+        manifest_sha="ab" * 32,
+        train=records[:2],
+        val=records[2:3],
+        test=records[3:],
+    )
+    record = {"data_split": prov.data_split_provenance(SimpleNamespace(data_split=stamp))}
+    written = json.loads(json.dumps(record, indent=2, default=str))["data_split"]
+    assert written["manifest_sha256"] == "ab" * 32
+    assert written["records"] == {"train": 2, "val": 1, "test": 1}
+    assert written["subjects"] == {"train": ["01"], "val": ["02"], "test": ["03"]}
+
+
+@pytest.mark.parametrize("pipeline", [SimpleNamespace(), SimpleNamespace(data_split={})])
+def test_data_split_provenance_is_none_when_no_partition_was_recorded(pipeline):
+    assert prov.data_split_provenance(pipeline) is None

@@ -213,12 +213,12 @@ Test the trained model on validation data:
 .. code-block:: bash
 
    spectramr infer \
-       --checkpoint experiments/results/tutorial_01_basic_unet/checkpoints/checkpoint_epoch_<E>_step_<S>.pt \
+       --checkpoint experiments/results/tutorial_01_basic_unet/checkpoints/step_<NNNNNNNN>.safetensors \
        --input databases/fastmri/datasets/multicoil_val \
        --output experiments/results/tutorial_01_basic_unet/inference
 
 ``ls`` the ``checkpoints/`` directory and substitute the file you want.
-A ``checkpoint_best.pt`` is written there instead once more than one
+A ``best.safetensors`` is written there too once more than one
 validation event has been scored.
 
 ``--config`` is optional here: the run directory beside the checkpoint holds

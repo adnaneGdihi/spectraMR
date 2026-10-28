@@ -28,10 +28,14 @@ Intelligently suggests loss combinations for different tasks.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
+from typing import Any
 
 from spectramr.config.schemas.loss import LossConfigSchema
+from spectramr.models.losses.weights import canonical_loss_name
 
 
 class TaskType(Enum):
@@ -100,7 +104,7 @@ class RecommendationSet:
         """Overall confidence in recommendations (0-1)."""
         if not self.losses:
             return 0.0
-        return sum(l.confidence for l in self.losses) / len(self.losses)
+        return sum(rec.confidence for rec in self.losses) / len(self.losses)
 
     def summary(self) -> str:
         """Get summary of recommendations."""
@@ -120,6 +124,30 @@ class RecommendationSet:
                 lines.append(f"  - {note}")
 
         return "\n".join(lines)
+
+
+_MODEL_TYPE_TO_TASK: Mapping[str, TaskType] = MappingProxyType(
+    {
+        "gan": TaskType.SYNTHESIS,
+        "diffusion": TaskType.SYNTHESIS,
+        "vae": TaskType.SYNTHESIS,
+        "flow": TaskType.SYNTHESIS,
+    }
+)
+
+#: Where each recommendable loss lives on the flag surface of the loss schema:
+#: ``(section, enable_<name> field, lambda_<name> field)``. Keys are canonical
+#: registry names, so ``mse`` lands on ``l2``; ``gan`` is this module's own key.
+_SCHEMA_FIELDS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
+    {
+        "l1": ("reconstruction", "enable_l1", "lambda_l1"),
+        "l2": ("reconstruction", "enable_l2", "lambda_l2"),
+        "ssim": ("reconstruction", "enable_ssim", "lambda_ssim"),
+        "perceptual": ("reconstruction", "enable_perceptual", "lambda_perceptual"),
+        "lpips": ("reconstruction", "enable_lpips", "lambda_lpips"),
+        "gan": ("gan", "enable_adversarial", "lambda_adv"),
+    }
+)
 
 
 class TaskAnalyzer:
@@ -143,15 +171,15 @@ class TaskAnalyzer:
             Analysis -->|None| Default[TaskType.RECONSTRUCTION]
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize task analyzer."""
         self.logger = logging.getLogger(__name__)
 
     def analyze_task_type(
         self,
-        task_description: str = None,
-        model_type: str = None,
-        output_type: str = None,
+        task_description: str | None = None,
+        model_type: str | None = None,
+        output_type: str | None = None,
     ) -> TaskType:
         """Analyze and detect task type.
 
@@ -175,7 +203,7 @@ class TaskAnalyzer:
                 return TaskType.SYNTHESIS
             elif "super" in desc_lower and "resolution" in desc_lower:
                 return TaskType.SUPER_RESOLUTION
-            elif "denoise" in desc_lower or "noise" in desc_lower:
+            elif "denois" in desc_lower or "noise" in desc_lower:
                 return TaskType.DENOISING
             elif "artifact" in desc_lower:
                 return TaskType.ARTIFACT_REMOVAL
@@ -184,20 +212,15 @@ class TaskAnalyzer:
             elif "translation" in desc_lower or "domain" in desc_lower:
                 return TaskType.TRANSLATION
 
-        # Default based on model type - O(1) registry lookup
-        MODEL_TYPE_TO_TASK = {
-            "gan": TaskType.SYNTHESIS,
-            "diffusion": TaskType.SYNTHESIS,
-            "vae": TaskType.SYNTHESIS,
-            "flow": TaskType.SYNTHESIS,
-        }
-        return MODEL_TYPE_TO_TASK.get(model_type, TaskType.RECONSTRUCTION)
+        if model_type is None:
+            return TaskType.RECONSTRUCTION
+        return _MODEL_TYPE_TO_TASK.get(model_type, TaskType.RECONSTRUCTION)
 
 
 class LossRecommender:
     """Recommends loss configurations based on task."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize loss recommender."""
         self.logger = logging.getLogger(__name__)
         self.analyzer = TaskAnalyzer()
@@ -404,12 +427,12 @@ class LossRecommender:
 
     def recommend(
         self,
-        task_type: TaskType = None,
-        task_description: str = None,
-        model_type: str = None,
-        output_type: str = None,
-        use_gan: bool = None,
-        use_perceptual: bool = None,
+        task_type: TaskType | None = None,
+        task_description: str | None = None,
+        model_type: str | None = None,
+        output_type: str | None = None,
+        use_gan: bool | None = None,
+        use_perceptual: bool | None = None,
     ) -> RecommendationSet:
         """Get loss recommendations for task.
 
@@ -437,9 +460,9 @@ class LossRecommender:
         losses = self._apply_overrides(base_recs, use_gan, use_perceptual)
 
         # Categorize losses
-        primary = [l.name for l in losses if l.enabled and l.confidence >= 0.85]
-        auxiliary = [l.name for l in losses if l.enabled and l.confidence < 0.85]
-        optional = [l.name for l in losses if not l.enabled]
+        primary = [rec.name for rec in losses if rec.enabled and rec.confidence >= 0.85]
+        auxiliary = [rec.name for rec in losses if rec.enabled and rec.confidence < 0.85]
+        optional = [rec.name for rec in losses if not rec.enabled]
 
         # Generate configuration
         config = self._generate_config(losses)
@@ -510,33 +533,29 @@ class LossRecommender:
             ReconstructionLossesConfig,
         )
 
-        # Extract enabled losses from recommendations
-        l1_enabled = any(l.name == "l1" and l.enabled for l in losses)
-        l2_enabled = any(l.name == "l2" and l.enabled for l in losses)
-        ssim_enabled = any(l.name == "ssim" and l.enabled for l in losses)
-        perceptual_enabled = any(l.name == "perceptual" and l.enabled for l in losses)
-        lpips_enabled = any(l.name == "lpips" and l.enabled for l in losses)
-        gan_enabled = any(l.name == "gan" and l.enabled for l in losses)
+        sections: dict[str, dict[str, Any]] = {"reconstruction": {}, "gan": {}}
+        for section, enable_field, _ in _SCHEMA_FIELDS.values():
+            sections[section][enable_field] = False
 
-        # Create reconstruction config with enabled losses
-        reconstruction_config = ReconstructionLossesConfig(
-            enable_l1=l1_enabled,
-            enable_l2=l2_enabled,
-            enable_ssim=ssim_enabled,
-            enable_perceptual=perceptual_enabled,
-            enable_lpips=lpips_enabled,
-        )
+        enabled: set[str] = set()
+        for rec in losses:
+            key = rec.name if rec.name in _SCHEMA_FIELDS else canonical_loss_name(rec.name)
+            fields = _SCHEMA_FIELDS.get(key)
+            if fields is None or not rec.enabled:
+                continue
+            section, enable_field, lambda_field = fields
+            sections[section][enable_field] = True
+            # An unwritten lambda reads its schema default (lambda_perceptual 10.0,
+            # lambda_ssim 0.0), which is not the weight being recommended.
+            sections[section][lambda_field] = rec.weight
+            enabled.add(key)
 
-        # Create GAN config
-        gan_config = GANLossesConfig(
-            enable_adversarial=gan_enabled,
-        )
-
-        # Create metrics config to track enabled metrics
+        reconstruction_config = ReconstructionLossesConfig(**sections["reconstruction"])
+        gan_config = GANLossesConfig(**sections["gan"])
         metrics_config = MetricsConfig(
-            compute_ssim=ssim_enabled,
-            compute_psnr=l1_enabled or l2_enabled,
-            compute_lpips=lpips_enabled,
+            compute_ssim="ssim" in enabled,
+            compute_psnr=bool(enabled & {"l1", "l2"}),
+            compute_lpips="lpips" in enabled,
         )
 
         # Create unified config
@@ -562,15 +581,15 @@ class LossRecommender:
         ]
 
         # Warn about missing recommendations
-        if not any(l.enabled for l in losses):
+        if not any(rec.enabled for rec in losses):
             notes.append("Warning: No losses enabled. Please enable at least one loss.")
 
         # Suggest GAN if not present
-        if not any(l.name == "gan" and l.enabled for l in losses):
+        if not any(rec.name == "gan" and rec.enabled for rec in losses):
             notes.append("Consider enabling GAN loss if generation quality is not satisfactory.")
 
         # Suggest curriculum learning
-        if len([l for l in losses if l.enabled]) > 2:
+        if len([rec for rec in losses if rec.enabled]) > 2:
             notes.append(
                 "With multiple losses, consider curriculum learning: enable complex losses after initial training."
             )
@@ -582,9 +601,9 @@ class LossRecommender:
 
 
 def get_loss_recommendation(
-    task_type: TaskType = None,
-    task_description: str = None,
-    **kwargs,
+    task_type: TaskType | None = None,
+    task_description: str | None = None,
+    **kwargs: Any,
 ) -> RecommendationSet:
     """Get loss recommendations for a task.
 

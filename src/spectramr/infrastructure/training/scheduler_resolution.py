@@ -29,7 +29,7 @@ Design (pitfall #15: read + validate + stamp, in the same change):
   there and nothing consumed it),
 * ``T_0``/``T_mult`` promote a ``cosine`` request to warm restarts, because that
   is the only factory that consumes them,
-* ``T_max`` falls back to ``training.max_iterations``, never to 100,
+* ``T_max`` falls back to the run length in scheduler steps, never to 100,
 * any key the resolved factory cannot consume **raises** — a typo or a
   wrong-family knob can no longer be silently dropped,
 * the resolved spec is returned as a plain dataclass so callers can stamp it
@@ -58,6 +58,7 @@ __all__ = [
     "SchedulerSpec",
     "build_scheduler_from_spec",
     "resolve_scheduler_spec",
+    "resolved_schedule_record",
 ]
 
 
@@ -72,19 +73,17 @@ SCHEDULER_PARAM_KEYS: dict[str, frozenset[str]] = {
     "step_lr": frozenset({"step_size", "gamma"}),
     "exponential": frozenset({"gamma"}),
     "linear": frozenset({"start_factor", "end_factor", "total_iters"}),
-    "reduce_on_plateau": frozenset(
-        {
-            "mode",
-            "factor",
-            "patience",
-            "threshold",
-            "threshold_mode",
-            "cooldown",
-            "min_lr",
-            "eps",
-        }
-    ),
 }
+
+#: Names this resolver used to accept and now rejects with a reason. The
+#: plateau scheduler was built but never stepped with a validation metric, so
+#: every arm naming it trained at a constant LR (#2301).
+_REMOVED_NAMES: dict[str, str] = dict.fromkeys(
+    ("plateau", "reduce_on_plateau", "reduce_lr_on_plateau"),
+    "ReduceLROnPlateau was removed: nothing steps it with a validation metric, "
+    "so it trained at a constant LR (#2301). Declare a clock-driven family "
+    "(cosine, step, linear_decay) instead.",
+)
 
 #: Names accepted in ``lr_scheduler_strategy`` / ``scheduler.type`` that are not
 #: themselves registry keys. A warmup-bearing name resolves to its *decay* family
@@ -97,8 +96,6 @@ _NAME_ALIASES: dict[str, str] = {
     "cosine_warm_restarts": "cosine_annealing_warm_restarts",
     "step": "step_lr",
     "linear_decay": "linear",
-    "plateau": "reduce_on_plateau",
-    "reduce_lr_on_plateau": "reduce_on_plateau",
     # Warmup with no decay family: the wrapper alone, over a flat base LR.
     "warmup": "constant",
     "linear_warmup": "constant",
@@ -151,6 +148,8 @@ class SchedulerSpec:
 
 def _canonical_name(declared: str) -> str:
     """Map a declared scheduler name onto a registry key, or raise."""
+    if declared.lower() in _REMOVED_NAMES:
+        raise ConfigurationError(f"Scheduler {declared!r}: {_REMOVED_NAMES[declared.lower()]}")
     key = _NAME_ALIASES.get(declared.lower(), declared.lower())
     if key not in SCHEDULER_REGISTRY:
         raise ConfigurationError(
@@ -182,6 +181,42 @@ def _strategy_explicitly_declared(optimization: Any) -> bool:
     )
 
 
+def _run_length_in_scheduler_steps(
+    name: str,
+    period_key: str,
+    max_iterations: int | None,
+    accumulation_steps: int,
+    warmup_steps: int,
+) -> int:
+    """How many times the main scheduler steps in the run: its default period.
+
+    ``max_iterations`` counts micro-batches, while the loop steps schedulers
+    once per optimizer step and a warmup wrapper withholds its first
+    ``warmup_steps`` of those, so a period of ``max_iterations`` left every
+    ``accumulation_steps: 4`` arm at 85 % of its base LR at the end of the run.
+    A negative ``max_iterations`` means "bounded by epochs", which is not a
+    length known here; used as a period it made the cosine alternate between
+    the base LR and ``eta_min`` on every step.
+    """
+    if max_iterations is None or max_iterations <= 0:
+        raise ConfigurationError(
+            f"Scheduler {name!r} needs {period_key!r} and none could be "
+            f"resolved: declare optimization.scheduler.{period_key} or set a "
+            f"positive training.max_iterations (got {max_iterations!r}). Falling "
+            "back to the torch default of 100 is what made the LR oscillate "
+            "instead of anneal (issue #533)."
+        )
+    steps = max_iterations // max(1, int(accumulation_steps)) - warmup_steps
+    if steps <= 0:
+        raise ConfigurationError(
+            f"Scheduler {name!r}: warmup_steps={warmup_steps} leaves no optimizer "
+            f"steps for the main schedule in a run of {max_iterations} iterations "
+            f"at accumulation_steps={accumulation_steps}. Shorten the warmup or "
+            f"declare optimization.scheduler.{period_key}."
+        )
+    return steps
+
+
 def _merge(dst: dict[str, Any], src: dict[str, Any], src_label: str) -> None:
     """Merge ``src`` into ``dst``, raising on a disagreeing duplicate.
 
@@ -208,9 +243,10 @@ def resolve_scheduler_spec(
 
     Args:
         optimization: the frozen ``config.optimization`` block.
-        max_iterations: ``config.training.max_iterations``, used as the default
-            run length for period-based schedulers. ``None`` when the run is
-            epoch-driven, in which case the period must be declared explicitly.
+        max_iterations: ``config.training.max_iterations``, from which the
+            default period of a period-based scheduler is derived. ``None`` or
+            negative when the run is epoch-bounded, in which case the period
+            must be declared explicitly.
 
     Returns:
         The resolved spec, or ``None`` when no scheduler is configured.
@@ -322,15 +358,13 @@ def resolve_scheduler_spec(
     # ---- period default ----------------------------------------------------
     period_key = _RUN_LENGTH_KEY.get(name)
     if period_key is not None and params.get(period_key) is None:
-        if not max_iterations:
-            raise ConfigurationError(
-                f"Scheduler {name!r} needs {period_key!r} and none could be "
-                f"resolved: declare optimization.scheduler.{period_key} or set "
-                "training.max_iterations. (Falling back to the torch default "
-                "of 100 is what made the LR oscillate instead of anneal — "
-                "issue #533.)"
-            )
-        params[period_key] = int(max_iterations)
+        params[period_key] = _run_length_in_scheduler_steps(
+            name,
+            period_key,
+            max_iterations,
+            optimization.gradient.accumulation_steps,
+            warmup_steps,
+        )
 
     # ---- reject anything unroutable ---------------------------------------
     allowed = SCHEDULER_PARAM_KEYS[name]
@@ -365,6 +399,23 @@ def resolve_scheduler_spec(
         warmup_start_lr=warmup_start_lr,
         warmup_end_lr=warmup_end_lr,
     )
+
+
+def resolved_schedule_record(config: Any) -> dict[str, Any]:
+    """The LR schedule a run actually builds, as the record its artifacts stamp.
+
+    ``{"scheduler": None}`` when no scheduler is built: the schema default of
+    ``lr_scheduler_strategy`` is not honoured (#662), so any artifact that shows
+    that default instead of this record misreports a constant-LR run (#2760).
+
+    Raises:
+        ConfigurationError: propagated from :func:`resolve_scheduler_spec`.
+    """
+    spec = resolve_scheduler_spec(
+        config.optimization,
+        max_iterations=getattr(getattr(config, "training", None), "max_iterations", None),
+    )
+    return spec.as_provenance() if spec is not None else {"scheduler": None}
 
 
 def build_scheduler_from_spec(

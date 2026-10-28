@@ -316,7 +316,6 @@ Create ``experiments/training/tutorial_05_freq_weighted.yaml``:
        enabled: true
        dtype: bfloat16
    checkpoint:
-     checkpoint_dir: checkpoints/tutorial_05
      save_interval: 5000
      best_metric_name: val_psnr
      best_metric_mode: max

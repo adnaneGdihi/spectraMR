@@ -6,6 +6,7 @@ constraints, including k-space consistency, Bloch equation residuals, and
 spectral domain losses.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.core.coil_map_names import kwargs_accepted_by
+from spectramr.data.transforms.normalization import decompress_kspace_log
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c, sense_forward
 from spectramr.models.losses.registry import register_loss
 
@@ -28,7 +30,7 @@ class NonCartesianGraphLoss(nn.Module):
 
         \mathcal{L}_{NonCartesian} = \| \mathcal{F}^{-1}(\hat{k}) - y \|_1"""
 
-    def __init__(self, nufft_operator):
+    def __init__(self, nufft_operator: Any) -> None:
         """
         Args:
             nufft_operator: Instance of NUFFTOperator (physics forward model).
@@ -80,7 +82,7 @@ class NonCartesianGraphLoss(nn.Module):
         pred_image = self.nufft.adjoint(pred_kspace)
 
         # 2. Image Domain Loss (Perceptual/Structural)
-        image_loss = self.l1(pred_image, target_image)
+        image_loss: torch.Tensor = self.l1(pred_image, target_image)
 
         return image_loss
 
@@ -103,7 +105,7 @@ class GraphConsistencyLoss(nn.Module):
 
         \mathcal{L}_{GraphConsistency} = \mathbb{E}[ dcf \odot \| \hat{k}_{graph} - k_{graph} \|_2^2 ]"""
 
-    def __init__(self, density_weighting: bool = True):
+    def __init__(self, density_weighting: bool = True) -> None:
         """__init__.
 
         Args:
@@ -117,7 +119,7 @@ class GraphConsistencyLoss(nn.Module):
         self,
         pred_nodes: torch.Tensor,
         target_nodes: torch.Tensor,
-        dcf: torch.Tensor = None,
+        dcf: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -141,11 +143,11 @@ class GraphConsistencyLoss(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # Convert grid inputs [B, C, H, W] to flat graph [B, H*W, C] -> [B, N, 2]
         if pred_nodes.dim() == 4:
-            B, C, H, W = pred_nodes.shape
-            pred_nodes = pred_nodes.view(B, C, -1).permute(0, 2, 1)
+            b, c = pred_nodes.shape[:2]
+            pred_nodes = pred_nodes.view(b, c, -1).permute(0, 2, 1)
         if target_nodes.dim() == 4:
-            B, C, H, W = target_nodes.shape
-            target_nodes = target_nodes.view(B, C, -1).permute(0, 2, 1)
+            b, c = target_nodes.shape[:2]
+            target_nodes = target_nodes.view(b, c, -1).permute(0, 2, 1)
 
         # Compute Squared Error per node: [B, N, 2]
         error = (pred_nodes - target_nodes) ** 2
@@ -164,13 +166,13 @@ class GraphConsistencyLoss(nn.Module):
                 elif dcf.dim() == 3:
                     dcf = dcf.view(dcf.shape[0], -1)
 
-                # Check shapes for broadcasting
-                if dcf.ndim == 2 and error_mag.ndim == 2:
-                    weighted_error = error_mag * dcf
-                else:
-                    weighted_error = error_mag  # Fallback if shapes mismatch
-
-                return weighted_error.mean()
+                if dcf.shape != error_mag.shape:
+                    raise ValueError(
+                        f"graph_consistency: dcf {tuple(dcf.shape)} does not match the "
+                        f"per-node error {tuple(error_mag.shape)}; an unweighted fallback "
+                        "would silently drop the density compensation."
+                    )
+                return (error_mag * dcf).mean()
 
         return error_mag.mean()
 
@@ -184,7 +186,7 @@ class BlochResidualLoss(nn.Module):
     Equation: dM/dt = M x (gamma * B) - R * (M - M0)
     """
 
-    def __init__(self, dt: float = 1e-3, gamma: float = 267.52e6):
+    def __init__(self, dt: float = 1e-3, gamma: float = 267.52e6) -> None:
         """
         Args:
            dt: Time step between frames in seconds (e.g. 1ms)
@@ -200,8 +202,8 @@ class BlochResidualLoss(nn.Module):
         M_pred: torch.Tensor,
         T1_map: torch.Tensor,
         T2_map: torch.Tensor,
-        PD_map: torch.Tensor = None,
-        B0_map: torch.Tensor = None,
+        PD_map: torch.Tensor | None = None,  # noqa: N803 — physics symbol (proton density)
+        B0_map: torch.Tensor | None = None,  # noqa: N803 — physics symbol (off-resonance field)
     ) -> torch.Tensor:
         """
         Args:
@@ -231,7 +233,9 @@ class BlochResidualLoss(nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # 0. Shapes and Time
-        B, T, C, H, W = M_pred.shape
+        if M_pred.dim() != 5:
+            raise ValueError(f"M_pred must be [B, T, 3, H, W]; got {tuple(M_pred.shape)}.")
+        B, T, C = M_pred.shape[:3]
         assert C == 3, "Output must have 3 channels (Mx, My, Mz)"
 
         # The maps are documented `[B, 1, H, W]` and the code below relies on it:
@@ -308,7 +312,8 @@ class BlochResidualLoss(nn.Module):
         target_dM_dt = torch.stack([target_dMx, target_dMy, target_dMz], dim=2)
 
         # 3. Residual Loss
-        return self.mse(dM_dt_pred, target_dM_dt)
+        residual: torch.Tensor = self.mse(dM_dt_pred, target_dM_dt)
+        return residual
 
 
 @register_loss(name="physics_constraint", aliases=["PhysicsConstraintLoss"])
@@ -327,7 +332,7 @@ class PhysicsConstraintLoss(nn.Module):
         smoothness_weight: float = 0.1,
         energy_weight: float = 0.1,
         kspace_weight: float = 0.1,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -407,7 +412,7 @@ class PhysicsConstraintLoss(nn.Module):
         target: torch.Tensor,
         kspace_target: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute combined physics loss.
 
         Returns:
@@ -428,7 +433,7 @@ class PhysicsConstraintLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        metrics = {}
+        metrics: dict[str, float] = {}
         # Accumulate as a graph-connected tensor — never via ``.item()`` (which
         # would return a gradient-free Python float and silently zero the loss).
         total_loss = torch.zeros((), device=pred.device)
@@ -460,9 +465,9 @@ class SNRPreservingLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SNR} = \\lambda \\max(0, \text{SNR}_{target} - \text{SNR}_{current})"""
+        \\mathcal{L}_{SNR} = \\lambda \\max(0, \\text{SNR}_{target} - \\text{SNR}_{current})"""
 
-    def __init__(self, target_snr: float = 20.0, weight: float = 1.0):
+    def __init__(self, target_snr: float = 20.0, weight: float = 1.0) -> None:
         """__init__.
 
         Args:
@@ -501,8 +506,9 @@ class SNRPreservingLoss(nn.Module):
         # Noise power (mse)
         noise = torch.mean((pred - target) ** 2)
 
-        # Estimated SNR
-        current_snr = 10 * torch.log10(signal / (noise + 1e-8))
+        # Estimated SNR; the floor on BOTH sides keeps an all-zero target finite
+        # (log10(0) = -inf would make the penalty, and its gradient, infinite).
+        current_snr = 10 * torch.log10((signal + 1e-8) / (noise + 1e-8))
 
         # Penalty if SNR is below target
         penalty = F.relu(self.target_snr - current_snr)
@@ -523,7 +529,7 @@ class PhysicsInformedLoss(nn.Module):
         lambda_l2: float = 1.0,
         lambda_dc: float = 1.0,
         lambda_reg: float = 0.01,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -572,15 +578,19 @@ class PhysicsInformedLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        losses = {}
+        losses: dict[str, torch.Tensor] = {}
 
         # L2 loss in image space
         losses["l2_image"] = self.lambda_l2 * F.mse_loss(pred, target)
 
         # Data consistency loss in k-space
         if pred_kspace is not None and target_kspace is not None and mask is not None:
-            masked_pred = pred_kspace * mask.unsqueeze(1)
-            masked_target = target_kspace * mask.unsqueeze(1)
+            # Only a channel-less [B, H, W] mask needs the axis; unsqueezing a
+            # [B, 1, H, W] mask makes it 5-D and broadcasts a phantom batch axis.
+            if mask.dim() == pred_kspace.dim() - 1:
+                mask = mask.unsqueeze(1)
+            masked_pred = pred_kspace * mask
+            masked_target = target_kspace * mask
             losses["dc_kspace"] = self.lambda_dc * F.mse_loss(
                 masked_pred,
                 masked_target,
@@ -614,7 +624,7 @@ class PhysicsInformedLoss(nn.Module):
             # weight of shape ``(C, 1, k, k)`` (out_channels divisible by groups),
             # not ``(1, C, k, k)`` — the latter raises for C > 1.
             blur_kernel = torch.ones(
-                pred.shape[1], 1, kernel_size, kernel_size, device=pred.device
+                pred.shape[1], 1, kernel_size, kernel_size, device=pred.device, dtype=pred.dtype
             ) / (kernel_size**2)
             blurred = F.conv2d(pred, blur_kernel, padding=padding, groups=pred.shape[1])
 
@@ -629,12 +639,9 @@ class PhysicsInformedLoss(nn.Module):
             )
 
         # Total loss
-        total_loss = torch.tensor(0.0, device=pred.device)
+        total_loss = pred.new_zeros(())
         for loss_value in losses.values():
-            if isinstance(loss_value, torch.Tensor):
-                total_loss = total_loss + loss_value
-            else:
-                total_loss = total_loss + torch.tensor(loss_value, device=pred.device)
+            total_loss = total_loss + loss_value
         losses["total"] = total_loss
 
         return losses
@@ -649,11 +656,11 @@ class ParallelImagingKSpaceLoss(nn.Module):
     multi-coil sensitivities and forward transforms.
     """
 
-    def __init__(self, fft_transformer: Any | None = None):
+    def __init__(self, fft_transformer: Any | None = None) -> None:
         """
         Args:
             fft_transformer: Object dealing with FFT operations (must implement fft2c).
-                           If None, standard torch.fft is used.
+                           If None, the physics SSOT ``fft2c`` is used.
         """
         super().__init__()
         self.fft_transformer = fft_transformer
@@ -714,10 +721,21 @@ class ParallelImagingKSpaceLoss(nn.Module):
         if pred_kspace.shape != target_kspace.shape:
             # Handle complex view mismatch (last dim 2 vs complex64/128)
             pred_kspace, target_kspace = self._align_complex_shapes(pred_kspace, target_kspace)
+        # The documented single-coil [B, H, W] measurement lacks only the coil axis;
+        # left as is it broadcasts against [B, 1, H, W] into a [B, B, H, W] cross-batch loss.
+        if target_kspace.dim() == pred_kspace.dim() - 1:
+            target_kspace = target_kspace.unsqueeze(1)
+        if pred_kspace.shape != target_kspace.shape:
+            raise ValueError(
+                f"parallel_imaging_kspace: predicted k-space {tuple(pred_kspace.shape)} "
+                f"and measured k-space {tuple(target_kspace.shape)} do not match."
+            )
 
         if mask is not None:
-            return self.l1(pred_kspace * mask, target_kspace * mask)
-        return self.l1(pred_kspace, target_kspace)
+            pred_kspace = pred_kspace * mask
+            target_kspace = target_kspace * mask
+        loss: torch.Tensor = self.l1(pred_kspace, target_kspace)
+        return loss
 
     def _ensure_complex(self, x: torch.Tensor) -> torch.Tensor:
         """Ensure tensor is in complex format (not B,C,H,W with last dim 2)."""
@@ -774,7 +792,7 @@ class SpectralKSpaceLoss(nn.Module):
 
         \mathcal{L}_{SpectralKSpace} = \| \log(|\mathcal{F}(\hat{y})| + \epsilon) - \log(|\mathcal{F}(y)| + \epsilon) \|_1"""
 
-    def __init__(self, epsilon: float = 1e-8):
+    def __init__(self, epsilon: float = 1e-8) -> None:
         """__init__.
 
         Args:
@@ -861,7 +879,9 @@ class HFENLoss(nn.Module):
     3. Use k-space native: complex_l1, weighted_kspace_l1, data_consistency
     """
 
-    def __init__(self, kernel_size: int = 5, sigma: float = 1.0):
+    kernel: torch.Tensor
+
+    def __init__(self, kernel_size: int = 5, sigma: float = 1.0) -> None:
         """__init__.
 
         Args:
@@ -976,15 +996,31 @@ class InvertedFocalFrequencyLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{InvertedFocal} = \\mathbb{E} \\left[ (1 + \alpha |k|^2) | \\hat{k} - k |^2 \right]"""
+        \\mathcal{L}_{InvertedFocal} = \\mathbb{E} \\left[ (1 + \\alpha |k|^2) | \\hat{k} - k |^2 \\right]"""
 
-    def __init__(self, alpha: float = 2.0, **kwargs):
+    def __init__(self, alpha: float = 2.0, **kwargs: Any) -> None:
         """
         Args:
             alpha: Controls the steepness of the high-frequency penalty.
+            **kwargs: Accepted and never read.
         """
         super().__init__()
         self.alpha = alpha
+        self._radial_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+    def _radial_weight(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        """``1 + alpha * r^2`` on a [-1, 1] grid, ``[1, 1, H, W]``, built once per shape."""
+        key = (height, width, device)
+        cached = self._radial_cache.get(key)
+        if cached is None:
+            yy, xx = torch.meshgrid(
+                torch.linspace(-1, 1, height, device=device),
+                torch.linspace(-1, 1, width, device=device),
+                indexing="ij",
+            )
+            cached = (1.0 + self.alpha * (xx**2 + yy**2)).unsqueeze(0).unsqueeze(0)
+            self._radial_cache[key] = cached
+        return cached
 
     def forward(
         self,
@@ -1021,21 +1057,8 @@ class InvertedFocalFrequencyLoss(nn.Module):
         pred_shifted = fft2c(pred)
         target_shifted = fft2c(target)
 
-        B, C, H, W = pred.shape
-
-        # 3. Construct normalized radial distance mask [-1, 1]
-        # We cache this to avoid recomputing every forward pass in a real implementation
-        Y, X = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=pred.device),
-            torch.linspace(-1, 1, W, device=pred.device),
-            indexing="ij",
-        )
-        radial_dist = torch.sqrt(X**2 + Y**2)
-
-        # 4. Apply Inverted Weighting: 1 + alpha * r^2
-        # Center (DC) has weight 1. Periphery (High Freq) has weight heavily scaled
-        weight = 1.0 + self.alpha * (radial_dist**2)
-        weight = weight.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, H, W]
+        # Inverted weighting 1 + alpha * r^2: DC has weight 1, the periphery the most.
+        weight = self._radial_weight(pred.shape[-2], pred.shape[-1], pred.device)
 
         if weight_matrix is not None:
             weight = weight * weight_matrix.unsqueeze(0).unsqueeze(0)
@@ -1065,7 +1088,7 @@ class ManifoldConstrainedGradient(nn.Module):
                (Medical Image Analysis, 2022)
     """
 
-    def __init__(self, step_size: float = 1.0):
+    def __init__(self, step_size: float = 1.0) -> None:
         """
         Args:
             step_size: Data consistency step size (lambda)
@@ -1137,9 +1160,9 @@ class DivergenceFreeLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{DivergenceFree} = \\mathbb{E}[ (\nabla \\cdot \vec{v})^2 ]"""
+        \\mathcal{L}_{DivergenceFree} = \\mathbb{E}[ (\nabla \\cdot \\vec{v})^2 ]"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """__init__."""
         super().__init__()
 
@@ -1160,15 +1183,13 @@ class DivergenceFreeLoss(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         vx, vy = flow[:, 0:1], flow[:, 1:2]
 
-        # Central differences
-        dvx_dx = (vx[:, :, :, 2:] - vx[:, :, :, :-2]) / 2.0
-        dvy_dy = (vy[:, :, 2:, :] - vy[:, :, :-2, :]) / 2.0
+        # Central differences on the shared interior: dvx_dx is centred at column
+        # j+1 and dvy_dy at row i+1, so each is trimmed along its OTHER axis. A
+        # corner crop instead adds derivatives taken one pixel apart.
+        dvx_dx = (vx[:, :, 1:-1, 2:] - vx[:, :, 1:-1, :-2]) / 2.0
+        dvy_dy = (vy[:, :, 2:, 1:-1] - vy[:, :, :-2, 1:-1]) / 2.0
 
-        # Align shapes
-        min_h = min(dvx_dx.shape[2], dvy_dy.shape[2])
-        min_w = min(dvx_dx.shape[3], dvy_dy.shape[3])
-
-        divergence = dvx_dx[:, :, :min_h, :min_w] + dvy_dy[:, :, :min_h, :min_w]
+        divergence = dvx_dx + dvy_dy
 
         return torch.mean(divergence**2)
 
@@ -1219,6 +1240,19 @@ class JacobianDeterminantLoss(nn.Module):
         return torch.mean(F.relu(-det_J))
 
 
+def _interleaved_to_complex(x: torch.Tensor) -> torch.Tensor:
+    """Complex passes through; real ``[B, 2C, H, W]`` pairs channels (2c, 2c+1) as re/im.
+
+    A real tensor with an odd channel count is a magnitude and gets zero phase.
+    """
+    if x.is_complex():
+        return x
+    if x.dim() >= 3 and x.shape[-3] % 2 == 0:
+        paired = x.reshape(*x.shape[:-3], x.shape[-3] // 2, 2, *x.shape[-2:])
+        return torch.complex(paired[..., 0, :, :], paired[..., 1, :, :])
+    return torch.complex(x, torch.zeros_like(x))
+
+
 @register_loss(name="data_consistency", aliases=["DataConsistencyLoss"])
 class DataConsistencyLoss(nn.Module):
     """Data Consistency Loss for Unrolled Optimization.
@@ -1233,7 +1267,7 @@ class DataConsistencyLoss(nn.Module):
     Reference: Hammernik et al., "Learning a Variational Network" (MRM 2018)
     """
 
-    def __init__(self, lambda_dc: float = 1.0):
+    def __init__(self, lambda_dc: float = 1.0) -> None:
         """__init__.
 
         Args:
@@ -1264,11 +1298,12 @@ class DataConsistencyLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        if not pred_image.is_complex():
-            pred_image = pred_image.to(torch.complex64)
-
-        pred_kspace = fft2c(pred_image)
-        residual = (pred_kspace - measured_kspace) * mask
+        # Both sides follow the project's interleaved [B, 2C, H, W] real/imag
+        # convention; a plain complex cast would FFT the real and imaginary
+        # channels as two separate real images.
+        pred_kspace = fft2c(_interleaved_to_complex(pred_image))
+        measured = _interleaved_to_complex(measured_kspace)
+        residual = (pred_kspace - measured) * mask
 
         return self.lambda_dc * torch.mean(torch.abs(residual) ** 2)
 
@@ -1297,7 +1332,7 @@ class SelfSupervisedPhysicsLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SelfSup} = \\lambda \\| \\mathcal{F}(\text{Bloch}(T_1, T_2, PD)) \\odot M - k_{target} \\odot M \\|_1"""
+        \\mathcal{L}_{SelfSup} = \\lambda \\| \\mathcal{F}(\\text{Bloch}(T_1, T_2, PD)) \\odot M - k_{target} \\odot M \\|_1"""
 
     def __init__(
         self,
@@ -1305,8 +1340,8 @@ class SelfSupervisedPhysicsLoss(nn.Module):
         use_sensitivity_maps: bool = True,
         loss_weight: float = 1.0,
         kspace_weight: float = 1.0,
-        device: torch.device = None,
-    ):
+        device: torch.device | None = None,
+    ) -> None:
         """
         Args:
             bloch_layer: DifferentiableBlochLayer instance for SPGR simulation.
@@ -1367,7 +1402,7 @@ class SelfSupervisedPhysicsLoss(nn.Module):
         target_kspace: torch.Tensor,
         mask: torch.Tensor,
         sensitivity_maps: torch.Tensor | None = None,
-        acq_params: dict | None = None,
+        acq_params: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """
         Compute self-supervised physics loss.
@@ -1437,7 +1472,7 @@ class SelfSupervisedPhysicsLoss(nn.Module):
         sim_kspace_real = torch.view_as_real(sim_kspace_masked)
         target_kspace_real = torch.view_as_real(target_kspace_masked)
 
-        loss_kspace = self.l1_loss(sim_kspace_real, target_kspace_real)
+        loss_kspace: torch.Tensor = self.l1_loss(sim_kspace_real, target_kspace_real)
 
         # Apply loss weight
         total_loss = self.loss_weight * self.kspace_weight * loss_kspace
@@ -1485,11 +1520,11 @@ class AdvancedSelfSupervisedPhysicsLoss(SelfSupervisedPhysicsLoss):
 
     def forward(
         self,
-        pred_params,
+        pred_params: tuple[torch.Tensor, ...],
         target_kspace: torch.Tensor,
         mask: torch.Tensor,
         sensitivity_maps: torch.Tensor | None = None,
-        acq_params: dict | None = None,
+        acq_params: dict[str, Any] | None = None,
         b1_smoothness_weight: float = 10.0,
     ) -> torch.Tensor:
         """
@@ -1545,10 +1580,10 @@ class AdvancedSelfSupervisedPhysicsLoss(SelfSupervisedPhysicsLoss):
         # 4. Compute k-space data consistency loss
         sim_kspace_real = torch.view_as_real(sim_kspace_masked)
         target_kspace_real = torch.view_as_real(target_kspace_masked)
-        loss_kspace = self.l1_loss(sim_kspace_real, target_kspace_real)
+        loss_kspace: torch.Tensor = self.l1_loss(sim_kspace_real, target_kspace_real)
 
         # 5. Compute B1 smoothness regularization (if provided)
-        loss_b1_smooth = 0.0
+        loss_b1_smooth = loss_kspace.new_zeros(())
         if b1_map is not None:
             loss_b1_smooth = self._compute_b1_smoothness_loss(b1_map, weight=b1_smoothness_weight)
 
@@ -1587,14 +1622,14 @@ class EnergyConservationLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{EnergyConservation} = \\left( \frac{\\sum |\\hat{k}|^2}{\\sum |k|^2} - 1 \right)^2"""
+        \\mathcal{L}_{EnergyConservation} = \\left( \\frac{\\sum |\\hat{k}|^2}{\\sum |k|^2} - 1 \\right)^2"""
 
     def __init__(
         self,
         energy_method: str = "magnitude_squared",
         reduction: str = "mse",
         margin: float = 0.05,
-    ):
+    ) -> None:
         """__init__.
 
         Args:
@@ -1643,13 +1678,13 @@ class EnergyConservationLoss(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
 
         # Helper to compute energy from k-space representation
-        def compute_energy(kspace):
+        def compute_energy(kspace: torch.Tensor) -> torch.Tensor:
             """compute_energy.
 
             Args:
-                kspace (Any): Description.
+                kspace (torch.Tensor): Description.
             Returns:
-                Any: Description.
+                torch.Tensor: Description.
             """
             if kspace.is_complex():
                 # Complex tensor: E = sum(|K|^2)
@@ -1697,60 +1732,80 @@ class EnergyConservationLoss(nn.Module):
         return loss
 
 
+def kspace_to_image(
+    kspace: torch.Tensor, *, return_complex: bool = False, log_scaled: bool = False
+) -> torch.Tensor:
+    """Move a loss operand from k-space to the image domain.
+
+    The one k-space -> image step on the loss path. When the arm's k-space is
+    ``log1p``-compressed (``KSpaceNormalizationSpec`` with ``log_scaling``), the
+    compression is undone first: the inverse FFT of compressed k-space is not the
+    image, and a loss that scores it trains against a space nobody declared (#2338).
+    Every loss that bridges itself carries a ``log_scaled`` attribute that
+    ``LossBuilder`` sets from the arm and checks.
+
+    Args:
+        kspace: Complex ``[B, C, H, W]``, real-stacked interleaved ``[B, 2C, H, W]``
+            (``R0, I0, R1, I1, ...``), or ``[..., 2]``.
+        return_complex: Return the complex image instead of its magnitude.
+        log_scaled: Decompress with :func:`decompress_kspace_log` before the iFFT.
+
+    Returns:
+        The complex image, or its magnitude.
+    """
+    if not torch.is_complex(kspace):
+        if kspace.shape[-1] == 2:
+            kspace = torch.view_as_complex(kspace)
+        else:
+            B, _, H, W = kspace.shape
+            C = kspace.shape[1] // 2
+            kspace = torch.view_as_complex(
+                kspace.view(B, C, 2, H, W).permute(0, 1, 3, 4, 2).contiguous()
+            )
+    if log_scaled:
+        kspace = decompress_kspace_log(kspace)
+    img_complex = ifft2c(kspace)
+    return img_complex if return_complex else torch.abs(img_complex)
+
+
 class DifferentiableFourierBridge(nn.Module):
     """
     Bridges pure k-space predictions into the image domain for spatial loss
     calculations, maintaining full autograd tracking for complex tensors.
     """
 
-    def __init__(self, spatial_loss_fn=None, return_complex: bool = False):
+    def __init__(
+        self,
+        spatial_loss_fn: Callable[..., torch.Tensor] | None = None,
+        return_complex: bool = False,
+        log_scaled: bool = False,
+    ) -> None:
         """__init__.
 
         Args:
             spatial_loss_fn (Any): Description.
             return_complex (bool): Description.
+            log_scaled (bool): The operands are ``log1p``-compressed k-space; see
+                :func:`kspace_to_image`.
         """
         super().__init__()
         self.spatial_loss_fn = spatial_loss_fn
         self.return_complex = return_complex
+        self.log_scaled = log_scaled
 
     def _kspace_to_image(self, kspace: torch.Tensor) -> torch.Tensor:
-        # 1. Ensure input is complex [B, C, H, W] where C=1 (if coils are combined)
-        """_kspace_to_image.
-
-        Args:
-            kspace (torch.Tensor): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        if not torch.is_complex(kspace):
-            if kspace.shape[-1] == 2:
-                # [..., 2] format: convert to complex
-                kspace = torch.view_as_complex(kspace)
-            else:
-                # [B, 2*C, H, W] stacked: reshape to complex
-                B, _, H, W = kspace.shape
-                C = kspace.shape[1] // 2
-                kspace = torch.view_as_complex(
-                    kspace.view(B, C, 2, H, W).permute(0, 1, 3, 4, 2).contiguous()
-                )
-
-        # 2. Inverse FFT with orthonormal scaling (crucial for gradient magnitude)
-        # Use the verified ifft2c from physics ops which handles shift order correctly
-        img_complex = ifft2c(kspace)
-
-        # 3. Return magnitude for spatial loss (or keep complex for phase losses)
-        if self.return_complex:
-            return img_complex
-        return torch.abs(img_complex)
+        """Delegate to :func:`kspace_to_image` with this bridge's settings."""
+        return kspace_to_image(
+            kspace, return_complex=self.return_complex, log_scaled=self.log_scaled
+        )
 
     def forward(
         self,
         k_pred: torch.Tensor,
         k_target: torch.Tensor,
-        spatial_mask: torch.Tensor = None,
-        **kwargs,
-    ):
+        spatial_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         """forward.
 
         Args:
@@ -1789,7 +1844,8 @@ class DifferentiableFourierBridge(nn.Module):
         # The builder's wrapper forwards everything, so this is the hop that narrows
         # kwargs to the inner loss, and the one that must re-file the coil maps.
         accepted = kwargs_accepted_by(self.spatial_loss_fn, kwargs)
-        return self.spatial_loss_fn(img_pred, img_target, **accepted)
+        loss: torch.Tensor = self.spatial_loss_fn(img_pred, img_target, **accepted)
+        return loss
 
 
 @register_loss(name="background_suppression", aliases=["BackgroundSuppressionLoss"])
@@ -1829,7 +1885,7 @@ class BackgroundSuppressionLoss(nn.Module):
 
         \mathcal{L}_{Background} = \mathbb{E}[ | \hat{y} | \odot M_{bg} ]"""
 
-    def __init__(self, threshold_ratio: float = 1.5, use_fourier_bridge: bool = True):
+    def __init__(self, threshold_ratio: float = 1.5, use_fourier_bridge: bool = True) -> None:
         """__init__.
 
         Args:
@@ -1842,19 +1898,14 @@ class BackgroundSuppressionLoss(nn.Module):
 
         if use_fourier_bridge:
             # Define the spatial loss logic (mean absolute error of masked image)
-            def l1_mae(pred, target):
-                """l1_mae.
-
-                Args:
-                    pred (Any): Description.
-                    target (Any): Description.
-                Returns:
-                    Any: Description.
-                """
+            def l1_mae(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                """Mean magnitude of the (background-masked) prediction; ``target`` is unused."""
                 return pred.abs().mean()
 
             # Wrap the spatial logic in the differentiable bridge to preserve Parseval's theorem
-            self.bridge = DifferentiableFourierBridge(spatial_loss_fn=l1_mae)
+            self.bridge: DifferentiableFourierBridge | None = DifferentiableFourierBridge(
+                spatial_loss_fn=l1_mae
+            )
         else:
             self.bridge = None
 
@@ -1883,7 +1934,7 @@ class BackgroundSuppressionLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        if self.use_fourier_bridge:
+        if self.bridge is not None:
             # ── K-SPACE PATH ──────────────────────────────────────────────────
             # Derive background mask from GT without gradients (mask is non-differentiable)
             with torch.no_grad():
@@ -1895,7 +1946,8 @@ class BackgroundSuppressionLoss(nn.Module):
                 bg_mask = (img_gt < (self.ratio * noise_level)).float()
 
             # Bridge projects k_pred into image space (differentiable) then masks + MAE
-            return self.bridge(k_pred=k_pred, k_target=k_gt, spatial_mask=bg_mask)
+            bridged: torch.Tensor = self.bridge(k_pred=k_pred, k_target=k_gt, spatial_mask=bg_mask)
+            return bridged
 
         else:
             # ── IMAGE-DOMAIN PATH ─────────────────────────────────────────────
@@ -1942,7 +1994,7 @@ class ComplexGradientLoss(nn.Module):
 
         \\mathcal{L}_{ComplexGradient} = \\| \nabla \\hat{k} - \nabla k \\|_p"""
 
-    def __init__(self, use_fourier_bridge: bool = True):
+    def __init__(self, use_fourier_bridge: bool = True) -> None:
         """__init__.
 
         Args:
@@ -1950,6 +2002,7 @@ class ComplexGradientLoss(nn.Module):
         """
         super().__init__()
         self.use_fourier_bridge = use_fourier_bridge
+        self.bridge: DifferentiableFourierBridge | None = None
 
         def complex_gradient_penalty(
             img_pred: torch.Tensor, img_target: torch.Tensor
@@ -1985,9 +2038,7 @@ class ComplexGradientLoss(nn.Module):
                 spatial_loss_fn=complex_gradient_penalty,
                 return_complex=True,
             )
-        else:
-            self.bridge = None
-            self._spatial_loss_fn = complex_gradient_penalty
+        self._spatial_loss_fn = complex_gradient_penalty
 
     def forward(self, k_pred: torch.Tensor, k_target: torch.Tensor) -> torch.Tensor:
         """Compute complex spatial gradient loss.
@@ -2013,8 +2064,9 @@ class ComplexGradientLoss(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        if self.use_fourier_bridge:
-            return self.bridge(k_pred, k_target)
+        if self.bridge is not None:
+            bridged: torch.Tensor = self.bridge(k_pred, k_target)
+            return bridged
         # Inputs are already complex image-domain tensors
         return self._spatial_loss_fn(k_pred, k_target)
 
@@ -2032,10 +2084,15 @@ class SENSEAdjointPhaseLoss(nn.Module):
 
         \mathcal{L}_{SENSEAdjointPhase} = \| \sum_c S_c^* \mathcal{F}^{-1}(\hat{k}_c) - \sum_c S_c^* \mathcal{F}^{-1}(k_c) \|_1"""
 
-    def __init__(self):
+    #: Bridges from k-space itself; LossBuilder reads this to route and to set
+    #: ``log_scaled`` (#467, #2338).
+    use_fourier_bridge = True
+
+    def __init__(self) -> None:
         """__init__."""
         super().__init__()
         self.l1 = nn.L1Loss()
+        self.log_scaled = False
 
     def forward(
         self,
@@ -2074,7 +2131,9 @@ class SENSEAdjointPhaseLoss(nn.Module):
         if sensitivity_maps.shape[-1] == 2 and not sensitivity_maps.is_complex():
             sensitivity_maps = torch.view_as_complex(sensitivity_maps)
 
-        # iFFT
+        if self.log_scaled:
+            pred_kspace = decompress_kspace_log(pred_kspace, channel_dim=1)
+            target_kspace = decompress_kspace_log(target_kspace, channel_dim=1)
         pred_img = ifft2c(pred_kspace)
         target_img = ifft2c(target_kspace)
 
@@ -2089,7 +2148,8 @@ class SENSEAdjointPhaseLoss(nn.Module):
 
         # Phase extraction or direct complex L1
         # L1 on the combined complex images intrinsically penalizes phase
-        return self.l1(pred_combined, target_combined)
+        loss: torch.Tensor = self.l1(pred_combined, target_combined)
+        return loss
 
 
 @register_loss(name="sobolev_frequency", aliases=["SobolevFrequencyLoss"])
@@ -2101,9 +2161,9 @@ class SobolevFrequencyLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{SobolevFrequency} = \\mathbb{E}_{k} \\left[ (1 + |k|) | \\hat{k} - k | \right]"""
+        \\mathcal{L}_{SobolevFrequency} = \\mathbb{E}_{k} \\left[ (1 + |k|) | \\hat{k} - k | \\right]"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """__init__."""
         super().__init__()
         self.l1 = nn.L1Loss()
@@ -2155,7 +2215,8 @@ class SobolevFrequencyLoss(nn.Module):
         weighted_diff = diff * weight
 
         # L1 norm of complex difference
-        return self.l1(weighted_diff, torch.zeros_like(weighted_diff))
+        loss: torch.Tensor = self.l1(weighted_diff, torch.zeros_like(weighted_diff))
+        return loss
 
 
 @register_loss(name="unit_norm_coil", aliases=["UnitNormCoilLoss"])
@@ -2165,9 +2226,9 @@ class UnitNormCoilLoss(nn.Module):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{UnitNormCoil} = \\mathbb{E} \\left[ (1 - \\sum_c |S_c|^2)^2 \right]"""
+        \\mathcal{L}_{UnitNormCoil} = \\mathbb{E} \\left[ (1 - \\sum_c |S_c|^2)^2 \\right]"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
     def forward(self, S_real: torch.Tensor, S_imag: torch.Tensor) -> torch.Tensor:
@@ -2195,11 +2256,14 @@ class MagnitudeTVLoss(nn.Module):
     Total Variation on the Magnitude of the Complex Fields.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
     def forward(
-        self, S_real: torch.Tensor, S_imag: torch.Tensor, shape: tuple[int, int] = None
+        self,
+        S_real: torch.Tensor,  # noqa: N803 — physics symbol (coil sensitivity S)
+        S_imag: torch.Tensor,  # noqa: N803 — physics symbol (coil sensitivity S)
+        shape: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """
         Args:

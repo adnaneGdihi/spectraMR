@@ -1,4 +1,5 @@
 from einops import rearrange
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -98,11 +99,11 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=getattr(self.attn_drop, "p", 0.0) if self.training else 0.0,
+            scale=self.scale,
+        )
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

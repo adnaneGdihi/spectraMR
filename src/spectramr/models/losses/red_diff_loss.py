@@ -29,6 +29,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,7 +106,7 @@ class REDDiffLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None or "denoiser" not in context:
@@ -125,10 +127,7 @@ class REDDiffLoss(nn.Module):
                 prediction.device,
                 prediction.dtype,
             )
-            if custom_sigma is not None:
-                sigma = custom_sigma(t)
-            else:
-                sigma = self._sigma(t)
+            sigma = custom_sigma(t) if custom_sigma is not None else self._sigma(t)
             sigma_b = sigma.view(-1, *([1] * (prediction.dim() - 1)))
             eps = torch.randn_like(prediction)
             noisy = prediction + sigma_b * eps

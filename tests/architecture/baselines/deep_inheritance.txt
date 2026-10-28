@@ -90,6 +90,7 @@ GuidedSuperResolutionStrategy  # depth 3
 HRFManifoldDiffusionStrategy  # depth 3
 HSSCStrategy  # depth 3
 HamiltonianAcquisitionStrategy  # depth 3
+HardwareWarpCalibrationStrategy  # depth 4
 HeteroscedasticULFStrategy  # depth 4
 IBActiveAcquisitionStrategy  # depth 3
 IBVFTrainingStrategy  # depth 4

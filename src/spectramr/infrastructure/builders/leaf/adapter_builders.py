@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 HOOKS: tuple[str, ...] = (
     "pre_model",
     "post_model",
-    "pre_loss_pred",
     "pre_loss_target",
     "pre_metric",
 )
@@ -99,7 +98,25 @@ def apply_chain(chain: list[Any], x: Any) -> Any:
     return x
 
 
-__all__ = ["HOOKS", "AdapterChainBuilder", "apply_chain"]
+def apply_pre_model(
+    chains: dict[str, list[Any]], input_batch: Any, target_batch: Any
+) -> tuple[Any, Any]:
+    """Apply the ``pre_model`` chain to input and target, the one owner for train and validation.
+
+    Both paths must hand the model the same tensor; a validation that skips this grades
+    the model on a different input than it trained on.
+    """
+    chain = chains.get("pre_model") or []
+    if not chain:
+        return input_batch, target_batch
+    if input_batch is not None:
+        input_batch = apply_chain(chain, input_batch)
+    if target_batch is not None:
+        target_batch = apply_chain(chain, target_batch)
+    return input_batch, target_batch
+
+
+__all__ = ["HOOKS", "AdapterChainBuilder", "apply_chain", "apply_pre_model"]
 # VALID_INSERTION_POINTS re-exported for callers that need to validate
 # YAML hook names against the canonical set.
 assert set(HOOKS) == set(VALID_INSERTION_POINTS), "HOOKS and VALID_INSERTION_POINTS must agree."

@@ -18,11 +18,14 @@ Reference:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.checkpointing.restore import weights
+from spectramr.infrastructure.distributed.owned_modules import sync_frozen_module
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
@@ -30,6 +33,16 @@ from spectramr.infrastructure.training.strategies.simulator_builder import (
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
+
+
+def _build_teacher(config: Any) -> torch.nn.Module:
+    from spectramr.models.generators.cross_attention_oracle import CrossAttentionOracleUNet
+
+    return CrossAttentionOracleUNet(
+        in_channels=config.model.in_channels,
+        out_channels=config.model.out_channels,
+        **(config.model.model_kwargs or {}),
+    )
 
 
 class ConcreteDistillationStrategy(BaseTrainingStrategy):
@@ -48,6 +61,12 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
         simulator: Digital Twin for generating training pairs (config-driven).
     """
 
+    # parallel_compat: The teacher is frozen and runs under no_grad, so it needs no reduction,
+    # only rank 0's values (sync_frozen_module). The student is the wrapped env generator.
+    parallel_compat = frozenset({"replicated"})
+
+    synthesises_model_input: ClassVar[bool] = True
+
     def __init__(
         self,
         env: Any,
@@ -55,7 +74,8 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize Teacher, simulator (from config), and losses."""
@@ -86,68 +106,46 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
             self._teacher is not None,
         )
 
+    @staticmethod
+    def _student_returns_latent(student: torch.nn.Module) -> bool:
+        """Whether the student's forward takes ``return_latent``.
+
+        Read on the inner module: a DDP/DP wrapper's forward takes only ``*inputs,
+        **kwargs``, so probing it dropped the distillation term without an error.
+        """
+        inner = unwrap_model(student)
+        return hasattr(inner, "forward") and "return_latent" in inner.forward.__code__.co_varnames
+
     def _load_teacher(self) -> None:
-        """Load the frozen Teacher model from checkpoint."""
-        checkpoint_config = self.config.checkpoint
-        teacher_path = None
-
-        if hasattr(checkpoint_config, "resume_from") and checkpoint_config.resume_from:
-            teacher_path = checkpoint_config.resume_from
-
-        if teacher_path is None:
-            # INFO, not WARNING: no-teacher is a supported, graceful mode — the
-            # distillation loss simply becomes 0.0 (see _compute_losses_impl).
-            # A WARNING here trips the smoke audit (CLAUDE.md #10) on every
-            # distillation arm that runs without a Method-A checkpoint. If a
-            # teacher is ever genuinely REQUIRED, enforce it in the schema/raise,
-            # not via a log level. (smoke audit 2026-06-03, F7b)
+        """Load the frozen teacher from ``training.distillation.teacher_checkpoint``."""
+        distillation = self.config.training.distillation
+        teacher_path = distillation.teacher_checkpoint if distillation is not None else None
+        if not teacher_path:
+            # INFO, not WARNING: no-teacher is a supported mode and the distillation loss
+            # is simply 0.0; a WARNING trips the smoke audit (F7b).
             logger.info(
-                "[DistillationStrategy] No teacher checkpoint configured. "
-                "Set checkpoint.resume_from to the Method A checkpoint path. "
+                "[DistillationStrategy] No teacher checkpoint configured. Set "
+                "training.distillation.teacher_checkpoint to the Method A checkpoint. "
                 "Distillation loss will be skipped."
             )
             return
-
         try:
-            from spectramr.models.generators.cross_attention_oracle import (
-                CrossAttentionOracleUNet,
-            )
-
-            model_kwargs = self.config.model.model_kwargs or {}
-            teacher = CrossAttentionOracleUNet(
-                in_channels=self.config.model.in_channels,
-                out_channels=self.config.model.out_channels,
-                **model_kwargs,
-            )
-
-            state = torch.load(teacher_path, map_location=self.device, weights_only=True)
-            if "model_state_dict" in state:
-                teacher.load_state_dict(state["model_state_dict"], strict=False)
-            elif "generator" in state:
-                teacher.load_state_dict(state["generator"], strict=False)
-            else:
-                teacher.load_state_dict(state, strict=False)
-
+            teacher = _build_teacher(self.config)
+            weights(teacher_path, "generator", teacher, policy="overlap")
             teacher.to(self.device)
             teacher.eval()
-
             for param in teacher.parameters():
                 param.requires_grad = False
-
+            sync_frozen_module(teacher)  # "overlap" leaves unmatched tensors rank-seeded
             self._teacher = teacher
             logger.info("[DistillationStrategy] Teacher loaded from %s", teacher_path)
         except Exception as e:
-            # Fail loud: reaching here means ``checkpoint.resume_from`` WAS set,
-            # so a teacher was explicitly requested. Swallowing the error and
-            # setting ``self._teacher = None`` would silently collapse the
-            # distillation loss to 0.0 and train the student as a plain
-            # reconstruction — a facade (pitfall #16). (The genuinely-optional
-            # no-teacher path returns early above without ever reaching here.)
+            # A configured teacher that fails to load must not collapse the loss to 0.0
+            # and train a plain reconstruction under the distillation label (pitfall #16).
             raise RuntimeError(
-                f"[DistillationStrategy] checkpoint.resume_from='{teacher_path}' "
-                f"was configured but the teacher failed to load ({e}). Fix the "
-                "path/checkpoint, or unset checkpoint.resume_from to run without "
-                "distillation."
+                f"[DistillationStrategy] training.distillation.teacher_checkpoint="
+                f"'{teacher_path}' was configured but the teacher failed to load ({e}). "
+                "Fix the path, or unset it to run without distillation."
             ) from e
 
     def _to_complex(self, batch: torch.Tensor) -> torch.Tensor:
@@ -207,7 +205,7 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
 
         # 4. Student forward (blind — no marker)
         student = self.generator_model
-        if hasattr(student, "forward") and "return_latent" in student.forward.__code__.co_varnames:
+        if self._student_returns_latent(student):
             result = student(corrupted_input, return_latent=True)
             if isinstance(result, tuple):
                 student_pred, z_student = result

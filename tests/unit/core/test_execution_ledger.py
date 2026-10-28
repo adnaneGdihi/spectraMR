@@ -871,12 +871,10 @@ def test_an_unknown_config_version_is_none_not_invented():
 # ----------------------------------------------------------------------
 #
 # `alias` and `validation_alias` are different attributes, and the ledger read
-# only the first. `CheckpointConfigSchema.checkpoint_dir` carries
-# `validation_alias="save_dir"` with `alias=None`, and it is the ONLY aliased
-# field in the entire schema tree -- so that one missing attribute name was
-# 100% of the alias surface, and every one of the 293 corpus arms declaring
-# `save_dir` was recorded as EXTRA_IGNORE_DROPPED at severity "error" while the
-# value reached `checkpoint_dir` intact.
+# only the first. The schema's one aliased field at the time, the since-retired
+# `checkpoint.checkpoint_dir` (`validation_alias="save_dir"`, #2842), was
+# therefore recorded as EXTRA_IGNORE_DROPPED at severity "error" on 293 corpus
+# arms while its value landed intact. The stand-in below keeps that shape.
 #
 # Sensitivity pair, per this module's opening docstring: the alias must go
 # quiet AND a genuinely-unknown key on the same model must still fire. Without
@@ -922,29 +920,6 @@ def test_the_canonical_field_name_is_still_accepted():
     ledger = ExecutionLedger.begin_run(source="t")
     raw = {"checkpoint_dir": "/tmp/x"}
     diff_declared_vs_resolved(raw, AliasedByValidationAlias(**raw), ledger=ledger)
-    assert _dropped(ledger) == []
-
-
-def test_the_real_checkpoint_schema_accepts_save_dir_quietly():
-    """The production class this defect was found on, not a stand-in.
-
-    A local model proves the branch works; only the shipped schema proves the
-    branch applies to the 293 arms. Imported inside the test so `core`'s own
-    suite does not take a hard `config` dependency at collection time.
-    """
-    from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
-
-    field = CheckpointConfigSchema.model_fields["checkpoint_dir"]
-    assert field.validation_alias == "save_dir" and field.alias is None, (
-        "this test's premise moved: checkpoint_dir no longer carries "
-        "validation_alias='save_dir' with alias=None"
-    )
-
-    ledger = ExecutionLedger.begin_run(source="t")
-    raw = {"save_dir": "./checkpoints"}
-    instance = CheckpointConfigSchema(**raw)
-    assert instance.checkpoint_dir == "./checkpoints"
-    diff_declared_vs_resolved(raw, instance, ledger=ledger)
     assert _dropped(ledger) == []
 
 

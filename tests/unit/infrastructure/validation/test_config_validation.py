@@ -117,9 +117,8 @@ def _registry_clean(mode):
     """A config whose ONLY defect is ``training_mode`` — nothing else errors.
 
     Verified against the live registry: batch_size / learning_rate / epochs are
-    the three unconditional error rules, and ``training_mode_compatibility``
-    stays silent on an unknown mode (it reads ``.get(mode) or {}``). So any
-    error this config produces came from the splice.
+    the three unconditional error rules, and no registry rule rejects an unknown mode.
+    So any error this config produces came from the splice.
     """
     return _StubSettings(
         {
@@ -178,8 +177,7 @@ class TestValidateFunnelActuallyRunsTheCheck:
     def test_dispatchable_mode_passes_the_funnel(self):
         """The mirror case: a real mode must not be rejected by the splice.
 
-        ``physics_driven`` is deliberate — it is dispatchable AND carries no
-        ``TRAINING_MODE_CONSTRAINTS`` entry, so it is exactly the population this
-        PR unblocked. Before the fix this raised "Unknown training mode".
+        ``physics_driven`` is deliberate — it is dispatchable and was missing from
+        the old constraints table, so it is exactly the population this PR unblocked. Before the fix this raised "Unknown training mode".
         """
         ConfigValidator.validate(_registry_clean("physics_driven"))

@@ -36,7 +36,8 @@ def test_defaults() -> None:
     assert cfg.optimizer.learning_rate == 1e-5
     assert cfg.optimizer.type == "adamw"
     assert cfg.optimizer.weight_decay == 1e-4
-    assert cfg.optimizer.beta1 == 0.5
+    # Unset: the optimizer's own default applies and is stamped into provenance (#2308).
+    assert cfg.optimizer.beta1 is None
     assert cfg.optimizer.beta2 == 0.999
     assert cfg.precision.enabled is False
     assert cfg.gradient.accumulation_steps == 1
@@ -200,6 +201,22 @@ def test_flat_scheduler_knobs_reach_the_resolver() -> None:
     assert spec is not None
     assert spec.name == "cosine_annealing"
     assert spec.params == {"T_max": 4242, "eta_min": 1e-7}
+
+
+def test_undeclared_t_max_is_the_run_in_optimizer_steps() -> None:
+    """The ``T_max`` description promises the run length; it is counted in scheduler steps."""
+    from spectramr.infrastructure.training.scheduler_resolution import (
+        resolve_scheduler_spec,
+    )
+
+    cfg = OptimizationConfigSchema(
+        scheduler_type="cosine",
+        scheduler={"warmup_steps": 500},
+        gradient={"accumulation_steps": 4},
+    )
+    spec = resolve_scheduler_spec(cfg, max_iterations=30000)
+    assert spec is not None
+    assert spec.params["T_max"] == 30000 // 4 - 500
 
 
 def test_scheduler_none_means_no_scheduler() -> None:

@@ -5,11 +5,22 @@ style transfer by re-encoding the swapped output and comparing against
 the original content code.
 """
 
+from collections.abc import Callable
+from typing import Protocol
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.models.losses.registry import register_loss
+
+
+class _DisentangledModel(Protocol):
+    """The three submodules the cross-swap reads off the model."""
+
+    content_encoder: Callable[[torch.Tensor], torch.Tensor]
+    style_encoder: Callable[[torch.Tensor], torch.Tensor]
+    generator: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 @register_loss("latent_consistency", aliases=["LatentConsistencyLoss", "latent_swap"])
@@ -53,7 +64,9 @@ class LatentConsistencyLoss(nn.Module):
         self.reduction = reduction
         self.norm_type = norm_type
 
-    def forward(self, model: nn.Module, x_a: torch.Tensor, x_b: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, model: _DisentangledModel, x_a: torch.Tensor, x_b: torch.Tensor
+    ) -> torch.Tensor:
         """Compute latent consistency loss via cross-swapping.
 
         Args:

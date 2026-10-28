@@ -17,9 +17,7 @@ from typing import Any
 import torch
 
 from spectramr.infrastructure.services import IModelManagementService
-from spectramr.infrastructure.services.checkpoint_service import CheckpointService
 from spectramr.models.model_cards import ModelCard, PerformanceMetrics, TrainingDetails
-from spectramr.shared.utils.safe_io import safe_torch_load
 
 
 @dataclass
@@ -52,14 +50,12 @@ class ModelManagementService(IModelManagementService):
     def __init__(
         self,
         base_dir: str = "./models",
-        checkpoint_service: Any | None = None,
         logging_service: Any | None = None,
     ):
         """Initialize the model management service.
 
         Args:
             base_dir: Base directory for model storage
-            checkpoint_service: Optional checkpoint service for persistence
             logging_service: Optional logging service for tracking
 
         """
@@ -79,7 +75,6 @@ class ModelManagementService(IModelManagementService):
             dir_path.mkdir(parents=True, exist_ok=True)
 
         # Dependencies
-        self.checkpoint_service = checkpoint_service
         self.logging_service = logging_service
         self.logger = logging.getLogger(__name__)
 
@@ -167,7 +162,7 @@ class ModelManagementService(IModelManagementService):
         """Retrieve a model by ID.
 
         Note: This returns None as models are typically loaded from checkpoints
-        rather than stored in memory. Use load_model_checkpoint instead.
+        rather than stored in memory. Use ``checkpointing.restore`` instead.
 
         Args:
             model_id: Unique model identifier
@@ -242,124 +237,6 @@ class ModelManagementService(IModelManagementService):
         self.logger.info(f"Updated metadata for model {model_id}")
 
         return True
-
-    def save_model_checkpoint(
-        self,
-        model_id: str,
-        model: torch.nn.Module,
-        optimizer: Any,
-        epoch: int,
-        step: int | None = None,
-        metrics: dict[str, Any] | None = None,
-    ) -> str:
-        """Save model checkpoint with metadata.
-
-        Args:
-            model_id: Unique model identifier
-            model: PyTorch model to save
-            optimizer: Optimizer state
-            epoch: Current epoch
-            step: Current step (optional, but recommended)
-            metrics: Optional training metrics
-
-        Returns:
-            Path to saved checkpoint
-
-        """
-        if model_id not in self._model_registry:
-            raise ValueError(f"Model {model_id} not registered")
-
-        model_info = self._model_registry[model_id]
-
-        # [FIX] Construct name with step if available
-        if step is not None:
-            checkpoint_name = f"checkpoint_epoch_{epoch}_step_{step}.pth"
-        else:
-            checkpoint_name = f"checkpoint_epoch_{epoch}.pth"
-
-        # Use checkpoint service if available
-        if self.checkpoint_service:
-            # We explicitly pass checkpoint_name to ensure persistent naming
-            checkpoint_path = self.checkpoint_service.save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                step=step,
-                checkpoint_name=checkpoint_name,
-                **(metrics or {}),
-            )
-        else:
-            # Fallback: delegate to a transient checkpoint service
-            fallback_service = CheckpointService(model_info.checkpoint_dir)
-
-            checkpoint: dict[str, Any] = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "model_id": model_id,
-                "model_type": model_info.model_type,
-                "version": model_info.version,
-                **(metrics or {}),
-            }
-
-            checkpoint_path = fallback_service.save_payload(
-                checkpoint,
-                checkpoint_name,
-            )
-
-        # Update model info
-        model_info.updated_at = datetime.now().isoformat()
-        self._save_registry()
-
-        self.logger.info(
-            "Saved checkpoint for model %s: %s",
-            model_id,
-            checkpoint_path,
-        )
-        return checkpoint_path
-
-    def load_model_checkpoint(
-        self,
-        model_id: str,
-        checkpoint_name: str,
-    ) -> dict[str, Any] | None:
-        """Load model checkpoint.
-
-        Args:
-            model_id: Unique model identifier
-            checkpoint_name: Name of checkpoint file
-
-        Returns:
-            Checkpoint data dictionary or None if not found
-
-        """
-        if model_id not in self._model_registry:
-            self.logger.warning(f"Model {model_id} not found")
-            return None
-
-        model_info = self._model_registry[model_id]
-        checkpoint_path = os.path.join(
-            model_info.checkpoint_dir,
-            checkpoint_name,
-        )
-
-        if not os.path.exists(checkpoint_path):
-            self.logger.warning(f"Checkpoint not found: {checkpoint_path}")
-            return None
-
-        try:
-            if self.checkpoint_service:
-                # Use checkpoint service if available
-                return self.checkpoint_service.load_checkpoint(checkpoint_path)
-            # Load directly with safe loading
-            return safe_torch_load(checkpoint_path, map_location="cpu")
-        except Exception as e:
-            self.logger.error(
-                "Failed to load checkpoint %s: %s",
-                checkpoint_path,
-                e,
-            )
-            return None
 
     def export_model(
         self,

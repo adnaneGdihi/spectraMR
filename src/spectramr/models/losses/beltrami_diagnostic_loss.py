@@ -1,13 +1,17 @@
 """Beltrami coefficient diagnostic + (optional) regularizer.
 
-For a planar map :math:`f = u + i v`, the Beltrami coefficient is
+The input is a displacement :math:`d = u + i v`, and the map it induces is
+:math:`f(z) = z + d(z)`. Its Beltrami coefficient is
 
 .. math::
 
     \\mu(f)
         = \\frac{\\partial f / \\partial \\bar z}{\\partial f / \\partial z}
         = \\frac{(u_x - v_y) + i (v_x + u_y)}
-                {(u_x + v_y) + i (v_x - u_y)}.
+                {(2 + u_x + v_y) + i (v_x - u_y)},
+
+so a zero displacement (the identity map) has :math:`\\mu = 0`, matching
+:func:`spectramr.infrastructure.physics.beltrami_faithfulness.beltrami_from_displacement`.
 
 The map is quasiconformal iff :math:`\\| \\mu \\|_\\infty < 1`. The
 loss returns :math:`\\| \\mu \\|_\\infty` (or its squared mean) as a
@@ -20,14 +24,16 @@ is stable.
 
 Input convention:
 
-- 2D: ``(B, 2, H, W)`` interpreted as ``u`` and ``v`` channels.
-- 3D: ``(B, 2, D, H, W)`` — Beltrami is computed per axial slice
-  (the natural QC notion in 3D requires a Frenet frame; per-slice
-  is the standard MRI-distortion proxy).
+- 2D: ``(B, 2, H, W)`` interpreted as the displacement channels ``u`` (along
+  W, x) and ``v`` (along H, y), in pixels.
+- 3D: ``(B, 2 or 3, D, H, W)`` — Beltrami is computed per axial slice on the
+  in-plane components ``(u, v)`` = channels 0 and 1, the standard MRI-distortion
+  proxy. A third (z) component is ignored by this diagnostic.
 
-Fallback signature ``forward(pred, target)`` treats the residual
-``pred - target`` as a 2-channel displacement field if it has 2
-channels; otherwise raises ``ValueError``.
+The GeoMamba displacement head supplies the 3D field through ``displacement=``.
+The fallback ``forward(pred, target)`` uses the residual ``pred - target``, which
+must have 2 or 3 channels. A 1-channel intensity residual raises, because it is
+not a displacement.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ from spectramr.models.losses.registry import register_loss
     aliases=["BeltramiDiagnostic", "beltrami"],
 )
 class BeltramiDiagnosticLoss(nn.Module):
-    """Differentiable Beltrami coefficient ``||mu||`` for a (u, v) field.
+    """Differentiable Beltrami coefficient ``|mu|`` of the map ``z + d`` for a displacement ``d``.
 
     Args:
         reduction: ``"infty"`` returns the per-batch maximum
@@ -86,18 +92,23 @@ class BeltramiDiagnosticLoss(nn.Module):
         field — only valid when both are 2-channel (u, v).
         """
         field = self._resolve_field(pred, target, displacement)
-        # Now `field` is (B, 2, H, W) for 2D or (B, 2, D, H, W) for 3D.
         if field.ndim == 4:
+            if field.shape[1] != 2:
+                raise ValueError(f"2D Beltrami needs (B,2,H,W), got {tuple(field.shape)}")
             mu_abs = self._beltrami_2d(field)
         elif field.ndim == 5:
-            # Per-slice Beltrami: vectorize batch and depth dims.
-            B, two, D, H, W = field.shape
-            assert two == 2
-            stacked = field.permute(0, 2, 1, 3, 4).reshape(B * D, 2, H, W)
-            mu_abs = self._beltrami_2d(stacked)
+            if field.shape[1] not in (2, 3):
+                raise ValueError(
+                    f"3D Beltrami needs (B,2|3,D,H,W) displacement, got {tuple(field.shape)}"
+                )
+            # Per-slice Beltrami on the in-plane (u, v): vectorize batch and depth.
+            B, _, D, H, W = field.shape
+            inplane = field[:, :2].permute(0, 2, 1, 3, 4).reshape(B * D, 2, H, W)
+            mu_abs = self._beltrami_2d(inplane)
         else:
             raise ValueError(
-                f"Beltrami input must be 4D (B,2,H,W) or 5D (B,2,D,H,W), got {field.ndim}D"
+                "Beltrami input must be (B,2,H,W) or (B,2|3,D,H,W), got "
+                f"{field.ndim}D"
             )
 
         if self.reduction == "infty":
@@ -127,10 +138,11 @@ class BeltramiDiagnosticLoss(nn.Module):
                 "pred and target must have the same shape when displacement is None "
                 f"(got {tuple(pred.shape)} vs {tuple(target.shape)})"
             )
-        if pred.shape[1] != 2:
+        if pred.shape[1] not in (2, 3):
             raise ValueError(
-                "Beltrami fallback (pred, target) requires 2-channel inputs "
-                f"interpretable as (u, v); got {pred.shape[1]} channels"
+                "Beltrami fallback (pred, target) needs a displacement with 2 or 3 channels; "
+                f"got {pred.shape[1]}. A 1-channel intensity residual is not a displacement: "
+                "pass displacement= from the model's displacement head."
             )
         return pred - target
 
@@ -145,15 +157,21 @@ class BeltramiDiagnosticLoss(nn.Module):
         v_x = self._dx(v)
         v_y = self._dy(v)
 
-        # mu = ( (u_x - v_y) + i(v_x + u_y) ) / ( (u_x + v_y) + i(v_x - u_y) )
+        # 2 f_zbar over 2 f_z for f = z + d: the identity contributes 2 to the
+        # real part of 2 f_z and nothing to 2 f_zbar.
         num_re = u_x - v_y
         num_im = v_x + u_y
-        den_re = u_x + v_y
+        den_re = 2.0 + u_x + v_y
         den_im = v_x - u_y
 
         num_sq = num_re.pow(2) + num_im.pow(2)
         den_sq = den_re.pow(2) + den_im.pow(2) + self.eps
-        return (num_sq / den_sq).sqrt()
+        ratio = num_sq / den_sq
+        # sqrt has an infinite derivative at 0, which a conformal region (mu = 0)
+        # hits exactly; route those entries through a constant so their gradient is 0.
+        positive = ratio > 0
+        safe = torch.where(positive, ratio, torch.ones_like(ratio))
+        return torch.where(positive, safe.sqrt(), torch.zeros_like(ratio))
 
     @staticmethod
     def _dx(t: torch.Tensor) -> torch.Tensor:

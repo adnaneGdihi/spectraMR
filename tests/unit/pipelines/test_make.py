@@ -10,6 +10,8 @@ backward-compatible. Passing neither must raise (no silent default).
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -121,15 +123,91 @@ class TestMakeBuildsThroughTheCanonicalBuilder:
         assert "get_model_factory" not in called
 
     def test_builds_through_model_builder(self) -> None:
-        assert "ModelBuilder(config, device_obj)" in self._make_src()
+        assert "ModelBuilder(config, device_obj, warm_start=" in self._make_src()
 
-    def test_binds_the_shared_checkpoint_reader(self) -> None:
+    def test_binds_the_one_weight_reader(self) -> None:
         import spectramr.pipelines.make as make_mod
 
-        assert hasattr(make_mod, "resolve_state_dict"), (
-            "make.py still knows only `model_state_dict` and never strips "
-            "wrapper prefixes; a DDP/compile checkpoint loads nothing"
-        )
+        assert make_mod.weights.__module__ == "spectramr.infrastructure.checkpointing.restore"
+
+    @staticmethod
+    def _weights_calls(src: str) -> list[tuple[object, object]]:
+        """``(part, policy)`` of every ``weights(...)`` call, read off the AST."""
+        import ast
+
+        calls = []
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "weights":
+                part = node.args[1].value if len(node.args) > 1 else None
+                policy = next((k.value.value for k in node.keywords if k.arg == "policy"), None)
+                calls.append((part, policy))
+        return calls
+
+    def test_loads_the_generator_part_exactly(self) -> None:
+        """The made model is the trained generator, all of it: neither the EMA shadow nor a partial load."""
+        assert self._weights_calls(self._make_src()) == [("generator", "exact")]
+
+
+class _RecordingBuilder:
+    """Stands in for ModelBuilder: records ``warm_start`` and yields a tiny module."""
+
+    seen: ClassVar[list[bool]] = []
+
+    def __init__(self, config, device, *, warm_start=False) -> None:
+        _RecordingBuilder.seen.append(warm_start)
+
+    def build_generator(self):
+        return self
+
+    def validate(self):
+        return self
+
+    def build(self):
+        return {"generator": torch.nn.Linear(1, 1)}
+
+
+def _make_with_recording_builder(monkeypatch, checkpoint_path):
+    import contextlib
+    from types import SimpleNamespace
+
+    import spectramr.infrastructure.training.builders.model_builder as mb
+    from spectramr.pipelines.make import make_model
+
+    _RecordingBuilder.seen.clear()
+    monkeypatch.setattr(mb, "ModelBuilder", _RecordingBuilder)
+    config = SimpleNamespace(model=SimpleNamespace(model_type="fake"))
+    # The absent checkpoint is read after the build under test.
+    with contextlib.suppress(FileNotFoundError):
+        make_model(device="cpu", checkpoint_path=checkpoint_path, config=config)
+    return _RecordingBuilder.seen
+
+
+def test_make_without_a_checkpoint_warm_starts(monkeypatch) -> None:
+    """A scripted stage-2 model handed to ``fit`` must get its stage-1 VAE and
+    ``model.checkpoint_path``, exactly as the train path does."""
+    assert _make_with_recording_builder(monkeypatch, None) == [True]
+
+
+def test_make_with_a_checkpoint_does_not_warm_start(monkeypatch, tmp_path) -> None:
+    """Its own checkpoint replaces every weight, so a predecessor is not loaded first."""
+    assert _make_with_recording_builder(monkeypatch, str(tmp_path / "own.pt")) == [False]
+
+
+def test_make_loads_the_generator_part_of_a_run_state(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    import spectramr.infrastructure.training.builders.model_builder as mb
+    from spectramr.pipelines.make import make_model
+    from tests.fixtures.run_state_files import write_run_state
+
+    ref = torch.nn.Linear(1, 1)
+    torch.nn.init.constant_(ref.weight, 0.375)
+    path = write_run_state(tmp_path / "best.pt", {"generator": ref.state_dict()})
+    monkeypatch.setattr(mb, "ModelBuilder", _RecordingBuilder)
+    config = SimpleNamespace(model=SimpleNamespace(model_type="fake"))
+    model, meta = make_model(device="cpu", checkpoint_path=str(path), config=config)
+    assert torch.equal(model.weight, ref.weight) and torch.equal(model.bias, ref.bias)
+    assert meta["checkpoint_loaded"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -309,3 +387,36 @@ def test_make_dataset_applies_the_refusal_before_building_anything(monkeypatch):
     monkeypatch.setattr(make_mod, "_resolve_settings", lambda _p, _c: cfg)
     with pytest.raises(RuntimeError, match="held-out test set"):
         make_dataset(config=cfg, split="test")
+
+
+def test_make_dataloader_builds_a_single_pass_non_persistent_loader(monkeypatch):
+    """A one-shot walk must not leave a persistent worker pool behind."""
+    import spectramr.infrastructure.builders.directors.data_pipeline_director as dpd
+    import spectramr.pipelines.make as make_mod
+
+    seen = {}
+
+    class _StopError(Exception):
+        pass
+
+    class _Director:
+        def __init__(self, cfg):
+            pass
+
+        def build_dataloaders(self, **kwargs):
+            seen.update(kwargs)
+            raise _StopError
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(
+            loader=SimpleNamespace(num_workers=2), dataset_type="kspace"
+        )
+    )
+    monkeypatch.setattr(make_mod, "_resolve_settings", lambda _p, _c: cfg)
+    monkeypatch.setattr(
+        make_mod, "_refuse_substitution_for_a_declared_test_set", lambda *_a: None
+    )
+    monkeypatch.setattr(dpd, "DataPipelineDirector", _Director)
+    with pytest.raises(_StopError):
+        make_mod.make_dataloader(config=cfg, split="train")
+    assert seen["persistent_workers"] is False

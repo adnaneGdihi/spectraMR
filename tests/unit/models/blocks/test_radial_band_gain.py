@@ -189,6 +189,10 @@ def test_a_second_grid_size_builds_its_own_index(monkeypatch):
 
 
 # ── reachability: the generator builds it and the forward calls it ────────────
+#: The rung support every generator forward carries (the geometry planes read it).
+_MASK = torch.ones(1, 1, 32, 32)
+
+
 def _generator(**extra):
     from spectramr.models.generators.kspace_cold_diffusion_generator import (
         KSpaceColdDiffusionGenerator,
@@ -212,7 +216,7 @@ def test_the_block_fires_during_the_generator_forward():
     fired: list[tuple[int, ...]] = []
     gen.radial_band_gain.register_forward_hook(lambda m, i, o: fired.append(tuple(o.shape)))
     with torch.no_grad():
-        gen(torch.randn(1, 4, 32, 32), torch.zeros(1, dtype=torch.long))
+        gen(torch.randn(1, 4, 32, 32), torch.zeros(1, dtype=torch.long), mask=_MASK)
     assert len(fired) == 1
 
 
@@ -220,8 +224,8 @@ def test_an_arm_with_the_block_reproduces_its_control_at_init():
     """The A/B is attributable only if step 0 is bit-identical."""
     x, t = torch.randn(1, 4, 32, 32), torch.zeros(1, dtype=torch.long)
     with torch.no_grad():
-        control = _generator()(x, t)
-        gained = _generator(radial_band_gain_bands=8)(x, t)
+        control = _generator()(x, t, mask=_MASK)
+        gained = _generator(radial_band_gain_bands=8)(x, t, mask=_MASK)
     assert torch.allclose(control, gained, atol=1e-6)
 
 
@@ -230,9 +234,9 @@ def test_a_trained_gain_changes_the_generator_output():
     x, t = torch.randn(1, 4, 32, 32), torch.zeros(1, dtype=torch.long)
     gen = _generator(radial_band_gain_bands=8)
     with torch.no_grad():
-        control = _generator()(x, t)
+        control = _generator()(x, t, mask=_MASK)
         gen.radial_band_gain.gamma.fill_(0.5)
-        gained = gen(x, t)
+        gained = gen(x, t, mask=_MASK)
     assert not torch.allclose(control, gained, atol=1e-5)
 
 

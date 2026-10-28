@@ -49,7 +49,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ..renames import reject_renamed_keys
 
 __all__ = [
     "AdaptiveSFCHSSCTrainingConfigSchema",
@@ -69,7 +71,7 @@ __all__ = [
 #: These blocks are constructor-time hyperparameters, not free-form kwargs, so a
 #: typo must raise rather than sit unread — the failure this module exists to
 #: end. Matches the 2026-06 batch.
-_KNOB_BLOCK = {"extra": "forbid", "frozen": True}
+_KNOB_BLOCK = ConfigDict(extra="forbid", frozen=True)
 
 
 class SpatiotemporalAdaptiveSFCReconTrainingConfigSchema(BaseModel):
@@ -237,6 +239,10 @@ class BlochEquivariantTranslationTrainingConfigSchema(BaseModel):
 
     model_config = _KNOB_BLOCK
 
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.bloch_equivariant_translation"))  # type: ignore[arg-type]
+    )
+
     t1_scale_ulf: float = Field(default=0.30, gt=0.0, description="ULF T1 scale factor.")
     t2_scale_ulf: float = Field(default=1.05, gt=0.0, description="ULF T2 scale factor.")
     tr_ulf: float = Field(default=8.0, gt=0.0, description="ULF repetition time (ms).")
@@ -253,7 +259,7 @@ class BlochEquivariantTranslationTrainingConfigSchema(BaseModel):
         default=0.1, ge=0.0, description="Weight of the cycle-consistency term."
     )
     unpaired_patch: int = Field(default=32, ge=1, description="Patch size for the unpaired branch.")
-    use_bloch_checkpoint: bool = Field(
+    enable_bloch_checkpoint: bool = Field(
         default=False, description="Gradient-checkpoint the Bloch simulation."
     )
 
@@ -286,6 +292,10 @@ class RiemannianBlochDiffusionTrainingConfigSchema(BaseModel):
 
     model_config = _KNOB_BLOCK
 
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.riemannian_bloch_diffusion"))  # type: ignore[arg-type]
+    )
+
     t_min: float = Field(default=1e-3, gt=0.0, description="Diffusion time floor.")
     t_max: float = Field(default=1.0, gt=0.0, description="Diffusion time ceiling.")
     step_size_init: float = Field(default=0.05, gt=0.0, description="Initial geodesic step size.")
@@ -303,7 +313,7 @@ class RiemannianBlochDiffusionTrainingConfigSchema(BaseModel):
     metric_refresh_interval: int = Field(
         default=50, ge=1, description="Epochs between metric-cache refreshes."
     )
-    use_bloch_checkpoint: bool = Field(
+    enable_bloch_checkpoint: bool = Field(
         default=False, description="Gradient-checkpoint the Bloch manifold ops."
     )
 
@@ -319,6 +329,10 @@ class PrivilegedLearningTrainingConfigSchema(BaseModel):
 
     model_config = _KNOB_BLOCK
 
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.privileged"))  # type: ignore[arg-type]
+    )
+
     alpha: float = Field(
         default=1.0, ge=0.0, description="Weight of the privileged-distillation term."
     )
@@ -329,11 +343,17 @@ class PrivilegedLearningTrainingConfigSchema(BaseModel):
         gt=0.0,
         description="Initial curriculum temperature; decays over training.",
     )
-    n_min: float = Field(
-        default=0.0, ge=0.0, description="Lower bound of the curriculum noise range."
+    min_keep_fraction: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Floor of the marker keep-fraction the curriculum decays towards.",
     )
-    n_max: float = Field(
-        default=1.0, ge=0.0, description="Upper bound of the curriculum noise range."
+    initial_keep_fraction: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Marker keep-fraction at epoch 0, decayed by exp(-epoch / curriculum_tau0).",
     )
     disc_hidden_dim: int = Field(
         default=128, ge=1, description="Hidden width of the domain discriminator."

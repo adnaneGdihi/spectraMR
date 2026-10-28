@@ -286,3 +286,51 @@ def test_complex_unet_rms_norm_scores_far_below_none():
     assert rms.outer_band_retention < 0.6 * none.outer_band_retention
     # The roll-off is a shape, not an overall attenuation: DC survives in both.
     assert rms.normalized[0] == pytest.approx(1.0)
+
+
+class _NullSpaceGen(nn.Module):
+    """Refuses without a mask, as the two null-space attention blocks do (#2145)."""
+
+    def __init__(self, process=None) -> None:
+        super().__init__()
+        self.kspace_process = process
+        self._current_mask = None
+        self.seen: list = []
+
+    def set_current_mask(self, mask):
+        self._current_mask = mask
+
+    def forward(self, x, timesteps=None, **kwargs):
+        mask = kwargs.get("mask", self._current_mask)
+        if mask is None:
+            raise ValueError("HermitianNullSpaceAttention requires `mask`")
+        self.seen.append(mask)
+        return x
+
+
+def test_a_withheld_mask_still_raises():
+    """PLANTED: the refusal is correct; only the probe's side of it changed."""
+    with pytest.raises(ValueError, match="requires `mask`"):
+        measure_radial_transfer(_NullSpaceGen(), **KW)
+
+
+def test_probe_arm_supplies_the_arms_mask(monkeypatch):
+    """PLANTED (#2145): red before the fix -- the bare forward carried no mask."""
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.validation import energy_probe as ep
+    from spectramr.infrastructure.validation.spectral_transfer_probe import probe_arm
+    from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
+    from tests.utils.data_config_stub import DataConfigStub
+
+    gen = _NullSpaceGen(KSpaceUndersamplingProcess(num_timesteps=8, max_acceleration=4.0))
+    monkeypatch.setattr(ep, "build_probe_model", lambda config, device: gen)
+    config = SimpleNamespace(
+        model=SimpleNamespace(in_channels=4, out_channels=4, model_kwargs={"timesteps": 8}),
+        data=DataConfigStub(patch_size=[64, 64, 1], batch_size=2),
+    )
+    reading = probe_arm(config, "cpu", n_bins=8, repeats=2)
+
+    assert reading.outer_band_retention == pytest.approx(1.0)
+    assert gen.seen and all(m.shape == (1, 1, 64, 64) for m in gen.seen)
+    assert float(gen.seen[0].mean()) < 1.0, "the arm's rung at t = 4, not all-ones"

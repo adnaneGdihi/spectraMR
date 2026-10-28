@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from spectramr.config.schemas.loss import LossConfigSchema
+from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
 from spectramr.models.losses.weights import build_loss_weight_table
 from tests.utils.corpus import tracked_yamls
 from tests.utils.repo_scripts import skip_if_public_export
@@ -239,17 +241,51 @@ def test_kan_ablation_has_coil_estimation(arm: Path) -> None:
     )
 
 
-@pytest.mark.skipif(not _KAN_ABLATION_ARMS, reason="kan-ablation arms not present")
-@pytest.mark.parametrize("arm", _KAN_ABLATION_ARMS, ids=[_arm_id(a) for a in _KAN_ABLATION_ARMS])
-def test_kan_ablation_no_stray_pre_dc(arm: Path) -> None:
-    """No kan-ablation arm may set lambda_pre_dc_kspace: the KAN family drops it
-    (unlike the base SSOT), so a lone arm carrying it (the no_csg regression) is a
-    second, unintended loss delta vs the shared baseline."""
+_KAN_BASELINE = _COHORT / "experiment_11_kan_dual_domain.yaml"
+
+#: The two halves of the pre-DC recipe (#2244): the unobserved-band term and its
+#: acquired-band complement. They are one recipe, so they are compared together.
+_PRE_DC_TERMS = ("pre_dc_kspace", "pre_dc_acquired")
+
+
+def _resolved_pre_dc(arm: Path) -> dict[str, float | None]:
     losses = (yaml.safe_load(arm.read_text()) or {}).get("losses") or {}
-    assert "lambda_pre_dc_kspace" not in json.dumps(losses), (
-        f"{_arm_id(arm)}: carries lambda_pre_dc_kspace — a stray loss delta vs the "
-        f"KAN family (which drops it); confounds the arm's single-knob ablation."
+    table = build_loss_weight_table(LossConfigSchema(**losses))
+    return {
+        name: (None if table.get(name) is None else float(table.get(name).weight))
+        for name in _PRE_DC_TERMS
+    }
+
+
+@pytest.mark.skipif(not _KAN_ABLATION_ARMS, reason="kan-ablation arms not present")
+@pytest.mark.skipif(not _KAN_BASELINE.exists(), reason="kan baseline not present")
+@pytest.mark.parametrize("arm", _KAN_ABLATION_ARMS, ids=[_arm_id(a) for a in _KAN_ABLATION_ARMS])
+def test_kan_ablation_shares_the_baseline_pre_dc_recipe(arm: Path) -> None:
+    """Each kan-ablation arm resolves the same pre-DC weights as its baseline.
+
+    The family carries pre-DC like the rest of the cohort (#2245). What confounds
+    a single-knob ablation is a pre-DC weight that differs from the shared
+    baseline, in either half, so the check is parity on the resolved table,
+    not the presence or absence of a YAML key.
+    """
+    expected = _resolved_pre_dc(_KAN_BASELINE)
+    assert _resolved_pre_dc(arm) == expected, (
+        f"{_arm_id(arm)}: pre-DC weights differ from {_KAN_BASELINE.name} "
+        f"({expected}) -- a second loss delta inside a one-knob ablation."
     )
+
+
+def test_the_pre_dc_parity_check_sees_both_halves(tmp_path: Path) -> None:
+    """Planted violations: a drift in either term turns the parity check red."""
+    baseline = yaml.safe_load(_KAN_BASELINE.read_text())
+    for term, key in (("pre_dc_kspace", "lambda_pre_dc_kspace"),
+                      ("pre_dc_acquired", "lambda_pre_dc_acquired")):
+        planted = json.loads(json.dumps(baseline))
+        planted["losses"]["reconstruction"][key] = 0.9
+        arm = tmp_path / f"drift_{term}.yaml"
+        arm.write_text(yaml.safe_dump(planted))
+        assert _resolved_pre_dc(arm)[term] == 0.9
+        assert _resolved_pre_dc(arm) != _resolved_pre_dc(_KAN_BASELINE), term
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +500,54 @@ def test_no_cohort_directory_is_covered_by_a_gitignore_rule() -> None:
 # declared" but the three ways declaring it silently changes the experiment.
 
 
+def _runs_upstream_process(doc: dict) -> bool:
+    """Whether the arm trains through a prior method's own process (#2455).
+
+    Resolved through the strategy factory, the same path ``train`` takes, so a
+    renamed or subclassed baseline strategy is still recognised.
+    """
+    from spectramr_baselines.strategy import UpstreamProcessStrategy
+
+    training = doc.get("training") or {}
+    declared = SimpleNamespace(
+        training=SimpleNamespace(
+            strategy_class=training.get("strategy_class"),
+            training_mode=training.get("training_mode"),
+        )
+    )
+    resolved = TrainingStrategyFactory().get_strategy_class(declared)
+    return issubclass(resolved, UpstreamProcessStrategy)
+
+
+_MAX_REDUCE_BUCKET = 100_000_000
+
+
+def _zero2_violations(doc: dict) -> list[str]:
+    """What keeps an arm off the cohort's ZeRO-2 recipe; empty when it complies.
+
+    Stage 3 also partitions parameters and changes the communication profile, so
+    a lone arm on 3 is no longer comparable to its siblings.
+    """
+    if _runs_upstream_process(doc):
+        return []
+    parallel = doc.get("parallel") or {}
+    ds = parallel.get("deepspeed") or {}
+    violations = []
+    if parallel.get("strategy") != "deepspeed":
+        violations.append(f"strategy={parallel.get('strategy')!r}, cohort arms shard with DeepSpeed")
+    if ds.get("enabled") is not True:
+        violations.append("deepspeed.enabled must equal (strategy == 'deepspeed')")
+    if ds.get("zero_stage") != 2:
+        violations.append(f"zero_stage={ds.get('zero_stage')!r}, the cohort is ZeRO-2")
+    bucket = ds.get("reduce_bucket_size")
+    if not isinstance(bucket, int) or bucket > _MAX_REDUCE_BUCKET:
+        violations.append(
+            f"reduce_bucket_size={bucket!r}: undeclared or above {_MAX_REDUCE_BUCKET}; the 5e8 default "
+            "allocates 4 GB of gradient buffers that shard nothing at world size 1 (OOM on 32 GB)"
+        )
+    return violations
+
+
 @pytest.mark.skipif(not _DATA_ARMS, reason="kspace_filling cohort not present")
 @pytest.mark.parametrize("arm", _DATA_ARMS, ids=[_arm_id(a) for a in _DATA_ARMS])
 def test_arm_declares_deepspeed_zero2(arm: Path) -> None:
@@ -473,21 +557,57 @@ def test_arm_declares_deepspeed_zero2(arm: Path) -> None:
     in opposite directions depending on which you set: ``strategy`` alone raised
     after the whole training environment was built, while ``enabled`` alone
     sharded silently under a config claiming it did not.
+
+    Arms on ``UpstreamProcessStrategy`` are exempt: they reproduce a published
+    method's training recipe, and sharding it would change what is reproduced.
     """
-    parallel = (yaml.safe_load(arm.read_text()) or {}).get("parallel") or {}
-    ds = parallel.get("deepspeed") or {}
-    assert parallel.get("strategy") == "deepspeed", (
-        f"{_arm_id(arm)}: cohort arms shard with DeepSpeed; got "
-        f"strategy={parallel.get('strategy')!r}"
-    )
-    assert ds.get("enabled") is True, (
-        f"{_arm_id(arm)}: deepspeed.enabled must equal (strategy == 'deepspeed')"
-    )
-    assert ds.get("zero_stage") == 2, (
-        f"{_arm_id(arm)}: cohort is ZeRO-2; got zero_stage={ds.get('zero_stage')!r}. "
-        "Stage 3 also partitions parameters and changes the communication "
-        "profile, so a lone arm on 3 is no longer comparable to its siblings."
-    )
+    violations = _zero2_violations(yaml.safe_load(arm.read_text()) or {})
+    assert not violations, f"{_arm_id(arm)}: " + "; ".join(violations)
+
+
+_ZERO2 = {
+    "parallel": {
+        "strategy": "deepspeed",
+        "deepspeed": {"enabled": True, "zero_stage": 2, "reduce_bucket_size": 50_000_000},
+    }
+}
+_DIFFUSION = {"training": {"training_mode": "diffusion"}}
+_UPSTREAM = {"training": {"strategy_class": "spectramr_baselines.strategy.UpstreamProcessStrategy"}}
+
+
+@pytest.mark.parametrize(
+    ("doc", "expected"),
+    [
+        pytest.param({**_DIFFUSION, **_ZERO2}, 0, id="compliant-cohort-arm"),
+        pytest.param(_DIFFUSION, 4, id="planted-cohort-arm-without-parallel"),
+        pytest.param(
+            {**_DIFFUSION, "parallel": {"strategy": "deepspeed", "deepspeed": {"enabled": True, "zero_stage": 3, "reduce_bucket_size": 50_000_000}}},
+            1,
+            id="planted-cohort-arm-on-zero3",
+        ),
+        pytest.param(
+            {**_DIFFUSION, "parallel": {"strategy": "deepspeed", "deepspeed": {"enabled": True, "zero_stage": 2}}},
+            1,
+            id="planted-default-bucket",
+        ),
+        pytest.param(
+            {
+                **_DIFFUSION,
+                "parallel": {
+                    "strategy": "deepspeed",
+                    "deepspeed": {"enabled": True, "zero_stage": 2, "reduce_bucket_size": 500_000_000},
+                },
+            },
+            1,
+            id="planted-oversized-bucket",
+        ),
+        pytest.param(_UPSTREAM, 0, id="baseline-without-parallel-is-exempt"),
+        pytest.param({**_UPSTREAM, **_ZERO2}, 0, id="baseline-with-zero2-is-accepted"),
+    ],
+)
+def test_zero2_rule_planted(doc: dict, expected: int) -> None:
+    """Only the upstream-process strategy is exempt; every other arm still has to shard."""
+    assert len(_zero2_violations(doc)) == expected
 
 
 @pytest.mark.skipif(not _DATA_ARMS, reason="kspace_filling cohort not present")
@@ -629,33 +749,30 @@ def test_the_acquired_band_anchor_is_enabled_cohort_wide(arm: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2026-09-22 cross-contrast objective fence.
+# Cross-contrast objective fence.
 #
-# ``experiment_cross_contrast_kspace_diffusion`` was the one LIVE arm in the
-# cohort still on the pre-#2220 recipe: its resolved table held three terms
-# against the cohort's fourteen, so neither the null-space supervision (#2220)
-# nor the acquired-band anchor (#2244) ever reached it. It was brought onto the
-# cohort objective, MINUS the two coil-domain terms -- and that subtraction is
-# the fragile half, because it reads as an oversight rather than as a fact
-# about the arm's channel axis. The second test below states the fact.
+# ``experiment_cross_contrast_kspace_diffusion`` trains on the cohort's
+# objective. It once lacked the two coil-domain terms because T1 was stacked
+# into its channel axis; T1 now reaches the generator as a reference (#2452), so
+# the state is 4 coils like every sibling and both terms apply.
 # ---------------------------------------------------------------------------
 
 _CROSS_CONTRAST = _COHORT / "experiment_cross_contrast_kspace_diffusion.yaml"
 
-#: What the arm must share with the cohort reference, weight for weight. The
-#: two coil-domain terms are absent by measurement, not by preference; `l2` is
+#: What the arm must share with the cohort reference, weight for weight. `l2` is
 #: the arm's own diffusion objective and has no counterpart in the reference.
 _CROSS_CONTRAST_SHARED_WEIGHTS = {
     "bloch_residual": 0.0,
-    "complex_l1": 1.0,
+    "coil_subspace_residual": 0.25,
+    "complex_l1": 0.25,
     "complex_spatial_gradient": 1.0,
     "hfen": 0.3,
-    "log_spectral": 0.1,
     "null_space_content": 0.25,
     "perceptual": 0.0,
     "physics_constraint": 0.0,
     "pre_dc_acquired": 0.5,
     "pre_dc_kspace": 0.3,
+    "sense_adjoint_l1": 0.3,
     "snr_preserving": 0.0,
     "sobolev_kspace": 0.05,
 }
@@ -684,31 +801,22 @@ def test_cross_contrast_resolves_the_cohort_objective() -> None:
 
 
 @pytest.mark.skipif(not _CROSS_CONTRAST.exists(), reason="cross-contrast arm not present")
-def test_the_coil_domain_terms_cannot_run_on_the_cross_contrast_layout() -> None:
-    """Why ``sense_adjoint_l1`` and ``coil_subspace_residual`` are absent there.
+def test_the_coil_domain_terms_score_the_cross_contrast_state() -> None:
+    """The arm's state is the target's coils, so the coil-domain terms apply.
 
-    ``prior_channel_range: [0, 8]`` makes channels 0-7 the fully-sampled T1
-    prior and 8-15 the target contrast, so the 16 channels are TWO CONTRASTS x
-    4 coils x (real, imag) -- not 8 coils. Both terms read dim 1 as the coil
-    axis, so both raise against this arm's 4 sensitivity maps.
-
-    This asserts the mechanism in both directions: red if the losses start
-    accepting the layout (then the exclusion is stale and the arm should get
-    them back), and red if they stop scoring the cohort's own 8-channel layout
-    (then the exclusion has been misattributed). Pinning only the absence would
-    catch neither.
+    Red if T1 moves back into the state: the channel count would no longer be
+    two per physical coil and both terms raise against the arm's maps.
     """
     torch = pytest.importorskip("torch")
     from spectramr.models.losses.registry import create_loss
 
     cfg = yaml.safe_load(_CROSS_CONTRAST.read_text()) or {}
-    model_kwargs = (cfg.get("model") or {}).get("model_kwargs") or {}
-    assert model_kwargs.get("prior_channel_range") == [0, 8], (
-        "the prior no longer occupies channels 0-7; re-derive whether the coil "
-        "terms can run before trusting this exclusion."
-    )
-    n_ch = int((cfg.get("model") or {}).get("out_channels"))
+    model = cfg.get("model") or {}
+    model_kwargs = model.get("model_kwargs") or {}
+    n_ch = int(model.get("out_channels"))
     n_coils = int(model_kwargs.get("num_physical_coils"))
+    assert n_ch == 2 * n_coils, "the diffusion state must be the target's coils alone"
+    assert (cfg.get("data") or {}).get("pairing", {}).get("source_layout") == "separate"
 
     smaps = torch.randn(1, n_coils, 16, 16, dtype=torch.complex64)
     terms = {
@@ -719,17 +827,80 @@ def test_the_coil_domain_terms_cannot_run_on_the_cross_contrast_layout() -> None
         ),
     }
     for name, (fn, kw) in terms.items():
-        with pytest.raises((RuntimeError, ValueError)):
-            fn(
-                torch.randn(1, n_ch, 16, 16),
-                torch.randn(1, n_ch, 16, 16),
-                **{kw: smaps},
-            )
-        # ...and the same call scores on the cohort's own layout, so the raise
-        # above is about THIS arm's channel axis and not about the loss.
         value = fn(
-            torch.randn(1, n_coils * 2, 16, 16),
-            torch.randn(1, n_coils * 2, 16, 16),
+            torch.randn(1, n_ch, 16, 16),
+            torch.randn(1, n_ch, 16, 16),
             **{kw: smaps},
         )
-        assert torch.isfinite(value), f"{name} did not score the {n_coils}-coil layout"
+        assert torch.isfinite(value), f"{name} did not score the arm's {n_coils}-coil state"
+        # Planted: the stacked T1|target layout this arm used to train on.
+        with pytest.raises((RuntimeError, ValueError)):
+            fn(
+                torch.randn(1, 2 * n_ch, 16, 16),
+                torch.randn(1, 2 * n_ch, 16, 16),
+                **{kw: smaps},
+            )
+
+
+def _input_repetition_violation(doc: dict) -> str | None:
+    """Why an arm breaks the training-input protocol, or ``None`` when it complies.
+
+    The cohort trains on one repetition drawn per sample wherever the M4Raw loader
+    can honour the draw; the arms it would refuse (cross-contrast pairing, the
+    leave-one-out and rep_pair targets, coil maps) keep repetition 0.
+    """
+    data = doc.get("data") or {}
+    honoured = (
+        data.get("dataset_type") == "m4raw"
+        and data.get("target_mode") == "phase_aligned_mean"
+        and data.get("use_repetitions") is not False
+        and (data.get("pairing") or {}).get("single_contrast", True) is not False
+        and not data.get("nex_target_exclude_input")
+        and data.get("coil_maps_root") is None
+        and data.get("coil_maps_reference_root") is None
+    )
+    if honoured and data.get("input_repetition") != "random":
+        return f"input_repetition={data.get('input_repetition')!r}, the cohort draws 'random'"
+    return None
+
+
+@pytest.mark.skipif(not _DATA_ARMS, reason="kspace_filling cohort not present")
+@pytest.mark.parametrize("arm", _DATA_ARMS, ids=[_arm_id(a) for a in _DATA_ARMS])
+def test_arm_draws_its_training_input_repetition(arm: Path) -> None:
+    """Every arm the loader can rotate trains on a drawn repetition, so none differs on it."""
+    assert _input_repetition_violation(yaml.safe_load(arm.read_text())) is None
+
+
+@pytest.mark.parametrize(
+    ("data", "violates"),
+    [
+        ({"dataset_type": "m4raw", "target_mode": "phase_aligned_mean"}, True),
+        (
+            {
+                "dataset_type": "m4raw",
+                "target_mode": "phase_aligned_mean",
+                "input_repetition": "first",
+            },
+            True,
+        ),
+        (
+            {
+                "dataset_type": "m4raw",
+                "target_mode": "phase_aligned_mean",
+                "input_repetition": "random",
+            },
+            False,
+        ),
+        ({"dataset_type": "m4raw", "target_mode": "rep_pair"}, False),
+        (
+            {
+                "dataset_type": "m4raw",
+                "target_mode": "phase_aligned_mean",
+                "pairing": {"single_contrast": False},
+            },
+            False,
+        ),
+    ],
+)
+def test_input_repetition_rule_planted(data: dict, violates: bool) -> None:
+    assert (_input_repetition_violation({"data": data}) is not None) is violates

@@ -148,8 +148,8 @@ def test_zerorf_is_not_rectified_flow() -> None:
 # without re-reading that comment; a re-appearance means the timing regressed.
 KNOWN_CROSS_REGISTRY_DISAGREEMENTS = frozenset(
     (
-        "attention_unet", "cycle_gan", "diffusion_unet", "disentangled_vae",
-        "enhanced_deep_unet", "enhanced_kan_unet", "equivariant_unet",
+        "attention_unet", "cycle_gan", "disentangled_vae",
+        "enhanced_kan_unet", "equivariant_unet",
         "fusion_unet", "gaussian_splatting", "laplace_diffusion", "medical_dino",
         "motion_inr", "pggs_pipeline", "physics_aware_gaussian_splatter", "pin_nerf",
         "refined_kan_unet", "rl_scanner", "sparse_vae", "stable_vit", "structured_vae",

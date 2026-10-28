@@ -42,7 +42,8 @@ def _strategy(lam_null: float = 0.0, lam_acquired: float = 0.0):
                 lambda_pre_dc_kspace=lam_null,
                 lambda_pre_dc_acquired=lam_acquired,
             )
-        )
+        ),
+        model=SimpleNamespace(model_kwargs={}),
     )
     strategy._unsampled_weight = DiffusionTrainingStrategy._unsampled_weight
     strategy._acquired_weight = DiffusionTrainingStrategy._acquired_weight

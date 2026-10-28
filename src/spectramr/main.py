@@ -36,14 +36,17 @@ warnings.filterwarnings(
 # else: `torchrun -m spectramr.cli train-distributed` never imports this module, so
 # the multi-GPU path ran with every one of these unset and DeepSpeed's import
 # wrote into $HOME.
+from spectramr.infrastructure.config.cpu_threads import resolve_cpu_threads  # noqa: E402
 from spectramr.infrastructure.config.env_resolver import configure_cache_environment
 
 configure_cache_environment()
 
-# Force thread isolation to prevent DataLoader deadlocks on new Slurm nodes
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+# Threads per rank come from the scheduler's grant (SPECTRAMR_CPU_THREADS overrides);
+# a run outside an allocation stays at 1.
+_CPU_THREADS = resolve_cpu_threads()
+os.environ["OMP_NUM_THREADS"] = str(_CPU_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(_CPU_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(_CPU_THREADS)
 
 # CUDA memory configuration — MUST precede ``import torch``. PyTorch reads
 # ``PYTORCH_CUDA_ALLOC_CONF`` exactly once, when the CUDA caching allocator is
@@ -60,7 +63,7 @@ os.environ["TORCH_CUDA_EAGER_CACHE_MANAGER"] = "1"
 import torch
 
 try:
-    torch.set_num_threads(1)
+    torch.set_num_threads(_CPU_THREADS)
 except AttributeError:
     pass  # PyTorch build without OpenMP support
 from spectramr.accelerator import initialize_accelerator
@@ -83,6 +86,13 @@ from spectramr.config.settings import TrainingSettings
 # lets a malformed config fail BEFORE the heavy import on the train path.
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_log_level(settings: "TrainingSettings") -> None:
+    """Apply the config's declared log level now, not only once the container builds."""
+    from spectramr.infrastructure.logging.log_policy import apply_logging_config
+
+    apply_logging_config(settings.logging)
 
 
 def _resolved_determinism(settings) -> bool:
@@ -161,7 +171,9 @@ def begin_inference_run(
             # The run's own resolved_config.json beside the checkpoint wins over
             # the YAML unless ``from_yaml`` says otherwise (#1379); the resolver
             # logs which one it used and whether the two disagree.
-            from spectramr.pipelines.infer import resolve_inference_settings
+            from spectramr.infrastructure.validation.inference_settings import (
+                resolve_inference_settings,
+            )
 
             settings, _source = resolve_inference_settings(
                 config_path, checkpoint_path, from_yaml=from_yaml
@@ -171,6 +183,8 @@ def begin_inference_run(
     except Exception as e:
         logger.error(f"Configuration Error: {e}")
         sys.exit(1)
+
+    _apply_log_level(settings)
 
     # Seed + determinism come from the training YAML that produced the
     # checkpoint. Hardcoding ``initialize_accelerator(device, 42)`` made
@@ -206,6 +220,8 @@ def __common_train_setup(args: argparse.Namespace, is_sanity_check: bool = False
     except Exception as e:
         logger.error(f"Configuration Error: {e}")
         sys.exit(1)
+
+    _apply_log_level(settings)
 
     # 2. Get seed: CLI override > run.seed (schema default 42).
     # `training.seed` is a RAISE-posture rename (phase 4b), so the old
@@ -266,6 +282,7 @@ def __common_train_setup(args: argparse.Namespace, is_sanity_check: bool = False
 
     if hasattr(args, "override") and args.override:
         settings = apply_overrides(settings, args.override)
+        _apply_log_level(settings)
 
     if args.dry_run:
         # Dry run mode: just validate config
@@ -298,13 +315,18 @@ def __common_train_setup(args: argparse.Namespace, is_sanity_check: bool = False
             is_sanity_check=is_sanity_check,
             resume_path=resume_path,
             allow_status=getattr(args, "allow_status", None),
+            validate_only=bool(getattr(args, "validate_only", False)),
         )
         mode_str = "Sanity Check" if is_sanity_check else "Training"
         logger.info(f"{mode_str} completed: {result}")
 
-        # Fail-fast: pipeline may return success=False without raising
-        if isinstance(result, dict) and not result.get("success", True):
-            error_msg = result.get("error", "Unknown pipeline error")
+        # Fail-fast: pipeline may return success=False without raising. Only an
+        # explicit True is success; an absent flag is unknown, not a pass (#181). The rule
+        # lives in one place so ``train-distributed`` applies it too.
+        from spectramr.pipelines.result_status import failure_reason
+
+        error_msg = failure_reason(result)
+        if error_msg is not None:
             logger.error(f"{mode_str} pipeline reported failure: {error_msg}")
             sys.exit(1)
     except Exception as e:
@@ -439,6 +461,7 @@ def experiment_command(args: argparse.Namespace) -> None:
     ]
     user_overrides = list(args.override) if getattr(args, "override", None) else []
     settings = apply_overrides(settings, experiment_overrides + user_overrides)
+    _apply_log_level(settings)
 
     # 3. Initialize accelerator with the post-override config-resolved policy,
     # mirroring ``__common_train_setup``: CLI --seed > config.training.seed >
@@ -470,10 +493,12 @@ def experiment_command(args: argparse.Namespace) -> None:
             device=args.device,
             resume_path=resume_path,
             allow_status=getattr(args, "allow_status", None),
+            validate_only=bool(getattr(args, "validate_only", False)),
         )
         logger.info(f"Experiment completed: {result}")
-        if isinstance(result, dict) and not result.get("success", True):
-            logger.error(f"Experiment pipeline reported failure: {result.get('error', 'unknown')}")
+        if not (isinstance(result, dict) and result.get("success") is True):
+            reason = result.get("error", "unknown") if isinstance(result, dict) else result
+            logger.error(f"Experiment pipeline reported failure: {reason}")
             sys.exit(1)
     except Exception as e:
         logger.exception("Experiment failed")

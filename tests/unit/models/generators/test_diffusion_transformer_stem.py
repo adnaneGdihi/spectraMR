@@ -27,6 +27,7 @@ from spectramr.models.generators.diffusion_transformer_stem import (
     build_contrast_projection,
     modulate,
 )
+from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
 
 SIZE = 32
 CHANNELS = 8
@@ -188,6 +189,21 @@ def test_time_conditioning_without_timesteps_uses_step_zero() -> None:
     assert cond(None, 3, torch.device("cpu")).shape == (3, DIM)
 
 
+def test_time_conditioning_broadcasts_a_single_step() -> None:
+    cond = TimeConditioning(DIM)
+    out = cond(torch.tensor([7]), 3, torch.device("cpu"))
+    assert out.shape == (3, DIM)
+    assert torch.equal(out[0], out[2])
+
+
+@pytest.mark.parametrize("n", [4, 2])
+def test_time_conditioning_refuses_a_step_count_that_is_not_the_batch(n: int) -> None:
+    """PLANTED (#2438): 4 steps for a batch of 3 used to be sliced to the first 3."""
+    cond = TimeConditioning(DIM)
+    with pytest.raises(ValueError, match=f"received {n} timesteps for a batch of 3"):
+        cond(torch.arange(n), 3, torch.device("cpu"))
+
+
 # ---------------------------------------------------------------------------
 # TimeConditioning: forward-time max_timesteps override (the shared owner
 # every backbone's contract now reads instead of re-implementing).
@@ -284,6 +300,19 @@ def test_apply_contrast_conditioning_projects_a_reconcilable_width() -> None:
     assert not torch.allclose(a, b)
 
 
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("width", [DIM, 256])
+def test_apply_contrast_conditioning_refuses_a_row_mismatch(rows: int, width: int) -> None:
+    """Three rows against a two-row ``cond`` used to be sliced to two and added
+    (#2055), on both the direct and the projected branch."""
+    proj = build_contrast_projection(256, DIM)
+    with pytest.raises(ValueError, match=f"contrast_emb batch {rows}") as exc:
+        apply_contrast_conditioning(
+            torch.zeros(2, DIM), torch.zeros(rows, width), proj, owner="SomeBackbone"
+        )
+    assert "SomeBackbone" in str(exc.value)
+
+
 def test_apply_contrast_conditioning_raises_on_an_unreconcilable_width() -> None:
     cond = torch.zeros(2, DIM)
     with pytest.raises(ValueError, match="contrast_emb") as exc:
@@ -311,3 +340,27 @@ def test_modulate_is_the_identity_at_zero() -> None:
     x = torch.randn(2, 5, DIM)
     zeros = torch.zeros(2, DIM)
     assert torch.equal(modulate(x, zeros, zeros), x)
+
+
+def test_integer_scale_ignores_both_horizons() -> None:
+    """``scale="integer"`` embeds the step index whatever horizon is declared
+    at construction or at forward (#2315)."""
+    torch.manual_seed(0)
+    cond = TimeConditioning(DIM, max_timesteps=29.0)
+    t = torch.tensor([3.0, 4.0])
+    with torch.no_grad():
+        got = cond(t, 2, t.device, max_timesteps=29.0, scale="integer")
+        ref = cond.mlp(sinusoidal_timestep_embedding(t, DIM))
+    assert torch.allclose(got, ref)
+
+
+def test_unit_interval_divides_exactly_once() -> None:
+    """The forward-time horizon now reaches the helper instead of being divided
+    out beforehand; the result must equal a single division."""
+    torch.manual_seed(0)
+    cond = TimeConditioning(DIM)
+    t = torch.tensor([3.0])
+    with torch.no_grad():
+        got = cond(t, 1, t.device, max_timesteps=29.0)
+        ref = cond.mlp(sinusoidal_timestep_embedding(t / 29.0, DIM))
+    assert torch.allclose(got, ref)

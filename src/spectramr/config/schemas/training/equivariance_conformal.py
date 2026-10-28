@@ -20,8 +20,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..renames import reject_renamed_keys
 from .base import BaseTrainingConfigSchema
 
 
@@ -68,13 +69,14 @@ class EquivarianceConformalConfig(BaseModel):
         lt=1.0,
         description="Minimum KS p-value below which exchangeability is flagged.",
     )
-    pretrained_reconstructor_checkpoint: str = Field(
-        ...,
-        description="Path to the frozen reconstructor checkpoint G_phi.",
-    )
     output_artefact: str | None = Field(
         default=None,
         description="Optional path to write the conformal-quantile JSON report.",
+    )
+
+    # Retired prior-checkpoint field (#647); the refusal names the removal record.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("training.equivariance_conformal"))  # type: ignore[arg-type]
     )
 
 

@@ -57,11 +57,14 @@ _BLOCK_SCHEMAS: dict[str, str] = {
     "sampling": "DataSamplingConfigSchema",
     "pairing": "DataPairingConfigSchema",
     "source": "DataSourceConfigSchema",
+    "staging": "DataStagingConfigSchema",
     # Cine's block. Without it, ``_create_cine_dataset``'s
     # ``getattr(config, "temporal", None)`` takes the None branch against a
     # stub and raises "requires data.temporal.enabled=true" -- a failure that
     # reads as a real defect and is only a missing stand-in.
     "temporal": "TemporalConfigSchema",
+    # Always present on the real schema (enabled=False by default).
+    "augmentation": "AugmentationConfigSchema",
 }
 
 # Legacy flat kwarg -> (sub-block, canonical leaf). Mirrors the `fold` records in
@@ -132,6 +135,7 @@ FLAT_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "patch_size": ("sampling", "patch_size"),
     "samples_per_volume": ("sampling", "samples_per_volume"),
     "queue_length": ("sampling", "queue_length"),
+    "subject_prefetch": ("sampling", "subject_prefetch"),
     "enable_slab_mode": ("sampling", "enable_slab_mode"),
     "slice_2d": ("sampling", "enable_slice_2d"),
     "num_synthetic_samples": ("sampling", "num_synthetic_samples"),

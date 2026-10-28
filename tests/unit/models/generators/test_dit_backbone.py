@@ -269,3 +269,44 @@ class TestContrastConditioning:
                 timesteps=torch.tensor([5.0, 5.0]),
                 contrast_emb=torch.zeros(2, 256),
             )
+
+
+@pytest.mark.parametrize("scale", ["unit_interval", "integer"])
+def test_forward_passes_the_timestep_scale_to_its_stem(scale: str) -> None:
+    """The generator sends ``timestep_scale``; a backbone that drops it keeps
+    dividing by the horizon whatever the arm declared (#2315)."""
+    from unittest import mock
+
+    import spectramr.models.generators.diffusion_transformer_stem as stem
+
+    seen: list[str] = []
+    real = stem.sinusoidal_timestep_embedding
+
+    def spy(t, dim, *, max_timesteps=None, scale="unit_interval"):
+        seen.append(scale)
+        return real(t, dim, max_timesteps=max_timesteps, scale=scale)
+
+    net = _net().eval()
+    with mock.patch.object(stem, "sinusoidal_timestep_embedding", spy), torch.no_grad():
+        net(
+            torch.randn(1, CHANNELS, SIZE, SIZE),
+            timesteps=torch.tensor([3]),
+            max_timesteps=29.0,
+            timestep_scale=scale,
+        )
+    assert seen == [scale]
+
+
+def test_attn_mask_reaches_the_block_attention() -> None:
+    torch.manual_seed(0)
+    block = DiTBlock(64, 4, 4.0)
+    with torch.no_grad():
+        torch.nn.init.normal_(block.modulation.weight, std=0.5)
+    tokens, cond = torch.randn(1, 8, 64), torch.randn(1, 64)
+    later = tokens.clone()
+    later[:, 5] += 1.0
+    causal = torch.tril(torch.ones(8, 8, dtype=torch.bool))
+    assert torch.allclose(
+        block(tokens, cond, causal)[:, :5], block(later, cond, causal)[:, :5], atol=1e-6
+    )
+    assert not torch.allclose(block(tokens, cond)[:, :5], block(later, cond)[:, :5])

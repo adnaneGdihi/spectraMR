@@ -12,10 +12,16 @@ and none of the signal does.
                                     {\sum_q w_q},\qquad
     P_q^{\perp}=I-\hat s_q\hat s_q^{H},\quad \hat s_q=s_q/\lVert s_q\rVert .
 
-**Why this is not a smoothness prior.** The penalty is identically zero on every
-realisable image, so it cannot trade against fidelity the way a regulariser
-does. It only has a gradient where the reconstruction has put energy somewhere
-the coil array cannot reach.
+**What it does and does not trade against.** The penalty is zero on every
+*noise-free* rank-one image, and only there. A measured image is not one: white
+coil noise of variance :math:`\sigma^2` per coil leaves a floor of
+:math:`(C-1)\sigma^2` per pixel (the :math:`(C-1)/C` share above), and maps
+estimated from the data add their own model error. The term reads no target, so
+its minimiser is the projection of the prediction onto the coil manifold, not the
+target: reproducing a noisy target exactly still costs that floor, and the term
+pulls towards a coil-denoised image against every fidelity term at the noise
+level. Away from the noise level it acts only on energy the coil array cannot
+reach.
 
 **Why it bites for R2R in particular.** Recorrupted-to-Recorrupted guarantees
 :math:`\mathbb E[\text{target}\mid\text{input}]=x`, which constrains the
@@ -110,14 +116,16 @@ class CoilSubspaceResidualLoss(nn.Module):
         self.use_fourier_bridge = input_domain == "kspace"
         self.weight_by_support = weight_by_support
         self.eps = eps
+        # Set by LossBuilder from the arm's k-space normalisation (#2338).
+        self.log_scaled = False
 
     def _coil_images(self, x: torch.Tensor) -> torch.Tensor:
         complex_x = _to_complex_coils(x)
         if self.input_domain == "image":
             return complex_x
-        from spectramr.infrastructure.physics.fft_ops import ifft2c
+        from spectramr.models.losses.physics_losses import kspace_to_image
 
-        return ifft2c(complex_x)
+        return kspace_to_image(complex_x, return_complex=True, log_scaled=self.log_scaled)
 
     def forward(
         self,
@@ -152,8 +160,12 @@ class CoilSubspaceResidualLoss(nn.Module):
                 "per-pixel and per-coil."
             )
 
-        norm = coil_sensitivities.abs().pow(2).sum(1, keepdim=True).sqrt()
-        unit = coil_sensitivities / norm.clamp(min=self.eps)
+        # Clamp the squared norm BEFORE the root: sqrt'(0) is infinite, so a map
+        # that is zero outside the support gives a NaN gradient to learned maps.
+        norm2 = (coil_sensitivities.real.pow(2) + coil_sensitivities.imag.pow(2)).sum(
+            1, keepdim=True
+        )
+        unit = coil_sensitivities / norm2.clamp(min=self.eps**2).sqrt()
         # ||P x||^2 = ||x||^2 - |<s_hat, x>|^2, so the projector never has to be
         # formed: a (B, H, W, C, C) tensor per step would be pure overhead.
         projection = (unit.conj() * images).sum(1)
@@ -162,11 +174,18 @@ class CoilSubspaceResidualLoss(nn.Module):
 
         if not self.weight_by_support:
             return residual.mean()
-        weights = norm.squeeze(1).pow(2)
+        weights = norm2.squeeze(1)
         total = weights.sum()
-        if float(total) <= 0.0:
-            raise ValueError(
-                "coil_subspace_residual: every sensitivity map is zero, so no pixel "
-                "carries a rank-one constraint. The maps did not reach this loss."
-            )
+        # Device-side assert: ``float(total)`` blocked the host every step (#2265).
+        # CPU raises at once and is re-typed as ValueError, which the declarative
+        # loss path re-raises (it logs and drops other exceptions); CUDA fails at a
+        # later kernel launch and takes the context down with it.
+        message = (
+            "coil_subspace_residual: every sensitivity map is zero, so no pixel "
+            "carries a rank-one constraint. The maps did not reach this loss."
+        )
+        try:
+            torch._assert_async(total > 0, message)
+        except RuntimeError as exc:
+            raise ValueError(message) from exc
         return (weights * residual).sum() / total

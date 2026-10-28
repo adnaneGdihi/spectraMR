@@ -76,9 +76,19 @@ from spectramr.data.transforms.normalization import (
     IMPLEMENTED_NORMALIZATION_TYPES as IMPLEMENTED_NORMALIZATION_TYPES,
 )
 from spectramr.data.transforms.physics_sync import PhysicsSynchronization
-from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+from spectramr.data.transforms.tio_physics import PhysicsInformedMasking, loader_masks_lines
 
 logger = logging.getLogger(__name__)
+
+
+def _phase_encode_axis_of(config: Any) -> int | None:
+    """``data.acquisition.phase_encode_axis`` from a ``TrainingSettings`` or a data config.
+
+    ``config.acquisition`` alone is wrong on a ``TrainingSettings``: there it names
+    the top-level acquisition-design block, not the dataset's.
+    """
+    data = getattr(config, "data", None) or config
+    return getattr(getattr(data, "acquisition", None), "phase_encode_axis", None)
 
 
 class _NoOpTransform(tio.Transform):
@@ -122,6 +132,27 @@ class _SyncSubjectAttributes(tio.Transform):
         """Mirror every mapping entry into ``__dict__`` and return the subject."""
         subject.update_attributes()
         return subject
+
+
+def _compose_copying_once(transforms: list[tio.Transform]) -> tio.Compose:
+    """``tio.Compose`` that deep-copies the subject once, not once per member.
+
+    A torchio transform's default ``copy=True`` deep-copies the whole subject on
+    entry, so an N-member chain made N+1 copies of every sample's multi-coil
+    k-space; profiled at ~10% of a self_supervised run (sabine, 2026-10-21). The
+    Compose keeps its own copy, which protects a cached or prefetched subject.
+    """
+    stack: list[Any] = list(transforms)
+    while stack:
+        member = stack.pop()
+        if isinstance(member, tio.Transform):
+            member.copy = False
+        # OneOf keeps its members in `transforms_dict`, not `transforms`.
+        if isinstance(member, tio.Compose):
+            stack.extend(member.transforms)
+        elif isinstance(member, tio.OneOf):
+            stack.extend(member.transforms_dict)
+    return tio.Compose(transforms)
 
 
 class _ValDebugStats(tio.Transform):
@@ -430,6 +461,22 @@ class _KSpaceToInputTransform(tio.Transform):
         return subject
 
 
+class _DataWithRunBlocks:
+    """A data config that also answers for the run-level blocks the builder reads.
+
+    The two blocks are set explicitly: ``__getattr__`` would forward them to the
+    data config, which has neither.
+    """
+
+    def __init__(self, data: Any, *, undersampling: Any, physics: Any) -> None:
+        self._data = data
+        self.undersampling = undersampling
+        self.physics = physics
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._data, name)
+
+
 @dataclass
 class TorchIOTransformConfig:
     """Configuration for TorchIO transform pipeline.
@@ -465,6 +512,11 @@ class TorchIOTransformConfig:
     # Actual dynamic masking is handled by training strategies (e.g., DiffusionTrainingStrategy).
     acceleration: int = 1
     center_fraction: float = 1.0
+    # `undersampling.mask_direction`: the axis the Cartesian line pattern varies
+    # along (None keeps the first spatial axis). `phase`/`readout` resolve
+    # through `data.acquisition.phase_encode_axis` (#2160).
+    mask_direction: str | None = None
+    phase_encode_axis: int | None = None
 
     # Image→k-space bridge (opt-in via data.image_undersampling). When True, a
     # RetrospectiveImageUndersampling transform synthesises an aliased ``input``
@@ -480,6 +532,8 @@ class TorchIOTransformConfig:
     digital_twin_config: object | None = None
     digital_twin_apply: bool = False
     digital_twin_degradation_only: bool = True
+    # physics.field_strength, the B0 of the scanner profile a twin acquisition block builds.
+    digital_twin_field_strength_t: float | None = None
 
     # Normalization
     # Normalization (Refactored Phase 4)
@@ -491,6 +545,9 @@ class TorchIOTransformConfig:
     # "kspace" (percentile of |k|) or "image" (Parseval: percentile of the
     # coil-RSS magnitude after ifft2c). See DataConfigSchema.kspace_scale_domain.
     kspace_scale_domain: str = "kspace"
+    # Subject image the scale is measured on: "target" (historical order) or
+    # "input". See ProcessingConfig.kspace_scale_reference.
+    kspace_scale_reference: str = "target"
 
     # Image Normalization Strategy
     # Options: "none", "standard" (Z-score), "minmax" (Rescale), "percentile" (Robust Scale)
@@ -640,6 +697,22 @@ class TorchIOTransformConfig:
                 )
 
     @staticmethod
+    def from_settings(config) -> "TorchIOTransformConfig":
+        """Build from a run config (``TrainingSettings``) or a bare data config.
+
+        The one entry point for the data builders: it presents ``data`` together
+        with the run-level ``undersampling`` and ``physics`` blocks that
+        :meth:`from_training_config` reads beside it.
+        """
+        data = config.data if hasattr(config, "data") else config
+        view = _DataWithRunBlocks(
+            data,
+            undersampling=getattr(config, "undersampling", None),
+            physics=getattr(config, "physics", None),
+        )
+        return TorchIOTransformConfig.from_training_config(view)
+
+    @staticmethod
     def from_training_config(config) -> "TorchIOTransformConfig":
         """Create from TrainingSettings config object.
 
@@ -667,6 +740,7 @@ class TorchIOTransformConfig:
         log_scaling = config.processing.enable_log_scaling
         log_scaling_center_fraction = config.processing.log_scaling_center_fraction
         kspace_scale_domain = config.processing.kspace_scale_domain
+        kspace_scale_reference = config.processing.kspace_scale_reference
 
         # Image normalization, declared spelling kept verbatim. The
         # ``robust_percentile`` -> ``percentile`` fold that used to sit here
@@ -741,7 +815,7 @@ class TorchIOTransformConfig:
 
         # [DEBUG] Verify the undersampling block exists.
         # NOTE the two different `config`s in this module. Here `config` is the
-        # settings object (or its ConfigProxy), where phase 11 renamed the
+        # settings object (or its `from_settings` view), where phase 11 renamed the
         # top-level BLOCK `acceleration:` -> `undersampling:`. Everywhere below,
         # `config` is a TorchIOTransformConfig whose `acceleration` field is a
         # FLOAT factor phase 11 did NOT rename -- the block rename swept up seven
@@ -759,6 +833,7 @@ class TorchIOTransformConfig:
             # below; the schema refuses anything below 1.0.
             acceleration = accel_config.base_acceleration
             center_fraction = accel_config.center_fraction
+            mask_direction = getattr(accel_config, "mask_direction", None)
             logger.info(
                 f"[SSOT-ACCELERATION] Dataloader will use: "
                 f"acceleration={acceleration:.1f}x, center_fraction={center_fraction:.2f} "
@@ -770,6 +845,7 @@ class TorchIOTransformConfig:
             # the choice is observable, but don't WARN — this is the
             # intended path for fully-sampled / non-k-space experiments
             # (image-domain reconstruction, latent diffusion, etc.).
+            mask_direction = None
             logger.info(
                 "[SSOT-ACCELERATION] No top-level 'acceleration' config — "
                 "using acceleration=1 (no undersampling). If this is a "
@@ -809,20 +885,22 @@ class TorchIOTransformConfig:
         _data_cfg = getattr(config, "_data", config)
 
         # Transversal Digital-Twin degradation: opt-in via
-        # physics.digital_twin.apply_as_transform. Read defensively because
-        # `config` may be the data sub-config (no `physics`) in some paths.
+        # physics.digital_twin.apply_as_transform. `physics` is a run-level block,
+        # so it is present only when the caller went through `from_settings`.
         dt_cfg = None
         dt_apply = False
         dt_degradation_only = True
+        dt_field_strength_t = None
         _physics = getattr(config, "physics", None)
         _dt = getattr(_physics, "digital_twin", None) if _physics is not None else None
         if _dt is not None and getattr(_dt, "apply_as_transform", False):
             dt_cfg = _dt
             dt_apply = True
             dt_degradation_only = getattr(_dt, "transform_degradation_only", True)
+            dt_field_strength_t = _physics.field_strength
 
         # Hoist optional sub-configs once (config may be a TrainingSettings, a
-        # ConfigProxy, or a bare DataConfigSchema, so read defensively), then
+        # `from_settings` view, or a bare DataConfigSchema, so read defensively), then
         # access their fields with single (non-nested) getattr below.
         _resample = getattr(config, "resample", None)
         _crop_or_pad = getattr(config, "crop_or_pad", None)
@@ -836,15 +914,19 @@ class TorchIOTransformConfig:
             trajectory_type=trajectory,
             acceleration=acceleration,
             center_fraction=center_fraction,
+            mask_direction=mask_direction,
+            phase_encode_axis=_phase_encode_axis_of(config),
             image_undersampling=bool(getattr(config, "image_undersampling", False)),
             digital_twin_config=dt_cfg,
             digital_twin_apply=dt_apply,
             digital_twin_degradation_only=dt_degradation_only,
+            digital_twin_field_strength_t=dt_field_strength_t,
             normalize_kspace=normalize_kspace,
             kspace_percentile=kspace_percentile,
             log_scaling=log_scaling,
             log_scaling_center_fraction=log_scaling_center_fraction,
             kspace_scale_domain=kspace_scale_domain,
+            kspace_scale_reference=kspace_scale_reference,
             normalization_type=normalization_type,
             normalization_kwargs=normalization_kwargs,
             normalize_images=normalize_images,
@@ -866,7 +948,7 @@ class TorchIOTransformConfig:
             # ── Phase 4: resampling configurability ───────────────────────
             # Read from data.resample.* and data.crop_or_pad.*. The proxy's
             # __getattr__ forwards to data_config, so these resolve cleanly
-            # whether config is a TrainingSettings, a ConfigProxy, or a
+            # whether config is a TrainingSettings, the `from_settings` view, or a
             # bare DataConfigSchema.
             resample_enabled=bool(getattr(_resample, "enabled", False)),
             resample_strategy=str(getattr(_resample, "strategy", "reference")),
@@ -1050,6 +1132,13 @@ class TorchIOTransformBuilder:
                 "[COIL] CoilCombineTransform (rss_per_channel): (C,H,W,D) complex -> "
                 "(2,H,W,D) real k-space"
             )
+        elif config.coil_processing_mode == "rss_image" and (
+            TorchIOTransformBuilder._rss_image_follows_masking(config)
+        ):
+            logger.debug(
+                "[COIL] rss_image deferred until after the physics masking: the loader "
+                "undersamples multi-coil k-space, which the combine would collapse to one channel"
+            )
         elif config.coil_processing_mode == "rss_image":
             # IFFT → RSS → image-domain magnitude (1 channel, real).
             # Distinct from ``"rss"`` (which round-trips through FFT and
@@ -1173,6 +1262,8 @@ class TorchIOTransformBuilder:
                 log_scaling=config.log_scaling,
                 center_fraction=config.log_scaling_center_fraction,
                 scale_domain=config.kspace_scale_domain,
+                phase_encode_axis=config.phase_encode_axis,
+                scale_reference=config.kspace_scale_reference,
             )
             transforms.append(kspace_norm)
             logger.info(
@@ -1198,6 +1289,8 @@ class TorchIOTransformBuilder:
         # =====================================================================
         # Image normalization is applied AFTER all k-space operations
         # (physics dispatch, k-space normalization)
+
+        TorchIOTransformBuilder._append_rss_image_after_masking(transforms, config)
 
         # ONE resolver decides the whole step -- the k-space mutual exclusion,
         # the vocabulary fold and the spec -- for this chain, the val chain and
@@ -1261,7 +1354,7 @@ class TorchIOTransformBuilder:
         # chain produced rather than what it received (#1213).
         transforms.append(_SyncSubjectAttributes())
 
-        return tio.Compose(transforms)
+        return _compose_copying_once(transforms)
 
     @staticmethod
     def _append_image_undersampling(transforms: list, config: TorchIOTransformConfig) -> None:
@@ -1376,6 +1469,10 @@ class TorchIOTransformBuilder:
                 "[COIL] CoilCombineTransform (rss_per_channel): (C,H,W,D) complex -> "
                 "(2,H,W,D) real k-space"
             )
+        elif config.coil_processing_mode == "rss_image" and (
+            TorchIOTransformBuilder._rss_image_follows_masking(config)
+        ):
+            logger.debug("[COIL] rss_image deferred until after the physics masking")
         elif config.coil_processing_mode == "rss_image":
             transforms.append(CoilCombineTransform(method="rss_image"))
             logger.debug(
@@ -1415,8 +1512,12 @@ class TorchIOTransformBuilder:
                 log_scaling=config.log_scaling,
                 center_fraction=config.log_scaling_center_fraction,
                 scale_domain=config.kspace_scale_domain,
+                phase_encode_axis=config.phase_encode_axis,
+                scale_reference=config.kspace_scale_reference,
             )
             transforms.append(kspace_norm)
+
+        TorchIOTransformBuilder._append_rss_image_after_masking(transforms, config)
 
         # Image normalization -- the SAME resolver the train chain uses.
         #
@@ -1474,7 +1575,7 @@ class TorchIOTransformBuilder:
         # reference is a docstring example, #1210), so that is the live reason here.
         transforms.append(_SyncSubjectAttributes())
 
-        return tio.Compose(transforms)
+        return _compose_copying_once(transforms)
 
     @staticmethod
     def _append_registry_transforms(
@@ -1510,6 +1611,41 @@ class TorchIOTransformBuilder:
             )
 
     @staticmethod
+    def _rss_image_follows_masking(config: TorchIOTransformConfig) -> bool:
+        """Whether ``rss_image`` must run after the loader's Cartesian masking.
+
+        ``rss_image`` collapses the coils to one magnitude image, which leaves
+        :class:`PhysicsInformedMasking` nothing to undersample (it needs even Re/Im
+        channels). So when the loader masks, the mask comes first and the combine turns
+        the masked k-space into the zero-filled image (``input``) and the full k-space
+        into the reference (``target``). Mirrors the branches of
+        :meth:`_build_physics_transform` that return that transform; a test pins the two.
+        """
+        twin = getattr(config, "digital_twin_apply", False) and config.digital_twin_config is not None
+        return (
+            config.coil_processing_mode == "rss_image"
+            and not twin
+            and config.trajectory_type == "cartesian"
+            and loader_masks_lines(config.acceleration)
+        )
+
+    @staticmethod
+    def _append_rss_image_after_masking(transforms: list, config: TorchIOTransformConfig) -> None:
+        """Append the deferred ``rss_image`` combine (see :meth:`_rss_image_follows_masking`).
+
+        ``measured_kspace`` keeps the multi-coil measurement ``y`` under its own name for the
+        consumers that read it; every other k-space key becomes an image.
+        """
+        if not TorchIOTransformBuilder._rss_image_follows_masking(config):
+            return
+        from spectramr.data.transforms.kspace_coil_transforms import CoilCombineTransform
+        from spectramr.data.transforms.tio_physics import MEASURED_KSPACE_KEY
+
+        keys = sorted(CoilCombineTransform.KSPACE_KEYS - {MEASURED_KSPACE_KEY})
+        transforms.append(CoilCombineTransform(method="rss_image", keys=keys))
+        logger.debug("[COIL] CoilCombineTransform (rss_image) after masking, keys=%s", keys)
+
+    @staticmethod
     def _build_physics_transform(config: TorchIOTransformConfig) -> tio.Transform:
         """Build physics transform based on trajectory type.
 
@@ -1519,21 +1655,30 @@ class TorchIOTransformBuilder:
         # opted in (produces input=corrupted, target=clean), independent of
         # trajectory. VF strategies leave this off (they corrupt internally).
         if getattr(config, "digital_twin_apply", False) and config.digital_twin_config is not None:
+            from spectramr.data.transforms.layout import pe_axis_of_plane_dim
             from spectramr.data.transforms.tio_physics import DigitalTwinDegradation
             from spectramr.infrastructure.physics.digital_twin_simulator import (
                 DigitalTwinSimulator,
             )
 
             im_size = tuple(config.patch_size[:2])
-            simulator = DigitalTwinSimulator.from_config(config.digital_twin_config, im_size)
+            simulator = DigitalTwinSimulator.from_config(
+                config.digital_twin_config,
+                im_size,
+                field_strength_t=config.digital_twin_field_strength_t,
+                phase_encode_axis=config.phase_encode_axis,
+            )
             logger.info(
                 "[PHYSICS] Injecting transversal DigitalTwinDegradation "
                 f"(im_size={im_size}, degradation_only="
                 f"{config.digital_twin_degradation_only})"
             )
+            pe_axis, pe_axis_source = pe_axis_of_plane_dim(config.phase_encode_axis)
             return DigitalTwinDegradation(
                 simulator,
                 degradation_only=config.digital_twin_degradation_only,
+                pe_axis=pe_axis,
+                pe_axis_source=pe_axis_source,
             )
 
         # [FIX] Skip k-space generation entirely if trajectory_type is None/null
@@ -1582,20 +1727,26 @@ class TorchIOTransformBuilder:
             )
         # [SSOT] If acceleration is 1 (default), use key rename transform (no masking).
         # The actual masking is done by training strategies (e.g., DiffusionTrainingStrategy).
-        if config.acceleration == 1:
+        if not loader_masks_lines(config.acceleration):
             logger.info(
                 "[PHYSICS] Data-loader acceleration=1 (KSpaceToInput). Dynamic masking by strategy."
             )
             return _KSpaceToInputTransform()
         else:
+            # The realised factor depends on the line count, which is unknown until
+            # the first subject arrives, so the transform logs it per shape (#2382).
             logger.info(
                 f"[PHYSICS] Injecting Cartesian PhysicsInformedMasking "
-                f"(acc={config.acceleration}x, cf={config.center_fraction})"
+                f"(declared acc={config.acceleration}x over the non-ACS lines, "
+                f"cf={config.center_fraction}; realised R = N/sampled lines is lower, "
+                f"logged per line count and recorded as 'realised_acceleration')"
             )
             return PhysicsInformedMasking(
                 acceleration=config.acceleration,
                 center_fraction=config.center_fraction,
                 validate_shapes=True,
+                mask_direction=config.mask_direction,
+                phase_encode_axis=config.phase_encode_axis,
             )
 
     @staticmethod

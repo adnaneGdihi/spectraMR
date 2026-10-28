@@ -158,6 +158,7 @@ def sigma_from_coil_nullspace(
     maps: torch.Tensor,
     *,
     eps: float = 1e-6,
+    fraction: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""The scalar magnitude :math:`\sigma` of the noise, from the coil null space.
 
@@ -189,10 +190,19 @@ def sigma_from_coil_nullspace(
             coil model this rests on does not hold in k-space.
         maps: ``[B, C, H, W]`` complex sensitivities.
         eps: floor on the map norm before normalising.
+        fraction: optional ``(B,)`` phase-encode fraction each sample's image
+            was formed from; each sample's mean residual is divided by it,
+            since zero-filled k-space leaves ``f * sigma^2`` per pixel.
+
+    Only pixels where the maps are non-zero enter the mean. ESPIRiT zeroes the
+    maps below its eigenvalue threshold, and there the "residual" is the whole
+    of ``||y||^2`` (C noise dimensions) while the division is by ``C - 1``.
 
     Returns:
-        A 0-dim tensor: the magnitude :math:`\sigma`, i.e. per-component
-        :math:`\sigma/\sqrt2` for a circular complex draw.
+        A ``(B,)`` tensor, one magnitude :math:`\sigma` per sample (per-component
+        :math:`\sigma/\sqrt2` for a circular complex draw). A batch mixes slices of
+        different subjects and contrasts whose normalised noise levels differ by an
+        order of magnitude, so one pooled value over-injects the quiet ones.
     """
     if not torch.is_complex(maps):
         raise ValueError(
@@ -213,23 +223,48 @@ def sigma_from_coil_nullspace(
             "With one coil the null space is empty and there is no pure-noise "
             "component to measure."
         )
-    norm = maps.abs().pow(2).sum(1, keepdim=True).sqrt().clamp(min=eps)
-    unit = maps / norm
+    norm2 = maps.abs().pow(2).sum(1, keepdim=True)
+    unit = maps / norm2.sqrt().clamp(min=eps)
     projection = (unit.conj() * coil_images).sum(1)
     residual = (coil_images.abs().pow(2).sum(1) - projection.abs().pow(2)).clamp(min=0.0)
-    return (residual.mean() / (num_coils - 1)).sqrt()
+    on_support = (norm2.squeeze(1) > eps**2).to(residual.dtype)
+    # A slice with no map support has no null space to read; its count is floored
+    # so it reads 0 rather than NaN (such slices are counted before launch, #2545).
+    per_sample = (residual * on_support).sum(dim=(-2, -1)) / on_support.sum(dim=(-2, -1)).clamp(
+        min=1.0
+    )
+    if fraction is not None:
+        per_sample = per_sample / fraction.to(residual.dtype)
+    return (per_sample / (num_coils - 1)).sqrt()
 
 
 def sigma_from_kspace_batch(
     kspace: torch.Tensor,
     maps: torch.Tensor | None,
+    *,
+    support_policy: str | None = None,
+    acquired: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    r"""Per-batch magnitude :math:`\sigma`, from k-space and the coil maps.
+    r"""Per-sample magnitude :math:`\sigma`, ``(B,)``, from k-space and the coil maps.
 
     The batch-shaped wrapper around :func:`sigma_from_coil_nullspace`: it pairs
     real-interleaved channels, moves to the image domain through the physics
     SSOT (the rank-one coil model does not hold in k-space), and refuses the
     inputs that would make the answer quietly wrong.
+
+    ``support_policy`` (:mod:`~spectramr.infrastructure.physics.pe_support`)
+    decides which phase-encode columns form the image and corrects the result
+    for their fraction: ``band`` requires one contiguous band per sample,
+    ``acs`` restricts a non-band sample to its central run. ``None`` (the
+    default, kept for the existing caller) uses every column uncorrected, which
+    is exact only for fully sampled k-space: zero-filled columns bias it low by
+    :math:`\sqrt f`, and scattered undersampling aliases signal into the null
+    space and biases it high.
+
+    ``acquired`` is the sampling mask the caller already holds. Under a ``support_policy``
+    it replaces the read of the support off the data, which mistakes an exactly-zero
+    sample inside an acquired line for a 2-D mask (see
+    :func:`~spectramr.infrastructure.physics.pe_support.batch_fit_columns`).
 
     Raises rather than falling back to a declared constant. A consumer asks for
     this because the constant is what it does not trust; substituting it on a
@@ -255,4 +290,10 @@ def sigma_from_kspace_batch(
             )
         paired = kspace.view(kspace.shape[0], channels // 2, 2, *kspace.shape[-2:])
         kspace = torch.complex(paired[:, :, 0], paired[:, :, 1])
-    return sigma_from_coil_nullspace(ifft2c(kspace), maps)
+    if support_policy is None:
+        return sigma_from_coil_nullspace(ifft2c(kspace), maps)
+    from spectramr.infrastructure.physics.pe_support import batch_fit_columns
+
+    columns, fraction = batch_fit_columns(kspace, support_policy, acquired=acquired)
+    images = ifft2c(kspace * columns[:, None, None, :].to(kspace.dtype))
+    return sigma_from_coil_nullspace(images, maps, fraction=fraction)

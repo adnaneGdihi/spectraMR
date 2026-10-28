@@ -13,22 +13,23 @@ from collections.abc import Mapping
 __all__ = ["NO_TRAINING_MODES", "zero_budget_defect"]
 
 #: Modes that optimise nothing (split-conformal, physics-residual conformal and
-#: equivariance-conformal calibration over a frozen checkpoint: ``train_step``
-#: returns no loss and ``run_calibration`` runs after the loop): ``epochs: 0``
+#: equivariance-conformal calibration, and the validation badge, all over a frozen
+#: checkpoint: ``train_step`` returns no loss and ``run_calibration`` runs after
+#: the loop): ``epochs: 0``
 #: is their contract, not a missing budget. ``twin_dps`` is NOT here: its
 #: strategy inherits the diffusion train step and its arm is
 #: ``needs_implementation`` until a sampler loop exists (VF review 2026-09-03).
 NO_TRAINING_MODES: frozenset[str] = frozenset(
-    {"calibration", "phys_residual_conformal", "equivariance_conformal"}
+    {"calibration", "phys_residual_conformal", "equivariance_conformal", "validation_badge"}
 )
 
 
 def _number(value: object) -> float | None:
-    if isinstance(value, bool) or value is None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except ValueError:
         return None
 
 

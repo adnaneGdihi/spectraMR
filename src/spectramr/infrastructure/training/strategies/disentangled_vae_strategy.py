@@ -10,6 +10,8 @@ from typing import Any
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_CALL
 from spectramr.infrastructure.physics.acquisition_registry import AcquisitionRegistry
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
@@ -19,6 +21,14 @@ from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
+
+_TISSUE_OUTPUT_MESSAGE = (
+    "DisentangledVAETrainingStrategy grades image tensors, but the generator returned a "
+    "tissue-parameter dict (model_kwargs.output_mode: tissue_params). Render it through "
+    "the Bloch layer with training.strategy_class "
+    "spectramr.infrastructure.training.strategies.disentangled_strategy."
+    "DisentangledTrainingStrategy."
+)
 
 
 class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
@@ -139,6 +149,15 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
         - Achituve et al. (2021): Disentangling By Factorising
     """
 
+    # parallel_compat: Every training step calls generator.encode_content / decode, outside the
+    # wrapped forward, which the call declaration refuses under ddp.
+    parallel_compat = frozenset({"replicated"})
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("generator.encode_content", OWNED_CALL),)
+        return (*super().owned_module_declarations(config), *own)
+
     def __init__(
         self,
         env: TrainingEnvironment | None = None,
@@ -150,7 +169,8 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
             env (Optional[TrainingEnvironment]): Description.
         """
         super().__init__(env=env, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize strategy-specific components."""
@@ -213,7 +233,7 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
         # 4-tuple-returning ``sparse_vae`` silently crash with
         # ``too many values to unpack (expected 3)``.
         gen = self.env.generator
-        _unwrapped = gen.module if hasattr(gen, "module") else gen
+        _unwrapped = unwrap_model(gen)
         if not hasattr(_unwrapped, "encode_content") or not hasattr(_unwrapped, "decode"):
             raise TypeError(
                 f"DisentangledVAETrainingStrategy requires a generator "
@@ -231,16 +251,14 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
 
         # B. Cross-Domain Translation (The Disentanglement Test)
         # Encode 64mT anatomy, decode with 3T physics -> Should look like 3T
-        # We need access to 'encode_content' and 'decode' methods of the model.
-        # If state.generator is DDP/Compiled, we might need to access .module or .orig_mod
-        model = self.env.generator
-        if hasattr(model, "module"):
-            model = model.module
+        model = self.inner_for_call(self.env.generator, "generator.encode_content")
 
         # [FIX] Use encode_content to get the 4D anatomy code, not the 2D style code (mu_64)
         z_anatomy_64 = model.encode_content(img_64)
         z_anatomy_3T = model.encode_content(img_3T)
         synth_3T = model.decode(z_anatomy_64, phys_3T)
+        if any(isinstance(out, dict) for out in (recon_64, recon_3T, synth_3T)):
+            raise TypeError(_TISSUE_OUTPUT_MESSAGE)
 
         # 4. Loss Calculation
 
@@ -388,17 +406,11 @@ class DisentangledVAETrainingStrategy(BaseTrainingStrategy):
         # [FIX] Use encode_content to get the 4D anatomy code, not the 2D style code
         z_anatomy = model.encode_content(img_64)
         fake_3T = model.decode(z_anatomy, phys_3T)
+        if isinstance(fake_3T, dict):
+            raise TypeError(_TISSUE_OUTPUT_MESSAGE)
 
-        # Compute standard metrics
-        metrics = {}
-
-        # Use unified validation computer
-        try:
-            computer = self._get_validation_metrics_computer(self.config)
-            computed = computer.compute(fake_3T, img_3T)
-            for k, v in computed.items():
-                metrics[f"val_{k}"] = v
-        except Exception as _exc:
-            logger.warning("[DisentangledVAE] Validation metrics failed: %s", _exc, exc_info=True)
-
+        # A failure here must raise: swallowed, it left val_psnr unemitted and the
+        # early-stopping monitor reading nothing for the whole run (#2606).
+        computer = self._get_validation_metrics_computer(self.config)
+        metrics = {f"val_{k}": v for k, v in computer.compute(fake_3T, img_3T).items()}
         return self._convert_metrics_to_floats(metrics)

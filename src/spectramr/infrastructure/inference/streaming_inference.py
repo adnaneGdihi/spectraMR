@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spectramr.data.io_strategies import lazy_load_nifti
+from spectramr.data.io_strategies import lazy_load_nifti, save_nifti
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +202,7 @@ class StreamingInferenceEngine:
             output_memmap.flush()
 
             # Convert memmap to NIfTI and save
-            out_nii = nib.Nifti1Image(output_memmap, affine)
-            nib.save(out_nii, str(output_path))
+            save_nifti(output_path, output_memmap, affine)
 
             # Cleanup
             del output_memmap

@@ -34,8 +34,8 @@ class ModalitySwapLoss(nn.Module):
         self,
         recon_img: torch.Tensor,
         target_img: torch.Tensor,
-        swap_img: torch.Tensor = None,
-        swap_target: torch.Tensor = None,
+        swap_img: torch.Tensor | None = None,
+        swap_target: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute loss.
 

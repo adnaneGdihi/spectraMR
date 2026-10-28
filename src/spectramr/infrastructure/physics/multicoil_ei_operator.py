@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import torch
 
+from spectramr.infrastructure.physics.coil_sensitivity import coil_support
 from spectramr.infrastructure.physics.fft_ops import sense_adjoint, sense_forward
 
 __all__ = ["MulticoilEIOperator", "interleaved_to_complex", "require_complex_maps"]
@@ -73,6 +74,10 @@ def interleaved_to_complex(x: torch.Tensor) -> torch.Tensor:
             "reading it as a real image with zero imaginary part is what made "
             "A = M F transform the real and imaginary parts separately."
         )
+    # An autocast generator hands back fp16/bf16, which `torch.complex` turns into the
+    # experimental ComplexHalf the FFT operator should not run in.
+    if x.dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
     paired = x.view(x.shape[0], channels // 2, 2, *x.shape[-2:])
     return torch.complex(paired[:, :, 0], paired[:, :, 1])
 
@@ -125,9 +130,47 @@ class MulticoilEIOperator:
         return cls(batch_context.get("coil_sensitivities"), mask, where="in the batch")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        r""":math:`Ax`: a coil-combined image to per-coil k-space."""
-        image = x if x.is_complex() else torch.complex(x, torch.zeros_like(x))
-        return sense_forward(image, self.maps, self.mask)
+        r""":math:`Ax`: a coil-combined image to per-coil k-space.
+
+        ``x`` is the network's real/imag-interleaved image (or complex). Reading
+        the two channels as two real images made ``sense_forward`` see a 2-"coil"
+        image against 4 coil maps and raise (#2326), the bug #2227 fixed on the
+        combined operator.
+        """
+        return sense_forward(interleaved_to_complex(x), self.maps, self.mask)
+
+    def adjoint(self, kspace: torch.Tensor) -> torch.Tensor:
+        r""":math:`A^Hk=S^HF^HMk` as a complex ``[B, 1, H, W]`` image (the solver form)."""
+        return sense_adjoint(kspace, self.maps, self.mask)
+
+    def lipschitz_bound(self) -> float:
+        r"""Upper bound on :math:`\lVert A\rVert^2`: :math:`\max_r\sum_c|S_c(r)|^2`.
+
+        :math:`F` is unitary and :math:`0\le M\le 1`, so
+        :math:`\lVert MFSx\rVert^2\le\max_r\sum_c|S_c(r)|^2\,\lVert x\rVert^2`. A few
+        power iterations approach :math:`L` from below; this never gives a step
+        above :math:`1/L`. Assumes a mask with entries in :math:`[0, 1]`.
+        """
+        return float(self.maps.abs().pow(2).sum(dim=1).amax())
+
+    def restrict(self, image: torch.Tensor) -> torch.Tensor:
+        r"""``image`` zeroed where no coil measures it, in the layout it came in.
+
+        :math:`A = MFS` is blind to a pixel with :math:`S = 0`, so an image network
+        is free there: the bound's RSS PSNR fell to 0 dB on a growing background,
+        and the EI term asked the network to reproduce that background rotated.
+        """
+        return image * coil_support(self.maps).to(image.real.dtype)
+
+    def combine(self, kspace: torch.Tensor) -> torch.Tensor:
+        r""":math:`S^HF^Hk` with no mask: a k-space network's output as the image EI acts on.
+
+        A k-space-native network (``complex_unet``) predicts every line of every
+        coil. The group acts on the anatomy, so the prediction is SENSE-combined
+        to the one complex image the maps describe before :math:`T_g` touches it.
+        """
+        combined = sense_adjoint(interleaved_to_complex(kspace), self.maps, None)
+        return torch.cat([combined.real, combined.imag], dim=1)
 
     def model_input(self, kspace: torch.Tensor) -> torch.Tensor:
         r""":math:`A^Hy` as the real 2-channel tensor the network consumes.
@@ -135,7 +178,7 @@ class MulticoilEIOperator:
         ``sense_adjoint`` SENSE-combines to one complex channel; the network
         reads real/imaginary interleaved, which is what ``in_channels: 2`` means.
         """
-        combined = sense_adjoint(kspace, self.maps, self.mask)
+        combined = self.adjoint(kspace)
         return torch.cat([combined.real, combined.imag], dim=1)
 
     def prepare(self, batch_context: dict, input_batch: torch.Tensor) -> tuple[torch.Tensor, dict]:

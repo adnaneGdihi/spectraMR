@@ -6,7 +6,7 @@ from spectramr.infrastructure.physics.data_consistency import SoftDataConsistenc
 class TestSoftDataConsistency:
     def test_initialization(self):
         sdc = SoftDataConsistency(lambda_init=5.0)
-        assert sdc.lambda_param.item() == 5.0
+        assert abs(sdc.lam.item() - 5.0) < 1e-5
         assert sdc.lambda_param.requires_grad is True
 
     def test_forward_shapes(self):
@@ -85,3 +85,44 @@ class TestSoftDataConsistency:
 
         assert sdc.lambda_param.grad is not None
         assert pred.grad is not None
+
+
+    def test_lambda_gradient_survives_a_tiny_weight(self):
+        """Planted: the old clamp(min=1e-6) zeroed the gradient once lambda went negative."""
+        sdc = SoftDataConsistency(lambda_init=1e-7)
+        k_pred = torch.randn(1, 2, 8, 8)
+        k_meas = torch.randn(1, 2, 8, 8)
+        mask = torch.ones(1, 1, 8, 8)
+        sdc(k_pred, k_meas, mask, is_kspace_domain=True).sum().backward()
+        assert sdc.lambda_param.grad is not None
+        assert sdc.lambda_param.grad.abs() > 0
+        assert sdc.lam.item() > 0
+
+    def test_log_scaled_blend_is_computed_on_linear_kspace(self):
+        """The proximal blend of decompressed values, recompressed -- not a blend of logs."""
+        from spectramr.data.transforms.normalization import (
+            compress_kspace_log,
+            decompress_kspace_log,
+        )
+
+        torch.manual_seed(0)
+        lin_pred = torch.randn(1, 2, 8, 8) * 30
+        lin_meas = torch.randn(1, 2, 8, 8) * 30
+        mask = torch.ones(1, 1, 8, 8)
+        sdc = SoftDataConsistency(lambda_init=1.0, learnable=False, log_scaled=True)
+        out = sdc(
+            compress_kspace_log(lin_pred, channel_dim=1),
+            compress_kspace_log(lin_meas, channel_dim=1),
+            mask,
+            is_kspace_domain=True,
+        )
+        expected = (lin_pred + lin_meas) / 2.0
+        torch.testing.assert_close(
+            decompress_kspace_log(out, channel_dim=1), expected, rtol=1e-3, atol=1e-3
+        )
+
+    def test_log_scaled_must_be_a_bool(self):
+        import pytest
+
+        with pytest.raises(TypeError, match="log_scaled"):
+            SoftDataConsistency(log_scaled=None)

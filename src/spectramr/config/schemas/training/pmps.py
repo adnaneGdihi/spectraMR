@@ -55,7 +55,6 @@ class PseudoQMRIBackrecoveryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = Field(default=True)
-    bloch_encoder_checkpoint: Path | None = Field(default=None)
     pseudo_qmri_noise_inflation: float = Field(default=2.0, gt=0.0)
 
 
@@ -131,9 +130,6 @@ class TrainingConfigCorruptionCalibration(BaseTrainingConfigSchema):
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
-    tissue_prior_checkpoint: Path = Field(
-        ..., description="Path to the Phase-1 tissue-prior checkpoint."
-    )
     ulf_corruption: ULFCorruptionConfig = Field(default_factory=ULFCorruptionConfig)
     hf_corruption: HFCorruptionConfig = Field(default_factory=HFCorruptionConfig)
     mmd: MMDConfig = Field(default_factory=MMDConfig)
@@ -176,8 +172,6 @@ class TrainingConfigPairedSynthesis(BaseTrainingConfigSchema):
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
-    tissue_prior_checkpoint: Path
-    corruption_calibration_checkpoint: Path
     n_synthetic_pairs: int = Field(default=10_000, ge=1)
     protocol_sampling: ProtocolSamplingConfig = Field(default_factory=ProtocolSamplingConfig)
     output_format: Literal["nifti", "h5", "npz"] = Field(default="nifti")

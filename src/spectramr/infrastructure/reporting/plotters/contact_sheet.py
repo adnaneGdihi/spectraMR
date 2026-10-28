@@ -27,7 +27,7 @@ def make(
     pngs = sorted(p for p in fig_dir.glob("*.png") if p.stem != out_path.stem)
     if not pngs:
         return None
-    use_default_style("nature")
+    use_default_style()
     cols = min(3, len(pngs))
     rows = (len(pngs) + cols - 1) // cols
     fig, axes = plt.subplots(

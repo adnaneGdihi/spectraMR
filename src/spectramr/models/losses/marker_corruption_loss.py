@@ -109,10 +109,7 @@ class MarkerCorruptionLoss(nn.Module):
         else:
             pred_real = prediction.abs() if prediction.is_complex() else prediction
 
-        if torch.is_complex(ideal_marker):
-            ideal_real = ideal_marker.abs()
-        else:
-            ideal_real = ideal_marker
+        ideal_real = ideal_marker.abs() if torch.is_complex(ideal_marker) else ideal_marker
 
         # Broadcast ideal across batch and channels of pred_real
         # (use repeat — `expand` cannot grow non-singleton dims).

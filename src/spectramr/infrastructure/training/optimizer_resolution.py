@@ -135,6 +135,8 @@ class OptimizerSpec:
     lookahead: LookaheadSpec | None = None
     role: str = "generator"
     dropped_defaults: tuple[str, ...] = ()
+    #: Knobs the framework chose because the YAML left them unset (e.g. ``fused`` on CUDA).
+    applied_defaults: tuple[str, ...] = ()
 
     def as_provenance(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -143,6 +145,13 @@ class OptimizerSpec:
             "lr": self.lr,
             **self.params,
         }
+        if "betas" not in record:
+            # Undeclared betas run at the constructor's default, which no record
+            # named, so no run could say which beta1 it trained with (#2308).
+            default = _constructor_default(self.name, "betas")
+            if isinstance(default, tuple | list):
+                record["betas"] = tuple(default)
+                record["betas_source"] = "optimizer constructor default"
         if self.param_groups:
             record["param_groups"] = [g.as_provenance() for g in self.param_groups]
         if self.lookahead is not None:
@@ -154,6 +163,8 @@ class OptimizerSpec:
             # Recorded, not hidden: "adafactor ignored your weight_decay default"
             # is exactly the kind of thing that is invisible at 3am otherwise.
             record["dropped_defaults"] = list(self.dropped_defaults)
+        if self.applied_defaults:
+            record["applied_defaults"] = list(self.applied_defaults)
         return record
 
 
@@ -182,13 +193,18 @@ def _explicitly_set(optimizer: Any) -> set[str]:
     return set(fields_set) if fields_set else set()
 
 
+#: torch's Adam-family beta1, which an undeclared beta1 already runs. Named so a
+#: half-declared pair (beta2 only) resolves to the same number rather than to a
+#: schema default that no optimizer applies (#2308).
+_TORCH_ADAM_BETA1 = 0.9
+
+
 def _resolve_betas(optimizer: Any, declared: set[str]) -> tuple[float, float] | None:
     """Reconcile the two homes for the Adam beta pair.
 
     ``betas`` had a validator, was set by 27 experiment YAMLs, and was read by
     NOTHING — its docstring named ``OptimizerSetupMixin._build_optimizer``, a
-    class that has never existed here. Meanwhile ``beta1`` defaults to 0.5 (not
-    0.9), so those arms silently trained at (0.5, 0.999).
+    class that has never existed here.
 
     Returns ``None`` when neither home was declared, so the pair is treated as a
     droppable default rather than an explicit request.
@@ -206,22 +222,22 @@ def _resolve_betas(optimizer: Any, declared: set[str]) -> tuple[float, float] | 
         and getattr(optimizer, "beta2", None) is not None
     )
 
-    if has_pair and has_scalars and {"betas"} & declared:
-        scalars = (
-            getattr(optimizer, "beta1", None),
-            getattr(optimizer, "beta2", None),
+    beta1 = getattr(optimizer, "beta1", None)
+    scalars = (
+        _TORCH_ADAM_BETA1 if beta1 is None else float(beta1),
+        float(getattr(optimizer, "beta2", 0.999)),
+    )
+    if has_pair and has_scalars and {"betas"} & declared and tuple(pair) != scalars:
+        raise OptimizerConfigurationError(
+            f"optimization.optimizer.betas={tuple(pair)} disagrees with "
+            f"optimization.optimizer.beta1/beta2={scalars}. Declare the beta pair in "
+            "ONE place: either `betas: [b1, b2]` or the scalar beta1/beta2 "
+            "fields."
         )
-        if tuple(pair) != scalars:
-            raise OptimizerConfigurationError(
-                f"optimization.optimizer.betas={tuple(pair)} disagrees with "
-                f"optimization.optimizer.beta1/beta2={scalars}. Declare the beta pair in "
-                "ONE place: either `betas: [b1, b2]` or the scalar beta1/beta2 "
-                "fields."
-            )
     if has_pair:
         return (float(pair[0]), float(pair[1]))
     if has_scalars:
-        return (float(optimizer.beta1), float(optimizer.beta2))
+        return scalars
     return None
 
 
@@ -257,7 +273,9 @@ def _candidate_kwargs(optimizer: Any, declared: set[str]) -> tuple[dict[str, Any
         # optimizer_kwargs could only ever agree with a default, never override
         # one — which is what left `adafactor` with no way to declare the tuple
         # `eps` its constructor requires.
-        if key in explicit and candidates[key] != value:
+        # A YAML list and the resolved tuple are the same pair.
+        comparable = tuple(value) if isinstance(value, list) else value
+        if key in explicit and candidates[key] != comparable:
             raise OptimizerConfigurationError(
                 f"optimization.optimizer.kwargs['{key}']={value!r} disagrees with "
                 f"optimization.{key}={candidates[key]!r}. Declare it once."
@@ -432,6 +450,24 @@ def _resolve_param_groups(
     return tuple(groups)
 
 
+#: Optimizers whose torch implementation has a fused CUDA kernel worth defaulting to.
+_FUSED_BY_DEFAULT = frozenset({"adam", "adamw"})
+
+
+def _fused_supported(model: Any) -> bool:
+    """Whether every trainable parameter is a real floating tensor on a CUDA device.
+
+    ``fused`` rejects complex, CPU and meta parameters, so the default applies only when it
+    is certain to be accepted; an explicit ``fused: true`` elsewhere still raises as before.
+    """
+    if model is None or not hasattr(model, "parameters"):
+        return False
+    params = [p for p in model.parameters() if p.requires_grad]
+    return bool(params) and all(
+        p.is_cuda and p.is_floating_point() and not p.is_complex() for p in params
+    )
+
+
 def resolve_optimizer_spec(
     optimization: Any,
     *,
@@ -459,9 +495,12 @@ def resolve_optimizer_spec(
         else float(optimizer.learning_rate) * float(lr_multiplier)
     )
 
+    # param_groups is keyed by the generator's named_parameters(); handed the
+    # discriminator it raised on an unmatched prefix, or silently gave D the
+    # generator's per-group lr/weight decay/freeze on a matching one (#2308).
     groups = _resolve_param_groups(
         optimizer,
-        model,
+        model if role == "generator" else None,
         base_lr=lr,
         base_weight_decay=float(forwarded.get("weight_decay", 0.0)),
     )
@@ -481,6 +520,11 @@ def resolve_optimizer_spec(
             list(dropped),
         )
 
+    applied: tuple[str, ...] = ()
+    if name in _FUSED_BY_DEFAULT and "fused" not in forwarded and _fused_supported(model):
+        forwarded = {**forwarded, "fused": True}
+        applied = ("fused",)
+
     return OptimizerSpec(
         name=name,
         lr=lr,
@@ -489,6 +533,7 @@ def resolve_optimizer_spec(
         lookahead=lookahead,
         role=role,
         dropped_defaults=dropped,
+        applied_defaults=applied,
     )
 
 

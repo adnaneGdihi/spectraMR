@@ -153,3 +153,33 @@ def test_lncc_registered() -> None:
     from spectramr.models.losses.registry import list_available
 
     assert "lncc" in list_available()
+
+
+# ---------------------------------------------------------------------------
+# Reduced precision
+# ---------------------------------------------------------------------------
+
+
+def test_half_precision_input_is_finite_and_matches_float32() -> None:
+    """fp16 inputs are evaluated in float32, where the 1e-8 floor does not underflow."""
+    torch.manual_seed(0)
+    pred = torch.zeros(1, 1, 32, 32)
+    pred[..., 8:24, 8:24] = torch.rand(16, 16) * 1e-2
+    target = pred * 0.9 + 1e-3 * torch.rand_like(pred)
+    loss = LNCCLoss()
+    ref = loss(pred, target)
+    half = pred.half().requires_grad_(True)
+    out = loss(half, target.half())
+    out.backward()
+    assert torch.isfinite(out)
+    assert half.grad is not None and torch.isfinite(half.grad).all()
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=0.0)
+
+
+def test_float64_input_is_accepted() -> None:
+    """A float64 batch no longer meets a float32 box kernel inside ``conv2d``."""
+    torch.manual_seed(0)
+    x = torch.rand(1, 1, 16, 16, dtype=torch.float64)
+    out = LNCCLoss(window_size=3)(x, x)
+    assert out.dtype == torch.float64
+    assert float(out) < -0.99

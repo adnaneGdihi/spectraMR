@@ -50,17 +50,17 @@ def mig():
 def arm(tmp_path: Path) -> Path:
     """A copy of a migrated arm with one redundant lambda put BACK.
 
-    ``log_spectral`` is declared on ``kspace_losses`` at 0.1; re-adding
-    ``lambda_log_spectral: 0.1`` recreates the dual declaration the migrator
+    ``sobolev_kspace`` is declared on ``kspace_losses`` at 0.05; re-adding
+    ``lambda_sobolev_kspace: 0.05`` recreates the dual declaration the migrator
     exists to collapse, at the same value (a different value is a separate case
     below, and does not even load).
     """
     dst = tmp_path / _ARM.name
     shutil.copy(_ARM, dst)
     text = dst.read_text()
-    assert "lambda_log_spectral" not in text, "fixture premise: the arm is migrated"
+    assert "lambda_sobolev_kspace" not in text, "fixture premise: the arm is migrated"
     dst.write_text(
-        text.replace("  reconstruction:\n", "  reconstruction:\n    lambda_log_spectral: 0.1\n", 1)
+        text.replace("  reconstruction:\n", "  reconstruction:\n    lambda_sobolev_kspace: 0.05\n", 1)
     )
     return dst
 
@@ -69,10 +69,10 @@ def test_removes_a_redundant_lambda_and_touches_nothing_else(mig, arm):
     before = arm.read_text()
     status, removed = mig.migrate(arm, apply=True)
     assert status == "MIGRATED", status
-    assert removed == ["reconstruction.lambda_log_spectral"]
+    assert removed == ["reconstruction.lambda_sobolev_kspace"]
     # every other line byte-identical: the deletion is the ONLY edit
     assert arm.read_text().splitlines() == [
-        ln for ln in before.splitlines() if ln.strip() != "lambda_log_spectral: 0.1"
+        ln for ln in before.splitlines() if ln.strip() != "lambda_sobolev_kspace: 0.05"
     ]
 
 
@@ -101,7 +101,7 @@ def test_refuses_an_arm_whose_two_surfaces_disagree(mig, arm):
     ``build_loss_weight_table`` raises on it, so the arm does not load and the
     migrator reports SKIP rather than picking a winner.
     """
-    arm.write_text(arm.read_text().replace("lambda_log_spectral: 0.1", "lambda_log_spectral: 0.9"))
+    arm.write_text(arm.read_text().replace("lambda_sobolev_kspace: 0.05", "lambda_sobolev_kspace: 0.9"))
     before = arm.read_text()
     status, _ = mig.migrate(arm, apply=True)
     assert status.startswith("SKIP unloadable"), status
@@ -170,7 +170,7 @@ def test_an_unparsable_audit_site_is_fatal(mig, arm, monkeypatch):
     monkeypatch.setattr(
         config_health_checker,
         "dual_surface_loss_declarations",
-        lambda _losses: [("log_spectral", 0.1, ["losses.log_spectral"], ["kspace_losses"])],
+        lambda _losses: [("sobolev_kspace", 0.05, ["losses.sobolev_kspace"], ["kspace_losses"])],
     )
     with pytest.raises(SystemExit, match="unparsable lambda site"):
         mig.migrate(arm, apply=True)
@@ -181,7 +181,7 @@ def test_a_migrated_arm_that_also_diverges_exits_1_and_prints_the_verdict(
 ):
     """A divergence must survive the reporting layer, not just the verdict string.
 
-    This arm both migrates (``lambda_log_spectral`` is reported and removable) and
+    This arm both migrates (``lambda_sobolev_kspace`` is reported and removable) and
     diverges (the widened ``pre_dc_kspace`` is not reported), so it is filed under
     the ``MIGRATED`` head. Two guards keyed on that head used to lose it: the detail
     line was printed only ``if head != "MIGRATED"``, and the exit code was derived
@@ -254,6 +254,19 @@ def _copy(src: Path, tmp_path: Path) -> Path:
     return dst
 
 
+def _diffusion_arm(tmp_path: Path) -> Path:
+    """The MSE arm with ``losses.diffusion.lambda_mse: 1.0`` restored.
+
+    The live arm no longer declares it (the cohort's doubled MSE was removed), so
+    the copy puts back the raw-read shape the deny-list exists for.
+    """
+    arm = _copy(_DIFFUSION_ARM, tmp_path)
+    text = arm.read_text()
+    assert "\n  diffusion:\n    lambda_mse" not in text, "premise: the live arm dropped it"
+    arm.write_text(text.replace("\nlosses:\n", "\nlosses:\n  diffusion:\n    lambda_mse: 1.0\n", 1))
+    return arm
+
+
 def test_leaves_a_lambda_outside_the_losses_surface_alone(mig, tmp_path, monkeypatch):
     """``training.diffusion.lambda_*`` is not this migration's surface.
 
@@ -299,7 +312,7 @@ def test_keeps_diffusion_lambda_mse_even_though_a_domain_list_declares_mse(mig, 
     ``image_losses`` ``mse`` entry looks like a duplicate declaration when it is not
     one -- ``mse`` really is in the removable set here, so only the deny-list stops it.
     """
-    arm = _copy(_DIFFUSION_ARM, tmp_path)
+    arm = _diffusion_arm(tmp_path)
     assert "mse" in mig._declared_in_domain_lists(arm), "premise: mse is removable"
     assert "    lambda_mse: 1.0\n" in arm.read_text(), "premise: declared under losses.diffusion"
 
@@ -361,7 +374,7 @@ def test_an_arm_with_both_a_denial_and_a_divergence_names_both(mig, tmp_path, mo
     on every run of a fully migrated cohort, while the divergence means the text scan
     and the audit stopped agreeing.
     """
-    arm = _copy(_DIFFUSION_ARM, tmp_path)
+    arm = _diffusion_arm(tmp_path)
     assert "perceptual" not in mig._declared_in_domain_lists(arm), "premise: not declared"
     assert "    lambda_perceptual: 0.0\n" in arm.read_text(), "premise: category key present"
     real = mig._declared_in_domain_lists
@@ -771,13 +784,13 @@ def documented_arm(arm: Path) -> Path:
     re-aiming this plant at a different key.
     """
     text = arm.read_text()
-    assert "    lambda_log_spectral: 0.1\n" in text, "premise: the arm fixture re-added the key"
+    assert "    lambda_sobolev_kspace: 0.05\n" in text, "premise: the arm fixture re-added the key"
     arm.write_text(
         text.replace(
-            "    lambda_log_spectral: 0.1\n",
+            "    lambda_sobolev_kspace: 0.05\n",
             "    # Log-spectral weighting: compares magnitude spectra in log space so\n"
             "    # high-frequency error is not swamped by the DC peak.\n"
-            "    lambda_log_spectral: 0.1\n",
+            "    lambda_sobolev_kspace: 0.05\n",
             1,
         )
     )
@@ -788,8 +801,8 @@ def test_migrate_drops_the_comment_on_a_real_arm(mig, documented_arm):
     """The production path reaches the drop -- observed, not inferred (NN16)."""
     status, removed = mig.migrate(documented_arm, apply=True)
     assert status == "MIGRATED", status
-    assert removed == ["reconstruction.lambda_log_spectral"]
+    assert removed == ["reconstruction.lambda_sobolev_kspace"]
     out = documented_arm.read_text()
-    assert "lambda_log_spectral" not in out
+    assert "lambda_sobolev_kspace" not in out
     assert "Log-spectral weighting" not in out
     assert "swamped by the DC peak" not in out

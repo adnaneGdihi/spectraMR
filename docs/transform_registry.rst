@@ -68,8 +68,55 @@ Adding a transform
    ``data/adapters/__init__.py``.
 #. Add a test asserting it is registered and constructs with defaults.
 
-Currently registered: ``foreground_mask``, ``graph_encoding``, ``phase_residual``,
-``scout_acquisition``. The remaining caller-free transforms under
+Currently registered (re-measure with ``TRANSFORM_REGISTRY``, this list moves):
+``complementary_rep_masking``, ``espirit_sensitivity``, ``foreground_mask``,
+``graph_encoding``, ``homomorphic_bias_field``, ``joint_rotation``,
+``phase_residual``, ``scout_acquisition``, ``select_middle_slice``,
+``simulate_ulf_from_hf``, ``simulate_ulf_from_qmaps``, ``slab_to_channel``,
+``slice_profile``, ``svd_coil_compression``.
+
+``svd_coil_compression`` (``requires=("input", "mask")``) is the M4Raw
+repetition route's coil compression, which the loader's
+``coils.processing_mode: svd`` cannot be on that route. Declared after
+``complementary_rep_masking``, it fits one SVD basis per slice on the masked
+``input`` alone and applies it to ``input``, ``measured_kspace``, ``target``,
+``kspace`` and ``input_alt``. Compression is linear on the coil axis and the
+mask acts on k-space positions, so the two commute and no unacquired line or
+reference repetition chooses the basis. It raises when ``mask`` is absent or a
+physical-coil key (coil maps, ``noise_covariance``) is present.
+
+``espirit_sensitivity`` estimates complex ESPIRiT maps from the subject's
+k-space and writes ``sensitivity_complex`` and its magnitude ``sensitivity``.
+Under ``data.coil_maps_root`` the M4Raw loader has already attached the group's
+precomputed maps and stamped the calibration that made them; the transform
+then estimates nothing, and raises if that calibration or the maps' shape
+differs from its own ``acs_size``/``kernel_size``/``eigen_threshold``.
+
+``complementary_rep_masking`` (``produces=("mask", "loss_mask", "measured_kspace")``) is the
+CoNEX protocol's data side (``experiments/inprogress/n2n/PAPER.md`` § 4): it
+undersamples ``input`` by a mask :math:`M_1` drawn inside the acquired
+phase-encode columns and emits ``loss_mask`` = :math:`M_2` for the
+``masked_kspace_l2`` loss (:doc:`losses_reference`). ``mode`` selects how
+:math:`M_2` relates to :math:`M_1` -- ``independent`` (a fresh draw),
+``complementary`` (disjoint, subsampled to :math:`|M_2| = |M_1|` above R = 2),
+``same`` and ``full_target`` (the two controls) -- and an unknown mode raises.
+Seeds are a CRC32 of ``(file_id, slice, seed)`` so every arm of an ablation sees
+the same :math:`M_1`. It also overwrites ``measured_kspace`` with the masked
+input. The M4Raw dataset publishes that key as the unmasked ``input`` and serves
+the reference under ``kspace``, so the strategy's measurement :math:`y` is the
+acquired input on every M4Raw arm and never the target (#2761).
+
+``pattern`` chooses the family of :math:`M_1`. ``cartesian_1d`` (the default) is the
+uniform random line draw above. ``poisson_disk``, ``radial``/``golden_angle`` and
+``spiral`` -- names resolved through ``SamplingPatternRegistry``, any other name
+raising -- draw 2-D masks over the whole grid (``data/transforms/rep_mask_patterns.py``):
+a variable-density Poisson-disc from ``MaskGenerator.variable_density_poisson_disc``,
+or a seeded rotation of the golden-angle orderings rasterised onto the grid. R
+means :math:`|M_1 \cap \mathrm{support}| = \mathrm{round}(|\mathrm{support}|/R)` for
+every family, and every 2-D mask holds the centred
+``round(center_fraction * W)``-square ESPIRiT window in both masks. A calibration
+region that fills the budget raises instead of silently lowering R, and the achieved
+R is stamped as ``realised_acceleration``. The remaining caller-free transforms under
 ``data/transforms/`` are a separate decision — several are duplicates that
 *disagree numerically* with a live implementation and should be deleted rather
 than registered.

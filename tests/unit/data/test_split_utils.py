@@ -107,3 +107,26 @@ def test_three_way_grouped_without_test_split_matches_two_way() -> None:
     train, val, test = split_index_three_way_grouped(files, 0.25, 0.0, key=_key)
     assert test == []
     assert (train, val) == split_index_grouped(files, 0.25, key=_key)
+
+
+def test_record_split_key_prefers_subject_then_file():
+    from spectramr.data.split_utils import record_split_key
+
+    assert record_split_key({"patient_id": "p1", "primary_path": "a.h5"}) == "p1"
+    assert record_split_key({"subject_id": "s1", "patient_id": "p1"}) == "s1"
+    assert record_split_key({"primary_path": "a.h5"}) == "a.h5"
+    a, b = {}, {}
+    assert record_split_key(a) != record_split_key(b)
+
+
+def test_record_split_key_reads_paths_and_attributes():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from spectramr.data.split_utils import record_split_key
+
+    # A BIDS label in the file name groups the records that carry no subject id.
+    assert record_split_key({"input": "/d/sub-07/anat/sub-07_T1w.nii.gz"}) == "sub-07"
+    assert record_split_key("/d/sub-03_T2w.nii.gz") == "sub-03"
+    assert record_split_key(Path("/d/vol_12.npy")) == "/d/vol_12.npy"
+    assert record_split_key(SimpleNamespace(subject_id="p9", input_path="x")) == "p9"

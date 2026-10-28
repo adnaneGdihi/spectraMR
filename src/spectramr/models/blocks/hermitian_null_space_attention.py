@@ -35,8 +35,13 @@ acceleration. The ``mirror_observed`` gate closes smoothly, so this degrades
 rather than misfires; do not read a null result at high R as a refutation of the
 prior.
 
-Everything else is inherited from :mod:`null_space_attention`: the same mandatory
-mask, the same center-crop alignment, and the same ``1 - M`` write gate.
+Everything else is shared with :mod:`null_space_attention`: the same mandatory
+mask, the same centre-crop alignment, the same ``1 - M`` write gate, the same
+phase-encode column-distance bias on the k-space stream (a real multiplicative
+weight, so the scores stay phase-invariant), and the same restriction of the
+normalisation statistics to the acquired bins. Structurally-zero bins (columns
+the scanner never acquires) are not distinguishable from undersampled ones
+without the target support, so they stay inside the write gate here too.
 """
 
 from __future__ import annotations
@@ -51,7 +56,12 @@ from spectramr.models.blocks.attention_domains import (
     interleaved_to_complex,
     validate_feature_domain,
 )
-from spectramr.models.blocks.null_space_attention import NullSpaceDualDomainAttention
+from spectramr.models.blocks.kspace_attention_kernels import (
+    align_mask_to_grid,
+    masked_complex_rms,
+    pe_biased_linear_attention,
+)
+from spectramr.models.blocks.null_space_attention import PE_SLOPE_INIT
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.layers.complex_norm import ComplexRMSNorm
 
@@ -75,16 +85,28 @@ class PhaseInvariantScoreAttention(nn.Module):
     a global phase (so the weights are), and still phase-aware, because the
     complex inner product reads relative phase inside the feature vector. The
     mask enters the key SUM, so restricting attention to the acquired bins costs
-    nothing and no ``[L, L]`` matrix is formed.
+    nothing and no ``[L, L]`` matrix is formed. With ``pe_distance_bias`` the
+    keys are further weighted by ``(1 + |delta w|) ** (-softplus(a))``, the
+    phase-encode column distance to the query; the normaliser's power mean runs
+    over the observed bins only.
     """
 
-    def __init__(self, complex_channels: int, num_features: int = 32, eps: float = 1e-6):
+    def __init__(
+        self,
+        complex_channels: int,
+        num_features: int = 32,
+        eps: float = 1e-6,
+        *,
+        pe_distance_bias: bool = False,
+    ):
         """__init__.
 
         Args:
             complex_channels (int): Complex channel count (half the interleaved).
             num_features (int): Kernel feature dimension of the score map.
             eps (float): Denominator floor; engages only where nothing is observed.
+            pe_distance_bias (bool): Weight keys by PE-column distance. Meaningful
+                only on a k-space grid; the image stream leaves it off.
         """
         super().__init__()
         self.eps = eps
@@ -93,6 +115,9 @@ class PhaseInvariantScoreAttention(nn.Module):
         self.k_proj = ComplexConv2d(complex_channels, num_features, 1, bias=False)
         self.v_proj = ComplexConv2d(complex_channels, complex_channels, 1, bias=False)
         self.out_proj = ComplexConv2d(complex_channels, complex_channels, 1, bias=False)
+        self.pe_slope_raw = (
+            nn.Parameter(torch.full((1,), PE_SLOPE_INIT)) if pe_distance_bias else None
+        )
 
     def _features(self, projected: torch.Tensor) -> torch.Tensor:
         """``[B, 2F, H, W]`` interleaved -> ``[B, F, L]`` positive invariant features."""
@@ -110,11 +135,23 @@ class PhaseInvariantScoreAttention(nn.Module):
             torch.Tensor: ``[B, 2C, H, W]``, projected output without a residual.
         """
         b, _, h, w = x.shape
-        normed = self.norm(x)
+        normed = masked_complex_rms(x, observed, self.norm.gain, self.norm.eps)
         q = self._features(self.q_proj(normed))
-        k = self._features(self.k_proj(normed)) * observed.reshape(b, 1, -1)
+        k = self._features(self.k_proj(normed))
         v = interleaved_to_complex(self.v_proj(normed)).flatten(-2, -1)
 
+        if self.pe_slope_raw is not None:
+            out = pe_biased_linear_attention(
+                q.unsqueeze(1),
+                k.unsqueeze(1),
+                v.unsqueeze(1),
+                observed,
+                F.softplus(self.pe_slope_raw),
+                eps=self.eps,
+            ).reshape(b, -1, h, w)
+            return self.out_proj(complex_to_interleaved(out))
+
+        k = k * observed.reshape(b, 1, -1)
         kv = torch.einsum("bfl,bcl->bfc", k.to(v.dtype), v)
         numerator = torch.einsum("bfl,bfc->bcl", q.to(v.dtype), kv)
         denominator = torch.einsum("bfl,bf->bl", q, k.sum(dim=-1)).clamp_min(self.eps)
@@ -155,7 +192,9 @@ class HermitianNullSpaceAttention(nn.Module):
         self.eps = eps
         complex_channels = in_channels // 2
 
-        self.kspace_attn = PhaseInvariantScoreAttention(complex_channels, num_features, eps)
+        self.kspace_attn = PhaseInvariantScoreAttention(
+            complex_channels, num_features, eps, pe_distance_bias=True
+        )
         self.image_attn = PhaseInvariantScoreAttention(complex_channels, num_features, eps)
         self.fuse = ComplexConv2d(2 * complex_channels, complex_channels, 1, bias=False)
         # Real per-channel gate: a magnitude scale commutes with a global phase, so
@@ -214,9 +253,7 @@ class HermitianNullSpaceAttention(nn.Module):
         else:
             h_k, h_i = fft2c(h), h
 
-        observed = NullSpaceDualDomainAttention.align_mask(
-            mask.to(x.dtype), h_k.shape[-2], h_k.shape[-1]
-        )
+        observed = align_mask_to_grid(mask.to(x.dtype), h_k.shape[-2], h_k.shape[-1])
 
         x_k = complex_to_interleaved(h_k)
         kspace_branch = self.kspace_attn(x_k, observed)

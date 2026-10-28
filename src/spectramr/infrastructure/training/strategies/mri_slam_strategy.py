@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 class MRISLAMStrategy(ReconstructionTrainingStrategy):
     """Joint trajectory-image SLAM-style reconstruction."""
 
+    # parallel_compat: Creates per-subject trajectory deltas mid-training; the set can differ per rank.
+    parallel_compat = frozenset()
+
     # Loss weights + trajectory-delta LR; overridable via the typed
     # training.mri_slam block (previously hardcoded inline constants).
     lambda_smooth: float = 1e-3

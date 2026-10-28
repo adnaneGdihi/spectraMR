@@ -41,6 +41,7 @@ from torch.nn import functional as func
 from spectramr.data.batch_types import read_batch_field
 
 from .diffusion import DiffusionTrainingStrategy
+from .mixins.validation_context import fold_depth
 
 VelocityFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
@@ -85,8 +86,19 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
                 "loss_fm_velocity": torch.tensor(0.0, device=self.device),
             }
 
+        conditional = bool(getattr(getattr(gen, "module", gen), "conditional_velocity", False))
+        condition = None
+        if conditional:
+            # A measurement-conditional velocity: the path starts at noise and the
+            # model sees the input y (the ULF image) as its condition.
+            condition = read_batch_field(batch, "input")
+            if condition is None:
+                raise ValueError("A conditional velocity generator needs batch['input'].")
+            target, _ = fold_depth(target)
+            condition, _ = fold_depth(condition)
+
         x1 = target
-        x0 = read_batch_field(batch, "source")
+        x0 = None if conditional else read_batch_field(batch, "source")
         if x0 is None:
             x0 = torch.randn_like(x1)
 
@@ -106,8 +118,11 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
         # this method -- so ``first_steps/input_prepared``, captured before the
         # forward pass, is not it. Declare the real one; the wrapper emits it
         # under ``diffusion_step`` (non-negotiable 14).
+        declared = {"model_input": x_t, "source_x0": x0, "target": x1}
+        if condition is not None:
+            declared["condition"] = condition
         self._declare_model_input(
-            {"model_input": x_t, "source_x0": x0, "target": x1},
+            declared,
             # Explicit and empty: none of these is k-space by NAME. When the arm
             # declares k-space data, ``save_debug_snapshot`` unions the canonical
             # keys in from the config SSOT -- which is why the tensors carry
@@ -128,7 +143,9 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
 
         # Dispatch via signature introspection (never except-TypeError to
         # branch, so an in-forward TypeError propagates — pitfall #9).
-        if self._generator_accepts_time(gen):
+        if conditional:
+            pred = gen(x_t, t=t.flatten(), condition=condition)
+        elif self._generator_accepts_time(gen):
             pred = gen(x_t, t.flatten())
         else:
             pred = gen(x_t)

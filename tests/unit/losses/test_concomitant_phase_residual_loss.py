@@ -27,7 +27,7 @@ class TestConcomitantPhaseResidualLoss:
     def test_canary_builds_and_forward_finite(self):
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = _phase()
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert torch.isfinite(out) and out.shape == ()
 
     # ── Parametric ──────────────────────────────────────────────────────────
@@ -36,14 +36,14 @@ class TestConcomitantPhaseResidualLoss:
     def test_parametric_weight(self, weight: float):
         loss_fn = ConcomitantPhaseResidualLoss(weight=weight)
         phi = _phase()
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert torch.isfinite(out) and out.item() >= 0.0
 
     @pytest.mark.parametrize("reduction", ["mean", "sum"])
     def test_parametric_reduction(self, reduction: str):
         loss_fn = ConcomitantPhaseResidualLoss(reduction=reduction)
         phi = _phase()
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert torch.isfinite(out)
 
     # ── Property ────────────────────────────────────────────────────────────
@@ -52,48 +52,46 @@ class TestConcomitantPhaseResidualLoss:
         """Residual = 0 → loss = λ * mean(0^2) = 0."""
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = torch.zeros(B, C, H, W)
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert out.item() == pytest.approx(0.0, abs=1e-9)
 
     def test_property_nonneg(self):
         """Squared L2 is always ≥ 0."""
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = _phase()
-        assert loss_fn(phi).item() >= 0.0
+        assert loss_fn(residual_phase=phi).item() >= 0.0
 
     def test_property_scales_linearly_with_weight(self):
         phi = _phase()
-        out_1 = ConcomitantPhaseResidualLoss(weight=1.0)(phi)
-        out_2 = ConcomitantPhaseResidualLoss(weight=2.0)(phi)
+        out_1 = ConcomitantPhaseResidualLoss(weight=1.0)(residual_phase=phi)
+        out_2 = ConcomitantPhaseResidualLoss(weight=2.0)(residual_phase=phi)
         assert out_2.item() == pytest.approx(2.0 * out_1.item(), rel=1e-5)
 
     def test_property_gradient_reaches_input(self):
         phi = _phase().requires_grad_(True)
         loss_fn = ConcomitantPhaseResidualLoss()
-        loss_fn(phi).backward()
+        loss_fn(residual_phase=phi).backward()
         assert phi.grad is not None and torch.isfinite(phi.grad).all()
 
-    def test_property_target_arg_is_ignored(self):
-        """target keyword is present for API parity but must not affect result."""
+    def test_positional_call_raises(self):
+        """The (prediction, target) call a loss list makes is refused (#2275)."""
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = _phase()
-        dummy_target = torch.rand_like(phi)
-        out_no_target = loss_fn(phi)
-        out_with_target = loss_fn(phi, target=dummy_target)
-        assert torch.allclose(out_no_target, out_with_target)
+        with pytest.raises(TypeError, match="residual_phase="):
+            loss_fn(phi, torch.rand_like(phi))
 
     # ── Edge ────────────────────────────────────────────────────────────────
 
     def test_edge_large_phase_residual(self):
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = torch.full((B, C, H, W), 1e3)
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert torch.isfinite(out)
 
     def test_edge_3d_input(self):
         loss_fn = ConcomitantPhaseResidualLoss()
         phi = torch.randn(B, C, 8, H, W)
-        out = loss_fn(phi)
+        out = loss_fn(residual_phase=phi)
         assert torch.isfinite(out)
 
     # ── Raises ──────────────────────────────────────────────────────────────

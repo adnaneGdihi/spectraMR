@@ -15,19 +15,26 @@ an unknown / unimplemented ``method`` raises at startup (no silent fallback).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.nn.functional import interpolate, mse_loss
 
+from spectramr.config.schemas.physics import subvoxel_input_channels
 from spectramr.core.metrics.anchor_conformal import (
     AnchorConformalCalibrator,
     local_detail_score,
 )
 from spectramr.core.metrics.b0_field_rmse import B0FieldRMSE
 from spectramr.core.metrics.quantitative.qmri_agreement import qmri_agreement_metrics
+from spectramr.core.metrics.subject_conformal import SubjectResidualBank
 from spectramr.core.metrics.super_nyquist_fidelity import SuperNyquistFidelity
-from spectramr.infrastructure.physics.multi_acquisition import MultiAcquisitionSimulator
+from spectramr.infrastructure.physics.marker_realisation import realisation_seeds, wrong_seed
+from spectramr.infrastructure.physics.multi_acquisition import (
+    AcquisitionResult,
+    MultiAcquisitionSimulator,
+)
+from spectramr.infrastructure.physics.psf_conditioning import otf_channel
 from spectramr.infrastructure.physics.psf_estimation import (
     estimate_psf,
     gaussian_psf,
@@ -44,6 +51,12 @@ from spectramr.infrastructure.physics.subpixel_registration import (
     estimate_subpixel_shifts,
     fourier_shift,
 )
+from spectramr.infrastructure.physics.tissue_factor import (
+    N_TISSUES,
+    class_agreement,
+    gain_vector,
+    tissue_kappa_map,
+)
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.utils import pick_present
 from spectramr.models.capabilities import StrategyCapabilities
@@ -53,6 +66,9 @@ logger = logging.getLogger(__name__)
 # Methods whose recovered field is an off-resonance B0 map (graded against the
 # real ``b0_map``); every other method recovers a B1 transmit scale (``b1_map``).
 _B0_METHODS = ("dual_echo", "bssfp_banding")
+# Fixed seed for the validation dither: one checkpoint must score the same
+# every time it is evaluated, or the selection metric is noise.
+_VALIDATION_SEED = 0
 
 
 class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
@@ -62,6 +78,11 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
     field with the arm model, and minimise ``MSE(pred_field, field)`` plus a
     light spatial-smoothness term (fields are smooth).
     """
+
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     #: Validation keys this strategy's own ``validation_step`` writes (cohort
     #: review 2026-09-02, T0.5); ``validation.scoring.compute`` may name them.
@@ -74,6 +95,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
                 "val_field_mae",
                 "val_field_mse",
                 "val_field_reference_real",
+                "val_kappa_class_agreement",
                 "val_kappa_error",
                 "val_kappa_measured",
                 "val_kappa_predicted",
@@ -85,7 +107,8 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
 
     def __init__(self, env: Any, device: torch.device | None = None, **kwargs: Any) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         cfg = self.config.physics.multi_acquisition
@@ -102,8 +125,17 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         reg = cfg.subvoxel_registration
         self._shift_source = reg.shift_source
         self._max_shift_px = float(reg.max_shift_px)
-        # The fiducial is only synthesised when something actually registers it.
-        marker_enabled = self._method == "subvoxel_sr" and reg.shift_source == "recovered"
+        self._marker_seed = int(reg.marker_seed)
+        self._per_sample_marker = reg.marker_realisation == "per_sample"
+        self._marker_epoch, self._marker_ordinal = -1, 0
+        self._probe_target = cfg.band_probe.target_realisation
+        self._input_stream = cfg.input_stream
+        self._fov_mask = cfg.fov_mask
+        # The fiducial is synthesised when something reads it: the registrar, or
+        # the model itself (marker_channels, which is allowed under 'blind').
+        marker_enabled = self._method == "subvoxel_sr" and (
+            reg.shift_source == "recovered" or bool(cfg.marker_channels)
+        )
         self.macq = MultiAcquisitionSimulator(
             cfg.method,
             field_strength_t=float(self.config.physics.field_strength),
@@ -178,9 +210,14 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         self._psf_cfg = psf
         self._psf_enabled = bool(psf.enabled)
         self._last_psf: dict[str, float] = {}
+        self._last_psf_channel: torch.Tensor | None = None
+        self._assumed_otf: torch.Tensor | None = None
+        self._assumed_otf_key: tuple[Any, ...] | None = None
         if self._psf_enabled:
-            assumed = gaussian_psf(psf.kernel_size, psf.sigma_px)
-            self._assumed_psf = assumed.reshape(1, 1, 1, *assumed.shape)
+            # Declared in HR pixels, compared and fed on the pooled grid, where
+            # the measured kernel lives -- one unit system for both sources.
+            assumed = gaussian_psf(psf.kernel_size, max(psf.sigma_px / cfg.sr_scale, 1e-3))
+            self._assumed_lr_kernel = assumed.reshape(1, 1, 1, *assumed.shape).to(self.device)
             # The simulator applies true_sigma_px when declared, so the assumed
             # kernel is WRONG on purpose and the measured arm has something to
             # correct. With it unset the two agree by construction, which the
@@ -208,6 +245,13 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         )
         self._last_coverage: dict[str, float] = {}
         self._last_result: Any = None
+        # Held-out-subject calibration (VFU-09): None in the marker mode.
+        self._subject_bank = (
+            SubjectResidualBank(conf.calibration_subject_count)
+            if conf.enabled and conf.calibration_source == "held_out_subjects"
+            else None
+        )
+        self._train_subjects: set[str] = set()
 
         # Relaxometric contrast transfer. kappa is computed ONCE from declared
         # acquisition parameters and declared marker relaxometry -- nothing here
@@ -215,7 +259,10 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         relax = cfg.relaxometric_calibration
         self._relax_enabled = bool(relax.enabled)
         self._relax_factored = bool(relax.factored)
+        self._factor_form = relax.factor_form
         self._marker_kappa: float | None = None
+        self._tissue_gains: torch.Tensor | None = None
+        self._last_kappa_logits: torch.Tensor | None = None
         if self._relax_enabled:
             src = AcquisitionParams(
                 relax.source.field_strength_t,
@@ -238,14 +285,25 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
                 tgt,
             )
             self.macq.set_field_transfer(gains, self._marker_kappa)
+            if self._relax_factored and self._factor_form == "tissue_map":
+                self._tissue_gains = gain_vector(gains, device=self.device)
+                expected_out = 1 + N_TISSUES
+                declared_out = int(self.config.model.out_channels)
+                if declared_out != expected_out:
+                    raise ValueError(
+                        f"factor_form='tissue_map' needs model.out_channels={expected_out} "
+                        f"(1 structure channel + {N_TISSUES} tissue-class logits), got "
+                        f"{declared_out}."
+                    )
             logger.info(
                 "[MultiAcq] relaxometric transfer %.3fT->%.3fT: kappa=%s "
-                "marker_kappa=%.4f factored=%s",
+                "marker_kappa=%.4f factored=%s factor_form=%s",
                 src.field_strength_t,
                 tgt.field_strength_t,
                 {k: round(v, 4) for k, v in gains.items()},
                 self._marker_kappa,
                 self._relax_factored,
+                self._factor_form,
             )
         self._last_kappa_measured: torch.Tensor | None = None
 
@@ -253,11 +311,12 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # by any backbone whose attention keys on the instrument.
         self._marker_channels = bool(getattr(cfg, "marker_channels", False))
         if self._method == "subvoxel_sr":
-            per_frame = 4 if self._marker_channels else 3
-            expected_in = cfg.n_frames * per_frame
+            expected_in = subvoxel_input_channels(cfg)
             declared_in = int(self.config.model.in_channels)
             if declared_in != expected_in:
                 extra = f" plus {cfg.n_frames} fiducial frames" if self._marker_channels else ""
+                if self._psf_enabled:
+                    extra += " plus 1 forward-PSF channel"
                 raise ValueError(
                     f"subvoxel_sr feeds the model {cfg.n_frames} frames plus "
                     f"{2 * cfg.n_frames} shift-conditioning maps{extra} = "
@@ -268,10 +327,15 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
                     "count."
                 )
             logger.info(
-                "[MultiAcq] subvoxel_sr shift_source=%s marker=%s in_channels=%d",
+                "[MultiAcq] subvoxel_sr shift_source=%s marker=%s in_channels=%d "
+                "marker_realisation=%s probe_target=%s input_stream=%s fov_mask=%s",
                 self._shift_source,
                 marker_enabled,
                 expected_in,
+                reg.marker_realisation,
+                self._probe_target,
+                self._input_stream,
+                self._fov_mask,
             )
         # Path A (oracle_bssfp): feed the dataset's real phase-cycled stack to the
         # model instead of synthesising one, grading vs the real b0_map.
@@ -443,8 +507,9 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
                     "stack. The fiducial is what carries the offsets; without it "
                     "there is nothing to register against."
                 )
-            hr_size = (h * self.macq.sr_scale, w * self.macq.sr_scale)
-            ref = self.macq.marker_reference(hr_size, stack.device, stack.dtype)
+            if res.marker_hr is None:
+                raise ValueError("the marker stack carries no marker_hr to register against")
+            ref = self.macq.pooled(res.marker_hr)
             # Absolute registration against the KNOWN un-shifted fiducial, not
             # frame-to-frame: that absolute anchor is what a fiducial buys.
             shifts = (
@@ -460,12 +525,14 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             self._last_shift_mae = true_shifts.abs().mean().detach()
 
         self._last_shifts = shifts
+        if self._psf_enabled:
+            self._last_psf_channel = self._psf_channel(res, shifts)
         if self._marker_channels:
             if res.marker_stack is None:
                 raise ValueError(
                     "marker_channels=True but the simulator produced no marker "
-                    "stack. Schema-guarded to shift_source='recovered', so this "
-                    "means the simulator was built without marker_enabled."
+                    "stack. marker_channels forces marker_enabled at setup, so "
+                    "this means the simulator was built some other way."
                 )
             # Anatomy frames first, then the instrument, then the shift maps.
             # `_append_shift_maps` puts the maps last, so a model can slice the
@@ -485,7 +552,14 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         n = shifts.shape[1]
         maps = (shifts / self._max_shift_px).clamp(-1.0, 1.0)
         maps = maps.reshape(b, 2 * n, 1, 1).expand(b, 2 * n, h, w)
-        return torch.cat((stack, maps), dim=1)
+        if not self._psf_enabled:
+            return torch.cat((stack, maps), dim=1)
+        if self._last_psf_channel is None:
+            raise RuntimeError(
+                "forward_psf is enabled but no PSF channel was resolved; "
+                "_condition_on_shifts must run before any model input is built."
+            )
+        return torch.cat((stack, maps, self._last_psf_channel), dim=1)
 
     def _calibrate_conformal(self, res: Any, pred_field: torch.Tensor) -> dict[str, float]:
         """Calibrate on the fiducial, then TEST the guarantee on the anatomy.
@@ -496,12 +570,15 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         used ONLY to check the assumption, never to calibrate. Calibrating on it
         would be assuming what the arm is meant to test.
         """
-        if self._conformal is None or res is None or res.marker_stack is None:
+        if (
+            self._conformal is None
+            or self._subject_bank is not None
+            or res is None
+            or res.marker_stack is None
+        ):
             return {}
         with torch.no_grad():
-            hr = (res.field.shape[-2], res.field.shape[-1])
-            marker_hr = self.macq.marker_hr(hr, pred_field.device, pred_field.dtype)
-            marker_hr = marker_hr.expand(pred_field.shape[0], 1, *hr)
+            marker_hr = res.marker_hr.to(pred_field.dtype)
             marker_pred = self.generator_model(
                 self._append_shift_maps(
                     (
@@ -527,14 +604,56 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         )
         return out
 
-    def _measure_psf(self, res: Any) -> dict[str, float]:
-        """Solve for the blur the acquisition applied, using the known marker.
+    def _estimate_lr_kernel(self, res: Any, shifts: torch.Tensor) -> torch.Tensor:
+        """Solve for the blur the acquisition applied, ``[B, 1, 1, k, k]``.
 
-        Reported on BOTH arms: the measurement is a property of the simulator,
-        not of the model, so the assumed arm has to carry the same number for
-        the comparison to have a shared reference. ``psf_identifiability`` rides
-        alongside because a kernel estimated where the marker has no spectral
-        energy is interpolation, and a FWHM quoted without it hides that.
+        BOTH sides at the POOLED resolution. Upsampling the observed frame back
+        to HR instead would fold the pooling and the interpolation into the
+        estimate (it read 18% low that way); here the pooling is common to both
+        sides and divides out, so what is left is the blur alone.
+        """
+        s_scale = self.macq.sr_scale
+        with torch.no_grad():
+            observed = res.marker_stack[:, :1]
+            known = self.macq.pooled(res.marker_hr).to(observed.dtype)
+            # The frame was dithered before pooling, so align first or the
+            # displacement is absorbed into the kernel as a shifted centroid.
+            known = fourier_shift(known, shifts[:, :1] / s_scale)
+            cfg = self._psf_cfg
+            return estimate_psf(
+                observed,
+                known,
+                kernel_size=cfg.kernel_size,
+                mu=cfg.mu,
+                control_grid=(cfg.control_rows, cfg.control_cols),
+            )
+
+    def _psf_channel(self, res: Any, shifts: torch.Tensor) -> torch.Tensor:
+        """The kernel ``forward_psf.source`` names, rendered as ``|OTF|`` ``[B,1,h,w]``."""
+        b, _n, h, w = res.stack.shape
+        if self._psf_cfg.source == "measured":
+            if res.marker_stack is None:
+                raise ValueError(
+                    "forward_psf.source='measured' but the simulator produced no "
+                    "marker stack to measure the kernel from."
+                )
+            return otf_channel(self._estimate_lr_kernel(res, shifts), (h, w)).detach()
+        # "assumed" (Literal-validated upstream): a constant, so rendered once per grid.
+        key = (h, w, res.stack.device, res.stack.dtype)
+        if self._assumed_otf_key != key:
+            kernel = self._assumed_lr_kernel.to(res.stack.device, res.stack.dtype)
+            self._assumed_otf = otf_channel(kernel, (h, w)).detach()
+            self._assumed_otf_key = key
+        return self._assumed_otf.expand(b, -1, -1, -1)
+
+    def _measure_psf(self, res: Any) -> dict[str, float]:
+        """Report the measured kernel against the assumed one, on both arms.
+
+        The measurement is a property of the simulator, not of the model, so
+        the assumed arm has to carry the same number for the comparison to have
+        a shared reference. ``psf_identifiability`` rides alongside because a
+        kernel estimated where the marker has no spectral energy is
+        interpolation, and a FWHM quoted without it hides that.
         """
         if not self._psf_enabled or res.marker_stack is None:
             self._last_psf = {}
@@ -543,36 +662,10 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         if shifts is None:
             self._last_psf = {}
             return {}
-        s_scale = self.macq.sr_scale
+        measured = self._estimate_lr_kernel(res, shifts)
         with torch.no_grad():
-            hr = (res.field.shape[-2], res.field.shape[-1])
-            # BOTH sides at the POOLED resolution. Upsampling the observed frame
-            # back to HR instead would fold the pooling and the interpolation
-            # into the estimate, and the kernel would no longer be the blur --
-            # it read 18% low that way. Here the pooling is common to both
-            # sides and divides out, so what is left is the blur alone.
-            observed = res.marker_stack[:, :1]
-            known = self.macq.marker_reference(hr, observed.device, observed.dtype).expand_as(
-                observed
-            )
-            # The frame was dithered before pooling, so align first or the
-            # displacement is absorbed into the kernel as a shifted centroid.
-            known = fourier_shift(known, shifts[:, :1] / s_scale)
-            cfg = self._psf_cfg
-            measured = estimate_psf(
-                observed,
-                known,
-                kernel_size=cfg.kernel_size,
-                mu=cfg.mu,
-                control_grid=(cfg.control_rows, cfg.control_cols),
-            )
-            # The assumed kernel is declared in HR pixels; the estimate lives
-            # on the pooled grid, so it is quoted at the same scale rather than
-            # comparing two numbers in different units.
-            assumed = gaussian_psf(cfg.kernel_size, max(cfg.sigma_px / s_scale, 1e-3)).to(
-                measured.device, measured.dtype
-            )
-            assumed = assumed.reshape(1, 1, 1, *assumed.shape)
+            known = self.macq.pooled(res.marker_hr).to(measured.dtype)
+            assumed = self._assumed_lr_kernel.to(measured.device, measured.dtype)
             out = {
                 "psf_fwhm_measured": float(psf_fwhm_map(measured).mean()),
                 "psf_fwhm_assumed": float(psf_fwhm_map(assumed).mean()),
@@ -600,9 +693,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             return
         with torch.no_grad():
             lr = res.marker_stack[:, :1]
-            ref = self.macq.marker_reference(
-                (res.field.shape[-2], res.field.shape[-1]), lr.device, lr.dtype
-            ).expand_as(lr)
+            ref = self.macq.pooled(res.marker_hr).to(lr.dtype)
             # Align before dividing. The marker frames are pooled views of a
             # SHIFTED marker, so an un-shifted reference biases the ratio by the
             # displacement itself: 6.3% at a 1.5 px dither, which would read as a
@@ -666,7 +757,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             # cross-keying itself -- state that when quoting it.
             probe_stack = torch.cat((marker_lr, marker_lr), dim=1)
         pred = self.generator_model(self._append_shift_maps(probe_stack, shifts))[:, :1]
-        target = self.macq.marker_hr(hr_size, pred.device, pred.dtype).expand(b, 1, *hr_size)
+        target = res.marker_hr.to(pred.dtype)
         if pred.shape[-2:] != target.shape[-2:]:
             raise ValueError(
                 f"band probe: model returned {tuple(pred.shape[-2:])} for a "
@@ -678,7 +769,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # its band components legitimately occupy the full field and excluding
         # the ringing would discard real information. A support weight becomes
         # meaningful only once the marker is embedded alongside anatomy.
-        rho = self._snf.transfer(pred, target)
+        rho = self._snf.transfer(pred, self._probe_loss_target(res, target))
         spectrum = self._snf.spectrum(pred, target)
         # The FLOOR: what a plain interpolator scores on the same instrument.
         # It is not zero, and it is arm-dependent. Boxcar pooling is not an
@@ -698,26 +789,103 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         sup = list(self._snf.super_nyquist_bands)
         return (1.0 - rho[:, sup]).mean()
 
+    def _probe_loss_target(self, res: Any, matched: torch.Tensor) -> torch.Tensor:
+        """The marker the instrument term is optimised against.
+
+        ``mismatched`` (the wrong-marker control) swaps in another realisation
+        of the same geometry, so the term keeps its magnitude and gradient path
+        and loses its information. The reported spectrum still scores ``matched``.
+        """
+        if self._probe_target != "mismatched":
+            return matched
+        b = matched.shape[0]
+        seeds = res.marker_seeds or (self._marker_seed,) * b
+        wrong = tuple(wrong_seed(s) for s in seeds)
+        return self.macq.marker_realisations(
+            wrong, tuple(matched.shape[-2:]), matched.device, matched.dtype
+        )
+
+    def _marker_seeds(self, family: str, epoch: int, b: int, batch_idx: Any = None):
+        """Per-sample realisation seeds, or ``None`` for the fixed fiducial."""
+        if not self._per_sample_marker:
+            return None
+        if family == "val":
+            if batch_idx is None:
+                raise ValueError(
+                    "marker_realisation='per_sample' keys validation markers on "
+                    "batch_idx; validation_step was called without it."
+                )
+            # A stride wider than any batch: a short last batch cannot collide.
+            ordinals = [int(batch_idx) * 65536 + i for i in range(b)]
+        else:
+            if epoch != self._marker_epoch:
+                self._marker_epoch, self._marker_ordinal = epoch, 0
+            ordinals = list(range(self._marker_ordinal, self._marker_ordinal + b))
+            self._marker_ordinal += b
+        return realisation_seeds(self._marker_seed, family, epoch, ordinals)
+
+    @property
+    def _needs_loaded_input(self) -> bool:
+        return self._input_stream == "acquired" or self._fov_mask != "none"
+
+    def _acquired_result(self, ulf: torch.Tensor, m0: torch.Tensor) -> AcquisitionResult:
+        """The REAL 64 mT slice as a one-frame, undithered acquisition (VFU-07)."""
+        if ulf.shape[-2:] != m0.shape[-2:]:
+            raise ValueError(
+                f"acquired input {tuple(ulf.shape[-2:])} and target {tuple(m0.shape[-2:])} "
+                "are not on one grid; the paired manifest resamples ULF onto the 3T grid."
+            )
+        return AcquisitionResult(
+            stack=self.macq.pooled(ulf), field=m0, shifts=m0.new_zeros(m0.shape[0], 1, 2)
+        )
+
     def _field_loss(
-        self, target_batch: torch.Tensor, external_field: torch.Tensor | None = None
+        self,
+        target_batch: torch.Tensor,
+        external_field: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        marker_seeds: tuple[int, ...] | None = None,
+        acquired_input: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         m0 = self._clean_magnitude(target_batch)
         self._last_anat = m0.detach()  # object support for display masking
-        res = self.macq(m0, external_field=external_field)
+        ulf = None
+        if self._needs_loaded_input:
+            if acquired_input is None:
+                raise ValueError(
+                    "input_stream='acquired' / fov_mask need the loaded 64 mT input, "
+                    "and none reached the loss."
+                )
+            ulf = self._clean_magnitude(acquired_input)
+        if self._input_stream == "acquired":
+            res = self._acquired_result(ulf, m0)
+        else:
+            res = self.macq(
+                m0, external_field=external_field, generator=generator, marker_seeds=marker_seeds
+            )
         model_input = self._condition_on_shifts(res)
         self._last_result = res
         pred = self.generator_model(model_input)
-        if self._relax_factored and self._marker_kappa is not None:
-            # y = kappa * g(x): the network is handed the contrast transfer and
-            # left the structural problem. The scalar is a CONSTANT, so this
-            # cannot absorb a learned intensity map -- an error shows up in g.
-            pred = pred * self._marker_kappa
-        self._measure_kappa(res)
         # The target may be a 1-channel field (B0/B1), 2-channel params (MRF
         # T1/T2), or a multi-channel image/series — supervise the matching head.
         k = res.field.shape[1]
-        pred_field = pred[:, :k]
-        mse = mse_loss(pred_field, res.field)
+        if self._tissue_gains is not None:
+            # y = kappa(x) * g(x), kappa(x) a posterior over the DECLARED gains.
+            logits = pred[:, k : k + N_TISSUES]
+            self._last_kappa_logits = logits.detach()
+            pred = pred[:, :k] * tissue_kappa_map(logits, self._tissue_gains)
+        elif self._relax_factored and self._marker_kappa is not None:
+            # y = kappa * g(x) with the fiducial's one constant: the scalar control.
+            pred = pred * self._marker_kappa
+        self._measure_kappa(res)
+        pred_field, field = pred[:, :k], res.field
+        if self._fov_mask == "acquired_support":
+            # Outside the ULF field of view the resample wrote zeros; the relative
+            # floor only absorbs FFT round-off on a k-space-stored input.
+            floor = 1e-6 * ulf.amax(dim=(-2, -1), keepdim=True)
+            support = (ulf > floor).to(pred_field.dtype)
+            pred_field, field = pred_field * support, field * support
+        mse = mse_loss(pred_field, field)
         loss = mse + self._lambda_smooth * self._spatial_smoothness(pred_field)
         # The TASK objective, before the probe term. Kept separate so a reader
         # can attribute a change in g_total_loss to the task or to the probe;
@@ -737,11 +905,11 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # a gain it earns is NOT the instrument's certificate. Nothing else in
         # this objective targets high frequency: the strategy never reads a
         # `losses:` block, so the base loss is MSE plus a smoothness penalty.
-        hf = self._anatomy_band_loss(pred_field, res.field)
+        hf = self._anatomy_band_loss(pred_field, field)
         self._last_hf_loss = None if hf is None else hf.detach()
         if hf is not None and self._lambda_anatomy > 0.0:
             loss = loss + self._lambda_anatomy * hf
-        return loss, pred_field, res.field
+        return loss, pred_field, field
 
     def _real_stack_loss(
         self, stack: torch.Tensor, external_field: torch.Tensor | None
@@ -787,10 +955,13 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         :meth:`_compute_losses`. (cluster smoke 2026-06-03: exp_vf_01 crashed at
         ``base.py`` 4-D unpack; arms 21-24/28 would raise ``[DomainMismatch]``.)
         """
-        if target_batch is None:
+        if target_batch is None or (self._needs_loaded_input and input_batch is None):
             _lr, hr = self._unpack_batch(batch)
             target_batch = pick_present(target_batch, hr)
+            input_batch = pick_present(input_batch, _lr)
         target_batch = self._to_device(target_batch)
+        if self._needs_loaded_input:
+            kwargs["acquired_input"] = self._to_device(input_batch)
         if not self.generator_model.training:
             self.generator_model.train()
 
@@ -824,10 +995,20 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # A REAL field (b0_map/b1_map) from the batch supervises the model against
         # a real off-resonance / B1 pattern instead of a random synthetic field.
         external_field = self._real_field_from_batch(kwargs.get("batch"))
+        if self._subject_bank is not None:
+            self._train_subjects.update(
+                self._batch_subjects(kwargs.get("batch"), int(target_batch.shape[0]))
+            )
         if self._use_real_stack:  # Path A: the model input IS the real stack
             loss, pred_field, field = self._real_stack_loss(input_batch, external_field)
         else:
-            loss, pred_field, field = self._field_loss(target_batch, external_field)
+            seeds = self._marker_seeds("train", epoch, int(target_batch.shape[0]))
+            loss, pred_field, field = self._field_loss(
+                target_batch,
+                external_field,
+                marker_seeds=seeds,
+                acquired_input=kwargs.get("acquired_input"),
+            )
         self._store_field_visuals(pred_field, field)
         out: dict[str, torch.Tensor] = {"g_total_loss": loss}
         if getattr(self, "_last_mse", None) is not None:
@@ -847,6 +1028,35 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             out["kappa_measured"] = self._last_kappa_measured
         return out
 
+    @staticmethod
+    def _batch_subjects(batch: Any, b: int) -> list[str]:
+        """Per-sample subject ids from a loaded batch; raises when absent."""
+        ids = batch.get("subject_id") if batch is not None and hasattr(batch, "get") else None
+        if ids is None:
+            raise ValueError(
+                "anchor_conformal.calibration_source='held_out_subjects' needs "
+                "subject_id on every batch, and this batch carries none."
+            )
+        ids = [ids] if isinstance(ids, str) else [str(i) for i in ids]
+        if len(ids) != b:
+            raise ValueError(f"{len(ids)} subject ids for a batch of {b}")
+        return ids
+
+    def reset_validation_metrics(self) -> None:
+        super().reset_validation_metrics()
+        if self._subject_bank is not None:
+            self._subject_bank.reset()
+
+    def finalize_validation(self) -> dict[str, float]:
+        out = dict(super().finalize_validation())
+        if self._subject_bank is not None and self._conformal is not None:
+            report = self._subject_bank.evaluate(
+                self._conformal, train_subjects=self._train_subjects
+            )
+            out.update({f"val_{k}": v for k, v in report.items()})
+            self._subject_bank.reset()
+        return out
+
     # ── validation ────────────────────────────────────────────────────────
     def validation_step(
         self,
@@ -854,6 +1064,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         target_batch: torch.Tensor,
         b0_map: torch.Tensor | None = None,
         b1_map: torch.Tensor | None = None,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         # A real reference field (gated trainer pass) grades the model against a
@@ -865,12 +1076,31 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             if self._use_real_stack:  # Path A: grade model(real stack) vs real b0
                 _loss, pred_field, field = self._real_stack_loss(input_batch, external_field)
             else:
-                _loss, pred_field, field = self._field_loss(target_batch, external_field)
+                gen = torch.Generator(device=target_batch.device).manual_seed(_VALIDATION_SEED)
+                seeds = self._marker_seeds(
+                    "val", 0, int(target_batch.shape[0]), kwargs.get("batch_idx")
+                )
+                _loss, pred_field, field = self._field_loss(
+                    target_batch,
+                    external_field,
+                    generator=gen,
+                    marker_seeds=seeds,
+                    acquired_input=(
+                        self._to_device(input_batch) if self._needs_loaded_input else None
+                    ),
+                )
             self._store_field_visuals(pred_field, field)
             bias = (pred_field - field).mean()
             mae = (pred_field - field).abs().mean()
-            rng = (field.amax() - field.amin()).clamp(min=1e-8)
-            psnr = 10.0 * torch.log10(rng**2 / (mse_loss(pred_field, field) + 1e-10))
+            # Per-sample data range: a batch-wide range would make the PSNR
+            # depend on which samples share a batch. B0 fields are in Hz, so a
+            # fixed unit range would be wrong for them.
+            flat_p, flat_f = pred_field.reshape(pred_field.shape[0], -1), field.reshape(
+                field.shape[0], -1
+            )
+            rng = (flat_f.amax(dim=1) - flat_f.amin(dim=1)).clamp(min=1e-8)
+            mse_s = ((flat_p - flat_f) ** 2).mean(dim=1)
+            psnr = (10.0 * torch.log10(rng**2 / (mse_s + 1e-10))).mean()
         result = {
             "val_field_mse": float(mse_loss(pred_field, field)),
             # SIGNED systematic offset -- a DIAGNOSTIC, never a selection target.
@@ -902,6 +1132,12 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             if self._last_result is not None
             else {}
         )
+        if self._subject_bank is not None:
+            self._subject_bank.add(
+                self._batch_subjects(batch_data, int(pred_field.shape[0])),
+                pred_field - field,
+                local_detail_score(field),
+            )
         # Coverage is GATED, not asserted: val_conformal_guaranteed is 0.0 when
         # any stratum missed its level, and that is a reportable result rather
         # than something to widen the tolerance until it disappears.
@@ -916,6 +1152,12 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # assumed, and a disagreement is visible instead of absorbed.
         if self._marker_kappa is not None:
             result["val_kappa_predicted"] = float(self._marker_kappa)
+        if self._last_kappa_logits is not None and self._last_result is not None:
+            # Report-only: the simulator's classes come from the HR target here.
+            classes = self.macq.tissue_classes(self._last_result.field)
+            result["val_kappa_class_agreement"] = float(
+                class_agreement(self._last_kappa_logits, classes)
+            )
         if self._last_kappa_measured is not None:
             result["val_kappa_measured"] = float(self._last_kappa_measured)
             if self._marker_kappa:

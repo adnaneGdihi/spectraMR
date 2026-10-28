@@ -149,6 +149,36 @@ def _build_dit(ctx: BackboneBuildContext) -> nn.Module:
     )
 
 
+def _line_backbone(cls: type, ctx: BackboneBuildContext) -> nn.Module:
+    return cls(
+        in_channels=ctx.in_channels,
+        out_channels=ctx.out_channels,
+        image_size=ctx.side,
+        dim=ctx.width,
+        depth=ctx.get("depth", 12),
+        heads=ctx.heads,
+        mlp_ratio=ctx.get("mlp_ratio", 4.0),
+        line_axis=ctx.get("line_axis", -1),
+        feature_domain=ctx.feature_domain,
+        max_timesteps=ctx.get("max_timesteps", None),
+        contrast_emb_dim=ctx.contrast_emb_dim,
+    )
+
+
+@register_backbone("kspace_ar")
+def _build_kspace_ar(ctx: BackboneBuildContext) -> nn.Module:
+    from spectramr.models.generators.kspace_ar_backbone import KSpaceARBackbone
+
+    return _line_backbone(KSpaceARBackbone, ctx)
+
+
+@register_backbone("kspace_masked")
+def _build_kspace_masked(ctx: BackboneBuildContext) -> nn.Module:
+    from spectramr.models.generators.kspace_masked_backbone import KSpaceMaskedBackbone
+
+    return _line_backbone(KSpaceMaskedBackbone, ctx)
+
+
 @register_backbone("uvit", "u_vit")
 def _build_uvit(ctx: BackboneBuildContext) -> nn.Module:
     from spectramr.models.generators.uvit_backbone import UViTBackbone
@@ -200,6 +230,35 @@ def _build_diffit(ctx: BackboneBuildContext) -> nn.Module:
         patch_size=ctx.get("patch_size", 8),
         mlp_ratio=ctx.get("mlp_ratio", 4.0),
         feature_domain=ctx.feature_domain,
+        max_timesteps=ctx.get("max_timesteps", None),
+        contrast_emb_dim=ctx.contrast_emb_dim,
+    )
+
+
+@register_backbone("reference_guided_unet")
+def _build_reference_guided_unet(ctx: BackboneBuildContext) -> nn.Module:
+    from spectramr.models.generators.reference_guided_unet import ReferenceGuidedUNet
+
+    # Source and target align pixel for pixel in image space only; fusing their
+    # k-space bins would pair frequencies, not anatomy.
+    if ctx.feature_domain != "image":
+        raise ValueError(
+            "backbone_type 'reference_guided_unet' fuses the reference in image space; "
+            "set model.model_kwargs.force_pure_kspace: false."
+        )
+    reference_channels = int(ctx.get("reference_channels", 0))
+    if reference_channels <= 0:
+        raise ValueError(
+            "backbone_type 'reference_guided_unet' needs model.model_kwargs.reference_channels "
+            "and data.pairing.source_layout: separate."
+        )
+    return ReferenceGuidedUNet(
+        in_channels=ctx.in_channels,
+        out_channels=ctx.out_channels,
+        reference_channels=reference_channels,
+        width=ctx.width,
+        levels=ctx.get("levels", 3),
+        heads=ctx.heads,
         max_timesteps=ctx.get("max_timesteps", None),
         contrast_emb_dim=ctx.contrast_emb_dim,
     )

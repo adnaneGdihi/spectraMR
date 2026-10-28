@@ -102,3 +102,37 @@ def test_negative_value_renders(tmp_path) -> None:
 def test_variable_panel_count(tmp_path, metrics) -> None:
     result = task_ablation_bars.make(_frame(), tmp_path / "m.pdf", metrics=metrics)
     assert result is not None and result.exists()
+
+
+def _captured_figure(monkeypatch, tmp_path, **kwargs):
+    """Run ``make`` and return the figure it would have saved."""
+    seen = {}
+
+    def _save(fig, out_dir, stem, *, formats, dpi):
+        seen["fig"] = fig
+        return {formats[0]: tmp_path / f"{stem}.{formats[0]}"}
+
+    monkeypatch.setattr(task_ablation_bars, "save_figure", _save)
+    task_ablation_bars.make(_frame(), tmp_path / "t.pdf", metrics=("ssim",), **kwargs)
+    return seen["fig"]
+
+
+def test_unconfirmed_arm_is_marked_and_excluded_arm_is_named(monkeypatch, tmp_path) -> None:
+    fig = _captured_figure(
+        monkeypatch,
+        tmp_path,
+        run_notes={"mrixfields_b2_full": "status unknown: no run_summary.json"},
+        excluded_runs={"mrixfields_b3_crashed": "crashed: RuntimeError"},
+    )
+    ticks = [t.get_text() for t in fig.axes[-1].get_xticklabels()]
+    assert ticks.count("full ‡") == 1, ticks
+    texts = " ".join(t.get_text() for t in fig.texts)
+    assert "‡ full: status unknown: no run_summary.json." in texts
+    assert "Not plotted: crashed (crashed: RuntimeError)." in texts
+
+
+def test_no_status_notes_leaves_labels_unmarked(monkeypatch, tmp_path) -> None:
+    fig = _captured_figure(monkeypatch, tmp_path)
+    ticks = [t.get_text() for t in fig.axes[-1].get_xticklabels()]
+    assert not any("‡" in t for t in ticks)
+    assert not any("Not plotted" in t.get_text() for t in fig.texts)

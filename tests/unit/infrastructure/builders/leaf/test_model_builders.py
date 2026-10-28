@@ -107,3 +107,75 @@ def test_in_and_out_channels_are_not_counted_as_declared(captured_call):
     builder.validate().build()
 
     assert "in_channels" not in captured_call["_declared_keys"]
+
+
+class TestWithCheckpointReadsTheRunStatePart:
+    """``with_checkpoint`` loads the named RunState part strictly into the built model."""
+
+    @staticmethod
+    def _factory(module):
+        factory = MagicMock()
+        factory.create_generator.return_value = module
+        factory.create_discriminator.return_value = module
+        return patch("spectramr.models.factories.model_factory.ModelFactory", return_value=factory)
+
+    @staticmethod
+    def _run_state(tmp_path):
+        import torch
+
+        from tests.fixtures.run_state_files import write_run_state
+
+        return write_run_state(
+            tmp_path / "best.pt",
+            {
+                "generator": {"weight": torch.full((2, 2), 3.0)},
+                "discriminator": {"weight": torch.full((1, 2), 7.0)},
+            },
+        )
+
+    def test_the_generator_part_loads(self, tmp_path):
+        import torch
+        from torch import nn
+
+        path = self._run_state(tmp_path)
+        with self._factory(nn.Linear(2, 2, bias=False)):
+            built = (
+                GeneratorBuilder(_config(), device="cpu")
+                .with_architecture("unet")
+                .with_input_channels(2)
+                .with_output_channels(2)
+                .with_checkpoint(str(path))
+                .build()
+            )
+        assert torch.equal(built.weight, torch.full((2, 2), 3.0))
+
+    def test_the_discriminator_part_loads(self, tmp_path):
+        import torch
+        from torch import nn
+
+        from spectramr.infrastructure.builders.leaf.model_builders import DiscriminatorBuilder
+
+        path = self._run_state(tmp_path)
+        with self._factory(nn.Linear(2, 1, bias=False)):
+            built = (
+                DiscriminatorBuilder(_config(), device="cpu")
+                .with_architecture("patch_gan_2d")
+                .with_input_channels(2)
+                .with_checkpoint(str(path))
+                .build()
+            )
+        assert torch.equal(built.weight, torch.full((1, 2), 7.0))
+
+    def test_a_mismatched_part_raises(self, tmp_path):
+        from torch import nn
+
+        path = self._run_state(tmp_path)
+        with self._factory(nn.Linear(3, 3, bias=False)), pytest.raises(RuntimeError):
+            (
+                GeneratorBuilder(_config(), device="cpu")
+                .with_architecture("unet")
+                .with_input_channels(2)
+                .with_output_channels(2)
+                .with_checkpoint(str(path))
+                .build()
+            )

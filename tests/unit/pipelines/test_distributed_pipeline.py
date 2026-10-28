@@ -30,6 +30,85 @@ class TestSetupDistributed:
             assert rank == 1
             assert world_size == 4
 
+    @patch("torch.distributed.init_process_group")
+    @patch("torch.cuda.set_device")
+    def test_a_hand_rolled_srun_rank_comes_from_slurm_procid(self, _mock_set, _mock_init):
+        """No RANK, a WORLD_SIZE and SLURM_PROCID: the global rank, not LOCAL_RANK."""
+        from spectramr.pipelines.distributed import setup_distributed
+
+        env = {"SLURM_PROCID": "5", "WORLD_SIZE": "8", "LOCAL_RANK": "1"}
+        with patch.dict("os.environ", env, clear=True):
+            rank, world_size = setup_distributed(backend="gloo")
+        assert (rank, world_size) == (5, 8)
+
+    @patch("torch.distributed.init_process_group")
+    def test_local_rank_alone_is_not_a_global_rank(self, _mock_init):
+        """Planted (#2701): a WORLD_SIZE and a LOCAL_RANK but no RANK or SLURM_PROCID would
+        have made every node's first process rank 0; it is now refused."""
+        from spectramr.pipelines.distributed import setup_distributed
+
+        with (
+            patch.dict("os.environ", {"WORLD_SIZE": "4", "LOCAL_RANK": "1"}, clear=True),
+            pytest.raises(RuntimeError, match="RANK"),
+        ):
+            setup_distributed(backend="gloo")
+
+    def test_local_rank_prefers_local_rank_then_slurm_localid_then_rank(self):
+        from spectramr.pipelines.distributed import _local_rank
+
+        with patch.dict("os.environ", {"LOCAL_RANK": "2", "SLURM_LOCALID": "1"}, clear=True):
+            assert _local_rank(9) == 2
+        with patch.dict("os.environ", {"SLURM_LOCALID": "1"}, clear=True):
+            assert _local_rank(9) == 1
+        with patch.dict("os.environ", {}, clear=True):
+            assert _local_rank(9) == 9
+
+    @patch("torch.distributed.init_process_group")
+    def test_slurm_procid_without_a_world_size_is_not_a_rank(self, _mock_init):
+        from spectramr.pipelines.distributed import setup_distributed
+
+        with (
+            patch.dict("os.environ", {"SLURM_PROCID": "3"}, clear=True),
+            pytest.raises(RuntimeError, match="WORLD_SIZE"),
+        ):
+            setup_distributed(backend="gloo")
+
+    @patch("torch.distributed.init_process_group")
+    @patch("torch.cuda.set_device")
+    def test_gloo_does_not_select_a_cuda_device(self, mock_set, _mock_init):
+        """``set_device`` raises on a CPU host, so a gloo group must not call it."""
+        from spectramr.pipelines.distributed import setup_distributed
+
+        env = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        with patch.dict("os.environ", env, clear=True):
+            setup_distributed(backend="gloo")
+        mock_set.assert_not_called()
+
+    @patch("torch.distributed.init_process_group")
+    @patch("torch.cuda.set_device")
+    def test_timeout_seconds_reaches_the_process_group(self, _mock_set, mock_init):
+        """A declared timeout must be what init_process_group receives."""
+        import datetime
+
+        from spectramr.pipelines.distributed import setup_distributed
+
+        env = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        with patch.dict("os.environ", env, clear=True):
+            setup_distributed(backend="gloo", timeout_seconds=90)
+
+        assert mock_init.call_args.kwargs["timeout"] == datetime.timedelta(seconds=90)
+
+    @patch("torch.distributed.init_process_group")
+    @patch("torch.cuda.set_device")
+    def test_no_timeout_leaves_torchs_default(self, _mock_set, mock_init):
+        from spectramr.pipelines.distributed import setup_distributed
+
+        env = {"RANK": "0", "WORLD_SIZE": "2", "LOCAL_RANK": "0"}
+        with patch.dict("os.environ", env, clear=True):
+            setup_distributed(backend="gloo")
+
+        assert "timeout" not in mock_init.call_args.kwargs
+
     @patch("torch.cuda.is_available", return_value=True)
     @patch("torch.distributed.init_process_group")
     @patch("torch.cuda.set_device")

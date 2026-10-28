@@ -1428,3 +1428,63 @@ class TestReturnSubspace:
         maps = rich.maps[0].permute(1, 2, 0).unsqueeze(-1)  # (H, W, C, 1)
         residual = (rich.null_projector[0] @ maps).squeeze(-1).abs().pow(2).sum(-1)
         assert residual[support[0]].max() < 1e-6
+
+
+def test_hankel_unfold_matches_patch_loop() -> None:
+    """The unfold used for the ESPIRiT calibration matrix equals the row/col patch loop."""
+    import torch
+
+    torch.manual_seed(0)
+    C, h, w, k = 4, 9, 11, 3
+    acs = torch.randn(C, h, w, dtype=torch.complex64)
+    loop = torch.stack(
+        [
+            acs[:, r : r + k, c : c + k].permute(1, 2, 0).reshape(-1)
+            for r in range(h - k + 1)
+            for c in range(w - k + 1)
+        ]
+    )
+    fast = acs.unfold(1, k, 1).unfold(2, k, 1).permute(1, 2, 3, 4, 0).reshape(-1, k * k * C)
+    assert torch.equal(fast, loop)
+
+
+@pytest.mark.parametrize(("h", "w", "k"), [(16, 16, 3), (15, 13, 3), (16, 16, 6), (15, 13, 6)])
+def test_shift_free_gram_matches_shifted_fft_pipeline(h: int, w: int, k: int) -> None:
+    """The wrapped kernel placement and the Gram-level roll equal ifftshift/fft2/fftshift."""
+    torch.manual_seed(0)
+    n_keep, C = 5, 4
+    kern = torch.randn(n_keep, C, k, k, dtype=torch.complex64)
+
+    padded = torch.zeros(n_keep, C, h, w, dtype=torch.complex64)
+    r0, c0 = h // 2 - k // 2, w // 2 - k // 2
+    padded[:, :, r0 : r0 + k, c0 : c0 + k] = kern
+    g_ref = torch.fft.fftshift(
+        torch.fft.fft2(torch.fft.ifftshift(padded, dim=(-2, -1)), dim=(-2, -1), norm="ortho"),
+        dim=(-2, -1),
+    )
+    pix_ref = g_ref.reshape(n_keep, C, h * w).permute(2, 1, 0).contiguous()
+    m_ref = pix_ref @ pix_ref.conj().transpose(-2, -1)
+
+    rows = (torch.arange(k) - k // 2) % h
+    cols = (torch.arange(k) - k // 2) % w
+    wrapped = torch.zeros(n_keep, C, h, w, dtype=torch.complex64)
+    wrapped[:, :, rows[:, None], cols[None, :]] = kern
+    pix = torch.fft.fft2(wrapped, dim=(-2, -1), norm="ortho").reshape(n_keep, C, h * w)
+    pix = pix.permute(2, 1, 0).contiguous()
+    m = (pix @ pix.conj().transpose(-2, -1)).reshape(h, w, C, C)
+    m = m.roll(shifts=(h // 2, w // 2), dims=(0, 1)).reshape(h * w, C, C)
+    assert torch.equal(m, m_ref)
+
+
+def test_coil_support_is_where_the_sense_combine_does_not_clamp() -> None:
+    """The support and the SENSE floor are one rule: a pixel below the floor is outside."""
+    from spectramr.infrastructure.physics.coil_sensitivity import coil_combine_sense, coil_support
+
+    maps = torch.ones(1, 2, 4, 4, dtype=torch.complex64) / math.sqrt(2.0)
+    maps[..., :, 0] = 0.0  # one column no coil sees
+    support = coil_support(maps)
+    assert support.shape == (1, 1, 4, 4) and support.dtype == torch.bool
+    assert not support[..., 0].any() and support[..., 1:].all()
+    image = torch.randn(1, 1, 4, 4, dtype=torch.complex64)
+    combined = coil_combine_sense(image * maps, maps)
+    torch.testing.assert_close(combined[support[:, 0:1]], image[support[:, 0:1]])

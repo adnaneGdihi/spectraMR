@@ -74,7 +74,7 @@ class ILoss(Protocol):
     Mathematical Formulation:
     .. math::
 
-        \\mathcal{L}_{ILoss} = \text{abstract}"""
+        \\mathcal{L}_{ILoss} = \\text{abstract}"""
 
     def forward(
         self,
@@ -193,6 +193,33 @@ class LossRegistry:
                     "Rename one of the two registrations."
                 )
 
+            # ``create`` consults the alias table before the canonical one, so a
+            # name that is both an alias and another loss's canonical key resolves
+            # to whichever registered first. Every name check runs before the first
+            # write, so a refused registration leaves no partial entry behind.
+            shadowed_by = cls._aliases.get(name)
+            if shadowed_by is not None and shadowed_by != name:
+                raise ValueError(
+                    f"Loss name '{name}' is already an alias of '{shadowed_by}'; "
+                    f"create('{name}') would resolve to '{shadowed_by}'. "
+                    "Rename the loss or drop the alias."
+                )
+            alias_keys = [alias.lower() for alias in aliases or []]
+            for alias_key in alias_keys:
+                if alias_key != name and alias_key in cls._custom_losses:
+                    raise ValueError(
+                        f"Loss alias '{alias_key}' for '{name}' is already the canonical "
+                        f"name of another loss; it would hijack create('{alias_key}'). "
+                        "Pick a different alias."
+                    )
+                existing_alias = cls._aliases.get(alias_key)
+                if existing_alias is not None and existing_alias != name:
+                    raise ValueError(
+                        f"Loss alias '{alias_key}' already maps to canonical "
+                        f"'{existing_alias}'; refusing to remap to '{name}'. "
+                        "Pick a different alias."
+                    )
+
             cls._custom_losses[name] = loss_cls
 
             # Phase 3: Store domain metadata if provided. Workflow tags
@@ -217,17 +244,8 @@ class LossRegistry:
             if capabilities is not None:
                 cls._loss_capabilities[name] = capabilities
 
-            if aliases:
-                for alias in aliases:
-                    alias_key = alias.lower()
-                    existing_alias = cls._aliases.get(alias_key)
-                    if existing_alias is not None and existing_alias != name:
-                        raise ValueError(
-                            f"Loss alias '{alias}' already maps to canonical "
-                            f"'{existing_alias}'; refusing to remap to '{name}'. "
-                            "Pick a different alias."
-                        )
-                    cls._aliases[alias_key] = name
+            for alias_key in alias_keys:
+                cls._aliases[alias_key] = name
 
             logger.debug(f"Registered custom loss: {name}")
             return loss_cls
@@ -274,7 +292,7 @@ class LossRegistry:
                 ) from e
 
         # If not found
-        available = sorted(list(cls._custom_losses.keys()))
+        available = sorted(cls._custom_losses)
         raise ValueError(
             f"Unknown loss: '{name}' (canonical: '{canonical}'). Available losses: {available}"
         )
@@ -282,7 +300,7 @@ class LossRegistry:
     @classmethod
     def list_available(cls) -> list[str]:
         """List all available loss names."""
-        return sorted(list(cls._custom_losses.keys()))
+        return sorted(cls._custom_losses)
 
     @classmethod
     def canonical_name(cls, name: str) -> str:
@@ -378,18 +396,16 @@ class LossRegistry:
 
     @classmethod
     def get_loss_info(cls, name: str) -> dict[str, Any]:
-        """Get metadata about a loss."""
-        # Use simple reflection for now
-        if name.lower() in cls._custom_losses:
-            loss_cls = cls._custom_losses[name.lower()]
-            return {
-                "name": name,
-                "description": loss_cls.__doc__ or "",
-                "aliases": cls.get_loss_aliases(name),
-                "type": "custom",
-            }
-        else:
+        """Get metadata about a loss, resolving aliases the way :meth:`create` does."""
+        loss_cls = cls.get_loss_class(name)
+        if loss_cls is None:
             raise KeyError(f"Unknown loss: {name}")
+        return {
+            "name": name,
+            "description": loss_cls.__doc__ or "",
+            "aliases": cls.get_loss_aliases(name),
+            "type": "custom",
+        }
 
 
 # Convenience functions
@@ -486,7 +502,7 @@ def create_loss(name: str, **kwargs: Any) -> nn.Module:
     return LossRegistry.create(name, **kwargs)
 
 
-def create_composite_loss(config: dict[str, dict]) -> nn.Module:
+def create_composite_loss(config: dict[str, dict[str, Any]]) -> nn.Module:
     """Create a weighted composite loss from config using Phase 5 infrastructure.
 
     Creates a ComposedLoss with full metrics support using the registry pattern.

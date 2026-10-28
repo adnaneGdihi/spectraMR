@@ -28,6 +28,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,10 +56,10 @@ def _soft_dice_per_class(p: torch.Tensor, t: torch.Tensor, smooth: float) -> tor
     correct on the *soft* outputs the anti-hallucination loss
     actually consumes.
     """
-    spatial_dims = list(range(2, p.dim()))
-    inter = (p * t).sum(dim=[0] + spatial_dims)
-    p_sq = (p * p).sum(dim=[0] + spatial_dims)
-    t_sq = (t * t).sum(dim=[0] + spatial_dims)
+    reduce_dims = [0, *range(2, p.dim())]
+    inter = (p * t).sum(dim=reduce_dims)
+    p_sq = (p * p).sum(dim=reduce_dims)
+    t_sq = (t * t).sum(dim=reduce_dims)
     return (2.0 * inter + smooth) / (p_sq + t_sq + smooth)
 
 
@@ -106,7 +108,7 @@ class SegmentationDiceLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         ctx = context or {}

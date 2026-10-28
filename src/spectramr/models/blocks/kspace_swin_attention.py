@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -70,6 +71,7 @@ class RadialWindowAttention(nn.Module):
         self.register_buffer("radial_indices", None, persistent=False)
         self.register_buffer("inverse_indices", None, persistent=False)
         self._cached_shape: tuple[int, int] = (0, 0)
+        self._pad_masks: dict[tuple[int, torch.device], Tensor] = {}
 
     def _compute_radial_indices(self, H: int, W: int, device: torch.device) -> None:
         """Compute sorting indices based on distance from k-space center."""
@@ -98,6 +100,18 @@ class RadialWindowAttention(nn.Module):
         self.radial_indices = sort_idx
         self.inverse_indices = inv_idx
         self._cached_shape = (H, W)
+
+    def _padding_mask(self, pad_len: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Additive ``(ws, ws)`` mask of the last window; padding attends to padding only."""
+        key = (pad_len, device)
+        mask = self._pad_masks.get(key)
+        if mask is None:
+            mask = torch.zeros(self.window_size, self.window_size, device=device)
+            mask[-pad_len:, :] = float("-inf")
+            mask[:, -pad_len:] = float("-inf")
+            mask[-pad_len:, -pad_len:] = 0.0
+            self._pad_masks[key] = mask
+        return mask.to(dtype)
 
     def forward(self, x: Tensor, H: int, W: int) -> Tensor:
         """Apply radial attention.
@@ -145,24 +159,31 @@ class RadialWindowAttention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, nW, nH, ws, d)
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
+        dropout_p = self.attn_drop.p if self.training else 0.0
 
-        # Mask padded elements (inf) if needed
+        def _sdpa(q_, k_, v_, mask=None):
+            # (B, nW, nH, ws, d) -> fold windows into batch for the fused kernel.
+            n = q_.shape[1]
+            q_, k_, v_ = (t.reshape(B * n, self.num_heads, self.window_size, -1) for t in (q_, k_, v_))
+            out = F.scaled_dot_product_attention(
+                q_, k_, v_, attn_mask=mask, dropout_p=dropout_p, scale=self.scale
+            )
+            return out.reshape(B, n, self.num_heads, self.window_size, -1)
+
         if pad_len > 0:
-            # We only mask the last window
-            mask = torch.zeros(1, 1, 1, self.window_size, self.window_size, device=x.device)
-            # The last `pad_len` elements in the highest frequency window are padding
-            mask[:, :, :, -pad_len:, :] = float("-inf")
-            mask[:, :, :, :, -pad_len:] = float("-inf")
-            mask[:, :, :, -pad_len:, -pad_len:] = 0.0  # padding attends to padding
-            # Apply only to last window
-            attn[:, -1:] = attn[:, -1:] + mask
+            # Only the last window holds padding: it attends with a mask, the rest do not.
+            out_last = _sdpa(
+                q[:, -1:], k[:, -1:], v[:, -1:], self._padding_mask(pad_len, x.device, q.dtype)
+            )
+            if num_windows > 1:
+                out_head = _sdpa(q[:, :-1], k[:, :-1], v[:, :-1])
+                attn_out = torch.cat([out_head, out_last], dim=1)
+            else:
+                attn_out = out_last
+        else:
+            attn_out = _sdpa(q, k, v)
 
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x_out = (attn @ v).transpose(2, 3).reshape(B, num_windows, self.window_size, C)
+        x_out = attn_out.transpose(2, 3).reshape(B, num_windows, self.window_size, C)
 
         # Merge windows
         x_out = x_out.view(B, L_padded, C)

@@ -11,6 +11,7 @@ giving sub-quadratic compute with attention-comparable performance.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -18,8 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@functools.lru_cache(maxsize=16)
 def _positional_encoding(L: int, d: int, device: torch.device) -> torch.Tensor:
-    """Sinusoidal time-positional encoding of length L, dim d."""
+    """Sinusoidal time-positional encoding of length L, dim d (cached per shape and device; read-only)."""
     pe = torch.zeros(L, d, device=device)
     pos = torch.arange(L, device=device).unsqueeze(1).float()
     div = torch.exp(torch.arange(0, d, 2, device=device).float() * (-math.log(10000.0) / d))

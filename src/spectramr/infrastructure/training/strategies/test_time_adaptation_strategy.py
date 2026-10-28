@@ -132,7 +132,8 @@ class TttAdaptationStrategy(BaseTrainingStrategy):
             env (Optional[TrainingEnvironment]): Description.
         """
         super().__init__(env=env, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     def _setup_strategy_specific_components(self) -> None:
         # Get TTT parameters from config

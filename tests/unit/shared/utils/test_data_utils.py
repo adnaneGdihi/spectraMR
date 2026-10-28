@@ -107,3 +107,24 @@ def test_extract_from_unsupported_type_raises() -> None:
         _extract_input_tensor("not a batch")
     with pytest.raises(ValueError, match="Unsupported batch type"):
         _extract_input_tensor(42)
+
+
+def test_dynamic_sample_batch_builds_a_non_persistent_loader(monkeypatch) -> None:
+    """The helper reads one batch and exits; a persistent pool would be leaked."""
+    import spectramr.infrastructure.builders.directors.data_pipeline_director as dpd
+    from spectramr.shared.utils import data_utils
+
+    seen = {}
+
+    class _Director:
+        def __init__(self, cfg):
+            pass
+
+        def build_dataloaders(self, **kwargs):
+            seen.update(kwargs)
+            return [{"input": torch.zeros(2, 1, 4, 4)}], None
+
+    monkeypatch.setattr(dpd, "DataPipelineDirector", _Director)
+    out = data_utils.get_sample_batch(object(), device=torch.device("cpu"))
+    assert out.shape[0] == 1
+    assert seen["persistent_workers"] is False

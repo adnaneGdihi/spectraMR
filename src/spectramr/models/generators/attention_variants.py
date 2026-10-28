@@ -177,9 +177,7 @@ class _LinformerAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         k = self.proj_k(k.transpose(-1, -2)).transpose(-1, -2)
         v = self.proj_v(v.transpose(-1, -2)).transpose(-1, -2)
-        attn = (q @ k.transpose(-1, -2)) * (self.head_dim**-0.5)
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, D)
         return self.out(out)
 
 

@@ -46,7 +46,7 @@ def get_sample_batch(
     try:
         director = DataPipelineDirector(config)
         # build_dataloaders returns tuple[DataLoader, DataLoader]
-        train_loader, _val_loader = director.build_dataloaders()
+        train_loader, _val_loader = director.build_dataloaders(persistent_workers=False)
 
         # Fetch first batch
         batch = next(iter(train_loader))

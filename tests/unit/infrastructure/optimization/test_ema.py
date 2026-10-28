@@ -377,7 +377,7 @@ def test_mixed_dtype_pair_falls_back_and_still_blends():
 # on 75 production arms. These tests plant that exact shape.
 #
 # Note what the pre-existing tests above could not catch: they call
-# ``ema.state_dict()`` directly, while the checkpoint director called
+# ``ema.state_dict()`` directly, while the pre-1.0 checkpoint writer called
 # ``unwrap_model(ema).state_dict()`` -- which peels ModelEma's own ``.module``
 # and so never runs the override. The tests and the production path were
 # exercising different code (non-negotiable 15).
@@ -510,7 +510,7 @@ def test_unwrapping_before_state_dict_drops_the_counter():
 
     ``unwrap_model`` peels ModelEma's ``.module``, so ``state_dict()`` runs on
     the inner module and the override that injects the counter never fires.
-    That is the shape the checkpoint director shipped: every resume restarted
+    That is the shape the pre-1.0 checkpoint writer shipped: every resume restarted
     the decay ramp at 0.
     """
     from spectramr.core.module_utils import unwrap_model

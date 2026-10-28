@@ -46,6 +46,10 @@ class SE3EquivariantNavigatorStrategy(BaseTrainingStrategy, ReconstructionMixin,
         _lambda_eq: weight on the equivariance-defect monitoring term.
     """
 
+    # parallel_compat: Calls generator.estimate_motion_latent outside the wrapped forward, so
+    # DDP/ZeRO reduce no gradient for it and FSDP reads a shard.
+    parallel_compat = frozenset()
+
     def __init__(
         self,
         env: Any,
@@ -53,7 +57,8 @@ class SE3EquivariantNavigatorStrategy(BaseTrainingStrategy, ReconstructionMixin,
         **kwargs: Any,
     ) -> None:
         super().__init__(env=env, device=device, **kwargs)
-        self._setup_strategy_specific_components()
+        # No second ``self._setup_strategy_specific_components()``: the base __init__
+        # already runs it, and it is not idempotent once it adds optimizer param groups.
 
     # ------------------------------------------------------------------
     def _setup_strategy_specific_components(self) -> None:

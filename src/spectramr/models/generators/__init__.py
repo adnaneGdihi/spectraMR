@@ -9,10 +9,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Diffusion Architectures
-from spectramr.models.diffusion.architectures.enhanced_deep_unet import (
-    EnhancedDeepDiffusionUNet,
-)
 from spectramr.models.reconstruction.unet import (
     EnhancedUNetGenerator,
     StandardUNetGenerator,
@@ -32,8 +28,6 @@ from .protocols import (
     ILatentGeneratorProtocol,
     IPhysicsGeneratorProtocol,
 )
-
-EnhancedDeepUNetGenerator = EnhancedDeepDiffusionUNet
 
 from ..gans.kan_gan import KANGenerator
 from ..gans.vit_kan_gan import ViTKANGenerator
@@ -125,6 +119,7 @@ PINNeRF = PINNNeRFGenerator
 # PMA-VarNet Blueprint Task 3b: K-space operators (fires @register_model decorators)
 # audit_plan_novel SFC §3: conformal multi-scale ULF→HF
 # (registers "conformal_geomamba_ulf")
+import spectramr.models.generators.b0_hypernetwork  # noqa: E402  # B0-conditioned generator
 import spectramr.models.generators.conformal_geomamba_ulf
 
 # audit_plan_novel_fmri — fMRI + MRF 2026 models
@@ -181,14 +176,14 @@ from .hdsf_mamba_generators import (
     HDSFHLDMamba,
     HDSFMambaUNet,
 )
+from .crm_mamba_generator import CRMMamba  # noqa: E402
+from .fe_mamba import FEMamba  # noqa: E402
+from .ct_mamba_generator import CTMamba  # noqa: E402
+from .hw_mamba import HWMamba  # noqa: E402
+from .inr_mamba import INRMamba  # noqa: E402
 from .hilbert_mamba_generators import (
-    CRMMamba,
-    CTMamba,
-    FEMamba,
     HilbertMambaUNet,
     HLDMamba,
-    HWMamba,
-    INRMamba,
     MDIMamba,
     MMMamba,
     TwoHalfDMamba,
@@ -197,9 +192,12 @@ from .hybrid_pinn import HybridQMapGenerator  # noqa: F401
 from .hyper_mamba_bridge import HyperMambaBridge, SSMParameters
 from .hyper_mamba_unet import HyperMambaUNet
 from .image_cold_diffusion_generator import ImageColdDiffusionGenerator
+from .image_fno_operator import ImageFNOOperator  # noqa: E402, F401
+from .windowed_sequence_denoiser import WindowedSequenceDenoiser  # noqa: E402, F401
 from .inr_cristal_generator import INRCRISTALGenerator
 from .isotonic_constrained import IsotonicConstrainedGenerator
 from .mamba_unet import MambaReconstruction, MambaUNet, MambaUNet_v2
+from .masked_contrast_unet import MaskedContrastUNet  # noqa: E402  (this block follows code)
 from .neural_advection_generator import NeuralAdvectionGenerator
 from .neural_cache import NeuralCacheGenerator
 
@@ -266,6 +264,7 @@ from .universal_multitask import (
     UniversalMultitaskGenerator,
 )
 from .unrolled_reconstruction_generator import UnrolledReconstructionGenerator
+from .unrolled_tissue_net import UnrolledTissueNet  # noqa: E402  (this block follows code)
 from .vae_3d_generator import VAE3DGenerator
 from .vae_generator import VAEGenerator
 from .vf_architectures import (
@@ -354,8 +353,6 @@ __all__ = [
     "create_standard_unet_generator",
     "create_enhanced_unet_generator",
     "create_configurable_unet_generator",
-    "EnhancedDeepDiffusionUNet",
-    "EnhancedDeepUNetGenerator",
     "AdversarialPurificationDiffusion",
     "AnisotropicVoxelGenerator",
     "ArtifactAwareAugmentation",
@@ -436,6 +433,8 @@ __all__ = [
     "DeepEnsembleGenerator",
     "UNet3DGenerator",
     "UNet2_5DGenerator",
+    "UnrolledTissueNet",
+    "MaskedContrastUNet",
     "AttentionUNetGenerator",
     "UNETRGenerator",
     "UnrolledReconstructionGenerator",

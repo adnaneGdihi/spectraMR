@@ -21,6 +21,7 @@ device-agnostic helpers are exercised on a bare ``__new__`` instance.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -130,6 +131,7 @@ def test_get_ph_loss_raises_when_topology_deps_missing(monkeypatch) -> None:
 
     s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
     s._ph_loss = None
+    s._topology_cfg = None
     with pytest.raises(RuntimeError, match="topology"):
         s._get_ph_loss()
 
@@ -143,11 +145,15 @@ def test_get_ph_loss_caches_constructed_module(monkeypatch) -> None:
     class _FakePH:
         def __init__(self, *a, **k):
             calls["n"] += 1
+            self.homology_dims = tuple(k.get("homology_dims", (0, 1)))
+            self.wasserstein_p = k.get("wasserstein_p", 2)
+            self.stratify_subvolumes = k.get("stratify_subvolumes", 1)
 
     monkeypatch.setattr(ph_mod, "CubicalPHWassersteinLoss", _FakePH)
 
     s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
     s._ph_loss = None
+    s._topology_cfg = None
     first = s._get_ph_loss()
     second = s._get_ph_loss()
     assert first is second
@@ -178,6 +184,7 @@ def _bare_for_setup(cfg):
     s.config = cfg
     s.env = SimpleNamespace(generator=_tiny_model())
     s._apply_metric_sfc_config = lambda *_a, **_k: None
+    s._ulf_unwarp = None
     s.logging_service = None
     return s
 
@@ -210,13 +217,14 @@ def test_a_weighted_beltrami_on_a_one_channel_output_raises() -> None:
     computed (the silent skip this replaces)."""
     s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
     s.env = SimpleNamespace(generator=lambda x, mask=None, contrast_id=None: x)
+    s._ulf_unwarp = None
     s._uncertainty_loss = None
     s._lambda_l1, s._lambda_ph_w2, s._lambda_beltrami = 10.0, 0.0, 0.05
     s._topology_warmup_epochs = 0
     s._ph_loss = None
     s._beltrami_loss = None
     x = torch.rand(1, 1, 8, 8)
-    with pytest.raises(ValueError, match="2-channel"):
+    with pytest.raises(ValueError, match="displacement_head"):
         GeoMambaULFStrategy._compute_losses_impl(s, x, x, epoch=0)
 
 
@@ -225,6 +233,7 @@ def test_an_unweighted_beltrami_on_a_one_channel_output_is_simply_absent() -> No
     trains on a 1-channel head."""
     s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
     s.env = SimpleNamespace(generator=lambda x, mask=None, contrast_id=None: x)
+    s._ulf_unwarp = None
     s._uncertainty_loss = None
     s._lambda_l1, s._lambda_ph_w2, s._lambda_beltrami = 10.0, 0.0, 0.0
     s._topology_warmup_epochs = 0
@@ -244,3 +253,191 @@ def test_loss_ownership_is_declared() -> None:
     assert GeoMambaULFStrategy.folds_image_losses is False
     assert not hasattr(GeoMambaULFStrategy, "_read_loss_weight")
     assert not hasattr(GeoMambaULFStrategy, "_search_loss_weight")
+
+
+def _schema_block(**metric_sfc):
+    from spectramr.config.schemas.training.geomamba_ulf import (
+        GeoMambaULFTrainingConfigSchema,
+    )
+
+    return GeoMambaULFTrainingConfigSchema(**({"metric_sfc": metric_sfc} if metric_sfc else {}))
+
+
+def test_a_declared_metric_sfc_on_a_model_without_one_raises() -> None:
+    """#1752: the block was accepted and silently dropped when the generator has
+    no ``sfc_beta``; an arm that writes it must be told nothing applies it."""
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s.env = SimpleNamespace(generator=torch.nn.Conv2d(1, 1, 1))
+    with pytest.raises(ValueError, match="no metric space-filling curve"):
+        s._apply_metric_sfc_config(_schema_block(beta=0.5))
+
+
+def test_the_default_filled_block_on_a_model_without_one_stays_silent() -> None:
+    """The schema fills ``metric_sfc`` by default, so an arm that never wrote it
+    must keep training on a model without a metric SFC."""
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s.env = SimpleNamespace(generator=torch.nn.Conv2d(1, 1, 1))
+    s._apply_metric_sfc_config(_schema_block())
+
+
+def test_get_ph_loss_builds_from_topology_config(monkeypatch) -> None:
+    """The declared topology knobs reach the loss, and the applied values are stamped."""
+    import spectramr.models.losses.cubical_ph_w2_loss as ph_mod
+    from spectramr.config.schemas.training.geomamba_ulf import TopologyConfig
+
+    seen: dict[str, Any] = {}
+
+    class _RecordingPH:
+        def __init__(self, homology_dims, wasserstein_p, stratify_subvolumes):
+            seen.update(
+                homology_dims=homology_dims,
+                wasserstein_p=wasserstein_p,
+                stratify_subvolumes=stratify_subvolumes,
+            )
+            self.homology_dims = tuple(homology_dims)
+            self.wasserstein_p = wasserstein_p
+            self.stratify_subvolumes = stratify_subvolumes
+
+    monkeypatch.setattr(ph_mod, "CubicalPHWassersteinLoss", _RecordingPH)
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s._ph_loss = None
+    s._topology_cfg = TopologyConfig(ph_dimensions=[0], wasserstein_p=1)
+    s._get_ph_loss()
+    assert seen == {"homology_dims": (0,), "wasserstein_p": 1, "stratify_subvolumes": 1}
+    stamped = s._topology_provenance["cubical_ph_w2"]
+    assert stamped["declared"]["wasserstein_p"] == 1
+    assert stamped["applied"]["homology_dims"] == [0]
+
+
+# ---------------------------------------------------------------------------
+# Physical unwarp: one helper for training and validation
+# ---------------------------------------------------------------------------
+
+
+def _unwarp_geo_cfg(declared: bool, **unwarp_kw):
+    from spectramr.config.schemas.training.geomamba_ulf import UnwarpConfig
+
+    unwarp_kw.setdefault("enable_grad_nonlinearity", False)
+    # An active EPI block must carry its shift parameter since ddcb9ab14.
+    unwarp_kw.setdefault("echo_spacing_s", 5e-4)
+    unwarp = UnwarpConfig(**unwarp_kw)
+    fields = {"unwarp"} if declared else set()
+    return SimpleNamespace(unwarp=unwarp, model_fields_set=fields)
+
+
+def test_undeclared_unwarp_block_builds_no_unwarp() -> None:
+    assert GeoMambaULFStrategy._build_ulf_unwarp(_unwarp_geo_cfg(False)) is None
+
+
+def test_declared_unwarp_block_with_b0_and_no_map_raises() -> None:
+    cfg = _unwarp_geo_cfg(True, enable_b0=True, enable_maxwell=False)
+    with pytest.raises(ValueError, match="b0_map_key"):
+        GeoMambaULFStrategy._build_ulf_unwarp(cfg)
+
+
+def test_prepare_input_is_the_same_transform_on_every_call() -> None:
+    """Train and validation both call _prepare_input, so one batch maps to one input."""
+    cfg = _unwarp_geo_cfg(
+        True,
+        enable_b0=False,
+        enable_maxwell=True,
+        echo_spacing_s=5.5e-4,
+        gradient_amplitudes_mt_per_m=[20.0, 20.0, 20.0],
+        field_strength_t=0.064,
+    )
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s._ulf_unwarp = GeoMambaULFStrategy._build_ulf_unwarp(cfg)
+    x = torch.linspace(0.0, 1.0, 4 * 8 * 8).reshape(1, 1, 4, 8, 8)
+    first = s._prepare_input(x, {})
+    second = s._prepare_input(x, {})
+    assert torch.equal(first, second)
+    assert not torch.allclose(first, x)
+
+
+def test_prepare_input_is_identity_without_unwarp() -> None:
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s._ulf_unwarp = None
+    x = torch.rand(1, 1, 4, 8, 8)
+    assert s._prepare_input(x, {}) is x
+
+
+# ---------------------------------------------------------------------------
+# Validation carries the batch's contrast and brain mask into the generator
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGenerator(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, x, mask=None, contrast_id=None):
+        self.calls.append({"mask": mask, "contrast_id": contrast_id})
+        return x
+
+
+def _validation_strategy(monkeypatch, n_contrasts: int):
+    gen = _RecordingGenerator()
+    s = GeoMambaULFStrategy.__new__(GeoMambaULFStrategy)
+    s.env = SimpleNamespace(generator=gen, device=torch.device("cpu"))
+    s.device = torch.device("cpu")
+    s._film_n_contrasts = n_contrasts
+    s._ulf_unwarp = None
+    stub = SimpleNamespace(get_metric_names=lambda: ["psnr"])
+    monkeypatch.setattr(
+        GeoMambaULFStrategy, "validation_metrics_computer", property(lambda _self: stub)
+    )
+    scored = []
+
+    def _score(self, output, target):
+        scored.append((output.shape, target.shape))
+        return {"psnr": 1.0}
+
+    monkeypatch.setattr(GeoMambaULFStrategy, "_score_validation_output", _score)
+    return s, gen, scored
+
+
+def test_validation_passes_the_batch_contrast_and_mask(monkeypatch) -> None:
+    s, gen, scored = _validation_strategy(monkeypatch, n_contrasts=3)
+    mask = torch.ones(1, 1, 4, 4)
+    metrics = s.validation_step(
+        torch.zeros(1, 1, 4, 4),
+        torch.zeros(1, 1, 4, 4),
+        batch_data={"contrast_idx": torch.tensor([2]), "foreground_mask": mask},
+    )
+    assert metrics == {"psnr": 1.0}
+    assert gen.calls[0]["contrast_id"].tolist() == [2]
+    assert torch.equal(gen.calls[0]["mask"], mask)
+    assert len(scored) == 1
+
+
+def test_validation_raises_without_a_contrast_key_when_film_is_multi_contrast(monkeypatch) -> None:
+    s, gen, _ = _validation_strategy(monkeypatch, n_contrasts=3)
+    with pytest.raises(ValueError, match="contrast_id/contrast_idx"):
+        s.validation_step(torch.zeros(1, 1, 4, 4), torch.zeros(1, 1, 4, 4), batch_data={})
+    assert gen.calls == []
+
+
+def test_validation_without_film_needs_no_contrast_key(monkeypatch) -> None:
+    s, gen, _ = _validation_strategy(monkeypatch, n_contrasts=1)
+    s.validation_step(torch.zeros(1, 1, 4, 4), torch.zeros(1, 1, 4, 4))
+    assert gen.calls[0]["contrast_id"] is None
+    assert gen.calls[0]["mask"] is None
+
+
+def test_validation_feeds_the_unwarped_input(monkeypatch) -> None:
+    s, _gen, _ = _validation_strategy(monkeypatch, n_contrasts=1)
+    seen = []
+    monkeypatch.setattr(
+        GeoMambaULFStrategy, "_prepare_input", lambda self, x, b: seen.append(x) or x + 1.0
+    )
+    s.validation_step(torch.zeros(1, 1, 4, 4), torch.zeros(1, 1, 4, 4), batch_data={})
+    assert len(seen) == 1
+
+
+def test_an_undeclared_unwarp_block_defaults_to_every_term_off() -> None:
+    """The schema default must construct: the all-on field defaults fail the shift check."""
+    from spectramr.config.schemas.training.geomamba_ulf import GeoMambaULFTrainingConfigSchema
+
+    unwarp = GeoMambaULFTrainingConfigSchema().unwarp
+    assert not (unwarp.enable_b0 or unwarp.enable_grad_nonlinearity or unwarp.enable_maxwell)

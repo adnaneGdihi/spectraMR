@@ -143,8 +143,8 @@ def test_numpy_state_survives_a_torch_save_round_trip(tmp_path):
 def test_restore_moves_a_device_resident_blob_back_to_cpu():
     """The GPU-only shape, reproduced without needing a working GPU.
 
-    ``CheckpointDirector.load_from`` loads with
-    ``map_location=pipeline.device``, so on the cluster every blob in the
+    A loader that maps with ``map_location=pipeline.device``, as the pre-1.0
+    one did, so on the cluster every blob in the
     envelope arrives on ``cuda:N`` -- and the generators reject a non-CPU
     tensor (``check_rng_state`` asserts ``device().type() == kCPU``). Unfixed,
     that turns every GPU resume into a failed load, which is worse than the

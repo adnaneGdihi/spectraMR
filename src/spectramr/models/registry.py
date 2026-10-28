@@ -17,6 +17,9 @@ from spectramr.config.schemas.enums import Regime, Task
 from spectramr.models.capabilities import Domain, ModelCapabilities
 
 MODEL_REGISTRY: dict[str, dict[str, Any]] = {}
+# Names registered with strict_kwargs=True. Kept beside the registry, not inside
+# its entries, which carry only the four documented keys.
+_STRICT_KWARG_MODELS: set[str] = set()
 
 
 def register_model(
@@ -51,6 +54,7 @@ def register_model(
     override: bool = False,
     workflows: "frozenset[Regime] | None" = None,
     tasks: "frozenset[Task] | None" = None,
+    strict_kwargs: bool = False,
 ):
     """Decorator to register a model class.
 
@@ -130,6 +134,10 @@ def register_model(
             silently clobber a decorator's full ``ModelCapabilities`` (the
             bloch_mamba_v2 scar) — which would disable the audit's
             compatibility checks for that model without any diagnostic.
+        strict_kwargs: True when the constructor has no ``**kwargs``. A
+            ``model_kwargs`` key the constructor does not accept then RAISES
+            at build time instead of being dropped (the swallow that made
+            ``base_channels``/``depth`` inert in the hilbert_mamba baseline).
     """
 
     capabilities = ModelCapabilities(
@@ -248,6 +256,10 @@ def register_model(
             "role": role,
             "capabilities": capabilities,
         }
+        if strict_kwargs:
+            _STRICT_KWARG_MODELS.add(name)
+        else:
+            _STRICT_KWARG_MODELS.discard(name)
         return cls
 
     return decorator
@@ -303,6 +315,14 @@ REJECTED_NAMES: dict[str, str] = {
     "trellis_image_large": "speculative TRELLIS variant; no formulation",
     "trellis_volume": "speculative TRELLIS variant; no formulation",
 }
+
+
+def is_strict_kwargs(name: str) -> bool:
+    """Return True if the registered model raises on unread ``model_kwargs``.
+
+    Unregistered names return False; the factory reports those itself.
+    """
+    return name in _STRICT_KWARG_MODELS
 
 
 def get_model_class(name: str) -> type[Any]:

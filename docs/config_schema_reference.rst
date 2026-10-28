@@ -109,6 +109,23 @@ Top-Level Structure
 
    Default ``false``, so every existing run is byte-identical until it opts in.
 
+   **ACS floor and per-sample masks on the fixed-ranking point families.**
+   ``random_cartesian`` and ``variable_density`` (with
+   ``fractional_variable_density``) rank k-space once and take the top-K at each
+   rung. Both place a centred disc of ``min_center_fraction`` of k-space
+   (``center_fraction`` when no floor is declared) at the head of that ranking,
+   so the disc is fully sampled at every rung whose budget covers it, and both
+   raise at construction on a declared ``min_center_fraction`` above
+   ``1 / max_acceleration``. ``mask_seed`` is part of the cached ranking on
+   these families and on ``nested`` and ``density_nested``, so
+   ``enable_dynamic_mask: true`` redraws per sample; on ``variable_density`` the
+   seed only breaks ties within an equal-radius shell, so per-sample masks differ
+   by a few boundary bins, and ``density_nested`` is the family whose draw is
+   genuinely random. The two pattern families also differ in kind:
+   ``random_cartesian`` has a flat periphery and ``variable_density`` a radially
+   decaying one, and both select individual ``(k_y, k_x)`` bins, so neither
+   samples whole phase-encode lines the way ``equispaced`` does.
+
 .. note::
 
    **Default hygiene: a disabled block must not carry sub-flags that default ON.**
@@ -208,6 +225,7 @@ what representation comes out.*
        patch_size: [320, 320, 1]
        samples_per_volume: 8
        queue_length: 200
+       subject_prefetch: auto    # subjects each queue worker loads ahead; or an int >= 1
        enable_slab_mode: false
        enable_slice_2d: false
        num_synthetic_samples: 10
@@ -215,7 +233,8 @@ what representation comes out.*
      loader:                     # how they reach the GPU
        batch_size: 4
        num_workers: 4
-       persistent_workers: false
+       persistent_workers: true  # default; forced off for 0-worker and single-pass loaders
+       reserved_cores: 2         # worker ceiling = max(1, cpus_per_rank - reserved_cores)
        prefetch_factor: 2
        pin_memory: true
 
@@ -223,6 +242,7 @@ what representation comes out.*
        enable_kspace_normalization: false
        kspace_percentile: 0.99   # a FRACTION, not a percent
        kspace_scale_domain: kspace
+       kspace_scale_reference: target   # or input: measure the scale on what deployment sees
        enable_log_scaling: false
        log_scaling_center_fraction: 0.25
        normalization_type: none
@@ -256,6 +276,16 @@ what representation comes out.*
        conformal_jacobian: false
        cortex_flatten_grid: false
        glm_design_matrix: false
+
+``sampling.subject_prefetch`` is the ``prefetch_factor`` of the loader that feeds
+subjects to the training ``tio.Queue``. A refill needs
+``ceil(queue_length / samples_per_volume)`` subjects, and torch's default of 2 per
+worker leaves most of them to load while the GPU waits (#2673). ``auto`` sizes it
+to one refill, ``ceil(ceil(queue_length / samples_per_volume) / num_workers)``,
+never below 2. The value changes how many subjects are in flight, not which are
+drawn or their order. It costs host RAM of ``(prefetch - 2) x num_workers`` whole
+subjects over the old default. The resolved value is logged at build as
+``[QUEUE] Train queue subject prefetch: declared=..., resolved=...``.
 
 Naming inside ``pairing:`` is deliberately un-prefixed.  ``contrasts`` is **not**
 renamed to ``input_contrasts``, because singular-vs-plural would be the only
@@ -471,9 +501,17 @@ Five named sub-blocks, plus the scheduler keys that are still flat:
 .. admonition:: A declared scheduler family is honoured with or without a dict
    :class: note
 
-   ``optimization.lr_scheduler_strategy: cosine`` resolves on its own, with the
-   period defaulting to ``training.max_iterations``. A ``scheduler:`` dict is
-   only needed to *parameterise* the family.
+   ``optimization.lr_scheduler_strategy: cosine`` resolves on its own. Its
+   period defaults to the number of steps the main scheduler takes in the run:
+   ``training.max_iterations // gradient.accumulation_steps`` optimizer steps,
+   less ``warmup_steps``. An epoch-bounded run (``max_iterations: -1``) must
+   declare ``T_max``. A ``scheduler:`` dict is only needed to *parameterise*
+   the family.
+
+   The cosine is ``MonotoneCosineLR``: closed form in the step count, held at
+   ``eta_min`` past ``T_max``, and on resume it keeps the configured ``T_max``
+   and ``eta_min`` rather than the checkpoint's, so a run resumed under a longer
+   budget continues its decay instead of restarting it.
 
    The field carries ``default="cosine"``, so every resolved config presents a
    family name. Only a name you actually declared is honoured — declare neither
@@ -711,12 +749,6 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
        ``enabled`` and ``method``. Needs the ``mask`` dataset of an HDF5 input
        and a k-space input route; raises when either is missing. See
        :doc:`running_pipelines`.
-   * - ``data_consistency.acs_mask_center_fraction``
-     - ``0.08``
-     - ACS center fraction
-   * - ``data_consistency.enable_acs_replacement``
-     - ``true``
-     - Hard-replace ACS lines at validation
    * - ``kspace.enforce_hermitian_symmetry``
      - ``true``
      - Conjugate symmetry for real output
@@ -765,33 +797,44 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    * - ``enabled``
      - ``true``
      - Enable checkpoint saving
-   * - ``checkpoint_dir``
-     - ``"./checkpoints"``
-     - Save directory
    * - ``save_interval``
      - ``1000``
      - Save every N steps
    * - ``keep_last_n``
      - ``5``
-     - Retain last N checkpoints
-   * - ``keep_best_n``
-     - ``3``
-     - Retain best N by metric
+     - After every step save, keep the N highest-step checkpoints
+       (``step_NNNNNNNN.<format>``, every format of a step counted once) in
+       ``<training.output_dir>/checkpoints`` and delete the older ones. ``best.<format>``
+       and any other file are never touched, and neither are steps above the save that
+       triggered the sweep. Must be ``>= 1``. Under DeepSpeed each pruned step's ZeRO tag
+       directory (``checkpoints/deepspeed/<model>/step_NNNNNNNN``) is deleted with it; the
+       ``best`` tag, the tag DeepSpeed's ``latest`` file names, and any directory not
+       spelled like a step tag are kept. If the tag just written is not visible from rank
+       0 (node-local storage), nothing is deleted and a warning is logged.
    * - ``best_metric_name``
      - ``"val_psnr"``
      - Metric for best-checkpoint selection
    * - ``best_metric_mode``
      - ``"max"``
      - ``max`` (PSNR/SSIM) or ``min`` (LPIPS/MSE)
-   * - ``pretrained_path``
-     - ``null``
-     - Load weights at start
-   * - ``resume_training``
-     - ``false``
-     - Resume iteration counter
+   * - ``load_optimizer_state``
+     - ``true``
+     - On resume, restore the optimizers (including each multi-stage
+       ``stage:<name>`` optimizer and the DeepSpeed engine's own). ``false`` restarts
+       them from the configured values.
+   * - ``load_scheduler_state``
+     - ``true``
+     - On resume, restore the LR schedulers
    * - ``format``
      - ``"safetensors"``
-     - ``safetensors`` (preferred) or ``pth``
+     - File format of every checkpoint the run writes: ``safetensors`` (no pickle),
+       ``pt`` or ``pth`` (the same ``torch.save`` container). A resume reads each file in
+       whatever format it has. See :doc:`checkpointing`.
+   * - ``async_write``
+     - ``false``
+     - Write checkpoint files and apply ``keep_last_n`` on a background thread; the
+       state is copied to CPU on the training thread first. A failed write still stops
+       the run, at the next save or at the end of training. See :doc:`checkpointing`.
    * - ``produced_by_arm``
      - ``null``
      - Name of the upstream campaign arm that builds this arm's declared
@@ -810,9 +853,11 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
    **The whole** ``checkpoint:`` **block is optional.** A config that omits it
    receives a default ``CheckpointConfigSchema`` (every sub-field above is
    defaulted), so :func:`spectramr.bootstrap.build_container` builds a working
-   checkpoint service rather than aborting.
-   Declare the block only to override the defaults (e.g. a per-arm
-   ``checkpoint_dir`` or ``best_metric_name``).
+   checkpoint store rather than aborting.
+   Declare the block only to override the defaults (e.g. ``save_interval``).
+   Checkpoints are always written to ``<training.output_dir>/checkpoints``; the
+   retired ``checkpoint_dir`` and its ``save_dir`` alias are refused at load
+   (#2842).
 
 
 ---
@@ -848,6 +893,9 @@ diffusion-only ``sampling``. Every value below is the live schema default.
        primary: psnr                     # early stopping / model selection
        domain: null                      # 'image' | 'kspace' | null to auto-detect
        output_transform: null            # 'ifft_magnitude' | 'ifft_mag_combine' | 'fft'
+       coil_manifold_projection: false   # project a k-space output onto s s^H before scoring; needs coil maps
+       measurement_maps: off             # 'off' | 'metrics': kspace_cold_diffusion only; adds val_<m>_measmaps scored with maps from the masked measurement
+       recorrupted_inference: null       # R2R arms only: {samples: J, alpha | angle_deg}; score the mean over J recorruptions
        enable_image_metrics: true
 
      visualization:
@@ -894,7 +942,7 @@ runtime; ``spectramr audit`` warns before the launch.
    sibling intervals (``logging.intervals.log`` and
    ``metrics.train_metric_interval``), it has **no** unconditional
    first/last-iteration force, so an interval above the budget produces *zero*
-   validation events: early stopping never evaluates, no ``checkpoint_best.pt``
+   validation events: early stopping never evaluates, no best checkpoint
    is written, and the run still exits reporting success.
    ``_execute_training_loop`` therefore rejects that combination at startup with
    a ``ConfigurationError``, unless ``on_epoch`` supplies events instead.
@@ -936,9 +984,10 @@ runtime; ``spectramr audit`` warns before the launch.
 ``logging:`` — LoggingConfigSchema
 ====================================
 
-Seven sub-blocks: *what the run is called* (``identity``), *where lines go*
-(``sinks``), *how often* (``intervals``), plus ``images``, ``tracking``,
-``snapshots`` and ``report_cases``. Every value below is the live schema default.
+Nine sub-blocks: *what the run is called* (``identity``), *where lines go*
+(``sinks``), *how often* (``intervals``), *which ranks write* (``distributed``),
+*how progress shows* (``progress``), plus ``images``, ``tracking``, ``snapshots``
+and ``report_cases``. Every value below is the live schema default.
 
 .. code-block:: yaml
 
@@ -953,8 +1002,18 @@ Seven sub-blocks: *what the run is called* (``identity``), *where lines go*
        level: info                     # debug | info | warning | error | critical
        silent: false
        to_console: true
+       console_stream: split           # split | stdout | stderr  (split: INFO to stdout, WARNING+ to stderr)
        to_file: true
        dir: ./logs
+
+     distributed:                      # what the ranks of a torchrun launch write
+       console_ranks: rank0            # rank0 | all
+       secondary_level: error          # floor on ranks != 0 when console_ranks is rank0
+       file_ranks: rank0               # rank0 | all (all: <name>.rank<N>.log per rank)
+
+     progress:                         # a bar on a TTY, one tracking line per N iterations in the log
+       mode: auto                      # auto | bar | lines | off
+       log_every_n_iterations: 1500
 
      intervals:                        # every-N-steps cadences
        log: 100

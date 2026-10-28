@@ -25,7 +25,7 @@ References:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -119,6 +119,11 @@ class RiemannianDFCDiffusionStrategy(BaseTrainingStrategy):
     chart-space target tangent.
     """
 
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
+
     # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
     # tensor, not the prepared input; declared here and emitted under the tag.
     snapshot_prepared_is_model_input: bool = False
@@ -164,7 +169,7 @@ class RiemannianDFCDiffusionStrategy(BaseTrainingStrategy):
         # ``cayley_transform(C_noisy)`` whose result never entered the score or
         # loss — flipping it changed nothing, pitfall #15.)
         # Generator returns a symmetric tangent score.
-        self._declare_model_input({"C_noisy": C_noisy, "sigma": sigma})
+        self._declare_model_input({"C_noisy": C_noisy, "sigma": sigma}, extra={"model_input_key": "C_noisy"})
         score = self.generator_model(C_noisy, sigma)
         target_score = -noise / sigma.view(-1, 1, 1).clamp_min(1e-6)
         loss = F.mse_loss(score, target_score)
@@ -176,6 +181,11 @@ class RiemannianDFCDiffusionStrategy(BaseTrainingStrategy):
 
 class HRFManifoldDiffusionStrategy(BaseTrainingStrategy):
     """1-D diffusion over the HRF function manifold."""
+
+    # Computes its own objective and reads no `losses:` block, so an empty builder stack
+    # is the design (LossBuilder.validate) and any declared image loss is a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
 
     # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
     # tensor, not the prepared input; declared here and emitted under the tag.
@@ -212,7 +222,7 @@ class HRFManifoldDiffusionStrategy(BaseTrainingStrategy):
         sigma = (log_lo + torch.rand(b, device=device) * (log_hi - log_lo)).exp()
         noise = torch.randn_like(target_batch)
         h_noisy = target_batch + sigma.view(-1, 1) * noise
-        self._declare_model_input({"h_noisy": h_noisy, "sigma": sigma})
+        self._declare_model_input({"h_noisy": h_noisy, "sigma": sigma}, extra={"model_input_key": "h_noisy"})
         score = self.generator_model(h_noisy, sigma)
         if score.dim() == 3:
             score = score.squeeze(1)

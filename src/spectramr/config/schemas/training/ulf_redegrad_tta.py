@@ -32,8 +32,3 @@ class UlfReDegradationTTAConfig(StrictSchema):
         ge=0.0,
         description="Weight of the re-degradation-consistency loss in the inner loop.",
     )
-    blur_cutoff: float = Field(
-        default=0.5,
-        gt=0.0,
-        description="Cutoff of the ULF low-pass re-degradation operator A=ulf_degrade.",
-    )

@@ -55,8 +55,8 @@ Run dry-run to validate before training:
 ``out_channels`` than the current config.
 
 **Fix**: Either match config to checkpoint architecture or use
-``load_optimizer_state: false`` + ``resume_training: false`` and
-fine-tune from scratch with the new channel count.
+``load_optimizer_state: false`` and warm-start the compatible weights with
+``model.checkpoint_path`` (do not pass ``--resume``).
 
 
 Config / Schema Errors
@@ -317,18 +317,21 @@ sequence (``N = H*W``). On a 256² map that is tens of GiB.
 ``_COMPLEX_MHA_QUERY_CHUNK`` (default 2048): softmax / top-k act per query on
 the key dimension, so the chunked result is *numerically identical* to the
 dense one, while peak attention memory drops from ``O(N²)`` to ``O(chunk·N)``.
-This mirrors the ``max_band_tokens`` cap on ``RadialBandAttention`` and
-``MultiScaleFreqBandAttention``. There is no YAML knob — the chunk size is an
-internal memory optimisation.
+Above ``max_band_tokens`` a radial band attends a fixed, seeded subsample that
+covers every row of the band and keeps conjugate pairs together, and its other
+bins receive the band mean of the attended outputs; above ``max_tokens`` a
+``MultiScaleFreqBandAttention`` band switches to the O(N) linear form
+(``ComplexMHA.forward_linear``) instead of pooling. There is no YAML knob for
+the chunk size -- it is an internal memory optimisation.
 
 ``max_dense_attn_tokens`` is the supported config lever for the score-tensor
-peak. When the feature-map sequence ``N = H*W`` exceeds it, the dense
-image/cross branches adaptive-pool to a ``round(sqrt(budget))²`` grid before
-attending, attend there, then interpolate back; the **output k-space stays full
-256²** regardless, so this coarsens only the *global attention mixing*, not the
-data or the reconstruction target. Because the budget sets the pooled attention
-resolution, keep it uniform across any set of arms you intend to compare, or a
-memory-vs-quality difference confounds the comparison.
+peak, and since the image branch became full-resolution linear attention it
+bounds only the cross branch: when ``N = H*W`` exceeds it, the cross branch
+attends the centre ``round(sqrt(budget))^2`` crop of k-space (queries keep
+their frequency location) against image-domain keys/values average-pooled to
+the same grid, and writes its update into the cropped bins only. The budget
+therefore sets which frequencies the cross branch can reach, so keep it
+uniform across any set of arms you intend to compare.
 
 If that is not enough headroom, gradient checkpointing
 (``optimization.gradient.enable_checkpointing: true``) and a larger GPU are the
@@ -384,11 +387,50 @@ Distributed (DDP) validation metrics are summed across ranks
 Under DDP the validation loader is wrapped in a ``DistributedSampler``
 (:func:`spectramr.pipelines.parallel._apply_distributed_samplers`) which *shards
 and pads* the val set, so each rank validates only ``~1/world_size`` of it.
-:func:`spectramr.pipelines.train._all_reduce_val_metrics` all-reduce-sums both
-the per-metric running-sums and the sample count before dividing, giving the
-correct sample-weighted global mean rather than one padded shard's value. It is
+:func:`spectramr.pipelines.train._all_reduce_val_metrics` all-reduce-sums the
+per-metric running-sums, the per-metric finite-sample counts and the sample
+count as one vector before dividing, giving the correct sample-weighted global
+mean rather than one padded shard's value. The ranks first agree on the union of
+their metric keys, so a rank whose batches all raised, or one that emitted a
+different key set, still joins the same collective instead of hanging it. It is
 a **no-op** when ``torch.distributed`` is not initialised (the default
 single-process ``spectramr train`` path), so single-GPU runs are unaffected.
+
+
+A validation column is averaged over its finite values only
+===========================================================
+
+Each validation metric is divided by its own count of finite samples. A NaN or
+Inf slice is left out of that column's mean instead of turning the column NaN
+for the whole pass, and a key that only some batches emit is averaged over those
+batches. The raw per-slice value, NaN included, stays in the per-batch rows
+(``validation.per_batch_rows``). Each pass logs the per-metric skip counts once,
+and the validation CSV carries two coverage columns:
+
+- ``val_samples_skipped_max``: the largest number of samples any metric left out.
+- ``val_monitor_samples_skipped``: the samples the ``early_stopping.metric``
+  column left out, present when early stopping is enabled and its metric resolves.
+
+When the early-stopping metric has no finite value in a pass, the pass logs a
+warning naming it, even if other columns such as ``psnr`` are finite. The
+training loop raises once the monitor stays non-finite for ``patience``
+validation events.
+
+
+Volumes of unequal depth are validated one at a time
+====================================================
+
+A whole-volume validation loader batches volumes that need not share a slice
+count (fastMRI knee volumes do not). The image collate zero-pads them to the
+longest and records the padding under ``<key>_padding``. Folding depth into rows
+would then score the padding as slices of exact zeros; the cold-diffusion
+reverse sampler refuses such a row with ``NoiseAdaptiveDataConsistency:
+sample(s) [0] have no measured k-space bin``. ``_run_validation`` therefore
+splits a padded batch into one batch per volume, each cut back to its own extent
+(:func:`spectramr.data.collation.unpad.split_padded_batches`), before the depth
+flatten and before ``validation.per_batch_rows`` cuts slices. The
+``validation.loader.num_batches`` cap still counts loader batches. Batches the
+collate did not pad, such as M4Raw's equal-depth volumes, pass through unchanged.
 
 
 Mixed precision: ``precision.dtype`` selects the autocast dtype
@@ -624,13 +666,13 @@ key. Convert:
 ------------------------------------------
 
 If resuming after changing ``max_iterations``, the step counter may
-be ahead of the new value. Fix:
+be ahead of the new value. Fix: do not resume (``--resume`` restores the step counter); warm-start instead:
 
 .. code-block:: yaml
 
+   model:
+     checkpoint_path: checkpoints/last.safetensors   # warm-start: weights only, step counter restarts
    checkpoint:
-     resume_training: false    # Don't restore step counter
-     pretrained_path: checkpoints/last.safetensors
      load_optimizer_state: true
 
 
@@ -1010,6 +1052,33 @@ come from applying non-symmetric augmentations in k-space. Use:
 .. code-block:: python
 
    kspace = kspace + torch.conj(torch.flip(kspace, dims=[-2, -1])) * 0.5
+
+Metrics are logged but no validation image is ever saved
+--------------------------------------------------------
+
+Symptom: ``val_psnr`` and ``val_ssim`` appear every pass, while the log carries
+``[ImageLogging] visual_samples was never captured`` and, after three passes,
+``consecutive validation passes saved NO image`` with a ``Last capture error``.
+
+Root cause: the image is rendered by a second forward in ``_run_validation``,
+separate from ``validation_step``, and that forward runs on the context
+:func:`spectramr.pipelines.train.visual_capture_inputs` builds. Unless the
+strategy supplies one, that context is bare (``use_dc``, ``measured_kspace=None``,
+the field conditioning) and the tensors pass through ``_prepare_validation_data``.
+A strategy whose ``_validation_forward`` needs the batch's mask, measurement or
+coil maps raises there, and the capture drops the image. The multi-coil EI
+operator and SSDU did this (#2431). Preparing the tensors is not safe for such a
+strategy either: with ``model.in_channels: 2``, a ``(2, 8, H, W)`` four-coil input
+is read as a ``(C, H, W, D)`` volume and permuted to ``(256, 2, 8, 256)``.
+
+Fix: have the strategy's ``validation_batch_context(input, target, batch)``
+return the context its ``validation_step`` grades on. A
+``ReconstructionTrainingStrategy`` subclass only sets
+``validates_on_batch_context = True``, which builds the context with
+``_prepare_batch_context(..., batch=batch)`` aligned to the input layout.
+``validation_step`` must read the same hook. When the hook answers, the capture
+renders on the unprepared tensors ``validation_step`` graded, so the saved image
+is the prediction the metrics scored.
 
 Validation REAL image is a centre-bright blob; FAKE is black; ``val_psnr`` NaN
 ------------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.core.compile_capability import compile_backend_for, triton_available
+from spectramr.core.device_capabilities import capability_of_device
 from spectramr.core.module_utils import is_wrapped
 
 from .compile_regions import (
@@ -69,7 +70,9 @@ def _assert_device_can_compile(device: Any, backend: str) -> None:
     if backend not in _TRITON_BACKED_BACKENDS:
         return
     device_type = getattr(device, "type", None) or str(device or "cpu").split(":")[0]
-    compile_backend_for(device_type, triton=triton_available())
+    compile_backend_for(
+        device_type, triton=triton_available(), capability=capability_of_device(device)
+    )
 
 
 def _select_models(

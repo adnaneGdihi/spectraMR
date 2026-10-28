@@ -97,6 +97,32 @@ def test_reverse_counters_are_emitted_without_the_oracle_knob() -> None:
     assert not any(k.startswith("val_band_") for k in out), "the oracle must stay opt-in"
 
 
+def test_integrity_and_divisor_columns_are_emitted_only_when_produced() -> None:
+    quiet = _call(_strategy(stats=dict(STATS, integrity_check="off"), attribution=False))
+    assert "val_reverse_integrity_steps_verified" not in quiet
+    assert "val_reverse_band_divisor_max" not in quiet
+    assert "val_reverse_decay_slope" not in quiet
+    assert "val_reverse_decay_unfitted" not in quiet
+    assert "val_reverse_projection_rejected_steps" not in quiet
+
+    stats = dict(
+        STATS,
+        reverse_mode="additive_normalized",
+        integrity_check="raise",
+        integrity_steps_verified=3,
+        band_divisor_max=2.5,
+        decay_slope=-1.25,
+        decay_unfitted=1,
+        projection_rejected_steps=4,
+    )
+    out = _call(_strategy(stats=stats, attribution=False))
+    assert out["val_reverse_integrity_steps_verified"] == 3.0
+    assert out["val_reverse_band_divisor_max"] == 2.5
+    assert out["val_reverse_decay_slope"] == -1.25
+    assert out["val_reverse_decay_unfitted"] == 1.0
+    assert out["val_reverse_projection_rejected_steps"] == 4.0
+
+
 def test_terminal_timestep_reports_the_executed_step_not_the_schedule_tail() -> None:
     """PLANTED: a schedule ending at 0 whose terminal step was skipped.
 

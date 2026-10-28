@@ -9,21 +9,32 @@ from typing import Any
 
 import torch
 
+from spectramr.core.metrics.data_range_contract import QuantileScaleContract
 from spectramr.core.metrics.flag_map import schema_flag_to_metric
 from spectramr.core.metrics.registry import MetricsRegistry
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
+from spectramr.core.metrics.sense_image_metrics import sense_scoring_pair
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.mixins.utils import (
     _get_config_value,
     _scoring_leaf,
     pick_present,
+    reduce_on_device,
 )
 from spectramr.infrastructure.training.utils.data_adapters import TorchIOAdapter
 from spectramr.infrastructure.training.utils.metric_transform import (
     IMPLEMENTED_METRIC_TRANSFORMS,
     MetricTransformResolution,
+    image_magnitude,
+    kspace_rss_magnitude,
     resolve_metric_transform,
 )
+from spectramr.infrastructure.training.utils.metric_views import (
+    MetricViews,
+    real_stacked_to_complex,
+)
+
+from .validation_context import scoring_maps
 
 logger = logging.getLogger(__name__)
 
@@ -286,15 +297,43 @@ class MetricsMixin:
             device=self.device,
             domain=domain,
             data_range=data_range,
+            scale_contract=self._metric_scale_contract(data_range),
         )
         return self._training_computer
+
+    def _metric_scale_contract(self, data_range: float | None) -> QuantileScaleContract | None:
+        """The declared percentile scale both computers hand their image metrics (#2241).
+
+        Logs once which of the three sources sets the image ``data_range``: the
+        declared value, the normalization contract, or the per-batch sign test.
+        """
+        from spectramr.infrastructure.training.utils.metric_data_range import (
+            scale_contract_from_config,
+        )
+
+        contract = scale_contract_from_config(getattr(self, "config", None))
+        if not getattr(self, "_metric_range_source_logged", False):
+            self._metric_range_source_logged = True
+            if data_range is not None:
+                logger.info("[Metrics] image data_range %g: declared", data_range)
+            elif contract is not None:
+                logger.info(
+                    "[Metrics] image data_range %g: %s", contract.anchor, contract.describe()
+                )
+            else:
+                logger.info(
+                    "[Metrics] image data_range: inferred per batch from the target's sign "
+                    "([0, 1] or [-1, 1]); no range or image-domain scale is declared"
+                )
+        return contract
 
     def _registry_backed_validation_metrics(self, declared: list[str]) -> list[str]:
         """Validate ``validation.scoring.compute`` against registry-or-emitted; return the registry part.
 
         ``metrics.compute`` has been gated against ``MetricsRegistry`` since #173;
         this list was not, and 13 arms used it to name keys their strategy's own
-        ``validation_step`` writes (``field_mse`` on the qMRI arms, ``val_loss``)
+        ``validation_step`` writes (``field_mse`` on the qMRI arms, ``val_loss``
+        on a path that writes it, see :func:`universal_validation_keys`)
         -- honest keys that the registry computer would have raised on at the
         first batch had it ever been built for those strategies. A strategy now
         DECLARES those keys in ``capabilities.emitted_metrics``; a name in
@@ -304,20 +343,15 @@ class MetricsMixin:
         the strategy produces them itself.
         """
         from spectramr.core.metrics.registry import MetricsRegistry
+        from spectramr.core.metrics.validation_names import partition_validation_compute
 
         emitted = frozenset(getattr(type(self).capabilities, "emitted_metrics", frozenset()))
-        # ``val_loss`` is written by ``ModelValidationMixin.validation_step`` for
-        # every strategy, so it is emitted everywhere without a declaration.
-        universal = frozenset({"loss", "val_loss"})
-
-        def _is_emitted(name: str) -> bool:
-            candidates = {name, f"val_{name}", name.removeprefix("val_")}
-            return bool(candidates & (emitted | universal))
-
-        registry_names = [m for m in declared if MetricsRegistry.is_registered(m)]
-        unknown = [
-            m for m in declared if not MetricsRegistry.is_registered(m) and not _is_emitted(m)
-        ]
+        registry_names, unknown = partition_validation_compute(
+            declared,
+            emitted,
+            MetricsRegistry.is_registered,
+            universal=universal_validation_keys(type(self)),
+        )
         if unknown and emitted:
             raise ValueError(
                 f"validation.scoring.compute names {len(unknown)} metric(s) that are neither "
@@ -415,6 +449,7 @@ class MetricsMixin:
             device=self.device,
             domain=domain,
             data_range=data_range,
+            scale_contract=self._metric_scale_contract(data_range),
         )
 
         self._validate_metrics_domain_consistency(config)
@@ -560,7 +595,7 @@ class MetricsMixin:
                 val_domain_actual = train_domain_actual
 
             val_transform = _get_config_value(val_config, "output_transform", None)
-            if val_transform == "ifft_magnitude":
+            if val_transform in ("ifft_magnitude", "ifft_target_magnitude", "sense_magnitude"):
                 val_domain_actual = "image"
         else:
             val_domain_actual = train_domain_actual
@@ -570,73 +605,6 @@ class MetricsMixin:
                 f"[Metrics Domain Mismatch] Training metrics computed in '{train_domain_actual}' domain, "
                 f"but validation metrics computed in '{val_domain_actual}' domain."
             )
-
-    def _slice_to_target_contrast_single(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Slice a single tensor to target contrast channels.
-
-        For federated multi-contrast data (e.g., 16 real-stacked channels =
-        T1 + FLAIR each with 4 complex coils), extract only the target contrast's
-        channels (second half) so iFFT + RSS doesn't mix different contrasts.
-
-        Args:
-            tensor: k-space tensor [B, C, H, W] with potentially stacked contrasts.
-
-        Returns:
-            Tensor with only the target contrast's channels.
-
-        Notes:
-            ``data.target_channels`` is documented in the schema as the number
-            of channels in the **reconstructed target image** (1 for RSS
-            magnitude, >1 for multi-contrast). It is NOT the count of
-            k-space channels per contrast — for that the layout is determined
-            by ``coil_processing_mode`` × ``num_virtual_coils`` × 2 (R/I).
-            We must NOT slice when ``target_channels == 1`` because the
-            tensor in that case is single-contrast, multi-coil, real-stacked
-            k-space; slicing to the last 1 channel returns the imaginary
-            half of the last coil and treating it as image (visualization
-            does no further IFFT for 1-channel) yields the experiment_11
-            "white spot" / "doubled brain" artefacts. Same hazard for
-            ``target_channels == 2`` when the tensor is single-contrast
-            with ≥ 2 coils — slicing to the last R/I pair drops every
-            other coil and the resulting per-coil magnitude is still
-            single-coil; pre-fix this rendered as a near-empty image
-            with a DC blob at centre.
-        """
-        target_ch = _get_config_value(
-            _get_config_value(self.config, "data", None),
-            "target_channels",
-            None,
-        )
-        # Guard 1: never slice when target_channels<=2 — a divisor that small
-        # nearly always matches single-contrast multi-coil data and would
-        # destroy phase information by selecting only one R/I pair.
-        if target_ch is None or target_ch < 4:
-            return tensor
-        if tensor.dim() >= 4 and tensor.shape[1] > target_ch and tensor.shape[1] % target_ch == 0:
-            logger.debug(
-                "[MetricsMixin] Slicing multi-contrast channels %d → %d "
-                "(last %d = target contrast)",
-                tensor.shape[1],
-                target_ch,
-                target_ch,
-            )
-            return tensor[:, -target_ch:]
-        return tensor
-
-    def _slice_to_target_contrast(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Slice both pred and target to target contrast channels.
-
-        Convenience wrapper around :meth:`_slice_to_target_contrast_single`
-        for paired tensors.
-        """
-        return (
-            self._slice_to_target_contrast_single(pred),
-            self._slice_to_target_contrast_single(target),
-        )
 
     def _prediction_for_visualization(self, predictions: torch.Tensor) -> torch.Tensor:
         """Reduce the raw validation prediction to the tensor that should be VISUALISED.
@@ -695,8 +663,35 @@ class MetricsMixin:
         pred: torch.Tensor,
         target: torch.Tensor,
         metrics_config: Any,
+        *,
+        batch_data: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply configured domain transforms before metric computation."""
+        """Apply configured domain transforms before metric computation.
+
+        Returns only the magnitude pair. A caller that scores a metric set
+        should use :meth:`_metric_transform_views` instead, so phase-sensitive
+        metrics receive the complex image rather than its magnitude (#867).
+        """
+        views = self._metric_transform_views(pred, target, metrics_config, batch_data=batch_data)
+        return views.pred, views.target
+
+    def _metric_transform_views(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        metrics_config: Any,
+        *,
+        batch_data: Any = None,
+        smaps: torch.Tensor | None = None,
+    ) -> MetricViews:
+        """Apply the configured transform, keeping the complex image it passes through.
+
+        ``batch_data`` is the validation batch, read only by ``sense_magnitude``
+        for its coil maps; the other transforms need nothing beyond the tensors.
+        ``smaps`` hands ``ifft_sense_adjoint`` an explicit map set in place of the
+        strategy's own, which is how cold-diffusion validation re-scores a
+        prediction with measurement-only maps; no other transform reads it.
+        """
         # NOTE: the metric-combine convention comes ONLY from the
         # metrics/validation transform — NOT from physics.coil_processing.combine,
         # which is the DATA-LOAD combine (a different pipeline stage: a model may
@@ -731,7 +726,7 @@ class MetricsMixin:
         if resolution.suppressed:
             # ``domain: none`` outranks the auto-magnitude gate below: the user
             # asked for metrics on the raw tensors, not for a combine we picked.
-            return pred, target
+            return MetricViews(pred, target)
 
         if not resolution.is_implemented:
             # Pitfall #9, and the actual defect behind #931. This chain has no
@@ -754,15 +749,13 @@ class MetricsMixin:
                 transform_name = "magnitude"
 
         if transform_name is None:
-            return pred, target
+            return MetricViews(pred, target)
+
+        complex_pred: torch.Tensor | None = None
+        complex_target: torch.Tensor | None = None
 
         if transform_name == "ifft_magnitude":
             from spectramr.infrastructure.physics.fft_ops import ifft2c
-
-            # [FIX] For federated multi-contrast data (e.g., 16ch = T1+FLAIR),
-            # slice to only the target contrast's channels before iFFT+RSS.
-            # Without this, RSS mixes different contrasts → doubled/banded images.
-            pred, target = self._slice_to_target_contrast(pred, target)
 
             # [FIX] For multi-contrast single-coil data (e.g., 8ch target =
             # 4 contrasts × 1 coil × 2 R/I), RSS over "4 complex channels"
@@ -804,23 +797,16 @@ class MetricsMixin:
             # i.e. the brain superimposed with its 180°-rotated copy. That is
             # the experiment_11 / experiment_130 / cross-contrast May-2026
             # "doubled brain" symptom in the saved validation_R*.png images.
-            # SSOT: ComplexToRealTransform and ComplexGuard both produce the
-            # interleaved layout [R0, I0, R1, I1, ...].
-            def _real_stacked_to_complex(t: torch.Tensor) -> torch.Tensor:
-                if torch.is_complex(t):
-                    return t
-                if t.dim() < 4 or t.shape[1] < 2 or t.shape[1] % 2 != 0:
-                    return t  # not real-stacked — return unchanged for downstream guard
-                return torch.complex(t[:, 0::2], t[:, 1::2])
-
-            pred_kc = _real_stacked_to_complex(pred)
-            target_kc = _real_stacked_to_complex(target)
+            pred_kc = real_stacked_to_complex(pred)
+            target_kc = real_stacked_to_complex(target)
 
             if torch.is_complex(pred_kc):
-                pred_complex = ifft2c(pred_kc)
-                target_complex = ifft2c(target_kc)
-                pred = torch.abs(pred_complex)
-                target = torch.abs(target_complex)
+                # Per-coil complex images: without smaps there is no
+                # phase-preserving coil combine, so phase metrics see each coil.
+                complex_pred = ifft2c(pred_kc)
+                complex_target = ifft2c(target_kc)
+                pred = torch.abs(complex_pred)
+                target = torch.abs(complex_target)
             else:
                 # Single-channel real fallback. iFFT on a strictly-real tensor
                 # has a Hermitian-symmetric output and its magnitude is
@@ -850,21 +836,50 @@ class MetricsMixin:
                 pred = torch.sqrt(torch.sum(pred**2, dim=1, keepdim=True))
                 target = torch.sqrt(torch.sum(target**2, dim=1, keepdim=True))
 
+        elif transform_name == "ifft_target_magnitude":
+            # Image-domain prediction, k-space target: only the target crosses
+            # domains (#2325). ``metric_transform`` documents why it is declared.
+            pred = image_magnitude(pred)
+            target = kspace_rss_magnitude(target)
+
+        elif transform_name == "sense_magnitude":
+            # The validation batch's scoring maps (#2664), else its own maps; not
+            # ``_current_smaps``, which only the diffusion strategies set. Missing
+            # maps raise inside the pair.
+            maps, _ = scoring_maps(batch_data, pred) if batch_data is not None else (None, None)
+            sense_pred, sense_target = sense_scoring_pair(pred, target, maps)
+            complex_pred = sense_pred if torch.is_complex(sense_pred) else None
+            complex_target = sense_target
+            pred = sense_pred.abs()
+            target = sense_target.abs()
+
         elif transform_name == "ifft_sense_adjoint":
             from spectramr.infrastructure.physics.fft_ops import sense_adjoint
 
-            pred, target = self._slice_to_target_contrast(pred, target)
             # Sensitivity maps are populated per strategy. Prefer the per-step
             # ``_current_smaps`` over the validation-scoped ``_cached_smaps`` and
             # accept a map only when its batch broadcasts against the current
             # prediction — otherwise a stale validation-batch map crashes
             # ``sense_adjoint`` at dim 0. See ``_select_batch_compatible_smaps``.
-            smaps = self._select_batch_compatible_smaps(pred.shape[0])
-            pred = torch.abs(sense_adjoint(pred, smaps=smaps))
-            target = torch.abs(sense_adjoint(target, smaps=smaps))
+            if smaps is None:
+                smaps = self._select_batch_compatible_smaps(pred.shape[0])
+            coils = pred.shape[1] if torch.is_complex(pred) else pred.shape[1] // 2
+            if smaps is None and coils > 1 and not getattr(self, "_sense_no_maps_warned", False):
+                self._sense_no_maps_warned = True
+                logger.warning(
+                    "[ifft_sense_adjoint] no sensitivity maps for a %d-coil prediction: the "
+                    "metrics grade per-coil iFFT magnitudes, not the SENSE-combined image the "
+                    "transform names. Further occurrences are not repeated.",
+                    coils,
+                )
+            complex_pred = sense_adjoint(pred, smaps=smaps)
+            complex_target = sense_adjoint(target, smaps=smaps)
+            pred = torch.abs(complex_pred)
+            target = torch.abs(complex_target)
 
         elif transform_name == "magnitude":
             if torch.is_complex(pred):
+                complex_pred, complex_target = pred, target
                 pred = torch.abs(pred)
                 target = torch.abs(target)
             elif pred.dim() == 4 and pred.shape[1] == 2:
@@ -876,13 +891,18 @@ class MetricsMixin:
                 # nothing ever stops training (mrixfields_b29 burned the full 150k iters
                 # / ~23 h GPU while val_psnr diverged -9 -> -21 dB). Resolve the target on
                 # its OWN shape.
-                complex_tensor = torch.complex(pred[:, 0], pred[:, 1])
-                abs_tensor = complex_tensor.abs()
-                pred = abs_tensor.unsqueeze(1)
+                complex_pred = torch.complex(pred[:, 0], pred[:, 1]).unsqueeze(1)
+                pred = complex_pred.abs()
                 if target.dim() == 4 and target.shape[1] == 2:
-                    target = torch.complex(target[:, 0], target[:, 1]).abs().unsqueeze(1)
-                elif torch.is_complex(target) or (target.dim() == 4 and target.shape[1] == 1):
-                    target = torch.abs(target)  # already a magnitude reference
+                    complex_target = torch.complex(target[:, 0], target[:, 1]).unsqueeze(1)
+                    target = complex_target.abs()
+                elif torch.is_complex(target):
+                    complex_target = target
+                    target = torch.abs(target)
+                elif target.dim() == 4 and target.shape[1] == 1:
+                    # A real 1-channel reference has no phase: complex_target
+                    # stays None and a phase metric raises in the computer.
+                    target = torch.abs(target)
                 else:
                     # Comparing |pred| against a target we cannot map to a magnitude
                     # produces a meaningless metric, so refuse to guess. NOTE: this is
@@ -897,7 +917,7 @@ class MetricsMixin:
                         "2-channel real-stacked, complex, or 1-channel magnitude target."
                     )
 
-        return pred, target
+        return MetricViews(pred, target, complex_pred, complex_target)
 
     def _select_batch_compatible_smaps(self, batch: int) -> torch.Tensor | None:
         """Return sensitivity maps whose batch broadcasts against ``batch``.
@@ -942,8 +962,13 @@ class MetricsMixin:
         target: torch.Tensor,
         config: Any = None,
         current_step: int = 0,
+        batch_data: Any = None,
     ) -> dict[str, float]:
-        """Compute reconstruction quality metrics during training."""
+        """Compute reconstruction quality metrics during training.
+
+        ``batch_data`` is the training batch, read only by ``sense_magnitude`` for
+        its coil maps.
+        """
         metrics: dict[str, float] = {}
 
         metrics_config = _get_config_value(config, "metrics", None)
@@ -1017,13 +1042,19 @@ class MetricsMixin:
         if pred.shape != target.shape:
             return metrics
 
-        pred, target = self._apply_metric_transforms(pred, target, metrics_config)
+        pred, target = self._training_metric_inputs(pred, target)
+        views = self._metric_transform_views(pred, target, metrics_config, batch_data=batch_data)
 
         with torch.no_grad():
-            computer = self.training_metrics_computer
-            raw_metrics = computer.compute(pred, target)
+            raw_metrics = views.compute(self.training_metrics_computer)
 
         return {f"train_{k}": v for k, v in raw_metrics.items()}
+
+    def _training_metric_inputs(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Put the training pair in the units validation scores in; identity unless overridden."""
+        return pred, target
 
     @torch.no_grad()
     def validation_step(
@@ -1032,7 +1063,15 @@ class MetricsMixin:
         target_batch: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Default validation step using ValidationMetricsComputer."""
+        """Default validation step using ValidationMetricsComputer.
+
+        Returns ``{}`` without a forward pass when the computer has no metrics,
+        i.e. every name in ``validation.scoring.compute`` is one the strategy
+        emits itself; its output need not be an image (#2839).
+        """
+        computer = self.validation_metrics_computer
+        if not computer.get_metric_names():
+            return {}
         with torch.no_grad():
             # Ensure model is in eval mode
             self.env.generator.eval()
@@ -1041,23 +1080,25 @@ class MetricsMixin:
             target_batch = target_batch.to(self.device, non_blocking=True)
 
             output = self.env.generator(input_batch)
-
-            if isinstance(output, tuple):
-                output = output[0]
-            elif isinstance(output, dict):
-                output = output.get("reconstruction", output.get("output", output))
-
-            if output.device != target_batch.device:
-                output = output.to(target_batch.device)
-
-            val_config = _get_config_value(self.config, "validation", None)
-            output, target_batch = self._apply_metric_transforms(output, target_batch, val_config)
-
-            metrics = self.validation_metrics_computer.compute(output, target_batch)
+            metrics = self._score_validation_output(output, target_batch)
 
             self.env.generator.train()
 
             return metrics
+
+    def _score_validation_output(self, output: Any, target_batch: torch.Tensor) -> dict[str, float]:
+        """Unpack a generator output and compute the validation metrics on it."""
+        if isinstance(output, tuple):
+            output = output[0]
+        elif isinstance(output, dict):
+            output = output.get("reconstruction", output.get("output", output))
+
+        if output.device != target_batch.device:
+            output = output.to(target_batch.device)
+
+        val_config = _get_config_value(self.config, "validation", None)
+        views = self._metric_transform_views(output, target_batch, val_config)
+        return views.compute(self.validation_metrics_computer)
 
     def reset_validation_metrics(self) -> None:
         """Reset validation metrics computer."""
@@ -1087,49 +1128,31 @@ class MetricsMixin:
     def _convert_metrics_to_floats(
         metrics: dict[str, Any],
     ) -> dict[str, float]:
-        """Convert all metrics to float scalars.
+        """Convert all metrics to float scalars, with one host transfer.
 
-        Tensor entries are each reduced to a single scalar ON-DEVICE (real part
-        for complex, ``mean()`` for non-scalar) and then transferred to the host
-        in a SINGLE fused ``.cpu()`` call instead of one ``.item()`` GPU-sync per
-        entry. This is value-identical to the previous per-key ``.item()`` loop
-        but collapses N host syncs (called every step via ``_handle_anomalies``)
-        into one — see backlog_wasted_compute_audit_2026_05_29 TRAIN-1. Non-tensor
-        numerics are converted directly. Raises TypeError if conversion fails.
+        Each entry is reduced by :func:`reduce_on_device` (real part of complex,
+        ``mean()`` of non-scalar), and the tensor scalars cross to the host in a
+        single fused transfer rather than one ``.item()`` per entry (audit
+        TRAIN-1). The strategies that score on the host call this; the per-step
+        ``_handle_anomalies`` does not, so it never syncs. Raises TypeError for
+        an unconvertible entry.
         """
         converted: dict[str, float] = {}
         tensor_keys: list[str] = []
         tensor_scalars: list[torch.Tensor] = []
         for key, value in metrics.items():
-            if isinstance(value, torch.Tensor):
-                v = value.detach()
-                # Extract real part if tensor is complex
-                if torch.is_complex(v):
-                    v = v.real
-                # Reduce to a single scalar on-device (no host sync yet); cast to
-                # float64 so the later torch.stack has a uniform dtype under AMP
-                # (mixed fp16/fp32 components) WITHOUT losing precision — fp16/
-                # fp32/fp64 all widen losslessly to fp64, matching the original
-                # per-key float(.item()) path exactly.
-                v = (v.mean() if v.numel() != 1 else v.reshape(())).double()
+            reduced = reduce_on_device(key, value)
+            if isinstance(reduced, torch.Tensor):
+                # float64 gives the fused stack one dtype under AMP (mixed fp16/
+                # fp32) and widens losslessly, so values match a per-key .item().
                 tensor_keys.append(key)
-                tensor_scalars.append(v)
-            elif isinstance(value, (float, int)):
-                converted[key] = float(value)
-            elif isinstance(value, complex):
-                converted[key] = float(value.real)
+                tensor_scalars.append(reduced.double())
             else:
-                raise TypeError(
-                    f"Cannot convert metric '{key}' of type {type(value).__name__} to float. "
-                    f"Expected tensor, float, or int."
-                )
+                converted[key] = reduced
         if tensor_scalars:
-            # ONE GPU->CPU sync for ALL tensor metrics. The mechanism now lives
-            # in core (`scalar_transfer`) because `core.metrics.computer` needs
-            # the same fusion and may not import from infrastructure. The
-            # REDUCTION above stays here on purpose: mean-over-batch is right
-            # for a loss and wrong for a metric, so the shared helper refuses to
-            # pick and each caller reduces to a scalar first.
+            # The transfer mechanism lives in core so `core.metrics.computer` can
+            # share it; the reduction stays with the caller, because mean-over-
+            # batch is right for a loss and wrong for a metric.
             for key, host_val in zip(tensor_keys, fuse_to_host(tensor_scalars), strict=True):
                 converted[key] = float(host_val)
         return converted
@@ -1279,9 +1302,6 @@ class MetricsMixin:
                         return to_magnitude(ksp)
 
                     from spectramr.infrastructure.physics.fft_ops import ifft2c
-
-                    # [FIX] Slice to target contrast for federated multi-contrast data
-                    ksp = self._slice_to_target_contrast_single(ksp)
 
                     # Check if SENSE adjoint is configured
                     _metrics_cfg = _get_config_value(self.config, "metrics", None)
@@ -1556,3 +1576,21 @@ class MetricsMixin:
         except Exception as e:
             if hasattr(self, "logging_service"):
                 self.logging_service.log_warning(f"Failed to log validation images: {e}")
+
+
+def universal_validation_keys(strategy_cls: type) -> frozenset[str]:
+    """The undeclared keys ``strategy_cls``'s validation path writes (#2838).
+
+    ``MetricsMixin.validation_step`` returns only the registry computer's keys,
+    so a strategy that resolves to it earns no ``val_loss`` exemption. Writing
+    ``val_loss`` there instead would need a forward pass and an image-shaped
+    output, which that path deliberately does not assume (#2839). An override
+    is trusted to write ``val_loss``, as ``ModelValidationMixin`` and the
+    diffusion/standard strategies do; one that only extends this default
+    without writing it is not detected here.
+    """
+    from spectramr.core.metrics.validation_names import UNIVERSAL_VALIDATION_KEYS
+
+    if getattr(strategy_cls, "validation_step", None) is MetricsMixin.validation_step:
+        return frozenset()
+    return UNIVERSAL_VALIDATION_KEYS

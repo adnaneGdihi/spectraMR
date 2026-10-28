@@ -152,48 +152,72 @@ class TestTheGuardCanFail:
         assert [p[0] for p in pairs] == ["complex_spatial_gradient"]
 
 
+#: Arms that list ``mse`` in a domain list and once also set ``losses.diffusion.lambda_mse``.
+_MSE_ARMS = (
+    "experiment_130_ti_ccd.yaml",
+    "experiment_cross_contrast_kspace_diffusion.yaml",
+    "experiment_cross_contrast_kspace_diffusion_noprior_baseline.yaml",
+    "experiment_cross_contrast_kspace_diffusion_noprior_flair.yaml",
+    "experiment_cross_contrast_kspace_diffusion_refenc.yaml",
+    "experiment_cross_contrast_kspace_diffusion_t2_to_flair.yaml",
+)
+
+
+def _cohort_arm(name):
+    (path,) = [arm for arm in _ARMS if arm.name == name]
+    return path
+
+
+def _raw_diffusion_weight(config):
+    """The diffusion-term weight exactly as the strategy's computer resolves it."""
+    from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
+        UnifiedDiffusionLossComputer,
+    )
+
+    computer = UnifiedDiffusionLossComputer.__new__(UnifiedDiffusionLossComputer)
+    computer.config = config
+    computer._scheduled_override = lambda _name: None
+    return computer._resolve_diffusion_weight()
+
+
 class TestWhatTheMigrationDeliberatelyLeft:
     """Two shapes that look like the violation and are not.
 
     Pinned so a later "tidy-up" cannot delete them under this rule's banner.
     """
 
-    def test_the_two_triple_source_arms_keep_their_diffusion_knob(self):
-        """``losses.diffusion.lambda_mse`` is the diffusion-term weight.
+    def test_the_mse_arms_train_the_diffusion_mse_once(self):
+        """The six MSE arms list ``mse`` in a domain list and carry no ``losses.diffusion``.
 
-        A computer reads it directly (step 3 of ``_resolve_diffusion_weight``);
-        the weight table merely aliases ``lambda_mse`` onto ``l2``, which is what
-        joins it to the ``mse`` list entry. Deleting it removes a knob.
+        ``losses.diffusion.lambda_mse: 1.0`` was read raw by
+        ``_resolve_diffusion_weight`` ahead of ``training.diffusion.lambda_mse: 0.0``,
+        so these arms trained an MSE twice: once as the strategy's diffusion term
+        and once as the list entry. With the block gone the raw
+        reader falls through to the training knob, and the list entry is the
+        single declaration.
         """
-        arms = [
-            _COHORT / "experiment_130_ti_ccd.yaml",
-            _COHORT / "experiment_cross_contrast_kspace_diffusion.yaml",
-        ]
-        for arm in arms:
-            losses = _load(arm).losses
-            assert losses.diffusion is not None
-            assert "lambda_mse" in losses.diffusion.model_fields_set
-            assert _pairs(losses) == []
+        for name in _MSE_ARMS:
+            config = _load(_cohort_arm(name))
+            assert config.losses.diffusion is None, name
+            listed = {
+                c.name
+                for domain in ("kspace_losses", "image_losses", "complex_losses", "latent_losses")
+                for c in getattr(config.losses, domain)
+            }
+            assert "mse" in listed, name
+            assert _raw_diffusion_weight(config) == 0.0, name
 
-    def test_the_two_triple_source_arms_keep_their_pinned_l2(self):
-        """``reconstruction.lambda_l2`` is what holds that knob and the list entry
-        at one value.
+    def test_a_restored_diffusion_block_turns_the_raw_weight_back_on(self, tmp_path):
+        """Planted: the deleted key, put back, is what the guard above must see."""
+        import yaml
 
-        Its own schema default is 0.0 against ``diffusion.lambda_mse``'s 1.0
-        (issue #421), so deleting it makes the two disagree. An earlier revision
-        of the migration deleted it from exactly these two arms and
-        ``tests/unit/config/test_exp11_kspace_filling_loss_weights.py`` went red;
-        both arms are therefore unchanged by this PR.
-        """
-        from spectramr.models.losses.weights import deleting_lambda_would_conflict
-
-        for name in (
-            "experiment_130_ti_ccd.yaml",
-            "experiment_cross_contrast_kspace_diffusion.yaml",
-        ):
-            losses = _load(_COHORT / name).losses
-            assert "lambda_l2" in losses.reconstruction.model_fields_set
-            assert deleting_lambda_would_conflict(losses, "reconstruction", "lambda_l2")
+        raw = yaml.safe_load(_cohort_arm(_MSE_ARMS[0]).read_text())
+        raw["losses"]["diffusion"] = {"lambda_mse": 1.0}
+        planted_path = tmp_path / _MSE_ARMS[0]
+        planted_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+        planted = _load(planted_path)
+        assert planted.losses.diffusion is not None
+        assert _raw_diffusion_weight(planted) == 1.0
 
     def test_lambda_pre_dc_kspace_survives_where_it_is_declared(self):
         """It has no list form at all — the diffusion strategy reads it inline.

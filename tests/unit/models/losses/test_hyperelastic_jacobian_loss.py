@@ -86,3 +86,17 @@ def test_wrong_rank_still_raises_on_rank() -> None:
     loss = HyperelasticJacobianLoss()
     with pytest.raises(ValueError, match="4-D or 5-D"):
         loss(torch.randn(2, 12))
+
+
+def test_3d_determinant_matches_a_closed_form_compression() -> None:
+    """u = (0, 0, -z/2) halves volume along z: det J = 0.5 on the interior.
+
+    Pins the per-axis derivative loop: each iteration must difference a different
+    spatial axis, and channel 2 (u_z) must be read against axis 2 (depth).
+    """
+    d = h = w = 6
+    zz = torch.arange(d, dtype=torch.float64).view(1, d, 1, 1).expand(1, d, h, w)
+    field = torch.zeros(1, 3, d, h, w, dtype=torch.float64)
+    field[:, 2] = -0.5 * zz
+    det = HyperelasticJacobianLoss._jacobian_det_3d(field)
+    torch.testing.assert_close(det, torch.full_like(det, 0.5))

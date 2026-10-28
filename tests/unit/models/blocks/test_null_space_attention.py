@@ -106,8 +106,8 @@ def test_align_mask_center_crops_and_stays_binary(level: int) -> None:
 def test_align_mask_reduces_channels_conservatively() -> None:
     """A bin counts as observed only where EVERY channel observed it.
 
-    ``prior_channel_range`` keeps one contrast fully sampled, so a channel-wise
-    max would mark that contrast's bins observed for every channel. ``amin`` errs
+    When channels disagree, a channel-wise max would mark a bin observed for
+    every channel because one channel saw it. ``amin`` errs
     toward calling a bin unmeasured, which is the harmless direction, and costs
     no host synchronisation inside the training loop.
     """
@@ -219,12 +219,13 @@ def test_both_branches_and_the_fusion_receive_gradient() -> None:
     out = block(torch.randn(2, CHANNELS, GRID, GRID), mask=_mask())
     (out - torch.randn_like(out)).pow(2).mean().backward()
 
-    for name in ("kspace_attn.proj", "image_attn.proj", "fuse"):
+    for name in ("kspace_attn.proj", "kspace_attn.v_proj", "image_attn.proj", "fuse"):
         grad = max(
             0.0 if p.grad is None else p.grad.abs().max().item()
             for p in block.get_submodule(name).parameters()
         )
         assert grad > 0.0, f"{name} receives no gradient"
+    assert block.kspace_attn.pe_slope_raw.grad.abs().max().item() > 0.0
 
 
 def test_block_is_not_an_identity_at_init() -> None:
@@ -310,3 +311,89 @@ def test_a_dropped_sample_contributes_no_density() -> None:
     assert torch.allclose(masked, cropped, atol=1e-5), (
         "masking a sample must equal never having acquired it"
     )
+
+
+# ── PE-distance bias, masked normalisation, complex-linear values ────────────
+
+
+def _near_far_weights(attn: ObservedKeyLinearAttention) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weights a missing column puts on acquired columns 3 and 60 PE lines away.
+
+    Equal key content everywhere, so only the positional bias can separate
+    them; value channel 0 marks the near column and channel 1 the far one.
+    """
+    heads, height, width, query_col = attn.num_heads, 4, 128, 30
+    near, far = query_col + 3, query_col + 60
+    observed = torch.zeros(1, 1, height, width)
+    observed[..., [near, far]] = 1.0
+    n = height * width
+    v = torch.zeros(1, heads, 2, height, width)
+    v[:, :, 0, :, near] = 1.0
+    v[:, :, 1, :, far] = 1.0
+    ones = torch.ones(1, heads, 2, n)
+    out = attn.attend(ones, ones, v.reshape(1, heads, 2, n), observed)
+    out = out.reshape(1, heads, 2, height, width)[0, :, :, 0, query_col]
+    return out[:, 0], out[:, 1]
+
+
+def test_a_missing_column_prefers_the_nearest_acquired_column() -> None:
+    """GRAPPA-like: at init every head weights a column 3 away above one 60 away."""
+    torch.manual_seed(0)
+    near, far = _near_far_weights(ObservedKeyLinearAttention(CHANNELS, num_heads=4).eval())
+    assert (near > far).all()
+    assert (near / far).min() > 10.0
+
+
+def test_with_the_bias_switched_off_the_columns_tie() -> None:
+    """Planted violation: content-only attention cannot tell the two apart."""
+    attn = ObservedKeyLinearAttention(CHANNELS, num_heads=4).eval()
+    with torch.no_grad():
+        attn.pe_slope_raw.fill_(-60.0)  # softplus -> 0: no positional decay
+    near, far = _near_far_weights(attn)
+    torch.testing.assert_close(near, far)
+
+
+def test_key_statistics_ignore_zero_filled_bins() -> None:
+    """The norm's moments come from the acquired bins only.
+
+    Filling the null bins with garbage instead of zeros must not move what the
+    acquired bins normalise to; ``InstanceNorm2d`` (the planted contrast) does.
+    """
+    torch.manual_seed(0)
+    attn = ObservedKeyLinearAttention(CHANNELS, num_heads=4).eval()
+    observed = _mask(batch=1)
+    x = torch.randn(1, CHANNELS, GRID, GRID) * 4.0 + 2.0
+    zero_filled = x * observed
+    garbage = zero_filled + 1e3 * (1.0 - observed)
+    sel = observed.bool().expand_as(x)
+
+    with torch.no_grad():
+        a = attn.norm(zero_filled, observed)[sel]
+        b = attn.norm(garbage, observed)[sel]
+        plain = torch.nn.InstanceNorm2d(CHANNELS)
+        moved = (plain(zero_filled)[sel] - plain(garbage)[sel]).abs().max()
+
+    torch.testing.assert_close(a, b)
+    assert moved > 1e-2
+
+
+def test_value_projection_is_complex_linear() -> None:
+    """``v(i * x) == i * v(x)``: the convex average of observed values commutes
+    with a complex scalar. A real 1x1 conv over interleaved channels does not."""
+    def _rotate(t: torch.Tensor, phi: float) -> torch.Tensor:
+        z = torch.complex(t[:, 0::2], t[:, 1::2]) * torch.exp(1j * torch.tensor(phi))
+        return torch.stack([z.real, z.imag], dim=2).flatten(1, 2)
+
+    torch.manual_seed(0)
+    attn = ObservedKeyLinearAttention(CHANNELS, num_heads=4).eval()
+    x = torch.randn(1, CHANNELS, 8, 8)
+    with torch.no_grad():
+        torch.testing.assert_close(attn.v_proj(_rotate(x, 0.9)), _rotate(attn.v_proj(x), 0.9))
+        real = torch.nn.Conv2d(CHANNELS, CHANNELS, 1, bias=False)
+        gap = (real(_rotate(x, 0.9)) - _rotate(real(x), 0.9)).abs().max()
+    assert gap > 1e-3
+
+
+def test_heads_must_not_split_a_complex_pair() -> None:
+    with pytest.raises(ValueError, match="divisible by num_heads"):
+        ObservedKeyLinearAttention(12, num_heads=4)

@@ -35,7 +35,6 @@ from spectramr.config.schemas.validator_registry import (
     _validate_metric_domain_compatibility,
     _validate_model_in_out_channels,
     _validate_num_workers,
-    _validate_training_mode_compatibility,
     _validate_training_mode_specified,
     get_validator_registry,
 )
@@ -120,10 +119,6 @@ PARADIGM_DICTS: list[tuple[str, dict[str, Any]]] = [
                 ),
                 "training_mode": "gan",
             },
-            # gan training_mode requires an adversarial objective — see
-            # TRAINING_MODE_CONSTRAINTS['gan'].required_objectives == ['gan'].
-            # Without it the (correct) training_mode_compatibility validator
-            # raises an error, so a valid gan fixture must declare it.
             "objectives": {"gan": {"lambda_adversarial": 1.0}},
             "model": {"in_channels": 1, "out_channels": 1},
         },
@@ -383,27 +378,10 @@ class TestExpectedFailures:
             "objectives": {},
         }
 
-        # This rule is now objectives-only: absence from TRAINING_MODE_CONSTRAINTS
-        # means "declares no required objectives", not "does not exist".
-        assert _validate_training_mode_compatibility(config) == []
-
-        # ...but the mode is still rejected, by the rule that owns existence.
+        # The mode is rejected by the rule that owns existence.
         assert (
             len(_validate_training_mode_dispatchable(config)) > 0
         ), "An unknown training_mode must still be flagged as an error"
-
-    def test_dispatchable_mode_without_constraints_entry_is_accepted(self) -> None:
-        """Regression: TRAINING_MODE_CONSTRAINTS is sparse, not an allow-list.
-
-        It was missing 90 of the 203 dispatchable modes, and this rule treated
-        absence as "Unknown training mode" at severity=error -- so real YAMLs
-        using physics_driven / cyclegan / meta_learning could not load at all.
-        """
-        for mode in ("physics_driven", "cyclegan", "meta_learning"):
-            config = {"training": {"training_mode": mode}, "objectives": {}}
-            assert (
-                _validate_training_mode_compatibility(config) == []
-            ), f"{mode} is dispatchable and declares no objectives -- must pass"
 
     def test_batch_size_zero_is_invalid(self) -> None:
         """batch_size=0 must fail validation."""
@@ -579,23 +557,10 @@ class TestVfAdvancedTrainingModesRegistered:
     """
 
     @pytest.mark.parametrize("mode", ["ib_vf", "twin_dps"])
-    def test_mode_is_known_to_validator(self, mode: str) -> None:
-        cfg = {"training": {"training_mode": mode}}
-        msgs = _validate_training_mode_compatibility(cfg)
-        assert not any("Unknown training mode" in m for m in msgs), (
-            f"training_mode '{mode}' is a registered strategy and must be in "
-            f"TRAINING_MODE_CONSTRAINTS; got {msgs}"
-        )
-
-    @pytest.mark.parametrize("mode", ["ib_vf", "twin_dps"])
-    def test_mode_in_allow_list_and_constraints(self, mode: str) -> None:
-        from spectramr.config.validation_constants import (
-            TRAINING_MODE_CONSTRAINTS,
-            VALID_TRAINING_MODES,
-        )
+    def test_mode_in_allow_list(self, mode: str) -> None:
+        from spectramr.config.validation_constants import VALID_TRAINING_MODES
 
         assert mode in VALID_TRAINING_MODES
-        assert mode in TRAINING_MODE_CONSTRAINTS
 
     def test_allowlist_consistent_with_strategy_factory(self) -> None:
         """Every dispatchable training mode must be in the validator allow-list
@@ -611,20 +576,6 @@ class TestVfAdvancedTrainingModesRegistered:
             assert (
                 mode in VALID_TRAINING_MODES
             ), f"{mode} dispatchable but not allow-listed"
-
-
-@pytest.mark.unit
-class TestGenerativeModeKnownToValidator:
-    """Regression WS1-core-01: ``generative`` (glow / equivariant_flow density
-    models) was in VALID_TRAINING_MODES but missing from TRAINING_MODE_CONSTRAINTS,
-    so the validator rejected every ``training_mode: generative`` config with a
-    false 'Unknown training mode' error.
-    """
-
-    def test_generative_not_unknown(self) -> None:
-        cfg = {"training": {"training_mode": "generative"}}
-        msgs = _validate_training_mode_compatibility(cfg)
-        assert not any("Unknown training mode" in m for m in msgs), msgs
 
 
 @pytest.mark.unit
@@ -693,3 +644,13 @@ class TestValidatorRegistryDuplicateRegistration:
         replacement = self._rule("dup_rule")
         reg.register(replacement, override=True)  # must not raise
         assert reg.get("dup_rule") is replacement
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"validation": None},
+        {"validation": {"metrics": ["fid", "lpips"]}, "data": None, "model": None},
+    ],
+)
+def test_metric_domain_compatibility_tolerates_null_blocks(cfg: dict[str, Any]) -> None:
+    assert isinstance(_validate_metric_domain_compatibility(cfg), list)

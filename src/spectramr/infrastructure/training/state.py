@@ -341,7 +341,7 @@ class TrainingState(ITrainingState):
         """Get EMA state for saving.
 
         Delegates to ``ModelEma.shadow_state_dict`` so this spelling and the
-        checkpoint director's produce the same bytes — bare weight keys plus the
+        checkpoint capture's produce the same bytes — bare weight keys plus the
         warmup counter. It previously called ``state_dict()``, which emits
         ``module.``-prefixed keys, a third and divergent on-disk shape.
         """

@@ -49,6 +49,15 @@ PROFILE_MODES: dict[str, tuple[str, ...]] = {
     "cpu+memory": ("--memory",),
 }
 
+#: Training iterations a profile runs by default: past warm-up and loader
+#: start-up, short enough for one validation pass to land inside the run.
+DEFAULT_PROFILE_ITERATIONS = 100
+
+#: Validation batches per pass a profile runs by default. ``--iterations`` shortens training
+#: but not validation, so an arm declaring a short eval interval walked its whole split every
+#: few steps (the cs_mno arms: five full passes with LPIPS inside 40 min, each one a timeout).
+DEFAULT_PROFILE_VAL_BATCHES = 4
+
 #: Which module defines each phase's driver — read off the marker table instead
 #: of restated here. The two declarations DID diverge while both read plausibly:
 #: this module asserted ``_run_validation`` sat in ``pipelines/training_loop.py``,
@@ -83,7 +92,7 @@ FOCUS_PRESETS: dict[str, tuple[str, ...]] = {
 #: The formatting key is ``child_run_dir`` and not ``run_dir`` for a reason worth
 #: stating: these templates used to be handed the arm's real results directory,
 #: so profiling ``experiment_11_attention_none`` for 300 iterations wrote
-#: ``checkpoints/``, ``checkpoint_best.pt``, metrics and TensorBoard events over
+#: ``checkpoints/`` (``best.<format>`` among them), metrics and TensorBoard events over
 #: the arm's actual run. The child reported it as healthy, because the injected
 #: path satisfied ``check_output_dir_convention`` either way.
 #:
@@ -101,6 +110,18 @@ OUTPUT_INJECTION: dict[str, tuple[str, str]] = {
     "sanity_check": ("--override", "training.output_dir={child_run_dir}"),
     "infer": ("--output", "{child_run_dir}/inference"),
 }
+
+
+#: Overrides every ``--override`` target's child runs with. Scalene re-arms itself
+#: in forked DataLoader workers without reporting them, and a worker freeing the
+#: parent's CUDA memory aborts the run (sabine, 2026-10-21, every mode). Loading in
+#: the main process both avoids that and puts the data path in the profile. The
+#: held-out test pass is not the loop being profiled and aborted the same way.
+PROFILE_CHILD_OVERRIDES: tuple[str, ...] = (
+    "data.loader.num_workers=0",
+    "validation.loader.num_workers=0",
+    "data.source.test_index_path=null",
+)
 
 
 def require_scalene() -> str | None:
@@ -145,6 +166,40 @@ def program_path() -> Path:
     return Path(__file__).parents[1]
 
 
+def build_child_argv(args: argparse.Namespace, *, child_run_dir: Path) -> list[str]:
+    """The verb argv both backends profile: ``<verb> --config ... --override ...``.
+
+    Pure: no filesystem or process side effects.
+    """
+    flag, template = OUTPUT_INJECTION[args.target]
+    child: list[str] = [
+        args.target,
+        "--config",
+        str(args.config),
+        flag,
+        template.format(child_run_dir=child_run_dir),
+    ]
+    if args.device:
+        child += ["--device", args.device]
+    if flag == "--override":
+        # The log sink is its own key; left alone it names the arm's experiment, not this run.
+        child += ["--override", f"logging.sinks.dir={child_run_dir / 'logs'}"]
+        child += [tok for ov in PROFILE_CHILD_OVERRIDES for tok in ("--override", ov)]
+    # `--override` is `action="append"` on the child parser, so this composes
+    # with the output redirect above rather than replacing it. Guarded upstream:
+    # `profile_cli` raises for a target that runs no validation loop.
+    if args.val_batches is not None:
+        child += ["--override", val_batches_override(args.val_batches)]
+    if args.iterations is not None:
+        # The dispatcher's smoke cap is the one owner: it also shrinks the
+        # validation interval, so the short run still reaches a validation pass.
+        from spectramr.cli.manifest_dispatch import compute_iter_cap_overrides
+
+        child += compute_iter_cap_overrides(args.config, args.iterations)[0]
+    child += list(args.extra or [])
+    return child
+
+
 def build_scalene_command(
     args: argparse.Namespace,
     *,
@@ -166,23 +221,6 @@ def build_scalene_command(
     if focus_filters:
         scalene_opts += ["--profile-only", ",".join(focus_filters)]
 
-    flag, template = OUTPUT_INJECTION[args.target]
-    child: list[str] = [
-        args.target,
-        "--config",
-        str(args.config),
-        flag,
-        template.format(child_run_dir=child_run_dir),
-    ]
-    if args.device:
-        child += ["--device", args.device]
-    # `--override` is `action="append"` on the child parser, so this composes
-    # with the output redirect above rather than replacing it. Guarded upstream:
-    # `profile_cli` raises for a target that runs no validation loop.
-    if args.val_batches is not None:
-        child += ["--override", val_batches_override(args.val_batches)]
-    child += list(args.extra or [])
-
     return [
         sys.executable,
         "-m",
@@ -191,15 +229,19 @@ def build_scalene_command(
         *scalene_opts,
         str(entry_script()),
         "---",
-        *child,
+        *build_child_argv(args, child_run_dir=child_run_dir),
     ]
 
 
 __all__ = [
+    "DEFAULT_PROFILE_ITERATIONS",
+    "DEFAULT_PROFILE_VAL_BATCHES",
     "FOCUS_PRESETS",
     "OUTPUT_INJECTION",
+    "PROFILE_CHILD_OVERRIDES",
     "PROFILE_MODES",
     "PROFILE_TARGETS",
+    "build_child_argv",
     "build_scalene_command",
     "entry_script",
     "program_path",

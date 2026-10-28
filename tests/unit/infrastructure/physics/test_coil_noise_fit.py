@@ -255,6 +255,31 @@ class TestTheScalarSigma:
         images, maps, truth = self._scene(gain)
         assert float(sigma_from_coil_nullspace(images, maps)) == pytest.approx(truth, rel=0.02)
 
+    def test_each_slice_of_a_batch_gets_its_own_sigma(self) -> None:
+        """A batch mixes slices whose normalised noise differs ~10x (audit 2026-10-09);
+        the pooled sqrt(mean sigma^2) over-injected the quiet slice ~7x."""
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_coil_nullspace
+
+        quiet, maps, low = self._scene(0.5)
+        loud, _, high = self._scene(4.0)
+        sigma = sigma_from_coil_nullspace(torch.cat([quiet, loud]), torch.cat([maps, maps]))
+        assert sigma.shape == (2,)
+        assert float(sigma[0]) == pytest.approx(low, rel=0.02)
+        assert float(sigma[1]) == pytest.approx(high, rel=0.02)
+        # Planted: the pooled value both slices used to share.
+        pooled = (sigma.pow(2).mean()).sqrt()
+        assert float(pooled) > 2 * low
+
+    def test_pixels_without_map_support_do_not_enter_the_fit(self) -> None:
+        """Where ESPIRiT zeroes the maps the residual is all C noise dimensions, and
+        dividing it by C - 1 read the noise high."""
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_coil_nullspace
+
+        images, maps, truth = self._scene(1.0)
+        cut = maps.clone()
+        cut[..., : maps.shape[-1] // 2] = 0  # half the field of view without support
+        assert float(sigma_from_coil_nullspace(images, cut)) == pytest.approx(truth, rel=0.03)
+
     def test_it_is_insensitive_to_the_anatomy_brightness(self) -> None:
         """The whole premise: the null space carries noise and none of the signal."""
         from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_coil_nullspace
@@ -338,3 +363,57 @@ class TestTheBatchWrapper:
         _, maps, _ = self._kspace_and_maps()
         with pytest.raises(ValueError, match="already combined"):
             sigma_from_kspace_batch(torch.randn(1, 3, 128, 128), maps)
+
+
+
+class TestTheBatchSupportPolicy:
+    """``sigma_from_kspace_batch(..., support_policy=...)``, the batch-time entry."""
+
+    @staticmethod
+    def _undersampled(keep: torch.Tensor):
+        from spectramr.infrastructure.physics.fft_ops import fft2c
+
+        images, maps, truth = TestTheScalarSigma._scene(1.0)
+        return fft2c(images) * keep, maps, truth
+
+    @staticmethod
+    def _band(width: int = 128, sampled: int = 97) -> torch.Tensor:
+        keep = torch.zeros(width, dtype=torch.bool)
+        keep[:sampled] = True
+        return keep
+
+    def test_the_legacy_call_is_low_by_sqrt_f_on_a_band(self) -> None:
+        """The planted defect #2322 suspected for this function: zero columns, no correction."""
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_kspace_batch
+
+        kspace, maps, truth = self._undersampled(self._band())
+        legacy = float(sigma_from_kspace_batch(kspace, maps))
+        assert legacy == pytest.approx(truth * (97 / 128) ** 0.5, rel=0.03)
+
+    @pytest.mark.parametrize("policy", ["band", "acs"])
+    def test_a_band_is_corrected_under_either_policy(self, policy) -> None:
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_kspace_batch
+
+        kspace, maps, truth = self._undersampled(self._band())
+        got = float(sigma_from_kspace_batch(kspace, maps, support_policy=policy))
+        assert got == pytest.approx(truth, rel=0.03)
+
+    def test_random_undersampling_is_fitted_on_its_acs_run(self) -> None:
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_kspace_batch
+
+        keep = torch.rand(128, generator=torch.Generator().manual_seed(3)) < 0.25
+        keep[52:76] = True
+        keep[51] = False
+        keep[76] = False
+        kspace, maps, truth = self._undersampled(keep)
+        got = float(sigma_from_kspace_batch(kspace, maps, support_policy="acs"))
+        assert got == pytest.approx(truth, rel=0.05)
+        with pytest.raises(ValueError, match="gaps"):
+            sigma_from_kspace_batch(kspace, maps, support_policy="band")
+
+    def test_an_unknown_policy_raises(self) -> None:
+        from spectramr.infrastructure.physics.coil_noise_fit import sigma_from_kspace_batch
+
+        kspace, maps, _ = self._undersampled(self._band())
+        with pytest.raises(ValueError, match="support_policy"):
+            sigma_from_kspace_batch(kspace, maps, support_policy="whole")

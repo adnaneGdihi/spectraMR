@@ -60,6 +60,8 @@ class TestILoggingService:
             "log_critical",
             "log_debug",
             "log_images_batch",
+            "open_tensorboard",
+            "sink_records",
             "epoch",
             "step",
             "set_epoch",
@@ -94,6 +96,12 @@ class TestILoggingService:
                 config: dict[str, Any] | None = None,
             ) -> None:
                 pass
+
+            def open_tensorboard(self, run_dir, logging_config, **kwargs) -> Any:
+                return None
+
+            def sink_records(self) -> list[dict[str, Any]]:
+                return []
 
             def get_logger(self, name: str) -> Any:
                 return Mock()
@@ -229,49 +237,30 @@ class TestICheckpointService:
         """Test that all required abstract methods are defined."""
         abstract_methods = ICheckpointService.__abstractmethods__
 
-        expected_methods = {
-            "save_checkpoint",
-            "load_checkpoint",
-            "find_latest_checkpoint",
-        }
+        expected_methods = {"save_step", "save_best", "resume", "best_weights"}
 
         assert abstract_methods == expected_methods
 
     def test_method_signatures(self):
         """Test method signatures are correct."""
-        save_sig = inspect.signature(ICheckpointService.save_checkpoint)
-        assert "model" in save_sig.parameters
-        assert "optimizer" in save_sig.parameters
-        assert "epoch" in save_sig.parameters
-        assert "loss" in save_sig.parameters
-        assert "file_path" in save_sig.parameters
+        save_sig = inspect.signature(ICheckpointService.save_step)
+        assert list(save_sig.parameters) == ["self", "pipeline", "kwargs"]
 
     def test_can_create_concrete_implementation(self):
         """Test that we can create a concrete implementation."""
 
         class ConcreteCheckpointService(ICheckpointService):
-            def save_checkpoint(
-                self,
-                model: Any,
-                optimizer: Any,
-                epoch: int,
-                loss: float,
-                file_path: str,
-                **kwargs: Any,
-            ) -> None:
+            def save_step(self, pipeline: Any, **kwargs: Any) -> Any:
                 pass
 
-            def load_checkpoint(
-                self,
-                model: Any,
-                optimizer: Any,
-                file_path: str,
-                **kwargs: Any,
-            ) -> dict[str, Any] | None:
-                return None
+            def save_best(self, pipeline: Any, **kwargs: Any) -> Any:
+                pass
 
-            def find_latest_checkpoint(self, checkpoint_dir: str) -> str | None:
-                return None
+            def resume(self, path: Any, pipeline: Any, **kwargs: Any) -> Any:
+                pass
+
+            def best_weights(self, path: Any, pipeline: Any, **kwargs: Any) -> None:
+                pass
 
         service = ConcreteCheckpointService()
         assert isinstance(service, ICheckpointService)
@@ -617,6 +606,12 @@ class TestInterfaceInheritance:
                 config: dict[str, Any] | None = None,
             ) -> None:
                 pass
+
+            def open_tensorboard(self, run_dir, logging_config, **kwargs) -> Any:
+                return None
+
+            def sink_records(self) -> list[dict[str, Any]]:
+                return []
 
             def get_logger(self, name: str) -> Any:
                 return Mock()

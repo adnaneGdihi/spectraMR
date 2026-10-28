@@ -26,6 +26,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,7 +64,7 @@ class _PatchSampleMLP(nn.Module):
         flat = feature.reshape(b, c, h * w).permute(0, 2, 1)  # (B, HW, C)
         gathered = torch.gather(flat, 1, indices.unsqueeze(-1).expand(-1, -1, c))  # (B, S, C)
         head = self._get_head(c, feature.device)
-        proj = head(gathered)  # (B, S, mlp_dim)
+        proj: torch.Tensor = head(gathered)  # (B, S, mlp_dim)
         return F.normalize(proj, dim=-1)
 
 
@@ -111,7 +113,7 @@ class CUTPatchNCELoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None:
@@ -131,7 +133,7 @@ class CUTPatchNCELoss(nn.Module):
 
         device = feats_src[0].device
         loss = torch.zeros((), device=device)
-        for f_src, f_tgt in zip(feats_src, feats_tgt):
+        for f_src, f_tgt in zip(feats_src, feats_tgt, strict=True):
             if f_src.shape != f_tgt.shape:
                 raise ValueError(
                     f"feat shape mismatch {tuple(f_src.shape)} vs {tuple(f_tgt.shape)}"

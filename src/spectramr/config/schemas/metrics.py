@@ -1,19 +1,14 @@
 """Metrics tracking and profiling configuration schemas."""
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .enums import MetricMode
 from .nr_metrics import NRMetricConfig
+from .renames import reject_renamed_keys
 
 _UNREAD_BEST_MODE = (
     "NOT READ — nothing in src/ consumes it (KNOWN_UNCONSUMED ledger, "
     "tests/unit/config/test_schema_key_consumption.py). 922 arms declare it "
-    'and this block is extra="forbid", so deleting the field would fail every one of them at load. '
-    "Wire it or retire it with a corpus migration; do not trust it today."
-)
-_UNREAD_TRACK_BEST = (
-    "NOT READ — nothing in src/ consumes it (KNOWN_UNCONSUMED ledger, "
-    "tests/unit/config/test_schema_key_consumption.py). 391 arms declare it "
     'and this block is extra="forbid", so deleting the field would fail every one of them at load. '
     "Wire it or retire it with a corpus migration; do not trust it today."
 )
@@ -58,6 +53,9 @@ class MetricsConfigSchema(BaseModel):
         "extra": "forbid",  # Strict schema: metrics must be explicitly declared
         "frozen": True,
     }
+
+    # Removed keys (removals.py) are refused with the reason, not a bare extra error.
+    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("metrics")))
 
     compute: list[str] = Field(
         default_factory=list,
@@ -508,11 +506,7 @@ class MetricsConfigSchema(BaseModel):
         description=("Evaluate metrics at end of epoch. " + _UNREAD_EVAL_EPOCH),
     )
 
-    # Best model tracking
-    track_best_metric: bool = Field(
-        default=True,
-        description=("Save best model based on metric. " + _UNREAD_TRACK_BEST),
-    )
+    # Best model tracking (`track_best_metric` was removed, #568)
     best_metric_name: str = Field(
         default="val_loss",
         description="Metric to optimize",
@@ -531,7 +525,9 @@ class MetricsConfigSchema(BaseModel):
         default=None,
         description=(
             "Transform applied before metric calculation: 'ifft_magnitude', "
-            "'ifft_sense_adjoint', 'magnitude', or None. Read on the TRAINING-"
+            "'ifft_sense_adjoint', 'magnitude', or None ('sense_magnitude' is "
+            "validation-only: this path has no batch coil maps and raises). "
+            "Read on the TRAINING-"
             "metrics path only (MetricsMixin._compute_training_metrics); the "
             "validation path reads validation.scoring.output_transform instead. "
             "Any other name RAISES -- 'ifft_mag_combine' / 'ifft_mag' are "

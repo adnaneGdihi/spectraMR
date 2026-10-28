@@ -222,33 +222,44 @@ class TestContrastAwarePairedDataset:
         assert len(ds) == 5
 
     @patch(_IO_FACTORY_PATCH)
-    def test_unpaired_skipped_when_not_allowed(self, mock_get, ulf_config, hf_config):
-        """When allow_unpaired=False, getitem on an unpaired record advances to next."""
-        mock_get.return_value = _mock_io()
+    def test_unpaired_record_in_a_paired_split_raises(self, mock_get, ulf_config, hf_config):
+        """A target-less record under allow_unpaired=False raises; it used to be
+        silently replaced by the next record (a second, silent admission policy)."""
+        from spectramr.data.batch_types import TargetlessSampleError
 
-        # index: first entry is unpaired, second is paired
-        index = [
-            {
-                "primary_path": "/data/ulf_un_0.nii.gz",
-                "target_path": None,
-                "file_id": "unpaired_0",
-                "pairing_status": "unpaired_ulf",
-            },
-            {
-                "primary_path": "/data/ulf_0.nii.gz",
-                "target_path": "/data/hf_0.nii.gz",
-                "file_id": "paired_0",
-                "pairing_status": "paired",
-            },
-        ]
+        mock_get.return_value = _mock_io()
         ds = ContrastAwarePairedDataset(
-            index=index,
+            index=_make_index(n_paired=1, n_unpaired=1)[::-1],  # unpaired first
             input_contrast=ulf_config,
             target_contrast=hf_config,
             allow_unpaired=False,
-            skip_nan_samples=False,  # disable NaN skip to simplify
+            skip_nan_samples=False,
         )
-        # Requesting index 0 (unpaired) should transparently load index 1 (paired)
-        subject = ds[0]
-        assert "target" in subject
-        assert subject["file_id"] == "paired_0"
+        with pytest.raises(TargetlessSampleError, match="unpaired_0"):
+            ds[0]
+        assert ds[1]["file_id"] == "paired_0"
+
+    @patch(_IO_FACTORY_PATCH)
+    def test_has_target_is_stamped_for_the_loop_guard(self, mock_get, ulf_config, hf_config):
+        """allow_unpaired=True keeps the record and stamps has_target=False, so
+        reject_targetless_samples refuses it in a supervised step."""
+        from torch.utils.data import default_collate
+
+        from spectramr.data.batch_types import TargetlessSampleError, reject_targetless_samples
+
+        mock_get.return_value = _mock_io()
+        ds = ContrastAwarePairedDataset(
+            index=_make_index(n_paired=1, n_unpaired=1),
+            input_contrast=ulf_config,
+            target_contrast=hf_config,
+            allow_unpaired=True,
+            skip_nan_samples=False,
+        )
+        paired, unpaired = ds[0], ds[1]
+        assert bool(paired["has_target"]) is True
+        assert bool(unpaired["has_target"]) is False and "target" not in unpaired
+        reject_targetless_samples(default_collate([{"has_target": paired["has_target"]}]), strategy="s")
+        with pytest.raises(TargetlessSampleError):
+            reject_targetless_samples(
+                default_collate([{"has_target": unpaired["has_target"]}]), strategy="s"
+            )

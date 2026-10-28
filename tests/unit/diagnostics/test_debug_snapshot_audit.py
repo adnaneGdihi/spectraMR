@@ -131,6 +131,92 @@ def test_s2_is_silent_when_prepared_genuinely_differs(tmp_path):
     assert "S2" not in mod.audit_arm(arm)["codes"]
 
 
+def _identical_with(arm, *, declared=None, transforms=None):
+    provenance = {
+        "declared": {} if declared is None else declared,
+        "applied": {"transforms": transforms or []},
+        "incomplete": [],
+    }
+    _write_snapshot(
+        arm,
+        "first_steps",
+        tensors=_canonical(prepared_std=1.0),
+        extra={"prepared_equals_model_input": True},
+        provenance=provenance,
+    )
+
+
+def test_s2_fires_when_a_degradation_is_declared_and_nothing_evidences_it(tmp_path):
+    """Planted: undersampling declared, no masking transform applied, prepared == raw."""
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(arm, declared={"acquisition": None, "undersampling": {"acceleration": 4}})
+    assert "S2" in mod.audit_arm(arm)["codes"]
+
+
+def test_s2_is_silent_when_no_degradation_is_declared(tmp_path):
+    """Noise2Noise, repetition-pair and reconstruction-only arms: the 26 false positives."""
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(arm, declared={"acquisition": None, "undersampling": None})
+    rec = mod.audit_arm(arm)
+    assert "S2" not in rec["codes"]
+    assert any("no degradation was declared" in n for n in rec["notes"])
+
+
+def test_s2_is_silent_for_a_populated_undersampling_block_that_masks_nothing(tmp_path):
+    """The three VAEs: the block is present with base == max == 1.0, i.e. full sampling."""
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(
+        arm,
+        declared={
+            "acquisition": None,
+            "undersampling": {
+                "base_acceleration": 1.0,
+                "max_acceleration": 1.0,
+                "center_fraction": 0.08,
+            },
+        },
+    )
+    assert "S2" not in mod.audit_arm(arm)["codes"]
+
+
+def test_s2_fires_for_an_acceleration_ladder_that_starts_at_one(tmp_path):
+    """Planted: base 1.0 but max 8.0 still asks for degraded inputs later in the run."""
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(
+        arm,
+        declared={
+            "acquisition": None,
+            "undersampling": {"base_acceleration": 1.0, "max_acceleration": 8.0},
+        },
+    )
+    assert "S2" in mod.audit_arm(arm)["codes"]
+
+
+def test_s2_is_silent_when_a_declared_degradation_is_applied_by_a_masking_transform(tmp_path):
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(
+        arm,
+        declared={"acquisition": None, "undersampling": {"acceleration": 2}},
+        transforms=["EnsureSpatialConsistency", "ComplementaryRepMasking"],
+    )
+    rec = mod.audit_arm(arm)
+    assert "S2" not in rec["codes"]
+    assert any("ComplementaryRepMasking" in n for n in rec["notes"])
+
+
+def test_s2_still_fires_when_the_record_does_not_say_what_was_declared(tmp_path):
+    """Absent is not 'none declared': an older snapshot without the keys keeps its S2."""
+    mod = _load()
+    arm = tmp_path / "arm"
+    _identical_with(arm, declared={"target_mode": "r2r"})
+    assert "S2" in mod.audit_arm(arm)["codes"]
+
+
 @pytest.mark.parametrize("field", ["nan_count", "inf_count"])
 def test_s3_fires_on_non_finite_values(tmp_path, field):
     mod = _load()

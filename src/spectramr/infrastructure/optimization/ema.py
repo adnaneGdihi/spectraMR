@@ -265,7 +265,7 @@ class ModelEma(nn.Module):
         """Bare shadow weights **plus** the warmup counter — the checkpoint form.
 
         The two halves of :meth:`state_dict` / :meth:`load_state_dict` were both
-        being bypassed: the checkpoint director called
+        being bypassed: the pre-1.0 checkpoint writer called
         ``unwrap_model(ema).state_dict()``, and ``unwrap_model`` peels this
         object's ``.module``, so ``nn.Module.state_dict`` ran on the inner module
         and the counter this class exists to persist was dropped on every save —

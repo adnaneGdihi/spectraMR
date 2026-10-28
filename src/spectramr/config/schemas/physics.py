@@ -28,11 +28,13 @@ This module only schematises *which* physics blocks are enabled and how
 they're parameterised at config-load time.
 """
 
-from typing import Literal
+import math
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .enums import AccelerationSchedule
+from .renames import reject_renamed_keys
 
 
 class DataConsistencyConfig(BaseModel):
@@ -62,19 +64,14 @@ class DataConsistencyConfig(BaseModel):
     }
 
     # ==================== ACS & STABILIZATION (Phase 2) ====================
-    acs_mask_center_fraction: float = Field(
-        default=0.08,
-        ge=0.0,
-        le=0.5,
-        description="Fraction of center lines to treat as ACS (Auto-Calibration Signal) for masking DC updates in low-frequencies.",
-    )
     enable_acs_decoupling: bool = Field(
         default=False,
         description="If True, nullifies DC gradient update in the ACS center to prevent Bessel ringing artifacts (Step 2.2).",
     )
-    enable_acs_replacement: bool = Field(
-        default=True,
-        description="If True, hard-replaces predicted ACS lines with ground truth lines during inference/validation (Step 2.3).",
+
+    # The two unread ACS knobs (#563) are refused here; the records are in removals.py.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("physics.data_consistency"))  # type: ignore[arg-type]
     )
 
     # ==================== CORE DC PARAMETERS ====================
@@ -178,7 +175,6 @@ class CoilSensitivityConfig(BaseModel):
     Example:
         >>> coil_config = CoilSensitivityConfig(
         ...     enable_estimation=True,
-        ...     estimation_method="espirit",
         ...     precomputed_path="/path/to/coil_maps.npy",
         ... )
     """
@@ -189,13 +185,15 @@ class CoilSensitivityConfig(BaseModel):
         "frozen": True,
     }
 
+    # `estimation_method` was never read (#306); the estimator is chosen by
+    # physics.coil_processing.estimation.method. Refused here, record in removals.py.
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("physics.coil_sensitivity"))  # type: ignore[arg-type]
+    )
+
     enable_estimation: bool = Field(
         default=False,
         description="Estimate coil sensitivities during training",
-    )
-    estimation_method: str = Field(
-        default="espirit",
-        description="Method for coil sensitivity estimation: espirit, walsh, sos",
     )
     estimation_type: str = Field(
         default="dynamic",
@@ -717,6 +715,142 @@ class BlochSimulationConfig(BaseModel):
     )
 
 
+#: B0 (T) of each scanner-profile preset. The one owner: the presets in
+#: ``infrastructure/physics/scanner_profile.py`` read their field from here, so the load-time
+#: conflict check against ``physics.field_strength`` needs no infrastructure import.
+SCANNER_PRESET_FIELD_STRENGTH_T: dict[str, float] = {"m4raw_0.3T": 0.3, "fastmri_3T": 3.0}
+
+
+#: Acquisition-block geometry knob -> the modes in which some twin operator reads it (Ruling 48).
+_GEOMETRY_KNOB_READ_IN: dict[str, frozenset[str]] = {
+    # The mm-declared SLICE_2D kernels read voxel_mm through the slice geometry too.
+    "voxel_mm": frozenset({"slice_2d", "multislice_2d", "volume_3d"}),
+    "slice_thickness_mm": frozenset({"multislice_2d"}),
+    "slice_order": frozenset({"multislice_2d"}),
+    "line_order": frozenset({"volume_3d"}),
+}
+
+
+def _knob_modes(knobs: list[str]) -> dict[str, list[str]]:
+    return {k: sorted(_GEOMETRY_KNOB_READ_IN[k]) for k in knobs}
+
+
+class DigitalTwinAcquisitionConfig(BaseModel):
+    """``physics.digital_twin.acquisition``: the scanner the twin's registry operators simulate.
+
+    Present, it builds one ``ScannerProfile`` (B0 = ``physics.field_strength``) that conditions
+    the stage-5 registry degradations; absent, no profile exists and the twin is unchanged.
+    A ``null`` field takes the preset's value, or the ``AcquisitionGeometry`` default
+    (``slice_2d``, unknown voxel) without a preset. The Literals mirror the physics enums
+    ``AcquisitionMode``, ``SliceOrder``, ``LineOrder`` and ``Sequence``.
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    scanner_profile: str | None = Field(
+        default=None,
+        description="Preset supplying the defaults: "
+        f"{', '.join(SCANNER_PRESET_FIELD_STRENGTH_T)}. Its B0 must equal physics.field_strength.",
+    )
+    mode: Literal["slice_2d", "multislice_2d", "volume_3d"] | None = Field(
+        default=None, description="Acquisition encoding of the simulated input."
+    )
+    voxel_mm: tuple[float, float, float] | None = Field(
+        default=None,
+        description="Voxel size (slice/kz, pe, ro) in mm, read in every mode.",
+    )
+    slice_thickness_mm: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Excited slice thickness, multislice_2d only; needs voxel_mm.",
+    )
+    slice_gap_mm: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Refused when set: no operator reads it (gap = voxel_mm[0] - thickness).",
+    )
+    slice_order: Literal["sequential", "interleaved"] | None = Field(
+        default=None, description="Temporal slice excitation order, multislice_2d only."
+    )
+    line_order: Literal["linear", "centric", "kz_inner", "ky_inner"] | None = Field(
+        default=None, description="Temporal (kz, ky) line order, volume_3d only."
+    )
+    sequence: (
+        Literal[
+            "spin_echo",
+            "tse",
+            "gre",
+            "spoiled_gre",
+            "ir_tse",
+            "mprage",
+            "bssfp",
+            "epi",
+            "radial",
+            "spiral",
+        ]
+        | None
+    ) = Field(default=None, description="Pulse-sequence family; required without a preset.")
+    readout_bw_hz_per_px: float | None = Field(
+        default=None, gt=0.0, description="Readout bandwidth per pixel; required without a preset."
+    )
+
+    @field_validator("scanner_profile")
+    @classmethod
+    def _preset_is_known(cls, value: str | None) -> str | None:
+        if value is not None and value not in SCANNER_PRESET_FIELD_STRENGTH_T:
+            raise ValueError(
+                f"unknown scanner_profile {value!r}; presets: {sorted(SCANNER_PRESET_FIELD_STRENGTH_T)}"
+            )
+        return value
+
+    @field_validator("voxel_mm")
+    @classmethod
+    def _voxel_is_positive(
+        cls, value: tuple[float, float, float] | None
+    ) -> tuple[float, float, float] | None:
+        if value is not None and min(value) <= 0:
+            raise ValueError(f"voxel_mm entries must be > 0, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _custom_profile_is_complete(self) -> "DigitalTwinAcquisitionConfig":
+        # Every preset is slice_2d, so an undeclared mode is slice_2d.
+        mode = self.mode or "slice_2d"
+        unread = [
+            k
+            for k, modes in _GEOMETRY_KNOB_READ_IN.items()
+            if getattr(self, k) is not None and mode not in modes
+        ]
+        if unread:
+            raise ValueError(
+                f"physics.digital_twin.acquisition {unread} would be inert in mode {mode}: no "
+                f"operator reads them there. They are read in {_knob_modes(unread)}."
+            )
+        if self.slice_gap_mm is not None:
+            raise ValueError(
+                "physics.digital_twin.acquisition slice_gap_mm is read by no operator: the "
+                "stack spacing is voxel_mm[0], so the gap is voxel_mm[0] - slice_thickness_mm. "
+                "Declare those instead."
+            )
+        if (
+            self.slice_thickness_mm is not None
+            and self.voxel_mm is None
+            and self.scanner_profile is None
+        ):
+            raise ValueError(
+                "physics.digital_twin.acquisition slice_thickness_mm is read as "
+                "slice_thickness_mm / voxel_mm[0]; declare voxel_mm (or a scanner_profile)"
+            )
+        if self.scanner_profile is None:
+            missing = [k for k in ("readout_bw_hz_per_px", "sequence") if getattr(self, k) is None]
+            if missing:
+                raise ValueError(
+                    f"physics.digital_twin.acquisition without a scanner_profile preset must "
+                    f"declare {missing}"
+                )
+        return self
+
+
 class DigitalTwinConfig(BaseModel):
     """Digital Twin MRI Simulator configuration.
 
@@ -751,8 +885,8 @@ class DigitalTwinConfig(BaseModel):
             "accepted: the simulator's 14 NATIVE axes (motion, noise, b0, b1, "
             "undersampling, gibbs, chemical_shift, eddy_current, spike_noise, "
             "rf_zipper, rf_crosstalk, b0_distortion, gradient_nonlinearity, "
-            "magic_angle), which modulate its built-in pipeline; and any of the "
-            "31 keys of infrastructure.physics.digital_twin_extensions."
+            "magic_angle), which modulate its built-in pipeline; and any key of "
+            "infrastructure.physics.degradations."
             "DEGRADATION_REGISTRY (rigid_motion, pulsatile_motion, rician, "
             "spike, nyquist_ghost, susceptibility, t2star_blur, partial_fourier, "
             "...), applied as standalone operators. A name in both banks is "
@@ -798,7 +932,7 @@ class DigitalTwinConfig(BaseModel):
             "thermal noise grows smoothly with the corruption factor while motion "
             "is closer to all-or-nothing, and a single shape for both is a modelling "
             "assumption rather than a physical one. Keys must name a known axis "
-            "(the 14 native plus the 31 DEGRADATION_REGISTRY operators) AND appear "
+            "(a native axis or a DEGRADATION_REGISTRY operator) AND appear "
             "in progressive_degradations -- an axis absent from that list is held "
             "static at full strength, so a schedule on it could never fire."
         ),
@@ -1028,6 +1162,17 @@ class DigitalTwinConfig(BaseModel):
         le=16.0,
         description="Undersampling acceleration factor (1=fully sampled)",
     )
+    mask_axis: Literal["phase", "readout"] | None = Field(
+        default=None,
+        description=(
+            "Which k-space lines the undersampling mask drops: 'phase' (the "
+            "phase-encode lines) or 'readout'. Resolved through "
+            "data.acquisition.phase_encode_axis, and required to be declared when "
+            "set. Unset keeps the historical row (dim -2) mask, which is the readout "
+            "on M4Raw T1/T2/FLAIR data, so any arm that means phase-encode "
+            "undersampling must set 'phase'."
+        ),
+    )
     ood_acceleration_range: list[float] | None = Field(
         default=None,
         description=(
@@ -1163,13 +1308,13 @@ class DigitalTwinConfig(BaseModel):
         default=0.75,
         ge=0.0,
         le=1.0,
-        description="Normalised FE position of the RF leak (0–1)",
+        description="Image-space FE position of the zipper line, as a fraction of the FOV (0 to 1)",
     )
     rf_zipper_intensity: float = Field(
         default=0.15,
         ge=0.0,
         le=1.0,
-        description="Zipper amplitude relative to peak k-space magnitude",
+        description="RMS of the zipper interference relative to the k-space RMS",
     )
 
     # ── Magic angle effect ──
@@ -1197,6 +1342,13 @@ class DigitalTwinConfig(BaseModel):
         ge=0.0,
         le=0.5,
         description="Approximate fraction of FOV containing collagen-like structures",
+    )
+
+    # ── Acquisition geometry + scanner profile ──
+    acquisition: DigitalTwinAcquisitionConfig | None = Field(
+        default=None,
+        description="Scanner profile conditioning the registry operators (stage 5); "
+        "null = no profile, the twin's output is unchanged.",
     )
 
 
@@ -1418,6 +1570,17 @@ class SubvoxelRegistrationConfig(BaseModel):
             "default spans +/-0.5 LR pixel, i.e. the full sub-pixel range."
         ),
     )
+    marker_realisation: Literal["fixed", "per_sample"] = Field(
+        default="fixed",
+        description=(
+            "'fixed' uses the one marker_seed lattice for every sample and step, "
+            "so the probe target is constant and can be memorised. 'per_sample' "
+            "draws one jittered lattice per sample, seeded from (marker_seed, "
+            "family, epoch, ordinal): training uses even seeds, validation odd "
+            "seeds that ignore the epoch, so validation markers are never seen in "
+            "training and every pass over one checkpoint scores the same ones."
+        ),
+    )
 
     # ---- Physical-units mode (mm), for real anisotropic acquisitions --------
     # The pixel knobs above are correct for the synthetic single-slice M4Raw arm,
@@ -1529,7 +1692,9 @@ class SubvoxelRegistrationConfig(BaseModel):
                     "same number of axes."
                 )
             bad = [
-                (g, e) for g, e in zip(self.voxel_mm, self.effective_voxel_mm, strict=True) if e < g
+                (g, e)
+                for g, e in zip(self.voxel_mm, self.effective_voxel_mm or (), strict=True)
+                if e < g
             ]
             if bad:
                 raise ValueError(
@@ -1611,6 +1776,19 @@ class RelaxometricCalibrationConfig(BaseModel):
             "is attributable (pitfall #17)."
         ),
     )
+    factor_form: Literal["scalar", "tissue_map"] = Field(
+        default="scalar",
+        description=(
+            "Shape of kappa in the factored head. 'scalar' multiplies by the "
+            "fiducial's one declared constant, which is all the factored arm did "
+            "before 2026-10 and which reduces to an output scale, because the "
+            "simulated anatomy transfer is tissue-dependent. 'tissue_map' makes "
+            "the model emit 3 extra channels of tissue-class logits and uses "
+            "kappa(x) = sum_c softmax_c * kappa_c over the DECLARED per-tissue "
+            "gains, so the gain values stay analytic and only the tissue layout "
+            "is learned. Requires factored=True and model.out_channels = 4."
+        ),
+    )
     source: "AcquisitionParamsConfig | None" = Field(
         default=None, description="The acquisition being translated FROM (ULF)."
     )
@@ -1672,6 +1850,15 @@ class RelaxometricCalibrationConfig(BaseModel):
             raise ValueError(
                 "relaxometric_calibration.factored=True with enabled=False: the "
                 "model would be scaled by a kappa the simulator never applied."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _tissue_map_requires_factored(self) -> "RelaxometricCalibrationConfig":
+        if self.factor_form == "tissue_map" and not self.factored:
+            raise ValueError(
+                "relaxometric_calibration.factor_form='tissue_map' requires "
+                "factored=True: an unfactored arm applies no kappa of any shape."
             )
         return self
 
@@ -1764,6 +1951,18 @@ class ForwardPsfConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _one_kernel_conditions_the_model(self) -> "ForwardPsfConfig":
+        # The kernel reaches the model as one |OTF| channel per sample; a varying
+        # control grid has no single OTF to render.
+        if self.enabled and (self.control_rows != 1 or self.control_cols != 1):
+            raise ValueError(
+                "forward_psf conditions the model on one kernel per sample, so "
+                "control_rows/control_cols must be 1, got "
+                f"{self.control_rows}x{self.control_cols}."
+            )
+        return self
+
 
 class AnchorConformalConfig(BaseModel):
     """Per-voxel prediction intervals calibrated on the fiducial.
@@ -1822,6 +2021,24 @@ class AnchorConformalConfig(BaseModel):
             "this until the gate passes defeats the gate."
         ),
     )
+    calibration_source: Literal["marker", "held_out_subjects"] = Field(
+        default="marker",
+        description=(
+            "'marker' refits per validation batch on fiducial residuals, with the "
+            "marker stack fed through the anatomy slot (an input the network never "
+            "trained on). 'held_out_subjects' banks ANATOMY residuals of the "
+            "ordinary forward pass per subject over a whole validation pass, "
+            "calibrates on the first calibration_subject_count subjects (sorted "
+            "by id) and measures coverage on the rest; a calibration subject seen "
+            "in training raises. Needs subject_id on every batch and a "
+            "subject-grouped validation split with more subjects than that count."
+        ),
+    )
+    calibration_subject_count: int = Field(
+        default=1,
+        ge=1,
+        description="Validation subjects that calibrate under 'held_out_subjects'.",
+    )
 
 
 class BandProbeConfig(BaseModel):
@@ -1875,6 +2092,16 @@ class BandProbeConfig(BaseModel):
             "control arm). Sub-Nyquist bands are excluded from the LOSS on "
             "purpose: they are directly measured by the LR frames and need no "
             "probe, so including them would blur what the term buys."
+        ),
+    )
+    target_realisation: Literal["matched", "mismatched"] = Field(
+        default="matched",
+        description=(
+            "Which marker the INSTRUMENT term (lambda_band) is optimised against. "
+            "'mismatched' is the wrong-marker control: the probe input carries "
+            "one realisation and the loss targets another of the same geometry, "
+            "so the term keeps its magnitude and gradient path but carries no "
+            "information. The reported val_snf_* always score the matched marker."
         ),
     )
     lambda_anatomy: float = Field(
@@ -1933,6 +2160,19 @@ class BandProbeConfig(BaseModel):
     )
 
 
+def subvoxel_input_channels(macq: Any) -> int:
+    """Width of the model input the ``subvoxel_sr`` strategy builds.
+
+    The one owner of this arithmetic: the strategy raises on a mismatch at
+    setup and the config health check reports it at audit time, both from here.
+    n frames + 2n shift maps, + n fiducial frames with ``marker_channels``, + 1
+    forward-PSF channel when ``forward_psf`` is enabled.
+    """
+    per_frame = 4 if getattr(macq, "marker_channels", False) else 3
+    psf = getattr(macq, "forward_psf", None)
+    return int(macq.n_frames) * per_frame + int(bool(getattr(psf, "enabled", False)))
+
+
 class MultiAcquisitionConfig(BaseModel):
     """Faithful multi-acquisition synthesis for VF field-mapping arms.
 
@@ -1987,6 +2227,29 @@ class MultiAcquisitionConfig(BaseModel):
             "in_channels). >= 4 is the elliptical-signal-model identifiability "
             "floor (Xiang-Hoff); the first-harmonic phase-cycle DFT needs it to "
             "resolve absolute off-resonance over one period."
+        ),
+    )
+    input_stream: Literal["twin", "acquired"] = Field(
+        default="twin",
+        description=(
+            "Where subvoxel_sr's low-resolution frames come from. 'twin' "
+            "synthesises them from the 3T TARGET (dither + pool): a digital-twin "
+            "SR problem on real 3T anatomy, which is what every arm ran before "
+            "2026-10. 'acquired' pools the loaded INPUT (the registered 64 mT "
+            "volume) instead, so the network sees the real low-field acquisition: "
+            "one frame, no dither, no fiducial. Requires n_frames=1, "
+            "shift_source='blind', no marker consumer, and fov_mask="
+            "'acquired_support'."
+        ),
+    )
+    fov_mask: Literal["none", "acquired_support"] = Field(
+        default="none",
+        description=(
+            "'acquired_support' restricts the loss and every validation metric to "
+            "voxels where the loaded 64 mT input is nonzero. The registration "
+            "resample zero-fills outside the ULF field of view, so those voxels "
+            "carry no acquired signal; a twin control declares it too, so both "
+            "arms are scored on the same voxels."
         ),
     )
     use_real_stack: bool = Field(
@@ -2047,7 +2310,10 @@ class MultiAcquisitionConfig(BaseModel):
             "ablation, carrying the real marker even where the model does not "
             "route through it, so architecture, parameter count and input "
             "geometry stay fixed and only the routing varies -- the same design "
-            "as the shift-knowledge ladder."
+            "as the shift-knowledge ladder.\n\n"
+            "Allowed with shift_source='blind': the fiducial is still synthesised "
+            "and fed to the model, but the shift maps are zero, so the marker "
+            "channels are the only registration information the network gets."
         ),
     )
     band_probe: "BandProbeConfig" = Field(
@@ -2171,7 +2437,14 @@ class MultiAcquisitionConfig(BaseModel):
         """The calibration set IS the marker residual set."""
         if not self.anchor_conformal.enabled:
             return self
-        if self.method != "subvoxel_sr" or self.subvoxel_registration.shift_source != "recovered":
+        if self.method != "subvoxel_sr":
+            raise ValueError(
+                f"anchor_conformal requires method='subvoxel_sr', got {self.method!r}."
+            )
+        # Held-out-subject calibration reads anatomy residuals, not the marker.
+        if self.anchor_conformal.calibration_source == "held_out_subjects":
+            return self
+        if self.subvoxel_registration.shift_source != "recovered":
             raise ValueError(
                 "anchor_conformal requires method='subvoxel_sr' with "
                 "subvoxel_registration.shift_source='recovered'. The whole "
@@ -2200,6 +2473,34 @@ class MultiAcquisitionConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _acquired_input_is_a_single_real_frame(self) -> "MultiAcquisitionConfig":
+        """The acquired stream is one real frame with no marker and no dither."""
+        if self.fov_mask != "none" and self.method != "subvoxel_sr":
+            raise ValueError(f"fov_mask requires method='subvoxel_sr', got {self.method!r}.")
+        if self.input_stream != "acquired":
+            return self
+        problems = []
+        if self.method != "subvoxel_sr":
+            problems.append(f"method={self.method!r} (needs 'subvoxel_sr')")
+        if self.n_frames != 1:
+            problems.append(f"n_frames={self.n_frames} (one acquisition: needs 1)")
+        if self.subvoxel_registration.shift_source != "blind":
+            problems.append("shift_source must be 'blind' (no known dither)")
+        if self.marker_channels or self.subvoxel_registration.marker_realisation != "fixed":
+            problems.append("no fiducial exists in an acquired scan (marker_channels)")
+        if self.forward_psf.enabled or self.relaxometric_calibration.enabled:
+            problems.append("forward_psf / relaxometric_calibration read the fiducial")
+        if self.band_probe.lambda_band > 0.0:
+            problems.append("band_probe.lambda_band > 0 probes the fiducial")
+        if self.anchor_conformal.enabled and self.anchor_conformal.calibration_source == "marker":
+            problems.append("anchor_conformal calibrates on the fiducial")
+        if self.fov_mask != "acquired_support":
+            problems.append("fov_mask must be 'acquired_support' (outside-FOV voxels are zero)")
+        if problems:
+            raise ValueError("input_stream='acquired' is inconsistent: " + "; ".join(problems))
+        return self
+
+    @model_validator(mode="after")
     def _marker_channels_need_a_marker(self) -> "MultiAcquisitionConfig":
         """Feeding the model a marker channel requires a marker to feed it."""
         if not self.marker_channels:
@@ -2209,13 +2510,15 @@ class MultiAcquisitionConfig(BaseModel):
                 f"marker_channels=True requires method='subvoxel_sr', got "
                 f"{self.method!r}; no other method synthesises a fiducial."
             )
-        if self.subvoxel_registration.shift_source != "recovered":
+        # 'blind' is allowed: the marker is synthesised and fed to the model while
+        # the shift maps stay zero, so it is the only registration source.
+        if self.subvoxel_registration.shift_source not in ("recovered", "blind"):
             raise ValueError(
                 "marker_channels=True requires "
-                "subvoxel_registration.shift_source='recovered', got "
-                f"{self.subvoxel_registration.shift_source!r}. The fiducial is "
-                "only synthesised on that rung, so the extra channels would be "
-                "zeros under a name that says otherwise."
+                "subvoxel_registration.shift_source 'recovered' or 'blind', got "
+                f"{self.subvoxel_registration.shift_source!r}. Under 'oracle' the "
+                "true offsets are already handed over, so a marker channel cannot "
+                "be the registration source the arm would claim it is."
             )
         return self
 
@@ -2266,6 +2569,11 @@ class MultiAcquisitionConfig(BaseModel):
                 "fiducial passed through the network. `lambda_anatomy` has no "
                 "such requirement -- it acts on the anatomy pair."
             )
+        if probe.target_realisation == "mismatched" and probe.lambda_band <= 0.0:
+            raise ValueError(
+                "band_probe.target_realisation='mismatched' requires lambda_band > 0: "
+                "the wrong target only enters the optimised instrument term."
+            )
         return self
 
     @model_validator(mode="after")
@@ -2277,9 +2585,18 @@ class MultiAcquisitionConfig(BaseModel):
                 f"method='subvoxel_sr', not {self.method!r}. Declaring it here "
                 "would advertise a mechanism nothing reads (CLAUDE.md #15)."
             )
-        if reg.shift_source == "recovered" and reg.marker_jitter <= 0.0:
+        if reg.marker_realisation == "per_sample" and not (
+            reg.shift_source == "recovered" or self.marker_channels
+        ):
             raise ValueError(
-                "shift_source='recovered' requires marker_jitter > 0. A perfectly "
+                "marker_realisation='per_sample' needs a synthesised fiducial "
+                "(shift_source='recovered' or marker_channels=True); otherwise no "
+                "marker exists to realise."
+            )
+        if (reg.shift_source == "recovered" or self.marker_channels) and reg.marker_jitter <= 0.0:
+            raise ValueError(
+                "a synthesised fiducial (shift_source='recovered' or "
+                "marker_channels=True) requires marker_jitter > 0. A perfectly "
                 "periodic fiducial lattice has a comb spectrum (0.27% of bins "
                 "populated) and is ambiguous modulo one lattice period under "
                 "translation, so phase correlation cannot register it: measured "
@@ -2437,6 +2754,22 @@ class PhysicsConfigSchema(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _scanner_preset_matches_field_strength(self) -> "PhysicsConfigSchema":
+        """``field_strength`` owns B0, so a twin preset at another field is a contradiction."""
+        acq = self.digital_twin.acquisition
+        if acq is None or acq.scanner_profile is None:
+            return self
+        preset_b0 = SCANNER_PRESET_FIELD_STRENGTH_T[acq.scanner_profile]
+        if not math.isclose(preset_b0, self.field_strength, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                f"physics.digital_twin.acquisition.scanner_profile={acq.scanner_profile!r} is a "
+                f"{preset_b0} T scanner but physics.field_strength={self.field_strength} T. "
+                "field_strength is the one B0 owner: set it to the preset's field, or drop "
+                "the preset and declare readout_bw_hz_per_px and sequence."
+            )
+        return self
+
 
 # Re-export the new sub-schemas alongside the existing public surface.
 __all__ = [
@@ -2455,6 +2788,8 @@ __all__ = [
     "PINNConfig",
     "BlochSimulationConfig",
     "DigitalTwinConfig",
+    "DigitalTwinAcquisitionConfig",
+    "SCANNER_PRESET_FIELD_STRENGTH_T",
     # v6.1
     "ConcomitantFieldConfig",
     "RelaxationPriorsConfig",

@@ -206,9 +206,15 @@ def test_all_reduce_val_metrics_noop_without_process_group():
     """On the default single-process path (no process group) the reducer is a
     no-op: returns the accumulators and count unchanged."""
     accum = {"psnr": 20.0, "l1": 4.0}
-    out_accum, out_count = train_mod._all_reduce_val_metrics(accum, 7, torch.device("cpu"))
+    finite = {"psnr": 7.0, "l1": 6.0}
+    seen = {"psnr": 7.0, "l1": 7.0}
+    out_accum, out_finite, out_seen, out_count = train_mod._all_reduce_val_metrics(
+        accum, finite, seen, 7, torch.device("cpu")
+    )
     assert out_count == 7
     assert out_accum == {"psnr": 20.0, "l1": 4.0}
+    assert out_finite == {"psnr": 7.0, "l1": 6.0}
+    assert out_seen == {"psnr": 7.0, "l1": 7.0}
 
 
 def test_all_reduce_val_metrics_single_rank_identity():
@@ -235,10 +241,16 @@ def test_all_reduce_val_metrics_single_rank_identity():
         pytest.skip(f"could not init gloo process group: {exc}")
     try:
         accum = {"psnr": 20.0, "l1": torch.tensor(4.0)}
-        out_accum, out_count = train_mod._all_reduce_val_metrics(accum, 8, torch.device("cpu"))
+        finite = {"psnr": 8.0, "l1": torch.tensor(7.0)}
+        seen = {"psnr": 8.0, "l1": 8.0}
+        out_accum, out_finite, out_seen, out_count = train_mod._all_reduce_val_metrics(
+            accum, finite, seen, 8, torch.device("cpu")
+        )
+        assert out_seen == {"psnr": pytest.approx(8.0), "l1": pytest.approx(8.0)}
         assert out_count == 8
         assert out_accum["psnr"] == pytest.approx(20.0)
         assert out_accum["l1"] == pytest.approx(4.0)  # tensor coerced to float
+        assert out_finite == {"psnr": pytest.approx(8.0), "l1": pytest.approx(7.0)}
     finally:
         dist.destroy_process_group()
 
@@ -256,7 +268,7 @@ def _cfg(spatial_dims: int) -> SimpleNamespace:
     # patch_size H,W == input H,W so the square-pad step never fires here.
     return SimpleNamespace(
         model=SimpleNamespace(spatial_dims=spatial_dims),
-        data=SimpleNamespace(patch_size=[32, 32, 3]),
+        data=SimpleNamespace(sampling=SimpleNamespace(patch_size=[32, 32, 3])),
     )
 
 
@@ -386,6 +398,66 @@ class TestVisualCaptureMissEscalation:
                 pipeline._visual_capture_misses = 0
         # Escalates once per unbroken run of misses, not once per miss.
         assert escalations == 2
+
+
+class TestVisualCaptureInputs:
+    """``visual_capture_inputs``: the tensors and context the validation image is rendered on.
+
+    EI multi-coil and Robust-SSDU raised inside ``_validation_forward`` on the bare
+    context, so their runs reported metrics and saved no validation image (#2431).
+    """
+
+    _X = torch.zeros(1, 2, 4, 4)
+    _Y = torch.ones(1, 2, 4, 4)
+
+    def _batch(self) -> dict:
+        return {"input": self._X, "target": self._Y, "field_strength_target": torch.tensor([7.0])}
+
+    def test_a_strategy_without_the_hook_keeps_the_bare_context(self) -> None:
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        x, y, context = visual_capture_inputs(SimpleNamespace(), self._X, self._Y, self._batch())
+        assert x is self._X and y is self._Y
+        assert context["use_dc"] is False and context["measured_kspace"] is None
+        assert context["input"] is self._X and context["target"] is self._Y
+        assert context["field_strength_target"].item() == 7.0
+
+    def test_a_hook_returning_none_keeps_the_bare_context(self) -> None:
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        strategy = SimpleNamespace(validation_batch_context=lambda *_: None)
+        _, _, context = visual_capture_inputs(strategy, self._X, self._Y, self._batch())
+        assert set(context) == {"use_dc", "measured_kspace", "input", "target", "field_strength_target"}
+
+    def test_the_bare_context_renders_on_the_prepared_tensors(self) -> None:
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        px, py = torch.randn(2, 2, 4, 4), torch.randn(2, 2, 4, 4)
+        strategy = SimpleNamespace(_prepare_validation_data=lambda *_: (px, py, None))
+        x, y, context = visual_capture_inputs(strategy, self._X, self._Y, self._batch())
+        assert x is px and y is py and context["input"] is px and context["target"] is py
+
+    def test_the_hook_context_is_used_on_the_graded_tensors(self) -> None:
+        """Preparing would fold a multi-coil input and misalign it from the hook's maps."""
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        measured, own_input = torch.randn(1, 8, 4, 4), torch.randn(1, 2, 4, 4)
+        seen: list = []
+
+        def hook(input_batch, target_batch, batch):
+            seen.append((input_batch, target_batch, batch))
+            return {"mask": torch.ones(1, 1, 4, 4), "measured_kspace": measured, "input": own_input}
+
+        def prepare(*_):
+            raise AssertionError("a strategy with a batch context must render on the graded tensors")
+
+        batch = self._batch()
+        strategy = SimpleNamespace(validation_batch_context=hook, _prepare_validation_data=prepare)
+        x, y, context = visual_capture_inputs(strategy, self._X, self._Y, batch)
+        assert seen == [(self._X, self._Y, batch)] and x is self._X and y is self._Y
+        assert context["measured_kspace"] is measured and "mask" in context
+        assert context["input"] is own_input, "the loop's input must not overwrite the hook's"
+        assert context["target"] is self._Y and "field_strength_target" in context
 
 
 class TestOutputSanityEscalation:
@@ -765,17 +837,18 @@ def test_train_resolves_target_size_from_patch_size_only() -> None:
     """`_resize_to_target`'s `elif hasattr(data_cfg, "image_size")` branch was
     doubly dead: the field is undeclared on an extra="ignore" block, and
     `migrate_legacy_sizes` already folds img_size/target_size/image_size into
-    `patch_size`. Re-declaring it would resurrect the spelling the migration
+    `patch_size`. Redeclaring it would resurrect the spelling the migration
     exists to retire."""
     import ast
     import inspect
 
-    from spectramr.config.schemas.data import DataConfigSchema
+    from spectramr.config.schemas.data import DataConfigSchema, DataSamplingConfigSchema
     from spectramr.pipelines import train
 
     assert "image_size" not in DataConfigSchema.model_fields
+    assert "image_size" not in DataSamplingConfigSchema.model_fields
     # The canonical key the migration folds into is still there.
-    assert "patch_size" in DataConfigSchema.model_fields
+    assert "patch_size" in DataSamplingConfigSchema.model_fields
 
     # AST, not a substring: the removal left an explanatory comment that quotes
     # the old `hasattr(data_cfg, "image_size")` probe verbatim, and a grep-based
@@ -914,6 +987,14 @@ class TestValidationCsvDerivation:
 
         got = validation_csv_for("/runs/a/logs/curve.csv")
         assert got.as_posix() == "/runs/a/logs/validation_metrics.csv"
+
+    def test_the_writer_uses_the_rule_infrastructure_readers_import(self):
+        """One owner: train.py re-uses the rule, it does not keep a copy (#2478)."""
+        from spectramr.infrastructure.training import validation_rows
+        from spectramr.pipelines import train
+
+        assert train.validation_csv_for is validation_rows.validation_csv_for
+        assert train.validation_batches_csv_for is validation_rows.validation_batches_csv_for
 
 
 class TestBestFoldsBothCsvs:
@@ -1104,20 +1185,14 @@ class TestReportingHasOneEntryPoint:
         )
         assert any(lvl == "warning" for lvl, _ in seen)
 
-    def test_training_loop_no_longer_generates_a_report(self):
-        """The ungated legacy call site is gone. The CLASS stays —
-        ``scripts/render_full_reporting_pipeline.py`` still builds from it — so
-        this asserts the CALL SITE, not the module's existence."""
-        import inspect
+    def test_the_legacy_report_generators_are_gone(self):
+        """``generate_report`` is the one report entry point; the ungated legacy
+        generators it replaced are deleted rather than kept beside it."""
+        import importlib.util
 
-        from spectramr.pipelines import training_loop
-
-        src = inspect.getsource(training_loop)
-        code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
-        assert "MetricsReportGenerator(" not in code, (
-            "training_loop instantiates MetricsReportGenerator again — reporting "
-            "has two entry points and the ungated one wins on every run."
-        )
+        for mod in ("metrics_report_generator", "advanced_reporting", "_training_curves"):
+            name = f"spectramr.infrastructure.reporting.{mod}"
+            assert importlib.util.find_spec(name) is None, f"{name} is back"
 
 
 class TestAnAllNaNValidationRowFailsTheRun:
@@ -1130,7 +1205,7 @@ class TestAnAllNaNValidationRowFailsTheRun:
     The state is unrecoverable rather than merely uninformative — a NaN monitor
     disarms `save_best` (gated on `math.isfinite`) and freezes `wait_count` in
     `EarlyStoppingService.update`, so the run trains to its full budget and
-    exits 0 with no `checkpoint_best.pt`. That is the #178 outcome reached
+    exits 0 with no best checkpoint. That is the #178 outcome reached
     through a value.
     """
 
@@ -1174,73 +1249,84 @@ class TestAnAllNaNValidationRowFailsTheRun:
 
 
 class TestRunSummaryRecordsWhereCheckpointsWent:
-    """#503 part 1: an empty `checkpoints/` cannot say WHY it is empty.
+    """#503, #1972: the summary names the directory the saves actually wrote.
 
-    exp_vf_01 retrieved a present-but-empty directory while its log named two
-    files it had written. Both were true — the arm's `checkpoint_dir` pointed
-    outside the collected run directory, so the files existed on the cluster and
-    the bundle never contained them. "Written elsewhere" and "never written"
-    need opposite responses (fix the sync vs fix the run), so the footer has to
-    tell them apart.
+    Every training-loop save writes ``<run_dir>/checkpoints``. The summary used
+    to report ``checkpoint.checkpoint_dir`` instead, which no save reads: on the
+    227 arms that inherit ``./checkpoints`` it pointed at the launch CWD and
+    warned that checkpoints were missing or outside the run.
     """
 
-    @staticmethod
-    def _summary(tmp_path, ckpt_dir):
+    def test_the_reported_dir_is_where_the_saves_land_not_the_declared_key(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Planted: the default ``./checkpoints`` under the launch CWD, files in the run."""
+        import json
+        import logging
         from types import SimpleNamespace
 
-        from spectramr.pipelines.train import _checkpoint_summary
+        from spectramr.pipelines import train as train_mod
 
-        cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=str(ckpt_dir)))
-        return _checkpoint_summary(cfg, tmp_path)
-
-    def test_a_dir_inside_the_run_is_flagged_inside(self, tmp_path):
-        ck = tmp_path / "checkpoints"
-        ck.mkdir()
-        assert self._summary(tmp_path, ck)["inside_run_dir"] is True
-
-    def test_a_dir_outside_the_run_is_flagged_outside(self, tmp_path):
-        """The exp_vf_01 shape, and the one that matters."""
-        outside = tmp_path.parent / "elsewhere_checkpoints"
-        outside.mkdir(exist_ok=True)
-        assert self._summary(tmp_path, outside)["inside_run_dir"] is False
+        monkeypatch.chdir(tmp_path)
+        run_dir = tmp_path / "experiments" / "results" / "arm"
+        ck = run_dir / "checkpoints"
+        ck.mkdir(parents=True)
+        (ck / "step_00000002.safetensors").write_bytes(b"x" * 5)
+        config = SimpleNamespace(
+            metadata=SimpleNamespace(name="arm", author=None),
+            logging=SimpleNamespace(identity=SimpleNamespace(run=None)),
+            training=SimpleNamespace(strategy_class="S", training_mode="reconstruction"),
+            model=SimpleNamespace(model_type="unet"),
+            checkpoint=SimpleNamespace(enabled=True),
+        )
+        with caplog.at_level(logging.WARNING):
+            train_mod._emit_run_summary(
+                config,
+                run_dir=run_dir,
+                result={"success": True},
+                seed=0,
+                logger_=logging.getLogger(__name__),
+            )
+        out = json.loads((run_dir / "run_summary.json").read_text())["checkpoints"]
+        assert out["dir"] == str(ck.resolve())
+        assert [f["name"] for f in out["files"]] == ["step_00000002.safetensors"]
+        assert out["total_bytes"] == 5
+        assert "OUTSIDE the run directory" not in caplog.text
+        assert "No checkpoint files found" not in caplog.text
+        assert "no checkpoint file is in" not in caplog.text
 
     def test_files_present_are_listed_with_sizes(self, tmp_path):
+        from spectramr.pipelines.train import _checkpoint_summary
+
         ck = tmp_path / "checkpoints"
         ck.mkdir()
-        (ck / "checkpoint_best.pt").write_bytes(b"x" * 11)
+        (ck / "best.pth").write_bytes(b"x" * 11)
         (ck / "notes.txt").write_text("not a checkpoint")
+        (ck / "checkpoint_best.pt").write_bytes(b"x" * 7)
 
-        out = self._summary(tmp_path, ck)
+        out = _checkpoint_summary(tmp_path)
 
-        assert [f["name"] for f in out["files"]] == ["checkpoint_best.pt"]
+        assert [f["name"] for f in out["files"]] == ["best.pth"]
         assert out["total_bytes"] == 11
 
-    def test_an_empty_dir_is_distinguishable_from_an_absent_one(self, tmp_path):
-        """Empty-with-a-path and no-path-at-all are different diagnoses."""
-        ck = tmp_path / "checkpoints"
-        ck.mkdir()
-        empty = self._summary(tmp_path, ck)
-        assert empty["dir"] is not None and empty["files"] == []
-
-        from types import SimpleNamespace
-
+    def test_an_absent_dir_reports_its_path_and_no_files(self, tmp_path):
         from spectramr.pipelines.train import _checkpoint_summary
 
-        absent = _checkpoint_summary(SimpleNamespace(checkpoint=None), tmp_path)
-        assert absent["dir"] is None
+        out = _checkpoint_summary(tmp_path)
+        assert out["dir"] == str((tmp_path / "checkpoints").resolve())
+        assert out["files"] == []
 
-    def test_it_never_raises(self, tmp_path):
+    def test_it_never_raises(self, tmp_path, monkeypatch):
         """A footer diagnostic must not cost a finished run its summary."""
-        from types import SimpleNamespace
+        from pathlib import Path
 
         from spectramr.pipelines.train import _checkpoint_summary
 
-        class _Explodes:
-            @property
-            def checkpoint_dir(self):
-                raise OSError("network filesystem stat failed")
+        def _explode(self, *a, **k):
+            raise OSError("network filesystem stat failed")
 
-        out = _checkpoint_summary(SimpleNamespace(checkpoint=_Explodes()), tmp_path)
+        monkeypatch.setattr(Path, "resolve", _explode)
+        out = _checkpoint_summary(tmp_path)
         assert out["dir"] is None
 
     def test_the_summary_carries_the_block(self):
@@ -1250,7 +1336,7 @@ class TestRunSummaryRecordsWhereCheckpointsWent:
         from spectramr.pipelines import train
 
         src = inspect.getsource(train._emit_run_summary)
-        assert '"checkpoints": _checkpoint_summary(config, run_dir)' in src
+        assert '"checkpoints": _checkpoint_summary(run_dir)' in src
 
 
 # ---------------------------------------------------------------------------
@@ -1595,7 +1681,7 @@ class TestSeedRankOffsetOrdering:
         assert offset_call < resume, (
             "the rank-offset re-seed moved AFTER stage 9 — resume restores "
             "the saved RNG state (core.rng_state, applied by "
-            "CheckpointDirector.load_from) and a "
+            "checkpointing.resume) and a "
             "later re-seed throws the resumed stream away."
         )
 
@@ -1944,6 +2030,18 @@ class TestTheLogDestinationIsStamped:
             f"the declared logging.sinks.dir is not recorded beside it: {keys}"
         )
 
+    def test_it_records_who_decided_the_log_level(self):
+        """The level is stamped with its source (cli/env/config/default), not as a bare number,
+        so a run launched with ``--log-level`` is distinguishable from one that read the YAML."""
+        tree, _ = self._stamp()
+        assert "level" in self._record_keys(tree), "the resolved log level is not recorded"
+
+    def test_it_records_the_distributed_and_writing_policy(self):
+        """Which ranks log, which stream, and the resolved progress mode are stamped, so a
+        run read off a SLURM file can say why its ``.err`` was empty or full."""
+        tree, _ = self._stamp()
+        assert "policy" in self._record_keys(tree), "the logging policy is not recorded"
+
     def test_a_relocation_is_recorded_as_incomplete_not_omitted(self):
         """Pitfall #16: what cannot be delivered is declared, never dropped. A
         log moved to a temp dir is gone after teardown, so a bare path would read
@@ -1996,7 +2094,7 @@ class TestTheLogDestinationIsStamped:
 # with NEITHER a budget guard NOR an unconditional first/last-iteration force:
 # `logging.intervals.log` and `metrics.train_metric_interval` have both. So an
 # interval above the run's budget produced ZERO validation events in silence --
-# no early stopping, no `checkpoint_best.pt`, exit 0 reporting success.
+# no early stopping, no best checkpoint, exit 0 reporting success.
 #
 # The oracle below is deliberately a re-implementation of the loop's own two
 # gate expressions rather than a table of expected answers: what has to hold is
@@ -2197,81 +2295,28 @@ class TestEpochValidationCanFire:
                         )
 
 
-class TestTheResumeDirectorCarriesTheParallelRuntime:
-    """The resume site built its `CheckpointDirector` without
-    `with_parallel_runtime`, so it resolved `DefaultCheckpointAdapter` no matter
-    what strategy actually wrote the files.
+class TestTheResumeCarriesTheParallelRuntime:
+    """The runtime selects the checkpoint adapter. Without it a ZeRO run's optimizer
+    partitions in the tag directory are never read, and the resume still reports
+    success. A literal ``None`` would satisfy a name-only check, so it is refused."""
 
-    That has two failure modes, and the quiet one is the worse one. A sharded
-    best checkpoint carries no generic payload at all, so resuming from one
-    raised. A *periodic* checkpoint does carry the generic envelope, so the
-    weights restored and the resume reported success -- while the ZeRO optimizer
-    partitions in the tag directory beside it went unread, silently continuing a
-    resumed run on a zeroed optimizer.
-
-    Walks the real AST rather than matching a comment, and rejects a literal
-    `None` argument: `with_parallel_runtime(None)` would satisfy a name-only
-    check while resolving the very adapter this exists to avoid.
-    """
-
-    @staticmethod
-    def _calls_on(tree, receiver):
-        """Every `receiver.<m>(...)` Call node in `tree`, by method name."""
+    def test_the_resume_is_given_the_parallel_runtime(self):
         import ast
 
-        found = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not isinstance(func, ast.Attribute):
-                continue
-            # Walk to the base of the chain: `d.a().b().c()` bottoms out at
-            # `d`. Call and Attribute ALTERNATE, so this has to loop until
-            # neither applies -- two sequential `while`s stop one link short
-            # and silently miss every method past the second.
-            base = func.value
-            while isinstance(base, ast.Call | ast.Attribute):
-                base = base.func if isinstance(base, ast.Call) else base.value
-            if isinstance(base, ast.Name) and base.id == receiver:
-                found.setdefault(func.attr, []).append(node)
-        return found
-
-    def test_the_resume_director_is_given_the_parallel_runtime(self):
-        calls = self._calls_on(_train_ast(), "resume_director")
-
-        # Non-vacuity: if the resume block is ever renamed or restructured this
-        # test must fail loudly rather than pass by finding nothing.
-        assert "load_from" in calls, (
-            "no `resume_director.load_from(...)` found in run_training_pipeline "
-            f"-- the resume block moved; found methods: {sorted(calls)}"
-        )
-        assert "with_parallel_runtime" in calls, (
-            "the resume director is built without with_parallel_runtime, so it "
-            "resolves DefaultCheckpointAdapter and cannot read a sharded "
-            f"strategy's checkpoint; found methods: {sorted(calls)}"
-        )
-
-    def test_the_runtime_argument_is_resolved_not_hardcoded_none(self):
-        import ast
-
-        calls = self._calls_on(_train_ast(), "resume_director")
-        node = calls["with_parallel_runtime"][0]
-
-        assert len(node.args) == 1, (
-            "with_parallel_runtime takes the runtime positionally; "
-            f"got {len(node.args)} positional args"
-        )
-        arg = node.args[0]
-        assert not (isinstance(arg, ast.Constant) and arg.value is None), (
-            "with_parallel_runtime(None) resolves DefaultCheckpointAdapter -- "
-            "the exact adapter this wiring exists to avoid"
-        )
-        src = ast.unparse(arg)
-        assert "parallel" in src, (
-            "the argument should read the runtime off the built environment "
-            f"(the way training_loop.py does); got `{src}`"
-        )
+        calls = [
+            node
+            for node in ast.walk(_train_ast())
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "resume_checkpoint")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "resume")
+            )
+        ]
+        assert calls, "no resume call found in run_training_pipeline"
+        for call in calls:
+            arg = {k.arg: k.value for k in call.keywords}["parallel"]
+            assert not (isinstance(arg, ast.Constant) and arg.value is None)
+            assert "parallel" in ast.unparse(arg)
 
 
 # ---------------------------------------------------------------------------
@@ -2426,6 +2471,363 @@ def test_an_unsizeable_batch_is_reported_not_silently_weighted(caplog):
         )
     messages = [r.getMessage() for r in caplog.records]
     assert any("weighted as a single sample" in m for m in messages), messages
+
+
+class _RaisesOnBatchStrategy(_PerBatchValueStrategy):
+    """Raises on the batch indices in ``fail``, the way a per-sample reverse-loop
+    refusal surfaces from ``validation_step``."""
+
+    def __init__(self, logging_cfg, fail):
+        super().__init__(logging_cfg)
+        self.fail = set(fail)
+
+    def validation_step(self, input_batch, target_batch, batch_idx=0):
+        if batch_idx in self.fail:
+            raise ValueError("planted per-batch refusal")
+        return super().validation_step(input_batch, target_batch, batch_idx=batch_idx)
+
+
+def _three_batches():
+    return [{"input": torch.randn(2, 1, 8, 8), "target": torch.randn(2, 1, 8, 8)} for _ in range(3)]
+
+
+def test_one_failed_validation_batch_fails_the_run_with_its_traceback():
+    """One of three batches raises: selecting on the other two would bias the metric, so it raises."""
+    pipeline, logging_cfg = _val_pipeline(_three_batches())
+    with pytest.raises(RuntimeError, match=r"lost 1 of 3 batch\(es\)") as raised:
+        train_mod._run_validation(
+            pipeline,
+            _RaisesOnBatchStrategy(logging_cfg, fail={1}),
+            iteration=1,
+            epoch=0,
+            logging_service=None,
+        )
+    assert "planted per-batch refusal" in str(raised.value)
+
+
+def test_a_clean_validation_reports_zero_failed_batches():
+    """Present at 0, so a clean row is distinguishable from one that never counted."""
+    pipeline, logging_cfg = _val_pipeline(_three_batches())
+    metrics = train_mod._run_validation(
+        pipeline,
+        _RaisesOnBatchStrategy(logging_cfg, fail=set()),
+        iteration=1,
+        epoch=0,
+        logging_service=None,
+    )
+    assert metrics["val_batches_failed"] == 0.0
+    assert metrics["val_batches_attempted"] == 3.0
+
+
+def test_the_batch_counts_do_not_disarm_the_all_non_finite_guard():
+    """The counts are finite; stamped before the #181 guard they would hide an all-NaN row."""
+
+    class _NaNStrategy(_PerBatchValueStrategy):
+        def validation_step(self, input_batch, target_batch, batch_idx=0):
+            return {"score": float("nan")}
+
+    pipeline, logging_cfg = _val_pipeline(_three_batches())
+    with pytest.raises(RuntimeError, match="EVERY metric is non-finite"):
+        train_mod._run_validation(
+            pipeline, _NaNStrategy(logging_cfg), iteration=1, epoch=0, logging_service=None
+        )
+
+
+# --- #2545: per-column means that skip non-finite values -------------------
+
+
+def _single_slice_batches(n):
+    return [{"input": torch.randn(1, 1, 8, 8), "target": torch.randn(1, 1, 8, 8)} for _ in range(n)]
+
+
+class _ScriptedStrategy(_PerBatchValueStrategy):
+    """Returns ``rows[batch_idx]``, as floats or as tensors."""
+
+    def __init__(self, logging_cfg, rows, as_tensor=False):
+        super().__init__(logging_cfg)
+        self.rows = rows
+        self.as_tensor = as_tensor
+
+    def validation_step(self, input_batch, target_batch, batch_idx=0):
+        row = self.rows[batch_idx]
+        if self.as_tensor:
+            return {k: torch.tensor(v) for k, v in row.items()}
+        return dict(row)
+
+
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["float", "tensor"])
+def test_one_nan_slice_leaves_its_column_finite_and_is_counted(as_tensor, caplog):
+    import logging as _logging
+
+    rows = [{"psnr": 30.0}, {"psnr": float("nan")}, {"psnr": 34.0}]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(3))
+    with caplog.at_level(_logging.WARNING, logger="spectramr.pipelines.train"):
+        metrics = train_mod._run_validation(
+            pipeline,
+            _ScriptedStrategy(logging_cfg, rows, as_tensor=as_tensor),
+            iteration=1,
+            epoch=0,
+            logging_service=None,
+        )
+    assert metrics["psnr"] == pytest.approx(32.0)
+    assert metrics["val_samples_skipped_max"] == 1.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("left out of the mean" in m for m in messages) == 1, messages
+    assert any("psnr=1" in m for m in messages), messages
+
+
+def test_an_inf_is_skipped_like_a_nan():
+    rows = [{"psnr": 30.0}, {"psnr": float("inf")}]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(2))
+    metrics = train_mod._run_validation(
+        pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+    )
+    assert metrics["psnr"] == pytest.approx(30.0)
+
+
+def test_each_column_is_divided_by_its_own_count():
+    """A key two of four batches emit is their mean, not half of it."""
+    rows = [{"psnr": 30.0, "hfen": 0.2}, {"psnr": 30.0}, {"psnr": 30.0, "hfen": 0.4}, {"psnr": 30.0}]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(4))
+    metrics = train_mod._run_validation(
+        pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+    )
+    assert metrics["hfen"] == pytest.approx(0.3)
+    assert metrics["psnr"] == pytest.approx(30.0)
+    # Absent is not non-finite: hfen was never NaN, so nothing was skipped.
+    assert metrics["val_samples_skipped_max"] == 0.0
+
+
+def test_the_coverage_columns_are_not_read_as_metrics():
+    """`psnr_skipped` would resolve as a psnr through the substring rule."""
+    from spectramr.core.metrics.metric_directions import resolve_direction
+
+    assert resolve_direction("val_samples_skipped_max") is None
+    assert resolve_direction("val_monitor_samples_skipped") is None
+    assert resolve_direction("val_monitor_coverage") is None
+
+
+def _monitored(pipeline, metric):
+    pipeline.config.early_stopping = SimpleNamespace(enabled=True, metric=metric)
+    return pipeline
+
+
+def test_an_all_nan_monitor_is_named_while_psnr_stays_finite(caplog):
+    """Planted: the selector column is all NaN, psnr is finite, so the all-non-finite
+    guard passes. The pass must still name the monitor."""
+    import logging as _logging
+
+    rows = [{"psnr": 30.0, "rep_bv": float("nan")} for _ in range(3)]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(3))
+    _monitored(pipeline, "val_rep_bv")
+    with caplog.at_level(_logging.WARNING, logger="spectramr.pipelines.train"):
+        metrics = train_mod._run_validation(
+            pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+        )
+    assert metrics["psnr"] == pytest.approx(30.0)
+    assert metrics["val_monitor_samples_skipped"] == 3.0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "early_stopping.metric 'val_rep_bv'" in m and "no finite value" in m for m in messages
+    ), messages
+
+
+def test_a_monitor_with_one_finite_slice_is_not_flagged(caplog):
+    import logging as _logging
+
+    rows = [{"psnr": 30.0, "rep_bv": v} for v in (float("nan"), 0.5, float("nan"))]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(3))
+    _monitored(pipeline, "val_rep_bv")
+    with caplog.at_level(_logging.WARNING, logger="spectramr.pipelines.train"):
+        metrics = train_mod._run_validation(
+            pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+        )
+    assert metrics["rep_bv"] == pytest.approx(0.5)
+    assert metrics["val_monitor_samples_skipped"] == 2.0
+    assert not any("no finite value" in r.getMessage() for r in caplog.records)
+
+
+def test_a_monitor_some_batches_never_emitted_is_not_selectable(caplog):
+    """Planted: one batch reported only the partial cascade mean, so the selection
+    column was averaged over two of three samples. That pass must not be ranked."""
+    import logging as _logging
+
+    rows = [
+        {"psnr": 30.0, "rep_bv": 0.5},
+        {"psnr": 30.0, "rep_bv_partial": 0.1},
+        {"psnr": 30.0, "rep_bv": 0.7},
+    ]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(3))
+    _monitored(pipeline, "val_rep_bv")
+    with caplog.at_level(_logging.WARNING, logger="spectramr.pipelines.train"):
+        metrics = train_mod._run_validation(
+            pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+        )
+    assert metrics["val_monitor_coverage"] == pytest.approx(2 / 3)
+    assert metrics["rep_bv"] != metrics["rep_bv"]  # nan
+    assert any("not selectable" in r.getMessage() for r in caplog.records)
+
+
+def test_a_fully_covered_monitor_is_untouched():
+    rows = [{"psnr": 30.0, "rep_bv": v} for v in (0.5, 0.7)]
+    pipeline, logging_cfg = _val_pipeline(_single_slice_batches(2))
+    _monitored(pipeline, "val_rep_bv")
+    metrics = train_mod._run_validation(
+        pipeline, _ScriptedStrategy(logging_cfg, rows), iteration=1, epoch=0, logging_service=None
+    )
+    assert metrics["val_monitor_coverage"] == 1.0
+    assert metrics["rep_bv"] == pytest.approx(0.6)
+
+
+def _run_ranks(monkeypatch, fn, per_rank_args, timeout=5.0):
+    """Run ``fn`` once per simulated rank on threads joined by fake collectives.
+
+    Each collective waits on a barrier, so a rank that skips one leaves its peers
+    waiting until ``timeout`` breaks the barrier: a deadlock becomes an error.
+    """
+    import threading
+
+    import torch.distributed as dist
+
+    world = len(per_rank_args)
+    barrier = threading.Barrier(world, timeout=timeout)
+    local = threading.local()
+    slots: dict = {}
+    lock = threading.Lock()
+
+    def _exchange(name, value):
+        local.calls = getattr(local, "calls", 0) + 1
+        key = (name, local.calls)
+        with lock:
+            slots.setdefault(key, [None] * world)[local.rank] = value
+        barrier.wait()
+        values = list(slots[key])
+        barrier.wait()
+        return values
+
+    def all_gather_object(out, obj):
+        out[:] = _exchange("gather", obj)
+
+    def all_reduce(tensor, op=None):
+        values = _exchange("reduce", tensor.clone())
+        shapes = {tuple(v.shape) for v in values}
+        if len(shapes) != 1:
+            raise RuntimeError(f"ranks reduced different shapes: {shapes}")
+        tensor.copy_(torch.stack(values).sum(dim=0))
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: world)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: local.rank)
+
+    results: list = [None] * world
+    errors: list = [None] * world
+
+    def _target(rank):
+        local.rank = rank
+        try:
+            results[rank] = fn(*per_rank_args[rank])
+        except Exception as exc:  # surfaced to the calling test
+            errors[rank] = exc
+
+    threads = [threading.Thread(target=_target, args=(r,)) for r in range(world)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout * 3)
+    return results, errors
+
+
+def test_a_rank_with_no_keys_still_joins_the_reduction(monkeypatch):
+    """#1323: rank 1's batches all raised, so it holds no keys. Both ranks must
+    issue the same collectives and agree on the means."""
+    per_rank = [
+        ({"psnr": 60.0, "ssim": 1.8}, {"psnr": 2.0, "ssim": 2.0}, {"psnr": 2.0, "ssim": 2.0}, 2, None),
+        ({}, {}, {}, 0, None),
+    ]
+    results, errors = _run_ranks(monkeypatch, train_mod._all_reduce_val_metrics, per_rank)
+    assert errors == [None, None]
+    assert results[0] == results[1]
+    accum, finite, seen, weight = results[1]
+    assert weight == 2
+    assert accum == {"psnr": 60.0, "ssim": pytest.approx(1.8)}
+    assert finite == {"psnr": 2.0, "ssim": 2.0}
+    assert seen == {"psnr": 2.0, "ssim": 2.0}
+
+
+def test_ranks_with_different_keys_reduce_the_union(monkeypatch):
+    per_rank = [
+        ({"psnr": 30.0}, {"psnr": 1.0}, {"psnr": 1.0}, 1, None),
+        ({"hfen": torch.tensor(0.4)}, {"hfen": torch.tensor(1.0)}, {"hfen": 1.0}, 1, None),
+    ]
+    results, errors = _run_ranks(monkeypatch, train_mod._all_reduce_val_metrics, per_rank)
+    assert errors == [None, None]
+    accum, finite, _seen, weight = results[0]
+    assert weight == 2
+    assert finite == {"hfen": 1.0, "psnr": 1.0}
+    assert train_mod._finite_mean(accum["psnr"], finite["psnr"]) == pytest.approx(30.0)
+    assert train_mod._finite_mean(accum["hfen"], finite["hfen"]) == pytest.approx(0.4)
+
+
+def test_a_rank_whose_batches_all_raised_does_not_hang_its_peers(monkeypatch):
+    """#1323 on the production path: rank 1's every batch raises. It must still
+    join the collectives (not leave through the zero-successes guard), and both
+    ranks must report the same global row."""
+
+    def _validate(fail):
+        pipeline, logging_cfg = _val_pipeline(_three_batches())
+        return train_mod._run_validation(
+            pipeline,
+            _RaisesOnBatchStrategy(logging_cfg, fail=fail),
+            iteration=1,
+            epoch=0,
+            logging_service=None,
+        )
+
+    _, errors = _run_ranks(monkeypatch, _validate, [(set(),), ({0, 1, 2},)])
+    # Rank 0 validated cleanly, yet the global count is 3 of 6 failed: both ranks raise together
+    # rather than one leaving through a guard while its peer waits in a collective.
+    assert all(isinstance(e, RuntimeError) and "lost 3 of 6" in str(e) for e in errors), errors
+
+
+def test_every_rank_raises_together_when_no_batch_succeeded_anywhere(monkeypatch):
+    def _validate():
+        pipeline, logging_cfg = _val_pipeline(_three_batches())
+        return train_mod._run_validation(
+            pipeline,
+            _RaisesOnBatchStrategy(logging_cfg, fail={0, 1, 2}),
+            iteration=1,
+            epoch=0,
+            logging_service=None,
+        )
+
+    _, errors = _run_ranks(monkeypatch, _validate, [(), ()])
+    assert all(
+        isinstance(e, RuntimeError) and "zero successful batches" in str(e) for e in errors
+    ), errors
+
+
+def test_the_rank_harness_catches_the_skipped_collective(monkeypatch):
+    """Planted #1323 shape: the pre-fix reduction skipped its sums when a rank had
+    no keys. The harness must report that as a broken collective, not pass."""
+    import threading
+
+    import torch.distributed as dist
+
+    def _reduce_skipping_empty_ranks(val_accum, val_weight, device):
+        count = torch.tensor([float(val_weight)])
+        dist.all_reduce(count)
+        keys = sorted(val_accum)
+        if keys:
+            sums = torch.tensor([float(val_accum[k]) for k in keys])
+            dist.all_reduce(sums)
+        return val_accum, count
+
+    per_rank = [({"psnr": 30.0}, 1, None), ({}, 0, None)]
+    _, errors = _run_ranks(monkeypatch, _reduce_skipping_empty_ranks, per_rank, timeout=1.0)
+    assert isinstance(errors[0], threading.BrokenBarrierError)
 
 
 class TestReportArtifactWritesAreRankGuardedAndOrdered:
@@ -2628,6 +3030,16 @@ def test_the_run_summary_author_is_none_when_the_arm_declares_none(tmp_path) -> 
 # ---------------------------------------------------------------------------
 
 
+def test_the_run_creates_its_checkpoint_dir_through_the_layout() -> None:
+    import inspect
+
+    from spectramr.pipelines import train
+
+    src = inspect.getsource(train.run_training_pipeline)
+    assert "CheckpointLayout.for_run(run_dir).ensure()" in src
+    assert '(run_dir / "checkpoints").mkdir' not in src
+
+
 class TestResumeDiscoveryModes:
     @staticmethod
     def _source() -> str:
@@ -2686,6 +3098,118 @@ class TestResumeDiscoveryModes:
         from spectramr.pipelines.train import _stamp_resume_record
 
         _stamp_resume_record(tmp_path / "does" / "not" / "exist", {"outcome": "fresh"})
+
+
+class TestResumeDiscoveryNamesSkippedFilesInTheRunLog:
+    """A skipped pre-1.0 file must reach the run log, not only the module logger,
+    which lands in the dispatch ``.err`` (#2841)."""
+
+    @pytest.mark.parametrize("mode", ["auto", "if-present"])
+    def test_a_legacy_only_dir_raises_naming_the_converter(self, tmp_path, mode) -> None:
+        """An unconverted chain must not restart at step 0 (NN3): both discovery
+        modes resolve through this helper, so both raise here."""
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _RESUME_DISCOVERY_MODES, _discover_resume_checkpoint
+
+        assert mode in _RESUME_DISCOVERY_MODES
+        ck = tmp_path / "checkpoints"
+        ck.mkdir()
+        (ck / "checkpoint_epoch_0003_step_002000.pt").write_bytes(b"x")
+        (ck / "checkpoint_best.pt").write_bytes(b"x")
+
+        with pytest.raises(FileNotFoundError) as info:
+            _discover_resume_checkpoint(tmp_path, MagicMock())
+        message = str(info.value)
+        assert "checkpoint_epoch_0003_step_002000.pt" in message
+        assert f"python scripts/migrations/convert_checkpoints_v1.py {tmp_path}" in message
+        assert "if-present" not in message
+
+    def test_both_modes_resolve_through_the_helper_before_branching(self) -> None:
+        import inspect
+
+        from spectramr.pipelines import train
+
+        src = inspect.getsource(train.run_training_pipeline)
+        call_at = src.index("_discover_resume_checkpoint(output_dir, logging_service)")
+        assert src.rfind("if _resume_mode in _RESUME_DISCOVERY_MODES:", 0, call_at) != -1
+        assert call_at < src.index('if latest is None and _resume_mode == "auto":')
+        assert call_at < src.index('"outcome": "fresh"')
+
+    def test_an_empty_dir_starts_fresh(self, tmp_path) -> None:
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _discover_resume_checkpoint
+
+        (tmp_path / "checkpoints").mkdir()
+        assert _discover_resume_checkpoint(tmp_path, MagicMock()) is None
+        assert _discover_resume_checkpoint(tmp_path / "never_ran", MagicMock()) is None
+
+    def test_a_pre_v1_file_is_named_with_the_converter(self, tmp_path) -> None:
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _discover_resume_checkpoint
+
+        ck = tmp_path / "checkpoints"
+        ck.mkdir()
+        (ck / "step_00000002.pt").write_bytes(b"x")
+        (ck / "checkpoint_epoch_0003_step_002000.pt").write_bytes(b"x")
+        logging_service = MagicMock()
+
+        assert _discover_resume_checkpoint(tmp_path, logging_service) == str(ck / "step_00000002.pt")
+        message = logging_service.log_warning.call_args[0][0]
+        assert "checkpoint_epoch_0003_step_002000.pt" in message
+        assert "scripts/migrations/convert_checkpoints_v1.py" in message
+
+    def test_an_interrupted_conversion_refuses_resume(self, tmp_path) -> None:
+        """A half-published conversion's latest step may be older than the run's newest."""
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _discover_resume_checkpoint
+
+        ck = tmp_path / "checkpoints"
+        ck.mkdir()
+        (ck / "step_00000002.pt").write_bytes(b"x")
+        (ck / "checkpoint_epoch_0001_step_000004.pt").write_bytes(b"x")
+        (ck / ".convert_v1.journal.json").write_text("{}")
+        with pytest.raises(RuntimeError, match="partial checkpoint conversion") as info:
+            _discover_resume_checkpoint(tmp_path, MagicMock())
+        assert f"scripts/migrations/convert_checkpoints_v1.py {tmp_path}" in str(info.value)
+
+    def test_a_clean_directory_writes_no_warning(self, tmp_path) -> None:
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _discover_resume_checkpoint
+
+        (tmp_path / "checkpoints").mkdir()
+        (tmp_path / "checkpoints" / "step_00000002.pt").write_bytes(b"x")
+        logging_service = MagicMock()
+        _discover_resume_checkpoint(tmp_path, logging_service)
+        logging_service.log_warning.assert_not_called()
+
+    def test_resume_auto_crosses_a_format_change(self, tmp_path) -> None:
+        """Review Focus 3: the run switched pt -> safetensors between links."""
+        from unittest.mock import MagicMock
+
+        from spectramr.pipelines.train import _discover_resume_checkpoint
+
+        ck = tmp_path / "checkpoints"
+        ck.mkdir()
+        (ck / "step_00000004.pt").write_bytes(b"x")
+        (ck / "step_00000008.safetensors").write_bytes(b"x")
+        assert _discover_resume_checkpoint(tmp_path, MagicMock()).endswith(
+            "step_00000008.safetensors"
+        )
+
+    def test_the_resume_path_calls_it(self) -> None:
+        """The helper is only delivered if stage 9 resolves through it (NN16)."""
+        import inspect
+
+        from spectramr.pipelines import train
+
+        src = inspect.getsource(train.run_training_pipeline)
+        assert "_discover_resume_checkpoint(" in src
+        assert "find_latest_checkpoint" not in src
 
 
 class TestAYieldedRunDoesNotClaimCompletion:
@@ -2752,3 +3276,328 @@ def test_async_cuda_faults_name_the_serialising_flag(message: str) -> None:
 def test_synchronous_failures_get_no_async_hint(exc: Exception) -> None:
     """A failure whose frame IS the culprit must not be labelled misdirection."""
     assert train_mod._async_cuda_fault_hint(exc) is None
+
+
+# ---------------------------------------------------------------------------
+# #2500: the per-call sink was attached to every strategy but fed only by the
+# four whose image logging calls feed_report_case_recorder, so reconstruction
+# runs (n2n) wrote no per_call_metrics.csv. The loop now feeds it, once per batch.
+# ---------------------------------------------------------------------------
+
+
+class _SelfFeedingStrategy(_PerBatchValueStrategy):
+    """Feeds the sink from inside validation_step, as GAN/diffusion do."""
+
+    def validation_step(self, input_batch, target_batch, batch_idx=0):
+        out = super().validation_step(input_batch, target_batch, batch_idx)
+        self._per_case_metric_sink.observe(case_id="own", metrics=out, step=7)
+        return out
+
+
+@pytest.mark.parametrize("strategy_cls", [_PerBatchValueStrategy, _SelfFeedingStrategy])
+def test_every_strategy_records_one_per_call_row_per_batch(strategy_cls):
+    from spectramr.infrastructure.reporting.cases.metric_sink import PerCallMetricSink
+
+    batches = [
+        {"input": torch.randn(2, 1, 8, 8), "target": torch.randn(2, 1, 8, 8)} for _ in range(3)
+    ]
+    pipeline, logging_cfg = _val_pipeline(batches)
+    strategy = strategy_cls(logging_cfg)
+    strategy._per_case_metric_sink = PerCallMetricSink(enabled=True)
+    train_mod._run_validation(pipeline, strategy, iteration=7, epoch=0, logging_service=None)
+    rows = strategy._per_case_metric_sink._rows
+    assert len(rows) == 3
+    assert {r["step"] for r in rows} == {7}
+    if strategy_cls is _PerBatchValueStrategy:
+        assert [r["batch_index"] for r in rows] == [0, 1, 2]
+# validation.per_batch_rows -- one row per validation batch beside the CSV, and
+# --validate-only. Both drive the real code so the knob and the flag are
+# observed to fire, not read to exist.
+# ---------------------------------------------------------------------------
+
+
+def _val_pipeline_with_rows(batches, tmp_path):
+    """The #1347 harness with ``per_batch_rows`` on and a training CSV to sit beside.
+
+    ``_run_validation`` reads the knob off the STRATEGY's config, which in
+    production is the same TrainingSettings the pipeline holds.
+    """
+    from types import SimpleNamespace
+
+    from tests.utils.config_block_stub import block_stub
+
+    pipeline, logging_cfg = _val_pipeline(batches)
+    validation_cfg = block_stub(
+        "validation",
+        num_validation_batches=len(batches),
+        num_samples=None,
+        effective_val_batch_size=1,
+        per_batch_rows=True,
+    )
+    pipeline.config = SimpleNamespace(
+        validation=validation_cfg,
+        logging=pipeline.config.logging,
+        data=pipeline.config.data,
+        model=pipeline.config.model,
+    )
+    strategy = _PerBatchValueStrategy(logging_cfg)
+    strategy.config = SimpleNamespace(logging=logging_cfg, validation=validation_cfg)
+    return pipeline, strategy, tmp_path / "logs" / "training_metrics.csv"
+
+
+def test_per_batch_rows_land_beside_the_validation_csv_with_their_identifiers(tmp_path):
+    import csv
+
+    batches = [
+        {
+            "input": torch.randn(1, 1, 8, 8),
+            "target": torch.randn(1, 1, 8, 8),
+            "subject_id": [f"subject_{i}"],
+            "contrast": ["T1"],
+            "slice_index": torch.tensor([i]),
+        }
+        for i in range(3)
+    ]
+    pipeline, strategy, csv_file = _val_pipeline_with_rows(batches, tmp_path)
+    train_mod._run_validation(
+        pipeline,
+        strategy,
+        iteration=2000,
+        epoch=4,
+        logging_service=None,
+        csv_file=str(csv_file),
+    )
+    rows_path = train_mod.validation_batches_csv_for(csv_file)
+    assert rows_path.name == "validation_batches.csv"
+    assert rows_path.parent == train_mod.validation_csv_for(csv_file).parent
+    with rows_path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [r["subject_id"] for r in rows] == ["subject_0", "subject_1", "subject_2"]
+    assert [r["slice_index"] for r in rows] == ["0", "1", "2"]
+    assert [r["iteration"] for r in rows] == ["2000"] * 3
+    assert [float(r["score"]) for r in rows] == [1.0, 1.0, 1.0]
+
+
+def test_per_batch_rows_are_off_by_default_and_need_a_csv_to_sit_beside(tmp_path):
+    batches = [{"input": torch.randn(1, 1, 8, 8), "target": torch.randn(1, 1, 8, 8)}]
+    pipeline, logging_cfg = _val_pipeline(batches)
+    csv_file = tmp_path / "logs" / "training_metrics.csv"
+    train_mod._run_validation(
+        pipeline,
+        _PerBatchValueStrategy(logging_cfg),
+        iteration=1,
+        epoch=0,
+        logging_service=None,
+        csv_file=str(csv_file),
+    )
+    assert not train_mod.validation_batches_csv_for(csv_file).exists()
+    pipeline, strategy, _ = _val_pipeline_with_rows(batches, tmp_path)
+    train_mod._run_validation(pipeline, strategy, iteration=1, epoch=0, logging_service=None)
+    assert not (tmp_path / "logs" / "validation_batches.csv").exists()
+
+
+def test_the_test_split_always_writes_per_slice_rows(tmp_path):
+    batches = [{"input": torch.randn(1, 1, 8, 8), "target": torch.randn(1, 1, 8, 8)}]
+    pipeline, logging_cfg = _val_pipeline(batches)
+    pipeline.data_loaders["test"] = pipeline.data_loaders["val"]
+    csv_file = tmp_path / "test" / "training_metrics.csv"
+    train_mod._run_validation(
+        pipeline,
+        _PerBatchValueStrategy(logging_cfg),
+        iteration=1,
+        epoch=0,
+        logging_service=None,
+        csv_file=str(csv_file),
+        split="test",
+    )
+    assert train_mod.validation_batches_csv_for(csv_file).exists()
+
+
+def test_validate_only_grades_resumed_weights_once_and_refuses_none(tmp_path):
+    """The flag drives ``TrainingLoop.evaluate`` at the resumed step and writes
+    beside the training CSV; without weights it raises rather than scoring the
+    initialisation."""
+    seen: dict = {}
+
+    class _Loop:
+        def evaluate(self, *, iteration, epoch, csv_file):
+            seen.update(iteration=iteration, epoch=epoch, csv_file=csv_file)
+            return {"val_nex_equivalent": 8.7}
+
+    paths = {"csv_log_file": str(tmp_path / "logs" / "training_metrics.csv")}
+    result = train_mod._validate_only_result(_Loop(), paths, 25000, "ckpt/epoch_50", None)
+    assert seen == {"iteration": 25000, "epoch": 0, "csv_file": paths["csv_log_file"]}
+    assert result["validate_only"] is True and result["iterations_completed"] == 0
+    assert result["resumed_step"] == 25000
+    assert result["best_metrics"] == {"val_nex_equivalent": 8.7}
+    with pytest.raises(ValueError, match="--validate-only needs weights"):
+        train_mod._validate_only_result(_Loop(), paths, 0, None, None)
+    assert "validate_only" in train_mod.run_training_pipeline.__code__.co_varnames
+
+
+def test_validate_only_grades_a_parameter_free_solver_without_weights(tmp_path):
+    """Only a DECLARED parameter-free model is graded with no checkpoint; the
+    default still refuses (planted: a network with no weights raises)."""
+
+    class _Loop:
+        def evaluate(self, *, iteration, epoch, csv_file):
+            return {"val_sense_psnr": 31.0}
+
+    result = train_mod._validate_only_result(_Loop(), {}, 0, None, None, parameter_free=True)
+    assert result["success"] and result["parameter_free"] is True
+    assert result["weights"] == "none: parameter-free model"
+    with pytest.raises(ValueError, match="--validate-only needs weights"):
+        train_mod._validate_only_result(_Loop(), {}, 0, None, None, parameter_free=False)
+    assert "_parameter_free" in train_mod.run_training_pipeline.__code__.co_varnames
+
+
+def test_per_batch_rows_score_a_volume_batch_slice_by_slice(tmp_path):
+    """A whole-volume validation loader (m4raw) gives one row per SLICE, with the
+    depth index as ``slice_index``, not one row per volume."""
+    import csv
+
+    batches = [
+        {
+            "input": torch.randn(1, 1, 8, 8, 3),
+            "target": torch.randn(1, 1, 8, 8, 3),
+            "subject_id": ["subject_0"],
+            "contrast": ["T2"],
+        }
+    ]
+    pipeline, strategy, csv_file = _val_pipeline_with_rows(batches, tmp_path)
+    train_mod._run_validation(
+        pipeline, strategy, iteration=10, epoch=1, logging_service=None, csv_file=str(csv_file)
+    )
+    with train_mod.validation_batches_csv_for(csv_file).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [r["slice_index"] for r in rows] == ["0", "1", "2"]
+    assert [r["subject_id"] for r in rows] == ["subject_0"] * 3
+    assert [r["n_samples"] for r in rows] == ["1"] * 3
+
+
+
+# ---------------------------------------------------------------------------
+# A run's success is earned, and a failed run overwrites the last summary
+# (#181, #182). These drive the real `run_training_pipeline` with the loop
+# stubbed, so the observed write is the production call site, not a helper.
+# ---------------------------------------------------------------------------
+
+
+class TestRunSummaryRecordsFailure:
+    def _run(self, monkeypatch, tmp_path, loop):
+        cfg = TrainingSettings.settings_from_dict(_config_dict(tmp_path))
+        monkeypatch.setattr(train_mod, "_maybe_run_reporting", lambda *a, **k: None)
+        monkeypatch.setattr(training_loop_mod, "_execute_training_loop", loop)
+        result = train_mod.run_training_pipeline(cfg, env=_env(cfg), device="cpu")
+        return result, json.loads((tmp_path / "run_summary.json").read_text())
+
+    @staticmethod
+    def _raise(exc):
+        def _loop(*a, **k):
+            raise exc
+
+        return _loop
+
+    def test_a_crash_overwrites_a_stale_success_summary(self, monkeypatch, tmp_path):
+        """The #182 shape: an OOM re-run left the previous run's success: true."""
+        (tmp_path / "run_summary.json").write_text(
+            json.dumps({"success": True, "run_id": "previous-run"})
+        )
+        result, summary = self._run(
+            monkeypatch, tmp_path, self._raise(MemoryError("CUDA out of memory"))
+        )
+        assert result["success"] is False
+        assert summary["success"] is False
+        assert summary["error_type"] == "MemoryError"
+        assert "CUDA out of memory" in summary["error"]
+        assert summary["run_id"] != "previous-run"
+
+    def test_validation_raising_fails_the_run_with_its_reason(self, monkeypatch, tmp_path):
+        """What `_run_validation` raises when every batch failed, e.g. the
+        #181(a) `Unknown dc_method 'adaptive'` now that diffusion re-raises it."""
+        exc = RuntimeError("Validation produced zero successful batches: Unknown dc_method")
+        result, summary = self._run(monkeypatch, tmp_path, self._raise(exc))
+        assert result["success"] is False
+        assert summary["success"] is False
+        assert summary["error_type"] == "RuntimeError"
+        assert "Unknown dc_method" in summary["error"]
+
+    def test_nan_validation_fails_the_run(self, monkeypatch, tmp_path):
+        """`_run_validation` raises when every metric is non-finite."""
+        exc = RuntimeError("Validation produced 4 successful batch(es) but EVERY metric is NaN")
+        result, summary = self._run(monkeypatch, tmp_path, self._raise(exc))
+        assert result["success"] is False
+        assert summary["success"] is False
+        assert "EVERY metric is NaN" in summary["error"]
+
+    def test_the_loop_verdict_reaches_the_summary(self, monkeypatch, tmp_path):
+        """Zero validation numbers: the loop returns the verdict, the summary
+        records it with the counts that justify it."""
+        verdict = {
+            "success": False,
+            "error": "Validation ran 2 time(s) and produced no finite metric",
+            "validation_events": 2,
+            "validation_events_with_finite_metric": 0,
+        }
+        result, summary = self._run(monkeypatch, tmp_path, lambda *a, **k: dict(verdict))
+        assert result["success"] is False
+        assert summary["success"] is False
+        assert "no finite metric" in summary["error"]
+        assert summary["validation_events"] == 2
+        assert summary["validation_events_with_finite_metric"] == 0
+
+    def test_an_absent_success_flag_is_not_recorded_as_success(self, monkeypatch, tmp_path):
+        _, summary = self._run(monkeypatch, tmp_path, lambda *a, **k: {"iterations_completed": 1})
+        assert summary["success"] is None
+
+    def test_a_build_failure_overwrites_a_stale_success_summary(self, monkeypatch, tmp_path):
+        class _Boom:
+            def __init__(self, *a, **k):
+                pass
+
+            def build_environment(self):
+                raise RuntimeError("generator construction failed")
+
+        (tmp_path / "run_summary.json").write_text(json.dumps({"success": True}))
+        cfg = TrainingSettings.settings_from_dict(_config_dict(tmp_path))
+        monkeypatch.setattr(train_mod, "TrainingEnvironmentDirector", _Boom)
+        result = train_mod.run_training_pipeline(cfg, device="cpu")
+        summary = json.loads((tmp_path / "run_summary.json").read_text())
+        assert result["success"] is False
+        assert summary["success"] is False
+        assert "generator construction failed" in summary["error"]
+
+    def test_only_rank_zero_writes_the_failure_summary(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(train_mod, "is_rank_zero", lambda _cfg: False)
+        cfg = TrainingSettings.settings_from_dict(_config_dict(tmp_path))
+        monkeypatch.setattr(
+            training_loop_mod, "_execute_training_loop", self._raise(RuntimeError("x"))
+        )
+        result = train_mod.run_training_pipeline(cfg, env=_env(cfg), device="cpu")
+        assert result["success"] is False
+        assert not (tmp_path / "run_summary.json").exists()
+
+
+class TestValidateOnlyEarnsItsSuccess:
+    @staticmethod
+    def _result(metrics):
+        loop = SimpleNamespace(evaluate=lambda **k: metrics)
+        return train_mod._validate_only_result(loop, {}, 0, "ckpt.pt", None)
+
+    def test_a_finite_metric_passes(self):
+        assert self._result({"val_psnr": 30.0})["success"] is True
+
+    @pytest.mark.parametrize("metrics", [{}, {"val_psnr": float("nan")}, {"validation_error": 1.0}])
+    def test_measuring_nothing_fails(self, metrics):
+        result = self._result(metrics)
+        assert result["success"] is False
+        assert "no finite metric" in result["error"]
+
+
+def test_validation_batches_are_moved_without_blocking_the_host() -> None:
+    """Planted: a plain ``.to(device)`` on the validation batch stalls the loop on the copy."""
+    import inspect
+
+    source = inspect.getsource(train_mod)
+    assert "val_batch.to(pipeline.device)" not in source
+    assert "val_batch.to(pipeline.device, non_blocking=True)" in source

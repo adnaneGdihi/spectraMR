@@ -218,3 +218,53 @@ def test_the_input_batch_substitution_is_gone_from_source() -> None:
 
     src = inspect.getsource(OneShotMultiParameterStrategy._compute_losses_impl)
     assert "else input_batch" not in src
+
+
+def _built_via_init(monkeypatch, cls=OneShotMultiParameterStrategy):
+    """The real ``__init__`` body over a stub reconstruction parent, uncertainty weighting on."""
+    from spectramr.config.schemas.training.base import MultiParameterTrainingConfigSchema
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    def _stub_init(self, *a, **k):
+        self.config = types.SimpleNamespace(
+            parallel=None,
+            training=types.SimpleNamespace(
+                spin_sde=None,
+                multi_parameter=MultiParameterTrainingConfigSchema(
+                    parameters=["t1", "t2"],
+                    uncertainty_weighting=True,
+                    bloch_consistency_lambda=0.0,
+                ),
+            ),
+        )
+        self.device = torch.device("cpu")
+        self.env = types.SimpleNamespace(
+            opt_g=torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1),
+            generator=lambda x: {"t1": x[:, :1] * 2.0, "t2": x[:, 1:] * 3.0},
+        )
+        self._owned_modules = {}
+        self._owned_wrappers = {}
+
+    monkeypatch.setattr(ReconstructionTrainingStrategy, "__init__", _stub_init)
+    return cls()
+
+
+def test_log_sigmas_are_an_owned_module_with_an_unchanged_checkpoint_key(monkeypatch) -> None:
+    """#2629: the holder is registered for DDP but is not an attribute, so the
+    checkpoint still carries ``params._log_sigmas`` and an old checkpoint loads."""
+    s = _built_via_init(monkeypatch)
+    assert s.owned_modules()["_log_sigmas"].value is s._log_sigmas
+    state = s.strategy_state_dict()
+    assert sorted(state["params"]) == ["_log_sigmas"] and state["modules"] == {}
+
+    x = torch.randn(1, 2, 4, 4)
+    batch = {"observed_contrasts": x, "t1": torch.zeros(1, 1, 4, 4), "t2": torch.ones(1, 1, 4, 4)}
+    s._compute_losses_impl(x, x, 0, batch=batch)["loss_total"].backward()
+    assert s._log_sigmas.grad is not None and s._log_sigmas.grad.abs().sum() > 0
+
+    fresh = _built_via_init(monkeypatch)
+    fresh.load_strategy_state_dict({"params": {"_log_sigmas": torch.tensor([0.5, -0.5])}})
+    assert torch.equal(fresh._log_sigmas.detach(), torch.tensor([0.5, -0.5]))
+    assert fresh.owned_modules()["_log_sigmas"]() is fresh._log_sigmas

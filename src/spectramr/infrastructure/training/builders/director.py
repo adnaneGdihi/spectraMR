@@ -9,10 +9,12 @@ import logging
 import torch
 
 from spectramr.core.compute_device import resolve_torch_device
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.builders.context import (
     BuilderContext,
     accepts_builder_context,
 )
+from spectramr.infrastructure.distributed.strategy_compat import check_strategy_for_parallel
 from spectramr.infrastructure.distributed.strategy_registry import (
     ParallelContext,
     ParallelRuntime,
@@ -25,6 +27,7 @@ from .data_builder import DataBuilder
 from .environment import TrainingEnvironment
 from .infrastructure_builder import InfrastructureBuilder
 from .loss_builder import LossBuilder
+from .memory_format import apply_channels_last
 from .model_builder import ModelBuilder
 from .optimization_builder import OptimizationBuilder
 from .physics_builder import PhysicsBuilder
@@ -76,6 +79,30 @@ class TrainingEnvironmentDirector:
         logger.info("[Parallel] strategy=%s", plugin.name)
         return plugin, ctx
 
+    def _enforce_parallel_compat(self) -> None:
+        """Refuse a strategy x parallel backend the strategy has not declared.
+
+        Runs before any model is built, like the compile placement, so a
+        combination that would silently diverge or read shards fails on the
+        login node rather than at the first step on a GPU. A strategy that cannot
+        be resolved here is left to ``create_strategy``, which raises the real
+        error; the gate has nothing to judge without a class.
+        """
+        parallel = getattr(self._config, "parallel", None)
+        if parallel is None or parallel.strategy == "none":
+            return
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        try:
+            strategy_cls = TrainingStrategyFactory().get_strategy_class(self._config)
+        except ConfigurationError:
+            return
+        verdict = check_strategy_for_parallel(self._config, strategy_cls)
+        if verdict.refused:
+            raise RuntimeError(verdict.message)
+        if verdict.undeclared:
+            logger.info("[Parallel] %s", verdict.message)
+
     def _resolve_compile_placement(self):
         """Where compilation goes for this arm's declared strategy.
 
@@ -90,11 +117,12 @@ class TrainingEnvironmentDirector:
             zero_stage=getattr(deepspeed, "zero_stage", None),
         )
 
-    def build_environment(self) -> TrainingEnvironment:
+    def build_environment(self, *, with_test_loader: bool = True) -> TrainingEnvironment:
         """Build complete training environment in correct order.
 
         Orchestrates all builders to create models, optimizers, losses,
-        physics operators, data loaders, and metrics.
+        physics operators, data loaders, and metrics. ``with_test_loader=False``
+        leaves the held-out test set unindexed (``data.source.test_pass: infer``).
 
         Returns:
             TrainingEnvironment: Immutable container with all components
@@ -103,6 +131,8 @@ class TrainingEnvironmentDirector:
             ValueError: If any builder fails validation
         """
         logger.info("Building training environment...")
+
+        self._enforce_parallel_compat()
 
         # Resolved FIRST so a refused combination fails here rather than after
         # the models, optimizers and dataloaders have been built on a cluster
@@ -119,7 +149,7 @@ class TrainingEnvironmentDirector:
         # 1. Models (must come first - needed by optimizers)
         logger.info("Step 1/6: Building models...")
         model_builder = (
-            ModelBuilder(self._config, self._device)
+            ModelBuilder(self._config, self._device, warm_start=True)
             .build_generator()
             .build_discriminator()
             .build_encoder_decoder()
@@ -134,6 +164,8 @@ class TrainingEnvironmentDirector:
         models = model_builder.build()
         ema_model = model_builder.ema
         logger.info(f"Models created: {list(models.keys())}")
+
+        memory_format_record = apply_channels_last(models, self._config)
 
         # 1b. Parallelism, Stage A — BEFORE optimizers exist.
         #
@@ -225,13 +257,10 @@ class TrainingEnvironmentDirector:
 
         # 5. Data loaders (independent)
         logger.info("Step 5/6: Building data loaders...")
-        data_loaders = (
-            DataBuilder(self._config)
-            .build_train_val_loaders()
-            .build_test_loader()
-            .validate()
-            .build()
-        )
+        data_builder = DataBuilder(self._config).build_train_val_loaders()
+        if with_test_loader:
+            data_builder.build_test_loader()
+        data_loaders = data_builder.validate().build()
         logger.info(f"Data loaders created: {list(data_loaders.keys())}")
 
         # Sampler substitution (DistributedSampler) belongs to the strategy:
@@ -256,6 +285,8 @@ class TrainingEnvironmentDirector:
             data_loaders=data_loaders,
             parallel=parallel_runtime,
             compile=compile_record,
+            memory_format=memory_format_record,
+            data_split=data_builder.split_provenance or None,
             metrics=metrics,
             scaler=scaler,
             device=self._device,

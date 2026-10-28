@@ -25,7 +25,7 @@ from spectramr.infrastructure.reporting.metadata import (
     stamp_figure,
     write_sidecar,
 )
-from spectramr.infrastructure.reporting.style import colour_for, use_default_style
+from spectramr.infrastructure.reporting.style import colour_for, use_default_style, save_plot
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,8 @@ def make(
     out_path: str | Path,
     *,
     slices: dict[str, np.ndarray] | None = None,
+    formats: tuple[str, ...] | None = None,
+    dpi: int = 600,
     metadata: RunMetadata | None = None,
 ) -> Path | None:
     """Render the Riemannian vs. Euclidean qMap comparison.
@@ -110,12 +112,7 @@ def make(
     if metadata is not None:
         stamp_figure(fig, metadata)
     fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    if metadata is not None:
-        write_sidecar(out_path, metadata)
-    return out_path
+    return save_plot(fig, out_path, formats=formats, dpi=dpi, metadata=metadata)
 
 
 __all__ = ["make"]

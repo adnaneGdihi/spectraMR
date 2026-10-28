@@ -29,6 +29,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -99,7 +101,7 @@ class SlicedScoreMatchingLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         if context is None or "x_input" not in context:
@@ -114,10 +116,7 @@ class SlicedScoreMatchingLoss(nn.Module):
                 "the autograd Hessian-vector product is well-defined."
             )
         model = context.get("model")
-        if model is not None:
-            score = model(x)
-        else:
-            score = prediction
+        score: torch.Tensor = model(x) if model is not None else prediction
         if score.shape != x.shape:
             raise ValueError(f"score shape {tuple(score.shape)} != x shape {tuple(x.shape)}")
         return _sliced_score_loss(score, x, self.n_slices, self.rademacher)

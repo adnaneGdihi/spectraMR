@@ -15,7 +15,11 @@ import torch
 from torch import nn
 
 from spectramr.domain.exceptions import ConfigurationError
-from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.computers.base import (
+    DEFAULT_LOSS_DEVICE,
+    BaseLossComputer,
+    LossOutput,
+)
 from spectramr.models.losses.computers.unified_diffusion_reconstruction import (
     _call_safe_loss,
 )
@@ -88,16 +92,17 @@ _NON_PRED_TARGET_LOSS_NAMES = frozenset(
 class UnifiedVAELossComputer(BaseLossComputer):
     """Unified VAE loss computer implementing SSOT pattern."""
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize VAE loss computer.
 
         Args:
             config: Configuration with VAE settings
             device: Compute device
         """
-        self.reconstruction_loss_fn = None
-        self.perceptual_loss_fn = None
-        self.adversarial_loss_fn = None
+        self.reconstruction_loss_fn: nn.Module | None = None
+        self.perceptual_loss_fn: nn.Module | None = None
+        # Duck-typed: the GAN loss library object exposing ``compute_generator_loss``.
+        self.adversarial_loss_fn: Any = None
 
         super().__init__(config, device)
 
@@ -201,18 +206,20 @@ class UnifiedVAELossComputer(BaseLossComputer):
         arms. Built once and cached. Like every other loss, a non-default choice
         is instantiated through the loss registry (``create_loss``).
         """
-        cached = getattr(self, "_latent_loss_cache", None)
+        cached: tuple[Any, str] | None = getattr(self, "_latent_loss_cache", None)
         if cached is not None:
             return cached
         latent_cfg = self.config.losses.latent if self.config.losses is not None else None
         name = getattr(latent_cfg, "latent_loss_type", None) or "kl_divergence"
+        resolved: tuple[Any, str]
         if str(name).lower() in ("kl", "kl_divergence"):
-            self._latent_loss_cache = (None, "kl_divergence")
-            return self._latent_loss_cache
-        from spectramr.models.losses.registry import create_loss
+            resolved = (None, "kl_divergence")
+        else:
+            from spectramr.models.losses.registry import create_loss
 
-        self._latent_loss_cache = (create_loss(str(name)), str(name))
-        return self._latent_loss_cache
+            resolved = (create_loss(str(name)), str(name))
+        self._latent_loss_cache = resolved
+        return resolved
 
     @staticmethod
     def _apply_latent_loss(
@@ -227,13 +234,17 @@ class UnifiedVAELossComputer(BaseLossComputer):
         silent mis-call.
         """
         key = name.lower()
+        out: torch.Tensor
         if key in ("kl", "kl_divergence", "vq_kl"):
-            return loss_fn(mu, logvar)
+            out = loss_fn(mu, logvar)
+            return out
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
         if key == "latent_regularization":
-            return loss_fn(z)
+            out = loss_fn(z)
+            return out
         if key in ("mmd", "maximum_mean_discrepancy"):
-            return loss_fn(z, torch.randn_like(z))
+            out = loss_fn(z, torch.randn_like(z))
+            return out
         raise ConfigurationError(
             f"latent_loss_type={name!r} is not a recognised latent loss. "
             "Supported: kl_divergence, latent_regularization, mmd."
@@ -261,8 +272,7 @@ class UnifiedVAELossComputer(BaseLossComputer):
         Returns:
             LossOutput with total loss and components
         """
-        device = target.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
 
         # 1. RECONSTRUCTION LOSS
         lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
@@ -382,8 +392,10 @@ class UnifiedVAELossComputer(BaseLossComputer):
                     )
                     logger.debug("Suppressed exception traceback:", exc_info=True)
 
-        # Compute total
-        total = self._stack_components(components, epoch=epoch)
+        # ``iteration`` reaches the stack as it reaches every gate above: resolved
+        # at step 0, the KL anneal would sit at ``kl_beta_start`` and every
+        # warm-up-gated term would weigh 0.0 for the whole run (#1648).
+        total = self._stack_components(components, epoch=epoch, iteration=iteration)
 
         return LossOutput(total=total, components=components, metrics={})
 
@@ -394,11 +406,11 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
     Handles vector quantization loss and commitment loss.
     """
 
-    def __init__(self, config: Any, device: torch.device = torch.device("cpu")):
+    def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize VQ-VAE loss computer."""
-        self.reconstruction_loss_fn = None
-        self.perceptual_loss_fn = None
-        self.adversarial_loss_fn = None
+        self.reconstruction_loss_fn: nn.Module | None = None
+        self.perceptual_loss_fn: nn.Module | None = None
+        self.adversarial_loss_fn: nn.Module | None = None
 
         super().__init__(config, device)
 
@@ -428,8 +440,7 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
         Returns:
             LossOutput with total loss and components
         """
-        device = target.device
-        components = {}
+        components: dict[str, torch.Tensor] = {}
 
         # 1. RECONSTRUCTION LOSS
         lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
@@ -498,8 +509,8 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
                     )
                     logger.debug("Suppressed exception traceback:", exc_info=True)
 
-        # Compute total
-        total = self._stack_components(components, epoch=epoch)
+        # ``iteration`` threaded for the same reason as in ``UnifiedVAELossComputer``.
+        total = self._stack_components(components, epoch=epoch, iteration=iteration)
 
         return LossOutput(total=total, components=components, metrics={})
 

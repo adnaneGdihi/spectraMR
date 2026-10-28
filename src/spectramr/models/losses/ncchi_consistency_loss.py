@@ -16,6 +16,8 @@ measurement (Gaussian consistency); below the noise floor ⇒ target → 0.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -74,7 +76,7 @@ class NcChiConsistencyLoss(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        context: dict | None = None,
+        context: dict[str, Any] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         pred_mag = _magnitude(prediction)

@@ -74,7 +74,6 @@ def _make_config(
     # conditioning (needs none) and Bloch physics conditioning (needs them) --
     # the same class of stub-vs-production gap the `sampling.patch_size` note
     # below records.
-    embed_dim=None,
     bloch_grounded=False,
     model_type="cfg_unet",
     # Three-state since #1916: True declares support, False is a positive
@@ -129,7 +128,6 @@ def _make_config(
         enabled=multi_contrast_enabled,
         n_contrasts=n_contrasts,
         acquisition_params=acquisition_params,
-        embed_dim=embed_dim,
         bloch_grounded=bloch_grounded,
     )
     data = _NS(
@@ -287,6 +285,31 @@ class TestMultiContrastRecommendations:
         assert "AUDIT-R003" not in codes
         assert "AUDIT-R010" not in codes
 
+    @pytest.mark.parametrize("table", [True, False])
+    def test_a_strategy_side_consumer_silences_r002_and_r003(self, monkeypatch, table):
+        """CycleBloch's sequence table reads the id in physics; without a table it does not."""
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.training.strategies.cycle_bloch_strategy import (
+            CycleBlochStrategy,
+        )
+        from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+        monkeypatch.setattr(
+            TrainingStrategyFactory, "get_strategy_class", lambda self, cfg: CycleBlochStrategy
+        )
+        cfg = _make_config(
+            model_type="__test_no_contrast",
+            supports_contrast=False,
+            multi_contrast_enabled=True,
+            n_contrasts=3,
+        )
+        cfg.training = SimpleNamespace(
+            cycle_bloch=SimpleNamespace(sequences={"T2w": object()} if table else None)
+        )
+        codes = {r.code for r in recommend_multi_contrast_alignment(cfg)}
+        assert ({"AUDIT-R002", "AUDIT-R003"} & codes) == (set() if table else {"AUDIT-R002", "AUDIT-R003"})
+
     def test_r010_exempts_mrixfields_native_contrast(self):
         # The mrixfields dataset emits a per-sample contrast_id natively (no
         # data.multi_contrast block needed), so a contrast-conditioned model
@@ -324,7 +347,6 @@ class TestMultiContrastRecommendations:
             supports_contrast=True,
             multi_contrast_enabled=True,
             n_contrasts=3,
-            embed_dim=128,
             acquisition_params=None,
         )
         rec = next(
@@ -343,7 +365,6 @@ class TestMultiContrastRecommendations:
         # The computed facts must be in the message, or "no action needed" is an
         # assertion the reader cannot check.
         assert "n_contrasts=3" in rec.detail
-        assert "embed_dim=128" in rec.detail
 
     def test_r003_still_offers_the_yaml_when_bloch_grounded_reads_the_params(self):
         """Half 2 — over-suppression guard. Same config, `bloch_grounded` on."""
@@ -352,7 +373,6 @@ class TestMultiContrastRecommendations:
             supports_contrast=True,
             multi_contrast_enabled=True,
             n_contrasts=3,
-            embed_dim=128,
             bloch_grounded=True,
             acquisition_params=None,
         )
@@ -478,7 +498,6 @@ class TestInverseAdapter:
         adapters = _NS(
             pre_model=[_NS(name="slice_3d_to_2d", enabled=True)],
             post_model=[],
-            pre_loss_pred=[],
             pre_loss_target=[],
             pre_metric=[],
         )
@@ -491,7 +510,7 @@ class TestInverseAdapter:
         adapters = _NS(
             pre_model=[_NS(name="slice_3d_to_2d", enabled=True)],
             post_model=[_NS(name="gather_2d_to_3d", enabled=True)],
-            pre_loss_pred=[], pre_loss_target=[], pre_metric=[],
+            pre_loss_target=[], pre_metric=[],
         )
         cfg = _make_config(adapters=adapters)
         assert recommend_inverse_adapter(cfg) == []

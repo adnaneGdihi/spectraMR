@@ -64,6 +64,7 @@ def _make_strategy(
     ONLY param group it adds to ``opt_g`` is the NCE sampler-MLP.
     """
     strat = CUTTrainingStrategy.__new__(CUTTrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = config
     gen = disc = opt_g = opt_d = None
     if wire_optimizers:
@@ -106,9 +107,7 @@ def test_cut_no_pixel_l1_to_target(minimal_cut_config: TrainingSettings) -> None
     strat = _make_strategy(minimal_cut_config)
     losses = strat._compute_losses_impl(_batch())
     assert "nce" in losses and "adv_g" in losses and "g_total_loss" in losses
-    assert not any(
-        k in losses for k in ("recon", "l1", "loss_l1", "reconstruction", "cycle")
-    )
+    assert not any(k in losses for k in ("recon", "l1", "loss_l1", "reconstruction", "cycle"))
 
 
 def test_cut_total_uses_config_nce_weight(
@@ -200,6 +199,7 @@ def test_setup_models_amp_configures_nce_sampler(
     """I2 pattern: the strategy-owned NCE sampler-MLP (built after base
     ``__init__``'s AMP pass) must itself be AMP-configured in ``setup_models``."""
     strat = CUTTrainingStrategy.__new__(CUTTrainingStrategy)
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = minimal_cut_config
     strat.env = types.SimpleNamespace(
         generator=None,
@@ -211,9 +211,7 @@ def test_setup_models_amp_configures_nce_sampler(
     )
     strat.device = torch.device("cpu")
     configured: list = []
-    strat.amp_helper = types.SimpleNamespace(
-        configure_model_for_amp=lambda m: configured.append(m)
-    )
+    strat.amp_helper = types.SimpleNamespace(configure_model_for_amp=lambda m: configured.append(m))
     strat.setup_models()
     assert strat.nce_loss in configured
 
@@ -230,7 +228,10 @@ def test_g_closure_exposes_plain_metric_names(
     metrics = strat._last_step_metrics
     assert {"nce", "adv_g", "g_total_loss"} <= set(metrics)
     assert "d_total_loss" in metrics
-    assert all(isinstance(metrics[k], float) for k in ("nce", "adv_g", "g_total_loss"))
+    assert all(
+        isinstance(metrics[k], torch.Tensor) and metrics[k].ndim == 0
+        for k in ("nce", "adv_g", "g_total_loss")
+    )
 
 
 def test_register_owned_params_raises_when_sampler_not_materialized(
@@ -247,6 +248,8 @@ def test_register_owned_params_raises_when_sampler_not_materialized(
     from spectramr.models.generators.cycle_gan import ResNetGenerator
 
     strat = CUTTrainingStrategy.__new__(CUTTrainingStrategy)
+
+    strat._owned_modules, strat._owned_wrappers = {}, {}
     strat.config = minimal_cut_config
     gen = ResNetGenerator(1, 1)
     disc = PatchGANDiscriminator(in_channels=1)
@@ -280,3 +283,47 @@ def test_strategy_registered_in_factory() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _cut_cfg_with_image_losses(image_losses: list[dict]) -> TrainingSettings:
+    return TrainingSettings(
+        data={"train_path": "/tmp/t", "val_path": "/tmp/v", "batch_size": 2},
+        model={"model_type": "cyclegan_generator", "in_channels": 1, "out_channels": 1},
+        optimization={"learning_rate": 2e-4},
+        logging={},
+        losses={
+            "gan": {"lambda_nce": 1.0},
+            "image_losses": image_losses,
+            "policy": {"output_domain": "image"},
+        },
+    )
+
+
+def test_cut_mind_source_term_fires_through_compute() -> None:
+    """MIND-SSC against the input: the total moves by exactly its own value.
+
+    One strategy (one set of initial weights); only the config's MIND weight changes.
+    """
+    from spectramr.models.losses.mind_ssc_loss import MINDSSCLoss
+
+    def cfg(w: float) -> TrainingSettings:
+        return _cut_cfg_with_image_losses([{"name": "mind_ssc", "weight": w, "role": "source"}])
+
+    strat = _make_strategy(cfg(1.0))
+    strat.env.losses = {"mind_ssc": MINDSSCLoss()}
+    torch.manual_seed(0)
+    out = strat._compute_losses_impl(_batch())
+    mind = out["loss_mind_ssc"]
+    assert torch.isfinite(mind) and mind > 0
+    # Same call: the total is adv_g + lambda_nce * nce + the source-role term.
+    assert torch.allclose(out["g_total_loss"], out["adv_g"] + out["nce"] + mind, atol=1e-5)
+
+
+def test_cut_refuses_target_role_image_loss() -> None:
+    from spectramr.models.losses.mind_ssc_loss import MINDSSCLoss
+
+    cfg = _cut_cfg_with_image_losses([{"name": "mind_ssc", "weight": 1.0}])
+    strat = _make_strategy(cfg)
+    strat.env.losses = {"mind_ssc": MINDSSCLoss()}
+    with pytest.raises(ValueError, match="role 'target'"):
+        strat._compute_losses_impl(_batch())

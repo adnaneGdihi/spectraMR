@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from spectramr.models.blocks.contrast_conditioning import require_contrast_rows
 from spectramr.models.blocks.mamba_block import MambaBlock
 
 
@@ -95,11 +96,7 @@ class FiLMMambaBlock(nn.Module):
                 f"Expected contrast_embedding of shape (B, {self.contrast_dim}), "
                 f"got {tuple(contrast_embedding.shape)}"
             )
-        if contrast_embedding.shape[0] != x.shape[0]:
-            raise ValueError(
-                "Batch size of contrast_embedding must match x; got "
-                f"{contrast_embedding.shape[0]} vs {x.shape[0]}"
-            )
+        require_contrast_rows(contrast_embedding, x.shape[0], owner="FiLMMambaBlock")
 
         film_params = self.film(contrast_embedding)  # (B, 4*d_model)
         gamma_in, beta_in, gamma_out, beta_out = film_params.chunk(4, dim=-1)

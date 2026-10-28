@@ -216,7 +216,75 @@ def reconstruct_from_log_components(
     return torch.exp(log_anatomy + log_bias)
 
 
+@register_transform(
+    "homomorphic_bias_correction", produces=("input_log_bias",), requires=("input",)
+)
+class HomomorphicBiasFieldCorrection(tio.transforms.Transform):
+    r"""Divide the receive-bias estimate out of one magnitude image, in place.
+
+    The bias is the normalised Gaussian convolution of ``log|y|`` over the
+    foreground, ``b = G*(m log|y|) / G*m`` with ``m = |y| > f * max|y|``, centred
+    to zero mean on the foreground so the global intensity is kept. The image
+    becomes ``y * exp(-b)`` on the foreground and is left unchanged elsewhere.
+    Weighting by ``m`` keeps the near-zero background from dragging the
+    estimate down at the brain edge, which plain low-pass filtering of
+    ``log(|y| + eps)`` does. The applied ``b`` is stored under ``store_bias_key``
+    so a snapshot can show that the correction ran and what it removed.
+
+    Args:
+        smoothness: Gaussian sigma of the bias estimate, in pixels.
+        kernel_size: Odd Gaussian kernel size.
+        foreground_fraction: Foreground threshold as a fraction of ``max|y|``.
+        image_key: Subject key corrected; ``input`` corrects the ULF side only.
+        store_bias_key: Subject key the applied log-bias map is stored under.
+    """
+
+    def __init__(
+        self,
+        smoothness: float = 8.0,
+        kernel_size: int = 31,
+        foreground_fraction: float = 0.05,
+        image_key: str = "input",
+        store_bias_key: str = "input_log_bias",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if not 0.0 < foreground_fraction < 1.0:
+            raise ValueError(f"foreground_fraction must lie in (0, 1), got {foreground_fraction}")
+        self._smoother = HomomorphicBiasFieldDecomposition(
+            smoothness=smoothness, kernel_size=kernel_size
+        )
+        self.foreground_fraction = float(foreground_fraction)
+        self.image_key = image_key
+        self.store_bias_key = store_bias_key
+
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        if self.image_key not in subject:
+            raise KeyError(
+                f"homomorphic_bias_correction: subject has no {self.image_key!r} image "
+                f"(keys: {sorted(subject.keys())})"
+            )
+        image = subject[self.image_key]
+        data = image.data
+        if torch.is_complex(data) or data.ndim not in (3, 4):
+            raise ValueError(
+                "homomorphic_bias_correction needs a real magnitude image (C, H, W) or "
+                f"(C, W, H, D); got dtype={data.dtype}, shape={tuple(data.shape)}"
+            )
+        magnitude = data.abs().float()
+        peak = magnitude.flatten(1).amax(dim=1).view(-1, *([1] * (data.ndim - 1)))
+        fg = (magnitude > self.foreground_fraction * peak).float()
+        smooth = self._smoother._gaussian_smooth
+        log_bias = smooth(fg * torch.log(magnitude.clamp_min(1e-12))) / smooth(fg).clamp_min(1e-6)
+        centre = (log_bias * fg).flatten(1).sum(1) / fg.flatten(1).sum(1).clamp_min(1.0)
+        log_bias = (log_bias - centre.view_as(peak)) * fg
+        image.set_data((data * torch.exp(-log_bias)).to(data.dtype))
+        subject.add_image(tio.ScalarImage(tensor=log_bias, affine=image.affine), self.store_bias_key)
+        return subject
+
+
 __all__ = [
+    "HomomorphicBiasFieldCorrection",
     "HomomorphicBiasFieldDecomposition",
     "reconstruct_from_log_components",
 ]

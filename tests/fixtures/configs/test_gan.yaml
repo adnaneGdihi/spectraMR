@@ -32,10 +32,6 @@ model:
     discriminator: patchgan
     generator: unet
   in_channels: 1
-  model_kwargs:
-    features:
-    - 32
-    - 64
   model_type: standard_unet
   out_channels: 1
   spatial_dims: 2

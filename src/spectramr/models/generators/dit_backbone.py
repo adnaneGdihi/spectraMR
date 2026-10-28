@@ -53,9 +53,13 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.modulation.weight)
         nn.init.zeros_(self.modulation.bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, cond: torch.Tensor, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         shift1, scale1, gate1, shift2, scale2, gate2 = self.modulation(cond).chunk(6, dim=-1)
-        x = x + gate1.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift1, scale1))
+        x = x + gate1.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift1, scale1), attn_mask=attn_mask
+        )
         return x + gate2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift2, scale2))
 
 
@@ -108,7 +112,13 @@ class DiTBackbone(GradCheckpointingMixin, nn.Module, IGenerator):
         grid = self.stem.grid(x.shape[-2], x.shape[-1])
         tokens = self.stem(x) + self.positions(grid)
 
-        cond = self.time(timesteps, x.shape[0], x.device, max_timesteps=kwargs.get("max_timesteps"))
+        cond = self.time(
+            timesteps,
+            x.shape[0],
+            x.device,
+            max_timesteps=kwargs.get("max_timesteps"),
+            scale=kwargs.get("timestep_scale", "unit_interval"),
+        )
         cond = apply_contrast_conditioning(
             cond, kwargs.get("contrast_emb"), self.contrast_proj, owner="DiTBackbone"
         )

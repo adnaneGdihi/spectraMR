@@ -246,6 +246,28 @@ class TestSenseLossRecommendation:
         recs = recommend_sense_loss_needs_sense_maps(cfg)
         assert any(r.code == "AUDIT-R020" for r in recs)
 
+    def test_r020_suggests_only_keys_it_names_and_the_schema_accepts(self):
+        """#872: the pasted block taught `coil_sensitivity.estimation_method`, which
+        nothing reads, while `yaml_keys` already named the live key."""
+        import yaml
+
+        from spectramr.config.schemas.physics import PhysicsConfigSchema
+
+        cfg = _cfg(image_losses=("sense_adjoint_l1",), load_coil_sensitivity=False)
+        (rec,) = [r for r in recommend_sense_loss_needs_sense_maps(cfg) if r.code == "AUDIT-R020"]
+        doc = yaml.safe_load(rec.suggested_yaml)
+
+        def leaves(node, prefix=""):
+            for key, value in node.items():
+                path = f"{prefix}{key}"
+                yield from leaves(value, path + ".") if isinstance(value, dict) else (path,)
+
+        suggested = set(leaves(doc))
+        assert "physics.coil_sensitivity.estimation_method" not in suggested
+        assert suggested <= set(rec.yaml_keys), suggested - set(rec.yaml_keys)
+        physics = PhysicsConfigSchema(**doc["physics"])
+        assert physics.coil_processing.estimation.method == "espirit"
+
     def test_r020_silent_when_source_declared(self):
         cfg = _cfg(image_losses=("sense_adjoint_l1",), load_coil_sensitivity=True)
         assert recommend_sense_loss_needs_sense_maps(cfg) == []

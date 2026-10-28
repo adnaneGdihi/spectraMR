@@ -11,10 +11,131 @@ Sanity-shape parametrized tests are in ``TestTALLSanityShape``.
 """
 from __future__ import annotations
 
+import copy
 import pytest
 import torch
+import torch.nn.functional as F
 
-from spectramr.models.blocks.tall import TALL, build_motif_permutations, locality_loss
+from spectramr.models.blocks.tall import (
+    TALL,
+    build_motif_permutations,
+    expected_locality_loss,
+    locality_loss,
+    permutation_coords,
+)
+
+
+def _seeded_tall(seed: int = 0) -> TALL:
+    torch.manual_seed(seed)
+    return TALL(order=2, feature_dim=4)
+
+
+class TestDifferentiableLocality:
+    """Exact expected step length of the soft traversal (Spec §9.3)."""
+
+    def test_one_hot_expected_equals_hard_permutation(self) -> None:
+        m = _seeded_tall()
+        m.eval()
+        m.track_locality = True
+        x = torch.randn(2, 4, 4, 4)
+        with torch.no_grad():
+            _, perm = m(x)
+        choice = F.one_hot(m._last_choice.argmax(dim=-1), m.n_motifs).float()
+        soft = expected_locality_loss(choice, m._last_ordered, m.side)
+        hard = locality_loss(permutation_coords(perm, m.side), m.side)
+        assert torch.allclose(soft, hard, atol=1e-6)
+
+    def test_hard_permutation_locality_has_no_grad(self) -> None:
+        # Documents the trap: the integer permutation path cannot carry a gradient.
+        m = _seeded_tall()
+        m.eval()
+        with torch.no_grad():
+            _, perm = m(torch.randn(1, 4, 4, 4))
+        assert not locality_loss(permutation_coords(perm, m.side), m.side).requires_grad
+
+    def test_uniform_choice_is_not_below_canonical_one_hot_on_side4(self) -> None:
+        # Reviewer counterexample: averaging coordinates before differencing used to
+        # reward an indecisive policy (uniform 0.114 < canonical one-hot 0.312).
+        m = _seeded_tall()
+        m.eval()
+        m.track_locality = True
+        with torch.no_grad():
+            m(torch.randn(1, 4, 4, 4))
+        ordered = m._last_ordered
+        n_cells, K = ordered.shape[0], ordered.shape[1]
+        canonical = F.one_hot(torch.zeros(1, n_cells, dtype=torch.long), K).float()
+        uniform = torch.full((1, n_cells, K), 1.0 / K)
+        one_hot_value = expected_locality_loss(canonical, ordered, m.side)
+        uniform_value = expected_locality_loss(uniform, ordered, m.side)
+        assert uniform_value >= one_hot_value - 1e-6
+
+    def test_mixing_never_goes_below_best_pure_choice(self) -> None:
+        # Multilinear in the cell choices, so the minimum sits at a pure assignment.
+        m = _seeded_tall()
+        m.eval()
+        m.track_locality = True
+        with torch.no_grad():
+            m(torch.randn(1, 4, 4, 4))
+        ordered = m._last_ordered
+        n_cells, K = ordered.shape[0], ordered.shape[1]
+        pure_idx = torch.cartesian_prod(*[torch.arange(K)] * n_cells)  # (K**n_cells, n_cells)
+        pure = F.one_hot(pure_idx, K).float()  # (P, n_cells, K)
+        # The function averages over the batch, so evaluate each pure assignment alone.
+        best_pure = min(
+            float(expected_locality_loss(pure[i : i + 1], ordered, m.side))
+            for i in range(pure.shape[0])
+        )
+        torch.manual_seed(3)
+        mixed = torch.distributions.Dirichlet(torch.ones(K)).sample((6, n_cells))
+        mixed_vals = torch.stack(
+            [expected_locality_loss(mixed[i : i + 1], ordered, m.side) for i in range(6)]
+        )
+        assert bool((mixed_vals >= best_pure - 1e-6).all())
+
+    def test_soft_locality_backprops_into_policy(self) -> None:
+        m = _seeded_tall()
+        m.train()
+        m.track_locality = True
+        m(torch.randn(2, 4, 4, 4), hard=False)
+        m.last_locality_loss().backward()
+        grads = [p.grad for p in m.policy.parameters()]
+        assert all(g is not None and torch.isfinite(g).all() for g in grads)
+        assert sum(float(g.abs().sum()) for g in grads) > 0.0
+
+    def test_locality_weight_changes_policy_gradient(self) -> None:
+        x = torch.randn(2, 4, 4, 4)
+
+        def policy_grads(weight: float) -> list[torch.Tensor]:
+            m = _seeded_tall()
+            m.train()
+            m.track_locality = True
+            torch.manual_seed(1)  # identical Gumbel noise for both weights
+            seq, _ = m(x, hard=False)
+            loss = seq.pow(2).mean() + weight * m.last_locality_loss()
+            loss.backward()
+            return [p.grad.detach().clone() for p in m.policy.parameters()]
+
+        g0 = policy_grads(0.0)
+        g1 = policy_grads(1.0)
+        assert any(not torch.allclose(a, b) for a, b in zip(g0, g1, strict=True))
+
+    def test_deepcopy_after_tracked_training_forward(self) -> None:
+        m = _seeded_tall()
+        m.train()
+        m.track_locality = True
+        m(torch.randn(2, 4, 4, 4), hard=False)
+        clone = copy.deepcopy(m)
+        assert clone._last_choice is None
+        assert clone.track_locality is True
+
+    def test_untracked_forward_keeps_no_graph(self) -> None:
+        m = _seeded_tall()
+        m.train()
+        m(torch.randn(2, 4, 4, 4), hard=False)
+        assert m._last_choice is None and m._last_ordered is None
+        copy.deepcopy(m)  # must not raise
+        with pytest.raises(RuntimeError, match="track_locality"):
+            m.last_locality_loss()
 
 
 class TestMotifPermutations:
@@ -126,10 +247,10 @@ class TestLocalityLoss:
         side = 16
         h = HilbertOrder(shape=(side, side), mode="hilbert")
         perm = h.permutation.unsqueeze(0)
-        loss_h = float(locality_loss(perm, side))
+        loss_h = float(locality_loss(permutation_coords(perm, side), side))
         r = HilbertOrder(shape=(side, side), mode="raster")
         rperm = r.permutation.unsqueeze(0)
-        loss_r = float(locality_loss(rperm, side))
+        loss_r = float(locality_loss(permutation_coords(rperm, side), side))
         # Hilbert mean step = 1; raster has occasional row-jumps of ~side
         assert loss_h < loss_r
 

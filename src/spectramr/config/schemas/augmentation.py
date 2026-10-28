@@ -2,7 +2,9 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from .renames import reject_renamed_keys
 
 
 class AugmentationConfigSchema(BaseModel):
@@ -18,11 +20,17 @@ class AugmentationConfigSchema(BaseModel):
         ... )
     """
 
+    # An unknown key raises: a misspelled transform flag would otherwise train
+    # without the augmentation the YAML advertises.
     model_config = {
         "protected_namespaces": (),
-        "extra": "ignore",
+        "extra": "forbid",
         "frozen": True,
     }
+
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("data.augmentation"))  # type: ignore[arg-type]
+    )
 
     enabled: bool = Field(
         default=False,
@@ -144,6 +152,48 @@ class AugmentationConfigSchema(BaseModel):
         default=False,
         description="Enable bias field (B1) inhomogeneity simulation",
     )
+
+    enable_forward_operator: bool = Field(
+        default=False,
+        description=(
+            "Replace the input, with probability prob_forward_operator, by a ULF "
+            "image simulated from the HF target through simulate_ulf_from_hf "
+            "(B0 shift, Maxwell, T2* blur, Rician noise). Train chain only: "
+            "validation keeps the measured input."
+        ),
+    )
+    prob_forward_operator: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description="Per-subject probability of the forward-operator replacement",
+    )
+    forward_operator_kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "SimulateULFFromHF constructor kwargs (field_strength_t, target_snr_db, "
+            "b0_distortion_strength, t2_star_blur_sigma, ...). An unknown key raises "
+            "when the pipeline is built; source_image/output_image are fixed."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _forward_operator_keys_are_owned(self) -> "AugmentationConfigSchema":
+        owned = {"source_image", "output_image", "keep_source", "p"} & set(
+            self.forward_operator_kwargs
+        )
+        if owned:
+            raise ValueError(
+                f"data.augmentation.forward_operator_kwargs may not set {sorted(owned)}: "
+                "the augmentation always reads target and writes input, and its "
+                "probability is prob_forward_operator."
+            )
+        if self.forward_operator_kwargs and not self.enable_forward_operator:
+            raise ValueError(
+                "data.augmentation.forward_operator_kwargs is set but "
+                "enable_forward_operator is false, so nothing reads it."
+            )
+        return self
 
     enable_b0_distortion: bool = Field(
         default=False,

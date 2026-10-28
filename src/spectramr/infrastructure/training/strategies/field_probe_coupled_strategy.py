@@ -16,7 +16,7 @@ through three real components:
    inverse) should be the identity.
 
 Public method :meth:`apply_demod` is exposed so the inference path can
-re-use the same demodulator on held-out data.
+reuse the same demodulator on held-out data.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
+
+from .owned_param_groups import add_owned_param_group
 from .reconstruction import ReconstructionTrainingStrategy
 
 # Gyromagnetic ratio of 1H (rad/s/T)
@@ -68,7 +71,16 @@ class PhaseDemodulator(nn.Module):
 class FieldProbeCoupledStrategy(ReconstructionTrainingStrategy):
     """Recon with learnable per-line phase demodulation."""
 
+    # parallel_compat: The phase demodulator is a bare group on opt_g, refused under ddp. It is
+    # built only when a batch carries b0_trace and kspace, and rebuilt whenever the readout-line
+    # count changes, so its creation is not a rank-symmetric point at which to wrap it.
+    parallel_compat = frozenset({"replicated"})
+
     lambda_self: float = 1e-2
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        return (*super().owned_module_declarations(config), ("_demod", OWNED_PARAM_GROUP))
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -79,7 +91,12 @@ class FieldProbeCoupledStrategy(ReconstructionTrainingStrategy):
             self._demod = PhaseDemodulator(n_lines).to(device)
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
-                opt.add_param_group({"params": list(self._demod.parameters()), "lr": 1e-4})
+                add_owned_param_group(
+                    self,
+                    opt,
+                    {"params": list(self._demod.parameters()), "lr": 1e-4},
+                    owner="its phase demodulator",
+                )
         return self._demod
 
     def apply_demod(self, kspace: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:

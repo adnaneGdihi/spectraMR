@@ -127,7 +127,9 @@ class ComplexActivation(nn.Module):
         real = x[:, 0::2, :, :]
         imag = x[:, 1::2, :, :]
 
-        return complex_mod_relu_jit(real, imag, self.bias)
+        # b > 0 adds a phase-coherent floor of magnitude b at every bin; on k-space that is a
+        # Dirac at the image centre (the crosshair), so only the dead-zone side is allowed.
+        return complex_mod_relu_jit(real, imag, self.bias.clamp(max=0.0))
 
 
 __all__ = ["ComplexActivation", "Mish", "Swish"]

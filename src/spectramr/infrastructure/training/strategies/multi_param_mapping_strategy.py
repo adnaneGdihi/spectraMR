@@ -16,6 +16,7 @@ import torch
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE, OwnedParameter
 from spectramr.models.capabilities import StrategyCapabilities
 
 from .reconstruction import ReconstructionTrainingStrategy
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 class OneShotMultiParameterStrategy(ReconstructionTrainingStrategy):
     """Reconstruction-derived strategy that emits multi-parameter heads."""
 
+    # parallel_compat: The log-sigma parameter is an owned module, DDP-wrapped, read via call_owned.
+    parallel_compat = frozenset({"replicated"})
+
     #: Quantitative MRI: joint (T1, T2, PD) estimation anchored by a Bloch
     #: signal-synthesis consistency loss that RAISES rather than degrade when the
     #: physics anchor cannot be fed.
@@ -33,6 +37,13 @@ class OneShotMultiParameterStrategy(ReconstructionTrainingStrategy):
         workflows=frozenset({Regime.QUANTITATIVE}),
         tasks=frozenset({Task.PARAMETER_MAPPING}),
     )
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        cfg = getattr(getattr(config, "training", None), "multi_parameter", None)
+        weighted = getattr(cfg, "uncertainty_weighting", False)
+        own = (("_log_sigmas", OWNED_MODULE),) if weighted else ()
+        return (*super().owned_module_declarations(config), *own)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -48,6 +59,7 @@ class OneShotMultiParameterStrategy(ReconstructionTrainingStrategy):
         if cfg.uncertainty_weighting:
             n_tasks = len(cfg.parameters)
             self._log_sigmas = torch.nn.Parameter(torch.zeros(n_tasks, device=self.device))
+            self.register_owned_module("_log_sigmas", OwnedParameter(self._log_sigmas))
             opt = getattr(self.env, "opt_g", None)
             if opt is not None:
                 opt.add_param_group({"params": [self._log_sigmas], "lr": 1e-3})
@@ -120,16 +132,23 @@ class OneShotMultiParameterStrategy(ReconstructionTrainingStrategy):
 
         # Per-task losses + Kendall weighting.
         task_losses: dict[str, torch.Tensor] = {}
-        for i, name in enumerate(self._mp_cfg.parameters):
-            if name not in pred or name not in batch:
-                continue
-            l = torch.nn.functional.l1_loss(pred[name], batch[name])
-            if self._log_sigmas is not None:
-                ls = self._log_sigmas[i]
-                weighted = 0.5 * torch.exp(-2.0 * ls) * l + ls
+        present = [
+            (i, name)
+            for i, name in enumerate(self._mp_cfg.parameters)
+            if name in pred and name in batch
+        ]
+        # One DDP forward per step, and only when its output reaches the loss.
+        log_sigmas = (
+            self.call_owned("_log_sigmas") if self._log_sigmas is not None and present else None
+        )
+        for i, name in present:
+            task_loss = torch.nn.functional.l1_loss(pred[name], batch[name])
+            if log_sigmas is not None:
+                ls = log_sigmas[i]
+                weighted = 0.5 * torch.exp(-2.0 * ls) * task_loss + ls
                 task_losses[f"loss_{name}"] = weighted
             else:
-                task_losses[f"loss_{name}"] = l
+                task_losses[f"loss_{name}"] = task_loss
 
         outputs.update(task_losses)
         outputs["loss_total"] = (

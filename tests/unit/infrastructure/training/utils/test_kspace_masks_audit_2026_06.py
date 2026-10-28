@@ -19,13 +19,13 @@ from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGener
 
 
 def test_default_linear_pattern_builds_without_silent_fallback():
-    gen = KSpaceMaskGenerator(default_pattern="linear")
+    gen = KSpaceMaskGenerator(num_timesteps=1000, default_pattern="linear")
     mask = gen.generate_mask((1, 1, 16, 16), seed=0)
     assert mask.shape[-2:] == (16, 16)
 
 
 def test_untranslatable_pattern_raises_not_silent_uniform():
-    gen = KSpaceMaskGenerator(default_pattern="poisson_disk")
+    gen = KSpaceMaskGenerator(num_timesteps=1000, default_pattern="poisson_disk")
     with pytest.raises(ValueError, match="cannot render pattern"):
         gen.generate_mask((1, 1, 16, 16), seed=0)
 
@@ -33,14 +33,14 @@ def test_untranslatable_pattern_raises_not_silent_uniform():
 def test_valid_masktype_pattern_passes_through():
     # variable_density is a valid MaskType — it must build (no raise, no silent
     # fallback to uniform); exact mask geometry is MaskGenerator's concern.
-    gen = KSpaceMaskGenerator(default_pattern="variable_density")
+    gen = KSpaceMaskGenerator(num_timesteps=1000, default_pattern="variable_density")
     mask = gen.generate_mask((1, 1, 16, 16), seed=1)
     assert isinstance(mask, torch.Tensor)
     assert mask.numel() > 0
 
 
 def test_generate_batch_masks_shape():
-    gen = KSpaceMaskGenerator(default_pattern="variable_density")
+    gen = KSpaceMaskGenerator(num_timesteps=1000, default_pattern="variable_density")
     timesteps = torch.tensor([0, 1, 2], dtype=torch.long)
     masks = gen.generate_batch_masks(3, timesteps, (16, 16))
     assert masks.shape[0] == 3

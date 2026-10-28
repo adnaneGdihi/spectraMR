@@ -10,7 +10,8 @@ import torch
 from torch import nn
 
 from spectramr.config.schemas.enums import TrainingModeTypes
-from spectramr.core.module_utils import strip_wrapper_prefixes, unwrap_model
+from spectramr.infrastructure.checkpointing import codecs
+from spectramr.infrastructure.checkpointing.restore import weights
 
 from .base_inference_strategy import BaseInferenceStrategy
 
@@ -50,28 +51,16 @@ class GANInferenceStrategy(BaseInferenceStrategy):
         return TrainingModeTypes.GAN
 
     def load_checkpoint(self, checkpoint_path: str, **kwargs: Any) -> None:
-        """Load GAN checkpoint with generator and discriminator.
+        """Load the generator as the base class does (EMA when kept), and the
+        discriminator when the file carries one and ``gan.discriminator`` is configured.
 
         Args:
             checkpoint_path: Path to checkpoint file
             **kwargs: Additional loading parameters
         """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        super().load_checkpoint(checkpoint_path)
 
-        # Load generator (main model). Strip wrapper prefixes so a checkpoint
-        # written by a compiled / DDP / FSDP run loads into this bare model.
-        if "generator_state_dict" in checkpoint:
-            unwrap_model(self.model).load_state_dict(
-                strip_wrapper_prefixes(checkpoint["generator_state_dict"])
-            )
-        else:
-            # Fallback to loading entire state dict
-            unwrap_model(self.model).load_state_dict(strip_wrapper_prefixes(checkpoint))
-
-        # Load discriminator if available
-        if "discriminator_state_dict" in checkpoint:
-            # We need to create the discriminator architecture
-            # This assumes discriminator creation logic is available
+        if "discriminator" in codecs.read(checkpoint_path)["models"]:
             discriminator_config = self.gan_config.get("discriminator", {})
             if discriminator_config:
                 from spectramr.models.factories.model_factory import get_model_factory
@@ -85,22 +74,9 @@ class GANInferenceStrategy(BaseInferenceStrategy):
 
                 # Cast to nn.Module to access PyTorch methods
                 if isinstance(self.discriminator, nn.Module):
-                    self.discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+                    weights(checkpoint_path, "discriminator", self.discriminator, policy="exact")
                     self.discriminator = self.discriminator.to(self.device)
                     self.discriminator.eval()
-
-        # Load EMA weights if available.
-        #
-        # ModelEma stores its shadow under `.module`, so an ema_state_dict has
-        # always been "module."-prefixed (and "module._orig_mod."-prefixed under
-        # torch.compile). Loading it straight into the bare generator therefore
-        # raised on EVERY use_ema inference run — this path could not have
-        # worked. strip_wrapper_prefixes makes it load the shadow it names.
-        if self.config.get("use_ema", False) and "ema_state_dict" in checkpoint:
-            ema_state_dict = strip_wrapper_prefixes(checkpoint["ema_state_dict"])
-            unwrap_model(self.model).load_state_dict(ema_state_dict)
-
-        self.model.eval()
 
     def preprocess_input(self, input_tensor: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Preprocess input tensor for GAN inference.

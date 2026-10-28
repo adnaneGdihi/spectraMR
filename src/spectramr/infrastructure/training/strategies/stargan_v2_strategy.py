@@ -53,6 +53,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
@@ -108,6 +110,10 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     folds their parameters into ``opt_g`` so ``{G, F, E}`` all train.
     """
 
+    # parallel_compat: The mapping network and style encoder are owned modules, built and
+    # wrapped in __init__ on every rank, and called through forward_of in training.
+    parallel_compat = frozenset({"replicated"})
+
     #: The five discrete MRIxFields FIELD levels (Tesla). A continuous
     #: ``field_strength`` is snapped to the nearest of these → domain index 0..4.
     _FIELD_LEVELS: tuple[float, ...] = (0.1, 1.5, 3.0, 5.0, 7.0)
@@ -116,6 +122,11 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
     #: Style-vector width (StarGAN v2 default 64); overridden if a reused
     #: ``env.generator`` declares a different ``style_dim``.
     _style_dim: int = 64
+
+    @classmethod
+    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
+        own = (("mapping", OWNED_MODULE), ("style_encoder", OWNED_MODULE))
+        return (*super().owned_module_declarations(config), *own)
 
     def _setup_strategy_specific_components(self) -> None:
         """Build/resolve the four networks (called from the base ``__init__``)."""
@@ -141,10 +152,12 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         primary_gen = getattr(env, "generator", None) if env is not None else None
         primary_disc = getattr(env, "discriminator", None) if env is not None else None
 
-        if isinstance(primary_gen, StarGANv2Generator):
+        # The env models arrive wrapped under dp/ddp, so their class and sizes are read inside.
+        inner_gen = unwrap_model(primary_gen)
+        if isinstance(inner_gen, StarGANv2Generator):
             self.generator: nn.Module = primary_gen
-            style_dim = int(primary_gen.style_dim)
-            img_channels = int(primary_gen.img_channels)
+            style_dim = int(inner_gen.style_dim)
+            img_channels = int(inner_gen.img_channels)
         else:
             style_dim = int(self._style_dim)
             self.generator = StarGANv2Generator(img_channels=img_channels, style_dim=style_dim)
@@ -160,7 +173,7 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             img_channels=img_channels, style_dim=style_dim, num_domains=num_domains
         )
 
-        if isinstance(primary_disc, StarGANv2Discriminator):
+        if isinstance(unwrap_model(primary_disc), StarGANv2Discriminator):
             self.discriminator: nn.Module = primary_disc
         else:
             self.discriminator = StarGANv2Discriminator(
@@ -204,6 +217,14 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             self.amp_helper.configure_model_for_amp(self.style_encoder)
             if self.discriminator is not primary_disc:
                 self.amp_helper.configure_model_for_amp(self.discriminator)
+
+        # The env models are wrapped by the parallel backend; everything built here is owned.
+        if self.generator is not primary_gen:
+            self.register_owned_module("generator", self.generator)
+        self.register_owned_module("mapping", self.mapping)
+        self.register_owned_module("style_encoder", self.style_encoder)
+        if self.discriminator is not primary_disc:
+            self.register_owned_module("discriminator", self.discriminator)
 
         self._register_owned_params()
 
@@ -343,16 +364,16 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         # Two latents → two styles → two fakes (the diverse branch).
         z1 = self._sample_latents(batch_size, device)
         z2 = self._sample_latents(batch_size, device)
-        s1 = self.mapping(z1, y_trg)
-        s2 = self.mapping(z2, y_trg)
-        x_fake = self.generator(x, s1)
-        x_fake2 = self.generator(x, s2)
+        s1 = self.forward_of("mapping")(z1, y_trg)
+        s2 = self.forward_of("mapping")(z2, y_trg)
+        x_fake = self.forward_of("generator")(x, s1)
+        x_fake2 = self.forward_of("generator")(x, s2)
 
         # Adversarial: push D's score on the fake (at the TARGET domain head) → real.
-        adv_g = self._adv.compute_generator_loss(self.discriminator(x_fake, y_trg))
+        adv_g = self._adv.compute_generator_loss(self.forward_of("discriminator")(x_fake, y_trg))
 
         # Style reconstruction: the style encoder must recover the injected style.
-        style = F.l1_loss(self.style_encoder(x_fake, y_trg), s1) * lambda_style
+        style = F.l1_loss(self.forward_of("style_encoder")(x_fake, y_trg), s1) * lambda_style
 
         # Style diversification: MAXIMISE the L1 gap between the two fakes (negative
         # sign → contributes negatively to the minimised total). A constant
@@ -362,8 +383,8 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
 
         # Cycle: re-encode the SOURCE style from the real source and translate the
         # fake back — the only reconstruction anchor (no paired L1 to target).
-        s_src = self.style_encoder(x, y_src)
-        x_cycle = self.generator(x_fake, s_src)
+        s_src = self.forward_of("style_encoder")(x, y_src)
+        x_cycle = self.forward_of("generator")(x_fake, s_src)
         cycle = F.l1_loss(x_cycle, x) * lambda_cycle
 
         g_total = adv_g + style + diversity + cycle
@@ -416,17 +437,17 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             # Fresh fake for the D-step (detached — no generator gradient path).
             with torch.no_grad():
                 z = self._sample_latents(x.shape[0], device)
-                s = self.mapping(z, y_trg)
-                x_fake = self.generator(x, s)
-            real_logits = self.discriminator(real_trg, y_trg)
-            fake_logits = self.discriminator(x_fake, y_trg)
+                s = self.forward_of("mapping")(z, y_trg)
+                x_fake = self.forward_of("generator")(x, s)
+            real_logits = self.forward_of("discriminator")(real_trg, y_trg)
+            fake_logits = self.forward_of("discriminator")(x_fake, y_trg)
             real_loss, fake_loss = self._adv.compute_discriminator_loss(real_logits, fake_logits)
             d_adv = real_loss + fake_loss
             # R1 gradient penalty on the REAL target image at its target-domain head
             # (grad flows through D via the domain-bound wrapper). Gated on
             # ``config.losses.gan.enable_r1`` (pitfall #15 — unwired knob guard).
             if self._enable_r1:
-                r1 = self._r1(_DomainBoundDiscriminator(self.discriminator, y_trg), real_trg)
+                r1 = self._r1(_DomainBoundDiscriminator(self.forward_of("discriminator"), y_trg), real_trg)
             else:
                 r1 = torch.zeros((), device=device)
             d_total = d_adv + r1
