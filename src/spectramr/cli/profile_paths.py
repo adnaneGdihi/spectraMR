@@ -5,14 +5,16 @@ so they are testable without building an argparse namespace:
 
 1. **Path resolution.** Every artifact a profiling run produces — the profiled
    run's own checkpoints/logs/metrics *and* the Scalene profile beside them —
-   lands under ``experiments/results/<experiment>/profiles/<run_id>/``. That
+   lands under ``<arm run dir>/profile/<run_id>/``. The arm run dir is
+   ``experiments/results/<experiment>`` for a standalone run and the
+   ``--output-dir`` that ``campaign profile`` passes (``<campaign>/<arm>``). That
    root is not a new convention invented here: ``config_health_checker`` already
    *requires* ``training.output_dir`` to be ``experiments/results/
    <experiment_name>``, so this module derives from that owner rather than
    becoming a second one (non-negotiable 17). ``resolve_experiment_name`` is the
    single place the ``<experiment>`` segment is decided.
 
-   The ``profiles/<run_id>/`` nesting is load-bearing rather than cosmetic: a
+   The ``profile/<run_id>/`` nesting is load-bearing rather than cosmetic: a
    profiling run is a THROWAWAY run of a real arm, and pointing it at the arm's
    own results directory made it overwrite the artifacts it was supposed to be
    measuring. See :class:`ProfilePaths` for the two roots that keeps apart.
@@ -102,15 +104,19 @@ def resolve_experiment_name(
     explicit: str | None,
     config_path: Path,
 ) -> str:
-    """Decide the ``<experiment>`` segment of ``experiments/results/<experiment>``.
+    """Decide ``<experiment>`` in ``experiments/results/<experiment>``: the arm's run dir.
+
+    A relative path that may span several segments (``<cohort>/<arm>``), so the
+    profile is filed inside the arm's own run directory rather than its cohort's.
 
     Precedence, most authoritative first:
 
     1. ``explicit`` — an operator-supplied ``--experiment``. Always wins, so a
        one-off profiling run can be filed separately from the arm's real results.
     2. ``output_dir`` — ``training.output_dir`` from the loaded config, when it
-       already points under ``experiments/results/``. This is the common case and
-       the reason a profiling run files itself next to the arm's own artifacts.
+       already points under ``experiments/results/``: everything after that pair.
+       This is the common case and the reason a profiling run files itself inside
+       the arm's own run directory.
     3. The config file's stem.
 
     Case 3 is reached when an arm's ``training.output_dir`` is the schema default
@@ -133,7 +139,7 @@ def resolve_experiment_name(
         anchor = CONVENTION_PARTS
         for i in range(len(parts) - len(anchor)):
             if parts[i : i + len(anchor)] == anchor and i + len(anchor) < len(parts):
-                return parts[i + len(anchor)]
+                return str(Path(*parts[i + len(anchor) :]))
     return config_path.stem
 
 
@@ -145,10 +151,10 @@ def resolve_profile_paths(
 ) -> ProfilePaths:
     """Build the artifact layout for one profiling run.
 
-    ``results_root`` is injectable for tests only; production always uses the
-    repo-relative :data:`RESULTS_ROOT`, because that is the path the config
-    health checker enforces and the reporting tooling (``discover_run_dirs``)
-    walks.
+    ``results_root`` defaults to the repo-relative :data:`RESULTS_ROOT`, the path
+    the config health checker enforces and ``discover_run_dirs`` walks. A
+    campaign's ``--output-dir`` is split into the two, so the profile lands in the
+    same ``<campaign>/<arm>`` directory its training run writes.
     """
     root = results_root if results_root is not None else RESULTS_ROOT
     run_dir = root / experiment

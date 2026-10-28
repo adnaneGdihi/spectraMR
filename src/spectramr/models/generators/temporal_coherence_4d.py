@@ -16,7 +16,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint_sequential
 
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -62,7 +64,7 @@ class _TemporalAttention(nn.Module):
 
 
 @register_model(name="temporal_coherence_4d", training_mode="reconstruction")
-class TemporalCoherence4DGenerator(IGenerator, nn.Module):
+class TemporalCoherence4DGenerator(GradCheckpointingMixin, IGenerator, nn.Module):
     """4D+T generator for temporal MRI reconstruction."""
 
     def __init__(
@@ -96,6 +98,7 @@ class TemporalCoherence4DGenerator(IGenerator, nn.Module):
             if i % 2 == 1:
                 layers.append(_TemporalAttention(feature_dim, temporal_dim))
         self.backbone = nn.Sequential(*layers)
+        self._ckpt_segments = max(1, num_3d_layers)
 
         self.out_conv = nn.Conv2d(feature_dim, out_channels, 3, padding=1)
         self.frame_stack = frame_stack
@@ -122,7 +125,10 @@ class TemporalCoherence4DGenerator(IGenerator, nn.Module):
         if self.in_channels * self.frame_stack > C:
             x = x.repeat(1, self.frame_stack, 1, 1)[:, : self.in_channels * self.frame_stack]
         h = self.intro(x)
-        h = self.backbone(h)
+        if self._checkpointing_active():
+            h = checkpoint_sequential(self.backbone, self._ckpt_segments, h, use_reentrant=False)
+        else:
+            h = self.backbone(h)
         return self.out_conv(h)
 
     def generate(self, z: torch.Tensor, **kwargs: Any) -> torch.Tensor:

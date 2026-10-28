@@ -137,7 +137,6 @@ KNOWN_NAMING_EXCEPTIONS: frozenset[str] = frozenset(
         "use_magnitude_scaling",
         "use_memory_bank",
         "use_momentum",
-        "use_orig_params",
         "use_real_stack",
         "use_repetitions",
     }

@@ -621,6 +621,10 @@ class FSDPConfigSchema(BaseModel):
     # rejects nothing that runs today. WS-1 round-2 closure (2026-07-02).
     model_config = {"extra": "forbid", "frozen": True}
 
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("parallel.fsdp"))  # type: ignore[arg-type]
+    )
+
     enabled: bool = Field(default=False)
     sharding_strategy: FSDPShardingStrategy = Field(default="full_shard")
     auto_wrap_policy: FSDPAutoWrapPolicy = Field(
@@ -645,11 +649,12 @@ class FSDPConfigSchema(BaseModel):
     cpu_offload: bool = Field(default=False)
     mixed_precision: Literal["fp16", "bf16"] | None = Field(
         default=None,
-        description="null | bf16 — an override of FSDP's MixedPrecision policy (fp16 is "
-        "refused). null follows optimization.precision, the arm's one precision decision: "
-        "off is float32, enabled with no dtype is float16 (refused under FSDP), and "
-        "bfloat16 must be declared. The clusters mix Ada and V100 nodes, which have no "
-        "native bf16, so bf16 is never a default.",
+        description="null | fp16 | bf16 — an override of FSDP's MixedPrecision policy. "
+        "null follows optimization.precision, the arm's one precision decision: off is "
+        "float32, enabled with no dtype is float16, and bfloat16 must be declared. fp16 "
+        "runs under the sharded fp16 scaler, whose non-finite flag is all-reduced across "
+        "ranks. Neither half type holds complex parameters, so a complex model is refused. "
+        "V100 has no bf16, so fp16 is the half precision there.",
     )
     reduce_dtype: Literal["float32", "match_param"] = Field(
         default="float32",
@@ -659,32 +664,6 @@ class FSDPConfigSchema(BaseModel):
         "the traffic and loses gradient precision. Ignored when mixed_precision "
         "is null.",
     )
-    buffer_dtype: Literal["float32", "match_param"] = Field(
-        default="float32",
-        description="Precision of module buffers (BatchNorm running statistics). "
-        "float32 (default) keeps them out of half precision. Ignored when "
-        "mixed_precision is null.",
-    )
-    activation_checkpointing: bool = Field(default=False)
-    limit_all_gathers: bool = Field(default=True)
-    use_orig_params: bool = Field(default=True)
-
-    @model_validator(mode="after")
-    def _fp16_needs_a_sharded_grad_scaler(self) -> "FSDPConfigSchema":
-        """fp16 gradients underflow without loss scaling, and none is wired for FSDP.
-
-        The scaler the loop builds is a plain ``GradScaler``: each rank decides
-        independently whether to skip a step, so shards disagree and diverge. The
-        sharded scaler is not wired, so fp16 is refused rather than run unscaled.
-        """
-        if self.enabled and self.mixed_precision == "fp16":
-            raise ValueError(
-                "fsdp.mixed_precision='fp16' is refused: it needs a ShardedGradScaler, "
-                "which is not wired, so gradients would underflow unscaled (or ranks "
-                "would disagree on skipping a step). Use 'bf16' on Ampere or newer, or "
-                "null to run in float32."
-            )
-        return self
 
     @model_validator(mode="after")
     def _transformer_policy_needs_layer_classes(self) -> "FSDPConfigSchema":

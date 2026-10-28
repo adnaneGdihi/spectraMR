@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.blocks.grad_checkpointing import NestedGradCheckpointingMixin
 from spectramr.models.generators.hilbert_mamba_generators import (
     _ConvHead,
     _ConvStem,
@@ -79,7 +80,7 @@ def _zero_linear(d: int) -> nn.Linear:
     requires_paired_data=True,
     strict_kwargs=True,
 )
-class HWMamba(nn.Module):
+class HWMamba(NestedGradCheckpointingMixin, nn.Module):
     """Hilbert-wavelet Mamba with a fixed Haar analysis and Mamba-predicted detail corrections.
 
     Args:

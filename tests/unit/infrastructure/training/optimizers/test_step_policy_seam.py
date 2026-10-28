@@ -22,10 +22,7 @@ import pytest
 torch = pytest.importorskip("torch")
 nn = pytest.importorskip("torch.nn")
 
-from spectramr.infrastructure.training.optimizers import (  # noqa: E402
-    AMPPolicy,
-    FSDPStepPolicy,
-)
+from spectramr.infrastructure.training.optimizers import AMPPolicy  # noqa: E402
 from spectramr.infrastructure.training.step_executor import StepExecutor  # noqa: E402
 from spectramr.infrastructure.training.strategy_interfaces import (  # noqa: E402
     IStepPolicy,
@@ -194,22 +191,8 @@ class TestGuardLoss:
 
 
 class TestGradientClippingIsPolicyOwned:
-    """Sharding-correctness, not cosmetics.
-
-    ``clip_grad_norm_(model.parameters(), n)`` computes the norm over the
-    parameters THIS RANK HOLDS. Under FSDP that is a shard, so each rank scales
-    by a different factor -- silently, and it presents as training instability
-    because every rank still steps successfully.
-    """
-
-    class _FakeFSDP(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lin = nn.Linear(2, 2)
-            self.clipped_to: float | None = None
-
-        def clip_grad_norm_(self, max_norm):
-            self.clipped_to = max_norm
+    """The default policy's clip is the global norm on every backend (FSDP2's
+    DTensor case runs on two real ranks in test_state_io_fsdp.py)."""
 
     def test_default_policy_clips_over_parameters(self) -> None:
         model = nn.Linear(2, 2)
@@ -218,33 +201,3 @@ class TestGradientClippingIsPolicyOwned:
         _policy().clip_gradients(model, 1.0)
         total = torch.cat([model.weight.grad.flatten(), model.bias.grad.flatten()])
         assert total.norm().item() == pytest.approx(1.0, rel=1e-4)
-
-    def test_fsdp_policy_delegates_to_the_modules_own_clip(self) -> None:
-        model = self._FakeFSDP()
-        FSDPStepPolicy(max_grad_norm=1.0, enable_gradient_clipping=True).clip_gradients(
-            model, 0.7
-        )
-        assert model.clipped_to == 0.7
-
-    def test_fsdp_policy_warns_rather_than_silently_degrading(self, caplog) -> None:
-        """An unwrapped model under an FSDP policy is a real inconsistency."""
-        model = nn.Linear(2, 2)
-        model.weight.grad = torch.ones_like(model.weight)
-        model.bias.grad = torch.ones_like(model.bias)
-        with caplog.at_level("WARNING"):
-            FSDPStepPolicy(
-                max_grad_norm=1.0, enable_gradient_clipping=True
-            ).clip_gradients(model, 1.0)
-        assert "not FSDP-wrapped" in caplog.text
-
-    def test_the_gating_lives_in_one_place(self) -> None:
-        """A sharded subclass overrides ONE method; the enable/threshold gating
-        is not duplicated into it."""
-        model = self._FakeFSDP()
-        policy = FSDPStepPolicy(max_grad_norm=2.0, enable_gradient_clipping=False)
-        policy._apply_gradient_clipping(model)
-        assert model.clipped_to is None  # disabled => no clip at all
-
-        policy = FSDPStepPolicy(max_grad_norm=2.0, enable_gradient_clipping=True)
-        policy._apply_gradient_clipping(model)
-        assert model.clipped_to == 2.0

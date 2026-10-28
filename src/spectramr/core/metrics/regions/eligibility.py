@@ -221,6 +221,7 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "power_spectrum_consistency",
             "radial_k_error",
             "sher",
+            "super_nyquist_fidelity",
         ),
     ),
     "phase": (
@@ -242,20 +243,23 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "mmd_metric",
             "rfs",
             "sliced_wasserstein",
+            "srf_bound",
             "wasserstein_1d",
         ),
     ),
     "mri_physics": (
-        "consumes the measurement (k-space / coil maps / sampling mask); an "
-        "image-space ROI cannot restrict a k-space measurement.",
+        "consumes the measurement or its geometry (k-space / trajectory / coil maps / "
+        "sampling mask); an image-space ROI cannot restrict a k-space measurement.",
         (
             "asymptotic_gfactor",
             "g_factor",
+            "k_space_trajectory_rmse",
             "nema_cnr",
             "nema_snr",
             "qi1",
             "residual_whiteness",
             "spike_detection",
+            "topological_mask_certificate",
             "wm2max",
         ),
     ),
@@ -264,24 +268,43 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         "an image region. 'inference_latency_ms restricted to grey matter' is not a "
         "quantity -- it is a category error.",
         (
+            "adaptive_ece",
+            "adversarial_psnr_drop",
             "bland_altman_bias",
+            "brier_score",
+            "classwise_ece",
+            "composed_spectral_norm_bound",
+            "conformal_risk_control",
+            "equivariance_defect",
             "expected_calibration_error",
             "galois_h1_certificate",
+            "gaussian_nll",
             "icc_3_1",
             "inference_latency_ms",
+            "input_dependence_spread",
             "limits_of_agreement_lower",
             "limits_of_agreement_upper",
+            "max_layer_spectral_norm",
             "mrf_persistence_stability",
             "nll_bits_per_dim",
+            "ood_acceleration_shift",
             "pac_bayes_certificate",
             "param_count",
+            "qmap_conformal_coverage",
+            "subgroup_psnr_disparity",
+            "subgroup_ssim_gap",
         ),
     ),
     "parametric_map": (
         "defined on a parametric / non-magnitude map (perfusion, diffusion, flow, "
-        "MRS, qMRI), not on a magnitude ROI.",
+        "B0 field, MRS, qMRI), not on a magnitude ROI.",
         (
+            "adc_mae",
+            "att_mae",
+            "b0_field_rmse",
             "bat",
+            "bloch_manifold_residual",
+            "cbf_rmse",
             "cc_snr",
             "cosine_preservation_score",
             "crlb",
@@ -295,8 +318,12 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "mass_conservation",
             "ndc_diffusion",
             "negative_voxels",
+            "net_flow_error",
+            "peak_velocity_error",
+            "phys_residual_consistency",
             "spectral_linewidth",
             "spike_percentage",
+            "velocity_rmse",
             "vnr",
             "wash_slope",
         ),
@@ -327,10 +354,13 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "folding_fraction",
             "hd95",
             "iou",
+            "synthseg_dice",
+            "synthseg_dice_risk",
             "target_registration_error",
             "tissue_dice",
             "tissue_hd95",
             "tissue_volume_similarity",
+            "volume_consistency",
         ),
     ),
     "temporal_series": (
@@ -345,6 +375,33 @@ _NOT_RESTRICTABLE_GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "temporal_fidelity",
             "tsnr",
         ),
+    ),
+    "topology": (
+        "persistent homology is a global invariant: a crop cuts connected components "
+        "and loops at its border and creates new ones, so the diagram of a crop is not "
+        "the restriction of the image's diagram. persistence_diameter is not computed on "
+        "an image at all but on a [T, d] signal trajectory.",
+        ("cubical_ph_w2_distance", "persistence_diameter"),
+    ),
+    "volumetric": (
+        "needs a through-plane axis ([D, H, W]); a region restricts one 2-D slice, on "
+        "which the through-plane line-spread function is undefined.",
+        ("through_plane_fwhm",),
+    ),
+    "pre_masked": (
+        "already a region metric: it averages over the banding / artefact mask its "
+        "caller supplies. Restricting it to another ROI would intersect the two masks, "
+        "which is a different claim; the regional squared error is mse in the map tier.",
+        ("banding_region_mse",),
+    ),
+    "task_observer": (
+        "a channelized Hotelling observer estimates its channel covariance from 32 px "
+        "tiles of the residual and scales the inserted lesion by the target's 95th "
+        "percentile. A ~40 px lesion box holds one tile, below the two realisations the "
+        "estimate needs, and a crop makes the lesion contrast ROI-local, so the regional "
+        "d' answers a different question from the full-slice one. Declined until a "
+        "regional observer is specified.",
+        ("task_based_detectability",),
     ),
 }
 
@@ -399,6 +456,7 @@ _NO_REFERENCE = (
     "total_variation",
     "wlms",
     "wpde",
+    "zipper_detection",
 )
 
 # Scalar full-reference reductions with no spatial map exposed -- well-defined on a

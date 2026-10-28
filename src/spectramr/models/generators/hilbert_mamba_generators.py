@@ -34,7 +34,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
+from spectramr.models.blocks.grad_checkpointing import (
+    GradCheckpointingMixin,
+    NestedGradCheckpointingMixin,
+)
 from spectramr.models.blocks.mamba_block import MambaBlock
 from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
@@ -140,7 +145,7 @@ class _HilbertLinearize(nn.Module):
         return lin.reverse(seq)
 
 
-class _MambaEncoder(nn.Module):
+class _MambaEncoder(GradCheckpointingMixin, nn.Module):
     """Stack of Mamba blocks operating on [B, L, D] sequences."""
 
     def __init__(
@@ -180,8 +185,9 @@ class _MambaEncoder(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        ckpt = self._checkpointing_active()
         for layer in self.layers:
-            x = x + layer(x)
+            x = x + (checkpoint(layer, x, use_reentrant=False) if ckpt else layer(x))
         return self.norm(x)
 
 
@@ -257,7 +263,7 @@ class _ConvHead(nn.Module):
     requires_paired_data=True,
     strict_kwargs=True,
 )
-class MMMamba(nn.Module):
+class MMMamba(NestedGradCheckpointingMixin, nn.Module):
     """Macro-Micro Nested Mamba for tractable 3D volumetric processing.
 
     Divides the Hilbert curve into local blocks (micro-curves), processes

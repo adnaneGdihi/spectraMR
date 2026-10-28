@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["GradCheckpointingMixin"]
+__all__ = ["GradCheckpointingMixin", "NestedGradCheckpointingMixin"]
 
 
 class GradCheckpointingMixin:
@@ -57,3 +57,31 @@ class GradCheckpointingMixin:
         return (
             self.grad_checkpointing and getattr(self, "training", False) and torch.is_grad_enabled()
         )
+
+
+class NestedGradCheckpointingMixin:
+    """``set_grad_checkpointing`` for a model whose checkpointed segments live in children.
+
+    For generators built from shared stacks (``_MambaEncoder``, ``DeltaMambaStack``) that
+    own the per-layer checkpointing. Raises when no child can checkpoint, for the same
+    reason ``KSpaceColdDiffusionGenerator`` does: a memory claim must not silently lapse.
+    """
+
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Forward the switch to every :class:`GradCheckpointingMixin` submodule.
+
+        Args:
+            enable: Whether the children should checkpoint their segments.
+
+        Raises:
+            NotImplementedError: No submodule implements checkpointing.
+        """
+        targets = [m for m in self.modules() if isinstance(m, GradCheckpointingMixin)]  # type: ignore[attr-defined]
+        if not targets:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no submodule that implements gradient "
+                "checkpointing; set optimization.gradient.enable_checkpointing: false "
+                "or add GradCheckpointingMixin to the block that holds its activations."
+            )
+        for module in targets:
+            module.set_grad_checkpointing(enable)

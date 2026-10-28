@@ -235,21 +235,12 @@ the registry so the two cannot drift.
 Gradient clipping under FSDP
 ----------------------------
 
-``clip_grad_norm_(model.parameters(), n)`` computes the norm over the parameters
-**this rank holds**. Under FSDP that is a shard, so each rank scales by a
-different factor. Nothing errors -- every rank steps successfully -- and it
-presents as training instability.
-
-:class:`~spectramr.infrastructure.training.optimizers.FSDPStepPolicy` uses FSDP's
-own ``model.clip_grad_norm_()``, which all-reduces the squared norms first. The
-strategy supplies it, because the strategy is what knows how the model was
-wrapped.
-
-The training loop clips through the strategy's ``_clip_and_log_gradients`` hook,
-which ``AMPPolicy`` prefers to ``policy.clip_gradients``. That hook therefore
-owns the choice too: ``_compute_gradient_norm`` calls the model's own
-``clip_grad_norm_`` when it has one (an FSDP root) and the plain utility
-otherwise.
+Under FSDP2 every sharded parameter, and so every gradient, is a DTensor, and
+``torch.nn.utils.clip_grad_norm_`` over DTensor gradients all-reduces the squared
+norms before scaling: the plain utility is already the global clip, so FSDP needs no
+step policy of its own. The training loop clips through the strategy's
+``_clip_and_log_gradients`` hook; ``_compute_gradient_norm`` returns the replicated
+norm as a plain tensor so callers never mix DTensor and Tensor arithmetic.
 
 Installing the step policy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -268,10 +259,9 @@ read by nothing: ``DeepSpeedStepPolicy``'s ``owns_gradient_accumulation`` /
 divided the loss a second time on top of DeepSpeed's own division. The run
 trains, every test passes, and only the numbers are wrong.
 
-The registry deliberately accepts a **class or an instance**: FSDP hands back
-``FSDPStepPolicy`` itself because only the loop layer knows the arm's
-``gradient_clip_value``, while DeepSpeed hands back a configured instance because
-only the engine knows itself. ``_install_parallel_step_policy`` resolves that;
+The registry deliberately accepts a **class or an instance**: a class is built by
+the loop layer, which alone knows the arm's ``gradient_clip_value``, while
+DeepSpeed hands back a configured instance because only the engine knows itself. ``_install_parallel_step_policy`` resolves that;
 ``adopt_step_policy`` rejects a class outright, because ``getattr`` on a class
 returns the descriptor rather than the value and would negotiate every capability
 flag silently to ``False``.
@@ -331,10 +321,12 @@ configured rate and the run still looks healthy.
 **Optimizers under ZeRO.** The engine adopts the optimizer this repo built, and it
 refuses some from *inside* ``deepspeed.initialize``: at ``zero_stage >= 1`` anything
 outside Adam, AdamW and Adagrad (and DeepSpeed's own fused variants) asserts, and
-any ``offload_optimizer`` other than ``none`` raises unless the optimizer is
-``DeepSpeedCPUAdam`` or ``DeepSpeedCPULion``, which this repo does not build. The
-audit reports both as ``deepspeed_optimizer_supported`` so they fail before
-cluster time is spent. ``round_robin_gradients`` is a stage-2 option and is
+any ``offload_optimizer`` other than ``none`` raises unless the client optimizer is
+``DeepSpeedCPUAdam`` or ``DeepSpeedCPULion``. Under offload this repo therefore rebuilds
+the Adam or AdamW it built as ``DeepSpeedCPUAdam`` (same parameter groups and
+hyperparameters; ``ZenFlowCPUAdam`` when ZenFlow is on), and refuses any other optimizer,
+as well as ``amsgrad`` and ``maximize``. The audit reports these as
+``deepspeed_optimizer_supported`` so they fail before cluster time is spent. ``round_robin_gradients`` is a stage-2 option and is
 refused elsewhere rather than advertised and ignored.
 
 ZeRO-3, DeepCompile and ZenFlow
@@ -425,7 +417,9 @@ Two limitations to know before committing GPU time:
 ``engine.step()`` issues collectives. An arm whose discriminator steps on a
 different cadence than the generator **deadlocks** rather than erroring. The
 backend refuses more than one optimizer unless
-``deepspeed.allow_multi_engine: true``.
+``deepspeed.allow_multi_engine: true``. That knob stays the gate until the
+two-engine GPU test passes (``test_deepspeed_multi_engine_gpu.py``, #2631); the
+pair is refused at ``zero_stage: 3`` regardless.
 
 **Complex / k-space arms with fp16.** ``get_autocast_context`` disables autocast
 for complex+fp16 because there is no ``complex16``. DeepSpeed casts weights to
@@ -661,8 +655,8 @@ Checkpoints
 -----------
 
 Every wrapper renames the keys ``state_dict()`` emits -- ``torch.compile`` adds
-``_orig_mod.``, DP/DDP and ``ModelEma`` add ``module.``, FSDP adds
-``_fsdp_wrapped_module.``. :mod:`spectramr.core.module_utils` is the single place
+``_orig_mod.``, DP/DDP and ``ModelEma`` add ``module.``, and checkpoints written
+under the former FSDP1 carry ``_fsdp_wrapped_module.`` (FSDP2 adds no prefix). :mod:`spectramr.core.module_utils` is the single place
 that strips them, applied at every save and load site.
 
 This is not cosmetic. Every inference and evaluation path builds a **bare** model
@@ -671,16 +665,16 @@ and loads with ``strict=True``, so a wrapped checkpoint raises there -- and unde
 nothing, loads nothing, and reports success, so a randomly-initialised model
 produces metrics that read as a bad arm.
 
-Under FSDP the keys are the smaller problem. ``unwrap_model(generator).state_dict()``
-is the inner module's flat shard views -- a ``(54,)`` slice where an ``(8, 8)``
-weight belongs -- even inside ``FSDP.state_dict_type``, and
-``optimizer.state_dict()`` holds one rank's slice of the Adam moments. Both are
-therefore read through the checkpoint adapter's ``state_io``
-(:mod:`spectramr.infrastructure.distributed.state_io`): the model is gathered on
-the FSDP **root**, and the optimizer goes through ``FSDP.optim_state_dict`` on
-save and ``optim_state_dict_to_load`` on resume. Every one of those calls is
-collective, so every rank enters them in the same order; ``rank0_only`` decides
-who receives the result, never who participates.
+Under FSDP the keys are the smaller problem. FSDP2 keeps the parameter names but
+makes every parameter a DTensor shard, so ``generator.state_dict()`` is 1/N of each
+weight and ``optimizer.state_dict()`` one rank's slice of the Adam moments. Both are
+read through the checkpoint adapter's ``state_io``
+(:mod:`spectramr.infrastructure.distributed.state_io`), which gathers with the
+distributed-checkpoint API (``get_model_state_dict`` / ``get_optimizer_state_dict``,
+full state dict, offloaded to rank 0) and scatters on resume with the ``set_*`` pair.
+Every one of those calls is collective, so every rank enters them in the same order.
+The EMA shadow is sharded like the generator (``prepare_ema``), so its blend and the
+validation swap stay shard-local, and its checkpoint form is gathered the same way.
 
 Every checkpoint records the topology it was written at (``world_size`` and
 ``parallel.strategy``), and a resume at a **different world size is refused**.
@@ -717,13 +711,13 @@ while the shadow holds its random initialisation forever. Measured against a rea
 DeepSpeed engine: shadow ``0.weight`` against engine ``module.0.weight``, overlap
 zero, on 75 arms (#2172).
 
-Under FSDP the live generator holds shards, so a key-matched blend also needs
-whole tensors. The loop therefore wraps the update in ``state_io.full_params``
-(``summon_full_params``, which costs an all-gather per EMA update; raise
-``ema.update_frequency`` to amortise it), and validation installs the shadow
-through ``state_io.swap_in``, which loads it the way a checkpoint is loaded and
-restores the live weights on exit. ``summon_full_params`` cannot be held across a
-validation forward, which is why the swap does not use it.
+Under FSDP the live generator holds DTensor shards, so the shadow is sharded the
+same way at Stage A (the plugin's ``prepare_ema``, through ``shard_like``). The
+blend then runs shard against shard with no gather, and validation installs the
+shadow through ``state_io.swap_in`` the same way; an unsharded shadow beside a
+sharded generator is refused rather than gathered on every swap. A failed update
+raises: it used to be logged as a warning, which left EMA frozen while validation
+went on grading it as EMA.
 
 Three consequences worth knowing:
 
@@ -821,16 +815,23 @@ on whether to stop.
 FSDP precision
 --------------
 
-``fsdp.mixed_precision`` is ``bf16`` (default), ``fp16`` or ``null``. ``fp16`` is
-**refused** at config load: it needs a ``ShardedGradScaler``, and the loop builds a
-plain ``GradScaler`` whose per-rank overflow decisions would let shards disagree
-on skipping a step. ``bf16`` needs Ampere or newer; V100 nodes should use ``null``.
+``fsdp.mixed_precision`` is ``fp16``, ``bf16`` or ``null`` (follow
+``optimization.precision``). ``optimization.precision`` with no dtype resolves to
+``fp16``, so an arm that enables AMP runs fp16 under FSDP. ``bf16`` needs Ampere or
+newer, and V100 has no bf16: fp16 is the half precision there.
 
-Gradients are reduced in ``float32`` and module buffers (BatchNorm running
-statistics) are kept in ``float32``, whatever ``mixed_precision`` is.
-``fsdp.reduce_dtype: match_param`` and ``fsdp.buffer_dtype: match_param`` restore
-the all-half policy, which halves the reduce-scatter traffic and loses gradient
-precision. Both are stamped into the run's provenance.
+fp16 runs under the same ``ComplexGradScaler`` as single-process arms, built with
+``sharded=True``. Its non-finite flag is all-reduced (MAX) across ranks, so an inf
+gradient on one rank makes every rank skip the same step and back off the scale
+identically. Neither half type has a complex counterpart, so a model with complex
+parameters is refused at wrap time under fp16 or bf16 and runs in ``float32``. The
+scaler class is stamped into provenance as ``fsdp.grad_scaler``.
+
+Gradients are reduced in ``float32`` whatever ``mixed_precision`` is, and module
+buffers (BatchNorm running statistics) keep their own dtype: FSDP2 never casts them.
+``fsdp.reduce_dtype: match_param`` reduces in the parameter dtype, which halves the
+reduce-scatter traffic and loses gradient precision. It is stamped into the run's
+provenance.
 
 Reference arms
 --------------

@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 from pydantic import BaseModel
@@ -50,8 +50,12 @@ def _schema_classes() -> dict[str, type[BaseModel]]:
 
 
 def _violations() -> set[tuple[str, str]]:
+    return _violations_in(_schema_classes())
+
+
+def _violations_in(classes: dict[str, Any]) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
-    for name, cls in _schema_classes().items():
+    for name, cls in classes.items():
         gate = cls.model_fields.get("enabled")
         if gate is None or gate.default is not False:
             continue
@@ -82,15 +86,6 @@ class TestNoTrueSubFlagUnderADisabledParent:
     #: so the exemption stays visible and reviewable.
     DELIBERATE_TRUE: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
-            # `use_orig_params=True` is the CORRECT FSDP setting -- it is what
-            # makes optimizer param groups and torch.compile work under
-            # sharding. Flipping it is FREE today (the single FSDP arm sets it
-            # explicitly, so 0 arms rely on the default) and WRONG tomorrow:
-            # every future FSDP arm that omits it would silently get the
-            # setting PyTorch itself recommends against. The rule's premise --
-            # "enabling the parent buys the sub-feature unasked" -- is exactly
-            # what you want here.
-            ("FSDPConfigSchema", "use_orig_params"),
         }
     )
 
@@ -121,10 +116,17 @@ class TestNoTrueSubFlagUnderADisabledParent:
         )
 
     def test_the_rule_finds_something(self) -> None:
-        """Anti-vacuity: if the walker silently imported nothing, every
-        assertion above would pass over an empty set."""
+        """Anti-vacuity: the walker imports the schema, and the rule turns red on a
+        planted violation. The real schema has none since the FSDP1 knobs went."""
+        from pydantic import BaseModel
+
+        class _Planted(BaseModel):
+            enabled: bool = False
+            use_thing: bool = True
+            enable_other: bool = False
+
         assert len(_schema_classes()) > 200
-        assert _violations(), "the detector found zero violations -- verify it works"
+        assert _violations_in({"_Planted": _Planted}) == {("_Planted", "use_thing")}
 
     def test_the_two_sets_are_disjoint(self) -> None:
         """"Not fixed yet" and "fixing it would be the bug" are opposite claims.

@@ -913,6 +913,12 @@ def test_runtime_knobs_reports_dtype_when_amp_is_on():
     assert "amp=bfloat16" in knobs
 
 
+def test_runtime_knobs_stamps_activation_offload():
+    cfg = _cfg()
+    cfg.optimization.gradient.activation_offload = "cpu"
+    assert "act_offload=cpu" in prov.format_runtime_knobs(cfg)
+
+
 def test_runtime_knobs_covers_the_cost_shaping_knobs():
     knobs = prov.format_runtime_knobs(_cfg())
     for expected in (

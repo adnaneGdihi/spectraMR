@@ -443,6 +443,14 @@ class TestApplyGradientCheckpointing:
         apply_gradient_checkpointing(model, SimpleNamespace())
         assert model.called is None
 
+    def test_model_without_hook_raises(self) -> None:
+        """#1333: the request used to lapse to a warning and train uncheckpointed."""
+        with pytest.raises(NotImplementedError, match="set_grad_checkpointing"):
+            apply_gradient_checkpointing(object(), self._cfg(True))
+
+    def test_model_without_hook_is_fine_when_disabled(self) -> None:
+        apply_gradient_checkpointing(object(), self._cfg(False))
+
 
 class _DeviceAware:
     """Names ``device`` explicitly -- the ``kspace_cold_diffusion`` shape."""

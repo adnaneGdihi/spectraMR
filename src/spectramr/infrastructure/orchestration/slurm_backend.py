@@ -797,6 +797,10 @@ exit ${{TRAIN_EXIT_CODE}}
         snapshot_text: str | None = None,
         inference_checkpoints: str | None = None,
         inference_checkpoints_text: str | None = None,
+        profile_run_dirs: str | None = None,
+        profile_run_dirs_text: str | None = None,
+        profile_args: str | None = None,
+        profile_args_text: str | None = None,
     ) -> str:
         """Generate ONE SLURM job-array script for a whole campaign cohort.
 
@@ -840,6 +844,12 @@ exit ${{TRAIN_EXIT_CODE}}
                 training (``campaign infer``); ``resume`` and ``fresh`` do not apply.
             inference_checkpoints_text: The list's content, embedded beside the manifest copy
                 like ``manifest_text`` so a moved campaign dir cannot break a pending task.
+            profile_run_dirs: Frozen arm-run-dir list aligned with the manifest. Each task then
+                runs ``spectramr profile --output-dir <line>`` instead of training (``campaign
+                profile``); ``resume`` and ``fresh`` do not apply.
+            profile_run_dirs_text: The list's content, embedded like ``inference_checkpoints_text``.
+            profile_args: Frozen ``profile`` flags, one argv element per line (``--verb-args-file``).
+            profile_args_text: Its content, embedded the same way.
 
         Returns:
             Complete bash script content (with the ``--array`` directive).
@@ -852,6 +862,11 @@ exit ${{TRAIN_EXIT_CODE}}
         if resume and fresh:
             raise ValueError(
                 "generate_array_job_script: resume and fresh are mutually exclusive."
+            )
+        if profile_run_dirs is not None and (resume or fresh or inference_checkpoints is not None):
+            raise ValueError(
+                "generate_array_job_script: a profile array runs each arm once; resume, fresh "
+                "and inference_checkpoints mean nothing there."
             )
         if inference_checkpoints is not None and (resume or fresh):
             raise ValueError(
@@ -897,6 +912,12 @@ exit ${{TRAIN_EXIT_CODE}}
             if inference_checkpoints is not None and inference_checkpoints_text is not None:
                 manifest_block += _embedded_file_block(inference_checkpoints, inference_checkpoints_text)
                 inference_checkpoints = "${ARRAY_MANIFEST_DIR}/" + Path(inference_checkpoints).name
+            if profile_run_dirs is not None and profile_run_dirs_text is not None:
+                manifest_block += _embedded_file_block(profile_run_dirs, profile_run_dirs_text)
+                profile_run_dirs = "${ARRAY_MANIFEST_DIR}/" + Path(profile_run_dirs).name
+            if profile_args is not None and profile_args_text is not None:
+                manifest_block += _embedded_file_block(profile_args, profile_args_text)
+                profile_args = "${ARRAY_MANIFEST_DIR}/" + Path(profile_args).name
 
         # %C above the task count reads misleadingly — cap it at N.
         eff_concurrency = min(concurrency, n_tasks)
@@ -930,13 +951,20 @@ exit ${{TRAIN_EXIT_CODE}}
             mail_user=os.environ.get(env_names.SPECTRAMR_SLURM_MAIL_USER),
         )
 
-        resume_block = _array_resume_block(resume=resume, fresh=fresh)
-        audit_flag = " --no-audit" if no_audit else ""
-        mode_flags = (
-            f"--inference-checkpoints {inference_checkpoints}"
-            if inference_checkpoints is not None
-            else "--prod ${RESUME_FLAG}"
+        resume_block = (
+            "" if profile_run_dirs is not None else _array_resume_block(resume=resume, fresh=fresh)
         )
+        audit_flag = " --no-audit" if no_audit else ""
+        if profile_run_dirs is not None:
+            mode_flags = f"--verb profile --profile-run-dirs {profile_run_dirs}" + (
+                f" --verb-args-file {profile_args}" if profile_args is not None else ""
+            )
+        elif inference_checkpoints is not None:
+            mode_flags = f"--inference-checkpoints {inference_checkpoints}"
+        else:
+            mode_flags = "--prod ${RESUME_FLAG}"
+        # A profile task is filed by its run-dir line, so it takes no --output-base.
+        output_flag = "" if profile_run_dirs is not None else f"--output-base {output_base} \\\n    "
 
         script = f"""{header}
 # ── Diagnostics ──
@@ -992,8 +1020,7 @@ python -m spectramr.cli.manifest_dispatch \\
     --index ${{SLURM_ARRAY_TASK_ID}} \\
     --nproc-per-node ${{GPUS_PER_NODE}} \\
     {mode_flags}{audit_flag} \\
-    --output-base {output_base} \\
-    --dispatch-dir {dispatch_dir}
+    {output_flag}--dispatch-dir {dispatch_dir}
 TASK_EXIT_CODE=$?
 
 echo ""

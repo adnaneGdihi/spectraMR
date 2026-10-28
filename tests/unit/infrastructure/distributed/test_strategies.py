@@ -200,3 +200,53 @@ class TestTimeoutSeconds:
             parallel=ParallelismConfigSchema(timeout_seconds=120), world_size=2
         )
         assert NoParallelStrategy().provenance(ctx)["timeout_seconds"] == 120
+
+
+class TestMultiEngineAdmission:
+    """The #2631 gate: every refusal raises from config alone, before initialize."""
+
+    @staticmethod
+    def _ds(**overrides):
+        base = {"allow_multi_engine": True, "zero_stage": 2}
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_knob_off_refuses_and_names_the_gpu_test(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import (
+            _require_multi_engine_admissible,
+        )
+
+        with pytest.raises(RuntimeError, match="test_deepspeed_multi_engine_gpu"):
+            _require_multi_engine_admissible(
+                self._ds(allow_multi_engine=False), {"opt_g": 1, "opt_d": 2}
+            )
+
+    @pytest.mark.parametrize("stage", [0, 1, 2])
+    def test_knob_on_admits_zero_0_to_2_pair(self, stage: int) -> None:
+        from spectramr.infrastructure.distributed.strategies import (
+            _require_multi_engine_admissible,
+        )
+
+        _require_multi_engine_admissible(
+            self._ds(zero_stage=stage), {"opt_g": 1, "opt_d": 2}
+        )
+
+    def test_planted_zero3_is_refused_even_with_the_knob(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import (
+            _require_multi_engine_admissible,
+        )
+
+        with pytest.raises(RuntimeError, match="zero_stage=3"):
+            _require_multi_engine_admissible(
+                self._ds(zero_stage=3), {"opt_g": 1, "opt_d": 2}
+            )
+
+    def test_planted_third_optimizer_is_refused(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import (
+            _require_multi_engine_admissible,
+        )
+
+        with pytest.raises(RuntimeError, match="opt_x"):
+            _require_multi_engine_admissible(
+                self._ds(), {"opt_g": 1, "opt_d": 2, "opt_x": 3}
+            )

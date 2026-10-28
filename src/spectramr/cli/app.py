@@ -2923,7 +2923,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Campaign command (with sub-subcommands)
     campaign_parser = subparsers.add_parser(
-        "campaign", help="Manage experiment campaigns (submit/status/evaluate/cancel)"
+        "campaign", help="Manage experiment campaigns (submit/status/evaluate/cancel/infer/profile)"
     )
     campaign_sub = campaign_parser.add_subparsers(dest="campaign_action", required=True)
 
@@ -3046,6 +3046,10 @@ def build_parser() -> argparse.ArgumentParser:
     from spectramr.cli.campaign_infer import attach as _attach_campaign_infer
 
     _attach_campaign_infer(campaign_sub)
+
+    from spectramr.cli.campaign_profile import attach as _attach_campaign_profile
+
+    _attach_campaign_profile(campaign_sub)
 
     # ── hpo ─────────────────────────────────────────────────────────────
     hpo_parser = subparsers.add_parser(

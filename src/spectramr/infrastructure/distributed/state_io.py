@@ -1,18 +1,12 @@
 """How a model's and optimizer's state is read for a checkpoint and put back.
 
-Under FSDP a checkpoint has to be assembled by *collectives* on the FSDP root:
+Under FSDP2 a parameter is a DTensor holding this rank's shard, so
+``model.state_dict()`` and ``optimizer.state_dict()`` are 1/N of the truth. The
+distributed-checkpoint state-dict API (``get_model_state_dict`` /
+``set_model_state_dict`` and the optimizer pair) gathers to, and scatters from, the
+full unsharded form.
 
-* ``model.module.state_dict()`` -- what ``unwrap_model(...)`` hands back -- is the
-  inner module's flat shard views (a ``(54,)`` slice where a ``(8, 8)`` weight
-  belongs), even inside ``FSDP.state_dict_type``. Only the root's own
-  ``state_dict()`` gathers.
-* ``optimizer.state_dict()`` holds this rank's slice of the Adam moments, so rank
-  0 would write one Nth of the optimizer and every rank would load it back.
-  ``FSDP.optim_state_dict`` / ``optim_state_dict_to_load`` convert to and from the
-  unsharded form.
-
-Every method here is entered by every rank. ``rank0_only`` decides who *receives*
-the gathered tensors, never who participates.
+Every method here is entered by every rank: the gathers are collectives.
 """
 
 from __future__ import annotations
@@ -40,10 +34,6 @@ class PassthroughStateIO:
         optimizer.load_state_dict(state)
 
     @contextlib.contextmanager
-    def full_params(self, model: Any) -> Generator[None]:
-        yield
-
-    @contextlib.contextmanager
     def swap_in(self, model: Any, shadow: Any) -> Generator[None]:
         """Run the block with the EMA ``shadow`` module's weights installed in ``model``."""
         from spectramr.infrastructure.optimization.ema_swap import ema_weights_swapped_in
@@ -59,110 +49,67 @@ def state_io_of(parallel: Any) -> PassthroughStateIO:
 
 
 def _is_fsdp_root(model: Any) -> bool:
-    import torch.distributed.fsdp as fsdp
+    from torch.distributed.fsdp import FSDPModule
 
-    return isinstance(model, fsdp.FullyShardedDataParallel)
+    return isinstance(model, FSDPModule)
+
+
+def _full(*, to_cpu: bool) -> Any:
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    # cpu_offload with a full state dict also makes the gather rank-0-only.
+    return StateDictOptions(full_state_dict=True, cpu_offload=to_cpu)
 
 
 class FSDPStateIO(PassthroughStateIO):
-    """Gather on save, scatter on load, all on the FSDP root.
+    """Gather on save, scatter on load, on an FSDP2 module.
 
-    A model that is not an FSDP root (a plain discriminator beside a wrapped
-    generator) takes the passthrough path, because the FSDP context managers
-    raise on it rather than degrade.
+    A model that is not sharded (a plain discriminator beside a sharded generator)
+    takes the passthrough path.
     """
-
-    def _save_contexts(self, model: Any):
-        import torch.distributed.fsdp as fsdp
-        from torch.distributed.fsdp import (
-            FullOptimStateDictConfig,
-            FullStateDictConfig,
-            StateDictType,
-        )
-
-        return fsdp.FullyShardedDataParallel.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        )
 
     def model_state(self, model: Any) -> dict[str, Any]:
         if not _is_fsdp_root(model):
             return super().model_state(model)
-        with self._save_contexts(model):
-            # The ROOT's state_dict(), not the unwrapped module's: only the root's
-            # hooks gather. Non-zero ranks receive an empty dict (rank0_only).
-            return strip_wrapper_prefixes(model.state_dict())
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        # Non-zero ranks receive an empty dict; rank 0 writes.
+        return get_model_state_dict(model, options=_full(to_cpu=True))
 
     def optimizer_state(self, model: Any, optimizer: Any) -> dict[str, Any]:
         if not _is_fsdp_root(model):
             return super().optimizer_state(model, optimizer)
-        import torch.distributed.fsdp as fsdp
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-        with self._save_contexts(model):
-            return fsdp.FullyShardedDataParallel.optim_state_dict(model, optimizer)
+        return get_optimizer_state_dict(model, optimizer, options=_full(to_cpu=True))
 
     def load_model_state(self, model: Any, state: dict[str, Any]) -> None:
         if not _is_fsdp_root(model):
             return super().load_model_state(model, state)
-        import torch.distributed.fsdp as fsdp
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
-        # Every rank holds the full dict (each reads the file), so rank0_only is
-        # False: FSDP slices out this rank's shard from what it is given.
-        with fsdp.FullyShardedDataParallel.state_dict_type(
-            model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(rank0_only=False)
-        ):
-            model.load_state_dict(strip_wrapper_prefixes(state))
+        # Every rank read the file, so every rank holds the full dict to slice from.
+        set_model_state_dict(model, strip_wrapper_prefixes(state), options=_full(to_cpu=False))
 
     def load_optimizer_state(self, model: Any, optimizer: Any, state: dict[str, Any]) -> None:
         if not _is_fsdp_root(model):
             return super().load_optimizer_state(model, optimizer, state)
-        import torch.distributed.fsdp as fsdp
+        from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
-        optimizer.load_state_dict(
-            fsdp.FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, state)
-        )
-
-    @contextlib.contextmanager
-    def full_params(self, model: Any) -> Generator[None]:
-        """Unsharded parameters on every rank, for code that reads whole tensors (EMA)."""
-        if not _is_fsdp_root(model):
-            yield
-            return
-        import torch.distributed.fsdp as fsdp
-
-        with fsdp.FullyShardedDataParallel.summon_full_params(model, writeback=False):
-            yield
+        set_optimizer_state_dict(model, optimizer, state, options=_full(to_cpu=False))
 
     @contextlib.contextmanager
     def swap_in(self, model: Any, shadow: Any) -> Generator[None]:
-        """EMA swap through the full-state-dict path, restoring the live weights on exit.
+        """EMA swap shard against shard; the shadow must be sharded like ``model``.
 
-        ``summon_full_params`` cannot be held across a validation forward (FSDP
-        only runs ``forward`` from its idle state), so the shadow is loaded the
-        way a checkpoint is -- gathered, then re-sharded -- and the live weights
-        are put back the same way. Strict on both loads: a partial swap would
-        grade a blend while reporting EMA.
+        A plain shadow beside a sharded model would need a full gather per swap and
+        a full-size copy per rank, which is what sharding exists to avoid, so it is
+        refused instead (``shard_like`` builds the matching shadow at Stage A).
         """
-        if not _is_fsdp_root(model):
-            with super().swap_in(model, shadow):
-                yield
-            return
-        import torch.distributed.fsdp as fsdp
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-        with fsdp.FullyShardedDataParallel.state_dict_type(
-            model, StateDictType.FULL_STATE_DICT, cfg
-        ):
-            live = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            model.load_state_dict(shadow.state_dict())
-        try:
+        if _is_fsdp_root(model) and not _is_fsdp_root(shadow):
+            raise RuntimeError(
+                "EMA swap under FSDP needs a shadow sharded like the live model; got an "
+                f"unsharded {type(shadow).__name__}. The FSDP plugin's prepare_ema shards it."
+            )
+        with super().swap_in(model, shadow):
             yield
-        finally:
-            with fsdp.FullyShardedDataParallel.state_dict_type(
-                model, StateDictType.FULL_STATE_DICT, cfg
-            ):
-                model.load_state_dict(live)

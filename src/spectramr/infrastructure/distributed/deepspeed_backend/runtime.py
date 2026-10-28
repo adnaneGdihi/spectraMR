@@ -18,10 +18,21 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DeepSpeedStepPolicy",
+    "cpu_adam_class",
     "deepspeed_available",
     "initialize_deepspeed_engine",
     "require_deepspeed",
 ]
+
+#: DeepSpeedCPUAdam is a C++ extension built on first construction, not at import.
+CPU_ADAM_HINT = (
+    "parallel.deepspeed.offload_optimizer needs DeepSpeedCPUAdam, "
+    "a C++ extension that DeepSpeed JIT-builds on first use. It needs a C++ toolchain "
+    "(ninja, g++, and nvcc matching the CUDA build) and a writable extension cache "
+    "(TORCH_EXTENSIONS_DIR, else XDG_CACHE_HOME). Pre-building it: "
+    "DS_BUILD_CPU_ADAM=1 pip install --no-build-isolation deepspeed. "
+    "Refusing to fall back to torch.optim: the engine rejects it under offload."
+)
 
 _INSTALL_HINT = (
     "parallel.strategy='deepspeed' requires the [deepspeed] extra. Install with:\n"
@@ -107,6 +118,20 @@ def require_deepspeed() -> Any:
         hint = _INSTALL_HINT if not deepspeed_available() else _IMPORTABLE_BUT_BROKEN_HINT
         raise ImportError(f"{hint}\n(import failed: {_describe_import_failure(exc)})") from exc
     return deepspeed
+
+
+def cpu_adam_class(*, zenflow: bool) -> Any:
+    """The CPU Adam class offload needs: ZenFlowCPUAdam under ZenFlow, else DeepSpeedCPUAdam.
+
+    The same single ``deepspeed`` import site as :func:`require_deepspeed`; the class
+    is only looked up here, so a missing or unbuildable op raises with the hint.
+    """
+    require_deepspeed()
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam, ZenFlowCPUAdam
+    except Exception as exc:
+        raise ImportError(f"{CPU_ADAM_HINT}\n(import failed: {_describe_import_failure(exc)})") from exc
+    return ZenFlowCPUAdam if zenflow else DeepSpeedCPUAdam
 
 
 def initialize_deepspeed_engine(
@@ -210,6 +235,89 @@ def _activate_deepcompile(engine: Any, config: dict[str, Any]) -> None:
     )
 
 
+def _fp32_overflow_check_absent(engine: Any) -> bool:
+    """True when DeepSpeed will not check gradients for overflow itself.
+
+    ``engine.py`` enables ``check_grad_overflow`` only for fp16 (and bf16 when
+    configured), so fp32 ZeRO never skips a non-finite step.
+    """
+    return not (engine.fp16_enabled() or engine.bfloat16_enabled())
+
+
+def _flatten_tensors(obj: Any) -> list[Any]:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return [obj]
+    if isinstance(obj, dict):
+        obj = list(obj.values())
+    if isinstance(obj, list | tuple):
+        return [t for item in obj for t in _flatten_tensors(item)]
+    return []
+
+
+def _local_gradients(engine: Any) -> list[Any]:
+    """The gradients this rank holds after ``engine.backward`` at a boundary.
+
+    Stage 0 keeps the reduced gradients on the module parameters. ZeRO 1-3 keep
+    this rank's partition in the optimizer's averaged-gradient buffers, which is
+    what ``engine.step`` consumes, so checking it checks what reaches the weights.
+    Finding none is an error, never a silent pass.
+    """
+    if engine.zero_optimization_stage() == 0:
+        grads = [p.grad for p in engine.module.parameters() if p.grad is not None]
+    else:
+        buffers = getattr(engine.optimizer, "averaged_gradients", None)
+        if buffers is None:
+            raise RuntimeError(
+                "fp32 DeepSpeed gradient check cannot locate this ZeRO stage's "
+                "gradient partitions (optimizer has no averaged_gradients); refusing "
+                "to step unverified."
+            )
+        grads = _flatten_tensors(buffers)
+    if not grads:
+        raise RuntimeError(
+            "fp32 DeepSpeed gradient check found no gradients at an accumulation "
+            "boundary; refusing to step unverified."
+        )
+    return grads
+
+
+def _raise_if_nonfinite_gradients(engine: Any) -> None:
+    """Raise when any rank holds a non-finite gradient at this optimizer step.
+
+    One fused norm per (device, dtype) group; the agreed flag is all-reduced
+    across ranks so every rank raises together. The single ``.item()`` is the
+    deliberate per-optimizer-step host read (performance.md, rule 9 exception).
+    """
+    import torch
+
+    from spectramr.infrastructure.training.nonfinite_monitor import process_group_spans_ranks
+
+    by_group: dict[tuple[Any, Any], list[Any]] = {}
+    grads = _local_gradients(engine)
+    for grad in grads:
+        by_group.setdefault((grad.device, grad.dtype), []).append(grad)
+    # Offloaded partitions live on the CPU, and NCCL reduces only accelerator tensors,
+    # so each group's verdict moves to the engine's device before stacking.
+    device = getattr(engine, "device", None) or grads[0].device
+    group_flags = [
+        (~torch.isfinite(torch.stack(torch._foreach_norm(group)))).any().to(device)
+        for group in by_group.values()
+    ]
+    flag = torch.stack(group_flags).any().to(torch.float32).reshape(1)
+    if process_group_spans_ranks():
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+    if flag.item() > 0:
+        stage = engine.zero_optimization_stage()
+        raise RuntimeError(
+            f"Non-finite gradient at optimizer step {engine.global_steps} on at least one "
+            f"rank (fp32 DeepSpeed, ZeRO stage {stage}). DeepSpeed's overflow check is off "
+            "outside fp16/bf16, so engine.step() would apply NaN to every weight; "
+            "refusing to step (check the loss terms and the coil maps)."
+        )
+
+
 class DeepSpeedStepPolicy(IStepPolicy):
     """Backward and step through the engine.
 
@@ -284,4 +392,7 @@ class DeepSpeedStepPolicy(IStepPolicy):
         """
         engine = self._engine_for(optimizer)
         engine.backward(loss)
+        # Before step(): once the engine applies a NaN gradient the weights are gone.
+        if engine.is_gradient_accumulation_boundary() and _fp32_overflow_check_absent(engine):
+            _raise_if_nonfinite_gradients(engine)
         engine.step()

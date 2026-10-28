@@ -17,6 +17,7 @@ from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
     _resolve_disc_updates,
     assemble_adversarial_step_configs,
+    set_critic_trainable,
 )
 from spectramr.infrastructure.training.strategy_helpers import (
     StrategyInitializationHelper,
@@ -284,8 +285,7 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             # parameters (the generator step below freezes them). Toggling at
             # closure entry — not after — keeps the state correct through the
             # trainer's out-of-closure backward.
-            if isinstance(discriminator, nn.Module):
-                discriminator.requires_grad_(True)
+            set_critic_trainable(discriminator, True)
 
             with torch.no_grad():
                 hr_fakes, _ = self._split_generator_output(self.env.generator(input_batch))
@@ -360,14 +360,8 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             Returns:
                 torch.Tensor: Description.
             """
-            # Freeze the discriminator for the generator step. Gradients still
-            # flow to the generator THROUGH D's activations (that needs only the
-            # input to require grad, not D's params), but D.grad is left
-            # untouched — preventing the "G trains D" leak that, under gradient
-            # accumulation, survives to D's optimizer.step(). Also saves a full
-            # D backward every step. The D step re-enables grad at its entry.
-            if isinstance(discriminator, nn.Module):
-                discriminator.requires_grad_(False)
+            # Keeps D's grads clean of the generator's objective; the D step re-enables.
+            set_critic_trainable(discriminator, False)
 
             hr_fakes, auxiliary = self._split_generator_output(self.env.generator(input_batch))
 

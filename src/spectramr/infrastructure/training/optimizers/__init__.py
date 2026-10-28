@@ -25,7 +25,6 @@ from . import (  # noqa: F401  (imported for @register_optimizer side effects)
     schedulefree_optimizers,
 )
 from .amp_policy import AMPPolicy
-from .fsdp_step_policy import FSDPStepPolicy
 from .lamb import LAMB
 from .lars import LARS
 from .lion import Lion
@@ -37,7 +36,6 @@ __all__ = [
     "LAMB",
     "LARS",
     "AMPPolicy",
-    "FSDPStepPolicy",
     "Lion",
     "Lookahead",
     "StandardOptimizerStepper",

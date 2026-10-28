@@ -169,6 +169,9 @@ from spectramr.infrastructure.training.validation_rows import (  # noqa: E402
     validation_batches_csv_for,
     validation_csv_for,
 )
+from spectramr.infrastructure.training.validation_memory import (  # noqa: E402
+    ValidationMemoryTrace,
+)
 from spectramr.infrastructure.validation.config_health_checker import (
     FATAL_HEALTH_CHECKS,
     validate_config_health,
@@ -2842,6 +2845,20 @@ def _run_validation(
     if _empty_cache_before_val and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # One memory line per pass at start, every N batches and end, on rank 0 only (the
+    # end line also carries the peak over ranks). Diagnoses validation OOM.
+    def _emit_val_mem(message: str) -> None:
+        if logging_service:
+            logging_service.log_info(message)
+        else:
+            logger.info(message)
+
+    _mem_trace = ValidationMemoryTrace(
+        getattr(pipeline, "device", None),
+        emit=_emit_val_mem if RankUtility.is_main_rank() else (lambda _message: None),
+    )
+    _mem_trace.start()
+
     ema_active = getattr(pipeline, "ema", None) is not None
     import contextlib
 
@@ -3201,6 +3218,7 @@ def _run_validation(
                 )
                 val_count += 1
                 val_samples += batch_n
+                _mem_trace.after_batch(i)
                 if batch_rows is not None:
                     batch_rows.add(i, batch_n, batch_identifiers(val_batch, batch_n), metrics)
             except TargetlessSampleError:
@@ -3235,6 +3253,9 @@ def _run_validation(
                     )
                 _val_warn_count += 1
                 continue
+
+    # Every rank reaches this collective, as it does the metric reduction below.
+    _mem_trace.end()
 
     if val_unweighted_batches:
         logger.warning(

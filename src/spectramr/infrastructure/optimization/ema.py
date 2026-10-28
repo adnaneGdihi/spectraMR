@@ -275,7 +275,14 @@ class ModelEma(nn.Module):
         Weight keys stay **bare**, matching what is already on disk, so existing
         checkpoints keep loading and no migration is needed.
         """
-        sd: dict[str, Any] = dict(self.module.state_dict())
+        from spectramr.infrastructure.distributed.state_io import FSDPStateIO, _is_fsdp_root
+
+        # A shadow sharded like an FSDP2 generator gathers here (a collective,
+        # entered by every rank); rank 0 receives the weights.
+        if _is_fsdp_root(self.module):
+            sd: dict[str, Any] = dict(FSDPStateIO().model_state(self.module))
+        else:
+            sd = dict(self.module.state_dict())
         sd[self._NUM_UPDATES_KEY] = torch.tensor(int(self.num_updates), dtype=torch.long)
         return sd
 
@@ -290,6 +297,19 @@ class ModelEma(nn.Module):
         counter = sd.pop(self._NUM_UPDATES_KEY, None)
         if counter is not None:
             self.num_updates = int(counter)
+        from spectramr.infrastructure.distributed.state_io import _is_fsdp_root
+
+        if _is_fsdp_root(self.module):
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                set_model_state_dict,
+            )
+
+            return set_model_state_dict(
+                self.module,
+                strip_wrapper_prefixes(sd),
+                options=StateDictOptions(full_state_dict=True, strict=strict),
+            )
         return self.module.load_state_dict(strip_wrapper_prefixes(sd), strict=strict)
 
     def load_state_dict(self, state_dict: Any, strict: bool = True, assign: bool = False) -> Any:

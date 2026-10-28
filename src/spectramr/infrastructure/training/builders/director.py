@@ -178,6 +178,7 @@ class TrainingEnvironmentDirector:
         parallel_plugin, parallel_ctx = self._resolve_parallel()
         if parallel_plugin is not None:
             models = parallel_plugin.prepare_models(models, parallel_ctx)
+            parallel_plugin.prepare_ema(ema_model, models, parallel_ctx)
 
         # FSDP compiles here -- torch.compile(FSDP(m)), the recommended order --
         # and DeepSpeed compiles here because initialize() must receive an

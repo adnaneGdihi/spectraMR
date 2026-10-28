@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from spectramr.infrastructure.physics.data_consistency import NoiseSimulatingDataConsistency
 from spectramr.infrastructure.physics.fft_ops import _to_complex, ifft2c
 from spectramr.models.blocks.mamba_block import MambaBlock
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.registry import register_model
 
 if TYPE_CHECKING:

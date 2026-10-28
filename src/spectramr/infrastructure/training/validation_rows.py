@@ -216,7 +216,12 @@ class ValidationBatchRows:
         metrics: Mapping[str, Any],
     ) -> None:
         """Record a batch; tensors are kept on their device until ``flush``."""
-        kept = {k: (v.detach() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()}
+        # Reduced to the mean here, the same reduction flush applies: a volume-sized
+        # metric tensor would otherwise be retained for every batch of the pass.
+        kept = {
+            k: (v.detach().reshape(-1).float().mean() if isinstance(v, torch.Tensor) else v)
+            for k, v in metrics.items()
+        }
         self._rows.append((int(batch_index), int(n_samples), dict(identifiers), kept))
 
     def flush(self) -> int:

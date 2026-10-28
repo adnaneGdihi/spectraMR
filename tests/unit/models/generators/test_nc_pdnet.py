@@ -130,3 +130,66 @@ def test_mismatched_widths_raise() -> None:
     """An unrolled cascade feeds its own output back in."""
     with pytest.raises(ValueError, match="must equal in_channels"):
         _net(in_channels=CHANNELS, out_channels=4)
+
+
+def test_two_copies_with_identical_weights_give_identical_outputs(acquisition) -> None:
+    """An EMA shadow and every DDP rank hold a copy of the same weights. The DC step
+    scale used to come from a power iteration started off the global RNG, so each
+    copy used its own scale and the outputs differed by ~9 % relative."""
+    traj, dcf, samples, x0 = acquisition
+    first, second = _net(), _net()
+    second.load_state_dict(first.state_dict())
+    torch.manual_seed(1)
+    rng_before = torch.get_rng_state()
+    a = first(x0, measured_kspace=samples, trajectory=traj, dcf=dcf)
+    assert torch.equal(torch.get_rng_state(), rng_before), "the forward drew from the global RNG"
+    torch.manual_seed(2)
+    b = second(x0, measured_kspace=samples, trajectory=traj, dcf=dcf)
+    assert torch.equal(a, b)
+
+
+FSDP_WORLD = 2
+FSDP_IM = 16
+
+
+def _fsdp_worker(rank: int, store: str) -> None:
+    import copy
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store}", rank=rank, world_size=FSDP_WORLD
+    )
+    try:
+        traj, dcf = get_trajectory("spiral", im_size=(FSDP_IM, FSDP_IM))
+        torch.manual_seed(0)
+        x0 = torch.randn(1, 4, FSDP_IM, FSDP_IM)
+        samples = torch.randn(1, 2, traj.shape[-1], dtype=torch.complex64)
+        net = NCPDNet(
+            in_channels=4, out_channels=4, image_size=FSDP_IM, num_cascades=1, width=4, depth=2
+        )
+        reference = copy.deepcopy(net)
+        fully_shard(net, mesh=init_device_mesh("cpu", (FSDP_WORLD,)))
+        out = net(x0, measured_kspace=samples, trajectory=traj, dcf=dcf)
+        out.square().mean().backward()
+        expected = reference(x0, measured_kspace=samples, trajectory=traj, dcf=dcf)
+        assert torch.allclose(out, expected, atol=1e-5)
+        assert net.dc_steps[0].step_size.grad is not None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fully_shard_wraps_and_runs_over_two_cpu_ranks() -> None:
+    """FSDP2 shards dim 0 and refuses a 0-d parameter, which step_size used to be."""
+    import os
+    import tempfile
+
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+    if not dist.is_available():
+        pytest.skip("torch.distributed is not built")
+    with tempfile.TemporaryDirectory() as tmp:
+        mp.spawn(_fsdp_worker, args=(os.path.join(tmp, "store"),), nprocs=FSDP_WORLD, join=True)

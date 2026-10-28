@@ -16,12 +16,12 @@ from spectramr.core.run_artifacts import INFERENCE_SUBDIR
 SOURCE_JSON = "inference_source.json"
 
 
-def checkpoint_for_task(checkpoints_file: str | Path, index: int) -> str:
-    """Line ``index`` of the frozen checkpoint list; a short or blank line raises."""
+def checkpoint_for_task(checkpoints_file: str | Path, index: int, what: str = "checkpoint") -> str:
+    """Line ``index`` of a frozen per-task list aligned with the manifest; a short or blank line raises."""
     lines = Path(checkpoints_file).read_text().splitlines()
     if not 0 <= index < len(lines) or not lines[index].strip():
         raise IndexError(
-            f"{checkpoints_file} has no checkpoint for task {index} ({len(lines)} lines); "
+            f"{checkpoints_file} has no {what} for task {index} ({len(lines)} lines); "
             "the list is frozen next to the manifest and must stay aligned with it."
         )
     return lines[index].strip()

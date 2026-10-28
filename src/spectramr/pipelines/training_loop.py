@@ -56,8 +56,6 @@ from spectramr.infrastructure.checkpointing.async_writer import (
 from spectramr.infrastructure.checkpointing.layout import CheckpointLayout
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
 from spectramr.infrastructure.logging.provenance import config_fingerprint
-from spectramr.infrastructure.distributed.state_io import state_io_of
-from spectramr.infrastructure.optimization.ema import EMAKeyMismatchError
 from spectramr.infrastructure.training.nonfinite_monitor import (
     NonFiniteMonitor,
     NonFiniteVerdict,
@@ -279,12 +277,10 @@ def _install_parallel_step_policy(strategy: Any, parallel_runtime: Any) -> None:
     ``engine.backward()``/``engine.step()``. That is not a crash, it is 1/N^2
     loss scaling with a green test suite.
 
-    The registry deliberately allows a CLASS or an INSTANCE. FSDP hands back
-    ``FSDPStepPolicy`` (the class) because only this layer knows the clip
-    settings; DeepSpeed hands back a configured instance because only the engine
-    knows itself. Resolving that is this function's job -- ``adopt_step_policy``
-    rejects a class outright rather than negotiating capability flags against a
-    descriptor.
+    The registry allows a CLASS or an INSTANCE. A class is constructed here because
+    only this layer knows the clip settings; DeepSpeed hands back a configured
+    instance because only the engine knows itself. ``adopt_step_policy`` rejects a
+    class outright rather than negotiating capability flags against a descriptor.
     """
     policy = getattr(parallel_runtime, "step_policy", None)
     if policy is None:
@@ -299,9 +295,8 @@ def _install_parallel_step_policy(strategy: Any, parallel_runtime: Any) -> None:
             % (getattr(parallel_runtime, "strategy", "?"),)
         )
     if isinstance(policy, type):
-        # Construct with the clip settings the current policy already resolved,
-        # so FSDPStepPolicy inherits the arm's gradient_clip_value rather than
-        # AMPPolicy's 1.0 default.
+        # Construct with the clip settings the current policy already resolved, so
+        # the policy inherits the arm's gradient_clip_value rather than a default.
         current = getattr(executor, "amp_policy", None)
         policy = policy(
             max_grad_norm=getattr(current, "max_grad_norm", 1.0),
@@ -1929,9 +1924,6 @@ def _execute_training_loop(
     # The step policy is adopted before the loop, so this is invariant too. A policy
     # that steps its own scheduler (DeepSpeed) must not be stepped a second time.
     _sched_owned_by_policy = policy_owns_lr_scheduler(strategy)
-    # Under FSDP the live generator holds shards, so the EMA blend needs the
-    # unsharded parameters; a passthrough elsewhere.
-    _state_io = state_io_of(parallel_runtime)
     _ema_cfg = getattr(config, "ema", None)
     _ema_update_freq = getattr(_ema_cfg, "update_frequency", 1)
     _ema_warmup = resolve_ema_warmup_gate(pipeline.ema, _ema_cfg)
@@ -2158,21 +2150,12 @@ def _execute_training_loop(
                 # EMA cadence (_ema_update_freq / _ema_warmup) hoisted above the
                 # loop (frozen config → invariant).
                 if ema_should_update(iteration, _ema_update_freq, _ema_warmup, _gas):
-                    try:
-                        # Unwrap: the shadow was deep-copied from the bare module
-                        # at build time, while this generator may since have been
-                        # wrapped by DDP / FSDP / DeepSpeed / torch.compile. The
-                        # blend is key-matched, so a prefixed live model blends
-                        # nothing and raises nothing (#2172).
-                        with _state_io.full_params(pipeline.generator):
-                            pipeline.ema.update(unwrap_model(pipeline.generator))
-                    except EMAKeyMismatchError:
-                        # Never demote this one to a warning: it means EMA has
-                        # been inert, which is the failure the guard exists to
-                        # surface.
-                        raise
-                    except Exception as ema_err:
-                        logger.warning(f"Failed to update EMA model weights: {ema_err}")
+                    # Unwrap: the shadow is key-matched against the bare module, and a
+                    # prefixed live model would blend nothing (#2172). Under FSDP2 the
+                    # shadow is sharded like the generator, so the blend is shard-local.
+                    # A failure raises: a warning here left EMA silently frozen while
+                    # validation kept grading it as EMA.
+                    pipeline.ema.update(unwrap_model(pipeline.generator))
 
             # Fetch extra metric components (PSNR, SSIM, component losses)
             if hasattr(strategy, "get_last_metrics"):

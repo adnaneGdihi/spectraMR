@@ -1288,6 +1288,7 @@ def format_runtime_knobs(config: Any) -> str:
     return " · ".join(
         [
             f"grad_ckpt={getattr(grad, 'enable_checkpointing', None)}",
+            f"act_offload={getattr(grad, 'activation_offload', None)}",
             amp,
             f"accum={getattr(grad, 'accumulation_steps', None)}",
             f"workers={getattr(loader, 'num_workers', None)}",

@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from spectramr.models.blocks.delta_mamba import DeltaMambaStack
+from spectramr.models.blocks.grad_checkpointing import NestedGradCheckpointingMixin
 from spectramr.models.generators.hilbert_mamba_generators import (
     _ConvHead,
     _ConvStem,
@@ -49,7 +50,7 @@ def _validate_delta_scales(encoder: float, decoder: float) -> None:
     requires_paired_data=True,
     strict_kwargs=True,
 )
-class CTMamba(nn.Module):
+class CTMamba(NestedGradCheckpointingMixin, nn.Module):
     """Continuous-time Mamba with a coarse encoder step and a finer decoder step.
 
     Args:

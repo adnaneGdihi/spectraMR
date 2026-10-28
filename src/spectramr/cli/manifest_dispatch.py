@@ -661,6 +661,7 @@ def _dispatch(
     verb_args_file: str | None = None,
     requeue_resumes: bool = False,
     inference_checkpoints: str | None = None,
+    profile_run_dirs: str | None = None,
 ) -> int:
     # --prod runs the actual experiment (FULL config max_iterations). A smoke cap
     # (--train-iters) is the opposite intent, so combining them is a contradiction
@@ -690,6 +691,18 @@ def _dispatch(
         print(
             "FATAL: --inference-checkpoints grades one checkpoint per task: it needs --output-base "
             "and the `train` verb, and excludes --prod, --train-iters, --resume and --resume-off.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if profile_run_dirs is not None and (
+        prod or train_iters is not None or resume is not None or output_base is not None
+        or verb != "profile"
+    ):
+        print(
+            "FATAL: --profile-run-dirs files one profile per task under its arm's run dir: it "
+            "needs the `profile` verb and excludes --prod, --train-iters, --resume, --resume-off "
+            "and --output-base.",
             file=sys.stderr,
         )
         return 2
@@ -731,6 +744,15 @@ def _dispatch(
             return 1
         verb_args = [*verb_args, *inference_verb_args(inference_ckpt)]
         resume = False  # the explicit --resume above is the only one
+
+    if profile_run_dirs is not None:
+        try:
+            run_dir = checkpoint_for_task(profile_run_dirs, index, what="run dir")
+        except (IndexError, OSError) as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            return 1
+        verb_args = [*verb_args, "--output-dir", run_dir]
+        print(f"[PROFILE] filing under {run_dir}/profile")
 
     name = Path(config).stem
     print(f"[manifest_dispatch] task {index}: {config}")
@@ -1080,6 +1102,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--profile-run-dirs",
+        default=None,
+        help=(
+            "Frozen file, one arm run dir per manifest line: each task runs `profile "
+            "--output-dir <line>`, filing under <line>/profile (`campaign profile`)."
+        ),
+    )
+    parser.add_argument(
         "--nproc-per-node",
         type=int,
         default=1,
@@ -1153,6 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
         verb_args_file=args.verb_args_file,
         requeue_resumes=args.requeue_resumes,
         inference_checkpoints=args.inference_checkpoints,
+        profile_run_dirs=args.profile_run_dirs,
     )
 
 

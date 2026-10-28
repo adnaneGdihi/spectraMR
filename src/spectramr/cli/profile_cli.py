@@ -15,8 +15,9 @@ layout lives in :mod:`spectramr.cli.profile_paths`.
 
 Everything a run produces — the profile, the manifest, the child's log, and the
 profiled run's own checkpoints/logs/metrics — is written under
-``experiments/results/<experiment>/profiles/<run_id>/``, never *at* the arm's
-own results directory, which a profiling run must not overwrite (see
+``<arm run dir>/profile/<run_id>/`` (``experiments/results/<experiment>``, or the
+``--output-dir`` a campaign passes), never *at* the arm's own
+results directory, which a profiling run must not overwrite (see
 :class:`~spectramr.cli.profile_paths.ProfilePaths`). Checks that refuse a run
 before Scalene starts live in :mod:`spectramr.cli.profile_preflight`.
 """
@@ -290,8 +291,13 @@ def profile(args: argparse.Namespace) -> int:
     # Before the run directory is resolved: a refusal leaves nothing behind.
     run_preflight(args, settings)
     declared = getattr(settings.training, "output_dir", None)
-    experiment = resolve_experiment_name(
-        declared, explicit=args.experiment, config_path=args.config
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is not None and args.experiment:
+        raise ValueError("--output-dir and --experiment both place the profile; pass one.")
+    experiment = (
+        output_dir.name
+        if output_dir is not None
+        else resolve_experiment_name(declared, explicit=args.experiment, config_path=args.config)
     )
 
     from spectramr.infrastructure.logging.provenance import git_provenance, make_run_id
@@ -303,7 +309,8 @@ def profile(args: argparse.Namespace) -> int:
         started_at,
         git_provenance().get("sha_short"),
     )
-    paths = resolve_profile_paths(experiment, run_id)
+    root = None if output_dir is None else output_dir.parent
+    paths = resolve_profile_paths(experiment, run_id, results_root=root)
     argv = _build_argv(args, choice, paths)
 
     if args.dry_run:
@@ -335,6 +342,7 @@ def profile(args: argparse.Namespace) -> int:
         window=torch_window(args.iterations) if choice.applied == "torch" else None,
     )
     manifest["modes"]["val_batches"] = args.val_batches
+    manifest["modes"]["output_dir"] = None if output_dir is None else str(output_dir)
     manifest["modes"]["single_process"] = parallel_off[1::2]
     manifest["modes"]["child_overrides"] = (
         list(PROFILE_CHILD_OVERRIDES) if args.target in _VAL_BATCH_TARGETS else []
@@ -413,7 +421,7 @@ def attach_subparsers(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "profile",
         help="Profile a pipeline verb with Scalene (CPU/GPU/memory); the "
-        "profile and the run's own outputs land under experiments/results/.",
+        "profile and the run's own outputs land under <arm run dir>/profile/<run_id>/.",
     )
     parser.add_argument(
         "--config", "-c", type=Path, required=True, help="Path to the arm's config YAML"
@@ -460,8 +468,15 @@ def attach_subparsers(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--experiment",
         default=None,
-        help="Override the <experiment> segment of experiments/results/<experiment>. "
+        help="Override the <experiment> path of experiments/results/<experiment>/profile. "
         "Defaults to the one implied by the config's training.output_dir.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="The arm's run directory; the profile is filed under <output-dir>/profile/ "
+        "(`campaign profile` passes <campaign>/<arm>).",
     )
     parser.add_argument(
         "--device",

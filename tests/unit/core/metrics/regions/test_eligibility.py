@@ -94,6 +94,24 @@ class TestT1Coverage:
                 assert len(policy.justification) > 20, key
 
 
+class TestPerImageSweptMetrics:
+    """The two swept per-image metrics are the ones a regional sweep actually reaches."""
+
+    def test_zipper_detection_crops_as_a_no_reference_statistic(self) -> None:
+        """Reads the prediction alone, so it crops like the rest of the NR family."""
+        policy = policy_for("zipper_detection")
+        assert policy.support is RoiSupport.CROP_THEN_COMPUTE
+        assert policy.min_roi_px > 0
+        assert not evaluate_eligibility("zipper_detection", _rect_region(20, 20)).eligible
+
+    def test_task_based_detectability_is_declined_on_a_region(self) -> None:
+        """One 32 px tile fits a ~40 px lesion box; the CHO needs two to estimate a
+        covariance, so a crop would return NaN or a ridge-determined d'."""
+        v = evaluate_eligibility("task_based_detectability", _rect_region(41, 41))
+        assert not v.eligible
+        assert v.support is RoiSupport.NOT_RESTRICTABLE
+
+
 class TestT3ContextInvariant:
     """The strongest rule: a k-space measurement cannot be restricted by an image crop."""
 

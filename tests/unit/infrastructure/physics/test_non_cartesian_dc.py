@@ -191,6 +191,60 @@ def test_the_gram_norm_is_cached_not_recomputed_per_step(spiral) -> None:
     assert layer._gram_norm == first
 
 
+def _estimate(layer: NonCartesianDataConsistency, traj, dcf, num_samples=None) -> None:
+    n = traj.shape[-1] if num_samples is None else num_samples
+    layer(
+        torch.ones(1, 1, *IM, dtype=torch.complex64),
+        torch.ones(1, 1, n, dtype=torch.complex64),
+        traj[..., :n],
+        dcf=dcf[..., :n],
+    )
+
+
+def test_two_copies_estimate_the_same_gram_norm(spiral) -> None:
+    """An EMA shadow or a second rank must derive the same step scale from the same
+    trajectory; a start vector drawn from the global RNG gave each copy its own."""
+    traj, dcf = spiral
+    first, second = _layer(mode="gradient"), _layer(mode="gradient")
+    torch.manual_seed(1)
+    _estimate(first, traj, dcf)
+    torch.manual_seed(2)
+    _estimate(second, traj, dcf)
+    assert first._gram_norm == second._gram_norm
+
+
+def test_the_gram_norm_estimate_leaves_the_global_rng_alone(spiral) -> None:
+    traj, dcf = spiral
+    layer = _layer(mode="gradient")
+    before = torch.get_rng_state()
+    _estimate(layer, traj, dcf)
+    assert layer._gram_norm, "no Gram norm was estimated"
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_a_new_trajectory_length_is_estimated_again(spiral) -> None:
+    traj, dcf = spiral
+    layer = _layer(mode="gradient")
+    _estimate(layer, traj, dcf)
+    _estimate(layer, traj, dcf, num_samples=traj.shape[-1] // 2)
+    assert len(layer._gram_norm) == 2
+
+
+def test_a_learned_step_is_one_dimensional_for_fsdp2() -> None:
+    """fully_shard shards dim 0 and raises on a 0-d parameter."""
+    assert _layer(learn_step=True, step_size=0.5).step_size.shape == (1,)
+
+
+def test_a_checkpoint_with_a_scalar_step_still_loads() -> None:
+    """Checkpoints written before the (1,) shape stored step_size as 0-d."""
+    layer = _layer(learn_step=True, step_size=1.0)
+    state = layer.state_dict()
+    state["step_size"] = torch.tensor(0.25)
+    layer.load_state_dict(state)
+    assert layer.step_size.shape == (1,)
+    assert layer.step_size.item() == 0.25
+
+
 def test_a_learned_step_is_a_parameter_and_a_fixed_one_is_not(spiral) -> None:
     assert any(p.requires_grad for p in _layer(learn_step=True).parameters())
     layer = _layer(learn_step=False)

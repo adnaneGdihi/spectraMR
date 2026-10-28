@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.generators.kspace_line_tokens import (
     LineHead,
     LinePositions,

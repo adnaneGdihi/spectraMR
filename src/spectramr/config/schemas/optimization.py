@@ -352,6 +352,12 @@ class GradientConfigSchema(BaseModel):
         "`use_gradient_checkpointing` and the `gradient_checkpointing` alias some "
         "diffusion configs wrote — which is one knob too many.",
     )
+    activation_offload: Literal["none", "cpu"] = Field(
+        default="none",
+        description="'cpu' keeps saved-for-backward activations of the training "
+        "forward+loss in pinned host memory (torch.autograd.graph.save_on_cpu). "
+        "Trades PCIe transfer time for GPU memory; validation is never affected.",
+    )
     detect_anomalies: bool = Field(
         default=False,
         description="torch.autograd.set_detect_anomaly (NaN/Inf checks). Global "

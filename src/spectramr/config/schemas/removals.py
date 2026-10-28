@@ -208,6 +208,39 @@ _RECORDS = [
         was_read=True,
     ),
     RemovalRecord(
+        "parallel.fsdp.buffer_dtype",
+        "2026-10-24",
+        "FSDP2 never casts module buffers: they keep their own dtype (float32 BatchNorm "
+        "statistics stay float32), so there is nothing left for this to select.",
+        mount="parallel.fsdp",
+        was_read=True,
+    ),
+    RemovalRecord(
+        "parallel.fsdp.limit_all_gathers",
+        "2026-10-24",
+        "An FSDP1 rate limiter; FSDP2 schedules its all-gathers itself and has no such option.",
+        mount="parallel.fsdp",
+        was_read=True,
+    ),
+    RemovalRecord(
+        "parallel.fsdp.use_orig_params",
+        "2026-10-24",
+        "An FSDP1 flat-parameter switch; FSDP2 always keeps the original parameters, as DTensors.",
+        mount="parallel.fsdp",
+        was_read=True,
+    ),
+    RemovalRecord(
+        "parallel.fsdp.activation_checkpointing",
+        "2026-10-24",
+        "It wrapped every leaf Linear/Conv2d (little saved, Conv3d skipped) and could "
+        "double-checkpoint models that already checkpoint their own blocks; the model's "
+        "set_grad_checkpointing is the one owner now.",
+        live="optimization.gradient.enable_checkpointing",
+        mount="parallel.fsdp",
+        was_read=True,
+        carry_value=True,
+    ),
+    RemovalRecord(
         "checkpoint.pretrained_path",
         "2026-10-10",
         "No reader loaded it; a warm-start is model.checkpoint_path.",

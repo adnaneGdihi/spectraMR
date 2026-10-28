@@ -7,11 +7,13 @@ Supports volumetric medical imaging with full 3D convolutions.
 Follows SOLID principles with single responsibility and dependency injection.
 """
 
+from itertools import pairwise
 from typing import Any
 
 import torch
 from torch import nn
 
+from spectramr.models.blocks.convolutional import DoubleConv3D
 from spectramr.models.blocks.unet import Down3D, OutConv3D, Up3D
 from spectramr.models.registry import register_model
 
@@ -72,57 +74,40 @@ class UNet3DGenerator(Base3DGenerator):
         )
 
         super().__init__(**params)
+        if not trilinear:
+            # Up3D's transposed conv assumes the input carries half the concatenated
+            # channels, which a doubling feature ladder never does.
+            raise ValueError("UNet3DGenerator supports trilinear=True only")
         self.trilinear = trilinear
+        features = tuple(self.features)
 
-        # Encoder (Downsampling path) - 3 levels for 3D
-        # to avoid excessive downsampling
-        self.downs = nn.ModuleList()
-        in_channels = self.in_channels
-        for feature in self.features:
-            self.downs.append(Down3D(in_channels, feature))
-            in_channels = feature
-
-        # Decoder (Upsampling path)
-        self.ups = nn.ModuleList()
-        # up blocks take concatenated channels as input
-        self.ups.append(Up3D(384, 128, trilinear))  # 256+128=384
-        self.ups.append(Up3D(192, 64, trilinear))  # 128+64=192
-        self.ups.append(Up3D(96, 32, trilinear))  # 64+32=96
-        self.ups.append(Up3D(64, 32, trilinear))  # 32+32=64
-
-        # Output layer
-        self.outc = OutConv3D(
-            self.features[0],
-            self.out_channels,
-            activation=nn.Identity(),
+        # Full-resolution stem, then one Down3D (pool + double conv) per deeper level.
+        self.inc = DoubleConv3D(self.in_channels, features[0])
+        self.downs = nn.ModuleList(Down3D(a, b) for a, b in pairwise(features))
+        # Each Up3D upsamples level i+1 and concatenates the level-i skip.
+        self.ups = nn.ModuleList(
+            Up3D(b + a, a, trilinear)
+            for a, b in reversed(list(pairwise(features)))
         )
+        self.outc = OutConv3D(features[0], self.out_channels, activation=nn.Identity())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the 3D UNet.
 
         Args:
-            x: Input tensor [N, C, D, H, W] where N is batch size,
-               C is number of channels, D, H, W are spatial dimensions
+            x: Input tensor [N, C, D, H, W]; each spatial extent must divide by
+               ``2 ** (len(features) - 1)``.
 
         Returns:
-            Output tensor [N, C_out, D, H, W] preserving input
-            spatial dimensions
+            Output tensor [N, C_out, D, H, W] at the input resolution.
         """
-        # Encoder with skip connections
-        x1 = self.downs[0](x)  # 32 channels
-        x2 = self.downs[1](x1)  # 64 channels
-        x3 = self.downs[2](x2)  # 128 channels
-        x4 = self.downs[3](x3)  # 256 channels (bottleneck)
-
-        # Decoder with skip connections
-        x = self.ups[0](x4, x3)  # 384 -> 128
-        x = self.ups[1](x, x2)  # 192 -> 64
-        x = self.ups[2](x, x1)  # 96 -> 32
-        x = self.ups[3](x, x1)  # 64 -> 32 (use x1 as skip for last layer)
-
-        # Output layer
-        logits = self.outc(x)
-        return self.output_activation(logits)
+        skips = [self.inc(x)]
+        for down in self.downs:
+            skips.append(down(skips[-1]))
+        x = skips.pop()
+        for up in self.ups:
+            x = up(x, skips.pop())
+        return self.output_activation(self.outc(x))
 
 
 def create_unet3d_generator(
