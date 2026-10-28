@@ -171,3 +171,16 @@ def test_the_path_rules_live_beside_the_writer() -> None:
         "/runs/a/logs/validation_metrics.csv"
     )
     assert validation_batches_csv_for(suffixed) == Path("/runs/a/logs/validation_batches.csv")
+
+
+def test_a_volume_sized_metric_tensor_is_not_retained_per_batch(tmp_path: Path) -> None:
+    """A map-valued metric is kept as its mean, so a pass holds scalars, not volumes."""
+    rows = ValidationBatchRows(tmp_path / "rows.csv", iteration=1, epoch=0)
+    volume = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+    rows.add(0, 1, {}, {"val_map": volume, "val_psnr": torch.tensor(30.0)})
+    stored = rows._rows[0][3]
+    assert stored["val_map"].numel() == 1
+    assert torch.isclose(stored["val_map"], volume.mean())
+    rows.flush()
+    written = float(_rows(tmp_path / "rows.csv")[0]["val_map"])
+    assert written == __import__("pytest").approx(float(volume.mean()), rel=1e-6)

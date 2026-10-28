@@ -583,6 +583,15 @@ class BaseTrainingStrategy(
         amp_enabled, amp_precision = resolve_amp_precision(
             opt_config.precision.enabled, opt_config.precision.dtype
         )
+        # Under FSDP the shards run in the FSDP-resolved precision; fp16 there needs the
+        # scaler (and the cross-rank non-finite flag) even when optimization.precision is off.
+        parallel = getattr(self.config, "parallel", None)
+        sharded_grads = getattr(parallel, "strategy", None) == "fsdp"
+        if sharded_grads:
+            from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision
+
+            if resolve_fsdp_precision(parallel.fsdp, opt_config.precision) == "fp16":
+                amp_enabled, amp_precision = True, "fp16"
 
         self.logging_service.log_info(
             f"[Mixed Precision] enabled={amp_enabled} precision={amp_precision} "
@@ -598,6 +607,7 @@ class BaseTrainingStrategy(
             loss_scaling=1024.0,
             dynamic_loss_scaling=True,
             enable_complex_support=is_complex,
+            sharded_grads=sharded_grads,
         )
         self.amp_helper = MixedPrecisionIntegrationHelper(amp_config, self.device)
         self.amp_helper.configure_model_for_amp(self.generator_model)
@@ -638,6 +648,7 @@ class BaseTrainingStrategy(
             amp_policy=self.amp_policy,
             gradient_accumulation_steps=self._acc_steps,
             enable_memory_monitoring=memory_monitoring,
+            activation_offload=opt_config.gradient.activation_offload,
         )
 
         # Resolved lazily by `_weight_table` (the per-name cache is gone: the SSOT
@@ -2624,13 +2635,10 @@ class BaseTrainingStrategy(
             Total gradient norm, on the parameters' device.
         """
         max_norm = clip_value if enable_clip else float("inf")
-        # An FSDP root owns the sharded gradients: only its own method reduces the
-        # norm across ranks. The plain utility clips each shard by its local norm,
-        # so every rank would scale by a different factor.
-        sharded_clip = getattr(model, "clip_grad_norm_", None)
-        if callable(sharded_clip):
-            return sharded_clip(max_norm)
-        return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+        # Over FSDP2's DTensor gradients this is already the global norm; it comes
+        # back replicated, and the local copy keeps callers on plain tensors.
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+        return norm.full_tensor() if hasattr(norm, "full_tensor") else norm
 
     def _check_and_log_gradient_anomalies(
         self,

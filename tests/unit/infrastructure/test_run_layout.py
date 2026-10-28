@@ -39,6 +39,7 @@ def test_the_discovery_skip_list_uses_this_constant() -> None:
     from spectramr.infrastructure.reporting.batch import _SKIP_DIRS
 
     assert PROFILE_SUBDIR in _SKIP_DIRS
+    assert "profiles" in _SKIP_DIRS  # trees written before the rename still carry it
 
 
 @pytest.mark.parametrize(
@@ -48,6 +49,8 @@ def test_the_discovery_skip_list_uses_this_constant() -> None:
         "experiments/results/exp_11/profiles/run-abc/run",
         "experiments/results/exp_11/profiles/run-abc/run/metrics/real_images",
         Path("/abs/experiments/results/exp_11/profiles/run-abc"),
+        # The current segment; the `profiles` cases above are trees written before the rename.
+        "experiments/results/campaigns/c/arm/profile/run-abc/run/metrics/real_images",
     ],
 )
 def test_paths_inside_a_profiling_run_are_recognised(path) -> None:
@@ -63,6 +66,7 @@ def test_paths_inside_a_profiling_run_are_recognised(path) -> None:
         "experiments/results/profiles_ablation",
         "experiments/results/profiles_ablation/logs",
         "experiments/results/exp_profiles/metrics/real_images",
+        "experiments/results/profile_sweep/metrics/real_images",
         # ...and the ordinary case.
         "experiments/results/exp_11",
         "experiments/results/exp_11/metrics/real_images",

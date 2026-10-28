@@ -36,7 +36,7 @@ from spectramr.models.generators.diffusion_transformer_stem import (
     both_domain_views,
     build_contrast_projection,
 )
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 

@@ -1,9 +1,15 @@
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import ContextManager
 
 import torch
 from torch.amp import GradScaler as NativeScaler
+
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # torch built without distributed support: no sharded grads exist
+    DTensor = None
 
 from spectramr.core.compute_device import resolve_torch_device
 from spectramr.core.device_capabilities import (
@@ -28,6 +34,8 @@ class MixedPrecisionConfig:
     loss_scaling: float | str = "dynamic"  # fixed value or "dynamic"
     dynamic_loss_scaling: bool = True
     enable_complex_support: bool = True  # Enable for MRI/Complex flows, disable for standard float
+    # True under FSDP: grads are DTensor shards, and the non-finite flag is all-reduced.
+    sharded_grads: bool = False
 
 
 # Maps the schema-facing ``optimization.precision.dtype`` to MixedPrecisionConfig.precision.
@@ -166,24 +174,16 @@ class MixedPrecisionIntegrationHelper:
                 capabilities=capabilities or probe_device_capabilities(device),
             )
         if config.enabled and config.precision == "fp16":
-            if config.enable_complex_support:
-                # Use our new ComplexGradScaler instead of native one
-                self.scaler = ComplexGradScaler(
-                    self.device_type,
-                    enabled=True,
-                    init_scale=(
-                        config.loss_scaling if isinstance(config.loss_scaling, float) else 2.0**16
-                    ),
-                )
-            else:
-                # Use NativeScaler for standard float training (faster, TF32 allowed)
-                self.scaler = NativeScaler(
-                    self.device_type,
-                    enabled=True,
-                    init_scale=(
-                        config.loss_scaling if isinstance(config.loss_scaling, float) else 2.0**16
-                    ),
-                )
+            # One scaler for every fp16 arm: real grads take the same path as before, and
+            # complex parameters (FNO, s4d, ...) no longer crash the foreach kernel.
+            self.scaler = ComplexGradScaler(
+                self.device_type,
+                enabled=True,
+                init_scale=(
+                    config.loss_scaling if isinstance(config.loss_scaling, float) else 2.0**16
+                ),
+                sharded=config.sharded_grads,
+            )
 
     def configure_model_for_amp(self, model: torch.nn.Module) -> None:
         """Calculates modification on the model if needed (usually none for PyTorch AMP)."""
@@ -265,15 +265,14 @@ class MixedPrecisionIntegrationHelper:
 
 class ComplexGradScaler(NativeScaler):
     """
-    Extends GradScaler to safely handle Complex64/128 gradients.
+    The fp16 grad scaler: complex gradients and FSDP2 shards included.
 
-    Standard NativeScaler typically expects real-valued losses to derive scale factors.
-    When working with complex-valued pipelines, gradients are complex.
-    PyTorch's AMP scaler logic involves checking for Inf/NaNs in gradients.
-
-    This implementation ensures that:
-    1. Validation of inputs prevents complex-valued LOSS being scaled directly (must be real).
-    2. Unscaling handles complex gradients correctly (checking magnitudes/real/imag).
+    torch's foreach unscale kernel has no complex dtype, so a complex gradient is
+    unscaled through ``torch.view_as_real`` (the same storage, real and imaginary
+    parts), and a DTensor gradient through its local shard. Every non-finite
+    check therefore sees both parts. Under FSDP (``sharded=True``) the non-finite
+    flag is all-reduced with MAX, so every rank skips the same step and backs off
+    the scale identically.
     """
 
     def __init__(
@@ -284,17 +283,9 @@ class ComplexGradScaler(NativeScaler):
         growth_factor=2.0,
         backoff_factor=0.5,
         growth_interval=2000,
+        sharded=False,
     ):
-        """__init__.
-
-        Args:
-            device (Any): Description.
-            enabled (Any): Description.
-            init_scale (Any): Description.
-            growth_factor (Any): Description.
-            backoff_factor (Any): Description.
-            growth_interval (Any): Description.
-        """
+        """Build the scaler; ``sharded`` makes the non-finite flag a cross-rank MAX."""
         super().__init__(
             device=device,
             enabled=enabled,
@@ -303,6 +294,7 @@ class ComplexGradScaler(NativeScaler):
             backoff_factor=backoff_factor,
             growth_interval=growth_interval,
         )
+        self.sharded = sharded
 
     def scale(self, outputs):
         """
@@ -317,19 +309,59 @@ class ComplexGradScaler(NativeScaler):
 
         return super().scale(outputs)
 
-    def _unscale_grads_(self, optimizer, *args, **kwargs):
-        """
-        Unscales the gradients of optimizer's assigned parameters.
-        Native implementation usually works on underlying .grad attributes.
-        We hook here just to provide observability or custom handling if PyTorch versions change.
+    def _unscale_grads_(self, optimizer, inv_scale, found_inf, allow_fp16):
+        """Unscale every gradient in place and return the per-device non-finite flags.
 
-        Note: PyTorch's native _unscale_grads_ iterates over parameters and multiplies .grad by inv_scale.
-        For complex tensors, multiplying by a real scalar (inv_scale) works correctly
-        (scales both real and imag parts).
-
-        The critical part is INF/NaN checking which is done in `step`.
+        Same contract as torch's ``_unscale_grads_``, which it replaces: the caller
+        stores the returned dict and ``step`` reads it.
         """
-        return super()._unscale_grads_(optimizer, *args, **kwargs)
+        found: dict[torch.device, torch.Tensor] = {}
+        groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = defaultdict(list)
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    is_shard = DTensor is not None and isinstance(grad, DTensor)
+                    local = grad.to_local() if is_shard else grad
+                    if local.is_sparse:
+                        raise ValueError("ComplexGradScaler does not unscale sparse gradients.")
+                    if not allow_fp16 and local.dtype == torch.float16:
+                        raise ValueError("Attempting to unscale FP16 gradients.")
+                    if torch.is_complex(local):
+                        local = torch.view_as_real(local)
+                    groups[(local.device, local.dtype)].append(local)
+
+            def flag_on(device: torch.device) -> torch.Tensor:
+                # Every rank reaches this for the scale's device, grads or not, so the
+                # all-reduce below is never skipped on one rank.
+                if device not in found:
+                    found[device] = (
+                        found_inf
+                        if found_inf.device == device
+                        else torch.zeros_like(found_inf, device=device)
+                    )
+                return found[device]
+
+            flag_on(found_inf.device)
+            for (device, _), grads in groups.items():
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    grads, flag_on(device), inv_scale.to(device)
+                )
+
+        if self.sharded:
+            # One collective per unscale, on the scale's device: NCCL cannot reduce a CPU
+            # flag, and grads live on the CPU under FSDP cpu_offload.
+            import torch.distributed as dist
+
+            total = found_inf.clone()
+            for flag in found.values():
+                total = torch.maximum(total, flag.to(found_inf.device))
+            dist.all_reduce(total, op=dist.ReduceOp.MAX)
+            for flag in found.values():
+                flag.copy_(total.to(flag.device))
+        return found
 
     def step(self, optimizer, *args, **kwargs):
         """

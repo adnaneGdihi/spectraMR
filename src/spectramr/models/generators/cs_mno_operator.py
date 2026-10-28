@@ -28,7 +28,7 @@ from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
     resolution_agnostic_mode,
 )
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.registry import register_model
 
 #: ``physical``: the per-token arc length of the curve (Theorem A).

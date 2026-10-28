@@ -68,6 +68,11 @@ from spectramr.infrastructure.physics.nufft_ops import NUFFTForwardModel
 
 logger = logging.getLogger(__name__)
 
+#: Seed of the power iteration's start vector. Fixed so every copy of a layer (an
+#: EMA shadow, each DDP/FSDP rank) derives the same step scale from the same
+#: trajectory, and so the estimate never draws from the global RNG stream.
+_POWER_ITERATION_SEED = 0
+
 #: How the layer reconciles a prediction with the acquired samples.
 NC_DC_MODES: frozenset[str] = frozenset({"gradient", "replace"})
 
@@ -146,17 +151,19 @@ class NonCartesianDataConsistency(nn.Module):
         # NUFFT has no degraded mode worth running, so the ImportError is the
         # correct outcome rather than something to guard into a fallback.
         self.operator = NUFFTForwardModel(im_size=self.im_size, grid_size_factor=grid_size_factor)
-        raw = torch.tensor(float(step_size))
-        self.step_size = nn.Parameter(raw) if learn_step else None
+        # Shape (1,), not 0-d: FSDP2's fully_shard shards dim 0 and refuses scalar
+        # parameters. The pre-hook still loads checkpoints saved with the 0-d shape.
+        self.step_size = nn.Parameter(torch.tensor([float(step_size)])) if learn_step else None
         if self.step_size is None:
-            self.register_buffer("_step_const", raw)
-        #: Gram-norm cache keyed by (num_samples, device). Estimated ONCE: the
+            self.register_buffer("_step_const", torch.tensor(float(step_size)))
+        self.register_load_state_dict_pre_hook(_promote_scalar_step)
+        #: Gram-norm cache keyed by (num_samples, device, dtype). Estimated ONCE: the
         #: power iteration costs two NUFFTs and a host sync, which is exactly
         #: what must not run per training step (non-negotiable 9). A trajectory
         #: that rotates per frame but keeps its length reuses the estimate --
         #: the Gram norm of a rotated trajectory is the same to within the
         #: tolerance a step size cares about.
-        self._gram_norm: dict[tuple[int, str], float] = {}
+        self._gram_norm: dict[tuple[int, str, torch.dtype], float] = {}
 
     def _step(self) -> torch.Tensor:
         return self.step_size if self.step_size is not None else self._step_const
@@ -165,12 +172,16 @@ class NonCartesianDataConsistency(nn.Module):
         self, trajectory: torch.Tensor, weights: torch.Tensor, like: torch.Tensor
     ) -> float:
         """Spectral norm of ``A^H W A``, by power iteration, cached."""
-        key = (trajectory.shape[-1], str(like.device))
+        key = (trajectory.shape[-1], str(like.device), like.dtype)
         cached = self._gram_norm.get(key)
         if cached is not None:
             return cached
         with torch.no_grad():
-            v = torch.randn(1, 1, *self.im_size, dtype=like.dtype, device=like.device)
+            # Drawn on the CPU from a local generator, so the start vector is the same
+            # on every device and the global RNG is left untouched.
+            generator = torch.Generator().manual_seed(_POWER_ITERATION_SEED)
+            v = torch.randn(1, 1, *self.im_size, dtype=torch.complex64, generator=generator)
+            v = v.to(device=like.device, dtype=like.dtype)
             v = v / v.abs().norm()
             for _ in range(8):
                 av = self.operator.forward_project(v, trajectory)
@@ -284,6 +295,14 @@ class NonCartesianDataConsistency(nn.Module):
         if dcf.shape[-1] != num_samples:
             raise ValueError(f"dcf covers {dcf.shape[-1]} samples, trajectory has {num_samples}.")
         return dcf
+
+
+def _promote_scalar_step(module, state_dict, prefix, *args) -> None:
+    """Reshape a 0-d ``step_size`` from a checkpoint saved before it became (1,)."""
+    key = prefix + "step_size"
+    value = state_dict.get(key)
+    if value is not None and value.ndim == 0:
+        state_dict[key] = value.reshape(1)
 
 
 __all__ = ["NC_DC_MODES", "NonCartesianDataConsistency", "align_sample_mask"]

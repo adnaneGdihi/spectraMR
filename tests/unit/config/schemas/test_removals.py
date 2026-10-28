@@ -77,7 +77,7 @@ def test_no_removed_key_is_also_a_rename() -> None:
 @pytest.mark.parametrize("dotted", sorted(REMOVALS))
 def test_no_removed_key_is_still_a_field_of_its_block(dotted: str) -> None:
     """Refused AND declared would be a field nothing can ever set."""
-    from spectramr.config.schemas.base import DeepSpeedConfigSchema
+    from spectramr.config.schemas.base import DeepSpeedConfigSchema, FSDPConfigSchema
     from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
     from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
     from spectramr.config.schemas.metrics import MetricsConfigSchema
@@ -111,6 +111,7 @@ def test_no_removed_key_is_still_a_field_of_its_block(dotted: str) -> None:
         "physics.data_consistency": [DataConsistencyConfig],
         "physics.coil_sensitivity": [CoilSensitivityConfig],
         "parallel.deepspeed": [DeepSpeedConfigSchema],
+        "parallel.fsdp": [FSDPConfigSchema],
     }
     rec = REMOVALS[dotted]
     for cls in owners[rec.mount_path]:
@@ -175,9 +176,13 @@ def test_unread_records_keep_their_message(dotted: str) -> None:
     assert rec.message().startswith(f"`{dotted}` was removed ({rec.since}): nothing read it. ")
 
 
-def test_only_the_consolidated_best_knob_was_read() -> None:
+def test_only_the_retired_read_knobs_were_read() -> None:
     assert [k for k, rec in REMOVALS.items() if rec.was_read] == [
-        "parallel.deepspeed.save_consolidated_best"
+        "parallel.deepspeed.save_consolidated_best",
+        "parallel.fsdp.buffer_dtype",
+        "parallel.fsdp.limit_all_gathers",
+        "parallel.fsdp.use_orig_params",
+        "parallel.fsdp.activation_checkpointing",
     ]
 
 

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-10-28
+
+### Added
+- **FSDP2.** Sharded data parallelism now uses `fully_shard` on a `DeviceMesh`, and fp16
+  runs under FSDP2 with a sharded gradient scaler. Complex-valued gradients are unscaled
+  correctly.
+- **Spatial (depth-split) parallelism for 3D conv models.** A `[B, C, D, H, W]` volume is
+  split along depth across a spatial group, and neighbouring ranks exchange halo planes. Use
+  it when one volume's activations do not fit on a GPU.
+- **Activation offload under every strategy:** `optimization.gradient.activation_offload: none | cpu`
+  (default `none`; an unknown value is refused).
+- **`spectramr campaign profile <campaign.yaml>`** profiles every enabled arm of a campaign as
+  one SLURM array and files each profile under `<campaign>/<arm>/profile/<run_id>/`.
+- A multi-GPU, multi-node smoke harness for the parallel paths.
+- Validation logs its memory use, and keeps fewer per-batch tensors alive.
+
+### Changed
+- **FSDP1 is removed.** Its config keys (for example `parallel.fsdp.use_orig_params`) are
+  refused at load with the reason. Configs that declare them must drop them.
+- **`optimization.gradient.enable_checkpointing` raises at build** on a model without
+  `set_grad_checkpointing`. Previously it fell back to wrapping single layers and turned a
+  wrapping failure into a warning.
+- DeepSpeed GAN runs admit several engines only when the config enables it, and freeze the
+  critic in one place.
+
+### Fixed
+- fp32 DeepSpeed raises on non-finite gradients at the optimizer boundary instead of
+  stepping NaNs into every weight.
+- `offload_optimizer` under DeepSpeed builds `DeepSpeedCPUAdam`.
+- `UNet3DGenerator` has a full-resolution stem, and derives its per-level skips from
+  `features`.
+- The non-Cartesian data-consistency step scale is deterministic and shards under FSDP2.
+- 36 swept metrics that declared no ROI policy now declare one.
+
 ## [1.3.1] - 2026-10-28
 
 ### Removed
@@ -441,7 +475,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      return 404, so the 200s here mean something. The `[0.1.0]` heading date above
      and `date-released` in CITATION.cff are two further declarations of the same
      day, and nothing reconciles the three; change them together. -->
-[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.2
 [1.3.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.1
 [1.3.0]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.0
 [0.1.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v0.1.2

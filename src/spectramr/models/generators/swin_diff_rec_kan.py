@@ -21,7 +21,7 @@ from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditi
 from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
 from spectramr.models.blocks.complex_blocks import ComplexResBlock
 from spectramr.models.blocks.swin import SwinBlock
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.kan.complex_kan import ComplexFastKANConvLayer
 from spectramr.models.registry import register_model

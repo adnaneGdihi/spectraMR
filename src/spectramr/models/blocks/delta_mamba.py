@@ -23,6 +23,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 
 _BACKENDS = ("cuda", "reference")
 
@@ -152,7 +155,7 @@ def _per_layer(value, n: int) -> list:
     return [value] * n
 
 
-class DeltaMambaStack(nn.Module):
+class DeltaMambaStack(GradCheckpointingMixin, nn.Module):
     """``num_layers`` DeltaMamba blocks with residuals and a final LayerNorm, as ``_MambaEncoder``."""
 
     def __init__(
@@ -184,8 +187,10 @@ class DeltaMambaStack(nn.Module):
     ) -> torch.Tensor:
         """Apply every layer; ``delta_shift`` is one tensor for all layers, or one per layer."""
         shifts = _per_layer(delta_shift, len(self.layers))
+        ckpt = self._checkpointing_active()
         for layer, shift in zip(self.layers, shifts, strict=True):
-            x = x + layer(x, delta_scale=delta_scale, delta_shift=shift)
+            kw = {"delta_scale": delta_scale, "delta_shift": shift}
+            x = x + (checkpoint(layer, x, use_reentrant=False, **kw) if ckpt else layer(x, **kw))
         return self.norm(x)
 
 

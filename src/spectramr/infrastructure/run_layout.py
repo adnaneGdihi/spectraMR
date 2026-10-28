@@ -2,7 +2,7 @@
 
 ``experiments/results/<experiment>/`` is not homogeneous: alongside the arm's
 real checkpoints, metrics and images, ``spectramr profile`` files a **throwaway**
-run of that same arm under ``profiles/<run_id>/run/``. That child is a genuine
+run of that same arm under ``profile/<run_id>/run/``. That child is a genuine
 training run — it writes the same markers, the same ``metrics/real_images``, the
 same ``final_metrics.json`` — so nothing about its *contents* distinguishes it
 from the arm's own. Only its location does.
@@ -28,10 +28,14 @@ from __future__ import annotations
 from pathlib import Path
 
 #: The results-tree segment under which ``spectramr profile`` files its runs, i.e.
-#: ``experiments/results/<experiment>/PROFILE_SUBDIR/<run_id>/run/``. Named once
-#: here and read by both the writer (``cli.profile_paths.resolve_profile_paths``)
-#: and every reader that walks a results tree.
-PROFILE_SUBDIR = "profiles"
+#: ``<arm run dir>/PROFILE_SUBDIR/<run_id>/run/``. Named once here and read by both
+#: the writer (``cli.profile_paths.resolve_profile_paths``) and every reader that
+#: walks a results tree.
+PROFILE_SUBDIR = "profile"
+
+#: Every segment a reader must treat as profiling output: the current one, and the
+#: ``profiles`` spelling that trees written before the rename still carry.
+PROFILE_SUBDIRS: frozenset[str] = frozenset({PROFILE_SUBDIR, "profiles"})
 
 
 def is_profiling_artifact(path: str | Path) -> bool:
@@ -41,7 +45,7 @@ def is_profiling_artifact(path: str | Path) -> bool:
     named ``profiles_ablation`` is not a profiling artifact, and a check written
     as ``"profiles" in str(path)`` would silently erase it from every report.
     """
-    return PROFILE_SUBDIR in Path(path).parts
+    return not PROFILE_SUBDIRS.isdisjoint(Path(path).parts)
 
 
 def drop_profiling_artifacts(paths: list[Path]) -> list[Path]:
@@ -53,4 +57,9 @@ def drop_profiling_artifacts(paths: list[Path]) -> list[Path]:
     return [p for p in paths if not is_profiling_artifact(p)]
 
 
-__all__ = ["PROFILE_SUBDIR", "drop_profiling_artifacts", "is_profiling_artifact"]
+__all__ = [
+    "PROFILE_SUBDIR",
+    "PROFILE_SUBDIRS",
+    "drop_profiling_artifacts",
+    "is_profiling_artifact",
+]

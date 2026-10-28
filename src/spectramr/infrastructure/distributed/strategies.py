@@ -17,6 +17,7 @@ three behaviour fixes carried in:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -121,6 +122,9 @@ class _BaseStrategy:
             schedulers=schedulers,
             provenance=self.provenance(ctx),
         )
+
+    def prepare_ema(self, ema: Any, models: dict[str, Any], ctx: ParallelContext) -> None:
+        """Stage A, after :meth:`prepare_models`: adapt the EMA shadow. Default: nothing."""
 
     def prepare_data_loaders(self, loaders: dict[str, Any], ctx: ParallelContext) -> dict[str, Any]:
         return loaders
@@ -250,12 +254,12 @@ class DDPStrategy(_BaseStrategy):
 
 
 class FSDPStrategy(_BaseStrategy):
-    """``FullyShardedDataParallel`` — wraps in **Stage A**, before optimizers.
+    """FSDP2 ``fully_shard`` — shards in **Stage A**, before optimizers.
 
-    ``FSDP.__init__`` re-points parameter storage into a flat shard. An optimizer
-    built beforehand would receive shard-shaped gradients against full-shape
-    moment buffers -- a shape error on the first step, or a silently wrong update
-    under ``foreach`` -- and would allocate full-size state, defeating the point.
+    Parameters become DTensor shards in place. An optimizer built beforehand
+    would hold full-size moment buffers against shard-shaped parameters, so the
+    shard must precede it. No step policy is supplied: ``clip_grad_norm_`` over
+    DTensor gradients already reduces the norm across shards.
     """
 
     name = "fsdp"
@@ -270,23 +274,25 @@ class FSDPStrategy(_BaseStrategy):
         for name in list(models):
             if models[name] is not None:
                 models[name] = maybe_wrap_with_fsdp(
-                    models[name], ctx.parallel, ctx.config.optimization.precision
+                    models[name], ctx.parallel, ctx.config.optimization.precision, ctx.device
                 )
-                logger.info("[Parallel] Wrapped %s with FSDP", name)
+                logger.info("[Parallel] Sharded %s with FSDP2", name)
         return models
 
-    def adopt(self, models, optimizers, schedulers, ctx):
-        # Already wrapped in Stage A. Supply the sharding-correct step policy:
-        # clip_grad_norm_(model.parameters(), n) computes a PER-SHARD norm, so
-        # each rank would scale by a different factor -- silently, and it reads
-        # as training instability rather than as an error.
-        from spectramr.infrastructure.training.optimizers import FSDPStepPolicy
+    def prepare_ema(self, ema, models, ctx):
+        # The shadow is a pre-shard deepcopy; sharded alike, the blend and the
+        # validation swap stay shard-local (a plain shadow cannot blend DTensors).
+        from spectramr.infrastructure.distributed.fsdp_wrap import shard_like
 
+        if ema is not None and models.get("generator") is not None:
+            shard_like(ema.module, models["generator"])
+            logger.info("[Parallel] Sharded the EMA shadow like the generator")
+
+    def adopt(self, models, optimizers, schedulers, ctx):
         return ParallelizationResult(
             models=models,
             optimizers=optimizers,
             schedulers=schedulers,
-            step_policy=FSDPStepPolicy,
             provenance=self.provenance(ctx),
         )
 
@@ -307,19 +313,59 @@ class FSDPStrategy(_BaseStrategy):
 
         record = super().provenance(ctx)
         fsdp = ctx.parallel.fsdp
+        precision = resolve_fsdp_precision(fsdp, ctx.config.optimization.precision)
         record["fsdp"] = {
             "sharding_strategy": fsdp.sharding_strategy,
             "auto_wrap_policy": fsdp.auto_wrap_policy,
             "transformer_layer_cls": list(fsdp.transformer_layer_cls),
             "min_num_params": fsdp.min_num_params,
             "cpu_offload": fsdp.cpu_offload,
-            "mixed_precision": resolve_fsdp_precision(fsdp, ctx.config.optimization.precision),
+            "mixed_precision": precision,
+            # The class the training loop builds for this precision (mixed_precision.py).
+            "grad_scaler": "ComplexGradScaler" if precision == "fp16" else None,
             "reduce_dtype": fsdp.reduce_dtype,
-            "buffer_dtype": fsdp.buffer_dtype,
-            "activation_checkpointing": fsdp.activation_checkpointing,
-            "use_orig_params": fsdp.use_orig_params,
+            "implementation": "fsdp2",
         }
         return record
+
+
+#: Optimizer keys the multi-engine path has been reasoned through for: the GAN pair.
+#: Any other multi-optimizer set is not covered by the freeze contract.
+_MULTI_ENGINE_KEYS = frozenset({"opt_g", "opt_d"})
+
+
+def _require_multi_engine_admissible(ds_cfg: Any, optimizers: Mapping[str, Any]) -> None:
+    """Refuse a multi-engine arm outside what the two-engine GPU test covers (#2631).
+
+    Config-only, so every rank raises identically before ``initialize``. The D
+    cadence is iteration-based (``_resolve_disc_updates``), hence rank-uniform;
+    the critic freeze keeps the generator's objective out of D's reduce buckets.
+    ``allow_multi_engine`` stays the gate until the GPU test has passed.
+    """
+    if not ds_cfg.allow_multi_engine:
+        raise RuntimeError(
+            f"parallel.strategy='deepspeed' with {len(optimizers)} optimizers "
+            f"({sorted(optimizers)}). deepspeed.initialize returns ONE engine per "
+            "optimizer, and engine.step() issues collectives -- an arm whose "
+            "discriminator steps on a different cadence than the generator will "
+            "DEADLOCK rather than error. Set parallel.deepspeed.allow_multi_engine: "
+            "true only after tests/unit/infrastructure/distributed/"
+            "test_deepspeed_multi_engine_gpu.py (#2631) has passed for your zero_stage."
+        )
+    if ds_cfg.zero_stage >= 3:
+        raise RuntimeError(
+            "parallel.deepspeed.zero_stage=3 with more than one engine is refused: "
+            "ZeRO-3 gathers parameters during forward, which the discriminator "
+            "freeze does not cover, and no stage-3 run has passed the two-engine "
+            "test (#2631). Use zero_stage 0-2."
+        )
+    unexpected = set(optimizers) - _MULTI_ENGINE_KEYS
+    if unexpected:
+        raise RuntimeError(
+            f"parallel.deepspeed with multiple engines is only admitted for the GAN "
+            f"pair {sorted(_MULTI_ENGINE_KEYS)}; got {sorted(unexpected)} as well. "
+            "Their step cadence and critic freeze are not covered by the test (#2631)."
+        )
 
 
 class DeepSpeedStrategy(_BaseStrategy):
@@ -346,52 +392,57 @@ class DeepSpeedStrategy(_BaseStrategy):
             build_deepspeed_config,
             initialize_deepspeed_engine,
         )
+        from spectramr.infrastructure.distributed.deepspeed_backend.cpu_adam import (
+            prepare_client_optimizer,
+        )
 
         ds_cfg = ctx.parallel.deepspeed
-        if len(optimizers) > 1 and not ds_cfg.allow_multi_engine:
-            # Not a limitation to paper over. `engine.step()` issues collectives,
-            # so a GAN whose discriminator steps every k iterations DEADLOCKS --
-            # it does not error, it hangs, which is far more expensive to
-            # diagnose on a cluster than a refusal here.
-            raise RuntimeError(
-                f"parallel.strategy='deepspeed' with {len(optimizers)} optimizers "
-                f"({sorted(optimizers)}). deepspeed.initialize returns ONE engine "
-                "per optimizer, and engine.step() issues collectives -- an arm "
-                "whose discriminator steps on a different cadence than the "
-                "generator will DEADLOCK rather than error. Set "
-                "parallel.deepspeed.allow_multi_engine: true only if you have "
-                "verified the two step in lockstep."
-            )
+        if len(optimizers) > 1:
+            _require_multi_engine_admissible(ds_cfg, optimizers)
 
         config = build_deepspeed_config(ctx.config)
         policy = DeepSpeedStepPolicy()
         new_models = dict(models)
         new_optimizers = dict(optimizers)
         new_schedulers = dict(schedulers)
+        optimizer_records: dict[str, dict[str, Any]] = {}
 
         for opt_key, optimizer in optimizers.items():
             model_key = "discriminator" if opt_key == "opt_d" else "generator"
             model = models.get(model_key)
             if model is None or optimizer is None:
                 continue
+            client, client_scheduler, record = prepare_client_optimizer(
+                optimizer,
+                schedulers.get(opt_key),
+                config=ctx.config,
+                zero_stage=ds_cfg.zero_stage,
+                offload_optimizer=ds_cfg.offload_optimizer,
+                zenflow=ds_cfg.zenflow.enabled,
+            )
             engine, ds_optimizer, ds_scheduler = initialize_deepspeed_engine(
                 model=model,
-                optimizer=optimizer,
-                lr_scheduler=schedulers.get(opt_key),
+                optimizer=client,
+                lr_scheduler=client_scheduler,
                 config=config,
             )
+            record["engine"] = type(ds_optimizer).__name__
+            optimizer_records[opt_key] = record
             new_models[model_key] = engine
             new_optimizers[opt_key] = ds_optimizer
             if ds_scheduler is not None:
                 new_schedulers[opt_key] = ds_scheduler
             policy.register(ds_optimizer, engine)
 
+        provenance = self.provenance(ctx)
+        # Which optimizer class ran: the client handed to DeepSpeed and the wrapper it returned.
+        provenance["optimizers"] = optimizer_records
         return ParallelizationResult(
             models=new_models,
             optimizers=new_optimizers,
             schedulers=new_schedulers,
             step_policy=policy,
-            provenance=self.provenance(ctx),
+            provenance=provenance,
         )
 
     def prepare_data_loaders(self, loaders, ctx):

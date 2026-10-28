@@ -135,17 +135,16 @@ class TestStageOrdering:
 
 
 class TestStepPolicyHandoff:
-    def test_fsdp_supplies_a_sharding_correct_step_policy(self) -> None:
-        """clip_grad_norm_(model.parameters(), n) computes a PER-SHARD norm under
-        FSDP, so each rank scales differently -- silently, and it reads as
-        training instability. The strategy knows how the model was wrapped, so it
-        is what supplies the right policy."""
-        import inspect
+    def test_fsdp_needs_no_step_policy(self) -> None:
+        """FSDP2's DTensor gradients make the plain clip global (pinned with two real
+        ranks in test_state_io_fsdp.py), so the plugin leaves the default policy."""
+        from types import SimpleNamespace
 
-        from spectramr.infrastructure.training.optimizers import FSDPStepPolicy
-
-        source = inspect.getsource(resolve_parallel_strategy("fsdp").adopt)
-        assert FSDPStepPolicy.__name__ in source
+        parallel = ParallelismConfigSchema(strategy="fsdp", fsdp={"enabled": True})
+        config = SimpleNamespace(optimization=SimpleNamespace(precision=None))
+        ctx = ParallelContext(config=config, device=torch.device("cpu"), parallel=parallel)
+        result = resolve_parallel_strategy("fsdp").adopt(_models(), {}, {}, ctx)
+        assert result.step_policy is None
 
     @pytest.mark.parametrize("name", ["none", "dp"])
     def test_unsharded_strategies_leave_the_default_policy(self, name: str) -> None:
@@ -179,12 +178,24 @@ class TestProvenance:
         assert record["world_size"] == 1
 
     def test_fsdp_records_the_sharding_knobs_that_were_actually_used(self) -> None:
-        ctx = _ctx(
-            strategy="fsdp",
-            fsdp={"enabled": True, "sharding_strategy": "shard_grad_op"},
+        # The precision is read from the frozen config, so the fixture needs an
+        # optimization block; the bare object() of _ctx() has none.
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.optimization import PrecisionConfigSchema
+
+        precision = PrecisionConfigSchema(enabled=True, dtype="bfloat16")
+        ctx = ParallelContext(
+            config=SimpleNamespace(optimization=SimpleNamespace(precision=precision)),
+            device=torch.device("cpu"),
+            parallel=ParallelismConfigSchema(
+                strategy="fsdp",
+                fsdp={"enabled": True, "sharding_strategy": "shard_grad_op"},
+            ),
         )
         record = resolve_parallel_strategy("fsdp").provenance(ctx)
         assert record["fsdp"]["sharding_strategy"] == "shard_grad_op"
+        assert record["fsdp"]["mixed_precision"] == "bf16"
         assert "transformer_layer_cls" in record["fsdp"]
 
 

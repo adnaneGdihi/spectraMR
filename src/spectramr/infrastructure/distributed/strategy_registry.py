@@ -101,6 +101,10 @@ class ParallelStrategyPlugin(Protocol):
         """Stage A — before optimizers exist. Wrapping here changes parameters."""
         ...
 
+    def prepare_ema(self, ema: Any, models: dict[str, Any], ctx: ParallelContext) -> None:
+        """Stage A, after ``prepare_models``: adapt the EMA shadow to the wrapped models."""
+        ...
+
     def adopt(
         self,
         models: dict[str, Any],

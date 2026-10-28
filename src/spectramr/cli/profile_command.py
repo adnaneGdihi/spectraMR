@@ -87,7 +87,7 @@ FOCUS_PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 #: How each target is told to write into this profiling run's OWN directory,
-#: ``experiments/results/<experiment>/profiles/<run_id>/run/``.
+#: ``<arm run dir>/profile/<run_id>/run/``.
 #:
 #: The formatting key is ``child_run_dir`` and not ``run_dir`` for a reason worth
 #: stating: these templates used to be handed the arm's real results directory,

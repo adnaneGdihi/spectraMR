@@ -172,17 +172,10 @@ class TestStepPolicyOwnership:
         """``perform_step`` is ignored on purpose: the engine decides boundaries
         itself, so step() is a no-op mid-window. Double-gating would stall it."""
         calls: list[str] = []
-
-        class _FakeEngine:
-            def backward(self, loss):
-                calls.append("backward")
-
-            def step(self):
-                calls.append("step")
-
+        engine = _FakeStepEngine(calls=calls, boundary=False)
         optimizer = object()
         policy = DeepSpeedStepPolicy()
-        policy.register(optimizer, _FakeEngine())
+        policy.register(optimizer, engine)
         policy.backward_and_step(torch.tensor(1.0), optimizer, perform_step=False)
         assert calls == ["backward", "step"]
 
@@ -217,6 +210,127 @@ class TestStepPolicyOwnership:
         model.weight.grad = torch.full_like(model.weight, 100.0)
         DeepSpeedStepPolicy().clip_gradients(model, 1.0)
         assert model.weight.grad.abs().max().item() == pytest.approx(100.0)
+
+
+class _FakeStepEngine:
+    """Just enough of a DeepSpeedEngine for the boundary gradient check."""
+
+    def __init__(
+        self,
+        *,
+        calls=None,
+        boundary=True,
+        stage=0,
+        fp16=False,
+        bf16=False,
+        module_grads=(),
+        averaged=None,
+    ):
+        self.calls = calls if calls is not None else []
+        self._boundary = boundary
+        self._stage = stage
+        self._fp16 = fp16
+        self._bf16 = bf16
+        self.global_steps = 7
+        self.module = SimpleNamespace(
+            parameters=lambda: [SimpleNamespace(grad=g) for g in module_grads]
+        )
+        self.optimizer = (
+            SimpleNamespace(averaged_gradients=averaged) if averaged is not None else object()
+        )
+
+    def backward(self, loss):
+        self.calls.append("backward")
+
+    def step(self):
+        self.calls.append("step")
+
+    def is_gradient_accumulation_boundary(self):
+        return self._boundary
+
+    def zero_optimization_stage(self):
+        return self._stage
+
+    def fp16_enabled(self):
+        return self._fp16
+
+    def bfloat16_enabled(self):
+        return self._bf16
+
+
+class TestFp32NonFiniteGradientCheck:
+    """Planted NaN/inf gradients must raise before step(); clean ones must step.
+
+    fp32 DeepSpeed has no overflow check of its own, so without this a NaN
+    gradient reaches every weight (issue #2270).
+    """
+
+    def _run(self, engine):
+        policy = DeepSpeedStepPolicy()
+        optimizer = object()
+        policy.register(optimizer, engine)
+        policy.backward_and_step(torch.tensor(1.0), optimizer)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_planted_nonfinite_gradient_at_the_boundary_raises_before_step(self, bad) -> None:
+        engine = _FakeStepEngine(module_grads=[torch.tensor([1.0, bad])])
+        with pytest.raises(RuntimeError, match="Non-finite gradient at optimizer step 7"):
+            self._run(engine)
+        assert engine.calls == ["backward"], "the step must never run on a NaN gradient"
+
+    def test_planted_nonfinite_zero_stage_partition_raises(self) -> None:
+        engine = _FakeStepEngine(stage=2, averaged={0: [torch.tensor([0.5, float("nan")])]})
+        with pytest.raises(RuntimeError, match="ZeRO stage 2"):
+            self._run(engine)
+        assert engine.calls == ["backward"]
+
+    def test_finite_gradients_step(self) -> None:
+        engine = _FakeStepEngine(module_grads=[torch.tensor([1.0, -2.0, 3.0])])
+        self._run(engine)
+        assert engine.calls == ["backward", "step"]
+
+    def test_a_non_boundary_micro_batch_is_not_checked(self) -> None:
+        """One host read per optimizer step, not per micro-batch."""
+        engine = _FakeStepEngine(boundary=False, module_grads=[torch.tensor([float("nan")])])
+        self._run(engine)
+        assert engine.calls == ["backward", "step"]
+
+    @pytest.mark.parametrize("precision", [{"fp16": True}, {"bf16": True}])
+    def test_fp16_and_bf16_engines_skip_the_check(self, precision) -> None:
+        """DeepSpeed's own overflow detect and step skip owns those paths."""
+        engine = _FakeStepEngine(module_grads=[torch.tensor([float("nan")])], **precision)
+        self._run(engine)
+        assert engine.calls == ["backward", "step"]
+
+    def test_an_unlocatable_partition_raises_rather_than_passing(self) -> None:
+        """No averaged_gradients on a ZeRO optimizer is a loud error, not a pass."""
+        engine = _FakeStepEngine(stage=1, averaged=None)
+        with pytest.raises(RuntimeError, match="cannot locate"):
+            self._run(engine)
+        assert engine.calls == ["backward"]
+
+    def test_no_gradients_at_the_boundary_raises_rather_than_passing(self) -> None:
+        engine = _FakeStepEngine(module_grads=[None])
+        with pytest.raises(RuntimeError, match="found no gradients"):
+            self._run(engine)
+        assert engine.calls == ["backward"]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a second device")
+    @pytest.mark.parametrize("bad", [False, True])
+    def test_offloaded_cpu_partition_beside_device_grads(self, bad) -> None:
+        """offload_optimizer keeps partitions on the CPU; the verdict must still reduce."""
+        cpu_grad = torch.tensor([1.0, float("nan") if bad else 2.0])
+        engine = _FakeStepEngine(
+            stage=2, averaged={0: [torch.ones(3, device="cuda"), cpu_grad]}
+        )
+        engine.device = torch.device("cuda")
+        if bad:
+            with pytest.raises(RuntimeError, match="Non-finite gradient"):
+                self._run(engine)
+            assert engine.calls == ["backward"]
+        else:
+            self._run(engine)
+            assert engine.calls == ["backward", "step"]
 
 
 class TestStrategyGuards:

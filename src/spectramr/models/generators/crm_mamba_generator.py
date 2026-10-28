@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.models.blocks.delta_mamba import DeltaMambaStack
+from spectramr.models.blocks.grad_checkpointing import NestedGradCheckpointingMixin
 from spectramr.models.generators.hilbert_mamba_generators import (
     _ConvHead,
     _ConvStem,
@@ -66,7 +67,7 @@ def _zero_linear(d_in: int, d_out: int) -> nn.Linear:
     requires_paired_data=True,
     strict_kwargs=True,
 )
-class CRMMamba(nn.Module):
+class CRMMamba(NestedGradCheckpointingMixin, nn.Module):
     """Cross-resolution modulated Mamba with a ULF-coarse context.
 
     Args:

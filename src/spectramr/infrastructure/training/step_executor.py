@@ -38,6 +38,9 @@ from spectramr.infrastructure.training.nonfinite_monitor import (
 
 logger = logging.getLogger(__name__)
 
+#: Accepted ``optimization.gradient.activation_offload`` values.
+_ACTIVATION_OFFLOAD_MODES = frozenset({"none", "cpu"})
+
 
 def _suppress_ddp_sync(model: Any, perform_step: bool) -> Any:
     """``model.no_sync()`` on accumulation micro-batches, else a null context.
@@ -86,6 +89,7 @@ class StepExecutor:
         amp_policy: Any,
         gradient_accumulation_steps: int = 1,
         enable_memory_monitoring: bool = False,
+        activation_offload: str = "none",
     ) -> None:
         """Initialize the unified trainer.
 
@@ -94,10 +98,17 @@ class StepExecutor:
             amp_policy: AMPPolicy for backward and step.
             gradient_accumulation_steps: Steps to accumulate grads.
             enable_memory_monitoring: Flag to enable rigorous memory leak tracking.
+            activation_offload: ``none`` or ``cpu``; any other value raises.
         """
+        if activation_offload not in _ACTIVATION_OFFLOAD_MODES:
+            raise ValueError(
+                f"activation_offload={activation_offload!r} is not one of "
+                f"{sorted(_ACTIVATION_OFFLOAD_MODES)}."
+            )
         self.amp_helper = amp_helper
         self.amp_policy = amp_policy
         self.enable_memory_monitoring = enable_memory_monitoring
+        self.activation_offload = activation_offload
         # Attached by the training loop for its run; None keeps the guard's
         # synchronous raise for every other caller.
         self.nonfinite_monitor: NonFiniteMonitor | None = None
@@ -142,8 +153,7 @@ class StepExecutor:
         Building the policy is only half the wiring; without this call the
         executor keeps the generic ``AMPPolicy`` and a DeepSpeed run never
         reaches ``engine.backward()``/``engine.step()`` -- it trains, every test
-        passes, and only the numbers are wrong (1/N^2 loss scaling). An FSDP run
-        keeps the per-shard gradient clip that ``FSDPStepPolicy`` exists to fix.
+        passes, and only the numbers are wrong (1/N^2 loss scaling).
 
         Raises:
             TypeError: if *policy* is a class rather than an instance. The
@@ -280,6 +290,10 @@ class StepExecutor:
                 # gets the TF32-safe path. The previous unconditional fp16
                 # autocast defeated that guard for every complex-domain arm.
                 stack.enter_context(self.amp_helper.get_autocast_context())
+                # Only the forward+loss is wrapped: saved tensors are unpacked by
+                # backward(), which runs after this block, so the hooks need no more.
+                if self.activation_offload == "cpu":
+                    stack.enter_context(torch.autograd.graph.save_on_cpu(pin_memory=True))
 
                 loss = closure()
 

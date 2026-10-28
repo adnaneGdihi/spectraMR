@@ -46,10 +46,6 @@ class TestPassthrough:
         io.load_model_state(model, prefixed)
         assert torch.allclose(model.weight, prefixed["module.weight"])
 
-    def test_full_params_is_a_no_op(self) -> None:
-        with PassthroughStateIO().full_params(nn.Linear(2, 2)):
-            pass
-
     def test_swap_in_installs_the_shadow_and_restores_the_live_weights(self) -> None:
         io = PassthroughStateIO()
         live, shadow = nn.Linear(2, 2), nn.Linear(2, 2)
@@ -69,5 +65,5 @@ class TestFSDPIOLeavesNonRootsAlone:
         state = io.model_state(model)
         io.load_model_state(model, state)
         io.load_optimizer_state(model, opt, io.optimizer_state(model, opt))
-        with io.full_params(model), io.swap_in(model, nn.Linear(2, 2)):
+        with io.swap_in(model, nn.Linear(2, 2)):
             pass

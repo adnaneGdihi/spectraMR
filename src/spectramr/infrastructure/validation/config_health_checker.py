@@ -9615,7 +9615,8 @@ class ConfigHealthChecker:
 
         ``deepspeed.initialize`` asserts on an unsupported client optimizer at
         ``zero_stage >= 1`` and raises on any client optimizer other than
-        DeepSpeedCPUAdam / DeepSpeedCPULion under ``offload_optimizer``. Both fire
+        DeepSpeedCPUAdam / DeepSpeedCPULion under ``offload_optimizer``; this repo
+        rebuilds Adam/AdamW as DeepSpeedCPUAdam and refuses the rest. Both fire
         inside the engine, after the model, data and physics are built; this
         reports them at audit time. The rules live in
         :mod:`spectramr.infrastructure.distributed.deepspeed_backend.optimizer_support`.
@@ -9662,8 +9663,8 @@ class ConfigHealthChecker:
                     "parallel.deepspeed.offload_optimizer",
                 ],
                 fix_hint=(
-                    "Use adam / adamw / adagrad, and for optimizer offload remove "
-                    "offload_optimizer (this repo builds torch optimizers, not DeepSpeedCPUAdam)."
+                    "Use adam / adamw / adagrad. Under offload_optimizer use adam or "
+                    "adamw: they are rebuilt as DeepSpeedCPUAdam."
                 ),
             )
         return HealthCheckResult(

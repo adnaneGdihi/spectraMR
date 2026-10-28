@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
+from spectramr.models.blocks.grad_checkpointing import (
+    GradCheckpointingMixin,
+    NestedGradCheckpointingMixin,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -295,7 +300,7 @@ class GraphAttentionLayer(nn.Module):
             return h_prime.mean(dim=2)
 
 
-class GraphAttentionUNet(nn.Module):
+class GraphAttentionUNet(GradCheckpointingMixin, nn.Module):
     """
     Graph Attention U-Net (GAT-UNet)
     """
@@ -364,6 +369,12 @@ class GraphAttentionUNet(nn.Module):
             curr_dim = head_dim_out * heads
 
         self.final_layer = nn.Linear(curr_dim, out_channels)
+
+    def _gat(self, layer: nn.Module, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """One GAT layer, checkpointed when active: its N x N attention dominates memory."""
+        if self._checkpointing_active():
+            return checkpoint(layer, x, adj, use_reentrant=False)
+        return layer(x, adj)
 
     def forward(self, x, adj, dcf=None):
         # x: [B, N, 5]
@@ -436,7 +447,7 @@ class GraphAttentionUNet(nn.Module):
                 raise ValueError(
                     f"Encoder GAT[{i}] expected {gat.in_features} features, got {x.shape[-1]}"
                 )
-            x = gat(x, adj)
+            x = self._gat(gat, x, adj)
             x = F.relu(x)
             skips.append(x)
 
@@ -452,7 +463,7 @@ class GraphAttentionUNet(nn.Module):
             raise ValueError(
                 f"Middle GAT expected {self.middle_layer.in_features} features, got {x.shape[-1]}"
             )
-        x = self.middle_layer(x, adj)
+        x = self._gat(self.middle_layer, x, adj)
         x = F.relu(x)
 
         # Decoder
@@ -474,7 +485,7 @@ class GraphAttentionUNet(nn.Module):
                 raise ValueError(
                     f"Decoder GAT[{i + 1}] expected {gat.in_features} features, got {x.shape[-1]}"
                 )
-            x = gat(x, adj)
+            x = self._gat(gat, x, adj)
             x = F.relu(x)
 
         if x.shape[-1] != self.final_layer.in_features:
@@ -861,7 +872,7 @@ class DynamicGraphUNet(nn.Module):
     accepts_complex=True,
     requires_paired_data=True,
 )
-class GraphUNetGenerator(nn.Module, IGenerator):
+class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
     """Wrapper for Graph U-Net Generators (Dynamic Graph UNet, GAT-UNet).
 
     Supports diffusion timestep conditioning and contrast class conditioning

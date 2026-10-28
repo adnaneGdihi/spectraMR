@@ -195,7 +195,9 @@ def _config(backend: str, zero_stage, *, cross_modal: bool, conditioning: bool) 
             geomamba_ulf=SimpleNamespace(uncertainty=SimpleNamespace(enabled=cross_modal)),
         ),
         undersampling=SimpleNamespace(adaptive=SimpleNamespace(enabled=conditioning)),
-        losses=SimpleNamespace(gan=SimpleNamespace(domain_grl=SimpleNamespace(enabled=cross_modal))),
+        losses=SimpleNamespace(
+            gan=SimpleNamespace(domain_grl=SimpleNamespace(enabled=cross_modal))
+        ),
         model=SimpleNamespace(
             conditioning=SimpleNamespace(
                 enabled=conditioning, sources=["field_strength"] if conditioning else []

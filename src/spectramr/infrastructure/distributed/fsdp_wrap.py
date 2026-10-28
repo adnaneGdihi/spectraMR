@@ -1,17 +1,15 @@
-"""FSDP wrap helper (PR-14 / L1).
+"""FSDP2 (``fully_shard``) wrap helper.
 
-Plan: TODO/backlog_paradigm_expansion_roadmap.md §PR-14.
-
-Reads ``parallel.fsdp`` from a TrainingSettings instance and applies
-``torch.distributed.fsdp.FullyShardedDataParallel`` with the requested
-sharding + mixed-precision policy. When ``fsdp.enabled=False`` this is
-a no-op (returns the model unchanged) so single-GPU training is
-unaffected.
+Reads ``parallel.fsdp`` and shards a model in place with
+``torch.distributed.fsdp.fully_shard`` on a ``DeviceMesh``. FSDP2 adds no wrapper
+class: the model keeps its type (it gains ``FSDPModule``), its parameters become
+DTensors, and ``torch.nn.utils.clip_grad_norm_`` over them is already the global
+norm. The names of the sharded units are recorded on the root so the EMA shadow can
+be sharded identically (:func:`shard_like`).
 """
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Any
 
@@ -20,55 +18,32 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-
-def _resolve_sharding_strategy(name: str) -> Any:
-    from torch.distributed.fsdp import ShardingStrategy
-
-    table = {
-        "full_shard": ShardingStrategy.FULL_SHARD,
-        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
-        "no_shard": ShardingStrategy.NO_SHARD,
-        "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
-    }
-    if name not in table:
-        raise ValueError(f"Unknown FSDP sharding_strategy={name!r}. Use one of {list(table)}.")
-    return table[name]
+#: Attribute on the root holding the dotted names of its ``fully_shard`` units ("" = root).
+FSDP_UNITS_ATTR = "_spectramr_fsdp_units"
 
 
-def _resolve_mixed_precision_policy(
-    dtype_name: str | None,
-    reduce_dtype: str = "float32",
-    buffer_dtype: str = "float32",
-) -> Any:
+def _resolve_mixed_precision_policy(dtype_name: str | None, reduce_dtype: str = "float32") -> Any:
     if dtype_name is None:
         return None
-    from torch.distributed.fsdp import MixedPrecision
+    from torch.distributed.fsdp import MixedPrecisionPolicy
 
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
     if dtype_name not in dtype_map:
         raise ValueError(f"Unknown FSDP mixed_precision={dtype_name!r}. Use fp16 | bf16 | null.")
     dtype = dtype_map[dtype_name]
     resolved = {"float32": torch.float32, "match_param": dtype}
-    for knob, value in (("reduce_dtype", reduce_dtype), ("buffer_dtype", buffer_dtype)):
-        if value not in resolved:
-            raise ValueError(f"Unknown FSDP {knob}={value!r}. Use float32 | match_param.")
-    return MixedPrecision(
-        param_dtype=dtype,
-        reduce_dtype=resolved[reduce_dtype],
-        buffer_dtype=resolved[buffer_dtype],
-    )
+    if reduce_dtype not in resolved:
+        raise ValueError(f"Unknown FSDP reduce_dtype={reduce_dtype!r}. Use float32 | match_param.")
+    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=resolved[reduce_dtype])
 
 
 def _resolve_layer_classes(names: tuple[str, ...]) -> set[type]:
-    """Turn configured class NAMES into the classes FSDP wraps on.
+    """Turn configured class NAMES into the classes FSDP shards on.
 
     Names, not import paths, because that is what a user reading a model's
-    ``print(model)`` output actually sees. Resolution scans the registered model
-    modules; an unresolvable name RAISES rather than being dropped, since a
-    silently-dropped name reproduces the empty-set bug one entry at a time.
+    ``print(model)`` output actually sees. An unresolvable name RAISES rather than
+    being dropped, since a silently-dropped name shrinks the shard set unseen.
     """
-    import torch.nn as nn
-
     candidates: dict[str, type] = {}
 
     def _collect(module: Any) -> None:
@@ -88,35 +63,22 @@ def _resolve_layer_classes(names: tuple[str, ...]) -> set[type]:
         except Exception:  # pragma: no cover - optional model deps
             logger.debug("could not scan %s for FSDP layer classes", module_path)
 
-    resolved: set[type] = set()
-    missing: list[str] = []
-    for name in names:
-        cls = candidates.get(name)
-        if cls is None:
-            missing.append(name)
-        else:
-            resolved.add(cls)
+    missing = sorted(name for name in names if name not in candidates)
     if missing:
         raise ValueError(
-            f"fsdp.transformer_layer_cls names {sorted(missing)} match no "
-            "nn.Module subclass in torch.nn or the model packages. A name that "
-            "resolves to nothing would silently shrink the wrap set -- the same "
-            "failure as the empty set this replaced."
+            f"fsdp.transformer_layer_cls names {missing} match no nn.Module subclass in "
+            "torch.nn or the model packages. A name that resolves to nothing would "
+            "silently shrink the shard set."
         )
-    return resolved
+    return {candidates[name] for name in names}
 
 
 def resolve_fsdp_precision(fsdp_cfg: Any, precision_cfg: Any = None) -> str | None:
-    """The precision FSDP runs in: ``"bf16"`` or ``None`` (single precision).
+    """The precision FSDP runs in: ``"fp16"``, ``"bf16"`` or ``None`` (single precision).
 
     ``optimization.precision`` owns the arm's precision, the same block DeepSpeed reads, so
     FSDP follows it: off means float32, and ``enabled`` with no dtype means float16, the
     global convention. ``parallel.fsdp.mixed_precision`` overrides it when an arm names one.
-    Every other precision has to be declared.
-
-    Raises:
-        ValueError: the resolved precision is float16. FSDP needs a ``ShardedGradScaler``
-            that is not wired, so float16 would underflow its gradients unscaled.
     """
     from spectramr.infrastructure.training.mixed_precision import resolve_amp_precision
 
@@ -129,136 +91,172 @@ def resolve_fsdp_precision(fsdp_cfg: Any, precision_cfg: Any = None) -> str | No
     )
     if not enabled:
         return None
-    if resolved == "fp16":
-        raise ValueError(
-            "optimization.precision resolves to float16 under FSDP, which needs a "
-            "ShardedGradScaler that is not wired, so gradients would underflow unscaled. "
-            "Declare optimization.precision.dtype: bfloat16 (Ampere or newer), or "
-            "optimization.precision.enabled: false for float32."
-        )
     return resolved
 
 
-def _build_auto_wrap_policy(cfg: Any) -> Any:
-    name = cfg.auto_wrap_policy
-    if name == "none":
-        return None
-    if name == "size_based":
-        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+def build_fsdp_mesh(sharding_strategy: str, device_type: str) -> Any:
+    """The mesh a sharding strategy means: 1-D shard, or 2-D (replicate, shard).
 
-        return functools.partial(size_based_auto_wrap_policy, min_num_params=cfg.min_num_params)
-    if name == "transformer_block":
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    ``no_shard`` is a 2-D mesh whose shard dimension has size 1, i.e. pure
+    replication, so every strategy goes through one ``fully_shard`` path.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
 
-        # This used to pass ``transformer_layer_cls=set()``. An empty class set
-        # matches NO module, so FSDP wrapped nothing -- effectively NO_SHARD --
-        # while ``maybe_wrap_with_fsdp`` logged "FSDP wrapped:
-        # sharding=full_shard". There was no config surface to populate the set,
-        # so the option could not be made to work from YAML at all (#621 F1).
+    world = dist.get_world_size()
+    if sharding_strategy in ("full_shard", "shard_grad_op"):
+        return init_device_mesh(device_type, (world,), mesh_dim_names=("shard",))
+    if sharding_strategy == "no_shard":
+        return init_device_mesh(device_type, (world, 1), mesh_dim_names=("replicate", "shard"))
+    if sharding_strategy == "hybrid_shard":
+        from spectramr.core.topology import resolve_run_topology
+
+        local = resolve_run_topology().local_world_size
+        if local < 1 or world % local:
+            raise ValueError(
+                f"fsdp.sharding_strategy='hybrid_shard' needs the world size ({world}) to be "
+                f"a multiple of the ranks per node ({local})."
+            )
+        return init_device_mesh(
+            device_type, (world // local, local), mesh_dim_names=("replicate", "shard")
+        )
+    raise ValueError(
+        f"Unknown FSDP sharding_strategy={sharding_strategy!r}. Use full_shard | "
+        "shard_grad_op | no_shard | hybrid_shard."
+    )
+
+
+def _select_units(model: nn.Module, cfg: Any) -> list[str]:
+    """Dotted names of the submodules that become their own shard unit, deepest first."""
+    policy = cfg.auto_wrap_policy
+    if policy == "none":
+        return []
+    named = [(name, module) for name, module in model.named_modules() if name]
+    if policy == "transformer_block":
         declared = tuple(getattr(cfg, "transformer_layer_cls", ()) or ())
         if not declared:
             raise ValueError(
                 "fsdp.auto_wrap_policy='transformer_block' requires a non-empty "
-                "fsdp.transformer_layer_cls. An empty class set matches no "
-                "module, so FSDP would wrap nothing and silently behave as "
-                "no_shard while reporting full_shard."
+                "fsdp.transformer_layer_cls. An empty class set matches no module, so "
+                "FSDP would shard only the root while reporting per-block units."
             )
-        return functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=_resolve_layer_classes(declared),
-        )
+        classes = tuple(_resolve_layer_classes(declared))
+        units = [name for name, module in named if isinstance(module, classes)]
+        if not units:
+            raise ValueError(
+                f"fsdp.transformer_layer_cls {list(declared)} matched no submodule of "
+                f"{type(model).__name__}."
+            )
+        return sorted(units, key=lambda n: n.count("."), reverse=True)
+    if policy == "size_based":
+        # Post-order, as FSDP1's size policy: a module whose parameters not yet
+        # claimed by a deeper unit reach min_num_params becomes a unit itself.
+        claimed: set[int] = set()
+        units = []
+        for name, module in sorted(named, key=lambda nm: nm[0].count("."), reverse=True):
+            free = [p for p in module.parameters() if id(p) not in claimed]
+            if sum(p.numel() for p in free) >= cfg.min_num_params:
+                units.append(name)
+                claimed.update(id(p) for p in free)
+        return units
     raise ValueError(
-        f"Unknown FSDP auto_wrap_policy={name!r}. Use size_based | transformer_block | none."
+        f"Unknown FSDP auto_wrap_policy={policy!r}. Use size_based | transformer_block | none."
     )
 
 
-def _maybe_apply_activation_checkpointing(model: nn.Module) -> None:
-    """Wrap nn.Linear / nn.Conv2d submodules with activation checkpointing."""
-    try:
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-            CheckpointImpl,
-            apply_activation_checkpointing,
-            checkpoint_wrapper,
-        )
-    except ImportError:  # pragma: no cover
-        logger.warning("torch.distributed activation_checkpointing API unavailable.")
-        return
+def _apply_units(model: nn.Module, units: list[str], **shard_kwargs: Any) -> None:
+    from torch.distributed.fsdp import fully_shard
 
-    def _check(submodule: nn.Module) -> bool:
-        return isinstance(submodule, (nn.Linear, nn.Conv2d))
-
-    apply_activation_checkpointing(
-        model,
-        checkpoint_wrapper_fn=functools.partial(
-            checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-        ),
-        check_fn=_check,
-    )
+    modules = dict(model.named_modules())
+    for name in units:
+        fully_shard(modules[name], **shard_kwargs)
+    fully_shard(model, **shard_kwargs)
+    setattr(model, FSDP_UNITS_ATTR, (*units, ""))
 
 
 def maybe_wrap_with_fsdp(
-    model: nn.Module, parallel_cfg: Any, precision_cfg: Any = None
+    model: nn.Module, parallel_cfg: Any, precision_cfg: Any = None, device: Any = None
 ) -> nn.Module:
-    """Wrap ``model`` with FSDP if ``parallel.fsdp.enabled`` is True.
+    """Shard ``model`` in place with ``fully_shard`` if ``parallel.fsdp.enabled``.
 
     Args:
-        model: The bare ``nn.Module`` returned by the model factory.
+        model: The bare ``nn.Module`` returned by the model factory, on its device.
         parallel_cfg: ``TrainingSettings.parallel`` (a ParallelismConfigSchema).
         precision_cfg: ``TrainingSettings.optimization.precision``; the source of FSDP's
             precision unless ``parallel.fsdp.mixed_precision`` names one.
+        device: The run's device; its type selects the mesh's backend device. Defaults to
+            the model's parameter device.
 
     Returns:
-        Either the wrapped FSDP module, or the input unchanged when
-        FSDP is disabled / torch.distributed is unavailable.
+        The same module object, now an ``FSDPModule``, or the input unchanged when FSDP
+        is disabled.
     """
     cfg = getattr(parallel_cfg, "fsdp", None)
     if cfg is None or not cfg.enabled:
         return model
 
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        # Was a warning + `return model`. That is the silent-fallback shape the
-        # repo bans (non-negotiable #3), and DDP has always RAISED for the same
-        # misconfiguration -- so one strategy aborted and the other trained a
-        # full-length unsharded run whose provenance claimed it was sharded.
         raise RuntimeError(
-            "FSDP requested but torch.distributed is not initialised. Launch "
-            "with:\n"
+            "FSDP requested but torch.distributed is not initialised. Launch with:\n"
             "    torchrun --nproc_per_node=N -m spectramr.cli train-distributed "
             "--config <arm>.yaml\n"
-            "Refusing to fall back to the unwrapped model: the run would "
-            "complete, report success, and not have been sharded."
+            "Refusing to fall back to the unsharded model: the run would complete, "
+            "report success, and not have been sharded."
         )
 
-    from torch.distributed.fsdp import CPUOffload
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import CPUOffloadPolicy
 
-    sharding = _resolve_sharding_strategy(cfg.sharding_strategy)
+    if device is None:
+        device = next(model.parameters()).device
+    mesh = build_fsdp_mesh(cfg.sharding_strategy, torch.device(device).type)
     precision = resolve_fsdp_precision(cfg, precision_cfg)
-    mp_policy = _resolve_mixed_precision_policy(precision, cfg.reduce_dtype, cfg.buffer_dtype)
-    wrap_policy = _build_auto_wrap_policy(cfg)
-    cpu_offload = CPUOffload(offload_params=True) if cfg.cpu_offload else None
+    if precision is not None and any(p.is_complex() for p in model.parameters()):
+        # Neither float16 nor bfloat16 has a complex counterpart the policy could cast to.
+        # Refused before any collective, so every rank raises alike.
+        raise ValueError(
+            f"FSDP {precision} cannot hold the complex parameters of {type(model).__name__}. "
+            "Run it in float32 (optimization.precision.enabled: false)."
+        )
+    kwargs: dict[str, Any] = {
+        "mesh": mesh,
+        "reshard_after_forward": cfg.sharding_strategy != "shard_grad_op",
+    }
+    mp_policy = _resolve_mixed_precision_policy(precision, cfg.reduce_dtype)
+    if mp_policy is not None:
+        kwargs["mp_policy"] = mp_policy
+    if cfg.cpu_offload:
+        kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
-    wrapped = FSDP(
-        model,
-        sharding_strategy=sharding,
-        mixed_precision=mp_policy,
-        auto_wrap_policy=wrap_policy,
-        cpu_offload=cpu_offload,
-        limit_all_gathers=cfg.limit_all_gathers,
-        use_orig_params=cfg.use_orig_params,
-    )
-
-    if cfg.activation_checkpointing:
-        _maybe_apply_activation_checkpointing(wrapped)
-
+    units = _select_units(model, cfg)
+    _apply_units(model, units, **kwargs)
     logger.info(
-        "FSDP wrapped: sharding=%s mp=%s cpu_offload=%s ckpt=%s",
+        "FSDP2 sharded %s: sharding=%s mesh=%s units=%d mp=%s cpu_offload=%s",
+        type(model).__name__,
         cfg.sharding_strategy,
+        tuple(mesh.shape),
+        len(units) + 1,
         precision,
         cfg.cpu_offload,
-        cfg.activation_checkpointing,
     )
-    return wrapped
+    return model
 
 
-__all__ = ["maybe_wrap_with_fsdp"]
+def shard_like(target: nn.Module, reference: nn.Module) -> nn.Module:
+    """Shard ``target`` (a structural copy of ``reference``) onto the same units and mesh.
+
+    For the EMA shadow: with both sharded alike, the per-step blend and the validation
+    swap run shard against shard, with no gather. The shadow never runs a forward, so
+    it takes no mixed-precision or offload policy.
+    """
+    units = getattr(reference, FSDP_UNITS_ATTR, None)
+    if units is None:
+        raise RuntimeError(
+            f"{type(reference).__name__} was not sharded by maybe_wrap_with_fsdp, so there "
+            "is no shard plan to copy onto the EMA shadow."
+        )
+    mesh = next(reference.parameters()).device_mesh
+    _apply_units(target, [name for name in units if name], mesh=mesh)
+    return target
+
+
+__all__ = ["FSDP_UNITS_ATTR", "build_fsdp_mesh", "maybe_wrap_with_fsdp", "shard_like"]

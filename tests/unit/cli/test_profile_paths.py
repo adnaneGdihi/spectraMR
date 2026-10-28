@@ -51,6 +51,16 @@ def test_name_comes_from_training_output_dir():
     )
 
 
+def test_a_nested_output_dir_keeps_every_segment_so_the_profile_sits_in_the_arm():
+    """``<cohort>/<arm>`` must not collapse to ``<cohort>``: arms would share one profile dir."""
+    name = resolve_experiment_name(
+        "experiments/results/campaigns/cohort_a/arm_7", explicit=None, config_path=CFG
+    )
+    assert name == "campaigns/cohort_a/arm_7"
+    paths = resolve_profile_paths(name, "run-1")
+    assert paths.profile_dir == Path("experiments/results/campaigns/cohort_a/arm_7/profile/run-1")
+
+
 def test_absolute_output_dir_resolves_the_same_as_the_relative_spelling():
     """A cluster arm may carry an absolute output_dir; the segment is the same."""
     assert (
@@ -104,7 +114,7 @@ def test_every_artifact_sits_under_the_experiment_results_dir(tmp_path):
     paths = resolve_profile_paths("exp_11", "run-1", results_root=tmp_path / "results")
     run_dir = tmp_path / "results" / "exp_11"
     assert paths.run_dir == run_dir
-    assert paths.profile_dir == run_dir / "profiles" / "run-1"
+    assert paths.profile_dir == run_dir / "profile" / "run-1"
     for artifact in (paths.outfile, paths.manifest, paths.log):
         assert artifact.parent == paths.profile_dir
 
@@ -266,6 +276,6 @@ def test_manifest_records_where_the_child_actually_wrote(tmp_path):
         argv=["scalene"],
         scalene_version="2.3.0",
     )
-    assert m["paths"]["child_run_dir"].endswith("profiles/run-1/run")
+    assert m["paths"]["child_run_dir"].endswith("profile/run-1/run")
     assert m["paths"]["child_run_dir"] != m["paths"]["run_dir"]
     assert m["config"]["declared_training_output_dir"] == "experiments/results/exp_11"

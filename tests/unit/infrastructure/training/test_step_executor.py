@@ -638,3 +638,93 @@ class TestAdoptStepPolicy:
         policy = MagicMock(owns_gradient_accumulation=False, owns_zero_grad=False)
         ex.adopt_step_policy(policy)
         assert ex.amp_policy is policy
+
+
+# ---------------------------------------------------------------------------
+# Activation offload (optimization.gradient.activation_offload)
+# ---------------------------------------------------------------------------
+
+
+class TestActivationOffload:
+    """The forward+loss runs under save_on_cpu; gradients are unchanged."""
+
+    @staticmethod
+    def _run(offload: str, monkeypatch, record=None):
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.Tanh(), torch.nn.Linear(8, 1))
+        x = torch.randn(3, 4)
+        amp_helper = MagicMock(enabled=False)
+        amp_policy = MagicMock()
+        amp_policy.backward_and_step.side_effect = lambda loss, **_: loss.backward()
+        if record is not None:
+            real = torch.autograd.graph.save_on_cpu
+
+            @contextlib.contextmanager
+            def spy(pin_memory=False, device_type="cuda"):
+                record.append(("enter", pin_memory))
+                with real(pin_memory=pin_memory, device_type=device_type):
+                    yield
+                record.append(("exit", pin_memory))
+
+            monkeypatch.setattr(torch.autograd.graph, "save_on_cpu", spy)
+        ex = StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy, activation_offload=offload)
+
+        def closure():
+            if record is not None:
+                record.append(("forward", None))
+            return model(x).pow(2).mean()
+
+        ex.execute_step(
+            {"optimizer": torch.optim.SGD(model.parameters(), lr=0.0), "closure": closure,
+             "model": model, "name": "generator"},
+            epoch=0, global_step=0,
+        )
+        return [p.grad.clone() for p in model.parameters()]
+
+    def test_forward_runs_inside_pinned_offload_context(self, monkeypatch):
+        events: list = []
+        self._run("cpu", monkeypatch, record=events)
+        assert events == [("enter", True), ("forward", None), ("exit", True)]
+
+    def test_no_offload_context_by_default(self, monkeypatch):
+        events: list = []
+        self._run("none", monkeypatch, record=events)
+        assert all(kind != "enter" for kind, _ in events)
+
+    def test_gradients_equal_the_no_offload_run(self, monkeypatch):
+        base = self._run("none", monkeypatch)
+        offloaded = self._run("cpu", monkeypatch)
+        for g0, g1 in zip(base, offloaded, strict=True):
+            assert torch.allclose(g0, g1, atol=0.0, rtol=0.0)
+
+    def test_composes_with_checkpointing_inside_the_closure(self, monkeypatch):
+        from torch.utils.checkpoint import checkpoint
+
+        def run(offload: str) -> list[torch.Tensor]:
+            torch.manual_seed(0)
+            block = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.Tanh())
+            head = torch.nn.Linear(8, 1)
+            model = torch.nn.ModuleList([block, head])
+            x = torch.randn(3, 4)
+            amp_policy = MagicMock()
+            amp_policy.backward_and_step.side_effect = lambda loss, **_: loss.backward()
+            ex = StepExecutor(
+                amp_helper=MagicMock(enabled=False),
+                amp_policy=amp_policy,
+                activation_offload=offload,
+            )
+            closure = lambda: head(checkpoint(block, x, use_reentrant=False)).pow(2).mean()  # noqa: E731
+            ex.execute_step(
+                {"optimizer": torch.optim.SGD(model.parameters(), lr=0.0), "closure": closure,
+                 "model": model, "name": "generator"},
+                epoch=0, global_step=0,
+            )
+            return [p.grad.clone() for p in model.parameters()]
+
+        base = run("none")
+        for g0, g1 in zip(base, run("cpu"), strict=True):
+            assert torch.allclose(g0, g1, atol=0.0, rtol=0.0)
+
+    def test_unknown_value_raises(self, amp_helper, amp_policy):
+        with pytest.raises(ValueError, match="activation_offload='gpu'"):
+            StepExecutor(amp_helper=amp_helper, amp_policy=amp_policy, activation_offload="gpu")

@@ -121,12 +121,12 @@ def _args(**over):
 
 
 def test_dry_run_prints_the_command_and_writes_nothing(stub_config, capsys, tmp_path):
-    created_before = set(Path("experiments/results").glob("exp_11/profiles/*"))
+    created_before = set(Path("experiments/results").glob("exp_11/profile/*"))
     assert profile_cli.profile(_args()) == 0
     out = capsys.readouterr().out
     assert "-m scalene run" in out
     assert "--program-path" in out
-    assert set(Path("experiments/results").glob("exp_11/profiles/*")) == created_before
+    assert set(Path("experiments/results").glob("exp_11/profile/*")) == created_before
 
 
 def test_dry_run_works_without_scalene(stub_config, monkeypatch, capsys):
@@ -177,7 +177,7 @@ def fake_run(monkeypatch, tmp_path, stub_config):
 
     monkeypatch.setattr(pp, "RESULTS_ROOT", tmp_path / "experiments" / "results")
     monkeypatch.setattr(profile_cli, "require_scalene", lambda: "2.3.0")
-    return tmp_path / "experiments" / "results" / "exp_11" / "profiles"
+    return tmp_path / "experiments" / "results" / "exp_11" / "profile"
 
 
 def _only_profile_dir(profiles_root: Path) -> Path:

@@ -26,7 +26,7 @@ from spectramr.models.blocks.contrast_conditioning import fuse_contrast_embeddin
 from spectramr.models.blocks.residual import ResidualBlock as ResBlock
 from spectramr.models.blocks.swin import SwinBlock
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 

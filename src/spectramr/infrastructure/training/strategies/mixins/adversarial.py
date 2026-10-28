@@ -59,6 +59,20 @@ def _resolve_disc_updates(config: Any, *, iteration: int) -> int:
     return int(gan_losses.disc_updates)
 
 
+def set_critic_trainable(critic: Any, trainable: bool) -> None:
+    """Freeze or unfreeze the critic for the step whose closure is running.
+
+    Called at closure entry and never restored on exit: the trainer runs
+    ``backward`` only AFTER the closure returns, so a scoped restore would
+    re-open the critic before the generator's loss writes into ``critic.grad``
+    (and, under DeepSpeed, into the critic engine's reduce buckets). The critic
+    step re-enables its own parameters at entry, so the state is always the
+    one the next backward needs.
+    """
+    if isinstance(critic, nn.Module):
+        critic.requires_grad_(trainable)
+
+
 def assemble_adversarial_step_configs(
     *,
     num_d_updates: int,
@@ -237,6 +251,7 @@ class AdversarialMixin:
                 Returns:
                     torch.Tensor: Description.
                 """
+                set_critic_trainable(self.discriminator_model, True)
                 with torch.no_grad():
                     hr_fakes = self.generator_model(input_batch)
 
@@ -277,6 +292,7 @@ class AdversarialMixin:
             Returns:
                 torch.Tensor: Description.
             """
+            set_critic_trainable(self.discriminator_model, False)
             hr_fakes = self.generator_model(input_batch)
 
             if hr_fakes.device != target_batch.device:

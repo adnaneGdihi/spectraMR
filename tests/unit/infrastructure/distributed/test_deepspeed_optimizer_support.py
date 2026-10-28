@@ -18,7 +18,7 @@ from spectramr.config.schemas.base import (
     ParallelismConfigSchema,
 )
 from spectramr.infrastructure.distributed.deepspeed_backend.optimizer_support import (
-    CPU_OFFLOAD_OPTIMIZERS,
+    CPU_OFFLOAD_REBUILDABLE,
     ZERO_SUPPORTED,
     qualified_name,
     zero_optimizer_problems,
@@ -42,11 +42,20 @@ class TestZeroOptimizerProblems:
         assert not zero_optimizer_problems(torch.optim.SGD, zero_stage=0, offload_optimizer="none")
 
     @pytest.mark.parametrize("offload", ["cpu", "nvme"])
-    def test_planted_torch_adamw_with_offload_is_refused(self, offload) -> None:
-        problems = zero_optimizer_problems(
-            torch.optim.AdamW, zero_stage=2, offload_optimizer=offload
-        )
-        assert any("DeepSpeedCPUAdam" in p for p in problems)
+    def test_adam_and_adamw_are_rebuilt_under_offload(self, offload) -> None:
+        for cls in (torch.optim.Adam, torch.optim.AdamW):
+            assert not zero_optimizer_problems(cls, zero_stage=2, offload_optimizer=offload)
+
+    @pytest.mark.parametrize("offload", ["cpu", "nvme"])
+    def test_planted_sgd_with_offload_is_refused(self, offload) -> None:
+        problems = zero_optimizer_problems(torch.optim.SGD, zero_stage=2, offload_optimizer=offload)
+        assert any("rebuilt as DeepSpeedCPUAdam" in p for p in problems)
+
+    def test_planted_adam_subclass_with_offload_is_refused(self) -> None:
+        class MyAdam(torch.optim.Adam):
+            pass
+
+        assert zero_optimizer_problems(MyAdam, zero_stage=2, offload_optimizer="cpu")
 
 
 class TestSetsMatchTheInstalledDeepSpeed:
@@ -59,14 +68,11 @@ class TestSetsMatchTheInstalledDeepSpeed:
         installed -= {n for n in installed if n.startswith("apex.")}
         assert installed <= ZERO_SUPPORTED
 
-    def test_offload_optimizers_are_the_two_deepspeed_checks(self) -> None:
-        adam = pytest.importorskip("deepspeed.ops.adam")
-        lion = pytest.importorskip("deepspeed.ops.lion")
-        expected = {
-            qualified_name(adam.DeepSpeedCPUAdam),
-            qualified_name(lion.DeepSpeedCPULion),
-        }
-        assert expected == CPU_OFFLOAD_OPTIMIZERS
+    def test_rebuildable_set_is_the_torch_adam_pair(self) -> None:
+        assert {
+            qualified_name(torch.optim.Adam),
+            qualified_name(torch.optim.AdamW),
+        } == CPU_OFFLOAD_REBUILDABLE
 
 
 def _checker() -> ConfigHealthChecker:
@@ -97,11 +103,16 @@ class TestHealthCheck:
         result = _checker().check_deepspeed_optimizer_supported(_config("sgd", zero_stage=1))
         assert not result.passed and result.severity == "error"
 
-    def test_planted_adamw_with_cpu_offload_is_an_error(self) -> None:
-        result = _checker().check_deepspeed_optimizer_supported(
+    def test_adamw_with_cpu_offload_passes_because_it_is_rebuilt(self) -> None:
+        assert _checker().check_deepspeed_optimizer_supported(
             _config("adamw", zero_stage=2, offload="cpu")
+        ).passed
+
+    def test_planted_sgd_with_cpu_offload_is_an_error(self) -> None:
+        result = _checker().check_deepspeed_optimizer_supported(
+            _config("sgd", zero_stage=2, offload="cpu")
         )
-        assert not result.passed and "DeepSpeedCPUAdam" in result.message
+        assert not result.passed and "rebuilt as DeepSpeedCPUAdam" in result.message
 
     def test_unresolvable_optimizer_is_left_to_the_registry_check(self) -> None:
         result = _checker().check_deepspeed_optimizer_supported(_config("no_such_optimizer"))
@@ -109,9 +120,8 @@ class TestHealthCheck:
 
 
 class TestSchemaRules:
-    def test_planted_fsdp_fp16_is_refused(self) -> None:
-        with pytest.raises(ValidationError, match="ShardedGradScaler"):
-            FSDPConfigSchema(enabled=True, mixed_precision="fp16")
+    def test_fsdp_fp16_is_accepted(self) -> None:
+        assert FSDPConfigSchema(enabled=True, mixed_precision="fp16").mixed_precision == "fp16"
 
     def test_fsdp_bf16_and_null_are_accepted(self) -> None:
         FSDPConfigSchema(enabled=True, mixed_precision="bf16")
@@ -120,9 +130,8 @@ class TestSchemaRules:
     def test_disabled_fsdp_block_does_not_trip_the_fp16_rule(self) -> None:
         FSDPConfigSchema(enabled=False, mixed_precision="fp16")
 
-    def test_reduce_and_buffer_dtype_default_to_float32(self) -> None:
-        cfg = FSDPConfigSchema(enabled=True)
-        assert (cfg.reduce_dtype, cfg.buffer_dtype) == ("float32", "float32")
+    def test_reduce_dtype_defaults_to_float32(self) -> None:
+        assert FSDPConfigSchema(enabled=True).reduce_dtype == "float32"
 
     def test_unknown_reduce_dtype_is_refused(self) -> None:
         with pytest.raises(ValidationError):
@@ -143,13 +152,12 @@ class TestMixedPrecisionPolicy:
         policy = _resolve_mixed_precision_policy("bf16")
         assert policy.param_dtype == torch.bfloat16
         assert policy.reduce_dtype == torch.float32
-        assert policy.buffer_dtype == torch.float32
 
-    def test_match_param_restores_the_old_all_half_policy(self) -> None:
+    def test_match_param_reduces_in_the_parameter_dtype(self) -> None:
         from spectramr.infrastructure.distributed.fsdp_wrap import _resolve_mixed_precision_policy
 
-        policy = _resolve_mixed_precision_policy("bf16", "match_param", "match_param")
-        assert policy.reduce_dtype == torch.bfloat16 and policy.buffer_dtype == torch.bfloat16
+        policy = _resolve_mixed_precision_policy("bf16", "match_param")
+        assert policy.reduce_dtype == torch.bfloat16
 
     def test_null_disables_the_policy(self) -> None:
         from spectramr.infrastructure.distributed.fsdp_wrap import _resolve_mixed_precision_policy
@@ -167,6 +175,6 @@ class TestMixedPrecisionPolicy:
         ctx = SimpleNamespace(parallel=parallel, world_size=2, config=config)
         record = FSDPStrategy().provenance(ctx)["fsdp"]
         assert record["reduce_dtype"] == "match_param"
-        assert record["buffer_dtype"] == "float32"
+        assert record["implementation"] == "fsdp2"
         # The precision stamped is the one that ran: followed from optimization.precision.
         assert record["mixed_precision"] == "bf16"

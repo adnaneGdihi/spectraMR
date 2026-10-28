@@ -76,7 +76,9 @@ takes the YAML as a positional). ``launch?`` marks the verbs reachable through
        (default 30; ``0`` = no cap). ``scripts/profiling/submit_profile_array.sh``
        submits a whole folder as an array (``audit`` first, ``--mode cpu-only``:
        ``cpu+gpu`` is for one arm, not an array) and a parameter-free arm is
-       refused up front.
+       refused up front. Artifacts land in ``<training.output_dir>/profile/<run_id>/``
+       (``--output-dir`` sets the arm directory); ``spectramr campaign profile`` files
+       every arm of a campaign under ``<campaign>/<arm>/profile/``.
    * - ``spectramr benchmark``
      - —
      - —

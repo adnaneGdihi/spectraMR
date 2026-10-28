@@ -361,7 +361,7 @@ def test_no_target_is_told_to_write_into_the_arms_real_results_dir(target):
     injected = [a for a in child if "exp_11" in a]
     assert injected, f"nothing in the child argv addresses the run dir: {child}"
     for value in injected:
-        assert "profiles/run-1/run" in value
+        assert "profile/run-1/run" in value
         assert not value.endswith("experiments/results/exp_11")
 
 

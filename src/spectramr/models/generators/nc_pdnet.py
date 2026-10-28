@@ -36,7 +36,7 @@ from spectramr.models.blocks.attention_domains import (
     complex_to_interleaved,
     interleaved_to_complex,
 )
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 

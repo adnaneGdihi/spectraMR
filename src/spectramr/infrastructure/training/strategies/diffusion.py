@@ -14,7 +14,6 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from spectramr.core.cascading_validation import (
     build_cascade_row,
@@ -62,6 +61,7 @@ from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
     _resolve_disc_updates,
     assemble_adversarial_step_configs,
+    set_critic_trainable,
 )
 from spectramr.infrastructure.training.strategies.validation_chunking import (
     forward_in_chunks,
@@ -1840,8 +1840,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             def d_closure() -> torch.Tensor:
                 # The critic trains on its own step, so its parameters need grad
                 # here; the generator step re-freezes them.
-                if isinstance(discriminator, nn.Module):
-                    discriminator.requires_grad_(True)
+                set_critic_trainable(discriminator, True)
                 with torch.no_grad():
                     fake, critic_cond, prepared_target = self._fake_for_critic(
                         input_batch, target_batch, epoch, iteration, kwargs.get("batch_data")
@@ -1903,8 +1902,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             still reaches ``pred`` through D, which is the whole point. The D
             step re-enables grad at its entry.
             """
-            if isinstance(discriminator, nn.Module):
-                discriminator.requires_grad_(False)
+            set_critic_trainable(discriminator, False)
             return g_config["closure"]()
 
         return assemble_adversarial_step_configs(

@@ -8,7 +8,9 @@ the model, data and physics have been built:
   and this repo does not emit it);
 * ``offload_optimizer`` other than ``none`` raises ``ZeRORuntimeException`` unless
   the client optimizer is ``DeepSpeedCPUAdam`` or ``DeepSpeedCPULion``
-  (``zero_force_ds_cpu_optimizer`` defaults to true).
+  (``zero_force_ds_cpu_optimizer`` defaults to true). This repo therefore rebuilds
+  a torch Adam/AdamW as ``DeepSpeedCPUAdam`` under offload (``cpu_adam.py``), and
+  refuses every other optimizer.
 
 Matching is by qualified class name so the audit can run without DeepSpeed
 installed. The sets mirror ``deepspeed/runtime/zero/utils.py`` at 0.19.6.
@@ -31,10 +33,12 @@ ZERO_SUPPORTED: frozenset[str] = frozenset(
     }
 )
 
-CPU_OFFLOAD_OPTIMIZERS: frozenset[str] = frozenset(
+#: The optimizers ``cpu_adam.py`` can rebuild as DeepSpeedCPUAdam under offload.
+#: Only the exact torch classes: a subclass has its own step and is refused.
+CPU_OFFLOAD_REBUILDABLE: frozenset[str] = frozenset(
     {
-        "deepspeed.ops.adam.cpu_adam.DeepSpeedCPUAdam",
-        "deepspeed.ops.lion.cpu_lion.DeepSpeedCPULion",
+        "torch.optim.adam.Adam",
+        "torch.optim.adamw.AdamW",
     }
 )
 
@@ -54,10 +58,10 @@ def zero_optimizer_problems(
             f"{name} is not a ZeRO-supported optimizer; deepspeed.initialize asserts at "
             f"zero_stage={zero_stage}. Use adam, adamw or adagrad."
         )
-    if offload_optimizer != "none" and name not in CPU_OFFLOAD_OPTIMIZERS:
+    if offload_optimizer != "none" and name not in CPU_OFFLOAD_REBUILDABLE:
         problems.append(
-            f"offload_optimizer={offload_optimizer!r} needs DeepSpeedCPUAdam or "
-            f"DeepSpeedCPULion, but this arm builds {name}, and deepspeed.initialize "
-            "raises ZeRORuntimeException for any other client optimizer."
+            f"offload_optimizer={offload_optimizer!r} needs an Adam or AdamW optimizer, "
+            f"which is rebuilt as DeepSpeedCPUAdam; this arm builds {name}, and "
+            "deepspeed.initialize raises ZeRORuntimeException for any other client optimizer."
         )
     return problems

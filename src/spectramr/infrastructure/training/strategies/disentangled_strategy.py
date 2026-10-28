@@ -46,6 +46,7 @@ from spectramr.infrastructure.training.strategies.disentangled_metric_keys impor
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
     _resolve_disc_updates,
+    set_critic_trainable,
 )
 from spectramr.infrastructure.training.strategies.mixins.reconstruction import (
     ReconstructionMixin,
@@ -286,6 +287,9 @@ class DisentangledTrainingStrategy(
             Returns:
                 torch.Tensor: Description.
             """
+            # Keep the critic's grads clean of the generator's adversarial term (see
+            # ``set_critic_trainable``); the critic step re-enables them.
+            set_critic_trainable(getattr(self.env, "discriminator", None), False)
             results = self._generator_forward_logic(x_a, x_b, batch)
             x_a_target, x_a_recon = x_a, results["x_a_recon"]
 
@@ -440,6 +444,7 @@ class DisentangledTrainingStrategy(
             ):
                 return torch.tensor(0.0, device=device, requires_grad=True)
 
+            set_critic_trainable(getattr(self.env, "discriminator", None), True)
             d_loss_output = self.adv_loss_computer.compute_discriminator_loss(
                 real=self._last_x_a_target,
                 fake=self._last_x_a_recon.detach(),

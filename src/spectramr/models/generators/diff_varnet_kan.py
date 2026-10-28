@@ -16,7 +16,7 @@ from torch.utils.checkpoint import checkpoint
 
 from spectramr.infrastructure.physics.conditioning import PhysicsInformedConditioning
 from spectramr.infrastructure.physics.data_consistency_layer import MaskedReplacementDataConsistency
-from spectramr.models.generators.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.kan.complex_kan import ComplexFastKANConvLayer
 from spectramr.models.registry import register_model

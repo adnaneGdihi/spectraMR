@@ -755,3 +755,17 @@ def test_plain_eager_is_still_valid() -> None:
     """
     assert CompileConfigSchema().enabled is False
     assert CompileConfigSchema(enabled=False).fail_on_recompile_limit is True
+
+
+class TestGradientActivationOffload:
+    def test_default_is_none_and_cpu_is_accepted(self):
+        from spectramr.config.schemas.optimization import GradientConfigSchema
+
+        assert GradientConfigSchema().activation_offload == "none"
+        assert GradientConfigSchema(activation_offload="cpu").activation_offload == "cpu"
+
+    def test_unknown_value_is_rejected(self):
+        from spectramr.config.schemas.optimization import GradientConfigSchema
+
+        with pytest.raises(ValidationError):
+            GradientConfigSchema(activation_offload="gpu")

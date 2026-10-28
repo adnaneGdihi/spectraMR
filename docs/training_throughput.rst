@@ -127,12 +127,16 @@ Listed here to be clear that it is **not** a throughput lever: it trades compute
 for memory, recomputing activations in the backward pass. Reach for it to fit a
 model that will not otherwise fit, then use the headroom for a larger batch.
 
-The knob reaches the model through the backbone's own ``set_grad_checkpointing``
-hook, and ``KSpaceColdDiffusionGenerator`` **raises at build** when the selected
-backbone has none — a memory claim that silently did not happen OOMs later with
-nothing to point at (non-negotiable 3). Implemented for ``complex_unet``,
-``swin_diff_rec``, ``swin_diff_rec_kan``, ``diff_varnet``, ``diff_varnet_kan``
-and ``nafnet``; measured on a ``[2, 8, 128, 128]`` batch, peak allocation falls
+The knob reaches the model through its own ``set_grad_checkpointing`` hook, and the
+build **raises** for any model without one — a memory claim that silently did not
+happen OOMs later with nothing to point at (non-negotiable 3). There is no generic
+fallback: only the model knows which blocks hold activations worth discarding.
+Under FSDP this is also the switch; ``parallel.fsdp.activation_checkpointing`` was
+removed. Implemented for ``complex_unet``,
+``swin_diff_rec``, ``swin_diff_rec_kan``, ``diff_varnet``, ``diff_varnet_kan``,
+``nafnet``, the Mamba stacks (``ct_mamba``, ``crm_mamba``, ``hw_mamba``,
+``mm_mamba``, ``hdsf_hld_mamba``, per layer), ``graph_unet`` (``gat_unet`` backbone,
+per GAT layer) and ``temporal_coherence_4d``; measured on a ``[2, 8, 128, 128]`` batch, peak allocation falls
 by 49–61 % on the latter three and the forward output is unchanged. It is a
 **training-only** lever: ``_checkpointing_active()`` requires ``self.training``
 and ``torch.is_grad_enabled()``, so the reverse sampler used for validation
@@ -145,6 +149,18 @@ checkpointed block catches it. The DC layer's shape diagnostic did, and turning
 the knob on reported ten ``[DC LAYER CRASH]`` errors per ``diff_varnet`` run
 that trained to completion. Catch the error class you are diagnosing --
 ``RuntimeError`` for a broadcast failure -- never ``Exception``.
+
+**Activation offload** — ``optimization.gradient.activation_offload: none | cpu``
+
+A memory lever that composes with checkpointing. ``cpu`` wraps the training
+forward and loss in ``torch.autograd.graph.save_on_cpu(pin_memory=True)``, so the
+tensors autograd saves for backward are copied to pinned host memory and copied
+back during ``backward()``. It applies under every parallel strategy because it
+wraps the closure the step executor calls, not a strategy's own code. Validation
+never enters the context. The cost is a device-to-host copy per saved tensor per
+step plus the pinned allocation, so it helps only when the run is memory-bound
+and the transfer hides behind compute. Not yet measured on the GPU lane; profile
+one arm with and without ``-O optimization.gradient.activation_offload=cpu``.
 
 **6. Sharding** — ``parallel.strategy: fsdp | deepspeed``
 

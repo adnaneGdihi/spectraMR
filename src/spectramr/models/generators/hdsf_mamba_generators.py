@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.models.blocks.grad_checkpointing import NestedGradCheckpointingMixin
 from spectramr.models.blocks.topology_linearizer import (
     ImageTopologyLinearizer,
     resolution_agnostic_mode,
@@ -331,7 +332,7 @@ class HDSFMambaUNet(nn.Module):
     accepts_complex=False,
     requires_paired_data=True,
 )
-class HDSFHLDMamba(nn.Module):
+class HDSFHLDMamba(NestedGradCheckpointingMixin, nn.Module):
     """Hierarchical Dilated Space-Filling Latent Diffusion Mamba.
 
     Operates as the global structural denoiser natively mapping out complex latent

@@ -104,9 +104,8 @@ class TestFSDPPrecisionFollowsTheGlobalPrecision:
     def test_bfloat16_must_be_declared_and_is_then_followed(self) -> None:
         assert self._resolve(None, enabled=True, dtype="bfloat16") == "bf16"
 
-    def test_mixed_precision_without_a_type_is_float16_and_fsdp_refuses_it(self) -> None:
-        with pytest.raises(ValueError, match="float16 under FSDP"):
-            self._resolve(None, enabled=True, dtype=None)
+    def test_mixed_precision_without_a_type_is_float16(self) -> None:
+        assert self._resolve(None, enabled=True) == "fp16"
 
     def test_the_fsdp_override_wins_over_the_global_block(self) -> None:
         assert self._resolve("bf16", enabled=False) == "bf16"
@@ -114,3 +113,73 @@ class TestFSDPPrecisionFollowsTheGlobalPrecision:
 
     def test_the_schema_default_defers_to_the_global_block(self) -> None:
         assert FSDPConfigSchema(enabled=True).mixed_precision is None
+
+
+class TestShardUnitSelection:
+    """Which submodules become their own ``fully_shard`` unit, deepest first."""
+
+    @staticmethod
+    def _units(model, **cfg):
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.distributed.fsdp_wrap import _select_units
+
+        base = {"auto_wrap_policy": "size_based", "min_num_params": 1, "transformer_layer_cls": []}
+        base.update(cfg)
+        return _select_units(model, SimpleNamespace(**base))
+
+    @staticmethod
+    def _net():
+        return nn.Sequential(
+            nn.Sequential(nn.Linear(4, 64), nn.Linear(64, 4)), nn.Linear(4, 4)
+        )
+
+    def test_none_shards_only_the_root(self) -> None:
+        assert self._units(self._net(), auto_wrap_policy="none") == []
+
+    def test_size_based_claims_parameters_once_from_the_deepest_module(self) -> None:
+        units = self._units(self._net(), min_num_params=200)
+        # 0.0 (320 params) and 0.1 (260) qualify; their parent then has nothing left.
+        assert units == ["0.0", "0.1"]
+
+    def test_size_based_parent_takes_what_its_children_did_not(self) -> None:
+        assert self._units(self._net(), min_num_params=500) == ["0"]
+
+    def test_transformer_block_selects_by_class_name(self) -> None:
+        units = self._units(
+            self._net(), auto_wrap_policy="transformer_block", transformer_layer_cls=["Linear"]
+        )
+        assert set(units) == {"0.0", "0.1", "1"}
+
+    def test_transformer_block_without_classes_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            self._units(self._net(), auto_wrap_policy="transformer_block")
+
+    def test_transformer_block_matching_nothing_raises(self) -> None:
+        with pytest.raises(ValueError, match="matched no submodule"):
+            self._units(
+                self._net(), auto_wrap_policy="transformer_block", transformer_layer_cls=["Conv2d"]
+            )
+
+    def test_unknown_policy_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown FSDP auto_wrap_policy"):
+            self._units(self._net(), auto_wrap_policy="layer_count")
+
+
+def test_shard_like_refuses_a_reference_without_a_shard_plan() -> None:
+    from spectramr.infrastructure.distributed.fsdp_wrap import shard_like
+
+    with pytest.raises(RuntimeError, match="no shard plan"):
+        shard_like(nn.Linear(2, 2), nn.Linear(2, 2))
+
+
+def test_unknown_sharding_strategy_raises() -> None:
+    from unittest import mock
+
+    from spectramr.infrastructure.distributed.fsdp_wrap import build_fsdp_mesh
+
+    with (
+        mock.patch("torch.distributed.get_world_size", return_value=2),
+        pytest.raises(ValueError, match="Unknown FSDP sharding_strategy"),
+    ):
+        build_fsdp_mesh("zero3", "cpu")

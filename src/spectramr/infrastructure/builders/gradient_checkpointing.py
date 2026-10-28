@@ -25,10 +25,12 @@ def apply_gradient_checkpointing(generator: Any, config: Any) -> None:
     checkpoints in training but not under the probe is probed on a model
     training never builds.
 
-    Extracted verbatim, including the broad ``except`` that downgrades a
-    wrapping failure to a warning. That swallow is a known defect, tracked in
-    #1333; preserving it here keeps this extraction behaviour-identical, so the
-    fix lands in one place rather than riding along with a refactor.
+    Only the model knows which segments hold activations worth discarding, so a
+    model without ``set_grad_checkpointing`` raises: the old generic fallback
+    wrapped single Conv2d/Linear layers, saved nothing and missed Conv3d (#1333).
+
+    Raises:
+        NotImplementedError: The arm enables checkpointing and the model has no hook.
     """
     try:
         enabled = config.optimization.gradient.enable_checkpointing
@@ -37,20 +39,15 @@ def apply_gradient_checkpointing(generator: Any, config: Any) -> None:
     if not enabled:
         return
 
-    if hasattr(generator, "set_grad_checkpointing"):
-        generator.set_grad_checkpointing(True)
-        logger.info("Gradient checkpointing enabled natively via set_grad_checkpointing(True)")
-        return
-
-    logger.info("Generic torch.utils.checkpoint applying to generator components...")
-    # Import stays OUTSIDE the try: a missing profiling module is a broken
-    # install, which must propagate, not be downgraded to a warning.
-    from spectramr.models.profiling.advanced_profiling import GradientCheckpointing
-
-    try:
-        GradientCheckpointing.apply_checkpointing(generator, checkpoint_ratio=1.0)
-    except Exception as chkp_err:  # preserved verbatim from the builder
-        logger.warning(f"Failed to apply generic gradient checkpointing: {chkp_err}")
+    if not hasattr(generator, "set_grad_checkpointing"):
+        raise NotImplementedError(
+            f"optimization.gradient.enable_checkpointing is true but "
+            f"{type(generator).__name__} has no set_grad_checkpointing. Add "
+            "GradCheckpointingMixin to the model (it decides which blocks to "
+            "checkpoint), or set enable_checkpointing: false."
+        )
+    generator.set_grad_checkpointing(True)
+    logger.info("Gradient checkpointing enabled on %s", type(generator).__name__)
 
 
 __all__ = ["apply_gradient_checkpointing"]

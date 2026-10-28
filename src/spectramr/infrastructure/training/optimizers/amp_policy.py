@@ -119,13 +119,8 @@ class AMPPolicy(IAMPPolicy):
     def clip_gradients(self, model: torch.nn.Module, max_norm: float) -> None:
         """Clip by global norm over the model's own parameters.
 
-        Correct for unsharded models (single-GPU, DP, DDP): every rank holds
-        every parameter, so the norm each rank computes is the global norm.
-
-        It is NOT correct under FSDP, where each rank holds a shard and this
-        would compute a per-shard norm -- clipping inconsistently across ranks,
-        silently, in a way that reads as training instability. See
-        ``FSDPStepPolicy``.
+        Global on every backend: unsharded models hold every parameter, and FSDP2's
+        DTensor gradients reduce the norm across shards inside the utility.
         """
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 

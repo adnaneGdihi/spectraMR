@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from spectramr.infrastructure.run_layout import PROFILE_SUBDIR
+from spectramr.infrastructure.run_layout import PROFILE_SUBDIRS
 
 from .pipeline import generate_report
 
@@ -48,13 +48,13 @@ _SKIP_DIRS = {
     "sensitivity_maps",
     ".git",
     # `spectramr profile` files a throwaway run under
-    # `experiments/results/<exp>/profiles/<run_id>/run/`. It carries the same
+    # `<arm run dir>/profile/<run_id>/run/`. It carries the same
     # run markers as a real one, so without this it would be discovered and
     # reported as an experiment -- but only for an arm that has NOT been trained
     # yet, because `_is_run_dir` stops the descent at a real run. That makes the
     # phantom appear and disappear depending on unrelated history, which is the
     # worst version of the bug. A profiling run is never an experiment run.
-    PROFILE_SUBDIR,
+    *PROFILE_SUBDIRS,
 }
 
 

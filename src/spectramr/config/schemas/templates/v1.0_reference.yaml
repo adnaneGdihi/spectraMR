@@ -681,6 +681,8 @@ training:
 #           metrics:
 #             best_metric_mode: 'min'            # options: 'min', 'max'
 #           optimization:
+#             gradient:
+#               activation_offload: 'none'     # options: 'none', 'cpu'
 #             compile:
 #               mode: 'default'                  # options: 'default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'
 #   perfusion_kinetic:
@@ -810,6 +812,7 @@ optimization:
     accumulation_steps: 1
     enable_checkpointing: false    # trade compute for activation memory
     detect_anomalies: false        # torch.autograd anomaly mode; global, 2-4x slower
+    activation_offload: none       # options: 'none', 'cpu'
     clip:
       enabled: true
       method: 'norm'               # options: 'norm', 'value'
@@ -1588,10 +1591,6 @@ parallel:
     cpu_offload: false
     mixed_precision: 'bf16'         # options: 'bf16', 'fp16', null
     reduce_dtype: 'float32'         # options: 'float32', 'match_param'
-    buffer_dtype: 'float32'         # options: 'float32', 'match_param'
-    activation_checkpointing: false
-    limit_all_gathers: true
-    use_orig_params: true
 
   # DeepSpeed ZeRO. This block is the SSOT; the ds_config dict is DERIVED from it
   # by build_deepspeed_config and written beside the run's provenance. There is
