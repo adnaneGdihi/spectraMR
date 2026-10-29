@@ -173,4 +173,7 @@ def calibrate_hardware_warp(
         "covariance": None if covariance is None else covariance.tolist(),
         "constant_per_degree": {str(d): float(v) for d, v in constants.items()},
         "n_pairs": len(generators),
+        # A fold's out-of-sample report is stamped by the caller that held the subject out
+        # (:mod:`hardware_warp_holdout`); the fit itself knows only the pairs it was given.
+        "held_out": None,
     }

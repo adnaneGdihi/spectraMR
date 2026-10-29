@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.utils._pytree import tree_flatten
 
 from spectramr.infrastructure.distributed.spatial.conv import (
     SpatialConv3d,
@@ -26,6 +27,7 @@ from spectramr.infrastructure.distributed.spatial.conv import (
 )
 from spectramr.infrastructure.distributed.spatial.halo import (
     reduce_spatial_gradients,
+    spatial_scope,
     split_depth,
 )
 from spectramr.infrastructure.distributed.spatial.norms import (
@@ -72,13 +74,6 @@ def convert_to_spatial(model: nn.Module, group: Any) -> nn.Module:
     return model
 
 
-def _slab_or_same(full: torch.Tensor, local: torch.Tensor, group: Any) -> torch.Tensor:
-    """The part of a full-volume tensor this rank's output corresponds to."""
-    if full.shape == local.shape:
-        return full  # replicated (e.g. after a global pool)
-    return split_depth(full, group)
-
-
 def _replicas_differ(model: nn.Module, group: Any) -> list[str]:
     """Names of parameters/buffers that are not identical on every rank of the group.
 
@@ -97,6 +92,18 @@ def _replicas_differ(model: nn.Module, group: Any) -> list[str]:
     return names
 
 
+class SpatialReport(NamedTuple):
+    """What the gate proved: the worst relative error, and which output leaves split.
+
+    ``split_mask`` has one entry per output tensor, in ``tree_flatten`` order. A leaf
+    is split when the local output's shape differs from the unsplit one (it carries
+    depth); a replicated leaf (a global pool, say) is identical on every rank.
+    """
+
+    worst: float
+    split_mask: tuple[bool, ...]
+
+
 def _compare(
     reference: nn.Module,
     model: nn.Module,
@@ -106,16 +113,37 @@ def _compare(
     atol: float,
     rtol: float,
     failures: list[str],
-) -> float:
+) -> SpatialReport:
+    sp = dist.get_world_size(group)
     x_ref = x.clone().requires_grad_(True)
     x_loc = split_depth(x, group).clone().requires_grad_(True)
-    ref_out, loc_out = reference(x_ref), model(x_loc)
-    weights = torch.randn(ref_out.shape, generator=gen).to(x.device)
-    (ref_out * weights).sum().backward()
-    scale = dist.get_world_size(group) if ref_out.shape == loc_out.shape else 1
-    (loc_out * _slab_or_same(weights, loc_out, group)).sum().div(scale).backward()
+    ref_out = reference(x_ref)
+    with spatial_scope():
+        loc_out = model(x_loc)
+    ref_leaves, _ = tree_flatten(ref_out)
+    loc_leaves, _ = tree_flatten(loc_out)
+    if len(ref_leaves) != len(loc_leaves) or not all(
+        torch.is_tensor(t) for t in (*ref_leaves, *loc_leaves)
+    ):
+        failures.append("output structure differs from the unsplit model's")
+        return SpatialReport(0.0, ())
+    split = tuple(r.shape != o.shape for r, o in zip(ref_leaves, loc_leaves, strict=True))
+    weights = [torch.randn(r.shape, generator=gen).to(x.device) for r in ref_leaves]
+    # Reference: the unscaled loss. Sharded: a split leaf takes its slab of the weights;
+    # a replicated leaf is identical on every rank, so its loss is divided by sp and the
+    # SUM over the group below restores one copy.
+    sum(((r * w).sum() for r, w in zip(ref_leaves, weights, strict=True))).backward()
+    loc_terms = []
+    for leaf, w, is_split in zip(loc_leaves, weights, split, strict=True):
+        if is_split:
+            loc_terms.append((leaf * split_depth(w, group)).sum())
+        else:
+            loc_terms.append((leaf * w).sum() / sp)
+    sum(loc_terms).backward()
     reduce_spatial_gradients(model, group)
-    pairs = [(_slab_or_same(ref_out, loc_out, group), loc_out, "output")]
+    pairs = []
+    for ref, got, is_split in zip(ref_leaves, loc_leaves, split, strict=True):
+        pairs.append((split_depth(ref, group) if is_split else ref, got, "output"))
     pairs.append((split_depth(x_ref.grad, group), x_loc.grad, "input gradient"))
     ref_params = dict(reference.named_parameters())
     for name, param in model.named_parameters():
@@ -129,7 +157,7 @@ def _compare(
         worst = max(worst, diff / (scale + 1e-12))
         if diff > atol + rtol * scale:
             failures.append(f"{what}: max |diff| {diff:.2e} at scale {scale:.2e}")
-    return worst
+    return SpatialReport(worst, split)
 
 
 def check_spatial_equivalence(
@@ -141,8 +169,8 @@ def check_spatial_equivalence(
     atol: float = 1e-5,
     rtol: float = 1e-4,
     seed: int = 0,
-) -> float:
-    """Return the worst relative error; raise :class:`SpatialEquivalenceError` on every rank.
+) -> SpatialReport:
+    """Return the :class:`SpatialReport`; raise :class:`SpatialEquivalenceError` on every rank.
 
     Runs in training mode (batch statistics included) with dropout disabled, and restores
     every buffer and mode afterwards so the check leaves no trace on running statistics.
@@ -160,9 +188,9 @@ def check_spatial_equivalence(
         gen = torch.Generator(device="cpu").manual_seed(seed)
         x = torch.randn(sample_shape, generator=gen).to(device)
         failures = [f"weights differ across ranks: {n}" for n in _replicas_differ(model, group)][:3]
-        worst = 0.0
+        report = SpatialReport(0.0, ())
         try:
-            worst = _compare(reference, model, x, gen, group, atol, rtol, failures)
+            report = _compare(reference, model, x, gen, group, atol, rtol, failures)
         except Exception as exc:  # a shape error from a depth-mixing op is a failed check
             failures.append(f"{type(exc).__name__}: {exc}")
         flag = torch.tensor([float(bool(failures))], device=device)
@@ -172,7 +200,7 @@ def check_spatial_equivalence(
                 "the depth-split model does not reproduce the unsplit one"
                 + (": " + "; ".join(failures[:5]) if failures else " on another rank")
             )
-        return worst
+        return report
     finally:
         for m, state, mode in zip((reference, model), saved, modes, strict=True):
             m.load_state_dict(state)
@@ -194,6 +222,7 @@ __all__ = [
     "ADOPTERS",
     "REFUSED",
     "SpatialEquivalenceError",
+    "SpatialReport",
     "check_spatial_equivalence",
     "convert_to_spatial",
     "make_spatial",

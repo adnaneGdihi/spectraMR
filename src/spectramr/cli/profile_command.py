@@ -96,11 +96,9 @@ FOCUS_PRESETS: dict[str, tuple[str, ...]] = {
 #: the arm's actual run. The child reported it as healthy, because the injected
 #: path satisfied ``check_output_dir_convention`` either way.
 #:
-#: Note ``validation.enabled`` is deliberately absent from every redirect: the
-#: framework does not read it (issue #673 — 1006 arms set it, 8 to ``false``, and
-#: validation runs anyway), so injecting it would be a knob that reports success
-#: and does nothing. ``validation.loader.num_batches`` IS read
-#: (``pipelines/train.py``), which is why ``--val-batches`` uses that instead.
+#: ``validation.enabled`` is deliberately absent from every redirect: it switches
+#: validation off rather than capping it, which is not what ``--val-batches`` asks
+#: for, so the cap goes to ``validation.loader.num_batches`` (``pipelines/train.py``).
 #: ``train``/``sanity_check`` accept ``--override`` and are redirected through
 #: the config SSOT; ``infer`` does not, and takes ``--output`` instead. A table,
 #: so adding a target forces its redirect to be stated rather than forgotten —

@@ -94,32 +94,19 @@ def resolve_fsdp_precision(fsdp_cfg: Any, precision_cfg: Any = None) -> str | No
     return resolved
 
 
-def build_fsdp_mesh(sharding_strategy: str, device_type: str) -> Any:
-    """The mesh a sharding strategy means: 1-D shard, or 2-D (replicate, shard).
+def fsdp_shard_mesh(mesh: Any, sharding_strategy: str) -> Any:
+    """The slice of the run's one DeviceMesh that FSDP shards over.
 
-    ``no_shard`` is a 2-D mesh whose shard dimension has size 1, i.e. pure
-    replication, so every strategy goes through one ``fully_shard`` path.
+    ``full_shard`` and ``shard_grad_op`` shard over ``dp_shard`` alone (1-D).
+    ``no_shard`` and ``hybrid_shard`` use the 2-D (replicate, shard) pair. The mesh is
+    built once by ``infrastructure.distributed.mesh``, so FSDP never creates groups of its own.
     """
-    import torch.distributed as dist
-    from torch.distributed.device_mesh import init_device_mesh
+    from spectramr.infrastructure.distributed.mesh import DATA_PARALLEL_DIMS
 
-    world = dist.get_world_size()
     if sharding_strategy in ("full_shard", "shard_grad_op"):
-        return init_device_mesh(device_type, (world,), mesh_dim_names=("shard",))
-    if sharding_strategy == "no_shard":
-        return init_device_mesh(device_type, (world, 1), mesh_dim_names=("replicate", "shard"))
-    if sharding_strategy == "hybrid_shard":
-        from spectramr.core.topology import resolve_run_topology
-
-        local = resolve_run_topology().local_world_size
-        if local < 1 or world % local:
-            raise ValueError(
-                f"fsdp.sharding_strategy='hybrid_shard' needs the world size ({world}) to be "
-                f"a multiple of the ranks per node ({local})."
-            )
-        return init_device_mesh(
-            device_type, (world // local, local), mesh_dim_names=("replicate", "shard")
-        )
+        return mesh["dp_shard"]
+    if sharding_strategy in ("no_shard", "hybrid_shard"):
+        return mesh[DATA_PARALLEL_DIMS]
     raise ValueError(
         f"Unknown FSDP sharding_strategy={sharding_strategy!r}. Use full_shard | "
         "shard_grad_op | no_shard | hybrid_shard."
@@ -175,7 +162,12 @@ def _apply_units(model: nn.Module, units: list[str], **shard_kwargs: Any) -> Non
 
 
 def maybe_wrap_with_fsdp(
-    model: nn.Module, parallel_cfg: Any, precision_cfg: Any = None, device: Any = None
+    model: nn.Module,
+    parallel_cfg: Any,
+    precision_cfg: Any = None,
+    device: Any = None,
+    *,
+    mesh: Any = None,
 ) -> nn.Module:
     """Shard ``model`` in place with ``fully_shard`` if ``parallel.fsdp.enabled``.
 
@@ -184,8 +176,9 @@ def maybe_wrap_with_fsdp(
         parallel_cfg: ``TrainingSettings.parallel`` (a ParallelismConfigSchema).
         precision_cfg: ``TrainingSettings.optimization.precision``; the source of FSDP's
             precision unless ``parallel.fsdp.mixed_precision`` names one.
-        device: The run's device; its type selects the mesh's backend device. Defaults to
-            the model's parameter device.
+        device: The run's device. Defaults to the model's parameter device.
+        mesh: The run's DeviceMesh (``infrastructure.distributed.mesh.build_parallel_mesh``).
+            Required when FSDP is enabled; FSDP shards over a slice of it.
 
     Returns:
         The same module object, now an ``FSDPModule``, or the input unchanged when FSDP
@@ -208,7 +201,12 @@ def maybe_wrap_with_fsdp(
 
     if device is None:
         device = next(model.parameters()).device
-    mesh = build_fsdp_mesh(cfg.sharding_strategy, torch.device(device).type)
+    if mesh is None:
+        raise RuntimeError(
+            "maybe_wrap_with_fsdp needs the run's DeviceMesh (mesh=...). FSDP shards over "
+            "a slice of that one mesh; a private mesh per call would split the run's groups."
+        )
+    shard_mesh = fsdp_shard_mesh(mesh, cfg.sharding_strategy)
     precision = resolve_fsdp_precision(cfg, precision_cfg)
     if precision is not None and any(p.is_complex() for p in model.parameters()):
         # Neither float16 nor bfloat16 has a complex counterpart the policy could cast to.
@@ -218,7 +216,7 @@ def maybe_wrap_with_fsdp(
             "Run it in float32 (optimization.precision.enabled: false)."
         )
     kwargs: dict[str, Any] = {
-        "mesh": mesh,
+        "mesh": shard_mesh,
         "reshard_after_forward": cfg.sharding_strategy != "shard_grad_op",
     }
     mp_policy = _resolve_mixed_precision_policy(precision, cfg.reduce_dtype)
@@ -233,7 +231,7 @@ def maybe_wrap_with_fsdp(
         "FSDP2 sharded %s: sharding=%s mesh=%s units=%d mp=%s cpu_offload=%s",
         type(model).__name__,
         cfg.sharding_strategy,
-        tuple(mesh.shape),
+        tuple(shard_mesh.shape),
         len(units) + 1,
         precision,
         cfg.cpu_offload,
@@ -259,4 +257,4 @@ def shard_like(target: nn.Module, reference: nn.Module) -> nn.Module:
     return target
 
 
-__all__ = ["FSDP_UNITS_ATTR", "build_fsdp_mesh", "maybe_wrap_with_fsdp", "shard_like"]
+__all__ = ["FSDP_UNITS_ATTR", "fsdp_shard_mesh", "maybe_wrap_with_fsdp", "shard_like"]

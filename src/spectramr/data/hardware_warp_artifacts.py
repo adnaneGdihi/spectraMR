@@ -22,6 +22,10 @@ the field of view's centre that the registration expressed everything about (it 
 on a fixed-FOV scanner, while the NIfTI origin of a Swoop export is the FOV corner). RAS is the
 frame of the framework's data path; the registration converts its LPS measurements at its own
 boundary. A consumer evaluates ``v`` at ``r - center_mm``.
+
+``held_out`` is ``null`` for a fit on every pair; a hold-one-subject-out fold sets it to the
+subject and its pooled residual RMS before and after the fitted commutator is removed. Such an
+artifact is a fold's evidence, not the production warp, and an image consumer refuses it.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ import torch
 
 __all__ = [
     "ARTIFACT_KEYS",
+    "HELD_OUT_KEYS",
     "PAIR_KEYS",
     "POSE_SET_KEYS",
     "identity_artifact",
@@ -67,7 +72,11 @@ ARTIFACT_KEYS: frozenset[str] = frozenset(
         "covariance",
         "constant_per_degree",
         "n_pairs",
+        "held_out",
     }
+)
+HELD_OUT_KEYS: frozenset[str] = frozenset(
+    {"subject_id", "n_pairs", "n_points", "rms_before_mm", "rms_predicted_mm", "rms_after_mm"}
 )
 
 
@@ -101,12 +110,10 @@ def _int_at_least(value: Any, floor: int, what: str) -> int:
 def _finite_floats(value: Any, n: int | None, what: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or (n is not None and len(value) != n):
         raise ValueError(f"{what} must be a list of {n if n is not None else 'finite'} numbers")
-    out = []
     for v in value:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
             raise ValueError(f"{what} contains a non-finite or non-numeric entry {v!r}")
-        out.append(float(v))
-    return out
+    return [float(v) for v in value]
 
 
 def validate_pose_set(doc: Any) -> dict[str, Any]:
@@ -134,29 +141,32 @@ def validate_pose_set(doc: Any) -> dict[str, Any]:
     return doc
 
 
-def load_pose_set(path: Path | str) -> dict[str, Any]:
-    """Read and validate a pose-set JSON.
-
-    An absent file is ``FileNotFoundError``; unreadable JSON or a contract violation is
-    ``ValueError`` naming the path or the offending key.
-    """
+def _read_json(path: Path | str, what: str) -> Any:
+    """An absent file is ``FileNotFoundError``; unreadable JSON is ``ValueError`` naming it."""
     path = Path(path)
     if not path.is_file():
-        raise FileNotFoundError(f"pose set not found: {path}")
+        raise FileNotFoundError(f"{what} not found: {path}")
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"pose set at {path} is not readable JSON: {exc}") from exc
-    return validate_pose_set(doc)
+        raise ValueError(f"{what} at {path} is not readable JSON: {exc}") from exc
+
+
+def load_pose_set(path: Path | str) -> dict[str, Any]:
+    """Read and validate a pose-set JSON; a contract violation is ``ValueError`` naming the key."""
+    return validate_pose_set(_read_json(path, "pose set"))
+
+
+def _write_json(doc: dict[str, Any], path: Path | str) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=2, allow_nan=False), encoding="utf-8")
+    return path
 
 
 def write_pose_set(pose_set: dict[str, Any], path: Path | str) -> Path:
     """Validate and write a pose set; the file is the contract, so nothing unvalidated lands."""
-    validate_pose_set(pose_set)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(pose_set, indent=2), encoding="utf-8")
-    return path
+    return _write_json(validate_pose_set(pose_set), path)
 
 
 def load_pair_residuals(
@@ -230,16 +240,21 @@ def validate_artifact(artifact: Any) -> dict[str, Any]:
         raise ValueError(
             f"artifact constant_per_degree must carry exactly the degrees {lo}..{hi} as strings"
         )
-    for degree, value in constants.items():
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-        ):
-            raise ValueError(f"artifact constant_per_degree[{degree!r}] is not a finite number")
-        if value < 0:
-            raise ValueError(f"artifact constant_per_degree[{degree!r}] is negative")
+    if min(_finite_floats(list(constants.values()), None, "artifact constant_per_degree")) < 0:
+        raise ValueError("artifact constant_per_degree has a negative entry")
+    if artifact["held_out"] is not None:
+        _validate_held_out(artifact["held_out"])
     return artifact
+
+
+def _validate_held_out(held: Any) -> None:
+    _require_keys(held, HELD_OUT_KEYS, "artifact held_out")
+    _nonempty_str(held["subject_id"], "artifact held_out.subject_id")
+    for key in ("n_pairs", "n_points"):
+        _int_at_least(held[key], 1, f"artifact held_out.{key}")
+    rms = [held[k] for k in ("rms_before_mm", "rms_predicted_mm", "rms_after_mm")]
+    if min(_finite_floats(rms, 3, "artifact held_out rms")) < 0:
+        raise ValueError("artifact held_out rms values must be non-negative")
 
 
 def identity_artifact(
@@ -269,22 +284,16 @@ def identity_artifact(
             "covariance": None,
             "constant_per_degree": {str(d): 0.0 for d in range(min_degree, max_degree + 1)},
             "n_pairs": 0,
+            "held_out": None,
         }
     )
 
 
 def write_artifact(artifact: dict[str, Any], path: Path | str) -> Path:
     """Validate and write the artifact as JSON, creating parent directories. Returns the path."""
-    validate_artifact(artifact)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(artifact, indent=2, allow_nan=False), encoding="utf-8")
-    return path
+    return _write_json(validate_artifact(artifact), path)
 
 
 def load_artifact(path: Path | str) -> dict[str, Any]:
     """Read and validate an artifact JSON."""
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"hardware-warp artifact not found: {path}")
-    return validate_artifact(json.loads(path.read_text(encoding="utf-8")))
+    return validate_artifact(_read_json(path, "hardware-warp artifact"))

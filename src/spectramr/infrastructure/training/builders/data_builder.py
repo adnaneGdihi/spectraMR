@@ -18,6 +18,7 @@ from typing import Any
 import torch
 from torch.utils.data import Subset
 
+from spectramr.config.schemas.validation import validation_declared_off
 from spectramr.core.topology import resolve_run_topology
 from spectramr.core.worker_policy import clamp_worker_count
 from spectramr.data.builders import TorchIOTransformBuilder, TorchIOTransformConfig
@@ -82,6 +83,11 @@ class DataBuilder(Builder):
             # already consulted, so the fallback could never fire.
             val_cfg = getattr(self._config, "validation", None)
             _val_bs = val_cfg.loader.batch_size if val_cfg is not None else None
+            # ``validation.enabled: false`` is honoured here, the one place a val loader is
+            # attached: without one the loop has no validation event to run and no
+            # reachability gate to fail (#673). The val dataset is still instantiated with
+            # the train one; only the loader is withheld.
+            validation_off = validation_declared_off(val_cfg)
 
             from spectramr.infrastructure.builders.directors.data_pipeline_director import (
                 DataPipelineDirector,
@@ -140,6 +146,12 @@ class DataBuilder(Builder):
             self.split_provenance = dict(director.split_provenance)
             if train_loader is not None:
                 self._loaders["train"] = train_loader
+            if val_loader is not None and validation_off:
+                logger.info(
+                    "validation.enabled=false: the val loader is not attached, so no "
+                    "validation event will run and no checkpoint_best.pt will be written"
+                )
+                val_loader = None
             if val_loader is not None:
                 self._loaders["val"] = val_loader
             logger.info(

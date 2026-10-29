@@ -11,6 +11,7 @@ can skip the allocator re-grow on the next train step. The default must remain
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -321,3 +322,26 @@ def test_unknown_selection_rule_is_refused_at_load() -> None:
 def test_selection_thresholds_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         ValidationConfigSchema(selection={"rule": "guarded_ring_fidelity", "fabrication_max": 0})
+
+
+class TestValidationDeclaredOff:
+    """``validation.enabled`` has one reader (issue #673); these are its three shapes."""
+
+    def test_absent_block_and_default_mean_on(self) -> None:
+        from spectramr.config.schemas.validation import (
+            ValidationConfigSchema,
+            validation_declared_off,
+        )
+
+        assert validation_declared_off(None) is False
+        assert validation_declared_off(ValidationConfigSchema()) is False
+        assert validation_declared_off(SimpleNamespace()) is False
+
+    def test_explicit_false_means_off(self) -> None:
+        from spectramr.config.schemas.validation import (
+            ValidationConfigSchema,
+            validation_declared_off,
+        )
+
+        assert validation_declared_off(ValidationConfigSchema(enabled=False)) is True
+        assert validation_declared_off(SimpleNamespace(enabled=False)) is True

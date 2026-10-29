@@ -202,6 +202,39 @@ class TestTimeoutSeconds:
         assert NoParallelStrategy().provenance(ctx)["timeout_seconds"] == 120
 
 
+class TestSpatialProbeShape:
+    """The gate's synthetic volume: declared when given, else the training patch."""
+
+    @staticmethod
+    def _ctx(patch, probe=None, in_channels=2):
+        from types import SimpleNamespace
+
+        from spectramr.infrastructure.distributed.strategy_registry import ParallelContext
+
+        config = SimpleNamespace(
+            data=SimpleNamespace(sampling=SimpleNamespace(patch_size=patch)),
+            model=SimpleNamespace(in_channels=in_channels),
+        )
+        parallel = SimpleNamespace(spatial_probe_shape=probe)
+        return ParallelContext(config=config, device=None, parallel=parallel, mesh=None)
+
+    def test_the_training_patch_is_the_default(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import _spatial_probe_shape
+
+        assert _spatial_probe_shape(self._ctx((16, 8, 8))) == (1, 2, 16, 8, 8)
+
+    def test_a_declared_probe_wins(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import _spatial_probe_shape
+
+        assert _spatial_probe_shape(self._ctx((16, 8, 8), probe=[32, 8, 8])) == (1, 2, 32, 8, 8)
+
+    def test_a_2d_patch_needs_a_declared_probe(self) -> None:
+        from spectramr.infrastructure.distributed.strategies import _spatial_probe_shape
+
+        with pytest.raises(ValueError, match="spatial_probe_shape"):
+            _spatial_probe_shape(self._ctx((64, 64)))
+
+
 class TestMultiEngineAdmission:
     """The #2631 gate: every refusal raises from config alone, before initialize."""
 

@@ -20,6 +20,20 @@ pytestmark = [pytest.mark.unit]
 WORLD = 2
 
 
+def _run_mesh(fsdp_cfg):
+    """The run's one mesh for this worker, built the production way (after init)."""
+    from spectramr.infrastructure.distributed.mesh import build_parallel_mesh
+
+    parallel = SimpleNamespace(
+        strategy="fsdp",
+        fsdp=fsdp_cfg,
+        mesh=SimpleNamespace(non_dp_size=1, tensor=1, context=1, spatial=1, pipeline=1),
+    )
+    return build_parallel_mesh(
+        parallel, device_type="cpu", world_size=WORLD, local_world_size=WORLD
+    ).device_mesh
+
+
 def _shard(net, **fsdp):
     from spectramr.infrastructure.distributed.fsdp_wrap import maybe_wrap_with_fsdp
 
@@ -35,7 +49,9 @@ def _shard(net, **fsdp):
     }
     base.update(fsdp)
     cfg = SimpleNamespace(fsdp=SimpleNamespace(**base))
-    return maybe_wrap_with_fsdp(net, cfg, None, torch.device("cpu"))
+    return maybe_wrap_with_fsdp(
+        net, cfg, None, torch.device("cpu"), mesh=_run_mesh(cfg.fsdp)
+    )
 
 
 def _net():

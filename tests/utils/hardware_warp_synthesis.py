@@ -34,8 +34,14 @@ def synthesize_planted_pose_set(
     unit_id: str = "swoop-01",
     software_version: str = "1.2.3",
     stride: int = 2,
+    n_subjects: int = 1,
 ) -> dict[str, Any]:
-    """Return ``{"canonical", "truth", "residuals", "pose_set"}`` for a planted warp."""
+    """Return ``{"canonical", "truth", "residuals", "pose_set"}`` for a planted warp.
+
+    Pair ``k`` belongs to subject ``sub-{k % n_subjects + 1:02d}``, so ``n_subjects > 1`` gives
+    a hold-one-subject-out fold something to hold out; the default keeps every pair on
+    ``sub-01`` as the older fixtures expect.
+    """
     canonical = HarmonicGradientBasis(
         ball_points(basis_points_per_axis, ball_radius_mm), max_degree, min_degree
     )
@@ -56,8 +62,8 @@ def synthesize_planted_pose_set(
         "center_mm": [0.0, 0.0, 0.0],
         "pairs": [
             {
-                "subject_id": "sub-01",
-                "sessions": ["ses-01", f"ses-{k + 2:02d}"],
+                "subject_id": f"sub-{k % n_subjects + 1:02d}",
+                "sessions": ["ses-01", f"ses-{k // n_subjects + 2:02d}"],
                 "omega": omega.tolist(),
                 "translation": t.tolist(),
                 "residual_path": f"pair_{k}.pt",

@@ -55,8 +55,8 @@ def test_it_caps_num_batches_and_not_num_samples():
     assert "num_samples" not in val_batches_override(3)
 
 
-def test_it_does_not_target_the_inert_enabled_knob():
-    """Issue #673: `validation.enabled` is set by 1006 arms and read by nothing."""
+def test_it_does_not_target_the_enabled_knob():
+    """`validation.enabled` switches validation off; a cap must not."""
     assert "validation.enabled" not in val_batches_override(1)
 
 

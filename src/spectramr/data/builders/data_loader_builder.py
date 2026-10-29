@@ -23,6 +23,8 @@ def wrap_with_distributed_sampler(
     loader: "torch.utils.data.DataLoader",
     *,
     shuffle: bool = False,
+    num_replicas: int | None = None,
+    rank: int | None = None,
 ) -> "torch.utils.data.DataLoader":
     """Return a new ``DataLoader`` that wraps ``loader``'s dataset with a ``DistributedSampler``.
 
@@ -36,6 +38,8 @@ def wrap_with_distributed_sampler(
     Args:
         loader: The non-distributed loader to rewrap.
         shuffle: Whether the distributed sampler should shuffle.
+        num_replicas: Data-parallel group size. ``None`` means the world size.
+        rank: This rank's index in the data-parallel group. ``None`` means the global rank.
 
     Returns:
         A new ``DataLoader`` with ``DistributedSampler`` attached, preserving
@@ -63,7 +67,9 @@ def wrap_with_distributed_sampler(
         # than on every rank.
         import torch.distributed as dist
 
-        sampler = loader.sampler.sharded(dist.get_rank(), dist.get_world_size())
+        world = dist.get_world_size() if num_replicas is None else num_replicas
+        index = dist.get_rank() if rank is None else rank
+        sampler = loader.sampler.sharded(index, world)
     else:
         if not isinstance(loader.sampler, (RandomSampler, SequentialSampler)):
             logging.getLogger(__name__).warning(
@@ -71,7 +77,9 @@ def wrap_with_distributed_sampler(
                 "is not preserved across ranks.",
                 type(loader.sampler).__name__,
             )
-        sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
+        # Only the explicit overrides are passed: the defaults read the world group.
+        extra = {k: v for k, v in (("num_replicas", num_replicas), ("rank", rank)) if v is not None}
+        sampler = DistributedSampler(loader.dataset, shuffle=shuffle, **extra)
     return _DataLoader(
         dataset=loader.dataset,
         batch_size=loader.batch_size,

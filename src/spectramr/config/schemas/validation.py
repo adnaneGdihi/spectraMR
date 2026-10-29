@@ -24,6 +24,7 @@ __all__ = [
     "ValidationScoringConfigSchema",
     "ValidationSelectionConfigSchema",
     "ValidationVisualizationConfigSchema",
+    "validation_declared_off",
 ]
 
 #: New sub-blocks are born strict. The parent stays `forbid` too, so an
@@ -627,6 +628,16 @@ class ValidationCascadeConfigSchema(BaseModel):
         return [float(level) for level in normalize_cascade_levels(value)]
 
 
+def validation_declared_off(validation: Any) -> bool:
+    """``True`` when the arm declares ``validation.enabled: false``; the flag's one reader.
+
+    An absent block and the default both mean validation is on, so only an explicit ``False``
+    turns it off. The data builder consults this to attach no val loader and the training
+    loop to stay silent about the loader it therefore does not find (issue #673).
+    """
+    return validation is not None and getattr(validation, "enabled", True) is False
+
+
 class ValidationConfigSchema(BaseModel):
     """Validation dataset and evaluation configuration.
 
@@ -644,13 +655,13 @@ class ValidationConfigSchema(BaseModel):
     sub-block before validation — but they are gone from Python, so there is one
     read path and, temporarily, two accepted spellings in YAML.
 
-    Six scalars stay flat on purpose. **Nothing reads them**, and giving an
-    inert knob a tidy home implies it works (the call `data.test_split` and
+    `enabled` stays flat and is read through `validation_declared_off` (issue #673).
+
+    Four more scalars stay flat on purpose. All but the last are **read by nothing**,
+    and giving an inert knob a tidy home implies it works (the call `data.test_split` and
     `optimization.num_steps` already got). They stay visibly odd beside the
     grouped blocks until each is wired or deleted:
 
-    * `enabled` — 1006 arms set it, 8 to `false`, and validation runs anyway.
-      Issue #673.
     * `split` — 388 arms set it; the live validation fraction is
       `data.split.validation_fraction` (10+ readers). Issue #673.
     * `validation_dir`, `validation_metric` — already carried by
@@ -709,9 +720,11 @@ class ValidationConfigSchema(BaseModel):
     enabled: bool = Field(
         default=True,
         description=(
-            "Enable validation during training. NOT READ — validation runs "
-            "regardless; the training loop gates only on the block's presence "
-            "(issue #673)."
+            "Enable validation during training. When false the data builder attaches no "
+            "val loader, so no validation event runs, no checkpoint_best.pt is written and "
+            "the validation-reachability gate does not apply; the val dataset is still "
+            "instantiated with the train one (issue #673, first half). Every reader goes "
+            "through validation_declared_off()."
         ),
     )
     split: float = Field(

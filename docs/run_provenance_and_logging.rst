@@ -387,7 +387,7 @@ Run *provenance* (above) is the on-disk record of a run. Separately, the
 is owned by :mod:`spectramr.infrastructure.logging.log_policy`, which is the only
 module that decides the root level, the console handler or the secondary-rank floor.
 Only that module, its ``console`` helper and ``LoggingService`` may write process-wide
-logging state; ``scripts/ci/check_logging_owner.py`` fails a ``basicConfig``, a root
+logging state; the maintainer-tree gate ``check_logging_owner.py`` fails a ``basicConfig``, a root
 ``setLevel`` / ``addHandler``, a ``logging.getLogger`` patch or a second
 ``LoggingService(...)`` anywhere else under ``src/`` (the ``scripts/`` tree is baselined
 and may only shrink). The level is resolved in one place, highest first:

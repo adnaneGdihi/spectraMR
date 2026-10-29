@@ -35,17 +35,21 @@ def _gather_samples_across_ranks(x_flat: torch.Tensor) -> torch.Tensor:
     happens to be authoritative. Ranks are truncated to the global minimum count
     so the all-gather is shape-safe.
     """
+    from spectramr.core.parallel_groups import dp_group, dp_world_size
+
     dist = torch.distributed
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() < 2:
+    if not dist.is_available() or not dist.is_initialized() or dp_world_size() < 2:
         return x_flat
+    # Over the data-parallel group: the grid is fitted to the batches each replica saw.
+    group = dp_group()
     counts = torch.tensor([x_flat.shape[0]], device=x_flat.device)
-    dist.all_reduce(counts, op=dist.ReduceOp.MIN)
+    dist.all_reduce(counts, op=dist.ReduceOp.MIN, group=group)
     n = int(counts.item())
     if n == 0:
         return x_flat
     local = x_flat[:n].contiguous()
-    buckets = [torch.empty_like(local) for _ in range(dist.get_world_size())]
-    dist.all_gather(buckets, local)
+    buckets = [torch.empty_like(local) for _ in range(dp_world_size())]
+    dist.all_gather(buckets, local, group=group)
     return torch.cat(buckets, dim=0)
 
 

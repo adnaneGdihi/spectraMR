@@ -37,6 +37,7 @@ import torch
 from spectramr.infrastructure.logging.progress import make_progress
 
 from spectramr.config.overrides import applied_override_paths
+from spectramr.config.schemas.validation import validation_declared_off
 from spectramr.core.cascading_validation import aggregate_cascade_rows
 from spectramr.core.metrics.flag_map import schema_flag_to_metric
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
@@ -1168,6 +1169,9 @@ def _execute_training_loop(
         config.validation.schedule.interval_steps if config.validation else max_iterations
     )
     eval_on_epoch = config.validation.schedule.on_epoch if config.validation else False
+    # Declared off: the data builder attached no val loader on purpose, so the absence is
+    # not worth a warning at each eval time (#673).
+    _validation_declared_off = validation_declared_off(config.validation)
     # The N of epoch-based mode. Declared, documented as "only consulted in
     # epoch-based mode", and read by NOTHING until now (#711) -- because the
     # mode it belongs to could never be entered.
@@ -2812,7 +2816,7 @@ def _execute_training_loop(
                         )
                     )
         elif time_for_eval and not pipeline.data_loaders.get("val"):
-            if logging_service:
+            if logging_service and not _validation_declared_off:
                 logging_service.log_warning(
                     f"[Pipeline] Skipping validation at iter {iteration}: No 'val' dataloader found in pipeline."
                 )

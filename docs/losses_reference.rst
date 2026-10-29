@@ -1000,7 +1000,7 @@ Masked k-space L2 (CoNEX)
 **Domain:** ``kspace``
 
 The self-supervised term of the CoNEX protocol
-(``experiments/inprogress/n2n/PAPER.md`` § 4): the network sees repetition 1
+(the n2n cohort's paper draft, § 4; not in the public export): the network sees repetition 1
 undersampled by :math:`M_1` and is supervised on repetition 2 at the entries of
 a second mask :math:`M_2`, so no fully sampled reference is ever used and the
 supervising noise is independent of the input's.

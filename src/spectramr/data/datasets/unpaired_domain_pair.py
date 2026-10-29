@@ -9,15 +9,17 @@ sample draws one of each independently.
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Iterable
 
 import torch
 import torchio as tio
-from loguru import logger
 
 from spectramr.data.datasets.contrast_aware import ContrastAwareSubjectBuilder, ContrastConfig
 from spectramr.data.datasets.field_strength_pair import stamp_field_strength_pair
+
+logger = logging.getLogger(__name__)
 
 
 class UnpairedDomainDataset(torch.utils.data.Dataset):
@@ -61,8 +63,10 @@ class UnpairedDomainDataset(torch.utils.data.Dataset):
         )
         self._rng: random.Random | None = None
         logger.info(
-            f"[UnpairedDomainDataset] A pool={len(self.a_pool)} records, "
-            f"B pool={len(self.b_pool)} records, disjoint_subjects={disjoint_subjects}"
+            "[UnpairedDomainDataset] A pool=%d records, B pool=%d records, disjoint_subjects=%s",
+            len(self.a_pool),
+            len(self.b_pool),
+            disjoint_subjects,
         )
 
     @staticmethod

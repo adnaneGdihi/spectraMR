@@ -16,6 +16,7 @@ import torch
 
 from spectramr.data.hardware_warp_artifacts import (
     ARTIFACT_KEYS,
+    HELD_OUT_KEYS,
     identity_artifact,
     load_artifact,
     load_pair_residuals,
@@ -148,6 +149,16 @@ class TestPairResiduals:
             load_pair_residuals(_pose_set(), tmp_path)
 
 
+HELD_OUT = {
+    "subject_id": "sub-02",
+    "n_pairs": 2,
+    "n_points": 486,
+    "rms_before_mm": 0.0115,
+    "rms_predicted_mm": 0.0115,
+    "rms_after_mm": 2.0e-17,
+}
+
+
 class TestArtifact:
     def test_identity_round_trip(self, tmp_path: Path) -> None:
         artifact = identity_artifact(**IDENTITY_KNOBS)
@@ -180,6 +191,11 @@ class TestArtifact:
             (lambda a: a.__setitem__("constant_per_degree", {"2": -1.0, "3": 1.0}), "negative"),
             (lambda a: a.__setitem__("basis_points_per_axis", 1), ">= 2"),
             (lambda a: a.__setitem__("max_degree", 1), ">= 2"),
+            (lambda a: a.pop("held_out"), "missing keys"),
+            (lambda a: a.__setitem__("held_out", {"subject_id": "sub-01"}), "held_out: missing"),
+            (lambda a: a.__setitem__("held_out", {**HELD_OUT, "n_pairs": 0}), "n_pairs"),
+            (lambda a: a.__setitem__("held_out", {**HELD_OUT, "rms_after_mm": -1.0}), "non-neg"),
+            (lambda a: a.__setitem__("held_out", {**HELD_OUT, "rms_before_mm": "x"}), "numeric"),
         ],
     )
     def test_contract_violations_raise(self, mutate, match: str) -> None:
@@ -187,6 +203,14 @@ class TestArtifact:
         mutate(artifact)
         with pytest.raises(ValueError, match=match):
             validate_artifact(artifact)
+
+    def test_held_out_report_round_trips(self, tmp_path: Path) -> None:
+        artifact = identity_artifact(**IDENTITY_KNOBS)
+        assert artifact["held_out"] is None
+        artifact["held_out"] = dict(HELD_OUT)
+        assert set(artifact["held_out"]) == HELD_OUT_KEYS
+        path = write_artifact(artifact, tmp_path / "fold.json")
+        assert load_artifact(path)["held_out"] == HELD_OUT
 
     def test_covariance_matrix_round_trips(self, tmp_path: Path) -> None:
         artifact = identity_artifact(**IDENTITY_KNOBS)

@@ -11,6 +11,9 @@ backward.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -18,6 +21,33 @@ import torch.distributed as dist
 
 #: Global-end fills the exchange supports: what the unsplit layer pads with there.
 EDGE_MODES = frozenset({"zeros", "replicate"})
+
+
+_SCOPE = threading.local()
+
+
+@contextmanager
+def spatial_scope() -> Iterator[None]:
+    """Mark a forward pass as running on a depth slab (the wrapper, or the equivalence gate)."""
+    depth = getattr(_SCOPE, "depth", 0)
+    _SCOPE.depth = depth + 1
+    try:
+        yield
+    finally:
+        _SCOPE.depth = depth
+
+
+def require_spatial_scope(layer: str) -> None:
+    """Raise unless called through :func:`spatial_scope`.
+
+    A converted layer on a full volume reads depth as ``local * world`` and silently
+    computes a different network, so an unscoped call (``unwrap_model(m)(x)``) must stop.
+    """
+    if not getattr(_SCOPE, "depth", 0):
+        raise RuntimeError(
+            f"{layer} was called outside a spatial scope: it runs only on a depth slab "
+            "inside SpatialModel or the equivalence gate, never on a full volume."
+        )
 
 
 def _neighbours(group: Any) -> tuple[int | None, int | None]:
@@ -183,5 +213,7 @@ __all__ = [
     "gather_depth",
     "overlap_add",
     "reduce_spatial_gradients",
+    "require_spatial_scope",
+    "spatial_scope",
     "split_depth",
 ]

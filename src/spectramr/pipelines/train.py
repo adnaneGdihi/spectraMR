@@ -182,7 +182,11 @@ from spectramr.infrastructure.validation.resolved_config_artifact import (  # no
 )
 from spectramr.models.analysis.extensive_gradient_logger import ExtensiveGradientLogger
 from spectramr.models.stability.manager import StabilityManager
-from spectramr.pipelines.parallel import is_rank_zero, resolve_data_rank
+from spectramr.pipelines.parallel import (  # noqa: E402
+    is_rank_zero,
+    resolve_data_rank,
+    resolve_global_rank,
+)
 from spectramr.pipelines.validation_evidence import (  # noqa: E402
     VALIDATION_FAILURE_SENTINEL,
     ValidationTally,
@@ -1069,12 +1073,10 @@ def run_training_pipeline(
     # It used to happen here, in one pass, after the environment was fully
     # built -- which cannot be correct for FSDP.
     _is_rank_zero = is_rank_zero(config)
-    # Resolved once here rather than at the write site, which is inside a
-    # `try:` that must not raise on a torch.distributed probe. Same resolver
-    # as the data-sharding rank below: one answer to 'which rank am I',
-    # because a provenance file named for a different rank than the one that
-    # sharded the data would be worse than no per-rank file at all.
-    _resolved_rank = resolve_data_rank(config)
+    # Global rank, one file per process: ranks that share a data shard (tensor
+    # peers) must still write distinct files. Resolved here, outside the `try:`
+    # at the write site.
+    _resolved_rank = resolve_global_rank(config)
 
     # 6. Stability Manager
     # =====================================================================
@@ -2687,11 +2689,16 @@ def _all_reduce_val_metrics(val_accum, val_finite, val_seen, val_weight, device)
     """
     import torch.distributed as dist
 
+    from spectramr.core.parallel_groups import dp_group, dp_world_size
+
     if not (dist.is_available() and dist.is_initialized()):
         return val_accum, val_finite, val_seen, val_weight
 
-    gathered: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, sorted(val_accum))
+    # Reduce over the data-parallel group only: model-parallel peers hold the same
+    # samples, so a world-wide sum would count each sample once per peer.
+    group = dp_group()
+    gathered: list[Any] = [None] * dp_world_size()
+    dist.all_gather_object(gathered, sorted(val_accum), group=group)
     keys = sorted({k for rank_keys in gathered for k in (rank_keys or ())})
 
     def _scalar(v) -> torch.Tensor:
@@ -2703,7 +2710,7 @@ def _all_reduce_val_metrics(val_accum, val_finite, val_seen, val_weight, device)
     entries = [_scalar(part.get(k, 0.0)) for part in (val_accum, val_finite, val_seen) for k in keys]
     entries.append(_scalar(float(val_weight)))
     reduced = torch.stack(entries)
-    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
     values = reduced.tolist()
     n = len(keys)
 

@@ -85,7 +85,7 @@ jobs:
         if: always()
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7
         with:
-          file: ./tests_experiments/coverage_release.xml
+          files: ./tests_experiments/coverage_release.xml
           flags: release
           fail_ci_if_error: false
 
@@ -103,7 +103,7 @@ jobs:
       - name: Install mutmut (best-effort)
         # Not in [dev]; `make test-mutation` prints a WARNING and exits 0 without
         # it, so a failure here must not fail the job.
-        run: pip install mutmut || true
+        run: pip install 'mutmut<3' || true
 
       - name: Run mutation testing
         env:

@@ -69,6 +69,8 @@ def _config(which: str) -> MagicMock:
     config.optimization.gradient.clip.enabled = False
     config.optimization.gradient.clip.method = "norm"
     config.optimization.gradient.clip.value = 1.0
+    # A MagicMock attribute is not a declared mode; StepExecutor refuses it.
+    config.optimization.gradient.activation_offload = "none"
     config.optimization.precision.dtype = "float32"
     training = SimpleNamespace(seed=0, model_fields_set=set(), model_extra={})
     if which == "multi_contrast":

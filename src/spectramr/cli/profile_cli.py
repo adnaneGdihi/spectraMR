@@ -494,9 +494,8 @@ def attach_subparsers(subparsers: argparse._SubParsersAction) -> None:
         f"applies -O {VAL_BATCHES_OVERRIDE_KEY}=8), so a slow validation pass "
         "does not dominate a profile aimed at training. Default "
         f"{DEFAULT_PROFILE_VAL_BATCHES} for train/sanity_check, because --iterations does "
-        "not shorten validation. Note validation.enabled "
-        "is NOT read by the framework (issue #673), so it cannot be used to skip "
-        "validation outright.",
+        "not shorten validation. To skip validation "
+        "outright, pass -O validation.enabled=false instead.",
     )
     parser.add_argument(
         "--iterations",

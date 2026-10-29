@@ -40,7 +40,9 @@ _SUBBLOCK = {
 }
 
 
-def settings(*, strategy="none", max_iterations=None, interval_steps=100, on_epoch=False):
+def settings(
+    *, strategy="none", max_iterations=None, interval_steps=100, on_epoch=False, enabled=True
+):
     """A REAL TrainingSettings, never a stub.
 
     A SimpleNamespace would make the override tests vacuous: `apply_overrides`
@@ -54,7 +56,10 @@ def settings(*, strategy="none", max_iterations=None, interval_steps=100, on_epo
         optimization={},
         logging={},
         training={"max_iterations": max_iterations},
-        validation={"schedule": {"interval_steps": interval_steps, "on_epoch": on_epoch}},
+        validation={
+            "enabled": enabled,
+            "schedule": {"interval_steps": interval_steps, "on_epoch": on_epoch},
+        },
         parallel={"strategy": strategy, **_SUBBLOCK.get(strategy, {})},
     )
 
@@ -244,6 +249,17 @@ def test_on_epoch_is_undecidable_up_front_so_it_stays_silent():
     )
 
 
+def test_validation_declared_off_passes_an_interval_beyond_the_budget():
+    """The data builder attaches no val loader, so the loop has no gate to reach (#673).
+
+    The exp_ulf_09 calibration arms run one iteration at the default interval of 1000.
+    """
+    unreachable = {"max_iterations": 1, "interval_steps": 1000}
+    pf.check_validation_interval(settings=settings(**unreachable, enabled=False), target="train")
+    with pytest.raises(ValueError, match="can NEVER fire"):
+        pf.check_validation_interval(settings=settings(**unreachable, enabled=True), target="train")
+
+
 def test_an_epoch_derived_budget_stays_silent():
     """max_iterations=None -> epochs x len(train_loader), unknown pre-flight."""
     pf.check_validation_interval(
@@ -304,3 +320,17 @@ def test_a_torchless_interpreter_reports_instead_of_guessing(monkeypatch, caplog
     monkeypatch.setattr("spectramr.cli.manifest_dispatch.declares_parameter_free_arm", no_torch)
     pf.check_parameter_free(config="arm.yaml", target="train")
     assert any("check skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_importing_the_preflight_module_does_not_pull_torch() -> None:
+    """``profile_preflight`` sits on the ``--help`` path, so its config reads stay lazy."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import spectramr.cli.profile_preflight\n"
+        "assert 'torch' not in sys.modules, 'torch imported'\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

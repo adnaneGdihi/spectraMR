@@ -1973,3 +1973,27 @@ def test_data_split_provenance_writes_the_applied_partition():
 @pytest.mark.parametrize("pipeline", [SimpleNamespace(), SimpleNamespace(data_split={})])
 def test_data_split_provenance_is_none_when_no_partition_was_recorded(pipeline):
     assert prov.data_split_provenance(pipeline) is None
+
+
+def test_parallel_provenance_records_the_active_mesh(no_launcher):
+    """The mesh shape and dim names reach the run record; absent when no mesh was built."""
+    from spectramr.core import parallel_groups as pg
+
+    assert prov.parallel_provenance(_cfg("ddp"))["mesh"] is None
+    pg.activate_dp_layout(
+        pg.DPLayout(
+            rank=0,
+            world_size=2,
+            group=None,
+            src_rank=0,
+            writer=True,
+            dim_names=("pp", "dp_replicate", "dp_shard", "cp", "sp", "tp"),
+            shape=(1, 2, 1, 1, 1, 2),
+        )
+    )
+    try:
+        mesh = prov.parallel_provenance(_cfg("ddp"))["mesh"]
+    finally:
+        pg.reset_dp_layout()
+    assert mesh["shape"] == {"pp": 1, "dp_replicate": 2, "dp_shard": 1, "cp": 1, "sp": 1, "tp": 2}
+    assert mesh["dp_world_size"] == 2

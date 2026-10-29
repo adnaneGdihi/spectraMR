@@ -205,9 +205,24 @@ class TestRng:
         torch.manual_seed(5)
         expected = torch.rand(2)
         torch.manual_seed(5)
-        with patch.object(resume_mod.RankUtility, "is_main_rank", staticmethod(lambda: False)):
+        with patch.object(resume_mod, "dp_rank", lambda: 1):
             _resume(path, fresh)
         assert torch.equal(torch.rand(2), expected)
+
+    def test_a_peer_of_replica_zero_restores_its_stream(self, tmp_path: Path) -> None:
+        # Spatial slabs of one volume share a data-parallel index and must draw alike.
+        path = _save(tmp_path)
+        fresh = make_pipeline()
+        torch.manual_seed(5)
+        with (
+            patch.object(resume_mod.RankUtility, "is_main_rank", staticmethod(lambda: False)),
+            patch.object(resume_mod, "dp_rank", lambda: 0),
+        ):
+            _resume(path, fresh)
+        restored = torch.rand(2)
+        torch.manual_seed(0)
+        _resume(path, make_pipeline())
+        assert torch.equal(restored, torch.rand(2))
 
     def test_a_file_without_rng_still_loads(self, tmp_path: Path) -> None:
         path = _save(tmp_path)

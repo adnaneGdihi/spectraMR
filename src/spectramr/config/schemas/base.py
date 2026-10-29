@@ -1035,6 +1035,28 @@ class PEFTConfigSchema(BaseModel):
     )
 
 
+class ParallelMeshConfigSchema(BaseModel):
+    """Sizes of the model-parallel axes of the one DeviceMesh (PR11).
+
+    Each axis defaults to 1, so an arm that declares nothing keeps today's pure
+    data-parallel run. The data-parallel size is what is left: ``world // product``.
+    That division needs the world size, which only the launch knows, so it is
+    checked where the mesh is built (``spectramr.infrastructure.distributed.mesh``).
+    """
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    tensor: int = Field(default=1, gt=0, description="Tensor-parallel size (tp).")
+    context: int = Field(default=1, gt=0, description="Context-parallel size (cp).")
+    spatial: int = Field(default=1, gt=0, description="Spatial (depth) parallel size (sp).")
+    pipeline: int = Field(default=1, gt=0, description="Pipeline-parallel size (pp).")
+
+    @property
+    def non_dp_size(self) -> int:
+        """Ranks that hold one data shard between them: the product of the four axes."""
+        return self.tensor * self.context * self.spatial * self.pipeline
+
+
 class ParallelismConfigSchema(BaseModel):
     """Configuration for distributed training and parallelism.
 
@@ -1095,6 +1117,18 @@ class ParallelismConfigSchema(BaseModel):
     fsdp: FSDPConfigSchema = Field(default_factory=FSDPConfigSchema)
     peft: PEFTConfigSchema = Field(default_factory=PEFTConfigSchema)
     deepspeed: DeepSpeedConfigSchema = Field(default_factory=DeepSpeedConfigSchema)
+    mesh: ParallelMeshConfigSchema = Field(
+        default_factory=ParallelMeshConfigSchema,
+        description="Model-parallel axis sizes on one DeviceMesh. Only ddp and fsdp may "
+        "use a size above 1; the data-parallel size is world // product.",
+    )
+    spatial_probe_shape: list[int] | None = Field(
+        default=None,
+        description="[S0, S1, S2] of the synthetic volume the spatial equivalence gate runs "
+        "on, when mesh.spatial > 1, in data.sampling.patch_size order. mesh.spatial splits "
+        "the first extent (tensor dim 2), so S0 must divide by it. null derives the shape "
+        "from data.sampling.patch_size.",
+    )
     timeout_seconds: int | None = Field(
         default=None,
         gt=0,
@@ -1124,6 +1158,42 @@ class ParallelismConfigSchema(BaseModel):
                 f"parallel.deepspeed.enabled={self.deepspeed.enabled}. DeepSpeed is "
                 "requested by setting BOTH strategy: deepspeed AND "
                 "deepspeed.enabled: true."
+            )
+        if self.strategy not in ("ddp", "fsdp") and self.mesh.non_dp_size > 1:
+            raise ValueError(
+                f"parallel.mesh {self.mesh.model_dump()} needs model-parallel axes of size "
+                f"1: strategy={self.strategy!r} has no mesh to split. Only 'ddp' and 'fsdp' "
+                "can use parallel.mesh.tensor/context/spatial/pipeline above 1."
+            )
+        if self.mesh.spatial > 1:
+            if self.strategy != "ddp":
+                raise ValueError(
+                    f"parallel.mesh.spatial={self.mesh.spatial} needs parallel.strategy='ddp': "
+                    f"spatial parallelism is not wired under {self.strategy!r} yet."
+                )
+            if self.mesh.tensor > 1 or self.mesh.context > 1 or self.mesh.pipeline > 1:
+                raise ValueError(
+                    "parallel.mesh.spatial cannot be combined with tensor, context or pipeline "
+                    "parallelism yet: the depth slabs and the combined dp x sp group assume "
+                    "those axes are 1."
+                )
+            if self.sync_batch_norm:
+                raise ValueError(
+                    "parallel.sync_batch_norm cannot be combined with parallel.mesh.spatial: "
+                    "the depth-split norms already reduce their statistics over the spatial group."
+                )
+            shape = self.spatial_probe_shape
+            if shape is not None and (
+                len(shape) != 3 or min(shape) < 1 or shape[0] % self.mesh.spatial
+            ):
+                raise ValueError(
+                    f"parallel.spatial_probe_shape={shape} must be three positive extents "
+                    f"[S0, S1, S2] with S0 divisible by mesh.spatial={self.mesh.spatial}."
+                )
+        elif self.spatial_probe_shape is not None:
+            raise ValueError(
+                "parallel.spatial_probe_shape is read only when parallel.mesh.spatial > 1; "
+                "it would be ignored on this run."
             )
         if self.strategy == "dp" and self.sync_batch_norm:
             raise ValueError(

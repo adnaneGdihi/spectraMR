@@ -707,7 +707,7 @@ depends on the other folders; the family and its size are written in each row so
 a folder read alone says what it was corrected against. Run ``--only`` with the
 whole family, or the size changes. The pass of each arm is the one the aggregate
 tables read (``--view``), so the statistics and the figures describe one checkpoint.
-``experiments/contrasts/n2n_paper.yaml`` is a worked example for one cohort; it
+``n2n_paper.yaml`` under ``experiments/contrasts`` (maintainer tree) is a worked example for one cohort; it
 mirrors the n2n paper script's ``CONTRASTS``, and a unit test pins the two.
 Holm runs across contrasts within one metric; metrics are not corrected against
 each other.

@@ -174,12 +174,8 @@ def test_shard_like_refuses_a_reference_without_a_shard_plan() -> None:
 
 
 def test_unknown_sharding_strategy_raises() -> None:
-    from unittest import mock
+    from spectramr.infrastructure.distributed.fsdp_wrap import fsdp_shard_mesh
 
-    from spectramr.infrastructure.distributed.fsdp_wrap import build_fsdp_mesh
-
-    with (
-        mock.patch("torch.distributed.get_world_size", return_value=2),
-        pytest.raises(ValueError, match="Unknown FSDP sharding_strategy"),
-    ):
-        build_fsdp_mesh("zero3", "cpu")
+    # The strategy is checked before the mesh is indexed, so no mesh is needed.
+    with pytest.raises(ValueError, match="Unknown FSDP sharding_strategy"):
+        fsdp_shard_mesh(object(), "zero3")

@@ -311,7 +311,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the other two are transitive, so no declared constraint changes.
 
 ### Migration
-- Convert pre-1.0 runs once with `scripts/migrations/convert_checkpoints_v1.py <run_dir>`
+- Convert pre-1.0 runs once with `convert_checkpoints_v1.py <run_dir>` (maintainer tree, `scripts/migrations/`; not in the public export)
   before `--resume` or `predict` on them.
 - Convert a run only while no job can write to it: finish or `scancel` its chain first.
   A conversion killed at any point finishes when the same command is rerun; one that

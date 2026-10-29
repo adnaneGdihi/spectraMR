@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from spectramr.core.parallel_groups import dp_rank
 from spectramr.core.rng_state import restore_rng_state
 from spectramr.infrastructure.checkpointing import codecs
 from spectramr.infrastructure.checkpointing.capture import (
@@ -50,14 +51,18 @@ def _gate(checkpoint_cfg: Any, name: str) -> bool:
 
 
 def _restore_rng(rng: dict[str, Any] | None) -> None:
-    # The file holds rank 0's streams only; replaying them on every rank would give all
-    # ranks one augmentation sequence, which train.py's rank-offset seeding prevents.
-    if rng and RankUtility.is_main_rank():
+    # The file holds the data-parallel index-0 streams. Every rank with that index
+    # (rank 0 and its model-parallel peers, such as spatial slabs of one volume) restores
+    # them, so the peers that draw the same batch keep drawing the same noise. Other
+    # replicas keep their own stream: replaying one stream on all of them would give
+    # every replica one augmentation sequence.
+    if rng and dp_rank() == 0:
         restore_rng_state(rng)
         logger.info("Restored RNG state (torch + cuda + numpy + python)")
     elif rng:
         logger.info(
-            "[RNG] rank %d keeps its own stream; the checkpoint carries rank 0's only.",
+            "[RNG] rank %d keeps its own stream; the checkpoint carries data-parallel "
+            "replica 0's only.",
             RankUtility.get_rank(),
         )
 

@@ -30,8 +30,10 @@ from tests.utils.hardware_warp_synthesis import write_planted_pose_set
 pytestmark = [pytest.mark.unit]
 
 
-def _config(tmp_path: Path, **overrides: Any) -> SimpleNamespace:
-    pose_set_path, _ = write_planted_pose_set(tmp_path / "pose")
+def _config(
+    tmp_path: Path, split: dict[str, Any] | None = None, **overrides: Any
+) -> SimpleNamespace:
+    pose_set_path, _ = write_planted_pose_set(tmp_path / "pose", n_subjects=3)
     training = {
         "training_mode": "hardware_warp_calibration",
         "max_degree": 3,
@@ -46,7 +48,11 @@ def _config(tmp_path: Path, **overrides: Any) -> SimpleNamespace:
         "software_version": "1.2.3",
     }
     training.update(overrides)
-    return SimpleNamespace(training=SimpleNamespace(**training))
+    config = SimpleNamespace(training=SimpleNamespace(**training))
+    if split is not None:
+        defaults = {"type": "manifest", "holdout_subject": None, "loso_fold": None}
+        config.data = SimpleNamespace(split=SimpleNamespace(**{**defaults, **split}))
+    return config
 
 
 class TestOrchestration:
@@ -102,6 +108,42 @@ class TestOrchestration:
             run_hardware_warp_calibration(knobs)
 
 
+class TestHoldOneSubjectOut:
+    def test_no_split_block_and_a_manifest_split_fit_every_pair(self, tmp_path: Path) -> None:
+        assert require_hardware_warp_config(_config(tmp_path)).holdout_subject is None
+        knobs = require_hardware_warp_config(_config(tmp_path, split={"type": "manifest"}))
+        assert knobs.holdout_subject is None
+        artifact = run_hardware_warp_calibration(knobs)
+        assert artifact["n_pairs"] == 6 and artifact["held_out"] is None
+
+    def test_loso_subject_holds_the_named_subject_out_and_reports_it(self, tmp_path: Path) -> None:
+        split = {"type": "loso_subject", "holdout_subject": "sub-02"}
+        knobs = require_hardware_warp_config(_config(tmp_path, split=split))
+        assert knobs.holdout_subject == "sub-02"
+        artifact = run_hardware_warp_calibration(knobs)
+        assert artifact["n_pairs"] == 4
+        held = artifact["held_out"]
+        assert held["subject_id"] == "sub-02" and held["n_pairs"] == 2
+        assert held["rms_after_mm"] < 1e-9 * held["rms_before_mm"]
+        assert load_artifact(knobs.artifact_path)["held_out"] == held
+
+    def test_unknown_holdout_subject_raises_before_writing(self, tmp_path: Path) -> None:
+        split = {"type": "loso_subject", "holdout_subject": "sub-99"}
+        knobs = require_hardware_warp_config(_config(tmp_path, split=split))
+        with pytest.raises(ValueError, match="sub-99"):
+            run_hardware_warp_calibration(knobs)
+        assert not knobs.artifact_path.exists()
+
+    def test_loso_fold_is_refused_because_it_indexes_the_manifest(self, tmp_path: Path) -> None:
+        split = {"type": "loso_subject", "loso_fold": 1}
+        with pytest.raises(ValueError, match="loso_fold"):
+            require_hardware_warp_config(_config(tmp_path, split=split))
+
+    def test_loso_subject_without_an_id_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="holdout_subject"):
+            require_hardware_warp_config(_config(tmp_path, split={"type": "loso_subject"}))
+
+
 class TestStrategyWiring:
     def test_factory_key_resolves_to_this_class(self) -> None:
         from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
@@ -117,8 +159,14 @@ class TestStrategyWiring:
             HardwareWarpCalibrationStrategy._setup_strategy_specific_components
         )
         assert "require_hardware_warp_config(" in setup
+        assert "isinstance(generator, HardwareWarpOperator)" in setup
+        # The fit and its load into the operator happen at construction, not on a training
+        # step: the substrate loader may yield no batch, and a step that never comes must not
+        # mean an artifact that is never written.
+        assert "run_hardware_warp_calibration(self._knobs)" in setup
+        assert "load_artifact_record(self._artifact)" in setup
         step = inspect.getsource(HardwareWarpCalibrationStrategy._compute_losses_impl)
-        assert "run_hardware_warp_calibration(" in step
+        assert "run_hardware_warp_calibration(" not in step
         assert "_zero_loss()" in step
 
     def test_declares_loss_ownership(self) -> None:

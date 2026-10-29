@@ -687,6 +687,23 @@ def synthetic_forward_probe(
             traceback=traceback.format_exc(),
         )
 
+    # ── Whole-probe opt-out ──────────────────────────────────────────
+    # A model with no image contract (``hardware_warp_operator`` acts on scanner-frame point
+    # clouds) declares ``synthetic_forward_probe_skip = {"forward"}``: probing it would either
+    # crash on the synthetic batch or, with a placeholder, pass a green that certifies nothing.
+    if "forward" in _coerce_probe_skip(getattr(model, "synthetic_forward_probe_skip", None)):
+        return ProbeResult(
+            passed=True,
+            category="no_probe",
+            message=(
+                f"{model_type} declares synthetic_forward_probe_skip={{'forward'}}: it does not "
+                "act on an image batch, so the Tier-2 forward probe does not apply to it."
+            ),
+            severity="info",
+            device=device,
+            elapsed_seconds=time.perf_counter() - t0,
+        )
+
     # ── Runtime input-concatenation hint ─────────────────────────────
     # Some models build their first conv expecting the post-concat
     # shape that the *training strategy* produces, not the raw

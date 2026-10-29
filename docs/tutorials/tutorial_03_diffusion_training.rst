@@ -115,7 +115,7 @@ The annotations mark the choices that matter for a diffusion arm.
      dataset_type: kspace
      # Which axis of the training batch carries the phase-encode lines, and
      # how many were acquired. M4Raw T1/T2/FLAIR: dim -1. Measure your own
-     # data with scripts/physics/measure_phase_encode_axis.py --arm <yaml>;
+     # data with measure_phase_encode_axis.py --arm <yaml> (maintainer tree);
      # mask_direction: phase raises without this block.
      acquisition:
        phase_encode_axis: -1
@@ -446,7 +446,7 @@ HDF5 file's ISMRMRD ``encodingLimits/kspace_encoding_step_1`` (``minimum`` to
 ``ismrmrd_header``, without those limits, or with data outside them makes
 ``infer`` fail for that file with the missing key named; there is no fallback
 to the full plane. M4Raw writes a line count into ``maximum``, so check a file
-with ``scripts/physics/measure_phase_encode_axis.py`` first.
+with the maintainer-tree ``measure_phase_encode_axis.py`` first.
 
 Inference writes ``final_eval.json`` (aggregated scores),
 ``final_eval_manifest.json`` (what was computed and why anything was skipped),

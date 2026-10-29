@@ -192,6 +192,9 @@ def check_validation_interval(*, settings: Any, target: str) -> None:
       run, but whether it does depends on ``len(train_loader)``, same problem;
     * ``target`` is ``sanity_check`` — see :data:`INTERVAL_TARGETS`.
 
+    An arm declaring ``validation.enabled: false`` passes: the data builder attaches no val
+    loader, so the loop never applies the gate (issue #673).
+
     The one residual imprecision is stated rather than hidden: the loop also
     requires a validation loader to exist before it raises, and that too needs a
     built pipeline. An arm with no validation split would therefore be refused
@@ -200,8 +203,12 @@ def check_validation_interval(*, settings: Any, target: str) -> None:
     """
     if target not in INTERVAL_TARGETS:
         return
+    from spectramr.config.schemas.validation import validation_declared_off
+
     training = getattr(settings, "training", None)
     validation = getattr(settings, "validation", None)
+    if validation_declared_off(validation):
+        return
     schedule = getattr(validation, "schedule", None)
     max_iterations = getattr(training, "max_iterations", None)
     eval_interval = getattr(schedule, "interval_steps", None)

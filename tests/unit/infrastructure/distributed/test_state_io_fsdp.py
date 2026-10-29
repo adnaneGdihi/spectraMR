@@ -44,10 +44,25 @@ def _net(seed: int):
     return nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 4))
 
 
+def _run_mesh(fsdp_cfg):
+    """The run's one mesh for this worker, built the production way (after init)."""
+    from spectramr.infrastructure.distributed.mesh import build_parallel_mesh
+
+    parallel = SimpleNamespace(
+        strategy="fsdp",
+        fsdp=fsdp_cfg,
+        mesh=SimpleNamespace(non_dp_size=1, tensor=1, context=1, spatial=1, pipeline=1),
+    )
+    return build_parallel_mesh(
+        parallel, device_type="cpu", world_size=WORLD, local_world_size=WORLD
+    ).device_mesh
+
+
 def _shard(net, **fsdp):
     from spectramr.infrastructure.distributed.fsdp_wrap import maybe_wrap_with_fsdp
 
-    return maybe_wrap_with_fsdp(net, _cfg(**fsdp), None, torch.device("cpu"))
+    cfg = _cfg(**fsdp)
+    return maybe_wrap_with_fsdp(net, cfg, None, torch.device("cpu"), mesh=_run_mesh(cfg.fsdp))
 
 
 def _batch():
@@ -214,6 +229,35 @@ def _scenario_complex_parameters(rank: int) -> None:
     assert torch.isfinite(norm.full_tensor())
 
 
+def _scenario_sharding_matrix(rank: int) -> None:
+    """no_shard and hybrid_shard, through the 2-D slice of the run's mesh, match one process.
+
+    Each strategy runs one clipped SGD step; the post-step weights must equal the unsharded
+    single-process run. The mesh shape pins which dimension FSDP actually sharded over.
+    """
+    expected_shape = {"no_shard": (2, 1), "hybrid_shard": (1, 2)}
+    for strategy, shape in expected_shape.items():
+        ref = _net(0)
+        ref(_batch()).square().sum().backward()
+        torch.nn.utils.clip_grad_norm_(ref.parameters(), 0.5)
+        torch.optim.SGD(ref.parameters(), lr=0.1).step()
+
+        model = _shard(_net(0), sharding_strategy=strategy)
+        assert tuple(next(model.parameters()).device_mesh.shape) == shape, strategy
+        model(_batch()).square().sum().backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.optim.SGD(model.parameters(), lr=0.1).step()
+        for got, want in zip(_full_params(model), ref.parameters(), strict=True):
+            torch.testing.assert_close(got, want.detach())
+
+
+def _full_params(model):
+    """Every parameter gathered to a full tensor, in order."""
+    from torch.distributed.tensor import DTensor
+
+    return [p.full_tensor() if isinstance(p, DTensor) else p.detach() for p in model.parameters()]
+
+
 def _spawn(scenario: str) -> None:
     import torch.multiprocessing as mp
 
@@ -227,6 +271,7 @@ def _spawn(scenario: str) -> None:
         "save_shapes",
         "round_trip",
         "matches_one_process",
+        "sharding_matrix",
         "ema",
         "unsharded_shadow_refused",
         "complex_parameters",

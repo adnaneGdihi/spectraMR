@@ -47,6 +47,7 @@ ARTIFACT_KEYS = {
     "covariance",
     "constant_per_degree",
     "n_pairs",
+    "held_out",
 }
 
 

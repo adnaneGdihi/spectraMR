@@ -54,15 +54,20 @@ def _distributed_world_size() -> int:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size()
+        from spectramr.core.parallel_groups import dp_world_size
+
+        return dp_world_size()
     return 1
 
 
 def _broadcast_from_rank0(tensor: torch.Tensor) -> torch.Tensor:
+    """Broadcast from the data-parallel root; the global rank 0 on a trivial mesh."""
     import torch.distributed as dist
 
+    from spectramr.core.parallel_groups import dp_group, dp_src_rank
+
     tensor = tensor.clone()
-    dist.broadcast(tensor, src=0)
+    dist.broadcast(tensor, src=dp_src_rank(), group=dp_group())
     return tensor
 
 
