@@ -95,7 +95,7 @@ warnings.filterwarnings(
     category=SyntaxWarning,
 )
 
-__version__ = "1.3.3.dev1"
+__version__ = "1.3.4.dev1"
 
 # ---------------------------------------------------------------------------
 # Public scripting surface — lazy re-exports (PEP 562 ``__getattr__``).
