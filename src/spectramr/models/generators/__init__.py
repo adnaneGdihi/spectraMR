@@ -207,6 +207,7 @@ from .paired_synthesis_generator import PairedSynthesisGenerator
 from .pma_varnet import PMAVarNet
 
 # PMPS Phase 2/3 — corruption operators + paired synthesis generator.
+from .hardware_warp_operator import HardwareWarpOperator  # noqa: E402
 from .pmps_corruption_operators import HFCorruptionOperator, ULFCorruptionOperator
 from .probabilistic_graphical import ProbabilisticGraphicalGenerator
 from .qspace_translation import qSpaceTranslation
@@ -542,6 +543,7 @@ __all__ = [
     "TissueParameterDiffusion",
     "ULFCorruptionOperator",
     "HFCorruptionOperator",
+    "HardwareWarpOperator",
     "PairedSynthesisGenerator",
     "SIRENGenerator",
     "ProbabilisticGraphicalGenerator",

@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.core.parallel_groups import dp_group, dp_rank, dp_world_size
 from spectramr.infrastructure.distributed.strategy_registry import (
     ParallelContext,
     ParallelizationResult,
@@ -69,23 +70,50 @@ def _convert_sync_batchnorm(models: dict[str, Any]) -> None:
     for name in list(models):
         module = models[name]
         if module is not None:
-            models[name] = nn.SyncBatchNorm.convert_sync_batchnorm(module)
+            # Statistics are reduced over the data-parallel group: model-parallel peers
+            # hold the same samples and must not be counted twice.
+            models[name] = nn.SyncBatchNorm.convert_sync_batchnorm(
+                module, process_group=dp_group()
+            )
             logger.info("[Parallel] Converted %s BatchNorm -> SyncBatchNorm", name)
 
 
-def _wrap_with_distributed_samplers(loaders: dict[str, Any]) -> dict[str, Any]:
-    """Give every loader a DistributedSampler.
+def _tensor_size(ctx: ParallelContext) -> int:
+    mesh = getattr(ctx, "mesh", None)
+    return int(mesh.shape.get("tp", 1)) if mesh is not None else 1
 
-    Delegates the DataLoader reconstruction to the data layer so this module
+
+def _apply_tensor_parallel(models: dict[str, Any], ctx: ParallelContext) -> None:
+    """Split the generator across the mesh's tensor dim (Stage A, before the DDP wrap).
+
+    DDP then syncs over ``dp_group()``, which pairs ranks holding the same shard.
+    """
+    if _tensor_size(ctx) <= 1:
+        return
+    from spectramr.infrastructure.distributed.tensor_parallel import parallelize_tensor
+
+    group = ctx.mesh.device_mesh["tp"].get_group()
+    names = parallelize_tensor(models["generator"], group)
+    logger.info("[Parallel] tensor-parallel over %d ranks: %d block(s)", _tensor_size(ctx), len(names))
+
+
+def _wrap_with_distributed_samplers(loaders: dict[str, Any]) -> dict[str, Any]:
+    """Give every loader a sampler over the data-parallel group.
+
+    Ranks inside one model-parallel group get the same ``dp_rank`` and so the same
+    batches. Delegates the DataLoader reconstruction to the data layer so this module
     never constructs one directly (pitfall #11).
     """
     from spectramr.data.builders.data_loader_builder import wrap_with_distributed_sampler
 
     out = dict(loaders)
+    replicas, rank = dp_world_size(), dp_rank()
     for split, loader in loaders.items():
         if loader is None:
             continue
-        out[split] = wrap_with_distributed_sampler(loader, shuffle=(split == "train"))
+        out[split] = wrap_with_distributed_sampler(
+            loader, shuffle=(split == "train"), num_replicas=replicas, rank=rank
+        )
         logger.info("[Parallel] Wrapped %r DataLoader with DistributedSampler", split)
     return out
 
@@ -188,11 +216,14 @@ class DataParallelStrategy(_BaseStrategy):
         )
 
 
-def wrap_with_ddp(module: nn.Module, parallel: Any, device: Any) -> nn.Module:
+def wrap_with_ddp(
+    module: nn.Module, parallel: Any, device: Any, process_group: Any = None
+) -> nn.Module:
     """The one ``DistributedDataParallel`` construction, shared with strategy-owned modules.
 
     Construction broadcasts rank 0's parameters, so every rank must call it at the same
-    point in the run (#2629).
+    point in the run (#2629). ``process_group`` defaults to the active mesh's data-parallel
+    group (the default group without a mesh).
     """
     from torch.nn.parallel import DistributedDataParallel
 
@@ -205,10 +236,44 @@ def wrap_with_ddp(module: nn.Module, parallel: Any, device: Any) -> nn.Module:
     return DistributedDataParallel(
         module,
         device_ids=device_ids,
+        process_group=process_group if process_group is not None else dp_group(),
         find_unused_parameters=parallel.find_unused_parameters,
         gradient_as_bucket_view=parallel.gradient_as_bucket_view,
         static_graph=parallel.static_graph,
     )
+
+
+def _spatial_probe_shape(ctx: ParallelContext) -> tuple[int, ...]:
+    """``[1, C, D, H, W]`` for the equivalence gate: declared, else the training patch."""
+    declared = ctx.parallel.spatial_probe_shape
+    if declared is not None:
+        extents = tuple(declared)
+    else:
+        extents = tuple(ctx.config.data.sampling.patch_size)
+        if len(extents) != 3:
+            raise ValueError(
+                "parallel.mesh.spatial needs a 3D volume: data.sampling.patch_size has "
+                f"{len(extents)} entries. Declare parallel.spatial_probe_shape [S0, S1, S2]."
+            )
+    # data.sampling.patch_size order; the split runs along the first extent (tensor dim 2).
+    return (1, int(ctx.config.model.in_channels), *(int(e) for e in extents))
+
+
+def _wrap_generator_spatially(models, ctx):
+    """Depth-split the generator (Stage A): convert, prove on a synthetic volume, wrap."""
+    from spectramr.infrastructure.distributed.spatial import wrap_spatial
+
+    if ctx.config.optimization.compile.enabled:
+        raise RuntimeError(
+            "parallel.mesh.spatial cannot run under torch.compile: the depth-split layers "
+            "exchange halos inside the compiled graph, which is not validated. Disable "
+            "optimization.compile for this arm."
+        )
+    if models.get("generator") is None:
+        raise RuntimeError("parallel.mesh.spatial needs a generator to depth-split")
+    shape = _spatial_probe_shape(ctx)
+    models["generator"] = wrap_spatial(models["generator"], ctx.mesh.spatial_group, shape)
+    logger.info("[Parallel] Depth-split generator over sp=%d", ctx.mesh.shape["sp"])
 
 
 class DDPStrategy(_BaseStrategy):
@@ -220,21 +285,38 @@ class DDPStrategy(_BaseStrategy):
     def prepare_models(self, models, ctx):
         if ctx.parallel.sync_batch_norm:
             _convert_sync_batchnorm(models)
+        _apply_tensor_parallel(models, ctx)
+        if ctx.parallel.mesh.spatial > 1:
+            _wrap_generator_spatially(models, ctx)
         return models
 
     def adopt(self, models, optimizers, schedulers, ctx):
         _require_process_group(self.name)
+        spatial = ctx.parallel.mesh.spatial > 1
+        # Depth slabs make each sp peer's gradient a partial, so the average runs over
+        # dp x sp: that is the unsplit gradient, in the one bucketed collective (see
+        # spatial/wrapper.py). Samplers and metrics keep the data-parallel group.
+        process_group = ctx.mesh.grad_group if spatial else dp_group()
         wrapped = dict(models)
         for name, module in models.items():
             if module is None:
                 continue
-            wrapped[name] = wrap_with_ddp(module, ctx.parallel, ctx.device)
+            wrapped[name] = wrap_with_ddp(
+                module, ctx.parallel, ctx.device, process_group=process_group
+            )
             logger.info("[Parallel] Wrapped %s with DDP", name)
+        provenance = self.provenance(ctx)
+        if spatial:
+            provenance["spatial"] = {
+                "mesh_spatial": ctx.parallel.mesh.spatial,
+                "grad_reduce_group": "dp x sp",
+                **getattr(models.get("generator"), "gate_report", {}),
+            }
         return ParallelizationResult(
             models=wrapped,
             optimizers=optimizers,
             schedulers=schedulers,
-            provenance=self.provenance(ctx),
+            provenance=provenance,
         )
 
     def prepare_data_loaders(self, loaders, ctx):
@@ -269,12 +351,22 @@ class FSDPStrategy(_BaseStrategy):
         _require_process_group(self.name)
         from spectramr.infrastructure.distributed.fsdp_wrap import maybe_wrap_with_fsdp
 
+        if _tensor_size(ctx) > 1:
+            raise RuntimeError(
+                "parallel.mesh.tensor > 1 composes with strategy 'ddp' only: FSDP over "
+                "tensor-parallel blocks needs DTensor plans, which are not implemented."
+            )
+
         if ctx.parallel.sync_batch_norm:
             _convert_sync_batchnorm(models)
         for name in list(models):
             if models[name] is not None:
                 models[name] = maybe_wrap_with_fsdp(
-                    models[name], ctx.parallel, ctx.config.optimization.precision, ctx.device
+                    models[name],
+                    ctx.parallel,
+                    ctx.config.optimization.precision,
+                    ctx.device,
+                    mesh=ctx.mesh.device_mesh,
                 )
                 logger.info("[Parallel] Sharded %s with FSDP2", name)
         return models

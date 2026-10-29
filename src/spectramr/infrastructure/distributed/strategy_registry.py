@@ -61,6 +61,8 @@ class ParallelContext:
     config: Any
     device: Any
     parallel: Any
+    #: The run's ``ParallelMesh`` (``mesh.build_parallel_mesh``); ``None`` for single-process.
+    mesh: Any = None
 
     @property
     def world_size(self) -> int:
@@ -192,6 +194,8 @@ class ParallelRuntime:
     step_policy: Any | None = None
     checkpoint_adapter: Any | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    #: The run's ``ParallelMesh``, so the loop reaches the one mesh the plugins used.
+    mesh: Any | None = None
 
     @classmethod
     def single_process(cls) -> ParallelRuntime:
@@ -205,5 +209,12 @@ class ParallelRuntime:
         a property rather than four edited call-site conditions so that the
         fifth checkpoint site added later inherits the answer instead of
         silently reintroducing the hang.
+
+        A model-parallel mesh (``mesh.layout.group`` set) also answers True: every rank
+        enters the save, and only rank 0 writes (``checkpointing.store``). Tensor, context
+        and spatial peers hold distinct shards once model parallelism shards the state, so
+        their collectives must run in step. Trivial meshes keep rank-0 gating.
         """
-        return bool(getattr(self.checkpoint_adapter, "requires_all_ranks", False))
+        if bool(getattr(self.checkpoint_adapter, "requires_all_ranks", False)):
+            return True
+        return self.mesh is not None and self.mesh.layout.group is not None

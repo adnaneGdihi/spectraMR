@@ -788,8 +788,10 @@ show_missing = true
 # ============================================================
 
 [tool.uv]
+# Python 3.15 has no Linux wheels yet for gudhi or ray[tune], so any re-lock
+# (Dependabot included) fails on that split; lift the cap once they ship.
 environments = [
-    "sys_platform == 'linux'",
+    "sys_platform == 'linux' and python_full_version < '3.15'",
 ]
 
 # CUDA 12.6 is what the TARGET HARDWARE needs, and it is the hardware that

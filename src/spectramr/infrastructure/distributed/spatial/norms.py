@@ -9,10 +9,14 @@ the native kernels at float32.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
+
+from spectramr.infrastructure.distributed.spatial.halo import require_spatial_scope
 
 
 def _all_sum(t: torch.Tensor, group: Any) -> torch.Tensor:
@@ -21,13 +25,16 @@ def _all_sum(t: torch.Tensor, group: Any) -> torch.Tensor:
     return all_reduce(t, group=group)
 
 
+def _global_count(x: torch.Tensor, dims: tuple[int, ...], group: Any) -> float:
+    # Slabs are equal (split_depth refuses an uneven split), so the global count is known
+    # on the host: no tensor to copy to the device and no collective to wait on.
+    return float(math.prod(x.shape[d] for d in dims) * dist.get_world_size(group))
+
+
 def _group_stats(
     x: torch.Tensor, dims: tuple[int, ...], group: Any
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    count = torch.tensor(
-        [float(torch.tensor([x.shape[d] for d in dims]).prod())], device=x.device, dtype=x.dtype
-    )
-    count = _all_sum(count, group)
+    count = _global_count(x, dims, group)
     mean = _all_sum(x.sum(dim=dims, keepdim=True), group) / count
     var = _all_sum((x - mean).square().sum(dim=dims, keepdim=True), group) / count
     return mean, var
@@ -45,6 +52,7 @@ class SpatialGroupNorm(nn.GroupNorm):
         return norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        require_spatial_scope("SpatialGroupNorm")
         b, c = x.shape[:2]
         grouped = x.reshape(b, self.num_groups, c // self.num_groups, *x.shape[2:])
         mean, var = _group_stats(grouped, tuple(range(2, grouped.dim())), self.spatial_group)
@@ -68,6 +76,7 @@ class SpatialInstanceNorm3d(nn.InstanceNorm3d):
         return norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        require_spatial_scope("SpatialInstanceNorm3d")
         mean, var = _group_stats(x, (2, 3, 4), self.spatial_group)
         y = (x - mean) / torch.sqrt(var + self.eps)
         if self.affine:
@@ -91,13 +100,12 @@ class SpatialBatchNorm3d(nn.BatchNorm3d):
         return norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        require_spatial_scope("SpatialBatchNorm3d")
         if not (self.training or not self.track_running_stats):
             return super().forward(x)
         mean, var = _group_stats(x, (0, 2, 3, 4), self.spatial_group)
         if self.training and self.track_running_stats:
-            count = _all_sum(
-                torch.tensor([float(x.numel() // x.shape[1])], device=x.device), self.spatial_group
-            )
+            count = _global_count(x, (0, 2, 3, 4), self.spatial_group)
             with torch.no_grad():
                 self.num_batches_tracked += 1
                 momentum = (
@@ -105,7 +113,7 @@ class SpatialBatchNorm3d(nn.BatchNorm3d):
                     if self.momentum is not None
                     else 1.0 / float(self.num_batches_tracked)
                 )
-                unbiased = var.flatten() * count / (count - 1).clamp_min(1)
+                unbiased = var.flatten() * (count / max(count - 1, 1.0))
                 self.running_mean.lerp_(mean.flatten(), momentum)
                 self.running_var.lerp_(unbiased, momentum)
         y = (x - mean) / torch.sqrt(var + self.eps)
@@ -129,10 +137,8 @@ class SpatialGlobalAvgPool3d(nn.AdaptiveAvgPool3d):
         return pool
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        count = _all_sum(
-            torch.tensor([float(x[0, 0].numel())], device=x.device, dtype=x.dtype),
-            self.spatial_group,
-        )
+        require_spatial_scope("SpatialGlobalAvgPool3d")
+        count = _global_count(x, (2, 3, 4), self.spatial_group)
         return _all_sum(x.sum(dim=(2, 3, 4), keepdim=True), self.spatial_group) / count
 
 

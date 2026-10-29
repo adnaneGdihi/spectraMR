@@ -1579,6 +1579,20 @@ parallel:
   static_graph: false
   sync_batch_norm: false            # needs a process group; rejected for 'dp'
 
+  # Model-parallel axis sizes on ONE DeviceMesh. Each defaults to 1 (pure
+  # data-parallel). The data-parallel size is world // (tensor*context*spatial*pipeline)
+  # and must divide exactly, checked at launch. Only 'ddp' and 'fsdp' may set an
+  # axis above 1; the other strategies raise at load time.
+  mesh:
+    tensor: 1
+    context: 1
+    spatial: 1
+    pipeline: 1
+  # [S0, S1, S2] (data.sampling.patch_size order) of the synthetic volume the spatial
+  # equivalence gate runs on when mesh.spatial > 1; the split runs along S0. null
+  # derives it from data.sampling.patch_size.
+  spatial_probe_shape: null
+
   fsdp:
     enabled: false                  # must equal (strategy == 'fsdp')
     sharding_strategy: 'full_shard' # options: 'full_shard', 'shard_grad_op', 'no_shard', 'hybrid_shard'

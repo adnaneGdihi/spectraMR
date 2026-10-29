@@ -34,6 +34,9 @@ def _layers():
         "convT k4 s2 p1": nn.ConvTranspose3d(4, 4, 4, stride=2, padding=1),
         "upsample nearest": nn.Upsample(scale_factor=2, mode="nearest"),
         "upsample trilinear": nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False),
+        "upsample trilinear aligned": nn.Upsample(
+            scale_factor=2, mode="trilinear", align_corners=True
+        ),
         "groupnorm": nn.GroupNorm(2, 4),
         "instancenorm": nn.InstanceNorm3d(4, affine=True),
         "batchnorm": nn.BatchNorm3d(4),
@@ -124,7 +127,11 @@ def _scenario_refused() -> None:
 def _scenario_keys_and_running_stats() -> None:
     import copy
 
-    from spectramr.infrastructure.distributed.spatial import convert_to_spatial, split_depth
+    from spectramr.infrastructure.distributed.spatial import (
+        convert_to_spatial,
+        spatial_scope,
+        split_depth,
+    )
 
     group = torch.distributed.group.WORLD
     torch.manual_seed(0)
@@ -135,7 +142,8 @@ def _scenario_keys_and_running_stats() -> None:
     assert list(model.state_dict()) == keys, "conversion renamed state-dict keys"
     x = torch.randn(SHAPE)
     reference(x)
-    model(split_depth(x, group))
+    with spatial_scope():
+        model(split_depth(x, group))
     for key in ("1.running_mean", "1.running_var"):
         torch.testing.assert_close(model.state_dict()[key], reference.state_dict()[key])
 

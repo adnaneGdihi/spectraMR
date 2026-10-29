@@ -263,5 +263,5 @@ any worker starts, and reads the copies. The default ``off`` reads in place.
 Jobs that share a node serialise on one lock and reuse each other's copy; a copy interrupted by
 a kill is discarded and made again. A set that does not leave ``min_free_gb`` free raises;
 ``when_full: read_in_place`` is the explicit, logged opt-out. Wired so far: M4Raw and the fastMRI-style HDF5 route (``kspace`` / ``image`` with an index); other dataset types read in place.
-``scripts/diagnostics/simulate_staging.py`` models the mechanism on a synthetic tree; it does not
+The maintainer-tree ``simulate_staging.py`` models the mechanism on a synthetic tree; it does not
 measure any cluster.

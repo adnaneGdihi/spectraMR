@@ -114,22 +114,36 @@ _GPU_PATH_PREFIXES = (
 _SMOKE_PATH_PREFIXES = ("tests/smoke/",)
 
 
+# getsource re-parses the whole module for a class, once per collected item; caching
+# per object took collection from ~37 min to minutes on the CI runner.
+_SOURCE_CACHE: dict[object, str] = {}
+
+
+def _cached_source(obj) -> str:
+    try:
+        return _SOURCE_CACHE[obj]
+    except KeyError:
+        pass
+    except TypeError:  # unhashable callable
+        return ""
+    try:
+        src = inspect.getsource(obj)
+    except (OSError, TypeError, AttributeError):
+        src = ""
+    _SOURCE_CACHE[obj] = src
+    return src
+
+
 def _gpu_source_blob(item) -> str:
     """Best-effort source text for a test: its function body plus, for
     class-based tests, the enclosing class body (setup/helpers live there)."""
     blob = ""
     func = getattr(item, "function", None)
     if func is not None:
-        try:
-            blob += inspect.getsource(func)
-        except (OSError, TypeError, AttributeError):
-            pass
+        blob += _cached_source(func)
     cls = getattr(item, "cls", None)
     if cls is not None:
-        try:
-            blob += inspect.getsource(cls)
-        except (OSError, TypeError, AttributeError):
-            pass
+        blob += _cached_source(cls)
     return blob
 
 

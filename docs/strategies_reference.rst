@@ -1018,7 +1018,7 @@ trained with.
 
 **FNO-EPG surrogate.** ``use_fno_epg: true`` renders through a Fourier-neural-operator
 surrogate of the analytic EPG. It needs ``model_kwargs.fno_epg_weights``, a file written by
-``scripts/physics/pretrain_fno_epg.py`` (fitted over T1, T2, B1+ and echo spacing, scored on
+the maintainer-tree ``pretrain_fno_epg.py`` (fitted over T1, T2, B1+ and echo spacing, scored on
 held-out voxels, refused above ``--max-mae``); a default-initialised surrogate is a random
 function and the strategy does not build one. It is loaded frozen.
 
@@ -1895,7 +1895,7 @@ per-batch fit from the coil null space. The correction is derived for
 complex-Gaussian k-space noise, so the schema refuses ``noise_model:
 ncchi_magnitude`` with it on. The estimator and its tests live in
 ``strategies/robust_ssdu.py``; the derivation is in
-``experiments/inprogress/self_supervised/PAPER.md``.
+the self_supervised cohort's paper draft (not in the public export).
 
 The strategy owns the operator: the network is handed :math:`A^H\tilde{\mathbf{y}}`
 (SENSE-combined with the batch's complex coil maps), the model's data consistency

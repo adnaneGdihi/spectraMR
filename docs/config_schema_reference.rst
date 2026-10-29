@@ -829,12 +829,12 @@ Replaces all legacy ``objectives:`` + ``lambda_*`` flat keys.
      - ``"safetensors"``
      - File format of every checkpoint the run writes: ``safetensors`` (no pickle),
        ``pt`` or ``pth`` (the same ``torch.save`` container). A resume reads each file in
-       whatever format it has. See :doc:`checkpointing`.
+       whatever format it has.
    * - ``async_write``
      - ``false``
      - Write checkpoint files and apply ``keep_last_n`` on a background thread; the
        state is copied to CPU on the training thread first. A failed write still stops
-       the run, at the next save or at the end of training. See :doc:`checkpointing`.
+       the run, at the next save or at the end of training.
    * - ``produced_by_arm``
      - ``null``
      - Name of the upstream campaign arm that builds this arm's declared

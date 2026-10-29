@@ -93,7 +93,7 @@ then estimates nothing, and raises if that calibration or the maps' shape
 differs from its own ``acs_size``/``kernel_size``/``eigen_threshold``.
 
 ``complementary_rep_masking`` (``produces=("mask", "loss_mask", "measured_kspace")``) is the
-CoNEX protocol's data side (``experiments/inprogress/n2n/PAPER.md`` § 4): it
+CoNEX protocol's data side (the n2n cohort's paper draft, § 4; not in the public export): it
 undersamples ``input`` by a mask :math:`M_1` drawn inside the acquired
 phase-encode columns and emits ``loss_mask`` = :math:`M_2` for the
 ``masked_kspace_l2`` loss (:doc:`losses_reference`). ``mode`` selects how

@@ -189,6 +189,20 @@ class TestRefusals:
         with pytest.raises(ValueError, match="missing keys"):
             HardwareUnwarp(artifact_path=path)
 
+    def test_fold_artifact_is_refused_as_the_production_warp(self, tmp_path: Path) -> None:
+        artifact = identity_artifact(**KNOBS)
+        artifact["held_out"] = {
+            "subject_id": "sub-0027",
+            "n_pairs": 2,
+            "n_points": 40000,
+            "rms_before_mm": 4.1,
+            "rms_predicted_mm": 0.3,
+            "rms_after_mm": 4.0,
+        }
+        path = write_artifact(artifact, tmp_path / "fold.json")
+        with pytest.raises(ValueError, match="held out sub-0027"):
+            HardwareUnwarp(artifact_path=path)
+
     def test_missing_image_key_raises(self, tmp_path: Path) -> None:
         path = write_artifact(identity_artifact(**KNOBS), tmp_path / "identity.json")
         subject = tio.Subject(other=tio.ScalarImage(tensor=_ramp(), affine=AFFINE.numpy()))

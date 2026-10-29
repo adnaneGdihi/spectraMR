@@ -287,11 +287,7 @@ def test_no_val_batches_adds_no_override():
 
 
 def test_val_batches_targets_a_key_the_framework_actually_reads():
-    """Guards against re-pointing this at `validation.enabled`, which is inert.
-
-    Issue #673: 1006 arms set `validation.enabled`, 8 to `false`, and validation
-    runs regardless. A cap wired to it would report success and do nothing.
-    """
+    """Guards against re-pointing this at `validation.enabled`, which switches validation off."""
     child = _child_argv(
         build_scalene_command(_ns(val_batches=2), child_run_dir=Path("r"), outfile=Path("p.json"))
     )

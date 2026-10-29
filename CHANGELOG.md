@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-10-28
+
+### Added
+- **One device mesh for every collective:** `parallel.mesh {tensor, context, spatial, pipeline}`
+  (each default 1). Only `ddp` and `fsdp` may split an axis, and the world size must divide
+  exactly by the mesh product.
+- **Tensor parallelism** for the transformer blocks under `ddp` (`parallel.mesh.tensor > 1`):
+  every `TokenAttention` and the MLPs of `DiTBlock` / `UViTBlock` are split Megatron-style. Each
+  split block is checked against an unsplit copy before training. A model with nothing to split,
+  a head or hidden count that does not divide, and `fsdp` with a tensor mesh are refused.
+- **Spatial parallelism for training** (`parallel.mesh.spatial: N`, `ddp` only): a 3D model trains
+  with each volume split along depth across the spatial group, after an equivalence check on a
+  synthetic volume. Its combinations with context, tensor or pipeline parallelism,
+  `sync_batch_norm` and `optimization.compile` are refused.
+- The hardware-warp calibration honours `split.type: loso_subject` over its pose set, and the
+  fitted warp is the arm's model (`hardware_warp_operator`).
+
+### Fixed
+- `validation.enabled: false` is read: no validation loader is attached, so no validation event
+  or best checkpoint follows and the validation reachability gate does not fire.
+- Test collection no longer re-reads each test class's source once per collected item; the full
+  suite collects in about a minute instead of 37-55 minutes.
+- The release test lane: a `loguru` import (not a dependency) is gone, the mutation job runs
+  under mutmut 2 against the physics tests, and the lock re-resolves (environments capped below
+  Python 3.15, where gudhi and ray[tune] ship no wheels).
+
+### Security
+- The lock moves to urllib3 2.8.0, pillow 13.0.0 and filelock 4.2.4.
+
 ## [1.3.2] - 2026-10-28
 
 ### Added
@@ -311,7 +340,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the other two are transitive, so no declared constraint changes.
 
 ### Migration
-- Convert pre-1.0 runs once with `scripts/migrations/convert_checkpoints_v1.py <run_dir>`
+- Convert pre-1.0 runs once with `convert_checkpoints_v1.py <run_dir>` (maintainer tree, `scripts/migrations/`; not in the public export)
   before `--resume` or `predict` on them.
 - Convert a run only while no job can write to it: finish or `scancel` its chain first.
   A conversion killed at any point finishes when the same command is rerun; one that
@@ -475,7 +504,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      return 404, so the 200s here mean something. The `[0.1.0]` heading date above
      and `date-released` in CITATION.cff are two further declarations of the same
      day, and nothing reconciles the three; change them together. -->
-[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.3
 [1.3.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.2
 [1.3.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.1
 [1.3.0]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.0

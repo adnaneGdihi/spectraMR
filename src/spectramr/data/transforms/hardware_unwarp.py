@@ -76,6 +76,14 @@ class HardwareUnwarp(tio.Transform):
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
         artifact = load_artifact(artifact_path)
+        if artifact["held_out"] is not None:
+            # A fold's artifact was fitted without one subject to score the fit on it; applying
+            # it to images would pass a validation fit off as the production warp.
+            raise ValueError(
+                f"{artifact_path} is a hold-one-subject-out fold (held out "
+                f"{artifact['held_out']['subject_id']}); calibrate without data.split to "
+                "produce the warp that images are corrected with"
+            )
         self.artifact_path = str(artifact_path)
         self.unit_id = artifact["unit_id"]
         self.software_version = artifact["software_version"]

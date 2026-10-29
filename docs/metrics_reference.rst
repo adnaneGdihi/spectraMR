@@ -457,11 +457,11 @@ Coil null-space and repetition metrics
 --------------------------------------
 
 Reference-free (or reference-noise-corrected) quantities for multi-coil
-k-space reconstruction, derived in ``experiments/inprogress/n2n/PAPER.md``
-(§ 3 and § 5). All four ``needs=("coil_maps", ...)`` metrics read the complex
+k-space reconstruction, derived in the n2n cohort's paper draft
+(§ 3 and § 5; not in the public export). All four ``needs=("coil_maps", ...)`` metrics read the complex
 ESPIRiT maps under ``sensitivity_complex``: published by the M4Raw loader from
 ``data.coil_maps_root`` (one file per repetition group, written by
-``scripts/precompute_m4raw_coil_maps.py``), or estimated by the
+the maintainer-tree ``precompute_m4raw_coil_maps.py``), or estimated by the
 ``espirit_sensitivity`` transform when no map root is declared. The
 ``pred_alt`` ones additionally need ``data.emit_alternate_input: true`` so the
 validation step can run the model on a second repetition of the same slice.

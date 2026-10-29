@@ -1,6 +1,7 @@
 """Unit tests for DataBuilder."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -533,3 +534,35 @@ def test_the_test_loader_batch_size_is_owned_by_the_test_split(monkeypatch):
     builder._loaders = {}
     builder.build_test_loader()
     assert builder._loaders["test"] == "t" and "val_batch_size" not in seen
+
+
+@patch("spectramr.infrastructure.builders.directors.data_pipeline_director.DataPipelineDirector")
+def test_validation_disabled_attaches_no_val_loader(mock_director_cls, builder):
+    """``validation.enabled: false`` was read by nothing (issue #673): the loader was
+    attached and the loop validated anyway. The builder is the flag's one owner now."""
+    mock_director = MagicMock()
+    mock_director.build_dataloaders.return_value = (MagicMock(name="train"), MagicMock(name="val"))
+    mock_director_cls.return_value = mock_director
+    builder._config.validation = SimpleNamespace(
+        enabled=False, loader=SimpleNamespace(batch_size=None, shuffle=False)
+    )
+
+    builder.build_train_val_loaders()
+
+    assert "train" in builder._loaders
+    assert "val" not in builder._loaders
+
+
+@patch("spectramr.infrastructure.builders.directors.data_pipeline_director.DataPipelineDirector")
+def test_validation_enabled_true_still_attaches_the_val_loader(mock_director_cls, builder):
+    mock_director = MagicMock()
+    mock_val = MagicMock(name="val")
+    mock_director.build_dataloaders.return_value = (MagicMock(name="train"), mock_val)
+    mock_director_cls.return_value = mock_director
+    builder._config.validation = SimpleNamespace(
+        enabled=True, loader=SimpleNamespace(batch_size=None, shuffle=False)
+    )
+
+    builder.build_train_val_loaders()
+
+    assert builder._loaders["val"] is mock_val

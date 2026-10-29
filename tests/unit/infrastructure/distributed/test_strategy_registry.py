@@ -242,3 +242,32 @@ class TestCheckpointAdapterSeam:
         assert "checkpoint_adapter=parallel_plugin.checkpoint_adapter(" in (
             inspect.getsource(director)
         )
+
+
+class TestCheckpointGatingFollowsTheMesh:
+    """A model-parallel mesh makes every rank enter the save; a trivial mesh does not."""
+
+    @staticmethod
+    def _runtime(group):
+        from spectramr.core.parallel_groups import DPLayout
+        from spectramr.infrastructure.distributed.mesh import ParallelMesh
+        from spectramr.infrastructure.distributed.strategy_registry import ParallelRuntime
+
+        layout = DPLayout(
+            rank=0,
+            world_size=2,
+            group=group,
+            src_rank=0,
+            writer=True,
+            dim_names=("pp", "dp_replicate", "dp_shard", "cp", "sp", "tp"),
+            shape=(1, 2, 1, 1, 1, 2),
+        )
+        return ParallelRuntime(
+            strategy="ddp", mesh=ParallelMesh(device_mesh=None, layout=layout, shape={})
+        )
+
+    def test_trivial_mesh_keeps_rank_zero_gating(self) -> None:
+        assert self._runtime(group=None).checkpoints_require_all_ranks is False
+
+    def test_model_parallel_mesh_enters_the_save_on_every_rank(self) -> None:
+        assert self._runtime(group="dp-group").checkpoints_require_all_ranks is True

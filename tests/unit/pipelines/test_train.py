@@ -1901,11 +1901,12 @@ class TestOnlyRankZeroWritesTheCanonicalArtifacts:
         source = self._source()
         assert 'f"provenance_rank{_resolved_rank}.json"' in source
 
-    def test_the_naming_rank_comes_from_the_shared_resolver(self):
-        """A provenance file named for a different rank than the one that sharded
-        the data would be worse than no per-rank file at all."""
+    def test_the_naming_rank_is_the_global_rank_not_the_data_rank(self):
+        """One file per process: tensor peers share a data rank, so naming by it
+        would have them overwrite each other's provenance."""
         source = self._source()
-        assert "_resolved_rank = resolve_data_rank(config)" in source
+        assert "_resolved_rank = resolve_global_rank(config)" in source
+        assert "_data_rank = resolve_data_rank(config)" in source
 
     def test_the_id_named_copy_is_rank_gated_too(self):
         """#1299's ``provenance_run_<run_id>.json`` needs the same gate.
@@ -2705,10 +2706,10 @@ def _run_ranks(monkeypatch, fn, per_rank_args, timeout=5.0):
         barrier.wait()
         return values
 
-    def all_gather_object(out, obj):
+    def all_gather_object(out, obj, group=None):
         out[:] = _exchange("gather", obj)
 
-    def all_reduce(tensor, op=None):
+    def all_reduce(tensor, op=None, group=None):
         values = _exchange("reduce", tensor.clone())
         shapes = {tuple(v.shape) for v in values}
         if len(shapes) != 1:

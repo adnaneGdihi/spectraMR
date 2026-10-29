@@ -73,7 +73,7 @@ takes the YAML as a positional). ``launch?`` marks the verbs reachable through
        through Scalene, or Scalene is not installed, and stamps why in the
        manifest; that backend records GPU kernel time only (no ``phases/``, no
        ``hotspots.json``) and needs CUDA and ``--iterations >= 16``. The child is stopped after ``--timeout-min``
-       (default 30; ``0`` = no cap). ``scripts/profiling/submit_profile_array.sh``
+       (default 30; ``0`` = no cap). ``submit_profile_array.sh`` (maintainer tree, not exported)
        submits a whole folder as an array (``audit`` first, ``--mode cpu-only``:
        ``cpu+gpu`` is for one arm, not an array) and a parameter-free arm is
        refused up front. Artifacts land in ``<training.output_dir>/profile/<run_id>/``
@@ -212,9 +212,9 @@ Two things are worth knowing about what the cap buys:
 On a volume-backed arm the direct validation loader emits one volume per batch,
 so ``N`` is also the number of volumes graded.
 
-``--val-batches`` caps validation; it cannot switch it off. ``validation.enabled``
-is declared by many arms and read by none (issue #673), so a value below 1 is
-refused rather than quietly meaning "no cap".
+``--val-batches`` caps validation; it cannot switch it off, so a value below 1 is
+refused rather than quietly meaning "no cap". To profile without validation, pass
+``-O validation.enabled=false``: the data builder then attaches no validation loader.
 
 Generating reports (``report``)
 -------------------------------

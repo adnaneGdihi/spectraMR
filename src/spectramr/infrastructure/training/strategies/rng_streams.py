@@ -25,6 +25,7 @@ from typing import Any
 import torch
 
 from spectramr.core.env import distributed_rank
+from spectramr.core.parallel_groups import current_dp_layout
 
 __all__ = ["generator_states", "rank_seeded_generator", "restore_generator_states", "stream_rank"]
 
@@ -32,12 +33,15 @@ _SEED_SPAN = 1 << 62
 
 
 def stream_rank() -> int:
-    """This process's global rank, ``0`` outside a distributed launch.
+    """This process's data-parallel rank, ``0`` outside a distributed launch.
 
-    Read from the launcher's environment rather than the process group, so it is
-    already correct when a strategy is built before ``init_process_group``.
+    Ranks that share one data replica (tensor, context, spatial or pipeline peers)
+    must draw the same timesteps and masks, so a non-trivial mesh keys the stream by
+    data-parallel rank. Without an active mesh it is the global rank, read from the
+    launcher's environment so it is correct before ``init_process_group``.
     """
-    return distributed_rank() or 0
+    layout = current_dp_layout()
+    return layout.rank if layout is not None else (distributed_rank() or 0)
 
 
 def rank_seeded_generator(seed: int) -> torch.Generator:

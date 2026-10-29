@@ -45,6 +45,42 @@ where ``strategy: 'none'`` with ``fsdp.enabled: true`` would silently shard, or
 where ``strategy: 'fsdp'`` alone would raise only after the whole training
 environment had been built.
 
+The device mesh
+---------------
+
+Every ``ddp`` and ``fsdp`` run builds one named ``DeviceMesh`` at launch, with the
+dimensions ``pp, dp_replicate, dp_shard, cp, sp, tp``. Set the model-parallel sizes
+under ``parallel.mesh`` (``tensor``, ``context``, ``spatial``, ``pipeline``; each
+defaults to 1):
+
+.. code-block:: yaml
+
+   parallel:
+     strategy: 'ddp'
+     mesh:
+       tensor: 2             # 4 ranks -> 2 data-parallel replicas of 2 tensor peers
+
+The data-parallel size is ``world // (tensor * context * spatial * pipeline)`` and must
+divide exactly; the launch raises otherwise. Only ``ddp`` and ``fsdp`` may set an axis
+above 1. Ranks that share a data shard (tensor peers) receive identical batches and
+draw the same data-stream seed. Validation metrics are summed over the data-parallel
+group only, so a sample is counted once. The run's provenance records the mesh shape
+and dimension names.
+
+**Tensor parallelism** (``mesh.tensor > 1``, with ``strategy: ddp``) splits every
+``TokenAttention`` by heads and the MLPs of ``DiTBlock`` and ``UViTBlock`` by hidden
+units, Megatron-style: each rank keeps the q, k and v rows of its own heads and the
+matching input columns of ``proj``, and one all-reduce per block sums the partial
+outputs. This covers the DiT, UViT and HAT backbones; a model with
+nothing to split is refused, as is ``fsdp`` with a tensor mesh (that needs DTensor
+plans). Before training, each split block is checked against an unsplit copy (output,
+input gradient, and the weights after one SGD step), on every rank, with the weights
+required identical across the tensor group. Parameter names are unchanged and a
+checkpoint gathers to full shapes on save and slices on load, so it is interchangeable
+with an unsplit model's; saving is therefore entered by every rank. Tensor peers draw
+the same strategy random streams (timesteps, masks), keyed by data-parallel rank.
+Context, spatial and pipeline axes are not wired into training yet.
+
 Launching
 ---------
 
@@ -61,8 +97,8 @@ this, and the distribution does not carry them: each states one site's
 allocation account and mail domain as data rather than taking them as
 parameters. One stands up the allocation and the rendezvous for **one arm**
 (single- or multi-node); the other fans a whole cohort out as an array, one task
-per YAML, reading each arm's ``parallel.strategy`` and picking the verb for it —
-see :ref:`array-dispatch-parallelism`. Neither needs to be told which arms are
+per YAML, reading each arm's ``parallel.strategy`` and picking the verb for it.
+Neither needs to be told which arms are
 distributed.
 
 That pick belongs to ``train``. An array submitted for another pipeline
@@ -769,8 +805,9 @@ nothing.
 
 At ZeRO stage 3 with EMA enabled, ``--resume`` refuses before loading anything: the
 step file carries only rank 0's partition of the shadow, and loading it would give
-every rank that partition. :doc:`checkpointing` ("ZeRO-3 with EMA") says what to do
-instead.
+every rank that partition. Train at ZeRO stage 1 or 2 when a run needs EMA and must
+resume; an existing stage-3 EMA run resumes only with ``ema.enabled: false``, which is a
+different experiment from the one it started as.
 
 Who participates vs who writes
 ------------------------------

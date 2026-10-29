@@ -61,8 +61,12 @@ repos:
         #     the 30 files issue #1918 touched alone).
         # `gool` is Luc Van Gool, a co-author on the SwinIR paper every arm
         # citing that backbone names; codespell reads the surname as "ghoul".
+        # `unser` is Michael Unser, co-author of Monte-Carlo SURE, cited in the
+        # cohort PROPOSAL.md reference lists; codespell reads it as "under".
+        # `carin` is Lawrence Carin, a co-author cited in the promoted PROPOSAL.md.
+        # `yau` is Shing-Tung Yau, co-author of the T-map paper cited in sfc_conformal_2026.
         # `lamda` is sigpy's own `SenseRecon` keyword (`lambda` is reserved).
-        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat,gool,reson,nmae,notin,lamda"]
+        args: ["--ignore-words-list=mse,nd,te,ot,fpr,astroid,unparseable,tre,nce,strat,gool,reson,nmae,unser,carin,yau,notin,lamda"]
 
   # Workflow YAML is load-bearing now: pr-required.yml gates every merge.
   - repo: https://github.com/rhysd/actionlint

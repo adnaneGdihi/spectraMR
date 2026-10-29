@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from spectramr.core.module_utils import unwrap_model
+from spectramr.core.parallel_groups import dp_rank
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +74,8 @@ def is_rank_zero(config: Any) -> bool:
     return torch.distributed.get_rank() == 0
 
 
-def resolve_data_rank(config: Any) -> int:
-    """Rank to offset the *data-stream* RNG by, or 0 when there is one process.
+def resolve_global_rank(config: Any) -> int:
+    """This process's global rank, or 0 when there is one process.
 
     Same four guards as ``is_rank_zero`` and deliberately so: the question "which
     rank am I" is only meaningful under exactly the conditions that make "am I
@@ -97,10 +98,23 @@ def resolve_data_rank(config: Any) -> int:
     return torch.distributed.get_rank()
 
 
+def resolve_data_rank(config: Any) -> int:
+    """Index of this rank's data shard: its data-parallel index, not its global rank.
+
+    With model-parallel axes, ranks in one tensor/context/spatial/pipeline group see the
+    same batches, so they must draw the same data-stream seed. The global rank would
+    split them. Equal to :func:`resolve_global_rank` on a trivial mesh.
+    """
+    if resolve_global_rank(config) == 0:
+        return 0
+    return dp_rank()
+
+
 #: ``unwrap_model`` is re-exported from ``spectramr.core.module_utils``; naming it
 #: here makes the re-export explicit rather than an apparently-unused import.
 __all__ = [
     "is_rank_zero",
     "resolve_data_rank",
+    "resolve_global_rank",
     "unwrap_model",
 ]

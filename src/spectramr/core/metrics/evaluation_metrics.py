@@ -1314,10 +1314,12 @@ class InceptionScoreMetric(BaseMetric):
         """
         import torch.distributed as dist
 
-        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        from spectramr.core.parallel_groups import dp_group, dp_world_size
+
+        if not (dist.is_available() and dist.is_initialized() and dp_world_size() > 1):
             return [] if local is None else [local]
-        gathered: list[Any] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, local)
+        gathered: list[Any] = [None] * dp_world_size()
+        dist.all_gather_object(gathered, local, group=dp_group())
         return [piece for piece in gathered if piece is not None]
 
     def compute_metric(self, preds: Image, target: Image, **kwargs: Any) -> Tensor:
@@ -1369,9 +1371,13 @@ class FID(BaseMetric):
         if self.use_torchmetrics:
             from torchmetrics.image.fid import FrechetInceptionDistance
 
-            self.fid = FrechetInceptionDistance(feature=feature_layer, normalize=True).to(
-                self.device
-            )
+            from spectramr.core.parallel_groups import dp_group
+
+            # torchmetrics syncs its feature state over the group given here; the data-
+            # parallel group, so model-parallel peers are not counted twice.
+            self.fid = FrechetInceptionDistance(
+                feature=feature_layer, normalize=True, process_group=dp_group()
+            ).to(self.device)
         elif torchvision:
             self.inception = inception_v3(weights=Inception_V3_Weights.DEFAULT)
             self.inception.fc = nn.Identity()

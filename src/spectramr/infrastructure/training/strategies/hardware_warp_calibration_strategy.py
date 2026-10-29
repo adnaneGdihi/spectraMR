@@ -3,10 +3,9 @@
 No learned parameters. The strategy walks under the standard training harness -- the
 ``QualityMatchingStrategy`` precedent -- and its deliverable is the warp artifact of
 :mod:`spectramr.data.hardware_warp_artifacts`, not a checkpoint. Every knob of
-``training.*`` is read, validated and stamped at construction, so a misdeclared arm fails
-before the dataloader has consumed any memory; the fit itself runs once, from the first
-training step, and every step returns an exactly-zero differentiable loss so the harness's
-backward/step cycle stays valid while nothing moves.
+``training.*`` is read, validated and stamped at construction, where the fit also runs once and
+is loaded into the arm's operator; every training step returns an exactly-zero differentiable
+loss so the harness's backward/step cycle stays valid while nothing moves.
 """
 
 from __future__ import annotations
@@ -24,6 +23,11 @@ from spectramr.data.hardware_warp_artifacts import (
     write_artifact,
 )
 from spectramr.infrastructure.physics.hardware_warp_calibration import calibrate_hardware_warp
+from spectramr.infrastructure.physics.hardware_warp_holdout import (
+    held_out_report,
+    split_pairs_by_subject,
+)
+from spectramr.models.generators.hardware_warp_operator import HardwareWarpOperator
 
 from .reconstruction import ReconstructionTrainingStrategy
 
@@ -64,6 +68,29 @@ class HardwareWarpKnobs:
     readout_term: str
     unit_id: str
     software_version: str
+    holdout_subject: str | None = None
+
+
+def holdout_subject_from_split(config: Any) -> str | None:
+    """The subject ``data.split`` holds out of the fit, or ``None`` when it declares no fold.
+
+    The framework's ``split.type: loso_subject`` is honoured by its ``holdout_subject`` id only.
+    Its ``loso_fold`` indexes the manifest's sorted subject list, which the data pipeline also
+    reads for this arm's substrate loader, while the calibration's subjects are the pose set's;
+    one index would name two different subjects, so it is refused rather than reinterpreted.
+    """
+    split = getattr(getattr(config, "data", None), "split", None)
+    if split is None or getattr(split, "type", None) != "loso_subject":
+        return None
+    if getattr(split, "loso_fold", None) is not None:
+        raise ValueError(
+            "data.split.loso_fold indexes the manifest's subjects, not the pose set's, so the "
+            "same fold would name two subjects; declare data.split.holdout_subject by id"
+        )
+    holdout = getattr(split, "holdout_subject", None)
+    if not isinstance(holdout, str) or not holdout:
+        raise ValueError("data.split.type=loso_subject requires data.split.holdout_subject")
+    return holdout
 
 
 def require_hardware_warp_config(config: Any) -> HardwareWarpKnobs:
@@ -131,6 +158,7 @@ def require_hardware_warp_config(config: Any) -> HardwareWarpKnobs:
         readout_term=str(values["readout_term"]),
         unit_id=values["unit_id"],
         software_version=values["software_version"],
+        holdout_subject=holdout_subject_from_split(config),
     )
 
 
@@ -139,10 +167,18 @@ def run_hardware_warp_calibration(knobs: HardwareWarpKnobs) -> dict[str, Any]:
 
     The floor is enforced on the artifact's own ``constant_per_degree`` -- the certificate the
     fit was made under -- and a degree below it raises before anything is written, because an
-    unidentifiable block would be reported as a measured warp.
+    unidentifiable block would be reported as a measured warp. With ``holdout_subject`` the fit
+    excludes that subject's pairs and the artifact's ``held_out`` reports their residual before
+    and after the fitted commutator; that number is reported, never judged, here.
     """
     pose_set = load_pose_set(knobs.pose_set_path)
     residuals = load_pair_residuals(pose_set, knobs.pose_set_path.parent)
+    held_pairs: list[dict[str, Any]] = []
+    held_residuals: list[Any] = []
+    if knobs.holdout_subject is not None:
+        pose_set, residuals, held_pairs, held_residuals = split_pairs_by_subject(
+            pose_set, residuals, knobs.holdout_subject
+        )
     artifact = calibrate_hardware_warp(
         pose_set,
         residuals,
@@ -164,15 +200,18 @@ def run_hardware_warp_calibration(knobs: HardwareWarpKnobs) -> dict[str, Any]:
             f"degree(s) {below}: the pose set does not determine those blocks. Add repeat "
             "sessions with a different head pose or lower training.max_degree."
         )
+    if held_pairs:
+        artifact["held_out"] = held_out_report(artifact, held_pairs, held_residuals)
     path = write_artifact(artifact, knobs.artifact_path)
     logger.info(
         "HardwareWarpCalibration: %d pairs, constant per degree %s (floor %g), %d coefficients "
-        "written to %s",
+        "written to %s; held out %s",
         artifact["n_pairs"],
         artifact["constant_per_degree"],
         knobs.identifiability_floor,
         len(artifact["coeffs"]),
         path,
+        artifact["held_out"],
     )
     return artifact
 
@@ -181,9 +220,12 @@ class HardwareWarpCalibrationStrategy(ReconstructionTrainingStrategy):
     """Identify the scanner's hardware warp from repeat-session commutators.
 
     A frozen-parameter orchestrator: it LEARNS NOTHING. Construction resolves and stamps every
-    knob and confirms the pose set exists; the first training step runs
-    :func:`run_hardware_warp_calibration` once and every step returns an exactly-zero,
-    differentiable loss.
+    knob, runs :func:`run_hardware_warp_calibration` once and loads the fit into the arm's
+    :class:`HardwareWarpOperator`; every training step then returns an exactly-zero,
+    differentiable loss. The fit runs at construction rather than on the first step because the
+    substrate loader is a formality for this arm and may yield no batch at all (the Swoop
+    volumes are smaller than the sibling arms' patch), and a step that never comes must not
+    silently mean an artifact that is never written.
     """
 
     #: Loss ownership (issue #1918): computes no loss term and folds nothing.
@@ -193,17 +235,37 @@ class HardwareWarpCalibrationStrategy(ReconstructionTrainingStrategy):
     def _setup_strategy_specific_components(self) -> None:
         self._verify_strategy_config(expected_modes=("hardware_warp_calibration",))
         self._knobs = require_hardware_warp_config(self.config)
-        self._artifact: dict[str, Any] | None = None
-        # Resolved knobs stamped into provenance (pitfall #15); the fit's certificate and pair
-        # count join them once the calibration has run.
+        generator = self.env.generator
+        if not isinstance(generator, HardwareWarpOperator):
+            # The fit is loaded into the model, so a network here would be constructed, probed
+            # and never touched by the calibration: the placeholder shape this arm used to have.
+            raise TypeError(
+                "hardware_warp_calibration needs model.model_type: hardware_warp_operator, got "
+                f"{type(generator).__name__}; the strategy loads the fitted warp into it"
+            )
+        # Resolved knobs stamped into provenance (pitfall #15), then the fit's certificate,
+        # pair count and hold-out report once the calibration has run.
         self.hardware_warp_provenance: dict[str, Any] = {
             k: str(v) if isinstance(v, Path) else v for k, v in asdict(self._knobs).items()
         }
         logger.info("HardwareWarpCalibrationStrategy knobs: %s", self.hardware_warp_provenance)
+        self._artifact: dict[str, Any] = run_hardware_warp_calibration(self._knobs)
+        generator.load_artifact_record(self._artifact)
+        self.hardware_warp_provenance.update(
+            constant_per_degree=self._artifact["constant_per_degree"],
+            n_pairs=self._artifact["n_pairs"],
+            n_basis=len(self._artifact["coeffs"]),
+            held_out=self._artifact["held_out"],
+        )
+        logger.info(
+            "HardwareWarpCalibrationStrategy: %d coefficients loaded into %s",
+            len(self._artifact["coeffs"]),
+            generator.name,
+        )
 
     @property
-    def artifact(self) -> dict[str, Any] | None:
-        """The written artifact, or ``None`` before the first step."""
+    def artifact(self) -> dict[str, Any]:
+        """The artifact written at construction."""
         return self._artifact
 
     def _zero_loss(self) -> torch.Tensor:
@@ -221,11 +283,4 @@ class HardwareWarpCalibrationStrategy(ReconstructionTrainingStrategy):
         epoch: int = 0,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        if self._artifact is None:
-            self._artifact = run_hardware_warp_calibration(self._knobs)
-            self.hardware_warp_provenance.update(
-                constant_per_degree=self._artifact["constant_per_degree"],
-                n_pairs=self._artifact["n_pairs"],
-                n_basis=len(self._artifact["coeffs"]),
-            )
         return {"loss_total": self._zero_loss()}

@@ -7,13 +7,15 @@ judgement is pure, so each failure shape it claims to catch is planted here.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.utils.repo_scripts import require_repo_file
+
 pytest.importorskip("torch")
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "diagnostics"))
+# The script imports its sibling parallel_smoke_scenarios, so its directory goes on the path.
+sys.path.insert(0, str(require_repo_file("scripts/diagnostics/parallel_smoke.py").parent))
 
 from parallel_smoke import _judge
 

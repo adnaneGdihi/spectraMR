@@ -4906,3 +4906,15 @@ def test_the_finished_result_names_the_step_its_restored_weights_come_from() -> 
     es = SimpleNamespace(best_iteration=54000)
     assert training_loop._extract_es_best_iter(es) == 54000
     assert training_loop._extract_es_best_iter(None) is None
+
+
+
+def test_a_validation_declared_off_is_not_warned_about_as_a_missing_loader():
+    """With ``validation.enabled: false`` the data builder attaches no val loader on purpose
+    (issue #673), so the per-event "No 'val' dataloader found" warning would report the
+    arm's own declaration back to it as a defect. Both the flag and its one reader are in
+    the loop source."""
+    src = _loop_source()
+
+    assert "_validation_declared_off = validation_declared_off(config.validation)" in src
+    assert "if logging_service and not _validation_declared_off:" in src

@@ -75,9 +75,30 @@ class TrainingEnvironmentDirector:
         if parallel is None or parallel.strategy == "none":
             return None, None
         plugin = resolve_parallel_strategy(parallel.strategy)
-        ctx = ParallelContext(config=self._config, device=self._device, parallel=parallel)
+        ctx = ParallelContext(
+            config=self._config,
+            device=self._device,
+            parallel=parallel,
+            mesh=self._build_mesh(parallel),
+        )
         logger.info("[Parallel] strategy=%s", plugin.name)
         return plugin, ctx
+
+    def _build_mesh(self, parallel):
+        """The run's one DeviceMesh, built on every rank before any wrap.
+
+        Only ``ddp`` and ``fsdp`` have a mesh to split. Without an initialised process
+        group the plugin raises its own launch error, so there is nothing to build.
+        """
+        import torch.distributed as dist
+
+        if parallel.strategy not in ("ddp", "fsdp"):
+            return None
+        if not (dist.is_available() and dist.is_initialized()):
+            return None
+        from spectramr.infrastructure.distributed.mesh import build_parallel_mesh
+
+        return build_parallel_mesh(parallel, device_type=self._device.type)
 
     def _enforce_parallel_compat(self) -> None:
         """Refuse a strategy x parallel backend the strategy has not declared.
@@ -214,11 +235,16 @@ class TrainingEnvironmentDirector:
                 result.optimizers,
                 result.schedulers,
             )
+            mesh = parallel_ctx.mesh
+            provenance = dict(result.provenance)
+            if mesh is not None:
+                provenance["mesh"] = mesh.provenance()
             parallel_runtime = ParallelRuntime(
                 strategy=parallel_plugin.name,
                 step_policy=result.step_policy,
                 checkpoint_adapter=parallel_plugin.checkpoint_adapter(parallel_ctx),
-                provenance=result.provenance,
+                provenance=provenance,
+                mesh=mesh,
             )
 
         # Compile last for the strategies that wrap late. For ddp this is what

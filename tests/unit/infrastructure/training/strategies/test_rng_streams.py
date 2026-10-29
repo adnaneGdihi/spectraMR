@@ -81,3 +81,29 @@ def test_a_stream_the_owner_lacks_is_refused(monkeypatch) -> None:
     states = {"_other": torch.Generator().get_state()}
     with pytest.raises(ValueError, match="_other"):
         restore_generator_states(SimpleNamespace(_rng=torch.Generator()), states)
+
+
+def test_model_parallel_peers_share_their_replicas_stream(monkeypatch) -> None:
+    """Under a mesh, global ranks 0 and 1 (tensor peers of dp replica 0) draw alike."""
+    from spectramr.core.parallel_groups import DPLayout, activate_dp_layout, reset_dp_layout
+
+    draws = []
+    try:
+        for global_rank, dp in ((0, 0), (1, 0), (2, 1)):
+            _on_rank(monkeypatch, global_rank)
+            activate_dp_layout(
+                DPLayout(
+                    rank=dp,
+                    world_size=2,
+                    group=None,
+                    src_rank=0,
+                    writer=True,
+                    dim_names=("dp_shard", "tp"),
+                    shape=(2, 2),
+                )
+            )
+            draws.append(_draws(rank_seeded_generator(7)))
+    finally:
+        reset_dp_layout()
+    assert torch.equal(draws[0], draws[1]), "tensor peers of one replica must draw alike"
+    assert not torch.equal(draws[0], draws[2]), "data replicas must still differ"

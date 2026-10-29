@@ -382,20 +382,18 @@ fuzz-audit-ladder:
 # Mutation testing for Tier-1 physics + config_health_checker (requires mutmut).
 # Runs mutmut against the four high-value target files and prints a results summary.
 # Usage: make test-mutation
+# mutmut 3 dropped these CLI flags; --CI reports survivors without failing the job.
+MUTMUT_PATHS := src/spectramr/infrastructure/physics/fft_ops.py,src/spectramr/infrastructure/physics/data_consistency.py,src/spectramr/infrastructure/physics/coil_sensitivity.py,src/spectramr/infrastructure/validation/config_health_checker.py
 test-mutation:
 	@echo "=== test-mutation: mutmut for physics + health checker ==="
 	@if $(VENV) python -c "import mutmut" 2>/dev/null; then \
 		$(VENV) \
 		mutmut run \
-			--paths-to-mutate \
-				src/spectramr/infrastructure/physics/fft_ops.py,\
-				src/spectramr/infrastructure/physics/data_consistency.py,\
-				src/spectramr/infrastructure/physics/coil_sensitivity.py,\
-				src/spectramr/infrastructure/validation/config_health_checker.py \
-			--tests-dir tests/unit/physics/ \
-			--runner "python -m pytest -x -q --tb=no" && \
+			--paths-to-mutate $(MUTMUT_PATHS) \
+			--tests-dir tests/unit/physics/ --CI \
+			--runner "python -m pytest -x -q --tb=no tests/unit/physics/" && \
 		mutmut results; \
 	else \
 		echo "WARNING: mutmut not installed — skipping test-mutation."; \
-		echo "Install with: pip install mutmut"; \
+		echo "Install with: pip install 'mutmut<3'"; \
 	fi

@@ -146,6 +146,13 @@ class _RaisingForwardModel(torch.nn.Module):
         raise RuntimeError("mat1 and mat2 shapes cannot be multiplied (65536x2 and 256x8)")
 
 
+class _ForwardSkipModel(_RaisingForwardModel):
+    """The raising model with the whole-probe opt-out: it has no image contract, so the probe
+    must report ``no_probe`` instead of reaching the forward that would go red."""
+
+    synthetic_forward_probe_skip = frozenset({"forward"})
+
+
 class _ContrastConditionedModel(torch.nn.Module):
     """Field+contrast-conditioned net that RAISES when contrast_id is absent.
 
@@ -252,6 +259,7 @@ def _patch_registry(monkeypatch: pytest.MonkeyPatch) -> None:
         "good": _GoodModel,
         "shape_break": _ShapeBreakingModel,
         "raising": _RaisingForwardModel,
+        "forward_skip": _ForwardSkipModel,
         "contrast_cond": _ContrastConditionedModel,
         "style_cond": _StyleConditionedModel,
         "tissue_tuple": _TissueTupleModel,
@@ -276,6 +284,19 @@ def test_probe_passes_on_well_formed_model(_patch_registry: None) -> None:
 def test_probe_unwraps_a_tuple_holding_a_dict_of_maps(_patch_registry: None) -> None:
     result = synthetic_forward_probe(_cfg(model_type="tissue_tuple"), device="cpu", backward=True)
     assert result.passed, result.message
+
+
+def test_probe_reports_no_probe_for_a_model_that_opts_out_of_forward(
+    _patch_registry: None,
+) -> None:
+    result = synthetic_forward_probe(_cfg(model_type="forward_skip"), device="cpu")
+    assert result.passed
+    assert result.category == "no_probe"
+    assert result.severity == "info"
+    assert "forward" in result.message
+    # Without the declaration the same model goes red through its forward.
+    plain = synthetic_forward_probe(_cfg(model_type="raising"), device="cpu")
+    assert not plain.passed and plain.category == "forward_pass_shape"
 
 
 def test_probe_fails_on_unregistered_model(_patch_registry: None) -> None:

@@ -684,6 +684,12 @@ def parallel_provenance(config: Any) -> dict[str, Any]:
             # a WORLD_SIZE that init_process_group was never given.
             record["world_size"] = int(dist.get_world_size())
             record["rank"] = int(dist.get_rank())
+            # This rank's place in the data-parallel group (equal to rank/world when trivial).
+            from spectramr.core.parallel_groups import dp_rank, dp_world_size, is_dp_writer
+
+            record["dp_rank"] = int(dp_rank())
+            record["dp_world_size"] = int(dp_world_size())
+            record["dp_writer"] = bool(is_dp_writer())
     except Exception:  # pragma: no cover - provenance never blocks training
         _logger.debug("distributed state probe failed", exc_info=True)
     # torchrun exports LOCAL_WORLD_SIZE but never a node count, so outside Slurm
@@ -695,6 +701,19 @@ def parallel_provenance(config: Any) -> dict[str, Any]:
         if isinstance(local, int) and local > 0 and isinstance(world, int):
             record["node_count"] = max(1, world // local)
             record["node_count_derived"] = True
+    # The run's DeviceMesh, when one was built: rank-independent, so it reads the same on every rank.
+    from spectramr.core.parallel_groups import current_dp_layout
+
+    layout = current_dp_layout()
+    record["mesh"] = (
+        None
+        if layout is None
+        else {
+            "shape": dict(zip(layout.dim_names, layout.shape, strict=True)),
+            "dim_names": list(layout.dim_names),
+            "dp_world_size": layout.world_size,
+        }
+    )
     return record
 
 

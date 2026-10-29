@@ -13,10 +13,15 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from spectramr.infrastructure.distributed.spatial.halo import exchange_halo, overlap_add
+from spectramr.infrastructure.distributed.spatial.halo import (
+    exchange_halo,
+    overlap_add,
+    require_spatial_scope,
+)
 
 
 def _depth(value: Any) -> int:
@@ -47,6 +52,7 @@ class SpatialConv3d(nn.Conv3d):
         return conv
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        require_spatial_scope("SpatialConv3d")
         k, s = _depth(self.kernel_size), _depth(self.stride)
         d, p = _depth(self.dilation), _depth(self.padding)
         depth = x.shape[2] * torch.distributed.get_world_size(self.spatial_group)
@@ -95,6 +101,7 @@ class SpatialConvTranspose3d(nn.ConvTranspose3d):
         return conv
 
     def forward(self, x: torch.Tensor, output_size: Any = None) -> torch.Tensor:
+        require_spatial_scope("SpatialConvTranspose3d")
         if output_size is not None:
             raise ValueError("spatial ConvTranspose3d does not take output_size")
         raw = F.conv_transpose3d(
@@ -115,9 +122,11 @@ class SpatialConvTranspose3d(nn.ConvTranspose3d):
 class SpatialUpsample(nn.Upsample):
     """``Upsample`` by an integer factor on a depth slab.
 
-    ``nearest`` is local. ``trilinear`` with ``align_corners=False`` reads one plane on
-    each side, so it upsamples a slab padded with a one-plane halo (replicated at the
-    volume's ends, which is how the unsplit op clamps) and crops ``scale`` planes per side.
+    ``nearest`` is local. ``trilinear`` reads at most one plane on each side, so both
+    variants start from a slab padded with a one-plane halo (replicated at the volume's
+    ends, which is how the unsplit op clamps). ``align_corners=False`` upsamples it and
+    crops ``scale`` planes per side; ``align_corners=True`` maps output planes to global
+    source coordinates, so depth is interpolated explicitly and height/width by the op.
     """
 
     spatial_group: Any
@@ -128,21 +137,34 @@ class SpatialUpsample(nn.Upsample):
         scale = scale[0] if isinstance(scale, tuple) else scale
         if up.size is not None or scale is None or float(scale) != int(scale):
             raise ValueError("spatial Upsample needs an integer scale_factor, not a size")
-        if up.mode not in ("nearest", "trilinear") or (up.mode == "trilinear" and up.align_corners):
-            raise ValueError(
-                f"spatial Upsample supports nearest and trilinear(align_corners=False), not {up.mode!r}"
-            )
+        if up.mode not in ("nearest", "trilinear"):
+            raise ValueError(f"spatial Upsample supports nearest and trilinear, not {up.mode!r}")
         up.__class__ = cls
         up.spatial_group = group
         return up
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        require_spatial_scope("SpatialUpsample")
         if self.mode == "nearest":
             return super().forward(x)
         scale = self.scale_factor
         scale = int(scale[0] if isinstance(scale, tuple) else scale)
-        out = super().forward(exchange_halo(x, 1, 1, "replicate", self.spatial_group))
-        return out[:, :, scale : out.shape[2] - scale]
+        padded = exchange_halo(x, 1, 1, "replicate", self.spatial_group)
+        if not self.align_corners:
+            out = super().forward(padded)
+            return out[:, :, scale : out.shape[2] - scale]
+        world, rank = dist.get_world_size(self.spatial_group), dist.get_rank(self.spatial_group)
+        local = x.shape[2]
+        d_in, d_out = local * world, local * world * scale
+        planes = torch.arange(rank * local * scale, (rank + 1) * local * scale, device=x.device)
+        coord = planes.double() * (d_in - 1) / max(d_out - 1, 1)
+        lo = coord.floor().long()
+        frac = (coord - lo).to(x.dtype).view(1, 1, -1, 1, 1)
+        idx = lo - rank * local + 1  # offset by the leading halo plane
+        upper = (idx + 1).clamp(max=padded.shape[2] - 1)
+        depth = torch.lerp(padded.index_select(2, idx), padded.index_select(2, upper), frac)
+        size = (depth.shape[2], x.shape[3] * scale, x.shape[4] * scale)
+        return F.interpolate(depth, size=size, mode="trilinear", align_corners=True)
 
 
 __all__ = ["SpatialConv3d", "SpatialConvTranspose3d", "SpatialUpsample"]
