@@ -1,22 +1,15 @@
 name: PR title
 
-# Uses `pull_request_target` so the linter can post a status check from the
-# base-repo context. SAFETY: this workflow NEVER checks out PR code. It only
-# reads `github.event.pull_request.title`, which is metadata. No secret
-# exfiltration surface exists — see
-# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+# Plain `pull_request`: the job only reads the PR title from the event payload and
+# its own pass/fail is the check, so it needs no base-repo write token.
 
 on:
   # No `branches:` filter -- it matches the PR's BASE branch, and PRs here target both
   # `dev` and `main`; pinning it to either base silently skips the other.
-  # pull_request_target workflows are read from the DEFAULT branch, so this file must
-  # also be published onto `main` or it stays inert. See docs/contributing/ci.rst.
-  pull_request_target:
+  pull_request:
     types: [opened, edited, synchronize, reopened]
 
-permissions:
-  pull-requests: read
-  statuses: write
+permissions: {}
 
 concurrency:
   group: pr-title-${{ github.event.pull_request.number }}
@@ -27,6 +20,8 @@ jobs:
     name: Conventional Commits prefix
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      pull-requests: read
     steps:
       - uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825  # v5
         env:
